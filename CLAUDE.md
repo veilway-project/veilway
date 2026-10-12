@@ -6,18 +6,18 @@ Read `PLAN.md` before any work. Its status block at the top says which phase is 
 
 ## State of this repo right now
 
-Phase 0 gave the tree its final layout and Phase 1 in `PLAN.md` is growing the engine into the real core: it runs on config v1 with several inbounds, routing rules and `netstack` exits. The `l3` exit, reload and the control API are not built yet. The crates `veilway-proto`, `veilway-transport`, `veilway-api`, `veilway-xray` and `veilway-ffi` are empty skeletons, and `panel/`, `packages/` and `apps/android` do not exist yet.
+Phase 0 gave the tree its final layout and Phase 1 in `PLAN.md` is growing the engine into the real core: it runs on config v1 with several inbounds, routing rules and `netstack` exits. Reload, quotas and the control API are not built yet. The crates `veilway-proto`, `veilway-transport`, `veilway-api`, `veilway-xray` and `veilway-ffi` are empty skeletons, and `panel/`, `packages/` and `apps/android` do not exist yet.
 
 The project lives in the GitHub organisation `veilway-project` (`veilway` and `veilway-docs`). Licence is Apache-2.0 with `NOTICE`, `TRADEMARKS.md` and a CLA. Never push unless the owner asks in that message.
 
 ## What the code does today
 
-A WireGuard peer connects over UDP or over WebSocket (one WireGuard datagram is one binary WS frame). The server terminates the tunnel in userspace with boringtun, checks and routes every inner IP packet, feeds TCP and UDP to a userspace TCP/IP stack (ipstack), and re-dials each flow through the outbound of the exit it was routed to (an upstream SOCKS5, or directly from the node). There is no TUN device and no kernel routing on the server, which is what gives strict peer isolation.
+A WireGuard peer connects over UDP or over WebSocket (one WireGuard datagram is one binary WS frame). The server terminates the tunnel in userspace with boringtun, checks and routes every inner IP packet, feeds TCP and UDP to a userspace TCP/IP stack (ipstack), and re-dials each flow through the outbound of the exit it was routed to (an upstream SOCKS5, or directly from the node). With `netstack` exits there is no TUN device and no kernel routing on the server. An `l3` exit (Linux, `CAP_NET_ADMIN`, needs `ip` and `nft`) writes packets to one TUN device and lets the kernel forward them, and only delivers return traffic that belongs to a live flow.
 
 | Path | Role |
 |---|---|
 | `crates/veilway-wg` | Multi-peer boringtun layer (handshake routing, cookies, timers, authenticated roaming) and, in `ws`, the WebSocket relay and UDP-to-WSS client bridge |
-| `crates/veilway-core` | `config/` is config v1 (parser, validation, schema, reload store). `engine/` runs it: start-up and counters (`mod.rs`), the compiled config (`plan.rs`), one WireGuard tunnel per inbound and the ingress checks (`inbound.rs`), the always-refused destinations (`gate.rs`), rules and the flow table (`route.rs`), per-flow egress through SOCKS5 or directly (`flows.rs`), packet parsing (`netstack.rs`), the node's DNS resolver with its per-user name memory (`resolver.rs`, messages in `dns.rs`) |
+| `crates/veilway-core` | `config/` is config v1 (parser, validation, schema, reload store). `engine/` runs it: start-up and counters (`mod.rs`), the compiled config (`plan.rs`), one WireGuard tunnel per inbound and the ingress checks (`inbound.rs`), the always-refused destinations (`gate.rs`), rules and the flow table (`route.rs`), per-flow egress through SOCKS5 or directly (`flows.rs`), packet parsing (`netstack.rs`), the node's DNS resolver with its per-user name memory (`resolver.rs`, messages in `dns.rs`), ICMP errors and direct ping (`icmp.rs`), the `l3` exit (`l3.rs`) |
 | `fuzz/` | cargo-fuzz targets, outside the workspace. See `fuzz/README.md` |
 | `crates/veilway` | The `veilway` binary: `run`, `genkey`, `bridge client`, `bridge relay` |
 | `crates/veilway-client` | Single-peer client engine plus the Windows Wintun, route, DNS (NRPT) layer |
@@ -32,6 +32,7 @@ cargo build --release --workspace
 cargo zigbuild --release --locked --target x86_64-unknown-linux-musl -p veilway --bin veilway
 cargo deny check && cargo audit
 veilway check --config config.example.json
+VEILWAY_TEST_L3=1 cargo test -p veilway-core --test l3   # needs NET_ADMIN and a responder, see the file header
 apps/desktop/scripts/fetch-wintun.sh
 cd apps/desktop/src-tauri && cargo check
 ```

@@ -40,18 +40,39 @@ pub enum Reason {
 	Unsupported,
 	/// An exit with a `block` backend.
 	BlockExit,
-	/// The queue into the userspace stack was full.
+	/// The queue into the userspace stack or into an l3 exit's interface was full.
 	QueueFull,
+	/// A packet the kernel routed into an l3 exit's interface that answers no live flow which left through that exit.
+	NoFlow,
+	/// Larger than the MTU of the tunnel or the interface it was going to.
+	TooBig,
+	/// Not a packet: an ICMP error the node owed a device and did not send, because that device had used up its share of them.
+	IcmpLimited,
 }
 
 impl Reason {
-	pub const COUNT: usize = 11;
+	pub const COUNT: usize = 14;
+}
+
+/// How a flow leaves through its exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum By {
+	/// The exit's own backend: the userspace stack and the outbound of a netstack exit, the interface of an l3 exit.
+	Backend,
+	/// The proxy of a netstack exit, for a UDP flow that proxy has given an association: from then on the flow leaves through it or not at all.
+	Proxy,
+	/// A ping the node answers itself.
+	Local,
+	/// From the node's own address around the exit's proxy: an unprivileged ping socket, or a UDP socket.
+	Direct,
+	/// Handed to this other exit, whose own `unsupported` policy is never consulted.
+	Via(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-	/// Leaves through this exit.
-	Exit {exit: usize},
+	/// Leaves through this exit, which is the one the rules chose and the one the user's `exits` were checked for.
+	Exit {exit: usize, by: By},
 	/// Tunnel DNS: the node's own resolver answers it, and each query on the flow is routed by itself.
 	Dns,
 	/// Handed to the device that holds the destination address.
@@ -84,7 +105,8 @@ impl Key {
 }
 
 /// `owner` is the device and the user a carried flow counts against. A refusal has none: it counts against nobody.
-struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration}
+/// `closing` is set once a TCP flow that no handler watches has shown a FIN or RST.
+struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool}
 
 #[derive(Default)]
 struct Table {
@@ -137,9 +159,9 @@ impl Flows {
 		}
 	}
 
-	/// Records the decision for a new flow. Err when the table, the user's share of it or the device's is full, which a refusal never is:
+	/// Records the decision for a new flow and returns the id of its entry. Err when the table, the user's share of it or the device's is full, which a refusal never is:
 	/// it is remembered only to spare the rules, so it takes the place of the oldest refusal and no room from a flow that carries something.
-	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision) -> Result<(), ()> {
+	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision) -> Result<u64, ()> {
 		let mut table = self.lock();
 		// A flow that expired a moment ago may still sit here until the next sweep.
 		table.remove(&key);
@@ -160,8 +182,28 @@ impl Flows {
 			table.carried += 1;
 			(Some((device, user)), FLOW_IDLE)
 		};
-		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle});
-		Ok(())
+		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false});
+		Ok(id)
+	}
+
+	/// Replaces the decision of the entry `id`. Only the handler of a UDP flow does this, once, when its exit's proxy turns out to have no UDP:
+	/// the entry keeps its place and its owner, so a flow that is refused this way stays refused for as long as its packets keep coming.
+	pub fn decide(&self, key: &Key, id: u64, decision: Decision) {
+		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {entry.decision = decision}
+	}
+
+	/// Ties the entry `id` to the proxy of its exit, which the handler of a UDP flow does the moment that proxy gives it an association.
+	/// Only a flow that still waits for that answer changes. One the policy has sent another way stays there.
+	pub fn pin(&self, key: &Key, id: u64) {
+		if let Some(Entry {decision: Decision::Exit {by: by @ By::Backend, ..}, ..}) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {*by = By::Proxy}
+	}
+
+	/// For a flow no handler watches, one through an l3 exit: how long its packets say to keep it. Once it is `closing` it stays short-lived whatever follows.
+	pub fn track(&self, key: &Key, id: u64, idle: Duration, closing: bool) {
+		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {
+			entry.closing |= closing;
+			entry.idle = if entry.closing {FLOW_IDLE} else {idle};
+		}
 	}
 
 	/// Sets how long the entry `id` outlives its last packet. A handler raises it while it runs and lowers it when it ends.
@@ -231,7 +273,7 @@ mod tests {
 	#[test]
 	fn the_table_is_bounded_per_device_per_user_and_in_total() {
 		let flows = Flows::default();
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap()}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap();}
 		assert!(flows.insert(key(60000), [1; 32], "a", Decision::Deliver).is_err(), "one device went over its share");
 		// However many devices a user has, their flows together stay inside the user's share.
 		for device in 2..=16u8 {
@@ -255,11 +297,11 @@ mod tests {
 	fn a_refusal_takes_no_room_from_a_flow() {
 		let flows = Flows::default();
 		// More refusals than fit, all from one device: none is turned away and none counts against the device or its user.
-		for sport in 0..(MAX_REFUSALS + 100) as u16 {flows.insert(key(sport), [1; 32], "a", REFUSED).unwrap()}
+		for sport in 0..(MAX_REFUSALS + 100) as u16 {flows.insert(key(sport), [1; 32], "a", REFUSED).unwrap();}
 		assert_eq!(flows.len(), MAX_REFUSALS);
 		assert!(flows.get(&key(0)).is_none() && flows.get(&key(99)).is_none(), "the oldest refusals did not give way");
 		assert_eq!(flows.get(&key(100)).map(|(_, decision)| decision), Some(REFUSED));
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [1; 32], "a", Decision::Deliver).unwrap()}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [1; 32], "a", Decision::Deliver).unwrap();}
 		assert_eq!(flows.len(), MAX_REFUSALS + MAX_FLOWS_PER_DEVICE);
 		// A full share turns a flow away, never a refusal.
 		assert!(flows.insert(Key {dport: 81, ..key(1)}, [1; 32], "a", Decision::Deliver).is_err());
@@ -279,8 +321,44 @@ mod tests {
 		std::thread::sleep(Duration::from_millis(5));
 		flows.sweep();
 		assert!(flows.is_empty());
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap()}
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [2; 32], "a", Decision::Deliver).unwrap()}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap();}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [2; 32], "a", Decision::Deliver).unwrap();}
+	}
+
+	#[test]
+	fn a_flow_no_handler_watches_is_kept_by_what_its_packets_say() {
+		let flows = Flows::default();
+		let leaves = Decision::Exit {exit: 0, by: By::Backend};
+		let id = flows.insert(key(1), [1; 32], "a", leaves).unwrap();
+		let idle = |flows: &Flows| flows.lock().flows.get(&key(1)).map(|entry| entry.idle);
+		assert_eq!(idle(&flows), Some(FLOW_IDLE));
+		flows.track(&key(1), id, Duration::from_secs(7200), false);
+		assert_eq!(idle(&flows), Some(Duration::from_secs(7200)));
+		flows.track(&key(1), id + 1, Duration::ZERO, true);
+		assert_eq!(idle(&flows), Some(Duration::from_secs(7200)), "another entry's id changed this one");
+		// After a FIN or RST the last acknowledgements must not make the flow long-lived again.
+		flows.track(&key(1), id, Duration::from_secs(7200), true);
+		flows.track(&key(1), id, Duration::from_secs(7200), false);
+		assert_eq!(idle(&flows), Some(FLOW_IDLE));
+		// An association ties the flow to its proxy. One that was already sent around the proxy is not taken back.
+		flows.pin(&key(1), id + 1);
+		assert_eq!(flows.get(&key(1)), Some((id, leaves)), "another entry's id changed this one");
+		flows.pin(&key(1), id);
+		assert_eq!(flows.get(&key(1)), Some((id, Decision::Exit {exit: 0, by: By::Proxy})));
+		for around in [Decision::Exit {exit: 0, by: By::Direct}, Decision::Exit {exit: 0, by: By::Via(1)}, Decision::Refuse {reason: Reason::Unsupported, reset: false}] {
+			flows.decide(&key(1), id, around);
+			flows.pin(&key(1), id);
+			assert_eq!(flows.get(&key(1)), Some((id, around)));
+		}
+		flows.decide(&key(1), id, leaves);
+		let refused = Decision::Refuse {reason: Reason::Unsupported, reset: true};
+		flows.decide(&key(1), id + 1, refused);
+		assert_eq!(flows.get(&key(1)), Some((id, leaves)));
+		flows.decide(&key(1), id, refused);
+		assert_eq!(flows.get(&key(1)), Some((id, refused)));
+		// It still holds its place in the device's share, unlike a refusal the rules made.
+		for sport in 2..=MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", leaves).unwrap();}
+		assert!(flows.insert(key(60000), [1; 32], "a", leaves).is_err());
 	}
 
 	#[test]

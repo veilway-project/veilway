@@ -1,8 +1,11 @@
-//! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to. There is no TUN device and no kernel routing.
+//! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to.
+//! Only an `l3` exit uses a TUN device and kernel routing, and only for the flows that were routed to it.
 pub mod dns;
 mod flows;
 pub mod gate;
+pub mod icmp;
 mod inbound;
+pub mod l3;
 pub mod netstack;
 pub mod plan;
 pub mod resolver;
@@ -16,10 +19,11 @@ use anyhow::Context;
 use inbound::{Peers, Tunnel};
 use ipstack::{IpStack, IpStackConfig, TcpConfig};
 use netstack::PacketDev;
-use plan::Backend;
+use plan::{Backend, Fallback};
 use resolver::Resolver;
 use route::Flows;
 use socket2::{Domain, Socket, Type};
+use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -110,6 +114,12 @@ pub struct Shared {
 	counters: Counters,
 	resolver: Resolver,
 	exits: Vec<ExitState>,
+	/// For each exit with an l3 backend, the way into its interface.
+	l3: Vec<Option<l3::Port>>,
+	/// The ICMP errors each device may still be sent, indexed like the devices of the plan.
+	limits: Vec<Mutex<icmp::Limit>>,
+	/// Pings that leave from the node's own address, by the device's address, the destination and the identifier the device chose, each with its device, that device's user and the way to its socket.
+	pings: Mutex<HashMap<(IpAddr, IpAddr, u16), (usize, usize, mpsc::Sender<Vec<u8>>)>>,
 	/// One for all `ws` listeners.
 	relays: Arc<ws::Stats>,
 	is_local: fn(IpAddr) -> bool,
@@ -120,10 +130,15 @@ impl Shared {
 	pub fn plan(&self) -> Arc<Plan> {self.plan.read().unwrap_or_else(|e| e.into_inner()).clone()}
 }
 
-/// A running engine. Its tasks live until the process exits.
-pub struct Engine {shared: Arc<Shared>}
+/// A running engine. Its tasks live until the process exits, and `shutdown` takes back what it set up on the host. Dropping it does so too, without waiting for the l3 tasks to end.
+pub struct Engine {shared: Arc<Shared>, l3: Vec<l3::Running>}
 
 impl Engine {
+	/// Stops every l3 exit and removes its interface, routes and firewall rules from the host. Everything else the engine holds goes with the process.
+	pub async fn shutdown(self) {
+		for exit in self.l3 {exit.close().await}
+	}
+
 	pub fn plan(&self) -> Arc<Plan> {self.shared.plan()}
 
 	pub fn user(&self, name: &str) -> Option<Totals> {self.plan().users.iter().position(|user| user.name == name).map(|i| self.shared.counters.users[i].totals())}
@@ -227,12 +242,26 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		}).with_context(|| format!("cannot listen on ws {addr}"))?;
 		serving.push(ws::relay(listener, tls, routes, ws::MAX_CONNS, relay_stats.clone()).with_context(|| format!("ws {addr}: cannot load the certificate or its key"))?);
 	}
+	// Return traffic finds its interface by the routes of the pools, and two interfaces cannot both have those. Telling them apart takes policy routing, which is not built.
+	let mut wired = plan.exits.iter().enumerate().filter(|(_, exit)| matches!(exit.backend, Backend::L3 {..}));
+	let (wired, second) = (wired.next(), wired.next());
+	if let (Some((_, first)), Some((_, second))) = (wired, second) {anyhow::bail!("exits `{}` and `{}` both have an l3 backend: this build runs one l3 exit per node, so remove one of them", first.tag, second.tag)}
+	let (mut l3, mut from_tunnels, tun_mtu): (Vec<Option<l3::Port>>, _, _) = (plan.exits.iter().map(|_| None).collect(), None, plan.inbounds.iter().map(|inbound| inbound.mtu).min().unwrap_or(crate::config::DEFAULT_MTU));
 	for exit in &plan.exits {
 		match &exit.backend {
 			Backend::Netstack {outbound: plan::Outbound::Socks5(_), ..} => tracing::info!("exit {}: netstack through a socks5 proxy", exit.tag),
 			Backend::Netstack {..} => tracing::info!("exit {}: netstack, direct from this node", exit.tag),
+			Backend::L3 {masquerade, ..} => if !masquerade && plan.hijack {tracing::warn!("exit {}: l3 without masquerade carries no query of the node's resolver, so dns fails for flows routed to it unless a rule sends the dns servers on port 53 to another exit", exit.tag)},
 			Backend::Block => tracing::info!("exit {}: block", exit.tag),
 		}
+		if let Backend::Netstack {icmp_echo: Fallback::Direct, ..} = &exit.backend {
+			icmp::ping_socket(true).map_err(|e| anyhow::anyhow!("exit `{}`: \"icmp_echo\": \"direct\" needs unprivileged ping sockets, which this system does not give the node ({e}); on Linux the node's group has to be inside net.ipv4.ping_group_range", exit.tag))?;
+			if plan.pools.iter().any(|(pool, _)| pool.addr().is_ipv6()) && icmp::ping_socket(false).is_err() {tracing::warn!("exit {}: this system gives the node no ping socket for ipv6, so ipv6 pings through the exit get no answer", exit.tag)}
+		}
+	}
+	if let Some((at, _)) = wired {
+		let (to, from) = mpsc::channel(QUEUE);
+		(l3[at], from_tunnels) = (Some(l3::Port {to, mtu: tun_mtu}), Some((at, from)));
 	}
 	let counters = Counters {
 		users: plan.users.iter().map(|_| Traffic::default()).collect(),
@@ -240,8 +269,10 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		exits: plan.exits.iter().map(|_| Traffic::default()).collect(),
 		drops: Default::default(),
 	};
-	let (exits, resolver) = (plan.exits.iter().map(|_| ExitState::default()).collect(), Resolver::new(&plan));
-	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(plan)), tunnels, flows: Flows::default(), counters, resolver, exits, relays: relay_stats, is_local: options.is_local});
+	let (exits, resolver, limits) = (plan.exits.iter().map(|_| ExitState::default()).collect(), Resolver::new(&plan), plan.devices.iter().map(|_| Mutex::new(icmp::Limit::new(Instant::now()))).collect());
+	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(plan)), tunnels, flows: Flows::default(), counters, resolver, exits, l3, limits, pings: Mutex::default(), relays: relay_stats, is_local: options.is_local});
+	// The last thing that can fail, so that a start that fails leaves no interface and no rule behind.
+	let l3 = from_tunnels.map(|(at, from)| l3::Running::start(&shared, &shared.plan(), at, from, tun_mtu)).transpose()?.into_iter().collect();
 	for (at, (stack, from_stack)) in stacks.into_iter().enumerate() {inbound::spawn(&shared, at, stack, from_stack)}
 	for relay in serving {tokio::spawn(relay);}
 	tokio::spawn({
@@ -254,5 +285,5 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 			}
 		}
 	});
-	Ok(Engine {shared})
+	Ok(Engine {shared, l3})
 }

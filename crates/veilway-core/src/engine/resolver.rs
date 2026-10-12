@@ -147,7 +147,14 @@ async fn answer(shared: Arc<Shared>, plan: Arc<Plan>, inbound: usize, user: usiz
 			tracing::debug!("inbound {tag}: user {who}: dns query for {} refused: {reason:?}", plan.show(asked.unwrap_or("<no domain>")));
 			return Some(query.reply(dns::REFUSED));
 		}
-		let (Backend::Netstack {outbound, ..}, Some(failures)) = (&plan.exits[exit].backend, resolver.failures.get(at * plan.exits.len() + exit)) else {continue};
+		// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
+		// Without `masquerade` the operator decides where that traffic goes, which the node cannot know, so such an exit carries no query of the node's resolver rather than one that takes another way out.
+		let outbound = match &plan.exits[exit].backend {
+			Backend::Netstack {outbound, ..} => outbound,
+			Backend::L3 {masquerade: true, ..} => &flows::AROUND,
+			_ => continue,
+		};
+		let Some(failures) = resolver.failures.get(at * plan.exits.len() + exit) else {continue};
 		// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
 		if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != server.is_ipv4()) {continue}
 		shared.counters.exits[exit].up(message.len());

@@ -40,17 +40,24 @@ impl Packet {
 }
 
 /// Reads the IP header and the start of the upper-layer header. None for anything that is not a complete, well formed packet.
-pub fn parse(raw: &[u8]) -> Option<Packet> {
+pub fn parse(raw: &[u8]) -> Option<Packet> {read(raw, false)}
+
+/// The same for the start of a packet as an ICMP error quotes it. The quote may end anywhere past the ports or the ICMP type and code, and `len` is then where it ends.
+pub fn quoted(raw: &[u8]) -> Option<Packet> {read(raw, true)}
+
+fn read(raw: &[u8], cut: bool) -> Option<Packet> {
 	let (src, dst, mut protocol, mut upper, len, mut fragment) = match raw.first()? >> 4 {
 		4 => {
 			let (header, len) = (usize::from(raw[0] & 0x0f) * 4, usize::from(u16::from_be_bytes([*raw.get(2)?, *raw.get(3)?])));
+			let len = if cut {len.min(raw.len())} else {len};
 			if header < 20 || len < header || raw.len() < len {return None}
 			let fragment = u16::from_be_bytes([raw[6], raw[7]]) & 0x3fff != 0;
 			(IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&raw[12..16]).ok()?)), IpAddr::V4(Ipv4Addr::from(<[u8; 4]>::try_from(&raw[16..20]).ok()?)), raw[9], header, len, fragment)
 		}
 		6 => {
 			let len = 40 + usize::from(u16::from_be_bytes([*raw.get(4)?, *raw.get(5)?]));
-			if raw.len() < len {return None}
+			let len = if cut {len.min(raw.len())} else {len};
+			if len < 40 || raw.len() < len {return None}
 			(IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&raw[8..24]).ok()?)), IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&raw[24..40]).ok()?)), raw[6], 40, len, false)
 		}
 		_ => return None,
@@ -76,11 +83,11 @@ pub fn parse(raw: &[u8]) -> Option<Packet> {
 	if !fragment {
 		match protocol {
 			Protocol::TCP | Protocol::UDP | Protocol::SCTP => {
-				if body.len() < if protocol == Protocol::TCP {20} else if protocol == Protocol::UDP {8} else {12} {return None}
+				if body.len() < if cut {4} else if protocol == Protocol::TCP {20} else if protocol == Protocol::UDP {8} else {12} {return None}
 				(sport, dport) = (u16::from_be_bytes([body[0], body[1]]), u16::from_be_bytes([body[2], body[3]]));
 			}
 			Protocol::ICMP | Protocol::ICMPV6 => {
-				if body.len() < 8 {return None}
+				if body.len() < if cut {2} else {8} {return None}
 				icmp = Some((body[0], body[1]));
 			}
 			_ => {}
@@ -239,6 +246,23 @@ mod tests {
 		assert!(parse(&v6(17, &udp[..7])).is_none());
 		assert!(parse(&[0x70; 60]).is_none());
 		assert!(parse(&[]).is_none());
+	}
+
+	#[test]
+	fn a_quoted_packet_is_read_as_far_as_it_goes() {
+		let mut whole = Vec::new();
+		PacketBuilder::ipv4([10, 7, 0, 2], [1, 1, 1, 1], 64).tcp(40000, 443, 1, 65535).write(&mut whole, &[0; 100]).unwrap();
+		// The least an ICMP error quotes is the IP header and 8 bytes, which is less than a TCP header.
+		assert!(parse(&whole[..28]).is_none());
+		let p = quoted(&whole[..28]).unwrap();
+		assert_eq!((p.src, p.dst, p.protocol, p.sport, p.dport, p.upper, p.len), ("10.7.0.2".parse().unwrap(), "1.1.1.1".parse().unwrap(), 6, 40000, 443, 20, 28));
+		assert_eq!(quoted(&whole).unwrap().len, whole.len());
+		for cut in 0..24 {assert!(quoted(&whole[..cut]).is_none(), "a quote cut to {cut} bytes was accepted")}
+		let mut six = Vec::new();
+		PacketBuilder::ipv6([0xfd; 16], [0x20; 16], 64).icmpv6_echo_request(7, 9).write(&mut six, b"payload").unwrap();
+		assert_eq!(quoted(&six[..42]).unwrap().icmp, Some((ECHO_REQUEST_V6, 0)));
+		assert!(quoted(&six[..41]).is_none() && quoted(&six[..39]).is_none());
+		assert!(quoted(&[0x70; 60]).is_none() && quoted(&[]).is_none());
 	}
 
 	#[test]

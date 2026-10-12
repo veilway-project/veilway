@@ -87,9 +87,20 @@ async fn main() -> anyhow::Result<()> {
 				std::process::exit(1);
 			}
 			log(match loaded.log.level {LogLevel::Error => "error", LogLevel::Warn => "warn", LogLevel::Info => "info", LogLevel::Debug => "debug", LogLevel::Trace => "trace"}, loaded.log.destinations);
-			let _engine = veilway_core::start(&loaded, Options::new(config.parent().unwrap_or(Path::new("")))).await?;
-			tokio::signal::ctrl_c().await?;
-			Ok(())
+			// SIGTERM is how a service manager and `docker stop` end the node, and SIGHUP is what a closing terminal sends it. An l3 exit has firewall rules and sysctls to take back before it goes, so both stop it the way Ctrl-C does.
+			#[cfg(unix)]
+			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);
+			let engine = veilway_core::start(&loaded, Options::new(config.parent().unwrap_or(Path::new("")))).await?;
+			#[cfg(unix)]
+			let stopped = tokio::select! {
+				stopped = tokio::signal::ctrl_c() => stopped,
+				_ = terminate.recv() => Ok(()),
+				_ = hangup.recv() => Ok(()),
+			};
+			#[cfg(not(unix))]
+			let stopped = tokio::signal::ctrl_c().await;
+			engine.shutdown().await;
+			Ok(stopped?)
 		}
 		Command::Check {config} => {
 			let (_, report) = veilway_core::config::load(&config, true);
