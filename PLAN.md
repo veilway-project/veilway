@@ -4,9 +4,10 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 0 (not started)
-- Last finished step: none
-- Next action: Phase 0, step 1
+- Active phase: 0, steps 1 to 5 done, gate passed on macOS and with a stock WireGuard client in containers. One existing test (`a_forged_handshake_flood_cannot_steal_the_endpoint`) fails on Linux and is under diagnosis; Phase 1 does not start until it is resolved.
+- Last finished step: Phase 0, step 5
+- Next action: resolve the Linux test failure, then Phase 1, step 1 (config v1 with JSON Schema)
+- Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 
 ## What we are building

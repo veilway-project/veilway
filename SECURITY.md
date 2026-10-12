@@ -50,6 +50,16 @@ Things we particularly want to hear about:
 
 Vulnerabilities in third-party dependencies are best reported upstream first. Tell us too if Veilway's use of the dependency makes the problem exploitable.
 
+## Verifying a release
+
+The `veilway-<target>` binaries of a tagged release are signed with [minisign](https://jedisct1.github.io/minisign/). Each asset has a `.minisig` file next to it, and its trusted comment names the tag and the asset. No release has been published yet.
+
+```
+minisign -Vm veilway-x86_64-unknown-linux-musl -P RWQiodKlFCiJ3bkZD3ojKV7AYyTYf3F5x/XY8upWvpSFTVm3O2cNRbrV
+```
+
+The desktop installer is signed with a separate key that the app's updater checks before it installs anything.
+
 ## Status of the obfuscation layer
 
 The tunnel itself is WireGuard, through the boringtun implementation, with its cryptography unchanged. The layer around it that makes traffic harder to recognise and block (transports and obfuscation) is **experimental and has not been externally reviewed**. It has had no independent audit. Do not treat it as proven against a capable censor, and do not rely on it alone where being detected has serious consequences. This notice will be updated when a review has taken place.
