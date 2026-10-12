@@ -1,4 +1,4 @@
-use crate::config::Upstream;
+use crate::legacy::Upstream;
 use ipstack::{IpStackTcpStream, IpStackUdpStream};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

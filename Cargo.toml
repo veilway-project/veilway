@@ -31,6 +31,8 @@ base64="0.22"
 rand_core={version="0.6", features=["getrandom"]}
 etherparse="0.20"
 wintun-bindings="0.7"
+schemars="1"
+time={version="0.3.36", default-features=false, features=["std", "parsing", "formatting"]}
 
 
 # ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout. See vendor/ipstack ("veilway patch").

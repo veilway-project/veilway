@@ -96,7 +96,7 @@ async fn spawn_server(upstream:&str, ws:bool)->Node{
 		r#"{{"private_key":"{}","address":"10.7.0.1/24","mtu":1420,{listen},"upstream":"{upstream}",
 		 "peers":[{{"public_key":"{}","allowed_ips":["10.7.0.2/32"]}}]}}"#,
 		veilway_wg::encode_key(&private), veilway_wg::encode_key(&veilway_wg::public_key(&client)));
-	let cfg:veilway_core::config::Config=serde_json::from_str(&json).unwrap();
+	let cfg:veilway_core::legacy::Config=serde_json::from_str(&json).unwrap();
 	cfg.validate().unwrap();
 	let running=veilway_core::start(cfg).await.unwrap();
 	Node{udp:running.udp_addr, ws:running.ws_addr, server_public:veilway_wg::encode_key(&veilway_wg::public_key(&private)), client_private:veilway_wg::encode_key(&client)}

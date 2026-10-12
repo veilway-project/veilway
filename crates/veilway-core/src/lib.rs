@@ -1,9 +1,10 @@
 //! Userspace WireGuard server: terminates peers and egresses only through an upstream SOCKS5 proxy.
 pub mod config;
+pub mod legacy;
 pub mod flow;
 pub mod net;
 
-use crate::config::{parse_upstream, Config, Upstream};
+use crate::legacy::{parse_upstream, Config, Upstream};
 use crate::net::{allowed_dst, peer_for, tcp_rst, PacketDev};
 use ipnet::IpNet;
 use ipstack::{IpStack, IpStackConfig, IpStackStream, TcpConfig};

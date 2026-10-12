@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-use veilway_core::config::Config;
+use veilway_core::legacy::Config;
 use veilway_wg::ws::{self, TlsFiles};
 
 #[derive(Parser)]
@@ -15,6 +15,12 @@ enum Command {
 	Run {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
 	},
+	/// Validate a version 1 config and print every error and warning
+	Check {
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+	},
+	/// Print the JSON Schema of config version 1
+	Schema,
 	/// Print a fresh private key and its public key
 	Genkey,
 	/// WireGuard over WebSocket bridge
@@ -56,6 +62,21 @@ async fn main() -> anyhow::Result<()> {
 		Command::Run {config} => {
 			veilway_core::start(Config::load(&config)?).await?;
 			tokio::signal::ctrl_c().await?;
+			Ok(())
+		}
+		Command::Check {config} => {
+			let (_, report) = veilway_core::config::load(&config, true);
+			for e in &report.errors {eprintln!("error: {e}")}
+			if report.more_errors > 0 {eprintln!("error: and {} more errors", report.more_errors)}
+			for w in &report.warnings {eprintln!("warning: {w}")}
+			if report.more_warnings > 0 {eprintln!("warning: and {} more warnings", report.more_warnings)}
+			if report.shadow_cut_short {eprintln!("note: the check for rules covered by an earlier rule stopped at its budget, so later rules were not compared")}
+			eprintln!("{}: {} errors, {} warnings", config.display(), report.errors.len() + report.more_errors, report.warnings.len() + report.more_warnings);
+			if !report.errors.is_empty() {std::process::exit(1)}
+			Ok(())
+		}
+		Command::Schema => {
+			print!("{}", veilway_core::config::schema());
 			Ok(())
 		}
 		Command::Bridge {command: Bridge::Client {listen, url, insecure}} => ws::run_client(listen, url, insecure).await,

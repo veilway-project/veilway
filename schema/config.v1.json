@@ -1,0 +1,1080 @@
+{
+  "$defs": {
+    "Action": {
+      "description": "{\"exit\": \"<exit tag>\"}, \"user\", \"block\" or \"reject\"",
+      "oneOf": [
+        {
+          "enum": [
+            "user",
+            "block",
+            "reject"
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "exit": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "exit"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Addr": {
+      "description": "an address and port such as 192.0.2.1:443 or [2001:db8::1]:443",
+      "pattern": "^[0-9A-Fa-f:.\\[\\]]+:[1-9][0-9]{0,4}$",
+      "type": "string"
+    },
+    "Backend": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "outbound": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "proxy_only": {
+              "description": "Defaults to true on a socks5 outbound. Must be absent or false on a direct one.",
+              "type": "boolean"
+            },
+            "tcp_idle_secs": {
+              "description": "Defaults to 7200.",
+              "format": "uint32",
+              "maximum": 86400,
+              "minimum": 10,
+              "type": "integer"
+            },
+            "type": {
+              "const": "netstack",
+              "type": "string"
+            },
+            "udp_idle_secs": {
+              "description": "Defaults to 60.",
+              "format": "uint32",
+              "maximum": 3600,
+              "minimum": 5,
+              "type": "integer"
+            },
+            "unsupported": {
+              "$ref": "#/$defs/Unsupported"
+            }
+          },
+          "required": [
+            "type",
+            "outbound"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "interface": {
+              "description": "Defaults to \"veilway0\".",
+              "pattern": "^[a-z][a-z0-9_-]{0,14}$",
+              "type": "string"
+            },
+            "masquerade": {
+              "description": "Defaults to true.",
+              "type": "boolean"
+            },
+            "type": {
+              "const": "l3",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "block",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Device": {
+      "additionalProperties": false,
+      "properties": {
+        "addresses": {
+          "items": {
+            "$ref": "#/$defs/Ip"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "name": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "type": "string"
+        },
+        "preshared_key": {
+          "$ref": "#/$defs/Key",
+          "description": "A secret. No diagnostic, log line or `Debug` output shows it."
+        },
+        "public_key": {
+          "$ref": "#/$defs/Key"
+        }
+      },
+      "required": [
+        "name",
+        "public_key",
+        "addresses"
+      ],
+      "type": "object"
+    },
+    "Dns": {
+      "additionalProperties": false,
+      "properties": {
+        "hijack": {
+          "description": "Defaults to true.",
+          "type": "boolean"
+        },
+        "servers": {
+          "items": {
+            "$ref": "#/$defs/Addr"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "type": "object"
+    },
+    "Exit": {
+      "additionalProperties": false,
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/Backend"
+        },
+        "country": {
+          "pattern": "^[A-Z]{2}$",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name. Defaults to the tag.",
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag",
+        "backend"
+      ],
+      "type": "object"
+    },
+    "Exits": {
+      "oneOf": [
+        {
+          "const": "all"
+        },
+        {
+          "items": {
+            "not": {
+              "enum": [
+                "all",
+                "any",
+                "block",
+                "reject",
+                "drop",
+                "local",
+                "direct",
+                "user"
+              ]
+            },
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        }
+      ]
+    },
+    "GatewayNet": {
+      "description": "a gateway address with its prefix such as 10.7.0.1/24",
+      "pattern": "^[0-9A-Fa-f:.]+/[1-9][0-9]{0,2}$",
+      "type": "string"
+    },
+    "HostPort": {
+      "description": "a host and port such as proxy.example.com:1080, with an IPv6 address in brackets",
+      "pattern": "^([a-z0-9.-]{1,253}|\\[[0-9A-Fa-f:.]+\\]):[1-9][0-9]{0,4}$",
+      "type": "string"
+    },
+    "IcmpEchoPolicy": {
+      "description": "\"local\", \"reject\", \"drop\", \"direct\" or {\"via\": \"<exit tag>\"}",
+      "oneOf": [
+        {
+          "enum": [
+            "local",
+            "reject",
+            "drop",
+            "direct"
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "via": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "via"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Inbound": {
+      "additionalProperties": false,
+      "properties": {
+        "address": {
+          "items": {
+            "$ref": "#/$defs/GatewayNet"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "mtu": {
+          "description": "Defaults to 1420.",
+          "format": "uint16",
+          "maximum": 1500,
+          "minimum": 1280,
+          "type": "integer"
+        },
+        "private_key": {
+          "$ref": "#/$defs/Key",
+          "description": "A secret. No diagnostic, log line or `Debug` output shows it."
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "transports": {
+          "items": {
+            "$ref": "#/$defs/Transport"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "type": {
+          "$ref": "#/$defs/InboundType"
+        }
+      },
+      "required": [
+        "tag",
+        "type",
+        "private_key",
+        "address",
+        "transports"
+      ],
+      "type": "object"
+    },
+    "InboundType": {
+      "enum": [
+        "wireguard"
+      ],
+      "type": "string"
+    },
+    "Ip": {
+      "description": "an IPv4 or IPv6 address without a prefix",
+      "pattern": "^[0-9A-Fa-f:.]+$",
+      "type": "string"
+    },
+    "IpEntry": {
+      "description": "a network such as 10.7.0.0/24 with no host bits set, geoip:private or tunnel:users",
+      "pattern": "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|tunnel:users)$",
+      "type": "string"
+    },
+    "Key": {
+      "description": "a WireGuard key: 44 characters of standard base64 with padding",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "type": "string"
+    },
+    "Log": {
+      "additionalProperties": false,
+      "properties": {
+        "destinations": {
+          "default": false,
+          "description": "Whether log lines may contain the destinations and DNS names users reach.",
+          "type": "boolean"
+        },
+        "level": {
+          "$ref": "#/$defs/LogLevel",
+          "default": "info"
+        }
+      },
+      "type": "object"
+    },
+    "LogLevel": {
+      "enum": [
+        "error",
+        "warn",
+        "info",
+        "debug",
+        "trace"
+      ],
+      "type": "string"
+    },
+    "OtherPolicy": {
+      "description": "\"reject\", \"drop\" or {\"via\": \"<exit tag>\"}",
+      "oneOf": [
+        {
+          "enum": [
+            "reject",
+            "drop"
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "via": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "via"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Outbound": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "bind": {
+              "$ref": "#/$defs/Ip"
+            },
+            "tag": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "direct",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tag"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "dependentRequired": {
+            "password": [
+              "username"
+            ],
+            "username": [
+              "password"
+            ]
+          },
+          "properties": {
+            "password": {
+              "description": "A secret. No diagnostic, log line or `Debug` output shows it.",
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            },
+            "server": {
+              "$ref": "#/$defs/HostPort"
+            },
+            "tag": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "socks5",
+              "type": "string"
+            },
+            "username": {
+              "description": "A secret. No diagnostic, log line or `Debug` output shows it.",
+              "maxLength": 255,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tag",
+            "server"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PortRange": {
+      "oneOf": [
+        {
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        },
+        {
+          "pattern": "^[1-9][0-9]{0,4}-[1-9][0-9]{0,4}$",
+          "type": "string"
+        }
+      ]
+    },
+    "Protocol": {
+      "oneOf": [
+        {
+          "enum": [
+            "tcp",
+            "udp",
+            "icmp",
+            "icmpv6",
+            "gre",
+            "esp",
+            "sctp"
+          ]
+        },
+        {
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      ]
+    },
+    "QuotaPeriod": {
+      "enum": [
+        "daily",
+        "weekly",
+        "monthly"
+      ],
+      "type": "string"
+    },
+    "Routing": {
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/Rule"
+          },
+          "maxItems": 4096,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "default"
+      ],
+      "type": "object"
+    },
+    "Rule": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "required": [
+            "inbound"
+          ]
+        },
+        {
+          "required": [
+            "user"
+          ]
+        },
+        {
+          "required": [
+            "group"
+          ]
+        },
+        {
+          "required": [
+            "ip"
+          ]
+        },
+        {
+          "required": [
+            "domain"
+          ]
+        },
+        {
+          "required": [
+            "protocol"
+          ]
+        },
+        {
+          "required": [
+            "port"
+          ]
+        },
+        {
+          "required": [
+            "icmp_type"
+          ]
+        },
+        {
+          "required": [
+            "icmp_code"
+          ]
+        }
+      ],
+      "dependentRequired": {
+        "icmp_code": [
+          "icmp_type"
+        ],
+        "icmp_type": [
+          "protocol"
+        ],
+        "port": [
+          "protocol"
+        ]
+      },
+      "description": "Every condition that is present must hold. A condition that is present is never an empty list.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/Action"
+        },
+        "domain": {
+          "items": {
+            "maxLength": 253,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "enabled": {
+          "description": "Defaults to true. Not a condition: a disabled rule is validated like any other and skipped when flows are matched.",
+          "type": "boolean"
+        },
+        "group": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "icmp_code": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "icmp_type": {
+          "items": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "inbound": {
+          "items": {
+            "not": {
+              "enum": [
+                "all",
+                "any",
+                "block",
+                "reject",
+                "drop",
+                "local",
+                "direct",
+                "user"
+              ]
+            },
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "ip": {
+          "items": {
+            "$ref": "#/$defs/IpEntry"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "port": {
+          "items": {
+            "$ref": "#/$defs/PortRange"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "protocol": {
+          "items": {
+            "$ref": "#/$defs/Protocol"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "user": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "tag",
+        "action"
+      ],
+      "type": "object"
+    },
+    "Timestamp": {
+      "description": "an RFC 3339 timestamp with an offset such as 2027-01-31T00:00:00Z",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
+      "type": "string"
+    },
+    "Tls": {
+      "additionalProperties": false,
+      "properties": {
+        "cert": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "key": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "cert",
+        "key"
+      ],
+      "type": "object"
+    },
+    "Transport": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "type": {
+              "const": "udp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "pattern": "^/[A-Za-z0-9._~/-]{0,255}$",
+              "type": "string"
+            },
+            "tls": {
+              "$ref": "#/$defs/Tls"
+            },
+            "type": {
+              "const": "ws",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "UdpPolicy": {
+      "description": "\"reject\", \"drop\", \"direct\" or {\"via\": \"<exit tag>\"}",
+      "oneOf": [
+        {
+          "enum": [
+            "reject",
+            "drop",
+            "direct"
+          ]
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "via": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "via"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Unsupported": {
+      "additionalProperties": false,
+      "properties": {
+        "icmp_echo": {
+          "$ref": "#/$defs/IcmpEchoPolicy",
+          "description": "Defaults to \"local\"."
+        },
+        "other": {
+          "$ref": "#/$defs/OtherPolicy",
+          "description": "Defaults to \"reject\". \"local\" and \"direct\" are not allowed."
+        },
+        "udp": {
+          "$ref": "#/$defs/UdpPolicy",
+          "description": "Defaults to \"reject\". \"local\" is not allowed."
+        }
+      },
+      "type": "object"
+    },
+    "User": {
+      "additionalProperties": false,
+      "dependentRequired": {
+        "quota_period": [
+          "quota_bytes"
+        ]
+      },
+      "properties": {
+        "devices": {
+          "items": {
+            "$ref": "#/$defs/Device"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "enabled": {
+          "description": "Defaults to true.",
+          "type": "boolean"
+        },
+        "exit": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "exits": {
+          "$ref": "#/$defs/Exits"
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "groups": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "name": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "type": "string"
+        },
+        "quota_bytes": {
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "quota_period": {
+          "$ref": "#/$defs/QuotaPeriod"
+        }
+      },
+      "required": [
+        "name",
+        "devices",
+        "exits"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "dns": {
+      "$ref": "#/$defs/Dns"
+    },
+    "exits": {
+      "items": {
+        "$ref": "#/$defs/Exit"
+      },
+      "maxItems": 256,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "groups": {
+      "items": {
+        "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+        "type": "string"
+      },
+      "maxItems": 256,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "inbounds": {
+      "items": {
+        "$ref": "#/$defs/Inbound"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "log": {
+      "$ref": "#/$defs/Log",
+      "default": {
+        "destinations": false,
+        "level": "info"
+      }
+    },
+    "outbounds": {
+      "items": {
+        "$ref": "#/$defs/Outbound"
+      },
+      "maxItems": 256,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "routing": {
+      "$ref": "#/$defs/Routing"
+    },
+    "users": {
+      "items": {
+        "$ref": "#/$defs/User"
+      },
+      "maxItems": 65536,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "version": {
+      "format": "uint64",
+      "maximum": 1,
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "dns",
+    "inbounds",
+    "outbounds",
+    "exits",
+    "routing",
+    "users"
+  ],
+  "title": "Config",
+  "type": "object"
+}
