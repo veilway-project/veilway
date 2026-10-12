@@ -17,7 +17,8 @@ A WireGuard peer connects over UDP or over WebSocket (one WireGuard datagram is 
 | Path | Role |
 |---|---|
 | `crates/veilway-wg` | Multi-peer boringtun layer (handshake routing, cookies, timers, authenticated roaming) and, in `ws`, the WebSocket relay and UDP-to-WSS client bridge |
-| `crates/veilway-core` | Engine: accept loop (`lib.rs`), isolation rules, per-flow SOCKS5 egress (`flow.rs`), JSON config (`config.rs`) |
+| `crates/veilway-core` | Engine: accept loop (`lib.rs`), isolation rules, per-flow SOCKS5 egress (`flow.rs`), the single-tunnel config it still runs on (`legacy.rs`). `config/` is config v1 (parser, validation, schema, reload store), not consumed by the engine yet |
+| `fuzz/` | cargo-fuzz targets, outside the workspace. See `fuzz/README.md` |
 | `crates/veilway` | The `veilway` binary: `run`, `genkey`, `bridge client`, `bridge relay` |
 | `crates/veilway-client` | Single-peer client engine plus the Windows Wintun, route, DNS (NRPT) layer |
 | `apps/desktop` | Tauri 2 desktop app. Outside the cargo workspace, own `Cargo.lock`, UI in `ui/` |
@@ -30,10 +31,12 @@ cargo test --workspace
 cargo build --release --workspace
 cargo zigbuild --release --locked --target x86_64-unknown-linux-musl -p veilway --bin veilway
 cargo deny check && cargo audit
+veilway check --config config.v1.example.json
 apps/desktop/scripts/fetch-wintun.sh
 cd apps/desktop/src-tauri && cargo check
 ```
 
+- Everything that runs (cargo, npm, servers, fuzzing) runs in Docker containers, not on the host.
 - The Windows client only builds for real on the GitHub Actions windows job. `cargo check` on macOS works once a `resources/wintun.dll` placeholder exists.
 - `.github/workflows/release.yml` builds on every push to `main` (cache warming, no publish) and publishes on `v*` tags.
 - After a version bump run `cargo update -w --offline` in the root and in `apps/desktop/src-tauri`.

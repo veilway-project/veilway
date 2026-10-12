@@ -1,0 +1,1 @@
+{"version":"1","log":{"level":5},"dns":[],"inbounds":{},"outbounds":null,"exits":[{"tag":1,"backend":{"type":"wat"}}],"routing":{"default":{"exit":1},"rules":[{"action":3}]},"users":[{"exits":{"all":1}}]}

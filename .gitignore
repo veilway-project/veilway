@@ -7,3 +7,6 @@ apps/desktop/src-tauri/gen/
 PROMPT.md
 *.local.md
 .claude/
+fuzz/target
+fuzz/artifacts
+fuzz/coverage

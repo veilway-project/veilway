@@ -1,0 +1,1 @@
+{"version":1,"dns":{"servers":["1.1.1.1:53"]},"inbounds":[],"outbounds":[],"exits":[{"tag":"sink","backend":{"type":"block"}}],"routing":{"default":"sink","rules":[{"tag":"all-tcp","protocol":["tcp"],"action":"reject"},{"tag":"off","enabled":false,"protocol":["tcp"],"port":[443],"action":"reject"},{"tag":"covered","protocol":["tcp"],"port":[22],"action":"block"}]},"users":[]}
