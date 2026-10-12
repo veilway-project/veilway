@@ -39,7 +39,7 @@ The honest size of this: about 25 to 35 long build sessions for everything below
 | Desktop shell | Tauri 2 | Already working in the current code for Windows. |
 | Xray support | Optional add-on that runs the official `xray` binary as a managed sidecar | No Go code embedded, no licence mixing, off by default. |
 | Languages | English and Persian at launch, locale packs as plain JSON files | New languages are a file, not a code change. |
-| Funding | A paid provider tier, paid in cryptocurrency. Core, clients and the panel's must-have features stay free and open | Providers are the ones earning money with it. See "Funding". |
+| Funding | A paid provider tier and donations with cosmetic perks, both paid in cryptocurrency. Core, clients and the panel's must-have features stay free and open | Providers are the ones earning money with it. See "Funding". |
 | Theme | Dark by default, light supported, user themes are colour tokens only | Themes can be shared as files without being a security risk. |
 
 ## Decisions the owner still owes
@@ -331,7 +331,8 @@ The project is funded by a paid tier for commercial providers. End users never p
 - **Where the paid code lives:** in a separate private repository, built into an official provider build of the panel through extension points in the public one. The public repository never contains code under a non-open licence. The CLA is what allows contributions to the public code to ship inside that build.
 - **Licensing a provider:** a licence file signed with a project key (Ed25519), checked offline by the panel. No phone-home, in line with "no telemetry". It names the provider, the tier and an expiry, nothing about users.
 - **Payment:** cryptocurrency only, through a self-hosted payment processor so no third party holds the money or a customer list: Monero plus one widely held coin. Prices are quoted in a stable unit and converted at payment time.
-- **Also accepted:** donations to a published address, and grants for anti-censorship work if one fits; an outside security audit is the first thing grant money would buy.
+- **Donations with perks:** anyone can donate in cryptocurrency through the same processor and get a supporter token back, a small signed file like the provider licence, imported into a client and checked offline. No account and no name is needed. Perks are recognition and looks only: a credit under a name the donor chooses, supporter themes and app icons, a supporter mark in the client, and a vote on what gets built next. A perk is never a security, speed or connectivity feature, so a user who cannot pay loses nothing that matters.
+- **Grants:** for anti-censorship work if one fits; an outside security audit is the first thing grant money would buy.
 - **Not done:** ads, telemetry, selling data, charging end users, or running a VPN service under the project's name.
 
 Tax and sanctions rules apply to crypto income as to any other. Get legal advice before the first sale.
@@ -413,7 +414,7 @@ Complete the docs in both languages, two SDK examples (a minimal custom client, 
 
 ### Phase 9: provider tier (2 to 3 sessions)
 
-Starts only after the public alpha is in real use. Extension points in the public panel, the signed licence file and its offline check, the payment flow on a self-hosted processor, then the paid features in the private repository, one at a time. Gate: a provider pays in cryptocurrency, receives a licence file, and a paid feature switches on in the official provider build while the public build is unchanged.
+Starts only after the public alpha is in real use. Extension points in the public panel, the signed licence file and its offline check, the payment flow on a self-hosted processor, then the paid features in the private repository, one at a time, and supporter tokens with their cosmetic perks in the clients. Gate: a donor pays and a supporter theme unlocks from the token alone; a provider pays in cryptocurrency, receives a licence file, and a paid feature switches on in the official provider build while the public build is unchanged.
 
 ## Risks
 
