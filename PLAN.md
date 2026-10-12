@@ -132,14 +132,14 @@ One versioned JSON document (`"version":1`) with a published JSON Schema, hot re
 
 ### Inbounds and outbounds
 
-An inbound is a WireGuard tunnel endpoint behind one transport. An exit is where the decrypted IP packets leave.
+An inbound is one WireGuard tunnel (one key, one address pool) reached over one or more transports. An exit is where the decrypted IP packets leave.
 
 | Kind | Types at v1 | Later |
 |---|---|---|
 | Inbound | `veilway` (WireGuard tunnel + any Veilway transport + control channel), `wireguard` (plain, for stock clients over UDP or WebSocket) | `xray:*` through the add-on (proxy protocols, TCP and UDP only) |
 | Exit backend | `l3` (TUN + NAT on the host: every IP protocol), `chain` (forward the packets into another Veilway or WireGuard node: every IP protocol), `netstack` (userspace TCP/IP re-dialled through `direct` or `socks5`: TCP and UDP, plus ping answered by the server where it can), `block` | `xray:*` outbounds through the add-on, behind `netstack` |
 
-Many inbounds on many ports, each with its own transport and user set. This is what "multi-inbound ports with different configs" means in the panel.
+Many inbounds, each with its own key, address pool, transports and ports. A device belongs to the inbound whose pool holds its address, and keeps that address on every transport of the inbound. This is what "multi-inbound ports with different configs" means in the panel.
 
 The protocol always carries every IP protocol. Whether ICMP or, say, GRE actually reaches the internet depends on the exit backend: a SOCKS5 upstream cannot carry them, a host with NAT can. Panel and clients show each exit as "full IP" or "TCP and UDP only" so nobody is surprised.
 
@@ -150,7 +150,7 @@ The protocol always carries every IP protocol. Whether ICMP or, say, GRE actuall
 | `reject` | Answer with the matching ICMP error (protocol, port or host unreachable) so the app fails at once and falls back | Default for other IP protocols and for UDP when the proxy has no UDP. QUIC drops to TCP immediately instead of timing out. |
 | `drop` | Discard silently | The provider wants no signal at all sent back. |
 | `local` | The server answers itself. For ping: an echo reply, so it measures client-to-server latency only | Default for ICMP echo. Apps and Windows connectivity checks that ping first keep working. |
-| `direct` | Send it from the server's own address, around the proxy | Real ping, traceroute and odd protocols are wanted more than isolation. |
+| `direct` | Send it from the server's own address, around the proxy. Ping and UDP only; other IP protocols need `via` to an `l3` exit, because a `netstack` exit has no privileges to send them. | Real ping and UDP are wanted more than isolation. |
 | `via:<exit>` | Hand that class to another exit, normally an `l3` one | A node has both a SOCKS5 upstream and plain NAT, and only TCP and UDP should use the proxy. |
 
 The three classes are: ICMP echo, UDP when the upstream has no UDP ASSOCIATE (DNS always keeps its TCP fallback), and every other IP protocol. `direct` and `via` break the "can only leave through this proxy" guarantee and reveal the server's own address to the destination, so the panel says that in plain words and asks for confirmation, and the exit is no longer labelled as proxy-only. Inbound ICMP errors that belong to a live TCP or UDP flow (path MTU, unreachable) are always synthesised towards the client, whatever the policy.
