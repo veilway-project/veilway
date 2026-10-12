@@ -45,7 +45,7 @@ Veilway یک VPN لایهٔ ۳ است. کلاینت یک کارت شبکهٔ م�
 | پل (`veilway bridge`) | `client` به برنامهٔ معمولی WireGuard یک نقطهٔ UDP محلی می‌دهد و آن را روی `wss://` می‌برد. `relay` اتصال WebSocket می‌پذیرد و به هر پورت UDP WireGuard می‌فرستد. |
 | کلاینت دسکتاپ | فقط ویندوز. یک فایل `.conf` معمولی WireGuard می‌خواند، تونل را درون خود برنامه روی UDP یا WebSocket و با آداپتر Wintun اجرا می‌کند و مسیرها و DNS را طوری تنظیم می‌کند که از تونل بگذرند. |
 
-محدودیت‌های شناخته‌شده: درون تونل فقط IPv4 هست (کلاینت ویندوز IPv6 را به آداپتر می‌فرستد و همان‌جا دور می‌ریزد تا از کنار تونل نگذرد)، ICMP و پروتکل‌های غیر از TCP و UDP از بالادست SOCKS5 رد نمی‌شوند، پیکربندی یک فایل JSON ثابت است و بارگذاری دوباره ندارد، و هنوز پنل، حسابداری کاربران و API کنترل وجود ندارد.
+محدودیت‌های شناخته‌شده: درون تونل فقط IPv4 هست (کلاینت ویندوز IPv6 را به آداپتر می‌فرستد و همان‌جا دور می‌ریزد تا از کنار تونل نگذرد)، ICMP و پروتکل‌های غیر از TCP و UDP از بالادست SOCKS5 رد نمی‌شوند، سرور روی نسخهٔ ۱ پیکربندی اجرا می‌شود و چند inbound، قانون مسیریابی و کاربر دارد، اما هنوز بارگذاری دوباره پیکربندی، سهمیه، پنل و API کنترل وجود ندارد؛ پینگ ICMP را خود نود پاسخ می‌دهد و پروتکل‌های دیگر غیر از TCP و UDP هنوز عبور داده نمی‌شوند.
 
 ### برنامهٔ پیش رو
 
@@ -111,7 +111,24 @@ cp config.example.json config.json
 
 <div dir="rtl">
 
-فایل `config.json` را ویرایش کنید: کلید خصوصی سرور را در `private_key` بگذارید، `upstream` را روی SOCKS5 خودتان تنظیم کنید و کلید عمومی هر همتا را زیر `peers` بنویسید. فایل نمونه یک شنوندهٔ WebSocket هم روی پورت 443 با فایل‌های گواهی باز می‌کند. برای شروع فقط با UDP بلوک `listen_ws` را پاک کنید، یا مسیر فایل‌های واقعی را در `cert` و `key` بگذارید.
+فایل `config.json` را ویرایش کنید:
+
+- در `private_key` هر inbound که نگه می‌دارید کلیدی از `veilway genkey` بگذارید. کلیدهای نمونه فقط جانگهدارند.
+- در outbound با نام `proxy`، `server` و اطلاعات ورود را روی SOCKS5 خودتان تنظیم کنید. برای خروج بدون پروکسی، `outbound` خروجی `main` را روی `plain` (outbound مستقیم) بگذارید.
+- زیر `users`، کلید عمومی هر دستگاه را در `public_key` بنویسید و در `addresses` نشانی‌ای از استخر inbound همان دستگاه بدهید.
+- فعلاً خروجی `node` را حذف کنید، چون backend از نوع `l3` هنوز ساخته نشده، و هرچه نامش را آورده است: قانون‌های `staff-intranet` و `staff-ping`، مقدار `"exit": "node"` برای alice و `"node"` در `exits` مربوط به bob.
+- ترنسپورت `ws` روی پورت 443 به فایل‌های گواهی در مسیرهای `tls` نیاز دارد، نسبت به پوشهٔ فایل پیکربندی. برای شروع فقط با UDP آن ترنسپورت را پاک کنید.
+
+`veilway run` پیکربندی‌ای را که گروه یا دیگران بتوانند بخوانند نمی‌پذیرد، پس دسترسی را محدود کنید و بعد اعتبارسنجی کنید:
+
+</div>
+
+```
+chmod 600 config.json
+./target/release/veilway check --config config.json
+```
+
+<div dir="rtl">
 
 ### ۴. اجرای سرور
 
@@ -146,7 +163,7 @@ PersistentKeepalive = 25
 
 <div dir="rtl">
 
-جایی که UDP بسته است، پل را کنار برنامهٔ WireGuard اجرا کنید و به‌جای آن `Endpoint = 127.0.0.1:51820` بگذارید. این کار به بلوک `listen_ws` سرور با گواهی معتبر برای دامنهٔ شما نیاز دارد (گام ۳)، یا به یک `veilway bridge relay` جلوی سرور (بخش «رلهٔ WebSocket» را ببینید). به‌جای `vpn.example.com` نام میزبان خودتان را بگذارید.
+جایی که UDP بسته است، پل را کنار برنامهٔ WireGuard اجرا کنید و به‌جای آن `Endpoint = 127.0.0.1:51820` بگذارید. این کار به یک ترنسپورت `ws` روی سرور با گواهی معتبر برای دامنهٔ شما نیاز دارد (گام ۳)، یا به یک `veilway bridge relay` جلوی سرور (بخش «رلهٔ WebSocket» را ببینید). به‌جای `vpn.example.com` نام میزبان خودتان را بگذارید.
 
 </div>
 
@@ -160,26 +177,24 @@ veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
 
 ## پیکربندی سرور
 
-`config.json` یک سند JSON است. `private_key`، `address`، `upstream`، `peers` و دست‌کم یک شنونده الزامی‌اند.
+`config.json` یک سند JSON نسخه‌دار است (`"version": 1`). `veilway check` آن را اعتبارسنجی می‌کند و کلید ناشناس خطاست.
 
-| کلید | معنی |
+| بخش | معنی |
 |---|---|
-| `private_key` | کلید سرور به شکل base64. با `veilway genkey` ساخته می‌شود. |
-| `address` | زیرشبکهٔ تونل همراه با نشانی دروازه (gateway)، مثلاً `10.7.0.1/24`. |
-| `upstream` | `socks5://user:pass@host:1080`. نام کاربری و گذرواژه می‌توانند percent-encoded باشند. |
-| `peers[]` | `public_key`، `allowed_ips`، و در صورت نیاز `preshared_key` و یک `upstream` جدا برای همان همتا. |
-| `listen_udp` | شنوندهٔ UDP WireGuard. اگر فقط WebSocket می‌خواهید حذفش کنید. |
-| `listen_ws` | `{addr, path, cert, key}`. برای `ws://` ساده پشت یک پروکسی معکوس، `cert` و `key` را حذف کنید. |
-| `dns` | DNS همهٔ همتاها را به این `ip:53` می‌فرستد. |
-| `mtu` | پیش‌فرض `1420`. |
-| `udp_idle_secs`، `tcp_idle_secs` | مهلت بیکاری جریان‌های رله‌شده. پیش‌فرض `60` و `7200`. |
-| `allow_private` | با `true` همتاها از راه پروکسی به بازه‌های خصوصی هم می‌رسند. پیش‌فرض `false`. |
+| `log` | سطح گزارش، و اینکه مقصدها اجازهٔ ظاهر شدن در گزارش‌ها را دارند یا نه (به‌طور پیش‌فرض خاموش). |
+| `dns` | resolverهای بالادستی، و اینکه هر پرسش DNS از تونل را خود نود پاسخ بدهد یا نه. |
+| `groups` | نام گروه‌هایی که کاربران و قانون‌ها می‌توانند به آن‌ها اشاره کنند. |
+| `inbounds` | تونل‌های WireGuard: یک کلید، یک استخر نشانی و یک یا چند ترنسپورت (`udp`، `ws`). |
+| `outbounds` | راه‌های برقراری جریان: `direct` یا `socks5`. |
+| `exits` | راه‌های خروج نام‌دار، هرکدام با یک backend (`netstack`، `block`). |
+| `routing` | خروج پیش‌فرض و فهرستی مرتب از قانون‌ها بر پایهٔ inbound، گروه، مقصد، دامنه و پروتکل. |
+| `users` | کاربران با گروه‌ها، خروج‌های مجاز، تاریخ انقضای اختیاری و دستگاه‌ها (کلید عمومی، نشانی‌ها). |
 
-یک نمونهٔ کامل در [config.example.json](config.example.json) هست.
+همهٔ کلیدها، پیش‌فرض‌ها و قواعد اعتبارسنجی در [مرجع پیکربندی](https://github.com/veilway-project/veilway-docs/blob/main/src/content/docs/reference/config.md) آمده است. یک نمونهٔ کامل در [config.example.json](config.example.json) هست.
 
 ## رلهٔ WebSocket
 
-با `listen_ws` خود سرور اتصال WebSocket را می‌پذیرد. `veilway bridge relay` نسخهٔ مستقل همین کار است: WebSocket را خاتمه می‌دهد و به هر پورت UDP WireGuard، حتی WireGuard هسته، می‌فرستد. هر اتصال سوکت UDP محلی خودش را دارد، پس جابه‌جایی میان شبکه‌ها و چند کلاینت پشت یک NAT درست کار می‌کند.
+با یک ترنسپورت `ws` روی inbound، خود سرور اتصال WebSocket را می‌پذیرد. `veilway bridge relay` نسخهٔ مستقل همین کار است: WebSocket را خاتمه می‌دهد و به هر پورت UDP WireGuard، حتی WireGuard هسته، می‌فرستد. هر اتصال سوکت UDP محلی خودش را دارد، پس جابه‌جایی میان شبکه‌ها و چند کلاینت پشت یک NAT درست کار می‌کند.
 
 با گواهی خودش:
 
@@ -299,7 +314,7 @@ flowchart TB
 ```
 crates/
   veilway             the only binary: run, genkey, bridge client, bridge relay
-  veilway-core        server engine: accept loop, isolation rules, per-flow SOCKS5 egress, config
+  veilway-core        server engine: config v1, inbounds, routing rules, flow table, isolation rules, per-flow egress
   veilway-wg          multi-peer WireGuard wrapper (handshake routing, cookies, timers, roaming) and the WebSocket relay
   veilway-client      single-peer client engine and the Windows Wintun, route and DNS layer
   veilway-proto       wire formats (empty skeleton)

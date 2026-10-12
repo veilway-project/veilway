@@ -1,27 +1,32 @@
 //! What happens to a TCP or UDP flow once the userspace stack has accepted it: it is re-dialled through the outbound of the exit its routing decision named.
 use super::plan::{Backend, Outbound, Plan, Upstream};
 use super::route::{Key, CLOSED_IDLE};
-use super::Shared;
+use super::{dns, Shared};
 use ipstack::{IpStackStream, IpStackUdpStream};
+use ring::rand::{SecureRandom, SystemRandom};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio_socks::tcp::Socks5Stream;
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_IDLE: Duration = Duration::from_secs(10);
+/// The largest answer taken from a server over UDP. One that fills it may have lost its tail, so it is asked for again over TCP like one the server truncated.
+const DNS_UDP_ANSWER: usize = 4096;
 const ASSOCIATE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_DATAGRAM: usize = 65535;
 /// An ipv4 header plus a udp header, the overhead ipstack silently clips a datagram against.
-const UDP_OVERHEAD: usize = 28;
+pub(super) const UDP_OVERHEAD: usize = 28;
+/// The same with an ipv6 header, for a flow from an ipv6 address.
+pub(super) const UDP_OVERHEAD_V6: usize = 48;
 /// How long a failed UDP ASSOCIATE keeps an exit on the tcp-only path before it is tried again, so a proxy without udp costs one attempt a minute while one that only hiccuped gets its udp back without a restart.
 const UDP_RETRY: Duration = Duration::from_secs(60);
 /// How much longer than its handler's idle time a flow stays in the table, so the handler always ends first.
-const HOLD_MARGIN: Duration = Duration::from_secs(10);
+pub(super) const HOLD_MARGIN: Duration = Duration::from_secs(10);
 
 /// RFC 1928 section 7 request header: two reserved bytes, the fragment number, then the destination.
 fn udp_header(dst: SocketAddr) -> Vec<u8> {
@@ -117,10 +122,9 @@ pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<Socks5Stream
 
 /// Runs one accepted flow to its end: through the outbound of `exit`, until either side closes or the flow has been quiet for the exit's idle time.
 #[allow(clippy::too_many_arguments)]
-pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: usize, dns: bool, stream: IpStackStream, mtu: u16) {
+pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: usize, stream: IpStackStream, mtu: u16) {
 	let Backend::Netstack {outbound, tcp_idle, udp_idle, ..} = &plan.exits[exit].backend else {return};
-	let (dst, tag) = (SocketAddr::new(key.dst, key.dport), plan.exits[exit].tag.as_str());
-	let target = if dns {plan.dns} else {dst};
+	let (target, tag) = (SocketAddr::new(key.dst, key.dport), plan.exits[exit].tag.as_str());
 	// A lookup is one round trip, so a port 53 flow must not pin an association and its control connection for long.
 	// The stack resets an idle TCP flow itself after the longest tcp_idle of any exit, so this timer is one second behind it and only ends flows of exits with a shorter one.
 	let idle = if key.protocol == 6 {*tcp_idle + Duration::from_secs(1)} else if key.dport == 53 {(*udp_idle).min(DNS_IDLE)} else {*udp_idle};
@@ -148,12 +152,10 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 				};
 				if let Err(e) = copied {tracing::debug!("exit {tag}: tcp to {}: {}", plan.show(target), e.kind())}
 			}
-			// DNS for the configured resolver rides a CONNECT: it works through every proxy, with or without UDP ASSOCIATE.
-			(IpStackStream::Udp(stream), Outbound::Socks5(up)) if dns => dns_over_tcp(stream, up, target, mtu, &plan).await,
-			// Every other UDP flow, port 53 included, gets a UDP ASSOCIATE: some apps speak their own protocol on 53 to hosts that never answer DNS over TCP. DNS over TCP is only the fallback for upstreams without UDP.
+			// Every UDP flow that comes here, port 53 included, gets a UDP ASSOCIATE: some apps speak their own protocol on 53 to hosts that never answer DNS over TCP. DNS over TCP is only the fallback for upstreams without UDP.
 			(IpStackStream::Udp(stream), Outbound::Socks5(up)) => {
-				if let Some(stream) = udp_relay(&shared, exit, tag, stream, up, dst, mtu, &plan).await {
-					if dst.port() == 53 {dns_over_tcp(stream, up, dst, mtu, &plan).await}
+				if let Some(stream) = udp_relay(&shared, exit, tag, stream, up, target, mtu, &plan).await {
+					if target.port() == 53 {dns_over_tcp(stream, up, target, mtu, &plan).await}
 				}
 			}
 			(IpStackStream::Udp(mut stream), Outbound::Direct {bind}) => {
@@ -254,6 +256,57 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 	}
 }
 
+/// One DNS exchange over a stream: a 2 byte big endian length goes before the query and comes before the answer.
+async fn framed<S: AsyncRead + AsyncWrite + Unpin>(remote: &mut S, query: &[u8]) -> std::io::Result<Vec<u8>> {
+	let mut out = Vec::with_capacity(query.len() + 2);
+	out.extend_from_slice(&(query.len() as u16).to_be_bytes());
+	out.extend_from_slice(query);
+	remote.write_all(&out).await?;
+	let mut len = [0u8; 2];
+	remote.read_exact(&mut len).await?;
+	let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
+	remote.read_exact(&mut answer).await?;
+	Ok(answer)
+}
+
+/// One query of the node's resolver to `target` through an outbound, and the answer to it. None when none came within `DNS_TIMEOUT`.
+/// Through a proxy the query rides a CONNECT, which works with or without UDP ASSOCIATE. Directly it goes over UDP, and again over TCP when that answer is truncated.
+/// The query goes out under an id the node draws for it, and only a response under that id is the answer. The id the tunnel client chose is known to that client, who could otherwise send the answer to its own query from outside. It is written back before the answer is returned.
+pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Option<Vec<u8>> {
+	let (mut asked, mut id) = (query.to_vec(), [0u8; 2]);
+	SystemRandom::new().fill(&mut id).ok()?;
+	asked.get_mut(..2)?.copy_from_slice(&id);
+	let (query, client) = (&asked[..], query.get(..2)?);
+	let ours = |answer: &[u8]| answer.len() >= dns::HEADER && answer[..2] == id && answer[2] & 0x80 != 0;
+	let exchange = async {
+		let answer = match outbound {
+			Outbound::Socks5(up) => framed(&mut dial(up, target).await.ok()?, query).await.ok()?,
+			Outbound::Direct {bind} => {
+				let local = bind.unwrap_or(if target.is_ipv4() {Ipv4Addr::UNSPECIFIED.into()} else {Ipv6Addr::UNSPECIFIED.into()});
+				let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await.ok()?;
+				socket.connect(target).await.ok()?;
+				socket.send(query).await.ok()?;
+				let mut answer = vec![0u8; DNS_UDP_ANSWER];
+				// Anything else that arrives on the socket is not the answer. An error is: the server's host said that nothing listens there.
+				let n = loop {
+					let n = socket.recv(&mut answer).await.ok()?;
+					if ours(&answer[..n]) {break n}
+				};
+				answer.truncate(n);
+				if n < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {
+					let socket = if target.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.ok()?;
+					if let Some(bind) = bind {socket.bind(SocketAddr::new(*bind, 0)).ok()?}
+					framed(&mut socket.connect(target).await.ok()?, query).await.ok()?
+				}
+			}
+		};
+		ours(&answer).then_some(answer)
+	};
+	let mut answer = tokio::time::timeout(DNS_TIMEOUT, exchange).await.ok().flatten()?;
+	answer.get_mut(..2)?.copy_from_slice(client);
+	Some(answer)
+}
+
 /// DNS with a 2 byte big endian length prefix, so the query rides an ordinary SOCKS5 CONNECT.
 async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: SocketAddr, mtu: u16, plan: &Plan) {
 	let cap = usize::from(mtu).saturating_sub(UDP_OVERHEAD);
@@ -270,29 +323,15 @@ async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: Socke
 				continue;
 			}
 		};
-		let mut framed = Vec::with_capacity(n + 2);
-		framed.extend_from_slice(&(n as u16).to_be_bytes());
-		framed.extend_from_slice(&query[..n]);
-		let exchange = async {
-			remote.write_all(&framed).await?;
-			let mut len = [0u8; 2];
-			remote.read_exact(&mut len).await?;
-			let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
-			remote.read_exact(&mut answer).await?;
-			Ok::<Vec<u8>, std::io::Error>(answer)
-		};
-		let mut answer = match tokio::time::timeout(DNS_TIMEOUT, exchange).await {
+		let mut answer = match tokio::time::timeout(DNS_TIMEOUT, framed(&mut remote, &query[..n])).await {
 			Ok(Ok(a)) => a,
 			_ => {
 				tracing::debug!("dns to {}: exchange failed or timed out", plan.show(target));
 				continue;
 			}
 		};
-		if answer.len() > cap {
-			// ipstack would clip the tail without saying so, so flag it truncated and let the client retry over tcp.
-			if answer.len() >= 3 {answer[2] |= 0x02}
-			answer.truncate(cap);
-		}
+		// ipstack would clip the tail without saying so.
+		dns::clip(&mut answer, cap);
 		// One write is one datagram here, and a short write would duplicate rather than continue.
 		if stream.write(&answer).await.is_err() {return}
 	}

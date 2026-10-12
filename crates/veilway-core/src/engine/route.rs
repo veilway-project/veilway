@@ -1,7 +1,7 @@
 //! Routing: the rules a flow's first packet is matched against, and the bounded table that keeps the decision for the rest of the flow.
 use super::gate;
 use super::netstack::{Packet, ECHO_REPLY_V4, ECHO_REPLY_V6, ECHO_REQUEST_V4, ECHO_REQUEST_V6};
-use super::plan::{Action, IpMatch, Plan};
+use super::plan::{Action, IpMatch, Pattern, Plan};
 use crate::config::Protocol;
 use ipnet::IpNet;
 use std::collections::{HashMap, VecDeque};
@@ -50,8 +50,10 @@ impl Reason {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
-	/// Leaves through this exit. `dns` relays it to the configured resolver instead of the address it was sent to.
-	Exit {exit: usize, dns: bool},
+	/// Leaves through this exit.
+	Exit {exit: usize},
+	/// Tunnel DNS: the node's own resolver answers it, and each query on the flow is routed by itself.
+	Dns,
 	/// Handed to the device that holds the destination address.
 	Deliver,
 	Refuse {reason: Reason, reset: bool},
@@ -190,7 +192,9 @@ impl Flows {
 }
 
 /// The action of the first enabled rule that matches a flow from `user` on `inbound` to `dst`, or `user` when none does.
-pub fn evaluate(plan: &Plan, inbound: usize, user: usize, dst: IpAddr, protocol: u8, dport: u16, icmp: Option<(u8, u8)>) -> &Action {
+/// `named` answers a `domain` condition: whether the flow goes to a name one of the patterns matches. It is asked last, and only by a rule that matched in everything else.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate<'a>(plan: &'a Plan, inbound: usize, user: usize, dst: IpAddr, protocol: u8, dport: u16, icmp: Option<(u8, u8)>, named: &dyn Fn(&[Pattern]) -> bool) -> &'a Action {
 	let ports = [Protocol::TCP, Protocol::UDP, Protocol::SCTP].contains(&protocol);
 	let pool = plan.pool_of(dst).filter(|_| !plan.is_gateway(dst));
 	// An IPv6 address that carries an IPv4 address reaches that address, so a rule on a network covers both.
@@ -204,9 +208,7 @@ pub fn evaluate(plan: &Plan, inbound: usize, user: usize, dst: IpAddr, protocol:
 		IpMatch::Tunnel(tunnel) => pool == Some(*tunnel),
 	};
 	plan.rules.iter().find(|rule| {
-		// No name memory yet: a rule with a domain condition never matches.
-		!rule.domain
-			&& rule.inbound.as_ref().is_none_or(|list| list.contains(&inbound))
+		rule.inbound.as_ref().is_none_or(|list| list.contains(&inbound))
 			&& rule.user.as_ref().is_none_or(|list| list.contains(&user))
 			&& rule.group.as_ref().is_none_or(|list| list.iter().any(|group| plan.users[user].groups.contains(group)))
 			&& rule.ip.as_ref().is_none_or(|list| list.iter().any(matches))
@@ -214,6 +216,7 @@ pub fn evaluate(plan: &Plan, inbound: usize, user: usize, dst: IpAddr, protocol:
 			&& rule.port.as_ref().is_none_or(|list| ports && list.iter().any(|(lo, hi)| (*lo..=*hi).contains(&dport)))
 			&& rule.icmp_type.as_ref().is_none_or(|list| icmp.is_some_and(|(kind, _)| list.contains(&kind)))
 			&& rule.icmp_code.as_ref().is_none_or(|list| icmp.is_some_and(|(_, code)| list.contains(&code)))
+			&& rule.domain.as_ref().is_none_or(|list| named(list))
 	}).map_or(&Action::User, |rule| &rule.action)
 }
 
