@@ -39,6 +39,7 @@ The honest size of this: about 25 to 35 long build sessions for everything below
 | Desktop shell | Tauri 2 | Already working in the current code for Windows. |
 | Xray support | Optional add-on that runs the official `xray` binary as a managed sidecar | No Go code embedded, no licence mixing, off by default. |
 | Languages | English and Persian at launch, locale packs as plain JSON files | New languages are a file, not a code change. |
+| Funding | A paid provider tier, paid in cryptocurrency. Core, clients and the panel's must-have features stay free and open | Providers are the ones earning money with it. See "Funding". |
 | Theme | Dark by default, light supported, user themes are colour tokens only | Themes can be shared as files without being a security risk. |
 
 ## Decisions the owner still owes
@@ -321,6 +322,20 @@ Must have for the first release:
 
 Later: per-app and per-domain split tunnelling, routing rule editor, connection log viewer, Xray add-on install flow (Phase 6), tray and quick toggles on every desktop OS.
 
+## Funding
+
+The project is funded by a paid tier for commercial providers. End users never pay the project, and nothing that is free at the public alpha becomes paid later.
+
+- **Free and open (Apache-2.0):** the core, the SDKs, every client, and all five "must have" panel features.
+- **Paid provider tier:** panel features that only matter at commercial scale: reseller accounts and roles, several nodes managed from one panel, billing hooks and webhooks, white-label branding. Each is in the panel's "later" list today.
+- **Where the paid code lives:** in a separate private repository, built into an official provider build of the panel through extension points in the public one. The public repository never contains code under a non-open licence. The CLA is what allows contributions to the public code to ship inside that build.
+- **Licensing a provider:** a licence file signed with a project key (Ed25519), checked offline by the panel. No phone-home, in line with "no telemetry". It names the provider, the tier and an expiry, nothing about users.
+- **Payment:** cryptocurrency only, through a self-hosted payment processor so no third party holds the money or a customer list: Monero plus one widely held coin. Prices are quoted in a stable unit and converted at payment time.
+- **Also accepted:** donations to a published address, and grants for anti-censorship work if one fits; an outside security audit is the first thing grant money would buy.
+- **Not done:** ads, telemetry, selling data, charging end users, or running a VPN service under the project's name.
+
+Tax and sanctions rules apply to crypto income as to any other. Get legal advice before the first sale.
+
 ## Security requirements
 
 Binding for every phase.
@@ -395,6 +410,10 @@ Start with a one-session spike of Tauri mobile + `VpnService`. Gate: the same su
 ### Phase 8: docs, SDK examples, hardening (3 sessions)
 
 Complete the docs in both languages, two SDK examples (a minimal custom client, a minimal custom server), fuzzing run in CI, signed releases, one-line installer, `veilway update` with the opt-in schedule. Gate: someone follows only the docs and gets a working setup.
+
+### Phase 9: provider tier (2 to 3 sessions)
+
+Starts only after the public alpha is in real use. Extension points in the public panel, the signed licence file and its offline check, the payment flow on a self-hosted processor, then the paid features in the private repository, one at a time. Gate: a provider pays in cryptocurrency, receives a licence file, and a paid feature switches on in the official provider build while the public build is unchanged.
 
 ## Risks
 
