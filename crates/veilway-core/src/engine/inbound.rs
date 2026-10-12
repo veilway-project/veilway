@@ -2,12 +2,12 @@
 use super::netstack;
 use super::plan::{Action, Backend, Holder, Outbound, Plan};
 use super::route::{self, Decision, Key, Reason};
-use super::{flows, gate, Shared};
+use super::{flows, gate, resolver, Shared};
 use crate::config::{Policy, Protocol};
 use ipstack::{IpStack, IpStackStream};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 use veilway_wg::{Wg, MAX_PACKET};
@@ -69,8 +69,8 @@ impl Shared {
 		}
 		let transport = packet.protocol == Protocol::TCP || packet.protocol == Protocol::UDP;
 		let gateway = plan.is_gateway(packet.dst);
-		// A gateway answers DNS and nothing else. With hijack on, every UDP port 53 flow is DNS for the node wherever it was sent.
-		let dns = packet.dport == 53 && ((gateway && transport) || (plan.hijack && packet.protocol == Protocol::UDP));
+		// A gateway answers DNS and nothing else. With hijack on, every UDP and TCP port 53 flow is DNS for the node wherever it was sent.
+		let dns = packet.dport == 53 && transport && (gateway || plan.hijack);
 		let local = !dns && !gateway && plan.pool_of(packet.dst).is_some();
 		if (gateway && !dns) || (!dns && !local && gate::refused(packet.dst, &plan.pools)) {return self.refuse(plan, from, &raw, Reason::Gate, true).await}
 		let key = Key::of(&packet);
@@ -78,25 +78,25 @@ impl Shared {
 		// It is looked for first: a refusal remembered for this side's own earlier try must not shut the answer out.
 		let decision = if local && key.reversed().and_then(|back| self.flows.get(&back)).is_some_and(|(_, decision)| decision == Decision::Deliver) {Decision::Deliver}
 		else if let Some((_, decision)) = self.flows.get(&key) {decision} else {
-			let target = if dns {plan.dns.ip()} else {packet.dst};
-			let decision = match route::evaluate(plan, at, user, target, packet.protocol, packet.dport, packet.icmp) {
+			// The resolver routes each query of a DNS flow by itself, by the server it goes to and the name it asks for.
+			let decision = if dns {Decision::Dns} else {match route::evaluate(plan, at, user, packet.dst, packet.protocol, packet.dport, packet.icmp, &|patterns| self.resolver.names(user).matches(packet.dst, patterns, Instant::now())) {
 				Action::Block => Decision::Refuse {reason: Reason::Rule, reset: false},
 				Action::Reject => Decision::Refuse {reason: Reason::Rule, reset: true},
 				// Traffic between users never leaves through an exit: any outcome but a refusal is delivery inside the node.
 				_ if local => Decision::Deliver,
-				// The resolver is a destination like any other, and the node's own addresses are known only to the host.
-				_ if (dns && gate::refused(target, &plan.pools)) || (self.is_local)(target) => Decision::Refuse {reason: Reason::Gate, reset: true},
+				// The node's own addresses are known only to the host.
+				_ if (self.is_local)(packet.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 				action => {
 					let exit = if let Action::Exit(exit) = action {*exit} else {plan.users[user].exit.unwrap_or(plan.default_exit)};
 					match &plan.exits[exit].backend {
 						// Entitlement is final: the flow is rejected and never falls through to another rule.
 						_ if plan.users[user].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) => Decision::Refuse {reason: Reason::Entitlement, reset: true},
 						Backend::Block => Decision::Refuse {reason: Reason::BlockExit, reset: false},
-						Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind)}, ..} if bind.is_ipv4() != target.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
-						Backend::Netstack {..} => Decision::Exit {exit, dns},
+						Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind)}, ..} if bind.is_ipv4() != packet.dst.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
+						Backend::Netstack {..} => Decision::Exit {exit},
 					}
 				}
-			};
+			}};
 			if self.flows.insert(key, plan.devices[device].public_key, &plan.users[user].name, decision).is_err() {return counters.count(Reason::FlowTableFull)}
 			tracing::debug!("inbound {}: user {}: new flow, protocol {} to {}: {decision:?}", plan.inbounds[at].tag, plan.users[user].name, packet.protocol, plan.show(SocketAddr::new(packet.dst, packet.dport)));
 			decision
@@ -110,7 +110,8 @@ impl Shared {
 					None => self.refuse(plan, from, &raw, Reason::Unreachable, true).await,
 				}
 			}
-			Decision::Exit {exit, ..} if transport => {
+			Decision::Dns => if self.tunnels[at].to_stack.try_send(raw).is_err() {counters.count(Reason::QueueFull)},
+			Decision::Exit {exit} if transport => {
 				counters.exits[exit].up(raw.len());
 				if self.tunnels[at].to_stack.try_send(raw).is_err() {counters.count(Reason::QueueFull)}
 			}
@@ -205,9 +206,12 @@ pub fn spawn(shared: &Arc<Shared>, at: usize, mut stack: IpStack, mut from_stack
 					_ => continue,
 				};
 				let (plan, key) = (shared.plan(), Key {protocol, src: src.ip(), dst: dst.ip(), sport: src.port(), dport: dst.port()});
-				let Some((id, Decision::Exit {exit, dns})) = shared.flows.get(&key) else {continue};
-				let mtu = plan.inbounds[at].mtu;
-				tokio::spawn(flows::run(shared.clone(), plan, key, id, exit, dns, stream, mtu));
+				let (mtu, from) = (plan.inbounds[at].mtu, plan.by_address.get(&key.src).copied());
+				match (shared.flows.get(&key), from) {
+					(Some((id, Decision::Exit {exit})), _) => drop(tokio::spawn(flows::run(shared.clone(), plan, key, id, exit, stream, mtu))),
+					(Some((id, Decision::Dns)), Some(from)) => drop(tokio::spawn(resolver::serve(shared.clone(), plan.clone(), key, id, at, plan.devices[from.device].user, stream, mtu))),
+					_ => {}
+				}
 			}
 		}
 	});

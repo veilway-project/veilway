@@ -16,7 +16,8 @@ use veilway_core::Options;
 
 const CLIENT:[u8;4]=[10, 7, 0, 2];
 const RESOLVER:[u8;4]=[1, 1, 1, 1];
-const DNS_QUERY:&[u8]=b"\x12\x34\x01\x00fake-query";
+/// A standard query for the A records of `example.com`. The node drops port 53 traffic that is not a DNS query.
+const DNS_QUERY:&[u8]=b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
 const DNS_ANSWER:&[u8]=b"\x12\x34\x81\x80fake-answer";
 
 /// Minimal no-auth SOCKS5 CONNECT proxy that records every target and sends all of them to `backend`.
@@ -65,8 +66,11 @@ async fn dns_responder()->SocketAddr{
 				if s.read_exact(&mut len).await.is_err(){return}
 				let mut query=vec![0u8;u16::from_be_bytes(len) as usize];
 				if s.read_exact(&mut query).await.is_err(){return}
+				if query.len()<2{return}
+				// The answer carries the id of the query, which is not the one the client chose when the node's resolver asks.
 				let mut out=(DNS_ANSWER.len() as u16).to_be_bytes().to_vec();
-				out.extend_from_slice(DNS_ANSWER);
+				out.extend_from_slice(&query[..2]);
+				out.extend_from_slice(&DNS_ANSWER[2..]);
 				let _=s.write_all(&out).await;
 			});
 		}

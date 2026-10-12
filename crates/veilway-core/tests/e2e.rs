@@ -12,8 +12,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use veilway_core::config::Config;
+use veilway_core::engine::dns::response;
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
-use veilway_core::{Engine, Options, Reason, Totals};
+use veilway_core::{DnsTotals, Engine, Options, Reason, Totals};
 
 const GATEWAY:[u8;4]=[10, 7, 0, 1];
 const PEER_A:[u8;4]=[10, 7, 0, 2];
@@ -174,13 +175,98 @@ async fn dns_responder()->SocketAddr{
 				if s.read_exact(&mut len).await.is_err(){return}
 				let mut query=vec![0u8;u16::from_be_bytes(len) as usize];
 				if s.read_exact(&mut query).await.is_err(){return}
+				if query.len()<2{return}
+				// The answer carries the id of the query, which is not the one the client chose when the node's resolver asks.
 				let mut out=(DNS_ANSWER.len() as u16).to_be_bytes().to_vec();
-				out.extend_from_slice(DNS_ANSWER);
+				out.extend_from_slice(&query[..2]);
+				out.extend_from_slice(&DNS_ANSWER[2..]);
 				let _=s.write_all(&out).await;
 			});
 		}
 	});
 	addr
+}
+
+type Zone=&'static [(&'static str, &'static [[u8;4]])];
+
+/// What the scripted DNS servers know. Every other name does not exist.
+const ZONE:Zone=&[
+	("example.com", &[PUBLIC]), ("www.example.com", &[OTHER]), ("site.example.com", &[OTHER]), ("blocked.example.com", &[PUBLIC]), ("deep.blocked.example.com", &[PUBLIC]),
+	("inside.example.com", &[PEER_B]), ("gateway.example.com", &[GATEWAY]), ("loop.example.com", &[[127, 0, 0, 1]]), ("mixed.example.com", &[PUBLIC, [127, 0, 0, 1]]),
+];
+
+/// A standard query for `name` with recursion desired.
+fn dns_query(id:u16, name:&str, qtype:u16)->Vec<u8>{
+	let mut out=id.to_be_bytes().to_vec();
+	out.extend_from_slice(&[1, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+	for label in name.split('.'){
+		out.push(label.len() as u8);
+		out.extend_from_slice(label.as_bytes());
+	}
+	out.push(0);
+	out.extend_from_slice(&qtype.to_be_bytes());
+	out.extend_from_slice(&[0, 1]);
+	out
+}
+
+/// What a scripted server says to one query: the A records `zone` has for the name with a TTL of 300, or NXDOMAIN. With
+/// `truncated` it is the empty answer with TC set that a server gives when the real one does not fit a datagram.
+fn dns_reply(zone:Zone, query:&[u8], truncated:bool)->Vec<u8>{
+	let (mut labels, mut at)=(Vec::new(), 12);
+	while query[at]!=0{
+		labels.push(String::from_utf8_lossy(&query[at+1..at+1+query[at] as usize]).to_lowercase());
+		at+=1+query[at] as usize;
+	}
+	let found=zone.iter().find(|(known, _)| *known==labels.join("."));
+	let records:&[[u8;4]]=match found{Some((_, records)) if !truncated=>records, _=>&[]};
+	let mut out=query[..2].to_vec();
+	out.extend_from_slice(&[if truncated{0x83}else{0x81}, if found.is_some(){0x80}else{0x83}, 0, 1, 0, records.len() as u8, 0, 0, 0, 0]);
+	out.extend_from_slice(&query[12..at+5]);
+	for record in records{
+		out.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 1, 0x2c, 0, 4]);
+		out.extend_from_slice(record);
+	}
+	out
+}
+
+/// A DNS server on UDP and TCP of one port that answers from `zone` and counts the queries it got over each. With
+/// `truncate` its UDP answers are truncated, so the whole answer is only to be had over TCP.
+async fn dns_server(ip:Ipv4Addr, zone:Zone, truncate:bool)->(SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>){
+	let (listener, socket)=loop{
+		let listener=TcpListener::bind((ip, 0)).await.unwrap();
+		if let Ok(socket)=UdpSocket::bind(listener.local_addr().unwrap()).await{break (listener, socket)}
+	};
+	let addr=listener.local_addr().unwrap();
+	let (udp_hits, tcp_hits)=(Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+	let (udp_counter, tcp_counter)=(udp_hits.clone(), tcp_hits.clone());
+	tokio::spawn(async move{
+		let mut buf=vec![0u8;2048];
+		loop{
+			let Ok((n, from))=socket.recv_from(&mut buf).await else{return};
+			udp_counter.fetch_add(1, Ordering::SeqCst);
+			let _=socket.send_to(&dns_reply(zone, &buf[..n], truncate), from).await;
+		}
+	});
+	tokio::spawn(async move{
+		loop{
+			let Ok((mut s, _))=listener.accept().await else{return};
+			let counter=tcp_counter.clone();
+			tokio::spawn(async move{
+				loop{
+					let mut len=[0u8;2];
+					if s.read_exact(&mut len).await.is_err(){return}
+					let mut query=vec![0u8;u16::from_be_bytes(len) as usize];
+					if s.read_exact(&mut query).await.is_err(){return}
+					counter.fetch_add(1, Ordering::SeqCst);
+					let reply=dns_reply(zone, &query, false);
+					let mut out=(reply.len() as u16).to_be_bytes().to_vec();
+					out.extend_from_slice(&reply);
+					if s.write_all(&out).await.is_err(){return}
+				}
+			});
+		}
+	});
+	(addr, udp_hits, tcp_hits)
 }
 
 fn listen()->SocketAddr{SocketAddr::from((Ipv4Addr::LOCALHOST, NEXT_PORT.fetch_add(1, Ordering::SeqCst)))}
@@ -510,9 +596,9 @@ async fn dns_is_forwarded_over_tcp_through_the_socks5(){
 	let node=launch(setup).await;
 	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
 	let builder=PacketBuilder::ipv4(PEER_A, [9, 9, 9, 9], 64).udp(40005, 53);
-	let query=b"\x12\x34\x01\x00fake-query";
+	let query=dns_query(0x1234, "example.com", 1);
 	let mut packet=Vec::with_capacity(builder.size(query.len()));
-	builder.write(&mut packet, query).unwrap();
+	builder.write(&mut packet, &query).unwrap();
 	client.send_ip(&packet).await;
 	let reply=client.recv_ip(Duration::from_secs(5)).await.expect("no dns reply");
 	let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
@@ -1093,7 +1179,7 @@ async fn the_gateway_answers_dns_and_nothing_else(){
 	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
 	let node=spawn_server(proxy).await;
 	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
-	client.send_ip(&ip_udp(PEER_A, GATEWAY, 41130, 53, b"\x12\x34\x01\x00fake-query")).await;
+	client.send_ip(&ip_udp(PEER_A, GATEWAY, 41130, 53, &dns_query(0x1234, "example.com", 1))).await;
 	let reply=client.recv_ip(Duration::from_secs(5)).await.expect("the gateway did not answer dns");
 	let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
 	let NetHeaders::Ipv4(ip, _)=parsed.net.unwrap() else{panic!("not ipv4")};
@@ -1122,13 +1208,15 @@ async fn tunnel_dns_is_routed_like_a_flow_to_the_resolver(){
 	let node=launch(setup).await;
 	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
 	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
-	a.send_ip(&ip_udp(PEER_A, [9, 9, 9, 9], 41140, 53, b"\x12\x34\x01\x00fake-query")).await;
+	a.send_ip(&ip_udp(PEER_A, [9, 9, 9, 9], 41140, 53, &dns_query(0x1234, "example.com", 1))).await;
 	let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no dns reply");
 	let PayloadSlice::Udp(payload)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
 	assert_eq!(payload, DNS_ANSWER);
 	assert_eq!(seen_second.lock().unwrap().as_slice(), ["1.1.1.1:53"], "the query did not leave through the exit the rule chose");
-	b.send_ip(&ip_udp(PEER_B, [9, 9, 9, 9], 41141, 53, b"\x12\x34\x01\x00fake-query")).await;
-	assert!(b.recv_ip(Duration::from_millis(700)).await.is_none(), "a blocked resolver still answered");
+	// The node answers for the resolver it may not ask: REFUSED, with the question as it was asked.
+	let query=dns_query(0x1234, "example.com", 1);
+	let refused=ask(&mut b, PEER_B, [9, 9, 9, 9], 41141, &query, Duration::from_secs(3)).await.expect("a query for a blocked resolver was not answered");
+	assert_eq!((&refused[..4], &refused[12..]), (&[0x12, 0x34, 0x81, 0x85][..], &query[12..]), "a blocked resolver was not answered REFUSED");
 	assert_eq!(node.engine.dropped(Reason::Rule), 1);
 	assert!(seen_first.lock().unwrap().is_empty(), "a query left through the default exit");
 }
@@ -1302,4 +1390,324 @@ async fn one_user_cannot_fill_the_flow_table(){
 	eventually("one user's flows were never bounded", || node.engine.dropped(Reason::FlowTableFull)>=over-100).await;
 	assert!(node.engine.dropped(Reason::FlowTableFull)<=over, "a user was refused flows below their share of the table");
 	assert_eq!(knock(&mut b, PEER_B, OTHER, 41221, 80).await, Answer::Accepted, "one user at their limit kept another user from opening a flow");
+}
+
+/// Sends one DNS query over UDP and returns the answer that comes back to the port it was sent from.
+async fn ask(client:&mut Client, src:[u8;4], dst:[u8;4], sport:u16, query:&[u8], budget:Duration)->Option<Vec<u8>>{
+	client.send_ip(&ip_udp(src, dst, sport, 53, query)).await;
+	let deadline=Instant::now()+budget;
+	while let Some(left)=deadline.checked_duration_since(Instant::now()){
+		let packet=client.recv_ip(left).await?;
+		let Ok(parsed)=PacketHeaders::from_ip_slice(&packet) else{continue};
+		let (Some(NetHeaders::Ipv4(ip, _)), Some(TransportHeader::Udp(udp)), PayloadSlice::Udp(payload))=(parsed.net, parsed.transport, parsed.payload) else{continue};
+		if (ip.source, udp.source_port, udp.destination_port)==(dst, 53, sport){return Some(payload.to_vec())}
+	}
+	None
+}
+
+/// The addresses of an answer that carries `id` and no error.
+fn resolved(answer:&[u8], id:u16)->Vec<IpAddr>{
+	let parsed=response(answer).expect("the answer is not a dns response");
+	assert_eq!((parsed.id, parsed.rcode, parsed.truncated), (id, 0, false));
+	parsed.addresses.iter().map(|(address, _)| *address).collect()
+}
+
+struct Named{node:Node, seen_first:Arc<Mutex<Vec<String>>>, seen_second:Arc<Mutex<Vec<String>>>, dns_hits:Arc<AtomicUsize>}
+
+/// A node with DNS hijacked and two exits, `main` and `second`, whose proxies both reach one scripted DNS server, with
+/// `rule` in front of the other rules. A proxy records `1.1.1.1:53` for every query that left through it.
+async fn named(rule:Value)->Named{
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (dns, _, dns_hits)=dns_server(Ipv4Addr::LOCALHOST, ZONE, false).await;
+	let (first, seen_first)=socks5_proxy(dns, backend, echo, false).await;
+	let (second, seen_second)=socks5_proxy(dns, backend, echo, false).await;
+	let mut setup=setup(first);
+	setup.doc["dns"]["hijack"]=json!(true);
+	add_exit(&mut setup.doc, "second", second);
+	add_rule(&mut setup.doc, rule);
+	Named{node:launch(setup).await, seen_first, seen_second, dns_hits}
+}
+
+fn recorded(seen:&Arc<Mutex<Vec<String>>>)->Vec<String>{seen.lock().unwrap().clone()}
+
+/// A `domain` rule decides about an address only for the user who resolved a matching name to it through the node, and
+/// only for as long as the node remembers that.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_domain_rule_matches_only_what_that_user_resolved_through_the_node(){
+	let Named{node, seen_first, seen_second, ..}=named(json!({"tag":"by-name", "domain":["site.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	// Nobody has asked for the name yet, so its address is like any other.
+	assert_eq!(knock(&mut a, PEER_A, OTHER, 42001, 80).await, Answer::Accepted);
+	eventually("the flow never reached the default exit", || recorded(&seen_first)==["93.184.216.35:80"]).await;
+	assert!(recorded(&seen_second).is_empty(), "a domain rule matched a name nobody resolved");
+	let answer=ask(&mut a, PEER_A, GATEWAY, 42002, &dns_query(7, "Site.Example.com", 1), Duration::from_secs(5)).await.expect("no dns answer");
+	assert_eq!(response(&answer).unwrap().addresses, [(IpAddr::from(OTHER), 300)], "the answer of the server was not relayed");
+	assert_eq!(resolved(&answer, 7), [IpAddr::from(OTHER)]);
+	// The query is itself a flow to the server, and the rule matches it by the name it asks for.
+	assert_eq!(recorded(&seen_second), ["1.1.1.1:53"], "the query did not leave through the exit of the domain rule");
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b"), node.engine.dns_names("nobody")), (Some(1), Some(0), None));
+	assert_eq!(knock(&mut a, PEER_A, OTHER, 42003, 80).await, Answer::Accepted);
+	eventually("the flow to a resolved name did not follow the domain rule", || recorded(&seen_second)==["1.1.1.1:53", "93.184.216.35:80"]).await;
+	// User b goes to the same address and never asked for the name.
+	assert_eq!(knock(&mut b, PEER_B, OTHER, 42004, 80).await, Answer::Accepted);
+	eventually("the flow of user b never reached the default exit", || recorded(&seen_first)==["93.184.216.35:80", "93.184.216.35:80"]).await;
+	// What the node forgets no longer matches.
+	assert!(node.engine.forget_names("a") && !node.engine.forget_names("nobody"));
+	assert_eq!(node.engine.dns_names("a"), Some(0));
+	assert_eq!(knock(&mut a, PEER_A, OTHER, 42005, 80).await, Answer::Accepted);
+	eventually("a forgotten name still matched", || recorded(&seen_first).len()==3).await;
+	assert_eq!(recorded(&seen_second).len(), 2, "a flow followed the domain rule without a remembered name");
+	assert_eq!(node.engine.dns(), DnsTotals{answered:1, ..DnsTotals::default()});
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_wildcard_domain_rule_matches_below_the_name_and_not_the_name(){
+	let Named{node, seen_first, seen_second, ..}=named(json!({"tag":"below", "domain":["*.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 42010, &dns_query(1, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 1), [IpAddr::from(PUBLIC)]);
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 42011, &dns_query(2, "www.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 2), [IpAddr::from(OTHER)]);
+	assert_eq!((recorded(&seen_first), recorded(&seen_second)), (vec!["1.1.1.1:53".to_string()], vec!["1.1.1.1:53".to_string()]), "each query should leave through the exit its own name is routed to");
+	assert_eq!(node.engine.dns_names("a"), Some(2));
+	assert_eq!(knock(&mut a, PEER_A, PUBLIC, 42012, 80).await, Answer::Accepted);
+	assert_eq!(knock(&mut a, PEER_A, OTHER, 42013, 80).await, Answer::Accepted);
+	eventually("the flows never reached their exits", || recorded(&seen_first).len()==2 && recorded(&seen_second).len()==2).await;
+	assert_eq!(recorded(&seen_first)[1], "93.184.216.34:80", "`*.example.com` matched `example.com` itself");
+	assert_eq!(recorded(&seen_second)[1], "93.184.216.35:80", "`*.example.com` did not match a name below it");
+}
+
+/// A query the rules refuse is answered REFUSED by the node and never reaches a server.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_blocked_name_is_answered_refused(){
+	let Named{node, seen_first, seen_second, dns_hits}=named(json!({"tag":"no-name", "domain":["blocked.example.com", "*.blocked.example.com"], "action":"block"})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for (id, name) in [(9u16, "blocked.example.com"), (10, "Deep.Blocked.Example.COM")]{
+		let query=dns_query(id, name, 1);
+		let answer=ask(&mut a, PEER_A, [9, 9, 9, 9], 42020+id, &query, Duration::from_secs(3)).await.expect("a blocked name was not answered");
+		assert_eq!(answer[..2], id.to_be_bytes());
+		assert_eq!(answer[2..12], [0x81, 0x85, 0, 1, 0, 0, 0, 0, 0, 0], "{name} was not answered REFUSED with no records");
+		assert_eq!(answer[12..], query[12..], "the question was not echoed as it was asked");
+	}
+	assert_eq!((dns_hits.load(Ordering::SeqCst), node.engine.dns_names("a")), (0, Some(0)));
+	assert!(recorded(&seen_first).is_empty() && recorded(&seen_second).is_empty(), "a refused query reached a proxy");
+	// A name that does not exist is the server's to say, and nothing to remember.
+	let missing=ask(&mut a, PEER_A, [9, 9, 9, 9], 42031, &dns_query(11, "blocked.example.org", 1), Duration::from_secs(5)).await.expect("no dns answer");
+	assert_eq!((missing[3]&0x0f, node.engine.dns_names("a")), (3, Some(0)));
+	assert_eq!(resolved(&ask(&mut a, PEER_A, [9, 9, 9, 9], 42032, &dns_query(12, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 12), [IpAddr::from(PUBLIC)]);
+	assert_eq!(node.engine.dns(), DnsTotals{answered:2, refused:2, ..DnsTotals::default()});
+	assert_eq!((node.engine.dropped(Reason::Rule), dns_hits.load(Ordering::SeqCst), node.engine.dns_names("a")), (2, 2, Some(1)));
+}
+
+/// The first address this machine has that is not loopback: the only place a test can put a server for a `direct` outbound.
+fn host_ip()->Ipv4Addr{
+	let probe=std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+	match probe.connect("192.0.2.1:9").and_then(|_| probe.local_addr()).map(|local| local.ip()){
+		Ok(IpAddr::V4(ip)) if !ip.is_loopback() && !ip.is_unspecified()=>ip,
+		other=>panic!("this test needs a non-loopback IPv4 address on the machine, found {other:?}"),
+	}
+}
+
+/// A node whose only exit is direct, with DNS hijacked to `servers`. It is told that no address is its own, so that
+/// servers on this machine pass the destination gate.
+async fn launch_direct(servers:&[SocketAddr])->Node{
+	let mut setup=setup(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+	setup.doc["dns"]=json!({"servers":servers.iter().map(|server| server.to_string()).collect::<Vec<_>>(), "hijack":true});
+	setup.doc["outbounds"]=json!([{"tag":"plain", "type":"direct"}]);
+	setup.doc["exits"]=json!([{"tag":"main", "backend":{"type":"netstack", "outbound":"plain"}}]);
+	// The machine's own address is usually a private one.
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await
+}
+
+/// Servers are tried in order with five seconds each, and when none answers the node says SERVFAIL itself.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn the_second_server_answers_when_the_first_is_silent(){
+	let host=host_ip();
+	let (silent, alone)=(UdpSocket::bind((host, 0)).await.unwrap(), UdpSocket::bind((host, 0)).await.unwrap());
+	let (server, udp_hits, tcp_hits)=dns_server(host, ZONE, false).await;
+	let node=launch_direct(&[silent.local_addr().unwrap(), server]).await;
+	let failing=launch_direct(&[alone.local_addr().unwrap()]).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut lost=Client::connect(failing.keys[0], failing.public, failing.addr).await;
+	let (query, started)=(dns_query(11, "example.com", 1), Instant::now());
+	let (answer, failure)=tokio::join!(ask(&mut a, PEER_A, [9, 9, 9, 9], 42040, &query, Duration::from_secs(9)), ask(&mut lost, PEER_A, [9, 9, 9, 9], 42041, &query, Duration::from_secs(9)));
+	assert!(started.elapsed()>=Duration::from_secs(5), "the first server was not given its five seconds");
+	assert_eq!(resolved(&answer.expect("the second server was not asked"), 11), [IpAddr::from(PUBLIC)]);
+	let mut asked=[0u8;512];
+	let n=timeout(Duration::from_secs(1), silent.recv(&mut asked)).await.expect("the first server was never asked").unwrap();
+	assert_eq!(asked[2..n], query[2..], "the query did not reach the first server as it was asked");
+	assert_eq!((udp_hits.load(Ordering::SeqCst), tcp_hits.load(Ordering::SeqCst)), (1, 0));
+	assert_eq!((node.engine.dns(), node.engine.dns_names("a")), (DnsTotals{answered:1, ..DnsTotals::default()}, Some(1)));
+	let failure=failure.expect("a query no server answered got no answer from the node");
+	assert_eq!((&failure[..4], &failure[4..12], &failure[12..]), (&[0, 11, 0x81, 0x82][..], &[0, 1, 0, 0, 0, 0, 0, 0][..], &query[12..]), "the node did not answer SERVFAIL");
+	assert_eq!((failing.engine.dns(), failing.engine.dns_names("a")), (DnsTotals{failed:1, ..DnsTotals::default()}, Some(0)));
+}
+
+/// Through a direct outbound a query goes over UDP, and again over TCP when the server truncated its answer.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_truncated_answer_is_asked_for_again_over_tcp(){
+	let (server, udp_hits, tcp_hits)=dns_server(host_ip(), ZONE, true).await;
+	let node=launch_direct(&[server]).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let answer=ask(&mut a, PEER_A, GATEWAY, 42050, &dns_query(13, "www.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer");
+	assert_eq!(resolved(&answer, 13), [IpAddr::from(OTHER)], "the client got the truncated answer and not the whole one");
+	assert_eq!((udp_hits.load(Ordering::SeqCst), tcp_hits.load(Ordering::SeqCst)), (1, 1));
+	assert_eq!(node.engine.dns_names("a"), Some(1));
+}
+
+/// DNS over TCP on port 53: each query has its length before it, several share one connection, and each is routed by itself.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn dns_over_tcp_is_answered_query_by_query(){
+	let Named{node, seen_first, seen_second, dns_hits}=named(json!({"tag":"by-name", "domain":["site.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	// Hijack is on, so the node answers whatever address the connection was opened to.
+	let (dst, sport)=([9, 9, 9, 9], 42060);
+	let isn=handshake(&mut a, dst, sport, 53).await;
+	let mut framed=Vec::new();
+	for (id, name) in [(21u16, "example.com"), (22, "site.example.com")]{
+		let query=dns_query(id, name, 1);
+		framed.extend_from_slice(&(query.len() as u16).to_be_bytes());
+		framed.extend_from_slice(&query);
+	}
+	let mut data=TcpHeader::new(sport, 53, 1001, 65535);
+	data.ack=true;
+	data.psh=true;
+	data.acknowledgment_number=isn.wrapping_add(1);
+	a.send_ip(&ip_tcp(PEER_A, dst, data, &framed)).await;
+	// This client acknowledges nothing, so a segment may come twice: only the bytes that continue the stream count.
+	let (mut got, mut answers, deadline)=(Vec::new(), Vec::new(), Instant::now()+Duration::from_secs(8));
+	while answers.len()<2{
+		let Some(packet)=a.recv_ip(deadline.checked_duration_since(Instant::now()).expect("the answers never came")).await else{break};
+		let Some((tcp, payload))=parse_tcp(&packet) else{continue};
+		if tcp.source_port==53 && tcp.sequence_number.wrapping_sub(isn.wrapping_add(1)) as usize==got.len(){got.extend_from_slice(&payload)}
+		let (mut at, mut whole)=(0, Vec::new());
+		while got.len()>=at+2 && got.len()>=at+2+usize::from(u16::from_be_bytes([got[at], got[at+1]])){
+			let len=usize::from(u16::from_be_bytes([got[at], got[at+1]]));
+			whole.push(got[at+2..at+2+len].to_vec());
+			at+=2+len;
+		}
+		answers=whole;
+	}
+	assert_eq!(answers.len(), 2, "two queries on one connection did not get two answers");
+	assert_eq!((resolved(&answers[0], 21), resolved(&answers[1], 22)), (vec![IpAddr::from(PUBLIC)], vec![IpAddr::from(OTHER)]));
+	assert_eq!((recorded(&seen_first), recorded(&seen_second)), (vec!["1.1.1.1:53".to_string()], vec!["1.1.1.1:53".to_string()]), "each query should leave through the exit its own name is routed to");
+	assert_eq!((dns_hits.load(Ordering::SeqCst), node.engine.dns_names("a")), (2, Some(2)));
+	assert_eq!(node.engine.dns(), DnsTotals{answered:2, ..DnsTotals::default()});
+}
+
+/// With hijack on, port 53 belongs to the node's resolver: what is not a DNS query gets no answer and goes nowhere.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn with_hijack_on_port_53_traffic_that_is_not_dns_is_dropped_and_counted(){
+	let Named{node, seen_first, seen_second, dns_hits}=named(json!({"tag":"by-name", "domain":["site.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut two_questions=dns_query(5, "example.com", 1);
+	two_questions[5]=2;
+	// Something that is not DNS at all, a response, and a query that claims a second question.
+	for (sport, payload) in [(42070u16, &b"custom"[..]), (42071, DNS_ANSWER), (42072, &two_questions)]{a.send_ip(&ip_udp(PEER_A, [54, 194, 213, 130], sport, 53, payload)).await}
+	eventually("the datagrams were never counted", || node.engine.dns().malformed==3).await;
+	assert!(a.recv_ip(Duration::from_millis(500)).await.is_none(), "port 53 traffic that is not dns was answered");
+	// Over TCP the same ends the connection.
+	let isn=handshake(&mut a, GATEWAY, 42073, 53).await;
+	let mut data=TcpHeader::new(42073, 53, 1001, 65535);
+	data.ack=true;
+	data.psh=true;
+	data.acknowledgment_number=isn.wrapping_add(1);
+	a.send_ip(&ip_tcp(PEER_A, GATEWAY, data, b"\x00\x06custom")).await;
+	eventually("the tcp garbage was never counted", || node.engine.dns().malformed==4).await;
+	assert_eq!(node.engine.dns(), DnsTotals{malformed:4, ..DnsTotals::default()});
+	assert_eq!(dns_hits.load(Ordering::SeqCst), 0);
+	assert!(recorded(&seen_first).is_empty() && recorded(&seen_second).is_empty(), "port 53 traffic that is not dns reached a proxy");
+	// The resolver still answers a real query from the same device.
+	assert_eq!(resolved(&ask(&mut a, PEER_A, [54, 194, 213, 130], 42074, &dns_query(6, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 6), [IpAddr::from(PUBLIC)]);
+}
+
+/// A name that resolves into the tunnel or to the node itself is the client's to hear about, but no `domain` rule ever
+/// matches by it, however the answer mixes such an address with good ones.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_answer_that_points_into_the_tunnel_or_at_loopback_is_relayed_and_not_remembered(){
+	let Named{node, seen_first, seen_second, ..}=named(json!({"tag":"below", "domain":["*.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for (id, name, addresses) in [(31u16, "inside.example.com", vec![PEER_B]), (32, "gateway.example.com", vec![GATEWAY]), (33, "loop.example.com", vec![[127, 0, 0, 1]]), (34, "mixed.example.com", vec![PUBLIC, [127, 0, 0, 1]])]{
+		let answer=ask(&mut a, PEER_A, GATEWAY, 42080+id, &dns_query(id, name, 1), Duration::from_secs(5)).await.expect("no dns answer");
+		assert_eq!(resolved(&answer, id), addresses.into_iter().map(IpAddr::from).collect::<Vec<_>>(), "the answer for {name} was not relayed as the server gave it");
+	}
+	assert_eq!((node.engine.dns().answered, node.engine.dns_names("a")), (4, Some(0)));
+	assert_eq!(recorded(&seen_second), ["1.1.1.1:53";4], "the queries did not follow the domain rule");
+	// The good address in the mixed answer was not remembered either, so the rule does not match a flow to it.
+	assert_eq!(knock(&mut a, PEER_A, PUBLIC, 42090, 80).await, Answer::Accepted);
+	eventually("the flow never reached the default exit", || recorded(&seen_first)==["93.184.216.34:80"]).await;
+	assert_eq!(recorded(&seen_second).len(), 4, "a flow followed a name whose answer was not to be remembered");
+	// A good answer on its own is remembered as ever.
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 42091, &dns_query(35, "www.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 35), [IpAddr::from(OTHER)]);
+	assert_eq!(node.engine.dns_names("a"), Some(1));
+}
+
+/// The node asks a server under an id of its own and takes an answer under that id alone. The id the client chose is
+/// known to the client, who could otherwise answer its own query from outside with any address it likes.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_answer_under_the_id_the_client_chose_is_not_taken(){
+	const FORGED:Zone=&[("www.example.com", &[PUBLIC])];
+	let server=UdpSocket::bind((host_ip(), 0)).await.unwrap();
+	let node=launch_direct(&[server.local_addr().unwrap()]).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut own=0;
+	for id in 40u16..44{
+		let query=dns_query(id, "www.example.com", 1);
+		let script=async{
+			let mut asked=[0u8;512];
+			let (n, from)=server.recv_from(&mut asked).await.unwrap();
+			// First what somebody who knows the question and the client's id can send, then the answer of the server.
+			if asked[..2]!=query[..2]{server.send_to(&dns_reply(FORGED, &query, false), from).await.unwrap();}
+			server.send_to(&dns_reply(ZONE, &asked[..n], false), from).await.unwrap();
+			asked[..n].to_vec()
+		};
+		let (answer, asked)=tokio::join!(ask(&mut a, PEER_A, GATEWAY, 42100+id, &query, Duration::from_secs(5)), script);
+		assert_eq!(asked[2..], query[2..], "the query did not reach the server as it was asked");
+		own+=usize::from(asked[..2]!=query[..2]);
+		assert_eq!(resolved(&answer.expect("no dns answer"), id), [IpAddr::from(OTHER)], "an answer the server never gave was taken");
+	}
+	assert!(own>0, "every query went to the server under the id the client chose");
+	assert_eq!((node.engine.dns().answered, node.engine.dns_names("a")), (4, Some(1)));
+}
+
+/// A DNS flow over UDP is a question and its answer. Resolvers send every query from a new port, so a flow that has
+/// its answer gives its place in the flow table back within seconds, and one that is used again is answered again.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_answered_dns_flow_soon_frees_its_place_in_the_flow_table(){
+	let Named{node, ..}=named(json!({"tag":"by-name", "domain":["site.example.com"], "action":{"exit":"second"}})).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 42110, &dns_query(51, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 51), [IpAddr::from(PUBLIC)]);
+	assert_eq!(node.engine.flows(), 1);
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 42110, &dns_query(52, "www.example.com", 1), Duration::from_secs(5)).await.expect("a second query from the same port was not answered"), 52), [IpAddr::from(OTHER)]);
+	tokio::time::sleep(Duration::from_secs(13)).await;
+	assert_eq!(node.engine.flows(), 0, "a dns flow kept its place in the flow table long after its answer");
+}
+
+/// An IPv6 header is 20 bytes longer than an IPv4 one, so a datagram to an IPv6 client carries that much less. An
+/// answer that fits the one and not the other is cut for the IPv6 client with the TC bit set, so it asks again over TCP.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_answer_too_long_for_an_ipv6_datagram_is_marked_truncated(){
+	// 1377 bytes as an answer: the MTU of 1420 leaves 1392 after an IPv4 and a UDP header and 1372 after an IPv6 one.
+	const BIG:Zone=&[("big.example.com", &[PUBLIC;84])];
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (dns, _, _)=dns_server(Ipv4Addr::LOCALHOST, BIG, false).await;
+	let (proxy, _)=socks5_proxy(dns, backend, echo, false).await;
+	let mut setup=setup(proxy);
+	setup.doc["inbounds"][0]["address"]=json!(["10.7.0.1/24", "fd7a:115c:a1e0::1/64"]);
+	setup.doc["users"][0]["devices"][0]["addresses"]=json!(["10.7.0.2", "fd7a:115c:a1e0::2"]);
+	let node=launch(setup).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let whole=ask(&mut a, PEER_A, GATEWAY, 42120, &dns_query(61, "big.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer");
+	assert_eq!((whole.len(), resolved(&whole, 61).len()), (1377, 84));
+	let (query, builder)=(dns_query(62, "big.example.com", 1), PacketBuilder::ipv6("fd7a:115c:a1e0::2".parse::<Ipv6Addr>().unwrap().octets(), "fd7a:115c:a1e0::1".parse::<Ipv6Addr>().unwrap().octets(), 64).udp(42121, 53));
+	let mut packet=Vec::with_capacity(builder.size(query.len()));
+	builder.write(&mut packet, &query).unwrap();
+	a.send_ip(&packet).await;
+	let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no dns answer over ipv6");
+	let PayloadSlice::Udp(cut)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
+	assert_eq!((reply.len(), cut.len(), &cut[..2]), (1420, 1372, &[0, 62][..]));
+	assert_eq!(cut[2]&0x02, 0x02, "an answer that lost its tail does not say so");
 }

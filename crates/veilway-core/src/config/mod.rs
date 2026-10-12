@@ -5,6 +5,7 @@ mod reload;
 mod validate;
 
 pub use model::*;
+pub(crate) use model::domain;
 pub use reload::*;
 use schemars::generate::SchemaSettings;
 use schemars::transform::{RecursiveTransform, Transform};

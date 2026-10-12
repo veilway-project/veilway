@@ -49,6 +49,22 @@ pub enum IpMatch {Net(IpNet), Private, Users, Tunnel(usize)}
 
 pub enum Action {Exit(usize), User, Block, Reject}
 
+/// A name a `domain` condition names: one name exactly, or every name below a suffix, which is kept with the dot before it.
+pub enum Pattern {Exact(String), Below(String)}
+
+impl Pattern {
+	/// `pattern` is a domain as validation accepts it in a rule, `*.example.com` included.
+	pub fn new(pattern: &str) -> Pattern {pattern.strip_prefix('*').map_or_else(|| Pattern::Exact(pattern.to_string()), |suffix| Pattern::Below(suffix.to_string()))}
+
+	/// `name` is lowercase and has no trailing dot. `*.example.com` matches every name below `example.com` and not `example.com` itself.
+	pub fn matches(&self, name: &str) -> bool {
+		match self {
+			Pattern::Exact(exact) => name == exact,
+			Pattern::Below(suffix) => name.ends_with(suffix.as_str()),
+		}
+	}
+}
+
 /// One enabled rule with every name resolved to an index.
 pub struct Rule {
 	pub tag: String,
@@ -56,8 +72,8 @@ pub struct Rule {
 	pub user: Option<Vec<usize>>,
 	pub group: Option<Vec<usize>>,
 	pub ip: Option<Vec<IpMatch>>,
-	/// The node has no name memory yet, so a rule with a `domain` condition never matches.
-	pub domain: bool,
+	/// Matched against the names the user resolved to the destination through the node, or against the name a DNS query asks for.
+	pub domain: Option<Vec<Pattern>>,
 	pub protocol: Option<Vec<u8>>,
 	pub port: Option<Vec<(u16, u16)>>,
 	pub icmp_type: Option<Vec<u8>>,
@@ -67,8 +83,8 @@ pub struct Rule {
 
 pub struct Plan {
 	pub log_destinations: bool,
-	/// The resolver tunnel DNS is relayed to.
-	pub dns: SocketAddr,
+	/// The servers the node's resolver asks, in the order it tries them.
+	pub dns: Vec<SocketAddr>,
 	pub hijack: bool,
 	pub inbounds: Vec<Inbound>,
 	/// Every user of the config, enabled or not, so counters and rules keep their indexes.
@@ -166,7 +182,7 @@ impl Plan {
 					IpEntry::Users => IpMatch::Users,
 					IpEntry::Tunnel(tag) => IpMatch::Tunnel(find(&inbound_tags, tag)?),
 				})).collect::<anyhow::Result<Vec<_>>>()).transpose()?,
-				domain: rule.domain.is_some(),
+				domain: rule.domain.as_ref().map(|list| list.iter().map(|name| Pattern::new(name)).collect()),
 				protocol: rule.protocol.as_ref().map(|list| list.iter().map(|protocol| protocol.0).collect()),
 				port: rule.port.as_ref().map(|list| list.iter().map(|range| (range.lo, range.hi)).collect()),
 				icmp_type: rule.icmp_type.clone(),
@@ -181,7 +197,7 @@ impl Plan {
 		}
 		Ok(Plan {
 			log_destinations: config.log.destinations,
-			dns: config.dns.servers.first().ok_or_else(stale)?.0,
+			dns: config.dns.servers.iter().map(|server| server.0).collect(),
 			hijack: config.dns.hijack != Some(false),
 			default_exit: find(&exit_tags, &config.routing.default)?,
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),

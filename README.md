@@ -43,7 +43,7 @@ The goal is one ecosystem that covers what today takes a proxy core, a separate 
 | Bridge (`veilway bridge`) | `client` gives a stock WireGuard app a local UDP endpoint and carries it over `wss://`. `relay` accepts WebSocket and forwards to any WireGuard UDP port. |
 | Desktop client | Windows only. Reads a normal WireGuard `.conf`, runs the tunnel in-process over UDP or WebSocket on a Wintun adapter, sets routes and DNS to go through the tunnel. |
 
-Known limits: IPv4 only inside the tunnel (the Windows client routes IPv6 into the adapter and drops it there instead of letting it bypass the tunnel), ICMP and other non-TCP/UDP protocols do not pass a SOCKS5 upstream, there is one static JSON config with no reload, and there is no panel, no user accounting and no control API yet.
+Known limits: IPv4 only inside the tunnel (the Windows client routes IPv6 into the adapter and drops it there instead of letting it bypass the tunnel), ICMP and other non-TCP/UDP protocols do not pass a SOCKS5 upstream, the server runs on config version 1, so several inbounds, routing rules and users exist, but there is no config reload, no quotas, no panel and no control API yet, and the node answers ICMP ping itself while other non-TCP/UDP protocols are not carried yet.
 
 ### Planned
 
@@ -93,7 +93,20 @@ It prints a `private_key` and its `public_key`. Run it once for the server and o
 cp config.example.json config.json
 ```
 
-Edit `config.json`: put the server private key in `private_key`, set `upstream` to your SOCKS5, and list each peer's public key under `peers`. The example also opens a WebSocket listener on port 443 with certificate files. Delete the `listen_ws` block to start with UDP only, or point `cert` and `key` at real files.
+Edit `config.json`:
+
+- Put a key from `veilway genkey` in the `private_key` of every inbound you keep. The example keys are placeholders.
+- In the `proxy` outbound, set `server` and the credentials to your SOCKS5 proxy. To leave without a proxy, point the `main` exit's `outbound` at `plain`, the direct outbound.
+- Under `users`, put each device's public key in `public_key`, with an `addresses` entry from the pool of its inbound.
+- Remove the `node` exit for now, because the `l3` backend is not built yet, and everything that names it: the `staff-intranet` and `staff-ping` rules, alice's `"exit": "node"` and `"node"` in bob's `exits`.
+- The `ws` transport on port 443 needs certificate files at the `tls` paths, relative to the config directory. Delete that transport to start with UDP only.
+
+`veilway run` refuses a config that group or others can read, so restrict it, then validate it:
+
+```
+chmod 600 config.json
+./target/release/veilway check --config config.json
+```
 
 ### 4. Run the server
 
@@ -120,7 +133,7 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 ```
 
-Where UDP is blocked, run the bridge next to the WireGuard app and set `Endpoint = 127.0.0.1:51820` instead. This needs the server's `listen_ws` block with a certificate for your domain (step 3), or a `veilway bridge relay` in front of it (see [WebSocket relay](#websocket-relay)). Replace `vpn.example.com` with your host.
+Where UDP is blocked, run the bridge next to the WireGuard app and set `Endpoint = 127.0.0.1:51820` instead. This needs a `ws` transport with a certificate for your domain on the server (step 3), or a `veilway bridge relay` in front of it (see [WebSocket relay](#websocket-relay)). Replace `vpn.example.com` with your host.
 
 ```
 veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
@@ -130,26 +143,24 @@ veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
 
 ## Server config
 
-`config.json` is one JSON document. `private_key`, `address`, `upstream`, `peers` and at least one listener are required.
+`config.json` is one versioned JSON document (`"version": 1`). `veilway check` validates it, and unknown keys are errors.
 
-| Key | Meaning |
+| Section | Meaning |
 |---|---|
-| `private_key` | Server key, base64. `veilway genkey` makes one. |
-| `address` | Tunnel subnet with the gateway address, for example `10.7.0.1/24`. |
-| `upstream` | `socks5://user:pass@host:1080`. Credentials may be percent-encoded. |
-| `peers[]` | `public_key`, `allowed_ips`, optional `preshared_key` and a per-peer `upstream`. |
-| `listen_udp` | WireGuard UDP listener. Omit for WebSocket only. |
-| `listen_ws` | `{addr, path, cert, key}`. Omit `cert` and `key` to serve plain `ws://` behind a reverse proxy. |
-| `dns` | Force every peer's DNS to this `ip:53`. |
-| `mtu` | Default `1420`. |
-| `udp_idle_secs`, `tcp_idle_secs` | Idle timeouts for relayed flows. Defaults `60` and `7200`. |
-| `allow_private` | `true` lets peers reach private ranges through the proxy. Default `false`. |
+| `log` | Log level, and whether destinations may appear in logs (off by default). |
+| `dns` | Upstream resolvers, and whether every DNS query from a tunnel is answered by the node. |
+| `groups` | Group names that users and rules may refer to. |
+| `inbounds` | WireGuard tunnels: a key, an address pool and one or more transports (`udp`, `ws`). |
+| `outbounds` | Ways to open flows: `direct` or `socks5`. |
+| `exits` | Named ways out, each with a backend (`netstack`, `block`). |
+| `routing` | The default exit and an ordered list of rules on inbound, group, destination, domain and protocol. |
+| `users` | Users with groups, allowed exits, an optional expiry, and devices (public key, addresses). |
 
-A full example is in [config.example.json](config.example.json).
+Every key, default and validation rule is in the [config reference](https://github.com/veilway-project/veilway-docs/blob/main/src/content/docs/reference/config.md). A full example is in [config.example.json](config.example.json).
 
 ## WebSocket relay
 
-`listen_ws` lets the server accept WebSocket itself. `veilway bridge relay` is the standalone version: it terminates WebSocket and forwards to any WireGuard UDP port, including the kernel's. Each connection gets its own local UDP socket, so roaming and several clients behind one NAT work.
+A `ws` transport on an inbound lets the server accept WebSocket itself. `veilway bridge relay` is the standalone version: it terminates WebSocket and forwards to any WireGuard UDP port, including the kernel's. Each connection gets its own local UDP socket, so roaming and several clients behind one NAT work.
 
 With its own certificate:
 
@@ -239,7 +250,7 @@ flowchart TB
 ```
 crates/
   veilway             the only binary: run, genkey, bridge client, bridge relay
-  veilway-core        server engine: accept loop, isolation rules, per-flow SOCKS5 egress, config
+  veilway-core        server engine: config v1, inbounds, routing rules, flow table, isolation rules, per-flow egress
   veilway-wg          multi-peer WireGuard wrapper (handshake routing, cookies, timers, roaming) and the WebSocket relay
   veilway-client      single-peer client engine and the Windows Wintun, route and DNS layer
   veilway-proto       wire formats (empty skeleton)

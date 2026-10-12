@@ -1,9 +1,11 @@
 //! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to. There is no TUN device and no kernel routing.
+pub mod dns;
 mod flows;
 pub mod gate;
 mod inbound;
 pub mod netstack;
 pub mod plan;
+pub mod resolver;
 pub mod route;
 
 pub use plan::Plan;
@@ -15,6 +17,7 @@ use inbound::{Peers, Tunnel};
 use ipstack::{IpStack, IpStackConfig, TcpConfig};
 use netstack::PacketDev;
 use plan::Backend;
+use resolver::Resolver;
 use route::Flows;
 use socket2::{Domain, Socket, Type};
 use std::io;
@@ -68,6 +71,21 @@ impl Traffic {
 	}
 }
 
+/// What the node's resolver did with the DNS queries of its tunnels since start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DnsTotals {
+	/// Answered with what a server said.
+	pub answered: u64,
+	/// Answered REFUSED: a rule, the destination gate, a block exit, or an exit the user may not use.
+	pub refused: u64,
+	/// Answered SERVFAIL because no server answered.
+	pub failed: u64,
+	/// Port 53 traffic that was not a DNS query, dropped without an answer.
+	pub malformed: u64,
+	/// Turned away because the user already had too many queries waiting.
+	pub throttled: u64,
+}
+
 /// Indexed like the users, inbounds and exits of the plan.
 struct Counters {users: Vec<Traffic>, inbounds: Vec<Traffic>, exits: Vec<Traffic>, drops: [AtomicU64; Reason::COUNT]}
 
@@ -90,6 +108,7 @@ pub struct Shared {
 	tunnels: Vec<Tunnel>,
 	flows: Flows,
 	counters: Counters,
+	resolver: Resolver,
 	exits: Vec<ExitState>,
 	/// One for all `ws` listeners.
 	relays: Arc<ws::Stats>,
@@ -125,6 +144,17 @@ impl Engine {
 	/// WebSocket connections refused at accept: a listener was full, or one source had too many unfinished upgrades.
 	pub fn ws_refused(&self) -> u64 {self.shared.relays.refused.load(Ordering::Relaxed)}
 
+	pub fn dns(&self) -> DnsTotals {
+		let resolver = &self.shared.resolver;
+		DnsTotals {answered: resolver.answered.load(Ordering::Relaxed), refused: resolver.refused.load(Ordering::Relaxed), failed: resolver.failed.load(Ordering::Relaxed), malformed: resolver.malformed.load(Ordering::Relaxed), throttled: resolver.throttled.load(Ordering::Relaxed)}
+	}
+
+	/// Names the node remembers for a user right now: those the user resolved through it whose answer has not expired.
+	pub fn dns_names(&self, user: &str) -> Option<usize> {self.plan().users.iter().position(|u| u.name == user).map(|i| self.shared.resolver.names(i).names(Instant::now()))}
+
+	/// Clears what the node remembers of one user's DNS answers. False when there is no such user.
+	pub fn forget_names(&self, user: &str) -> bool {self.plan().users.iter().position(|u| u.name == user).map(|i| self.shared.resolver.names(i).clear()).is_some()}
+
 	/// Flows in the flow table right now.
 	pub fn flows(&self) -> usize {self.shared.flows.len()}
 }
@@ -144,7 +174,7 @@ fn bind(addr: SocketAddr, kind: Type) -> io::Result<Socket> {
 /// Brings up every listener and task of a validated config and returns once they are bound.
 pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> {
 	let plan = Plan::new(config, OffsetDateTime::now_utc())?;
-	// One stack serves every exit, so it runs on the longest idle times and each flow's handler enforces its own exit's.
+	// One stack serves every exit, so it runs on the longest idle times and each flow's handler enforces its own exit's. A DNS flow waits for its answer longer than a short `udp_idle_secs` allows.
 	let idle = |pick: fn(&Backend) -> Option<Duration>, default: u32| plan.exits.iter().filter_map(|exit| pick(&exit.backend)).max().unwrap_or(Duration::from_secs(default.into()));
 	let tcp_idle = idle(|backend| if let Backend::Netstack {tcp_idle, ..} = backend {Some(*tcp_idle)} else {None}, DEFAULT_TCP_IDLE_SECS);
 	let udp_idle = idle(|backend| if let Backend::Netstack {udp_idle, ..} = backend {Some(*udp_idle)} else {None}, DEFAULT_UDP_IDLE_SECS);
@@ -184,7 +214,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (to_wg, from_stack) = mpsc::channel::<Vec<u8>>(QUEUE);
 		let (mut stack_config, mut tcp) = (IpStackConfig::default(), TcpConfig::default());
 		tcp.timeout = tcp_idle;
-		stack_config.mtu_unchecked(inbound.mtu).packet_information(false).udp_timeout(udp_idle).with_tcp_config(tcp);
+		stack_config.mtu_unchecked(inbound.mtu).packet_information(false).udp_timeout(udp_idle.max(resolver::FLOW_IDLE)).with_tcp_config(tcp);
 		stacks.push((IpStack::new(stack_config, PacketDev::new(from_wg, to_wg)), from_stack));
 		tracing::info!("inbound {}: public key {}, {}, {} peer(s)", inbound.tag, veilway_wg::encode_key(&wg.public_key()), shown.join(", "), inbound.peers.len());
 		tunnels.push(Tunnel {peers: Mutex::new(Peers {via: vec![0; inbound.peers.len()], wg}), sockets, to_stack});
@@ -204,16 +234,14 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 			Backend::Block => tracing::info!("exit {}: block", exit.tag),
 		}
 	}
-	let domain_rules = plan.rules.iter().filter(|rule| rule.domain).count();
-	if domain_rules > 0 {tracing::info!("{domain_rules} enabled routing rule(s) have a domain condition and never match yet: the node does not remember resolved names in this version")}
 	let counters = Counters {
 		users: plan.users.iter().map(|_| Traffic::default()).collect(),
 		inbounds: plan.inbounds.iter().map(|_| Traffic::default()).collect(),
 		exits: plan.exits.iter().map(|_| Traffic::default()).collect(),
 		drops: Default::default(),
 	};
-	let exits = plan.exits.iter().map(|_| ExitState::default()).collect();
-	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(plan)), tunnels, flows: Flows::default(), counters, exits, relays: relay_stats, is_local: options.is_local});
+	let (exits, resolver) = (plan.exits.iter().map(|_| ExitState::default()).collect(), Resolver::new(&plan));
+	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(plan)), tunnels, flows: Flows::default(), counters, resolver, exits, relays: relay_stats, is_local: options.is_local});
 	for (at, (stack, from_stack)) in stacks.into_iter().enumerate() {inbound::spawn(&shared, at, stack, from_stack)}
 	for relay in serving {tokio::spawn(relay);}
 	tokio::spawn({
