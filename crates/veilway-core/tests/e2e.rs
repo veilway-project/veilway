@@ -2,7 +2,7 @@
 //! and may only egress through local SOCKS5 proxies and responders we control and observe.
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use etherparse::{Icmpv4Type, NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
+use etherparse::{Icmpv4Type, IpNumber, NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
@@ -13,6 +13,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 use veilway_core::config::Config;
 use veilway_core::engine::dns::response;
+use veilway_core::engine::icmp::{MAX_PINGS_PER_DEVICE, MAX_PINGS_PER_USER};
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
 use veilway_core::{DnsTotals, Engine, Options, Reason, Totals};
 
@@ -466,14 +467,47 @@ async fn answer(client:&mut Client, packet:&[u8], sport:u16, dport:u16)->Answer{
 }
 
 /// Sends `packet` from one device until the other receives it unchanged. A device only counts as connected once the
-/// node has processed its first packet after the handshake, so the first tries may be refused.
+/// node has processed its first packet after the handshake, so the first tries may be refused. What else waits at the
+/// receiver, such as the ICMP error for a try of its own that was refused, is passed over.
 async fn delivered(from:&mut Client, to:&mut Client, packet:&[u8])->bool{
 	for _ in 0..20{
 		from.send_ip(packet).await;
-		if let Some(got)=to.recv_ip(Duration::from_millis(150)).await{return got==packet}
+		let deadline=Instant::now()+Duration::from_millis(150);
+		while let Some(left)=deadline.checked_duration_since(Instant::now()){
+			match to.recv_ip(left).await{
+				Some(got) if got==packet=>return true,
+				Some(_)=>{}
+				None=>break,
+			}
+		}
 	}
 	false
 }
+
+/// The next ICMP destination-unreachable a client receives within `budget`: who sent it, its code, the four bytes after
+/// the checksum, and the packet it quotes. Other packets are passed over.
+async fn unreachable(client:&mut Client, budget:Duration)->Option<([u8;4], u8, [u8;4], Vec<u8>)>{
+	let deadline=Instant::now()+budget;
+	while let Some(left)=deadline.checked_duration_since(Instant::now()){
+		let packet=client.recv_ip(left).await?;
+		if packet.len()>=28 && packet[0]==0x45 && packet[9]==1 && packet[20]==3{return Some((packet[12..16].try_into().unwrap(), packet[21], packet[24..28].try_into().unwrap(), packet[28..].to_vec()))}
+	}
+	None
+}
+
+/// Sends `packet` and expects the ICMP error with `code` for it, from the gateway and quoting it whole.
+async fn refused_with(client:&mut Client, packet:&[u8], code:u8){
+	client.send_ip(packet).await;
+	let (from, got, _, quoted)=unreachable(client, Duration::from_secs(3)).await.expect("no icmp error for a rejected packet");
+	assert_eq!((from, got), (GATEWAY, code));
+	assert_eq!(quoted, packet, "the error does not quote the packet it answers");
+}
+
+const PROHIBITED:u8=13;
+const PORT_UNREACHABLE:u8=3;
+const PROTOCOL_UNREACHABLE:u8=2;
+const HOST_UNREACHABLE:u8=1;
+const FRAGMENTATION_NEEDED:u8=4;
 
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn tcp_reaches_the_responder_through_the_socks5(){
@@ -667,7 +701,8 @@ async fn udp_reaches_the_responder_through_an_association(){
 	assert!(seen.contains(&"udp 93.184.216.34:9999".to_string()), "wrong relayed destination: {seen:?}");
 }
 
-/// A proxy that answers an association with REP 0x07 just loses the datagram, and the tunnel lives on.
+/// A proxy that answers an association with REP 0x07 cannot carry the datagram. The default `unsupported.udp` policy is
+/// `reject`, so the sender is told with a port unreachable, the datagram goes nowhere, and the tunnel lives on.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn a_refused_association_drops_the_datagram(){
 	let (backend, _)=tcp_responder().await;
@@ -675,8 +710,8 @@ async fn a_refused_association_drops_the_datagram(){
 	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, true).await;
 	let node=spawn_server(proxy).await;
 	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
-	client.send_ip(&ip_udp(PEER_A, [93, 184, 216, 34], 40011, 9999, b"ping")).await;
-	assert!(client.recv_ip(Duration::from_millis(1500)).await.is_none(), "a refused association still answered");
+	refused_with(&mut client, &ip_udp(PEER_A, [93, 184, 216, 34], 40011, 9999, b"ping"), PORT_UNREACHABLE).await;
+	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "a refused association still answered");
 	assert_eq!(hits.load(Ordering::SeqCst), 0, "the datagram reached the backend anyway");
 	assert!(seen.lock().unwrap().iter().any(|s| s=="associate 0.0.0.0:0"), "the association was never attempted");
 	assert_eq!(node.engine.udp_flips("main"), Some(1), "the switch to no udp was not counted once");
@@ -861,10 +896,11 @@ async fn block_drops_silently_and_reject_resets(){
 	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
 	assert_eq!(knock(&mut client, PEER_A, OTHER, 41020, 80).await, Answer::Silence, "a blocked flow was answered");
 	assert_eq!(knock(&mut client, PEER_A, PUBLIC, 41021, 80).await, Answer::Reset, "a rejected flow was not reset");
-	// Reject has nothing to say to UDP yet, so the datagram is only dropped.
-	client.send_ip(&ip_udp(PEER_A, PUBLIC, 41022, 9999, b"ping")).await;
-	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "a rejected datagram was answered");
-	assert_eq!(node.engine.dropped(Reason::Rule), 3);
+	// Reject answers UDP with an ICMP error, and block answers it with nothing.
+	refused_with(&mut client, &ip_udp(PEER_A, PUBLIC, 41022, 9999, b"ping"), PROHIBITED).await;
+	client.send_ip(&ip_udp(PEER_A, OTHER, 41023, 9999, b"ping")).await;
+	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "a blocked datagram was answered");
+	assert_eq!(node.engine.dropped(Reason::Rule), 4);
 	assert_eq!((hits.load(Ordering::SeqCst), udp_hits.load(Ordering::SeqCst)), (0, 0));
 	assert!(seen.lock().unwrap().is_empty(), "refused traffic still reached the proxy");
 	// The rule names two ports of one address, so the next port of the same address is not its business.
@@ -1081,7 +1117,7 @@ async fn a_user_is_never_sent_through_an_exit_outside_their_exits(){
 	let node=launch(setup).await;
 	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
 	assert_eq!(knock(&mut a, PEER_A, OTHER, 41100, 80).await, Answer::Reset, "the flow was not reset");
-	a.send_ip(&ip_udp(PEER_A, OTHER, 41101, 9999, b"ping")).await;
+	refused_with(&mut a, &ip_udp(PEER_A, OTHER, 41101, 9999, b"ping"), PROHIBITED).await;
 	assert!(a.recv_ip(Duration::from_millis(500)).await.is_none(), "a datagram came back through an exit the user may not use");
 	assert_eq!(node.engine.dropped(Reason::Entitlement), 2);
 	assert_eq!((hits.load(Ordering::SeqCst), udp_hits.load(Ordering::SeqCst)), (0, 0));
@@ -1187,7 +1223,7 @@ async fn the_gateway_answers_dns_and_nothing_else(){
 	let PayloadSlice::Udp(payload)=parsed.payload else{panic!("not udp")};
 	assert_eq!(payload, DNS_ANSWER);
 	assert_eq!(seen.lock().unwrap().as_slice(), ["1.1.1.1:53"], "the query did not go to the configured resolver");
-	client.send_ip(&ip_udp(PEER_A, GATEWAY, 41131, 9999, b"ping")).await;
+	refused_with(&mut client, &ip_udp(PEER_A, GATEWAY, 41131, 9999, b"ping"), PROHIBITED).await;
 	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "the gateway answered something that is not dns");
 	assert_eq!(node.engine.dropped(Reason::Gate), 1);
 	assert_eq!(udp_hits.load(Ordering::SeqCst), 0);
@@ -1242,15 +1278,15 @@ async fn ping_is_answered_by_the_node(){
 	assert_eq!((echoed.id, echoed.seq), (77, 3));
 	let PayloadSlice::Icmpv4(payload)=parsed.payload else{panic!("no icmp payload")};
 	assert_eq!(payload, b"abcdefgh");
-	// Other ICMP has no answer yet and is dropped. Ping to a private address is refused by the rule before the exit sees it.
+	// Other ICMP falls under `unsupported.other`, which rejects by default. Ping to a private address is rejected by the rule before the exit sees it.
 	let builder=PacketBuilder::ipv4(PEER_A, PUBLIC, 64).icmpv4_echo_reply(77, 3);
 	let mut stray=Vec::with_capacity(builder.size(0));
 	builder.write(&mut stray, &[]).unwrap();
-	client.send_ip(&stray).await;
+	refused_with(&mut client, &stray, PROHIBITED).await;
 	let builder=PacketBuilder::ipv4(PEER_A, [192, 168, 1, 1], 64).icmpv4_echo_request(78, 1);
 	let mut private=Vec::with_capacity(builder.size(0));
 	builder.write(&mut private, &[]).unwrap();
-	client.send_ip(&private).await;
+	refused_with(&mut client, &private, PROHIBITED).await;
 	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "something other than a public ping was answered");
 	assert_eq!((node.engine.dropped(Reason::Unsupported), node.engine.dropped(Reason::Rule)), (1, 1));
 	assert!(seen.lock().unwrap().is_empty(), "icmp reached the proxy");
@@ -1710,4 +1746,399 @@ async fn an_answer_too_long_for_an_ipv6_datagram_is_marked_truncated(){
 	let PayloadSlice::Udp(cut)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
 	assert_eq!((reply.len(), cut.len(), &cut[..2]), (1420, 1372, &[0, 62][..]));
 	assert_eq!(cut[2]&0x02, 0x02, "an answer that lost its tail does not say so");
+}
+
+/// A packet of an IP protocol that is neither TCP, UDP nor ICMP, with eight bytes after its header.
+fn ip_other(src:[u8;4], dst:[u8;4], protocol:u8)->Vec<u8>{
+	let mut out=Vec::new();
+	PacketBuilder::ipv4(src, dst, 64).write(&mut out, IpNumber(protocol), &[0, 0, 0x08, 0, 0, 0, 0, 0]).unwrap();
+	out
+}
+
+fn echo_request(src:[u8;4], dst:[u8;4], id:u16, seq:u16, payload:&[u8])->Vec<u8>{
+	let builder=PacketBuilder::ipv4(src, dst, 64).icmpv4_echo_request(id, seq);
+	let mut out=Vec::with_capacity(builder.size(payload.len()));
+	builder.write(&mut out, payload).unwrap();
+	out
+}
+
+/// The setup with `unsupported` on its one exit, whose traffic may then also leave around the proxy.
+fn setup_unsupported(proxy:SocketAddr, unsupported:Value)->Setup{
+	let mut setup=setup(proxy);
+	setup.doc["exits"][0]["backend"]=json!({"type":"netstack", "outbound":"proxy", "proxy_only":false, "unsupported":unsupported});
+	setup
+}
+
+/// Reject answers everything but TCP with the ICMP error for the reason, from the gateway of the sender's own address
+/// family and quoting the packet. It never answers an ICMP error or a packet to a broadcast address.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reject_is_answered_with_the_icmp_error_that_matches(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup(proxy);
+	setup.doc["inbounds"][0]["address"]=json!(["10.7.0.1/24", "fd7a:115c:a1e0::1/64"]);
+	setup.doc["users"][0]["devices"][0]["addresses"]=json!(["10.7.0.2", "fd7a:115c:a1e0::2"]);
+	setup.doc["routing"]["rules"][0]["enabled"]=json!(false);
+	let node=launch(setup).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	refused_with(&mut a, &ip_udp(PEER_A, [192, 168, 1, 1], 43000, 9999, b"ping"), PROHIBITED).await;
+	refused_with(&mut a, &ip_other(PEER_A, [192, 168, 1, 1], 47), PROHIBITED).await;
+	// A protocol the exit does not carry, and a tunnel address nobody holds.
+	refused_with(&mut a, &ip_other(PEER_A, PUBLIC, 47), PROTOCOL_UNREACHABLE).await;
+	refused_with(&mut a, &ip_udp(PEER_A, [10, 7, 0, 9], 43001, 9999, b"ping"), HOST_UNREACHABLE).await;
+	assert_eq!((node.engine.dropped(Reason::Rule), node.engine.dropped(Reason::Unsupported), node.engine.dropped(Reason::Unreachable)), (2, 1, 1));
+	let (device, gateway, private)=("fd7a:115c:a1e0::2".parse::<Ipv6Addr>().unwrap(), "fd7a:115c:a1e0::1".parse::<Ipv6Addr>().unwrap(), "2001:db8::1".parse::<Ipv6Addr>().unwrap());
+	let builder=PacketBuilder::ipv6(device.octets(), private.octets(), 64).udp(43002, 9999);
+	let mut six=Vec::with_capacity(builder.size(4));
+	builder.write(&mut six, b"ping").unwrap();
+	a.send_ip(&six).await;
+	let error=a.recv_ip(Duration::from_secs(3)).await.expect("no icmpv6 error for a rejected packet");
+	// Destination unreachable, administratively prohibited.
+	assert_eq!((&error[8..24], &error[24..40], error[6], &error[40..42]), (&gateway.octets()[..], &device.octets()[..], 58, &[1, 1][..]));
+	assert_eq!(&error[48..], &six[..], "the error does not quote the packet it answers");
+	// An ICMP error, and a packet to the broadcast address of the pool, are refused without a word.
+	let builder=PacketBuilder::ipv4(PEER_A, [192, 168, 1, 1], 64).icmpv4_raw(3, 1, [0;4]);
+	let mut error=Vec::with_capacity(builder.size(28));
+	builder.write(&mut error, &ip_udp([192, 168, 1, 1], PEER_A, 9999, 43000, b"")).unwrap();
+	a.send_ip(&error).await;
+	a.send_ip(&ip_udp(PEER_A, [10, 7, 0, 255], 43003, 9999, b"ping")).await;
+	assert!(a.recv_ip(Duration::from_millis(500)).await.is_none(), "an icmp error or a broadcast was answered");
+	assert_eq!((node.engine.dropped(Reason::Rule), node.engine.dropped(Reason::Unreachable), node.engine.dropped(Reason::IcmpLimited)), (4, 2, 0));
+	assert!(seen.lock().unwrap().is_empty(), "rejected traffic reached the proxy");
+}
+
+/// A device that keeps knocking on a closed door is sent a burst of ICMP errors and then a steady few, however many
+/// packets it sends, and the rest is counted.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn icmp_errors_are_rate_limited_per_device(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, _)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let node=spawn_server(proxy).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	// In batches the node's socket takes without loss, far faster than the share of errors is earned back.
+	for batch in 0..10u16{
+		for sport in 0..20{a.send_ip(&ip_udp(PEER_A, [192, 168, 1, 1], 43100+batch*20+sport, 9999, b"ping")).await}
+		eventually("the node did not get through the rejected packets", || node.engine.dropped(Reason::Rule)==u64::from(batch+1)*20).await;
+	}
+	let mut errors=0u64;
+	while unreachable(&mut a, Duration::from_millis(500)).await.is_some(){errors+=1}
+	assert!((20..=50).contains(&errors), "200 rejected packets in a row were answered with {errors} errors");
+	assert_eq!(node.engine.dropped(Reason::IcmpLimited), 200-errors, "the errors that were not sent were not counted");
+	// The share is per device: another device still gets its answer at once.
+	refused_with(&mut b, &ip_udp(PEER_B, [192, 168, 1, 1], 43400, 9999, b"ping"), PROHIBITED).await;
+}
+
+/// `unsupported.icmp_echo`: `reject` answers a ping with an ICMP error and `drop` with nothing. Neither reaches the proxy.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_ping_is_rejected_or_dropped_as_the_exit_says(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let node=launch(setup_unsupported(proxy, json!({"icmp_echo":"reject"}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	refused_with(&mut a, &echo_request(PEER_A, PUBLIC, 7, 1, b"abcdefgh"), PROHIBITED).await;
+	assert_eq!(node.engine.dropped(Reason::Unsupported), 1);
+	let node=launch(setup_unsupported(proxy, json!({"icmp_echo":"drop"}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	a.send_ip(&echo_request(PEER_A, PUBLIC, 7, 1, b"abcdefgh")).await;
+	assert!(a.recv_ip(Duration::from_millis(500)).await.is_none(), "a dropped ping was answered");
+	assert_eq!(node.engine.dropped(Reason::Unsupported), 1);
+	assert!(seen.lock().unwrap().is_empty(), "a ping reached the proxy");
+}
+
+/// `unsupported.icmp_echo: direct` sends the ping from the node itself through an unprivileged ping socket, and the
+/// answer comes back under the identifier and sequence number the device chose. The only host a test can ping is the
+/// machine it runs on, so the gate is told that the address is not local.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_direct_ping_leaves_from_the_node_and_its_answer_comes_back(){
+	if let Err(e)=veilway_core::engine::icmp::ping_socket(true){return eprintln!("skipped: this system gives the test no unprivileged ping socket ({e})")}
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup_unsupported(proxy, json!({"icmp_echo":"direct"}));
+	// The machine's own address is usually a private one.
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	let node=launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let host=host_ip().octets();
+	for (id, seq, payload) in [(77u16, 3u16, &b"abcdefgh"[..]), (77, 4, b"ijklmnop"), (9000, 1, b"another ping")]{
+		a.send_ip(&echo_request(PEER_A, host, id, seq, payload)).await;
+		let reply=a.recv_ip(Duration::from_secs(3)).await.expect("no echo reply through the ping socket");
+		let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
+		let NetHeaders::Ipv4(ip, _)=parsed.net.unwrap() else{panic!("not ipv4")};
+		assert_eq!((ip.source, ip.destination), (host, PEER_A));
+		let Some(TransportHeader::Icmpv4(icmp))=parsed.transport else{panic!("not icmp")};
+		let Icmpv4Type::EchoReply(echoed)=icmp.icmp_type else{panic!("not an echo reply: {:?}", icmp.icmp_type)};
+		assert_eq!((echoed.id, echoed.seq), (id, seq));
+		let PayloadSlice::Icmpv4(got)=parsed.payload else{panic!("no icmp payload")};
+		assert_eq!(got, payload);
+	}
+	let exit=node.engine.exit("main").unwrap();
+	assert_eq!((exit.up_packets, exit.down_packets, node.engine.dropped(Reason::Unsupported)), (3, 3, 0));
+	assert!(seen.lock().unwrap().is_empty(), "a ping reached the proxy");
+}
+
+/// `unsupported.other`: an IP protocol a netstack exit cannot carry is answered with protocol unreachable under `reject`
+/// and with nothing under `drop`.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn another_ip_protocol_is_rejected_or_dropped_as_the_exit_says(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let node=launch(setup_unsupported(proxy, json!({"other":"reject"}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	refused_with(&mut a, &ip_other(PEER_A, PUBLIC, 47), PROTOCOL_UNREACHABLE).await;
+	refused_with(&mut a, &ip_other(PEER_A, PUBLIC, 50), PROTOCOL_UNREACHABLE).await;
+	let node=launch(setup_unsupported(proxy, json!({"other":"drop"}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	a.send_ip(&ip_other(PEER_A, PUBLIC, 47)).await;
+	assert!(a.recv_ip(Duration::from_millis(500)).await.is_none(), "a dropped packet was answered");
+	assert_eq!(node.engine.dropped(Reason::Unsupported), 1);
+	// The ping the node answers itself is a policy of its own and still works next to it.
+	a.send_ip(&echo_request(PEER_A, PUBLIC, 7, 1, b"abcdefgh")).await;
+	assert!(a.recv_ip(Duration::from_secs(3)).await.is_some(), "the local echo reply is gone");
+	assert!(seen.lock().unwrap().is_empty(), "another protocol reached the proxy");
+}
+
+/// `unsupported.udp: drop`: UDP through a proxy that refuses the association is discarded without an answer, for the
+/// first datagram of the flow and for those after it.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn udp_is_dropped_when_the_exit_says_so_and_the_proxy_has_none(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, hits)=udp_responder().await;
+	let (proxy, _)=socks5_proxy(dns_responder().await, backend, echo, true).await;
+	let node=launch(setup_unsupported(proxy, json!({"udp":"drop"}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for _ in 0..3{
+		a.send_ip(&ip_udp(PEER_A, PUBLIC, 43200, 9999, b"ping")).await;
+		assert!(a.recv_ip(Duration::from_millis(400)).await.is_none(), "dropped udp was answered");
+	}
+	assert_eq!((hits.load(Ordering::SeqCst), node.engine.dropped(Reason::Unsupported), node.engine.udp_flips("main")), (0, 3, Some(1)));
+	// DNS keeps its fallback over TCP whatever the policy says.
+	a.send_ip(&ip_udp(PEER_A, [9, 9, 9, 9], 43201, 53, b"\x12\x34\x01\x00fake-query")).await;
+	let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no dns reply after the fallback");
+	let PayloadSlice::Udp(payload)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
+	assert_eq!(payload, DNS_ANSWER);
+}
+
+/// The decision for a UDP flow is made once, at its first packet: a flow that was rejected stays rejected, and each
+/// later datagram of it is answered with the same error without the proxy being asked again.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_rejected_udp_flow_stays_rejected(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, hits)=udp_responder().await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, true).await;
+	let node=spawn_server(proxy).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for round in 0..3u8{refused_with(&mut a, &ip_udp(PEER_A, PUBLIC, 43250, 9999, &[round;8]), PORT_UNREACHABLE).await}
+	assert_eq!((hits.load(Ordering::SeqCst), node.engine.dropped(Reason::Unsupported), node.engine.flows()), (0, 3, 1));
+	assert_eq!(seen.lock().unwrap().iter().filter(|s| s.starts_with("associate")).count(), 1, "the proxy was asked again for a flow that was already decided");
+}
+
+/// `unsupported.udp: {"via": ...}`: when the proxy of the exit refuses the association, the flow is handed to another
+/// exit and stays there, the user must be entitled to that exit too, and a target that cannot carry it rejects it.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn udp_goes_via_another_exit_when_the_proxy_has_none(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, hits)=udp_responder().await;
+	let (first, seen_first)=socks5_proxy(dns_responder().await, backend, echo, true).await;
+	let (second, seen_second)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let via=|second:SocketAddr|{
+		let mut setup=setup_unsupported(first, json!({"udp":{"via":"second"}}));
+		add_exit(&mut setup.doc, "second", second);
+		setup.doc["users"][1]["exits"]=json!(["main"]);
+		setup
+	};
+	let node=launch(via(second)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for round in 0..3u8{
+		a.send_ip(&ip_udp(PEER_A, PUBLIC, 43300, 9999, &[b'a'+round;4])).await;
+		let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no udp reply via the second exit");
+		let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
+		let NetHeaders::Ipv4(ip, _)=parsed.net.unwrap() else{panic!("not ipv4")};
+		assert_eq!((ip.source, ip.destination), (PUBLIC, PEER_A));
+		let PayloadSlice::Udp(payload)=parsed.payload else{panic!("not udp")};
+		assert_eq!(payload, [&b"echo:"[..], &[b'a'+round;4]].concat());
+	}
+	assert_eq!(hits.load(Ordering::SeqCst), 3);
+	// One refused association on the first proxy for the whole flow, and every datagram through the second.
+	assert_eq!(seen_first.lock().unwrap().as_slice(), ["associate 0.0.0.0:0"]);
+	assert_eq!(seen_second.lock().unwrap().iter().filter(|s| *s=="udp 93.184.216.34:9999").count(), 3);
+	let (main, onward)=(node.engine.exit("main").unwrap(), node.engine.exit("second").unwrap());
+	assert!(main.up_packets==3 && main.down_packets==3 && onward.up_packets>=2 && onward.down_packets==3, "main {main:?}, second {onward:?}");
+	// TCP never takes the detour.
+	handshake(&mut a, PUBLIC, 43301, 80).await;
+	eventually("tcp did not go through the proxy of its own exit", || seen_first.lock().unwrap().contains(&"93.184.216.34:80".to_string())).await;
+	// User b may use `main` only, so the flow is not handed on for them.
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	refused_with(&mut b, &ip_udp(PEER_B, PUBLIC, 43302, 9999, b"ping"), PROHIBITED).await;
+	assert_eq!((node.engine.dropped(Reason::Entitlement), hits.load(Ordering::SeqCst)), (1, 3));
+	// A target whose own proxy has no UDP either rejects the flow. Its own policy is not asked.
+	let (deaf, seen_deaf)=socks5_proxy(dns_responder().await, backend, echo, true).await;
+	let node=launch(via(deaf)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	refused_with(&mut a, &ip_udp(PEER_A, PUBLIC, 43303, 9999, b"ping"), PORT_UNREACHABLE).await;
+	assert_eq!(seen_deaf.lock().unwrap().as_slice(), ["associate 0.0.0.0:0"]);
+	assert_eq!((node.engine.udp_flips("main"), node.engine.udp_flips("second"), hits.load(Ordering::SeqCst)), (Some(1), Some(1), 3));
+}
+
+/// `unsupported.udp: direct` sends UDP from the node itself around a proxy that has none, which the config only allows
+/// on an exit that says `"proxy_only": false`. TCP still goes through the proxy.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn udp_goes_around_the_proxy_only_when_the_exit_is_not_proxy_only(){
+	let host=host_ip();
+	let (backend, _)=tcp_responder().await;
+	let (echo, hits)=udp_responder_on(host).await;
+	let (proxy, seen)=socks5_proxy(dns_responder().await, backend, echo, true).await;
+	let mut strict=setup(proxy);
+	strict.doc["exits"][0]["backend"]["unsupported"]=json!({"udp":"direct"});
+	let report=Config::parse(strict.doc.to_string().as_bytes()).unwrap().validate(false);
+	assert!(report.errors.iter().any(|e| e.to_string().contains("exits[0].backend.unsupported.udp")), "a proxy_only exit was allowed to send udp around its proxy: {:#?}", report.errors);
+	let mut setup=setup_unsupported(proxy, json!({"udp":"direct"}));
+	// The machine's own address is usually a private one.
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	let node=launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	for round in 0..2u8{
+		a.send_ip(&ip_udp(PEER_A, host.octets(), 43350, echo.port(), &[b'a'+round;4])).await;
+		let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no udp reply around the proxy");
+		let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
+		let NetHeaders::Ipv4(ip, _)=parsed.net.unwrap() else{panic!("not ipv4")};
+		assert_eq!((ip.source, ip.destination), (host.octets(), PEER_A));
+		let PayloadSlice::Udp(payload)=parsed.payload else{panic!("not udp")};
+		assert_eq!(payload, [&b"echo:"[..], &[b'a'+round;4]].concat());
+	}
+	assert_eq!((hits.load(Ordering::SeqCst), node.engine.udp_flips("main")), (2, Some(1)));
+	assert_eq!(seen.lock().unwrap().as_slice(), ["associate 0.0.0.0:0"], "udp was not sent around the proxy, or the proxy was asked twice for one flow");
+	handshake(&mut a, PUBLIC, 43351, 80).await;
+	eventually("tcp did not go through the proxy", || seen.lock().unwrap().contains(&"93.184.216.34:80".to_string())).await;
+}
+
+/// A UDP flow the proxy has carried never leaves another way. When the proxy ends the association and refuses the next
+/// one, the flow is refused, whatever `unsupported.udp` would have done with it at its first packet.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_udp_flow_the_proxy_has_carried_never_goes_around_it(){
+	let host=host_ip();
+	let (echo, hits)=udp_responder_on(host).await;
+	// A proxy that grants one association, answers its first datagram itself, ends it and refuses every later one.
+	let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let (proxy, asked)=(listener.local_addr().unwrap(), Arc::new(AtomicUsize::new(0)));
+	tokio::spawn({
+		let asked=asked.clone();
+		async move{
+			loop{
+				let Ok((mut client, _))=listener.accept().await else{return};
+				let mut request=[0u8;10];
+				if client.read_exact(&mut request[..4]).await.is_err()|| client.write_all(&[5, 0]).await.is_err()|| client.read_exact(&mut request).await.is_err(){continue}
+				if asked.fetch_add(1, Ordering::SeqCst)>0{
+					let _=client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+					continue;
+				}
+				let relay=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+				let mut granted=vec![5, 0, 0, 1, 127, 0, 0, 1];
+				granted.extend_from_slice(&relay.local_addr().unwrap().port().to_be_bytes());
+				if client.write_all(&granted).await.is_err(){continue}
+				let mut framed=vec![0u8;2048];
+				let Ok((n, peer))=relay.recv_from(&mut framed).await else{continue};
+				let _=relay.send_to(&[&framed[..10], b"proxy:", &framed[10..n]].concat(), peer).await;
+				// The answer must be on its way to the device before the control connection goes.
+				tokio::time::sleep(Duration::from_millis(200)).await;
+			}
+		}
+	});
+	let mut setup=setup_unsupported(proxy, json!({"udp":"direct"}));
+	// The machine's own address is usually a private one.
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	let node=launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	a.send_ip(&ip_udp(PEER_A, host.octets(), 43360, echo.port(), b"one")).await;
+	let reply=a.recv_ip(Duration::from_secs(5)).await.expect("no udp reply through the proxy");
+	let PayloadSlice::Udp(payload)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
+	assert_eq!(payload, &b"proxy:one"[..]);
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	for round in 0..3u8{refused_with(&mut a, &ip_udp(PEER_A, host.octets(), 43360, echo.port(), &[round;8]), PORT_UNREACHABLE).await}
+	assert_eq!((hits.load(Ordering::SeqCst), asked.load(Ordering::SeqCst)), (0, 2), "the flow left around the proxy, or the proxy was asked again after the flow was refused");
+}
+
+/// Pings that leave from the node are bounded for a user as well as for a device, so a user with many devices cannot
+/// take every ping socket of the node and shut out everybody else's pings.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn one_user_cannot_hold_every_direct_ping(){
+	if let Err(e)=veilway_core::engine::icmp::ping_socket(true){return eprintln!("skipped: this system gives the test no unprivileged ping socket ({e})")}
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, _)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup_unsupported(proxy, json!({"icmp_echo":"direct"}));
+	// The machine's own address is usually a private one.
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	let more=[veilway_wg::generate_key(), veilway_wg::generate_key()];
+	for (key, name, address) in [(&more[0], "second", "10.7.0.4"), (&more[1], "third", "10.7.0.5")]{
+		setup.doc["users"][0]["devices"].as_array_mut().unwrap().push(json!({"name":name, "public_key":encoded(key), "addresses":[address]}));
+	}
+	let node=launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await;
+	let (host, mut devices)=(host_ip().octets(), Vec::new());
+	for (key, src) in [(node.keys[0], PEER_A), (more[0], [10, 7, 0, 4]), (more[1], [10, 7, 0, 5])]{devices.push((Client::connect(key, node.public, node.addr).await, src))}
+	// Two devices use up the user's share between them, each inside its own.
+	let full=MAX_PINGS_PER_USER/MAX_PINGS_PER_DEVICE;
+	for (client, src) in &mut devices[..full]{
+		for id in 1..=MAX_PINGS_PER_DEVICE as u16{
+			client.send_ip(&echo_request(*src, host, id, 1, b"abcdefgh")).await;
+			let reply=client.recv_ip(Duration::from_secs(3)).await.expect("no echo reply inside the user's share");
+			assert_eq!((reply[9], reply[20]), (1, 0), "not an echo reply");
+		}
+	}
+	let (third, src)=&mut devices[full];
+	third.send_ip(&echo_request(*src, host, 1, 1, b"abcdefgh")).await;
+	assert!(third.recv_ip(Duration::from_millis(500)).await.is_none(), "a ping over the user's share was answered");
+	assert_eq!(node.engine.dropped(Reason::FlowTableFull), 1);
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	b.send_ip(&echo_request(PEER_B, host, 1, 1, b"abcdefgh")).await;
+	assert!(b.recv_ip(Duration::from_secs(3)).await.is_some(), "another user's ping was shut out");
+}
+
+/// A packet between users that is too big for the tunnel of the device it goes to is answered with "fragmentation
+/// needed" and the MTU that does fit, instead of being delivered or lost without a word.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_packet_too_big_for_the_other_tunnel_is_answered_with_its_mtu(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (proxy, _)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup(proxy);
+	let (office, office_listen, key_c)=(veilway_wg::generate_key(), listen(), veilway_wg::generate_key());
+	let mut small=inbound("office", &office, "10.8.0.1/24", udp(office_listen));
+	small["mtu"]=json!(1280);
+	setup.doc["inbounds"].as_array_mut().unwrap().push(small);
+	setup.doc["users"].as_array_mut().unwrap().push(user("c", &key_c, "10.8.0.2"));
+	setup.doc["routing"]["rules"][0]["enabled"]=json!(false);
+	let node=launch(setup).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut c=Client::connect(key_c, veilway_wg::public_key(&office), office_listen).await;
+	assert!(delivered(&mut a, &mut c, &ip_udp(PEER_A, PEER_C, 43400, 7777, &[7;1200])).await, "a packet that fits was not delivered");
+	// The first tries may have been answered as unreachable, before the other device counted as connected.
+	while a.recv_ip(Duration::from_millis(200)).await.is_some(){}
+	let big=ip_udp(PEER_A, PEER_C, 43400, 7777, &[7;1300]);
+	a.send_ip(&big).await;
+	let (from, code, rest, quoted)=unreachable(&mut a, Duration::from_secs(3)).await.expect("no icmp error for a packet that is too big");
+	assert_eq!((from, code, rest), (GATEWAY, FRAGMENTATION_NEEDED, [0, 0, 5, 0]));
+	assert_eq!(quoted, big[..548]);
+	assert!(c.recv_ip(Duration::from_millis(300)).await.is_none(), "a packet over the mtu was delivered");
+	assert_eq!(node.engine.dropped(Reason::TooBig), 1);
+}
+
+/// Return traffic finds its way by the routes of the pools, which only one interface can have, so a second `l3` exit
+/// is refused at start with both exits named, before anything is created on the host.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_second_l3_exit_is_refused_at_start(){
+	let mut setup=setup(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+	for (tag, interface) in [("first-l3", "vwfirst0"), ("second-l3", "vwsecond0")]{
+		setup.doc["exits"].as_array_mut().unwrap().push(json!({"tag":tag, "backend":{"type":"l3", "interface":interface, "masquerade":false}}));
+	}
+	let config=Config::parse(setup.doc.to_string().as_bytes()).unwrap();
+	assert!(config.validate(false).errors.is_empty());
+	let error=veilway_core::start(&config, Options::new("")).await.err().expect("two l3 exits started").to_string();
+	assert!(error.contains("`first-l3`") && error.contains("`second-l3`") && error.contains("one l3 exit"), "{error}");
+	assert!(!std::path::Path::new("/sys/class/net/vwfirst0").exists());
 }

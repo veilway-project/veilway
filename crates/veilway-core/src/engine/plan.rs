@@ -1,6 +1,6 @@
 //! Everything the engine derives from a config, built once and never changed. Tasks read it through `Shared::plan`, so a reload can later swap in a new one in a single step.
-use crate::config::{self, Config, Exits, IpEntry, Policy, Transport, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE};
-use anyhow::{anyhow, bail};
+use crate::config::{self, Config, Exits, IpEntry, Policy, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE};
+use anyhow::anyhow;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -13,8 +13,14 @@ pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>}
 
 pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
 
+/// What a netstack exit does with one class of traffic its outbound cannot carry: a policy of `unsupported`, with a `via` resolved to its exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fallback {Local, Reject, Drop, Direct, Via(usize)}
+
 pub enum Backend {
-	Netstack {outbound: Outbound, tcp_idle: Duration, udp_idle: Duration, icmp_echo: Policy},
+	Netstack {outbound: Outbound, tcp_idle: Duration, udp_idle: Duration, icmp_echo: Fallback, udp: Fallback, other: Fallback},
+	/// A TUN device of this name that the kernel forwards from. With `masquerade` the node also sets the host up for it.
+	L3 {interface: String, masquerade: bool},
 	Block,
 }
 
@@ -110,6 +116,16 @@ impl Plan {
 		let outbound_tags = index(config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => tag.as_str()}).collect());
 		let (exit_tags, inbound_tags) = (index(config.exits.iter().map(|exit| exit.tag.as_str()).collect()), index(config.inbounds.iter().map(|inbound| inbound.tag.as_str()).collect()));
 		let (group_names, user_names) = (index(config.groups.iter().map(String::as_str).collect()), index(config.users.iter().map(|user| user.name.as_str()).collect()));
+		let fallback = |policy: &Option<Policy>, default: Fallback| -> anyhow::Result<Fallback> {
+			Ok(match policy {
+				None => default,
+				Some(Policy::Local) => Fallback::Local,
+				Some(Policy::Reject) => Fallback::Reject,
+				Some(Policy::Drop) => Fallback::Drop,
+				Some(Policy::Direct) => Fallback::Direct,
+				Some(Policy::Via(tag)) => Fallback::Via(find(&exit_tags, tag)?),
+			})
+		};
 		let mut exits = Vec::with_capacity(config.exits.len());
 		for exit in &config.exits {
 			let backend = match &exit.backend {
@@ -127,9 +143,11 @@ impl Plan {
 					},
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
-					icmp_echo: netstack.unsupported.icmp_echo.clone().unwrap_or(Policy::Local),
+					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,
+					udp: fallback(&netstack.unsupported.udp, Fallback::Reject)?,
+					other: fallback(&netstack.unsupported.other, Fallback::Reject)?,
 				},
-				config::Backend::L3(_) => bail!("exit `{}` has an l3 backend, which this build cannot run yet: use a netstack or block backend", exit.tag),
+				config::Backend::L3(l3) => Backend::L3 {interface: l3.interface.clone().unwrap_or_else(|| DEFAULT_INTERFACE.to_string()), masquerade: l3.masquerade != Some(false)},
 				config::Backend::Block {} => Backend::Block,
 			};
 			exits.push(Exit {tag: exit.tag.clone(), backend});

@@ -37,13 +37,13 @@ The goal is one ecosystem that covers what today takes a proxy core, a separate 
 
 | Part | What it does |
 |---|---|
-| Server (`veilway run`) | Terminates WireGuard in userspace for many peers, over UDP and over WebSocket (one WireGuard datagram is one binary frame). No TUN device, no kernel routing, no root needed beyond binding a port below 1024. |
-| SOCKS5 egress | Every TCP and UDP flow a peer sends is re-dialled through an upstream SOCKS5, globally or per peer. DNS falls back to TCP when the upstream has no UDP. |
-| Peer isolation | A peer reaches the public internet through the proxy and nothing else: not other peers, the gateway, the host or private ranges, unless `allow_private` is set. |
+| Server (`veilway run`) | Terminates WireGuard in userspace for many peers, over UDP and over WebSocket (one WireGuard datagram is one binary frame). With `netstack` exits there is no TUN device, no kernel routing and no root needed beyond binding a port below 1024. An `l3` exit (Linux) adds one TUN device and needs `CAP_NET_ADMIN`. |
+| Egress | Each flow leaves through the exit the routing rules choose for it. An exit re-dials TCP and UDP through its outbound, an upstream SOCKS5 or a direct connection from the node, or hands every IP protocol to the kernel of a Linux host. DNS falls back to TCP when a SOCKS5 upstream has no UDP. |
+| Peer isolation | A peer never reaches the gateway or the host. Whether it reaches other users and private ranges is decided by routing rules, and the example config rejects both. |
 | Bridge (`veilway bridge`) | `client` gives a stock WireGuard app a local UDP endpoint and carries it over `wss://`. `relay` accepts WebSocket and forwards to any WireGuard UDP port. |
 | Desktop client | Windows only. Reads a normal WireGuard `.conf`, runs the tunnel in-process over UDP or WebSocket on a Wintun adapter, sets routes and DNS to go through the tunnel. |
 
-Known limits: IPv4 only inside the tunnel (the Windows client routes IPv6 into the adapter and drops it there instead of letting it bypass the tunnel), ICMP and other non-TCP/UDP protocols do not pass a SOCKS5 upstream, the server runs on config version 1, so several inbounds, routing rules and users exist, but there is no config reload, no quotas, no panel and no control API yet, and the node answers ICMP ping itself while other non-TCP/UDP protocols are not carried yet.
+Known limits: IPv4 only inside the tunnel (the Windows client routes IPv6 into the adapter and drops it there instead of letting it bypass the tunnel), ICMP and other non-TCP/UDP protocols do not pass a SOCKS5 upstream (the node answers ping itself, and only an `l3` exit on Linux carries every IP protocol), and there is no config reload, no quotas, no panel and no control API yet.
 
 ### Planned
 
@@ -63,7 +63,7 @@ The full plan with the gate for each phase is in [PLAN.md](PLAN.md).
 
 ## Quick start
 
-There is no published release yet, so build from source. You need a stable Rust toolchain and an upstream SOCKS5 proxy the server can reach.
+There is no published release yet, so build from source. You need a stable Rust toolchain. An upstream SOCKS5 proxy is optional: an exit can also leave directly from the server.
 
 ### 1. Build (~5 min)
 
@@ -98,7 +98,7 @@ Edit `config.json`:
 - Put a key from `veilway genkey` in the `private_key` of every inbound you keep. The example keys are placeholders.
 - In the `proxy` outbound, set `server` and the credentials to your SOCKS5 proxy. To leave without a proxy, point the `main` exit's `outbound` at `plain`, the direct outbound.
 - Under `users`, put each device's public key in `public_key`, with an `addresses` entry from the pool of its inbound.
-- Remove the `node` exit for now, because the `l3` backend is not built yet, and everything that names it: the `staff-intranet` and `staff-ping` rules, alice's `"exit": "node"` and `"node"` in bob's `exits`.
+- The `node` exit needs Linux with `CAP_NET_ADMIN` and the `ip` and `nft` programs (iproute2 and nftables); anywhere else, remove it and everything that names it: the `staff-intranet` and `staff-ping` rules, alice's `"exit": "node"` and `"node"` in bob's `exits`.
 - The `ws` transport on port 443 needs certificate files at the `tls` paths, relative to the config directory. Delete that transport to start with UDP only.
 
 `veilway run` refuses a config that group or others can read, so restrict it, then validate it:
@@ -222,7 +222,7 @@ flowchart LR
     S x--x O
 ```
 
-The server has no TUN device. It decrypts each packet, checks that the source address belongs to that peer, feeds it to a userspace TCP/IP stack and opens one SOCKS5 connection or association per flow. Flows are capped at 4096 in total and 512 per peer.
+It decrypts each packet, checks that the source address belongs to that device, and routes it by the rules. For a `netstack` exit the packet goes to a userspace TCP/IP stack, which opens one connection or association per flow through the exit's outbound, with no TUN device. For an `l3` exit it is written to a TUN device and the kernel forwards it. Flows are capped at 65536 in total, 1024 per user and 512 per device.
 
 The planned shape. Nothing in this second diagram beyond the tunnel and the SOCKS5 exit exists yet:
 

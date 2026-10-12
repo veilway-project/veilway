@@ -23,5 +23,9 @@ time.workspace=true
 ring.workspace=true
 socket2.workspace=true
 
+# The one ioctl that makes the TUN device of an l3 exit.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace=true
+
 [dev-dependencies]
 boringtun.workspace=true

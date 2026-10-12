@@ -363,6 +363,13 @@ impl AsyncWrite for IpStackTcpStream {
             return Poll::Ready(Err(std::io::Error::new(BrokenPipe, "TCP connection closed")));
         }
 
+        // veilway patch: the task that answers the SYN may not have run yet. Data written before it left ahead of the
+        // SYN/ACK under the initial sequence number, which no peer accepts. Wait until the SYN/ACK is on its way.
+        if state == TcpState::Listen {
+            self.write_notify.lock().unwrap().replace(cx.waker().clone());
+            return Poll::Pending;
+        }
+
         if send_window == 0 || is_full {
             self.write_notify.lock().unwrap().replace(cx.waker().clone());
             let info = format!("current send window: {send_window}, send buffer full: {is_full}");
@@ -546,6 +553,8 @@ async fn tcp_main_logic_loop(
         let state = tcb.get_state();
         log::trace!("{network_tuple} {state:?}: session now in {state:?} state");
     }
+    // veilway patch: a writer that came before the SYN/ACK waits in poll_write, see there.
+    write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
 
     let tcb_clone = tcb.clone();
 
