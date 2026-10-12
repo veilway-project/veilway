@@ -14,7 +14,9 @@ edition = "2024"
 name = "ipstack"
 version = "1.0.1"
 authors = ["Narrowlink <opensource@narrowlink.com>"]
-build = "build.rs"
+# veilway patch: the upstream build script only copies wintun.dll for its own examples, and on Windows it runs
+# `cargo metadata` in this directory, which fails inside another workspace. The examples are not built here.
+build = false
 autolib = false
 autobins = false
 autoexamples = false
