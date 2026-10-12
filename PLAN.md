@@ -4,9 +4,9 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 1 (not started). Phase 0 is done and its gate passed: 42 tests green on Linux, and a stock WireGuard client connects over UDP and over WebSocket.
+- Active phase: 1, step 1 in progress. Done: config v1 model, strict parser, validation, JSON Schema, `veilway check` and `veilway schema` (the format is specified in `veilway-docs`, `reference/config.md`). Left in step 1: the reload module, a fuzz target for the parser, the Persian reference page.
 - Last finished step: Phase 0, step 5
-- Next action: Phase 1, step 1 (config v1 with JSON Schema, validation and hot reload)
+- Next action: finish Phase 1 step 1 (reload, fuzz target), then step 2 (the engine moves from `legacy.rs` to config v1)
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 
@@ -158,7 +158,7 @@ The three classes are: ICMP echo, UDP when the upstream has no UDP ASSOCIATE (DN
 
 - `l3` needs `CAP_NET_ADMIN` on Linux (a TUN device and nftables rules). It is the default on a normal VPS.
 - `netstack` needs no privileges and keeps the current code's "can only leave through this proxy" guarantee. It is what the existing code does.
-- Peer isolation is enforced in the engine before a packet reaches any backend: source address must belong to that peer, and peer-to-peer, gateway, host and private ranges are refused unless allowed. With `l3`, nftables rules repeat the same policy as a second layer.
+- Isolation is enforced in the engine before a packet reaches any backend. Always, whatever the config says: a device can only send from its own addresses, and the gateway, the node's own addresses, loopback and link-local are never reachable. Traffic between users and traffic to private networks are decided by routing rules (`tunnel:users` and `geoip:private`), so an operator can open a shared network for games or a route to an office LAN. The default config rejects both, and `veilway check` warns when either is open. With `l3`, nftables rules repeat the same policy as a second layer.
 
 ### Exits: several locations behind one address and port
 

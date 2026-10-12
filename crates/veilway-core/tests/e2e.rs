@@ -184,7 +184,7 @@ async fn spawn_listening(listeners:&str, upstream:&str, dns:Option<&str>, extra:
 		r#"{{"private_key":"{}","address":"10.7.0.1/24","mtu":1420,{listeners},"upstream":"{upstream}"{dns}{extra},
 		 "peers":[{{"public_key":"{}","allowed_ips":["10.7.0.2/32"]}},{{"public_key":"{}","allowed_ips":["10.7.0.3/32"]}}]}}"#,
 		veilway_wg::encode_key(&private), veilway_wg::encode_key(&veilway_wg::public_key(&keys[0])), veilway_wg::encode_key(&veilway_wg::public_key(&keys[1])));
-	let cfg:veilway_core::config::Config=serde_json::from_str(&json).unwrap();
+	let cfg:veilway_core::legacy::Config=serde_json::from_str(&json).unwrap();
 	cfg.validate().unwrap();
 	let running=veilway_core::start(cfg).await.unwrap();
 	Node{addr:running.udp_addr, ws:running.ws_addr, public:veilway_wg::public_key(&private), keys}
@@ -529,13 +529,19 @@ async fn an_idle_tcp_flow_lives_exactly_as_long_as_tcp_idle_secs(){
 
 #[test]
 fn egress_never_dials_directly(){
-	let src=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	for entry in std::fs::read_dir(&src).unwrap(){
-		let path=entry.unwrap().path();
-		let text=std::fs::read_to_string(&path).unwrap();
-		// The only direct dial allowed is the control connection to the proxy itself.
-		for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
-			assert!(line.contains("up.addr"), "{} dials {} without the proxy", path.display(), line.trim());
+	let mut dirs=vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+	while let Some(dir)=dirs.pop(){
+		for entry in std::fs::read_dir(&dir).unwrap(){
+			let path=entry.unwrap().path();
+			if path.is_dir(){
+				dirs.push(path);
+				continue;
+			}
+			let text=std::fs::read_to_string(&path).unwrap();
+			// The only direct dial allowed is the control connection to the proxy itself.
+			for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
+				assert!(line.contains("up.addr"), "{} dials {} without the proxy", path.display(), line.trim());
+			}
 		}
 	}
 }
