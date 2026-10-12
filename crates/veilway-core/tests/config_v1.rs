@@ -702,7 +702,7 @@ fn disabled_rules() {
 
 #[test]
 fn private_networks_and_geoip() {
-	for bad in ["geoip:ir", "geoip:", "geoip:Private", "geoip:private ", "GEOIP:private", "geosite:private", "private", "geoip:private/8", "tunnel:gateways", "tunnel:", "tunnel:Users", "tunnel:users/24", "users", "2001:db8::1/32", "fe80::%eth0/64", "::ffff:10.0.0.0/104"] {
+	for bad in ["geoip:ir", "geoip:", "geoip:Private", "geoip:private ", "GEOIP:private", "geosite:private", "private", "geoip:private/8", "tunnel:", "tunnel:Users", "tunnel:users/24", "tunnel:ho.me", "tunnel:-home", "tunnel:home ", "users", "2001:db8::1/32", "fe80::%eth0/64", "::ffff:10.0.0.0/104"] {
 		let message = refused("routing.rules[1].ip[0]", |d| d["routing"]["rules"][1]["ip"] = json!([bad]));
 		assert!(!bad.contains(':') || message.contains("geoip:private") && message.contains("tunnel:users") && message.contains("this version"), "{bad}: {message}");
 	}
@@ -787,6 +787,40 @@ fn traffic_between_users() {
 			d["routing"]["rules"].as_array_mut().unwrap().insert(1, json!({"tag": "isolate", "ip": ["tunnel:users"], "action": "reject"}));
 		};
 	};
+}
+
+#[test]
+fn one_tunnel_by_its_inbound_tag() {
+	let first = |d: &mut Value, rule: Value| d["routing"]["rules"].as_array_mut().unwrap().insert(0, rule);
+	let lan = json!({"tag": "office-lan", "inbound": ["office"], "ip": ["tunnel:office"], "action": "user"});
+	// The shared network of the reference: one rule before the isolating one, and users are still isolated everywhere else.
+	all_clean! {
+		|d| first(d, lan.clone());
+		|d| first(d, json!({"tag": "to-any", "group": ["staff"], "ip": ["tunnel:home", "tunnel:office", "10.9.0.0/24"], "action": "user"}));
+		|d| first(d, json!({"tag": "no-office", "ip": ["tunnel:office"], "action": "block"}));
+		|d| d["exits"][3]["tag"] = json!("users");
+	};
+	let config = parse(&with(|d| first(d, lan.clone()))).unwrap();
+	assert_eq!(serde_json::to_value(&config).unwrap()["routing"]["rules"][0], lan);
+	cases! {error_at:
+		"routing.rules[0].ip[0]": |d| first(d, json!({"tag": "lan", "ip": ["tunnel:missing"], "action": "user"}));
+		"routing.rules[0].ip[1]": |d| first(d, json!({"tag": "lan", "ip": ["tunnel:home", "tunnel:gateways"], "action": "user"}));
+		"routing.rules[0].ip[0]": |d| first(d, json!({"tag": "lan", "enabled": false, "ip": ["tunnel:main"], "action": "user"}));
+		"routing.rules[0].ip[1]": |d| first(d, json!({"tag": "lan", "ip": ["tunnel:office", "tunnel:office"], "action": "user"}));
+		"inbounds[1].tag": |d| d["inbounds"][1]["tag"] = json!("users");
+	};
+	// Refusing every tunnel by its tag is not the rule the isolation warning asks for.
+	let report = check(&with(|d| d["routing"]["rules"][0]["ip"] = json!(["tunnel:home", "tunnel:office"])));
+	assert!(report.errors.is_empty() && report.warnings.len() == 1 && report.warnings[0].path == "routing.rules" && report.warnings[0].message.contains("tunnel:users"), "{report:#?}");
+	// A tag covers what lies in the pools of its own inbound, gateways left out, and tunnel:users covers every tag.
+	let report = check(&with(|d| {
+		first(d, json!({"tag": "office-devices", "ip": ["tunnel:office"], "action": "user"}));
+		rule(d, json!({"tag": "office-half", "ip": ["10.8.0.128/25"], "action": "user"}));
+		rule(d, json!({"tag": "home-half", "ip": ["10.7.0.128/25"], "action": "user"}));
+		rule(d, json!({"tag": "home-devices", "group": ["staff"], "ip": ["tunnel:home"], "action": "user"}));
+		rule(d, json!({"tag": "office-gateway", "ip": ["10.8.0.0/25"], "action": "user"}));
+	}));
+	assert_eq!(report.warnings.iter().map(|w| (w.path.as_str(), w.message.contains("routing.rules[0] "), w.message.contains("routing.rules[1] "))).collect::<Vec<_>>(), [("routing.rules[5]", true, false), ("routing.rules[6]", false, true), ("routing.rules[7]", false, true)], "{report:#?}");
 }
 
 #[test]

@@ -1,5 +1,5 @@
 //! Everything that relates one value of the document to another. Messages name other places by path and never repeat a value.
-use super::model::domain;
+use super::model::{domain, ident};
 use super::*;
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
@@ -20,11 +20,6 @@ impl Bits {
 	fn has(&self, i: usize) -> bool {self.0[i >> 6] >> (i & 63) & 1 == 1}
 
 	fn meets(&self, other: &Bits) -> bool {(0..4).any(|i| self.0[i] & other.0[i] != 0)}
-}
-
-/// `[a-z0-9][a-z0-9_-]{0,63}`, with `.` as well when `dot` is set.
-fn ident(s: &str, dot: bool) -> bool {
-	(1..=MAX_NAME_BYTES).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || (dot && b == b'.')) && s.as_bytes()[0].is_ascii_alphanumeric()
 }
 
 /// Maps each entry to its first index and reports every later copy: a list never holds the same entry twice.
@@ -79,6 +74,8 @@ impl Config {
 		let groups = index(&mut r, |i| format!("groups[{i}]"), self.groups.iter().map(String::as_str));
 		if self.inbounds.len() > MAX_INBOUNDS {r.error("inbounds", format!("expected at most {MAX_INBOUNDS} inbounds"))}
 		let inbound_tags = tags(&mut r, "inbounds", self.inbounds.iter().map(|inbound| inbound.tag.as_str()));
+		// `tunnel:users` in a rule already means every inbound, so no inbound can be called that.
+		if let Some(i) = inbound_tags.get(RESERVED_INBOUND_TAG) {r.error(format!("inbounds[{i}].tag"), format!("expected a tag that is not `{RESERVED_INBOUND_TAG}`: tunnel:{RESERVED_INBOUND_TAG} stands for the pools of every inbound"))}
 		let mut pools: Vec<(IpNet, usize)> = Vec::new();
 		let mut inbound_keys: HashMap<[u8; 32], usize> = HashMap::new();
 		let mut listeners: Vec<(String, &Transport)> = Vec::new();
@@ -289,11 +286,12 @@ impl Config {
 			};
 			if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || link_local || pools.iter().any(|(pool, _)| pool.contains(&ip)) {r.error(format!("dns.servers[{i}]"), "expected an address that is not loopback, link-local, unspecified, multicast or inside an inbound pool")}
 		}
-		// Whether every address of a network is matched by an `ip` entry. `geoip:private` leaves the inbound pools to `tunnel:users`, which leaves out the gateways.
+		// Whether every address of a network is matched by an `ip` entry. `geoip:private` leaves the inbound pools to the `tunnel:` names, which leave out the gateways.
 		let inside = |entry: &IpEntry, net: &IpNet| match entry {
 			IpEntry::Net(outer) => outer.contains(net),
 			IpEntry::Private => private.iter().any(|outer| outer.contains(net)) && !pools.iter().any(|(pool, _)| pool.contains(&net.network()) || net.contains(&pool.network())),
 			IpEntry::Users => pools.iter().any(|(pool, _)| pool.contains(net) && !net.contains(&pool.addr())),
+			IpEntry::Tunnel(tag) => inbound_tags.get(tag.as_str()).is_some_and(|inbound| pools.iter().any(|(pool, owner)| owner == inbound && pool.contains(net) && !net.contains(&pool.addr()))),
 		};
 		let rules = &self.routing.rules[..self.routing.rules.len().min(MAX_RULES)];
 		if self.routing.rules.len() > MAX_RULES {r.error("routing.rules", format!("expected at most {MAX_RULES} rules"))}
@@ -338,6 +336,9 @@ impl Config {
 					None => r.error(format!("{at}.group[{j}]"), "expected a group declared in groups"),
 				}
 			}
+			for (j, entry) in rule.ip.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
+				if matches!(entry, IpEntry::Tunnel(tag) if !inbound_tags.contains_key(tag.as_str())) {r.error(format!("{at}.ip[{j}]"), "expected tunnel:users or tunnel: with the tag of an inbound, found a tag no inbound has")}
+			}
 			for (j, name) in rule.domain.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
 				if !domain(name, true) {r.error(format!("{at}.domain[{j}]"), "expected a lowercase ASCII domain of at most 253 bytes with labels of 1 to 63, no trailing dot, not an IP address, with * only as the whole first label before at least two more")}
 			}
@@ -378,17 +379,17 @@ impl Config {
 				if dead {r.error(format!("{at}.action"), "the rule sends only protocols other than TCP and UDP to a netstack exit whose unsupported policy rejects or drops one of them")}
 			}
 		}
-		// An enabled rule that refuses whatever its ip entries match, for every user, on the inbounds it names or on all of them.
-		let refuses = |rule: &Rule, entry: Option<IpEntry>| live(rule) && matches!(rule.action, Action::Block | Action::Reject) && rule.user.is_none() && rule.group.is_none() && rule.domain.is_none() && rule.icmp_type.is_none() && rule.icmp_code.is_none()
-			&& entry.is_none_or(|entry| rule.protocol.is_none() && rule.port.is_none() && rule.ip.as_ref().is_some_and(|list| list.contains(&entry)));
-		if !rules.iter().any(|rule| refuses(rule, Some(IpEntry::Users)) && rule.inbound.is_none()) {
-			let isolated: HashSet<&str> = rules.iter().filter(|rule| refuses(rule, Some(IpEntry::Users))).flat_map(|rule| rule.inbound.iter().flatten()).map(String::as_str).collect();
+		// An enabled rule that refuses whatever its ip entries match, for every user, on the inbounds it names or on all of them. Only `tunnel:users` and `geoip:private` are asked for: `tunnel:<tag>` covers one destination tunnel, which isolates nobody on its own.
+		let refuses = |rule: &Rule, entry: Option<&IpEntry>| live(rule) && matches!(rule.action, Action::Block | Action::Reject) && rule.user.is_none() && rule.group.is_none() && rule.domain.is_none() && rule.icmp_type.is_none() && rule.icmp_code.is_none()
+			&& entry.is_none_or(|entry| rule.protocol.is_none() && rule.port.is_none() && rule.ip.as_ref().is_some_and(|list| list.contains(entry)));
+		if !rules.iter().any(|rule| refuses(rule, Some(&IpEntry::Users)) && rule.inbound.is_none()) {
+			let isolated: HashSet<&str> = rules.iter().filter(|rule| refuses(rule, Some(&IpEntry::Users))).flat_map(|rule| rule.inbound.iter().flatten()).map(String::as_str).collect();
 			let open: Vec<String> = self.inbounds.iter().enumerate().take(MAX_INBOUNDS).filter(|(_, inbound)| !isolated.contains(inbound.tag.as_str())).map(|(i, _)| format!("inbounds[{i}]")).collect();
 			if isolated.is_empty() {r.warning("routing.rules", "no enabled block or reject rule has tunnel:users in ip and no other condition, so users can reach each other's devices")} else if !open.is_empty() {
 				r.warning("routing.rules", format!("no enabled block or reject rule with tunnel:users in ip covers {}, so users there can reach each other's devices", open.join(", ")));
 			}
 		}
-		if !rules.iter().any(|rule| refuses(rule, Some(IpEntry::Private)) && rule.inbound.is_none()) {
+		if !rules.iter().any(|rule| refuses(rule, Some(&IpEntry::Private)) && rule.inbound.is_none()) {
 			r.warning("routing.rules", "no enabled block or reject rule has geoip:private in ip and no other condition, so private networks behind the exits are reachable");
 		}
 		for (s, Addr(server)) in self.dns.servers.iter().enumerate().take(MAX_DNS_SERVERS) {
@@ -416,7 +417,7 @@ impl Config {
 					budget -= cost;
 					let covered = comparable && within(&early.inbound, &late.inbound, |e, l| e == l) && within(&early.user, &late.user, |e, l| e == l) && within(&early.group, &late.group, |e, l| e == l)
 						&& within(&early.protocol, &late.protocol, |e, l| e == l) && within(&early.icmp_type, &late.icmp_type, |e, l| e == l) && within(&early.icmp_code, &late.icmp_code, |e, l| e == l)
-						&& within(&early.port, &late.port, |e, l| e.lo <= l.lo && l.hi <= e.hi) && within(&early.ip, &late.ip, |e, l| e == l || matches!(l, IpEntry::Net(l) if inside(e, l)))
+						&& within(&early.port, &late.port, |e, l| e.lo <= l.lo && l.hi <= e.hi) && within(&early.ip, &late.ip, |e, l| e == l || matches!((e, l), (IpEntry::Users, IpEntry::Tunnel(_))) || matches!(l, IpEntry::Net(l) if inside(e, l)))
 						&& within(&early.domain, &late.domain, |e, l| e == l || e.strip_prefix("*.").is_some_and(|base| {
 							let name = l.strip_prefix("*.").unwrap_or(l);
 							name.len() > base.len() && name.ends_with(base) && name.as_bytes()[name.len() - base.len() - 1] == b'.'
