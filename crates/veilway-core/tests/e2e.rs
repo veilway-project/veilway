@@ -312,6 +312,12 @@ async fn a_forged_handshake_flood_cannot_steal_the_endpoint(){
 	let attacker=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	attacker.connect(node.addr).await.unwrap();
 	for _ in 0..300{let _=attacker.send(&client.init).await;}
+	// The burst outruns the server and overflows its UDP receive buffer on Linux, and the kernel would
+	// drop the one unretransmitted SYN below along with the excess. Wait until the cookie replies stop.
+	let mut cookie=[0u8;64];
+	let mut cookies=0;
+	while let Ok(Ok(_))=timeout(Duration::from_millis(500), attacker.recv(&mut cookie)).await{cookies+=1}
+	assert!(cookies>0, "the flood never reached the rate limit, so nothing was proven");
 	handshake(&mut client, [93, 184, 216, 34], 40007, 80).await;
 	let mut got=Vec::new();
 	while got.len()<GREETING.len(){
