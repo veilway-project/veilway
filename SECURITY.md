@@ -24,8 +24,8 @@ Remove real server addresses, keys, passwords and subscription links before you 
 
 | Step | Time |
 |---|---|
-| We confirm that we received the report | within 3 days |
-| We tell you whether we can reproduce it and how serious we think it is | within 10 days |
+| We confirm that we received the report | within 7 days |
+| We tell you whether we can reproduce it and how serious we think it is | within 14 days |
 | Fix released for a confirmed vulnerability | as fast as it can be done properly; we aim for 30 days and tell you if it will take longer |
 
 We keep you informed while the fix is in progress, agree a disclosure date with you, and publish an advisory when the fix is out. You are credited in the advisory and the release notes under the name you choose, or not at all if you prefer. Please give us up to 90 days before publishing details yourself; if users are already being attacked, tell us and we will move faster.
