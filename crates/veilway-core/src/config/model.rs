@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -110,6 +110,11 @@ pub(crate) fn domain(s: &str, wildcard: bool) -> bool {
 		&& !name.rsplit('.').next().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()) || l.strip_prefix("0x").is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())))
 }
 
+/// `[a-z0-9][a-z0-9_-]{0,63}`, with `.` as well when `dot` is set.
+pub(crate) fn ident(s: &str, dot: bool) -> bool {
+	(1..=MAX_NAME_BYTES).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-' || (dot && b == b'.')) && s.as_bytes()[0].is_ascii_alphanumeric()
+}
+
 fn ip(s: &str) -> Result<IpAddr, &'static str> {
 	if s.contains('%') {return Err("an address without a zone")}
 	match s.parse() {
@@ -188,22 +193,25 @@ pub struct Ip(pub IpAddr);
 
 text_value!(Ip, "an IPv4 or IPv6 address without a prefix", "^[0-9A-Fa-f:.]+$", |s| ip(s).map(Ip), |ip| ip.0.to_string());
 
-/// One entry of a rule's `ip` condition: a network, the name `geoip:private` for the ranges in `GEOIP_PRIVATE` outside every inbound pool, or the name `tunnel:users` for every address in every inbound pool except the gateways.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum IpEntry {Net(IpNet), Private, Users}
+/// One entry of a rule's `ip` condition: a network, the name `geoip:private` for the ranges in `GEOIP_PRIVATE` outside every inbound pool, the name `tunnel:users` for every address in every inbound pool except the gateways, or `tunnel:<inbound tag>` for those of one inbound.
+/// `Tunnel` holds the tag as written. Whether an inbound has it is for `validate` to say.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum IpEntry {Net(IpNet), Private, Users, Tunnel(String)}
 
-text_value!(IpEntry, "a network such as 10.7.0.0/24 with no host bits set, geoip:private or tunnel:users", "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|tunnel:users)$", |s| {
-	match net(s, false) {
+text_value!(IpEntry, "a network such as 10.7.0.0/24 with no host bits set, geoip:private, tunnel:users or tunnel:<inbound tag>", "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|tunnel:[a-z0-9][a-z0-9_-]{0,63})$", |s| {
+	match (net(s, false), s.strip_prefix("tunnel:")) {
 		_ if s == "geoip:private" => Ok(IpEntry::Private),
 		_ if s == "tunnel:users" => Ok(IpEntry::Users),
-		Ok(net) => Ok(IpEntry::Net(net)),
-		Err(_) if s.contains(':') => Err("an IPv6 network with no host bits set, geoip:private or tunnel:users: no other geoip or tunnel name is supported in this version"),
-		Err(expected) => Err(expected),
+		(_, Some(tag)) if ident(tag, false) => Ok(IpEntry::Tunnel(tag.to_string())),
+		(Ok(net), _) => Ok(IpEntry::Net(net)),
+		(Err(_), _) if s.contains(':') => Err("an IPv6 network with no host bits set, geoip:private, tunnel:users or tunnel:<inbound tag>: no other geoip name is supported in this version"),
+		(Err(expected), _) => Err(expected),
 	}
 }, |entry| match entry {
 	IpEntry::Net(net) => net.to_string(),
 	IpEntry::Private => "geoip:private".to_string(),
 	IpEntry::Users => "tunnel:users".to_string(),
+	IpEntry::Tunnel(tag) => format!("tunnel:{tag}"),
 });
 
 /// An inbound's gateway address with the prefix of its pool. The host part is the gateway.

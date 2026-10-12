@@ -1,9 +1,11 @@
-//! Config version 1: the typed model, strict parsing and validation. The engine still runs on `crate::legacy`.
+//! Config version 1: the typed model, strict parsing, validation and reloading. The engine still runs on `crate::legacy`.
 mod model;
 mod parse;
+mod reload;
 mod validate;
 
 pub use model::*;
+pub use reload::*;
 use schemars::generate::SchemaSettings;
 use schemars::transform::{RecursiveTransform, Transform};
 use schemars::Schema;
@@ -47,6 +49,8 @@ pub const MIN_TCP_IDLE_SECS: u32 = 10;
 pub const MAX_TCP_IDLE_SECS: u32 = 86400;
 pub const MIN_UDP_IDLE_SECS: u32 = 5;
 pub const MAX_UDP_IDLE_SECS: u32 = 3600;
+pub const DEFAULT_TCP_IDLE_SECS: u32 = 7200;
+pub const DEFAULT_UDP_IDLE_SECS: u32 = 60;
 pub const DEFAULT_INTERFACE: &str = "veilway0";
 pub const MIN_POOL_PREFIX_V4: u8 = 16;
 pub const MAX_POOL_PREFIX_V4: u8 = 30;
@@ -61,6 +65,8 @@ pub const MAX_ENTITLEMENT_CLASSES: usize = 4096;
 /// Entry comparisons the shadowed rule check may spend before it stops.
 pub const SHADOW_BUDGET: usize = 20_000_000;
 pub const RESERVED_TAGS: [&str; 8] = ["all", "any", "block", "reject", "drop", "local", "direct", "user"];
+/// Not a tag of an inbound: the `ip` entry `tunnel:users` stands for every inbound.
+pub const RESERVED_INBOUND_TAG: &str = "users";
 /// The schema patterns of a tag and of a user, device or group name.
 pub const TAG_PATTERN: &str = "^[a-z0-9][a-z0-9_-]{0,63}$";
 pub const NAME_PATTERN: &str = "^[a-z0-9][a-z0-9._-]{0,63}$";
@@ -148,5 +154,6 @@ pub fn schema() -> String {
 		if object.get("type").is_some_and(|t| t == "array") {object.insert("uniqueItems".to_string(), Value::Bool(true));}
 		if object.get("pattern").is_some_and(|p| p == TAG_PATTERN) {object.insert("not".to_string(), json!({"enum": RESERVED_TAGS}));}
 	}).transform(&mut schema);
+	if let Some(Value::Array(reserved)) = schema.pointer_mut("/$defs/Inbound/properties/tag/not/enum") {reserved.push(json!(RESERVED_INBOUND_TAG))}
 	format!("{:#}\n", schema.as_value())
 }

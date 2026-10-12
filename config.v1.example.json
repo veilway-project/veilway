@@ -23,6 +23,15 @@
 			"transports": [
 				{"type": "udp", "listen": "[::]:51821"}
 			]
+		},
+		{
+			"tag": "gaming",
+			"type": "wireguard",
+			"private_key": "ExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExM=",
+			"address": ["10.9.0.1/24"],
+			"transports": [
+				{"type": "udp", "listen": "0.0.0.0:51822"}
+			]
 		}
 	],
 	"outbounds": [
@@ -54,6 +63,7 @@
 	"routing": {
 		"default": "main",
 		"rules": [
+			{"tag": "gaming-lan", "inbound": ["gaming"], "ip": ["tunnel:gaming"], "action": "user"},
 			{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"},
 			{"tag": "no-private", "ip": ["geoip:private"], "action": "reject"},
 			{"tag": "no-smtp", "protocol": ["tcp"], "port": [25, "465-587"], "action": "reject"},
@@ -71,7 +81,7 @@
 			"exit": "node",
 			"devices": [
 				{"name": "laptop", "public_key": "ISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhISE=", "addresses": ["10.7.0.2", "fd7a:115c:a1e0::2", "10.8.0.2"]},
-				{"name": "phone", "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=", "preshared_key": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=", "addresses": ["10.7.0.3"]}
+				{"name": "phone", "public_key": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=", "preshared_key": "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=", "addresses": ["10.7.0.3", "10.9.0.3"]}
 			]
 		},
 		{
@@ -81,7 +91,7 @@
 			"quota_bytes": 107374182400,
 			"quota_period": "monthly",
 			"devices": [
-				{"name": "desktop", "public_key": "IyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyM=", "addresses": ["10.7.0.4", "fd7a:115c:a1e0::4"]}
+				{"name": "desktop", "public_key": "IyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyM=", "addresses": ["10.7.0.4", "fd7a:115c:a1e0::4", "10.9.0.4"]}
 			]
 		},
 		{
