@@ -34,6 +34,7 @@ wintun-bindings="0.7"
 schemars="1"
 time={version="0.3.36", default-features=false, features=["std", "parsing", "formatting"]}
 ring="0.17"
+socket2="0.6"
 
 
 # ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout. See vendor/ipstack ("veilway patch").

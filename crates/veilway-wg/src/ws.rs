@@ -1,8 +1,9 @@
 //! WireGuard datagrams over WebSocket. One WG datagram = one binary WS message.
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::PemObject;
@@ -27,6 +28,33 @@ const QUEUE:usize=1024;
 const CONNECT_TIMEOUT:Duration=Duration::from_secs(10);
 /// Concurrent relay connections accepted at once, each of which owns a UDP socket and a 64KB buffer.
 pub const MAX_CONNS:usize=1024;
+/// How long a connection may take from the TCP accept to the end of the WebSocket upgrade, TLS included.
+pub const UPGRADE_TIMEOUT:Duration=Duration::from_secs(10);
+/// Connections from one source that may be in that phase at once. A source is an IPv4 address or an IPv6 /64.
+/// Far below MAX_CONNS, so one host that opens connections and says nothing cannot take every place.
+pub const MAX_PENDING_PER_SOURCE:usize=64;
+
+/// What a relay listener turned away, for whoever runs it to read.
+#[derive(Debug, Default)]
+pub struct Stats{
+	/// Connections dropped because the upgrade did not finish within UPGRADE_TIMEOUT.
+	pub stalled:AtomicU64,
+	/// Connections refused at accept: the listener was full, or their source had too many upgrades pending.
+	pub refused:AtomicU64,
+}
+
+/// One connection that has not finished its upgrade, counted against its source until this is dropped.
+struct Pending{by_source:Arc<Mutex<HashMap<IpAddr, usize>>>, source:IpAddr}
+
+impl Drop for Pending{
+	fn drop(&mut self){
+		let mut by_source=self.by_source.lock().unwrap_or_else(|e| e.into_inner());
+		if let Some(count)=by_source.get_mut(&self.source){
+			*count-=1;
+			if *count==0{by_source.remove(&self.source);}
+		}
+	}
+}
 
 /// TLS material for the relay listener. None means plain ws (behind a reverse proxy).
 #[derive(Clone, Debug)]
@@ -44,8 +72,16 @@ pub async fn serve(listener:TcpListener, tls:Option<TlsFiles>, path:String, targ
 
 /// Same as [`serve`] but with an explicit ceiling on concurrent connections.
 pub async fn serve_limited(listener:TcpListener, tls:Option<TlsFiles>, path:String, target:SocketAddr, max_conns:usize)->anyhow::Result<()>{
+	relay(listener, tls, vec![(path, target)], max_conns, Arc::default())?.await;
+	Ok(())
+}
+
+/// One listener for several tunnels: `routes` maps each request path to the UDP endpoint its frames are forwarded to.
+/// The certificate is loaded before this returns, so a bad file fails the caller instead of a background task.
+pub fn relay(listener:TcpListener, tls:Option<TlsFiles>, routes:Vec<(String, SocketAddr)>, max_conns:usize, stats:Arc<Stats>)->anyhow::Result<impl std::future::Future<Output=()>+Send+'static>{
 	let _=rustls::crypto::ring::default_provider().install_default();
 	let limit=Arc::new(tokio::sync::Semaphore::new(max_conns));
+	let by_source=Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
 	let acceptor=match &tls{
 		Some(f)=>{
 			let certs=CertificateDer::pem_file_iter(&f.cert)?.collect::<Result<Vec<_>, _>>()?;
@@ -57,34 +93,74 @@ pub async fn serve_limited(listener:TcpListener, tls:Option<TlsFiles>, path:Stri
 		}
 		None=>None,
 	};
-	info!(listen=%listener.local_addr()?, %path, %target, tls=acceptor.is_some(), max_conns, "relay listening");
-	loop{
-		let (stream, peer)=match listener.accept().await{
-			Ok(v)=>v,
-			Err(e)=>{warn!(error=%e, "accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue}
-		};
-		let Ok(permit)=limit.clone().try_acquire_owned() else{debug!(%peer, "at the connection limit, refusing"); continue};
-		let (acceptor, path)=(acceptor.clone(), path.clone());
-		tokio::spawn(async move{
-			let _permit=permit;
-			let r=match acceptor{
-				Some(a)=>match a.accept(stream).await{
-					Ok(s)=>relay_conn(s, peer, path, target).await,
-					Err(e)=>Err(anyhow::anyhow!("tls handshake: {e}")),
-				},
-				None=>relay_conn(stream, peer, path, target).await,
+	let routes=Arc::new(routes);
+	info!(listen=%listener.local_addr()?, paths=?routes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), tls=acceptor.is_some(), max_conns, "relay listening");
+	Ok(async move{
+		loop{
+			let (stream, peer)=match listener.accept().await{
+				Ok(v)=>v,
+				Err(e)=>{warn!(error=%e, "accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue}
 			};
-			if let Err(e)=r{debug!(%peer, error=%e, "connection ended with an error")}
-		});
-	}
+			let Ok(permit)=limit.clone().try_acquire_owned() else{
+				stats.refused.fetch_add(1, Ordering::Relaxed);
+				debug!(%peer, "at the connection limit, refusing");
+				continue
+			};
+			let source=match peer.ip(){
+				IpAddr::V6(a)=>IpAddr::V6(Ipv6Addr::from_bits(a.to_bits()&(!0u128<<64))),
+				v4=>v4,
+			};
+			// Counted here and not in the task, so a burst cannot get ahead of the count. The guard is made after the lock is gone: dropping it takes the lock.
+			let room={
+				let mut counts=by_source.lock().unwrap_or_else(|e| e.into_inner());
+				let count=counts.entry(source).or_default();
+				let room=*count<MAX_PENDING_PER_SOURCE;
+				if room{*count+=1}
+				room
+			};
+			if !room{
+				stats.refused.fetch_add(1, Ordering::Relaxed);
+				debug!(%peer, "too many unfinished upgrades from this source, refusing");
+				continue
+			}
+			let pending=Pending{by_source:by_source.clone(), source};
+			let (acceptor, routes, stats)=(acceptor.clone(), routes.clone(), stats.clone());
+			tokio::spawn(async move{
+				let _permit=permit;
+				// One deadline for TLS and the upgrade together: until both are done the peer has proven nothing, and without it
+				// a connection that never speaks would hold its place for good.
+				let deadline=Instant::now()+UPGRADE_TIMEOUT;
+				let r=match acceptor{
+					Some(a)=>match tokio::time::timeout_at(deadline, a.accept(stream)).await{
+						Ok(Ok(s))=>relay_conn(s, peer, &routes, deadline, pending).await,
+						Ok(Err(e))=>Err(anyhow::anyhow!("tls handshake: {e}")),
+						Err(e)=>Err(e.into()),
+					},
+					None=>relay_conn(stream, peer, &routes, deadline, pending).await,
+				};
+				match r{
+					Err(e) if e.is::<tokio::time::error::Elapsed>()=>{
+						stats.stalled.fetch_add(1, Ordering::Relaxed);
+						debug!(%peer, "no upgrade within {}s, dropping the connection", UPGRADE_TIMEOUT.as_secs());
+					}
+					Err(e)=>debug!(%peer, error=%e, "connection ended with an error"),
+					Ok(())=>{}
+				}
+			});
+		}
+	})
 }
 
-/// One accepted transport: handshake on `path`, then pump a private UDP socket against the WS.
-async fn relay_conn<S>(stream:S, peer:SocketAddr, path:String, target:SocketAddr)->anyhow::Result<()>
+/// One accepted transport: handshake on a known path before `deadline`, then pump a private UDP socket against the WS.
+async fn relay_conn<S>(stream:S, peer:SocketAddr, routes:&[(String, SocketAddr)], deadline:Instant, pending:Pending)->anyhow::Result<()>
 where S:AsyncRead+AsyncWrite+Unpin{
-	let ws=tokio_tungstenite::accept_hdr_async_with_config(stream, move |req:&Request, resp:Response|->Result<Response, ErrorResponse>{
-		if req.uri().path()==path{Ok(resp)}else{Err(Response::builder().status(404).body(Some("not found".to_string())).unwrap())}
-	}, Some(ws_config())).await?;
+	let mut chosen=None;
+	let ws=tokio::time::timeout_at(deadline, tokio_tungstenite::accept_hdr_async_with_config(stream, |req:&Request, resp:Response|->Result<Response, ErrorResponse>{
+		chosen=routes.iter().find(|(path, _)| req.uri().path()==path).map(|(_, target)| *target);
+		if chosen.is_some(){Ok(resp)}else{Err(Response::builder().status(404).body(Some("not found".to_string())).unwrap())}
+	}, Some(ws_config()))).await??;
+	drop(pending);
+	let target=chosen.ok_or_else(|| anyhow::anyhow!("handshake finished without a route"))?;
 	let udp=UdpSocket::bind(if target.is_ipv4(){SocketAddr::from((Ipv4Addr::LOCALHOST, 0))}else{SocketAddr::from((Ipv6Addr::LOCALHOST, 0))}).await?;
 	udp.connect(target).await?;
 	info!(%peer, %target, "ws connected");

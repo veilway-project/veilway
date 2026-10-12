@@ -1,14 +1,18 @@
 //! The whole client engine against a real in-process server: mock tun -> veilway-client -> ws bridge or udp
 //! -> server -> mock SOCKS5 -> fake DNS responder, and the answer all the way back out of the mock tun.
 use etherparse::{NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice};
+use serde_json::json;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use veilway_client::{ClientConfig, Endpoint, Tun, Tunnel};
+use veilway_core::config::Config;
+use veilway_core::Options;
 
 const CLIENT:[u8;4]=[10, 7, 0, 2];
 const RESOLVER:[u8;4]=[1, 1, 1, 1];
@@ -87,19 +91,34 @@ impl Tun for MockTun{
 
 struct Node{udp:SocketAddr, ws:Option<SocketAddr>, server_public:String, client_private:String}
 
-/// One peer, no dns override, egress pinned to `upstream`. `ws` swaps listen_udp for a plain ws relay.
-async fn spawn_server(upstream:&str, ws:bool)->Node{
+/// Port 0 is not a valid listen port in a config, so every test node takes the next one from here.
+static NEXT_PORT:AtomicU16=AtomicU16::new(23000);
+
+/// A valid version 1 document with one user on one inbound and one exit through `proxy`, started as a real engine.
+/// DNS is hijacked, as it is by default. `ws` swaps the udp transport for a plain ws relay.
+async fn spawn_server(proxy:SocketAddr, ws:bool)->Node{
 	let private=veilway_wg::generate_key();
 	let client=veilway_wg::generate_key();
-	let listen=if ws{r#""listen_ws":{"addr":"127.0.0.1:0","path":"/tunnel"}"#.to_string()}else{r#""listen_udp":"127.0.0.1:0""#.to_string()};
-	let json=format!(
-		r#"{{"private_key":"{}","address":"10.7.0.1/24","mtu":1420,{listen},"upstream":"{upstream}",
-		 "peers":[{{"public_key":"{}","allowed_ips":["10.7.0.2/32"]}}]}}"#,
-		veilway_wg::encode_key(&private), veilway_wg::encode_key(&veilway_wg::public_key(&client)));
-	let cfg:veilway_core::legacy::Config=serde_json::from_str(&json).unwrap();
-	cfg.validate().unwrap();
-	let running=veilway_core::start(cfg).await.unwrap();
-	Node{udp:running.udp_addr, ws:running.ws_addr, server_public:veilway_wg::encode_key(&veilway_wg::public_key(&private)), client_private:veilway_wg::encode_key(&client)}
+	let listen=SocketAddr::from(([127, 0, 0, 1], NEXT_PORT.fetch_add(1, Ordering::SeqCst)));
+	let transport=if ws{json!({"type":"ws", "listen":listen.to_string(), "path":"/tunnel"})}else{json!({"type":"udp", "listen":listen.to_string()})};
+	let doc=json!({
+		"version":1,
+		"dns":{"servers":["1.1.1.1:53"]},
+		"inbounds":[{"tag":"home", "type":"wireguard", "private_key":veilway_wg::encode_key(&private), "address":["10.7.0.1/24"], "mtu":1420, "transports":[transport]}],
+		"outbounds":[{"tag":"proxy", "type":"socks5", "server":proxy.to_string()}],
+		"exits":[{"tag":"main", "backend":{"type":"netstack", "outbound":"proxy"}}],
+		"routing":{"default":"main", "rules":[
+			{"tag":"isolate-users", "ip":["tunnel:users"], "action":"reject"},
+			{"tag":"no-private", "ip":["geoip:private"], "action":"reject"}
+		]},
+		"users":[{"name":"a", "exits":"all", "devices":[{"name":"device", "public_key":veilway_wg::encode_key(&veilway_wg::public_key(&client)), "addresses":["10.7.0.2"]}]}]
+	});
+	let config=Config::parse(doc.to_string().as_bytes()).unwrap_or_else(|e| panic!("the test config does not parse: {e}"));
+	let report=config.validate(false);
+	assert!(report.errors.is_empty(), "the test config is not valid: {:#?}", report.errors);
+	// The handle only reads counters, and the engine's tasks run until the test process ends.
+	veilway_core::start(&config, Options::new("")).await.unwrap();
+	Node{udp:listen, ws:ws.then_some(listen), server_public:veilway_wg::encode_key(&veilway_wg::public_key(&private)), client_private:veilway_wg::encode_key(&client)}
 }
 
 fn config(node:&Node, endpoint:Endpoint)->ClientConfig{
@@ -137,7 +156,7 @@ async fn answer(up:&Sender<Vec<u8>>, down:&Receiver<Vec<u8>>)->Vec<u8>{
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn dns_round_trips_over_the_ws_transport(){
 	let (proxy, seen)=socks5_proxy(dns_responder().await).await;
-	let node=spawn_server(&format!("socks5://{proxy}"), true).await;
+	let node=spawn_server(proxy, true).await;
 	let url=format!("ws://{}/tunnel", node.ws.unwrap());
 	let (up_tx, up_rx)=channel();
 	let (down_tx, down_rx)=channel();
@@ -153,7 +172,7 @@ async fn dns_round_trips_over_the_ws_transport(){
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn dns_round_trips_over_the_udp_transport(){
 	let (proxy, seen)=socks5_proxy(dns_responder().await).await;
-	let node=spawn_server(&format!("socks5://{proxy}"), false).await;
+	let node=spawn_server(proxy, false).await;
 	let (up_tx, up_rx)=channel();
 	let (down_tx, down_rx)=channel();
 	let tunnel=Tunnel::connect(config(&node, Endpoint::Udp(node.udp)), Box::new(MockTun{up:Mutex::new(up_rx), down:Mutex::new(down_tx)})).await.unwrap();
@@ -169,13 +188,15 @@ async fn dns_round_trips_over_the_udp_transport(){
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn ipv6_packets_never_reach_the_server(){
 	let (proxy, seen)=socks5_proxy(dns_responder().await).await;
-	let node=spawn_server(&format!("socks5://{proxy}"), false).await;
+	let node=spawn_server(proxy, false).await;
 	let (up_tx, up_rx)=channel();
 	let (down_tx, down_rx)=channel();
 	let tunnel=Tunnel::connect(config(&node, Endpoint::Udp(node.udp)), Box::new(MockTun{up:Mutex::new(up_rx), down:Mutex::new(down_tx)})).await.unwrap();
 	let builder=PacketBuilder::ipv6([0xfd;16], [0x20, 1, 0x48, 0x60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0x88], 64).udp(40005, 53);
 	let mut packet=Vec::with_capacity(builder.size(DNS_QUERY.len()));
 	builder.write(&mut packet, DNS_QUERY).unwrap();
+	// `connect` returns as soon as the handshake is in, which can be a moment before the keepalive that answers it is counted.
+	tokio::time::sleep(Duration::from_millis(200)).await;
 	let before=tunnel.stats().tx_bytes;
 	up_tx.send(packet).unwrap();
 	let deadline=tokio::time::Instant::now()+Duration::from_secs(5);

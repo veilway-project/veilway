@@ -1,4 +1,4 @@
-//! Config version 1: the typed model, strict parsing, validation and reloading. The engine still runs on `crate::legacy`.
+//! Config version 1: the typed model, strict parsing, validation and reloading. `crate::engine` compiles a validated document into its plan.
 mod model;
 mod parse;
 mod reload;
@@ -94,6 +94,8 @@ pub struct Report {
 	pub more_warnings: usize,
 	/// The shadowed rule check ran out of budget before it compared every pair of rules.
 	pub shadow_cut_short: bool,
+	/// The file can be read by group or others. Only `load` sets it, next to the warning that says so.
+	pub readable: bool,
 }
 
 impl Report {
@@ -125,6 +127,7 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 		}
 		Err(e) => (None, Report {errors: vec![e], ..Report::default()}),
 	};
+	report.readable = readable;
 	if readable {report.warning("", "the config file can be read by group or others; `veilway run` refuses that unless started with --allow-readable-config")}
 	(config, report)
 }

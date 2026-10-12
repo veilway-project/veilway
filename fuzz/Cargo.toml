@@ -19,6 +19,13 @@ test=false
 doc=false
 bench=false
 
+[[bin]]
+name="packet"
+path="fuzz_targets/packet.rs"
+test=false
+doc=false
+bench=false
+
 # Not part of the main workspace.
 [workspace]
 
