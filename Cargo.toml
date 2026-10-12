@@ -1,7 +1,7 @@
 [workspace]
 resolver="2"
 members=["crates/veilway-wg", "crates/veilway-proto", "crates/veilway-transport", "crates/veilway-core", "crates/veilway-api", "crates/veilway-xray", "crates/veilway-client", "crates/veilway-ffi", "crates/veilway"]
-exclude=["apps/desktop/src-tauri"]
+exclude=["apps/desktop/src-tauri", "fuzz"]
 
 [workspace.package]
 version="0.1.0"

@@ -1,0 +1,1 @@
+{"version":1,"bogus":true,"dns":{"servers":["1.1.1.1:53"]},"inbounds":[],"outbounds":[],"exits":[],"routing":{"default":"x","rules":[]},"users":[]}

@@ -1,0 +1,1 @@
+{"version":1,"dns":{"servers":["1.1.1.1:53"]},"inbounds":[],"outbounds":[],"exits":[{"tag":"sink","backend":{"type":"block"}}],"routing":{"default":"sink","rules":[]},"users":[]}

@@ -1,0 +1,27 @@
+[package]
+name="veilway-fuzz"
+version="0.0.0"
+edition="2021"
+publish=false
+
+[package.metadata]
+cargo-fuzz=true
+
+[dependencies]
+libfuzzer-sys="0.4"
+serde_json="1"
+veilway-core={path="../crates/veilway-core"}
+
+[[bin]]
+name="config"
+path="fuzz_targets/config.rs"
+test=false
+doc=false
+bench=false
+
+# Not part of the main workspace.
+[workspace]
+
+# Same patch as the root manifest, so the fuzzed build matches the real one.
+[patch.crates-io]
+ipstack={path="../vendor/ipstack"}

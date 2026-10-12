@@ -4,9 +4,9 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 1, step 1 in progress. Done: config v1 model, strict parser, validation, JSON Schema, `veilway check` and `veilway schema` (the format is specified in `veilway-docs`, `reference/config.md`). Left in step 1: the reload module, a fuzz target for the parser, the Persian reference page.
-- Last finished step: Phase 0, step 5
-- Next action: finish Phase 1 step 1 (reload, fuzz target), then step 2 (the engine moves from `legacy.rs` to config v1)
+- Active phase: 1, step 1 done: config v1 (model, strict parser, validation, JSON Schema, `veilway check` and `veilway schema`), the reload store (diff, two-phase apply, revision check), and a fuzz target for the parser. The format is specified in `veilway-docs`, `reference/config.md`. Nothing consumes it yet: the engine still runs on `legacy.rs`.
+- Last finished step: Phase 1, step 1
+- Next action: Phase 1, step 2 (the engine moves to config v1: several inbounds, flow table, router, `netstack` and `l3` exits, DNS with name memory, delivery between users, reload wired to SIGHUP). Update `THREAT_MODEL.md` in that step: isolation between users and access to private networks are now decided by routing rules.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 

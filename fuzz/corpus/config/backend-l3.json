@@ -1,0 +1,1 @@
+{"version":1,"dns":{"servers":["1.1.1.1:53"]},"inbounds":[],"outbounds":[],"exits":[{"tag":"node","backend":{"type":"l3","interface":"wgx0","masquerade":false}}],"routing":{"default":"node","rules":[]},"users":[]}
