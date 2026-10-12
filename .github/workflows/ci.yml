@@ -1,0 +1,56 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace --release
+      - run: cargo test --workspace
+      - name: Build the desktop app
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources | Out-Null
+          Set-Content -Path apps/desktop/src-tauri/resources/wintun.dll -Value "" # placeholder, this step only compiles
+          cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+  # Licences, bans, advisories and sources for both lockfiles. The policy is deny.toml.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Workspace
+        run: cargo deny --locked check
+      - name: Desktop app
+        if: always()
+        run: cargo deny --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --target x86_64-pc-windows-msvc --config deny.toml check
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Workspace
+        run: cargo audit --file Cargo.lock
+      - name: Desktop app
+        if: always()
+        run: cargo audit --file apps/desktop/src-tauri/Cargo.lock

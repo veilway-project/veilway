@@ -1,0 +1,123 @@
+name: release
+# Tag builds can only read caches saved on main, so main runs the same builds (without publishing) to keep them warm.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+          key: desktop
+      - name: Fetch wintun
+        shell: pwsh
+        run: |
+          $ver = "0.14.1"
+          $sha = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile wintun.zip
+          $got = (Get-FileHash wintun.zip -Algorithm SHA256).Hash
+          if ($got -ne $sha) { throw "wintun checksum mismatch: $got" }
+          Expand-Archive wintun.zip -DestinationPath wintun-unpacked -Force
+          New-Item -ItemType Directory -Force -Path apps/desktop/src-tauri/resources | Out-Null
+          Copy-Item wintun-unpacked/wintun/bin/amd64/wintun.dll apps/desktop/src-tauri/resources/wintun.dll
+      # With an empty tagName the action only builds and uploads nothing.
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop/src-tauri
+          tauriScript: npx --yes @tauri-apps/cli@^2
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          releaseName: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, target: x86_64-unknown-linux-musl, cross: true}
+          - {os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: true}
+          - {os: windows-latest, target: x86_64-pc-windows-msvc, cross: false}
+          - {os: macos-latest, target: aarch64-apple-darwin, cross: false}
+          - {os: macos-latest, target: x86_64-apple-darwin, cross: false}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        if: matrix.cross
+        with:
+          tool: cross
+      - name: Build
+        shell: bash
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked --target ${{ matrix.target }} -p veilway --bin veilway
+      - name: Stage asset
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          ext=""
+          [[ "$TARGET" == *windows* ]] && ext=".exe"
+          mkdir -p dist
+          cp "target/$TARGET/release/veilway$ext" "dist/veilway-$TARGET$ext"
+      - uses: actions/upload-artifact@v7
+        if: github.ref_type == 'tag'
+        with:
+          name: veilway-${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    # Runs after the desktop job so both do not race to create the release for the same tag.
+    if: github.ref_type == 'tag' && !cancelled() && needs.build.result == 'success'
+    needs: [build, desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      # RELEASE_SIGNING_KEY holds the contents of an unencrypted minisign secret key file (minisign -G -W).
+      # The trusted comment binds each signature to the tag and the asset name, so a signature cannot be reused for another file.
+      - name: Sign assets
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set, skipping minisign: this release is published without .minisig files"
+            exit 0
+          fi
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf "%s\n" "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/minisign.key"
+          for f in dist/*; do minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" -t "veilway $REF_NAME $(basename "$f")" </dev/null; done
+          echo "signed every asset in dist with minisign"
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
