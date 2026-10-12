@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/veilway-project/veilway/security/advisories/new
+    about: Private form. Never report a vulnerability in a public issue.
+  - name: Question or help with setup
+    url: https://github.com/veilway-project/veilway/discussions
+    about: Ask in Discussions, in English or Persian. Issues are for bugs and concrete feature requests.
+  - name: Documentation
+    url: https://github.com/veilway-project/veilway-docs
+    about: Problems with the documentation go to the docs repository.
