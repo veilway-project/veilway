@@ -243,6 +243,15 @@ The panel recommends Protected when creating an inbound and asks for confirmatio
 - SDK layers: `veilway-core` as a Rust library, the generated TypeScript client in `packages/sdk`, and `veilway-ffi` for Kotlin/Swift.
 - `veilway doctor` prints a diagnosis (ports, certificates, DNS, each outbound with TCP and UDP checks). This exists because of the production lessons in `CLAUDE.md`.
 
+### Updates
+
+Every part that ships as a binary can update itself, and every updater follows the same rules:
+
+- The artifact is verified against a signing key built into the running binary before anything is replaced. The version is read from the verified artifact, never from unsigned metadata, and an older version is refused.
+- Desktop and Android clients update automatically (the desktop app does today through Tauri's updater).
+- The server and the panel update with `veilway update`: fetch the release, verify its minisign signature, swap the binary, restart. It is manual by default, because a restart drops every tunnel on the node. An opt-in schedule (`update.auto` with a time window) is available for operators who want it, and the panel shows when a newer version exists.
+- A failed or unverified update leaves the running version in place and logs why.
+
 ## Subscriptions, provider content, themes
 
 ### Subscriptions
@@ -385,7 +394,7 @@ Start with a one-session spike of Tauri mobile + `VpnService`. Gate: the same su
 
 ### Phase 8: docs, SDK examples, hardening (3 sessions)
 
-Complete the docs in both languages, two SDK examples (a minimal custom client, a minimal custom server), fuzzing run in CI, signed releases, one-line installer. Gate: someone follows only the docs and gets a working setup.
+Complete the docs in both languages, two SDK examples (a minimal custom client, a minimal custom server), fuzzing run in CI, signed releases, one-line installer, `veilway update` with the opt-in schedule. Gate: someone follows only the docs and gets a working setup.
 
 ## Risks
 
