@@ -1,0 +1,9 @@
+target/
+*.pem
+config.json
+apps/desktop/src-tauri/resources/wintun.dll
+apps/desktop/src-tauri/gen/
+.DS_Store
+PROMPT.md
+*.local.md
+.claude/

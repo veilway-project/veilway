@@ -1,0 +1,30 @@
+{
+	"private_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+	"address": "10.7.0.1/24",
+	"mtu": 1420,
+	"listen_udp": "0.0.0.0:51820",
+	"listen_ws": {
+		"addr": "0.0.0.0:443",
+		"path": "/wg",
+		"cert": "fullchain.pem",
+		"key": "privkey.pem"
+	},
+	"upstream": "socks5://user:pass@127.0.0.1:1080",
+	"dns": "1.1.1.1:53",
+	"allow_private": false,
+	"udp_idle_secs": 60,
+	"tcp_idle_secs": 7200,
+	"peers": [
+		{
+			"public_key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=",
+			"preshared_key": null,
+			"allowed_ips": ["10.7.0.2/32"],
+			"upstream": null
+		},
+		{
+			"public_key": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+			"allowed_ips": ["10.7.0.3/32"],
+			"upstream": "socks5://other:pass@127.0.0.1:1081"
+		}
+	]
+}

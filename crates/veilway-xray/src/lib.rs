@@ -1,0 +1,1 @@
+//! Optional Xray sidecar manager.
