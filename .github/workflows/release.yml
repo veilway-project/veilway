@@ -1,9 +1,9 @@
 name: release
-# Tag builds can only read caches saved on main, so main runs the same builds (without publishing) to keep them warm.
+# Publishes on v* tags. Started by hand on main it runs the same builds without publishing, which also warms the caches a tag build reads.
 on:
   push:
-    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: read

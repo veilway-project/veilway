@@ -1,7 +1,11 @@
 name: ci
+# A normal push builds and tests on Linux only. Windows and macOS cost 2x and 10x the minutes on a private repository, so they run on tags and when started by hand (Actions, ci, Run workflow).
 on:
   push:
+    paths-ignore: ["**.md", "LICENSE", "NOTICE", "licenses/**"]
   pull_request:
+    paths-ignore: ["**.md", "LICENSE", "NOTICE", "licenses/**"]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,7 +15,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON((github.event_name == 'workflow_dispatch' || github.ref_type == 'tag') && '["ubuntu-latest", "windows-latest", "macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
