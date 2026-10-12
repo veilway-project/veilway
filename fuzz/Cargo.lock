@@ -1163,6 +1163,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "socket2",
  "time",
  "tokio",
  "tokio-socks",

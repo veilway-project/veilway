@@ -99,7 +99,7 @@ fn the_known_good_document_is_clean() {
 
 #[test]
 fn shipped_example_is_clean_and_survives_a_round_trip() {
-	let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.v1.example.json")).unwrap();
+	let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.json")).unwrap();
 	let config = Config::parse(&bytes).unwrap();
 	assert_eq!(config.validate(true), Report::default());
 	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);

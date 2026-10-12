@@ -21,6 +21,7 @@ base64.workspace=true
 schemars.workspace=true
 time.workspace=true
 ring.workspace=true
+socket2.workspace=true
 
 [dev-dependencies]
 boringtun.workspace=true

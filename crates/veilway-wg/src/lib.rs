@@ -94,6 +94,12 @@ impl Wg{
 	/// Feeds one datagram from the network. Appends datagrams destined back to that peer into `net_out`
 	/// and decrypted IP packets into `ip_out`. Returns the peer the datagram belonged to.
 	pub fn recv_from_network(&mut self, from:SocketAddr, datagram:&[u8], net_out:&mut Vec<Vec<u8>>, ip_out:&mut Vec<Vec<u8>>)->Option<usize>{
+		self.recv_authenticated(from, datagram, net_out, ip_out).map(|(idx, _)| idx)
+	}
+
+	/// Same as [`Wg::recv_from_network`], and also says whether the datagram proved the peer's key and so moved its
+	/// endpoint. A server with several sockets uses that to remember which one the peer is reachable through.
+	pub fn recv_authenticated(&mut self, from:SocketAddr, datagram:&[u8], net_out:&mut Vec<Vec<u8>>, ip_out:&mut Vec<Vec<u8>>)->Option<(usize, bool)>{
 		// Check mac1/mac2 before anything else. A cookie reply only proves the sender knows our public
 		// key, which is public, so such a datagram must never identify a peer or move its endpoint.
 		let limiter=self.limiter.clone();
@@ -128,8 +134,9 @@ impl Wg{
 		// Roam only on proof of the peer's private key: a decrypted packet, an accepted data packet, or a
 		// handshake that produced something other than another cookie reply.
 		let answered=net_out[before..].iter().any(|d| d.first()!=Some(&3));
-		if decrypted|| kind==4|| (kind!=3 && answered){peer.endpoint=Some(from)}
-		Some(idx)
+		let proven=decrypted|| kind==4|| (kind!=3 && answered);
+		if proven{peer.endpoint=Some(from)}
+		Some((idx, proven))
 	}
 
 	/// Encrypts one IP packet for `idx`. With no live session it emits a handshake initiation and queues the packet.
