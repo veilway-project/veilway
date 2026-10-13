@@ -53,6 +53,15 @@ pub const KEY_CHARS: usize = 44;
 pub const MIN_MTU: u16 = 1280;
 pub const MAX_MTU: u16 = 1500;
 pub const DEFAULT_MTU: u16 = 1420;
+/// The default `mtu` of a `veilway` inbound with a `udp-obfs` transport: 1500 less the 48 bytes of IPv6 and UDP and the 62 of WireGuard and the envelope.
+pub const DEFAULT_MTU_OBFS: u16 = 1390;
+pub const MIN_REPLAY_CACHE: u32 = 1024;
+pub const MAX_REPLAY_CACHE: u32 = 1 << 20;
+pub const DEFAULT_REPLAY_CACHE: u32 = 262_144;
+pub const MAX_PROOF_RATE: u32 = 65536;
+pub const DEFAULT_PROOFS_PER_SOURCE: ProofRate = ProofRate {burst: 256, rate: 32};
+pub const MAX_SESSIONS: u32 = 1 << 20;
+pub const DEFAULT_SESSIONS: u32 = 16384;
 pub const MIN_TCP_IDLE_SECS: u32 = 10;
 pub const MAX_TCP_IDLE_SECS: u32 = 86400;
 pub const MIN_UDP_IDLE_SECS: u32 = 5;

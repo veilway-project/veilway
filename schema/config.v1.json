@@ -407,11 +407,15 @@
           "uniqueItems": true
         },
         "mtu": {
-          "description": "Defaults to 1420.",
+          "description": "Defaults to 1420, and to 1390 for a `veilway` inbound with a `udp-obfs` transport.",
           "format": "uint16",
           "maximum": 1500,
           "minimum": 1280,
           "type": "integer"
+        },
+        "padding": {
+          "$ref": "#/$defs/Padding",
+          "description": "The upper bounds of the padding the node puts on what it sends over the obfuscated transports of a `veilway` inbound."
         },
         "private_key": {
           "$ref": "#/$defs/Key",
@@ -662,6 +666,27 @@
         }
       ]
     },
+    "Padding": {
+      "additionalProperties": false,
+      "description": "Transports page, \"Padding\", rule 4: the bounds \"may be set per profile for the client and per inbound for the node, inside the bounds in the table of numbers\".",
+      "properties": {
+        "normal": {
+          "description": "The most bytes of normal padding. Defaults to 255.",
+          "format": "uint16",
+          "maximum": 255,
+          "minimum": 64,
+          "type": "integer"
+        },
+        "wide": {
+          "description": "The most bytes of wide padding. Defaults to 1023.",
+          "format": "uint16",
+          "maximum": 1023,
+          "minimum": 512,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "PortRange": {
       "oneOf": [
         {
@@ -674,6 +699,29 @@
           "type": "string"
         }
       ]
+    },
+    "ProofRate": {
+      "additionalProperties": false,
+      "description": "Accepted proofs one source may bring: `burst` at once, then `rate` a second. A source is an IPv4 address or an IPv6 /64.",
+      "properties": {
+        "burst": {
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "rate": {
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "burst",
+        "rate"
+      ],
+      "type": "object"
     },
     "Protocol": {
       "oneOf": [
@@ -702,6 +750,23 @@
         "monthly"
       ],
       "type": "string"
+    },
+    "Replay": {
+      "additionalProperties": false,
+      "properties": {
+        "cache": {
+          "description": "How many accepted proofs the node remembers at once. Defaults to 262144. It is read at start: a reload that changes it changes nothing until the node starts again.",
+          "format": "uint32",
+          "maximum": 1048576,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "per_source": {
+          "$ref": "#/$defs/ProofRate",
+          "description": "Defaults to a burst of 256 and 32 a second."
+        }
+      },
+      "type": "object"
     },
     "Routing": {
       "additionalProperties": false,
@@ -998,8 +1063,43 @@
             "path"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "WireGuard datagrams inside the `udp-obfs` envelope, for a `veilway` inbound.",
+          "properties": {
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "type": {
+              "const": "udp-obfs",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "TransportLimits": {
+      "additionalProperties": false,
+      "description": "Node capacity numbers of one listener (transports page, \"Numbers that are judgement calls\").",
+      "properties": {
+        "sessions": {
+          "description": "Established sessions the listener holds at once. Defaults to 16384.",
+          "format": "uint32",
+          "maximum": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
     },
     "TransportSecret": {
       "description": "a transport secret: 44 characters of standard base64 with padding",
@@ -1189,6 +1289,10 @@
       "maxItems": 256,
       "type": "array",
       "uniqueItems": true
+    },
+    "replay": {
+      "$ref": "#/$defs/Replay",
+      "description": "The replay memory of the obfuscated transports. Only a node with such a transport keeps one."
     },
     "routing": {
       "$ref": "#/$defs/Routing"

@@ -501,7 +501,7 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					// "It applies on `udp` and `udp-obfs`. On a stream transport nothing fragments, the node answers `probe_start` with `error` code 2."
 					let datagram = {
 						let peers = plan.inbounds[from.inbound].tunnel.lock();
-						peers.wg.index(&device).and_then(|peer| peers.via.get(peer)).is_some_and(|(socket, over)| *over == Over::Udp && socket.strong_count() > 0)
+						peers.wg.index(&device).and_then(|peer| peers.over(peer)).is_some_and(|over| over != Over::Ws)
 					};
 					let mut token = [0u8; 8];
 					let started = datagram && random(&mut token).is_ok();
@@ -537,8 +537,8 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 							if built && raw.len() == usize::from(size) {
 								counters.probes_sent.fetch_add(1, Ordering::Relaxed);
 								shared.own(user, raw.len());
-								// Whole, whatever MTU the device has set: a probe that was cut to fit would confirm nothing.
-								shared.transmit(&plan, from, &raw).await;
+								// Whole, whatever MTU the device has set, and with no padding around it on `udp-obfs`: a probe that was cut to fit, or that left larger than it was made, would confirm nothing.
+								shared.probe(&plan, from, &raw).await;
 							}
 						}
 					}

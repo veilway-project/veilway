@@ -6,6 +6,7 @@ use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::IpAddr;
+use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
 
 const TAG_RULE: &str = "expected a tag: 1 to 64 characters from a-z, 0-9, _ and -, starting with a letter or digit";
 const NAME_RULE: &str = "expected a name: 1 to 64 characters from a-z, 0-9, ., _ and -, starting with a letter or digit";
@@ -100,16 +101,29 @@ impl Config {
 				if let Some((_, other)) = pools.iter().find(|(pool, owner)| *owner != i && (pool.contains(&net.network()) || net.contains(&pool.network()))) {r.error(&at, format!("expected a pool of its own, found one that overlaps a pool of inbounds[{other}]"))}
 				pools.push((*net, i));
 			}
+			// Transports page, "MTU": "For a `veilway` inbound, validation warns when `mtu` is above the IPv6 figure of any of its datagram transports. With a `udp-obfs` transport that is 1390."
+			let obfuscated = inbound.kind == InboundType::Veilway && inbound.obfuscated();
 			match inbound.mtu {
 				Some(mtu) if !(MIN_MTU..=MAX_MTU).contains(&mtu) => r.error(format!("{at}.mtu"), format!("expected an integer from {MIN_MTU} to {MAX_MTU}")),
-				Some(mtu) if mtu > DEFAULT_MTU => r.warning(format!("{at}.mtu"), format!("above {DEFAULT_MTU} the outer packet fragments on a normal path")),
+				Some(mtu) if obfuscated && mtu > DEFAULT_MTU_OBFS => r.warning(format!("{at}.mtu"), format!("above {DEFAULT_MTU_OBFS} a full-size udp-obfs packet does not fit a 1500 byte path over IPv6, and the node never fragments it")),
+				Some(mtu) if mtu > DEFAULT_MTU => r.warning(format!("{at}.mtu"), format!("above {DEFAULT_MTU} the outer packet {} on a normal path", if inbound.kind == InboundType::Veilway {"is lost"} else {"fragments"})),
 				_ => {}
+			}
+			if let Some(padding) = &inbound.padding {
+				if padding.wide.is_some_and(|wide| !WIDE_BOUNDS.contains(&u32::from(wide))) {r.error(format!("{at}.padding.wide"), format!("expected an integer from {} to {}", WIDE_BOUNDS.start(), WIDE_BOUNDS.end()))}
+				if padding.normal.is_some_and(|normal| !NORMAL_BOUNDS.contains(&u32::from(normal))) {r.error(format!("{at}.padding.normal"), format!("expected an integer from {} to {}", NORMAL_BOUNDS.start(), NORMAL_BOUNDS.end()))}
+				if !obfuscated {r.warning(format!("{at}.padding"), "never used: the inbound has no udp-obfs transport")}
 			}
 			if !(1..=MAX_TRANSPORTS).contains(&inbound.transports.len()) {r.error(format!("{at}.transports"), format!("expected 1 to {MAX_TRANSPORTS} transports"))}
 			for (j, transport) in inbound.transports.iter().enumerate().take(MAX_TRANSPORTS) {
 				let at = format!("{at}.transports[{j}]");
 				// Protocol overview, "Config and profile fields this draft assumes": on a `veilway` inbound `ws` is the native format, which is not built, and neither are `udp-obfs`, `tls` and `fronted`. The `ws` that is built is the one of a `wireguard` inbound, and it is never taken for the other.
-				if inbound.kind == InboundType::Veilway && !matches!(transport, Transport::Udp {..}) {r.error(format!("{at}.type"), "expected \"udp\": this build has no other transport for a veilway inbound. The ws of a veilway inbound is the native format, which is not built yet, and not the ws of a wireguard inbound")}
+				if inbound.kind == InboundType::Veilway && !transport.datagram() {r.error(format!("{at}.type"), "expected \"udp\" or \"udp-obfs\": this build has no other transport for a veilway inbound. The ws of a veilway inbound is the native format, which is not built yet, and not the ws of a wireguard inbound")}
+				if let Transport::UdpObfs {limits, ..} = transport {
+					// Every device of a `veilway` inbound has the transport secret the envelope is keyed with. A device of a `wireguard` inbound has none.
+					if inbound.kind != InboundType::Veilway {r.error(format!("{at}.type"), "expected \"udp\" or \"ws\": udp-obfs is a transport of a veilway inbound, whose devices have the transport secrets it is keyed with")}
+					if limits.and_then(|limits| limits.sessions).is_some_and(|sessions| !(1..=MAX_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.sessions"), format!("expected an integer from 1 to {MAX_SESSIONS}"))}
+				}
 				if let Transport::Ws {listen, path, tls} = transport {
 					if !path.starts_with('/') || path.len() > MAX_WS_PATH_BYTES || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~/-".contains(&b)) || path.split('/').any(|part| part == "..") {
 						r.error(format!("{at}.path"), format!("expected a path that starts with /, is at most {MAX_WS_PATH_BYTES} bytes from A-Z a-z 0-9 . _ ~ / - and has no .. component"));
@@ -120,17 +134,17 @@ impl Config {
 					}
 					if tls.is_none() && !listen.0.ip().is_loopback() {r.warning(format!("{at}.listen"), "plain ws without tls is meant for a reverse proxy on the same host; listen on a loopback address")}
 				}
-				let (here, udp) = (transport.listen(), matches!(transport, Transport::Udp {..}));
+				let (here, udp) = (transport.listen(), transport.datagram());
 				let clash = listeners.iter().find(|(_, other)| {
 					let there = other.listen();
 					let same_socket = here.port() == there.port() && here.is_ipv4() == there.is_ipv4() && (here.ip() == there.ip() || here.ip().is_unspecified() || there.ip().is_unspecified());
 					same_socket && match (transport, other) {
 						(Transport::Ws {path, tls, ..}, Transport::Ws {path: other_path, tls: other_tls, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls,
-						_ => udp == matches!(other, Transport::Udp {..}),
+						_ => udp == other.datagram(),
 					}
 				});
 				if let Some((other, _)) = clash {
-					r.error(format!("{at}.listen"), format!("conflicts with {other}: {}", if udp {"two udp transports never share an address and port"} else {"two ws transports share an address and port only with different paths and identical tls"}));
+					r.error(format!("{at}.listen"), format!("conflicts with {other}: {}", if udp {"two udp or udp-obfs transports never share an address and port"} else {"two ws transports share an address and port only with different paths and identical tls"}));
 				}
 				listeners.push((at, transport));
 			}
@@ -301,6 +315,12 @@ impl Config {
 			if notice.text.is_empty() || veilway_proto::control::display(&notice.text, usize::MAX, MAX_NOTICE_BYTES) != notice.text {r.error(format!("notices[{i}].text"), format!("expected 1 to {MAX_NOTICE_BYTES} bytes of plain text with no control, bidirectional formatting, zero-width or other invisible characters"))}
 		}
 		if !self.notices.is_empty() && !self.inbounds.iter().any(|inbound| inbound.kind == InboundType::Veilway) {r.warning("notices", "no inbound is a veilway inbound, so no device is shown these")}
+		if self.replay.cache.is_some_and(|cache| !(MIN_REPLAY_CACHE..=MAX_REPLAY_CACHE).contains(&cache)) {r.error("replay.cache", format!("expected an integer from {MIN_REPLAY_CACHE} to {MAX_REPLAY_CACHE}"))}
+		if let Some(rate) = self.replay.per_source {
+			if !(1..=MAX_PROOF_RATE).contains(&rate.burst) {r.error("replay.per_source.burst", format!("expected an integer from 1 to {MAX_PROOF_RATE}"))}
+			if !(1..=MAX_PROOF_RATE).contains(&rate.rate) {r.error("replay.per_source.rate", format!("expected an integer from 1 to {MAX_PROOF_RATE}"))}
+		}
+		if self.replay != Replay::default() && !self.inbounds.iter().any(|inbound| inbound.kind == InboundType::Veilway && inbound.obfuscated()) {r.warning("replay", "never used: no inbound has an obfuscated transport, so the node keeps no replay memory")}
 		if self.dns.sets.len() > MAX_DNS_SETS {r.error("dns.sets", format!("expected at most {MAX_DNS_SETS} sets"))}
 		tags(&mut r, "dns.sets", self.dns.sets.iter().take(MAX_DNS_SETS).map(|set| set.tag.as_str()));
 		// Every list of servers of the document with its path: `dns.servers`, then that of each set. The same rules hold for all of them.

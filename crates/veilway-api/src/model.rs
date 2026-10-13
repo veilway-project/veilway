@@ -93,6 +93,8 @@ pub struct Diff {
 	pub routing_default: bool,
 	pub rules_reordered: bool,
 	pub notices: bool,
+	/// `replay` changed. The rate per source is in force at once, the cache size from the next start of the node.
+	pub replay: bool,
 	pub inbound_changes: Vec<InboundChange>,
 	pub user_changes: Vec<UserChange>,
 }
@@ -111,6 +113,7 @@ impl From<&config::Diff> for Diff {
 			routing_default: diff.routing_default,
 			rules_reordered: diff.rules_reordered,
 			notices: diff.notices,
+			replay: diff.replay,
 			inbound_changes: diff.inbound_changes.iter().map(|change| InboundChange {tag: change.tag.clone(), restart: change.restart, transports_stopped: change.transports_stopped.clone(), transports_started: change.transports_started.clone()}).collect(),
 			user_changes: diff.user_changes.iter().map(|change| UserChange {name: change.name.clone(), devices_added: keys(&change.devices_added), devices_removed: keys(&change.devices_removed), devices_readdressed: keys(&change.devices_readdressed), devices_rekeyed: keys(&change.devices_rekeyed), devices_secrets_changed: keys(&change.devices_secrets_changed), lost_access: change.lost_access}).collect(),
 		}
@@ -287,12 +290,103 @@ pub struct Stats {
 	pub ws_refused: u64,
 	/// Writes of the usage state file that failed since start.
 	pub state_write_failures: u64,
+	/// Datagrams the node made for a device and no socket took, over every transport of every inbound. A socket of a `veilway` inbound never fragments, so a packet larger than the host's interface carries is counted here and not sent: lower the inbound's `mtu` when this grows.
+	pub send_failed: u64,
 	pub control: Control,
+	pub udp_obfs: UdpObfs,
+	/// The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory.
+	pub replay: Option<Replay>,
+}
+
+/// What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key.
+#[derive(Serialize, JsonSchema)]
+pub struct UdpObfs {
+	/// Sessions whose opening packet was accepted and on which WireGuard has not authenticated yet, right now.
+	pub pending: usize,
+	/// Established sessions right now, with those that a newer session of the same source replaced and that are still readable for 10 seconds.
+	pub sessions: usize,
+	/// Epoch tags in the tag tables right now: three for each transport secret of each device that may connect.
+	pub tags: usize,
+	/// Opening packets that were accepted, and sessions that became established.
+	pub opened: u64,
+	pub established: u64,
+	/// Packets the listeners made for a socket. Every one is a data packet of an established session, so a node that only strangers talk to has 0 here.
+	pub sent: u64,
+	/// Opening packets that were kept for the write of a higher limit and taken to the replay rule again when it had ended, and opening packets a limit refused whose salt was recorded as spent, so that nobody who saw one can use it later.
+	pub waited: u64,
+	pub spent: u64,
+	/// Datagrams dropped, by reason: shorter than a data packet, `short`. No data packet of a session at its source and a tag that is not in the tag table, `unknown`, which is where every datagram of a stranger is counted. A tag that is in the table on a packet that does not open, `open_failed`: its sender holds a tag of this epoch without the device's secret, or the packet was changed on its way.
+	pub short: u64,
+	pub unknown: u64,
+	pub open_failed: u64,
+	/// Opening packets of a device that the replay rule refused: a timestamp outside the window of 60 seconds, at or below the floor, a packet that was accepted before, and any while the cache is full.
+	pub window: u64,
+	pub floor: u64,
+	pub seen: u64,
+	pub cache_full: u64,
+	/// Opening packets with a timestamp above the written limit that were dropped: the listener already kept 64 others, or no write ended within 2 seconds. And those that came while the node took no proof at all.
+	pub limit: u64,
+	pub no_replay: u64,
+	/// Opening packets refused by a limit: the source has sessions of 4 other devices, the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.
+	pub source_devices: u64,
+	pub pool: u64,
+	pub pending_full: u64,
+	pub device_rate: u64,
+	pub source_rate: u64,
+	/// Handshake initiations above a session's allowance, datagrams inside a session that WireGuard did not take as a packet of the session's device, and packets the node could not make.
+	pub handshakes: u64,
+	pub tunnel: u64,
+	pub unsendable: u64,
+	/// Sessions that ended, by reason: no WireGuard packet within 10 seconds of the opening packet, no activity for 180 seconds, 2^31 packets sent, a newer session of the same source and device, the device's ninth session, and a device or transport secret the config no longer has.
+	pub ended_deadline: u64,
+	pub ended_idle: u64,
+	pub ended_packets: u64,
+	pub ended_replaced: u64,
+	pub ended_displaced: u64,
+	pub ended_revoked: u64,
+	/// How often a tag table was built for a new epoch, how often that was late, how often a build did not end, and tags that were left out because another secret had the same.
+	pub table_rebuilds: u64,
+	pub table_rebuilds_late: u64,
+	pub table_build_failures: u64,
+	pub tag_collisions: u64,
+}
+
+/// The replay memory of the node. Times are Unix seconds on the node's clock.
+#[derive(Serialize, JsonSchema)]
+pub struct Replay {
+	/// False while no proof is accepted at all: a reset whose file is not known to be on disk.
+	pub ready: bool,
+	pub clock: u64,
+	/// A proof with a timestamp at or below the floor is refused.
+	pub floor: u64,
+	/// A proof with a timestamp above the limit is not accepted before a higher limit is written.
+	pub limit: u64,
+	/// The highest limit that may be on disk, which a start after a kill takes as its floor.
+	pub disk_limit: u64,
+	pub entries: usize,
+	pub capacity: usize,
+	/// The floor is ahead of the clock in a way no start explains: more than 80 seconds, or risen while the node ran. Every proof of a client with a right clock is refused until the clock passes the floor or the replay memory is reset. After a start or a reset the floor is up to 80 seconds ahead, which is what they cost and is false here.
+	pub floor_ahead: bool,
+	/// How many seconds the floor is ahead of the clock, whatever the cause: for that long proofs with a right clock are refused. 0 on a node that takes them.
+	pub refusing_secs: u64,
+	/// Proofs refused at the floor while `floor_ahead` was true.
+	pub refused_floor_ahead: u64,
+	/// Writes of the replay file that went through, that failed, and that took more than 2 seconds.
+	pub writes: u64,
+	pub write_failures: u64,
+	pub slow_writes: u64,
+	/// How often the node brought its own limit down after a clock that had run ahead.
+	pub limit_lowered: u64,
+	pub resets: u64,
+}
+
+impl From<veilway_core::ReplayStatus> for Replay {
+	fn from(status: veilway_core::ReplayStatus) -> Replay {Replay {ready: status.ready, clock: status.clock, floor: status.floor, limit: status.limit, disk_limit: status.disk, entries: status.entries, capacity: status.capacity, floor_ahead: status.floor_ahead, refusing_secs: status.wait, refused_floor_ahead: status.refused_floor_ahead, writes: status.writes, write_failures: status.write_failures, slow_writes: status.slow_writes, limit_lowered: status.lowered, resets: status.resets}}
 }
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Transport {Udp, Ws}
+pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs}
 
 /// A device with a live session on one inbound. The address the device connects from is not part of it.
 #[derive(Serialize, JsonSchema)]

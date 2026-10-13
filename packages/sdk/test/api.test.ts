@@ -75,6 +75,17 @@ test("a usage reset answers with the user, zeroes the totals when asked and know
 	await assert.rejects(client.resetUsage("no.such.user"), (e: unknown) => e instanceof VeilwayError && e.status === 404 && e.code === "user_not_found");
 });
 
+test("a replay reset answers with the replay memory, which the stats then show", live, async () => {
+	const replay = await client.resetReplay();
+	assert.equal(replay.ready, true);
+	assert.equal(replay.floor, replay.limit);
+	assert.equal(replay.entries, 0);
+	assert.ok(replay.resets >= 1);
+	const stats = await client.stats();
+	assert.equal(stats.replay?.floor, replay.floor);
+	assert.equal(stats.udp_obfs.sessions, 0);
+});
+
 test("the event stream parser reads ids, comments, CRLF and lagged", async () => {
 	const body = ": keepalive\r\nid: 7\r\nevent: user_restored\r\ndata: {\"user\":\r\ndata: \"a\"}\r\n\r\nevent: lagged\ndata: {\"missed\":3}\n\nevent: other\ndata: 1\n\n";
 	const bytes = new TextEncoder().encode(body);

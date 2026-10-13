@@ -18,6 +18,8 @@ pub const EPOCH: u64 = 120;
 pub const DATA_MIN: usize = 12 + TAG;
 /// The smallest opening packet: the masked tag, the salt, the 12 bytes in front of the chunk and the tag. "Shorter than 76 bytes: drop."
 pub const OPENING_MIN: usize = 16 + 32 + 12 + TAG;
+/// A WireGuard handshake response of 92 bytes in a data packet with no padding: the nonce, the length, the response and the tag. A client makes no opening packet smaller than this, so that the node's first answer, which is no larger than the opening packet, always has room for it.
+pub const FIRST_ANSWER: usize = DATA_MIN + 2 + 92;
 /// What a full-size inner packet gains on its way into a data packet: 32 bytes from WireGuard, then the nonce, the length and the tag. "On `udp-obfs` no packet is larger than `mtu` + 62 bytes."
 pub const OVERHEAD: usize = 32 + 12 + 2 + TAG;
 /// "The client opens a new session at 2^30 sent or received."
@@ -62,7 +64,8 @@ impl Client {
 		if !(chunk::MIN_ITEM..=chunk::MAX_ITEM).contains(&datagram.len()) {return Err(ChunkError::Item)}
 		let (used, limit) = (2 + datagram.len(), max.saturating_sub(OPENING_MIN).min(MAX_PLAINTEXT));
 		if used > limit {return Err(ChunkError::Size)}
-		let (padding, mut plaintext, mut header) = (padding.draw(true, used, limit, random)?, Vec::new(), [VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+		// The node's first answer is no larger than this packet, and the largest thing it has to say first is a handshake response in a data packet, `FIRST_ANSWER` bytes. Padding is raised to that where a keepalive and a small draw would leave the packet below it.
+		let (padding, mut plaintext, mut header) = (padding.draw(true, used, limit, random)?.max(FIRST_ANSWER.saturating_sub(OPENING_MIN + used).min(limit - used)), Vec::new(), [VERSION, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
 		chunk::write(&[datagram], padding, &mut plaintext)?;
 		header[4..].copy_from_slice(&timestamp.to_be_bytes());
 		self.seal(self.tags.epoch_tag(epoch(timestamp)), &header, &plaintext, random, out)
@@ -149,11 +152,17 @@ impl Node {
 	/// Opens a datagram as an opening packet and finds its device in `tags` with one lookup, as an epoch tag. `tags` holds the epoch tags of the epochs the node accepts, so this function reads no clock: a table that is not rebuilt when the epoch changes refuses every client two minutes later. `scratch` is where the packet is opened.
 	///
 	/// "A datagram from a stranger costs the node one HMAC and one table lookup. A datagram whose unmasked tag is in the table costs one key derivation and one decryption more." A miss ends here, and the two keys of the data packets are not derived before a packet is accepted. The node answers nothing on any of these paths, so there is no timing to make equal. The answer to everything that is not an opening packet of a device in the table is the one `Refused`, and the caller drops the datagram.
-	pub fn open<'a, T>(&self, packet: &[u8], tags: &'a impl Tags<T>, scratch: &'a mut Vec<u8>) -> Result<Opening<'a, T>, Refused> {
+	pub fn open<'a, T>(&self, packet: &[u8], tags: &'a impl Tags<T>, scratch: &'a mut Vec<u8>) -> Result<Opening<'a, T>, Refused> {self.unseal(self.find(packet, tags).ok_or(Refused)?, packet, scratch)}
+	/// The first half of `open`, steps 3 and 4 of the node state machine: the device the masked tag of a datagram names, at the cost of one HMAC and one lookup. A node that counts a tag miss apart from a packet that then does not open calls this and `unseal`. It still answers nothing on either.
+	pub fn find<'a, T>(&self, packet: &[u8], tags: &'a impl Tags<T>) -> Option<&'a Device<T>> {
+		if packet.len() < OPENING_MIN || packet.len() > OPENING_MIN + MAX_PLAINTEXT {return None}
+		let mask = self.mask.mask(&std::array::from_fn(|index| packet[16 + index]));
+		tags.find_epoch(&std::array::from_fn(|index| packet[index] ^ mask[index]))
+	}
+	/// The second half of `open`, step 5 and the version and zero bytes of step 6, for the device `find` gave for this same datagram.
+	pub fn unseal<'a, T>(&self, device: &'a Device<T>, packet: &[u8], scratch: &'a mut Vec<u8>) -> Result<Opening<'a, T>, Refused> {
 		if packet.len() < OPENING_MIN || packet.len() > OPENING_MIN + MAX_PLAINTEXT {return Err(Refused)}
 		let salt: [u8; 32] = std::array::from_fn(|index| packet[16 + index]);
-		let mask = self.mask.mask(&salt);
-		let device = tags.find_epoch(&std::array::from_fn(|index| packet[index] ^ mask[index])).ok_or(Refused)?;
 		let (open, salted) = device.obfs.opening(&salt);
 		scratch.clear();
 		scratch.extend_from_slice(&packet[48..]);
@@ -323,6 +332,26 @@ mod tests {
 		assert!(answer.len() < packet.len());
 		assert_eq!(Receiver::new(keys.s2c).open(&answer, &mut third), Ok(None));
 		assert_eq!(receiver.open(&answer, &mut third), Err(Refused));
+	}
+
+	// The node's first answer is no larger than the opening packet, so an opening packet around a keepalive with the smallest padding still leaves room for a handshake response. And the two halves of `open` tell a tag the table does not have from a packet that names a device and does not open.
+	#[test]
+	fn an_opening_packet_has_room_for_a_handshake_response_and_a_miss_is_told_from_a_packet_that_does_not_open() {
+		let (zero, table, mut scratch) = (0u32.to_be_bytes(), table(TIME), Vec::new());
+		for (base, max) in [(0, MAX), (0, 115), (63, MAX)] {
+			let mut packet = Vec::new();
+			client().open(TIME, &item(), &padding(base), max, &mut script(&[&zero, &[0xa5; 32]]), &mut packet).unwrap();
+			assert_eq!(packet.len(), if max == 115 {115} else {FIRST_ANSWER.max(OPENING_MIN + 34 + base as usize)}, "base {base}, at most {max}");
+		}
+		assert_eq!(FIRST_ANSWER, 122);
+		let mut packet = Vec::new();
+		client().open(TIME, &item(), &padding(5), MAX, &mut seeded(3), &mut packet).unwrap();
+		assert!(node().find(&packet, &table).is_some_and(|device| device.id == 7) && node().unseal(node().find(&packet, &table).unwrap(), &packet, &mut scratch).is_ok());
+		let (mut tag, mut body) = (packet.clone(), packet.clone());
+		(tag[0], body[60]) = (tag[0] ^ 1, body[60] ^ 1);
+		assert!(node().find(&tag, &table).is_none() && node().open(&tag, &table, &mut scratch).is_err());
+		assert!(node().find(&body, &table).is_some() && node().unseal(node().find(&body, &table).unwrap(), &body, &mut scratch).is_err() && node().open(&body, &table, &mut scratch).is_err());
+		assert!(node().find(&packet[..75], &table).is_none());
 	}
 
 	#[test]

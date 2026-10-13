@@ -37,6 +37,8 @@ time={version="0.3.36", default-features=false, features=["std", "parsing", "for
 ring="0.17"
 socket2="0.6"
 libc="0.2.150"
+# Only `net` is used. `time` is there because rustix 1.1 does not build its socket options without the time types that feature brings.
+rustix={version="1", default-features=false, features=["std", "net", "time"]}
 axum={version="0.8", default-features=false, features=["http1", "tokio"]}
 hyper={version="1", features=["http1", "server"]}
 hyper-util={version="0.1", features=["tokio", "service"]}

@@ -2,16 +2,20 @@
 //! What the node learns while it runs (counters, name memory, tunnels) hangs off the plan and is handed from one plan to the next by tag, user name or public key, so a change of order or membership loses nothing that survives it.
 use super::inbound::Tunnel;
 use super::{control, icmp, l3, usage, ExitState, Traffic, UserState};
-use crate::config::{self, Config, Exits, InboundType, IpEntry, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
+use crate::config::{self, Config, Exits, InboundType, IpEntry, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
 use std::collections::HashMap;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+use tokio::runtime::{Handle, RuntimeFlavor};
+use veilway_proto::chunk::{NORMAL_DEFAULT, WIDE_DEFAULT};
+use veilway_proto::keys::{self, TagKey};
+use veilway_proto::udp_obfs;
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
 #[derive(PartialEq, Eq)]
@@ -71,10 +75,84 @@ impl DnsSet {
 	pub fn same(&self, other: &DnsSet) -> bool {self.servers.len() == other.servers.len() && self.servers.iter().all(|server| other.servers.contains(server))}
 }
 
+/// The transport secret a tag came from, as the tag table names it. A session keeps it to know when the config no longer has the secret it was opened with. Never logged and never shown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Proved(pub [u8; 32]);
+
+impl fmt::Debug for Proved {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {f.write_str("Proved(..)")}
+}
+
+/// What one transport secret of one device gives on one inbound: the key its tags are computed with, and the entry the tag table holds for it. It is made once and handed from plan to plan for as long as the secret, the device and the inbound's key stay,
+/// with the tags it last computed, so a plan that is compiled inside an epoch computes none again.
+pub struct Derived {tags: TagKey, pub device: Arc<keys::Device<Proved>>, epochs: Mutex<Vec<(u64, [u8; 16])>>}
+
+impl Derived {
+	/// `inbound` and `device` are the WireGuard public keys of the inbound and of the device.
+	pub fn new(secret: &[u8; 32], inbound: &[u8; 32], device: &[u8; 32]) -> Derived {Derived {tags: TagKey::derive(secret, inbound), device: Arc::new(keys::Device::derive(Proved(*secret), secret, inbound, device)), epochs: Mutex::default()}}
+
+	/// The epoch tag of each of `epochs`, which are the three a table holds. Those of the epochs before are forgotten.
+	fn tags(&self, epochs: [u64; 3]) -> [[u8; 16]; 3] {
+		let mut known = self.epochs.lock().unwrap_or_else(|e| e.into_inner());
+		let tags = epochs.map(|epoch| known.iter().find(|(of, _)| *of == epoch).map_or_else(|| self.tags.epoch_tag(epoch), |(_, tag)| *tag));
+		*known = epochs.into_iter().zip(tags).collect();
+		tags
+	}
+}
+
+/// The tag table of one inbound at one epoch (transports page, "How the node finds the device"): the epoch tags of the previous, the current and the next epoch of every transport secret of every device that may connect. It is built whole and swapped in whole.
+pub struct Tags {
+	/// The epoch number the table was built in.
+	pub epoch: u64,
+	pub table: keys::Table<Arc<keys::Device<Proved>>>,
+	/// Tags that were another secret's already and were left out, which no two random secrets ever cause: "Validation refuses a config in which two tags of one inbound are equal."
+	pub collisions: usize,
+}
+
+/// What a `veilway` inbound with a `udp-obfs` transport holds for it.
+pub struct Native {
+	pub node: udp_obfs::Node,
+	/// The upper bounds of wide and of normal padding on what the node sends.
+	pub wide: u32,
+	pub normal: u32,
+	pub mtu: u16,
+	/// One for each transport secret of each device with an address in the inbound whose user may connect.
+	pub keys: Vec<Arc<Derived>>,
+	tags: RwLock<Arc<Tags>>,
+}
+
+impl Native {
+	/// `now` is the wall clock in Unix seconds, which decides the epochs of the first table.
+	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, now: u64) -> Native {
+		let native = Native {node: udp_obfs::Node::new(inbound), wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, table: keys::Table::new(), collisions: 0}))};
+		native.swap(native.build(now));
+		native
+	}
+
+	/// The table for the epochs around `now`. It costs one HMAC for each tag that was not computed before, so it runs away from the packet path.
+	pub fn build(&self, now: u64) -> Tags {
+		let (epochs, mut table, mut collisions) = (udp_obfs::epochs(now), keys::Table::new(), 0);
+		for derived in &self.keys {
+			// The first epochs of all time name the same epoch twice, and a tag is in the table once.
+			for (at, tag) in derived.tags(epochs).into_iter().enumerate() {
+				if !epochs[..at].contains(&epochs[at]) && !table.epoch(tag, derived.device.clone()) {collisions += 1}
+			}
+		}
+		Tags {epoch: udp_obfs::epoch(now), table, collisions}
+	}
+
+	/// The table in force. A packet takes it once and works on that one value.
+	pub fn tags(&self) -> Arc<Tags> {self.tags.read().unwrap_or_else(|e| e.into_inner()).clone()}
+
+	pub fn swap(&self, tags: Tags) {*self.tags.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(tags)}
+}
+
 pub struct Inbound {
 	pub tag: String,
 	pub private_key: [u8; 32],
 	pub public_key: [u8; 32],
+	/// Set for a `veilway` inbound with a `udp-obfs` transport.
+	pub native: Option<Native>,
 	/// A `veilway` inbound: its gateway answers the control channel as well as DNS.
 	pub veilway: bool,
 	/// The gateway address with the prefix of its pool, as written in the config.
@@ -257,13 +335,14 @@ impl Plan {
 				failures: dns.iter().map(|set| was.zip(previous.dns.iter().position(|old| old.tag == set.tag && old.servers == set.servers)).and_then(|(was, at)| was.failures.get(at)).cloned().unwrap_or_default()).collect(),
 			});
 		}
-		let inbounds: Vec<Inbound> = config.inbounds.iter().zip(tunnels).map(|(inbound, tunnel)| Inbound {
+		let mut inbounds: Vec<Inbound> = config.inbounds.iter().zip(tunnels).map(|(inbound, tunnel)| Inbound {
 			tag: inbound.tag.clone(),
 			private_key: inbound.private_key.expose().0,
 			public_key: veilway_wg::public_key(&inbound.private_key.expose().0),
+			native: None,
 			veilway: inbound.kind == InboundType::Veilway,
 			pools: inbound.address.iter().map(|net| net.0).collect(),
-			mtu: inbound.mtu.unwrap_or(DEFAULT_MTU),
+			mtu: inbound.mtu(),
 			transports: inbound.transports.clone(),
 			dns: set_of_inbound.get(inbound.tag.as_str()).map_or(0, |set| set + 1),
 			traffic: was_inbound.get(inbound.tag.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(),
@@ -324,6 +403,19 @@ impl Plan {
 				});
 			}
 		}
+		// "Only devices of a user who is enabled, not expired and not over quota, with an address on this inbound, are in the table", which is every device of this plan that has the inbound.
+		// What a secret gives is taken from the plan before where that has it for the same device under the same inbound key.
+		// The keys and the tags of a large inbound take a while to make. A plan is compiled on a thread of the runtime with a reload or a cut-off waiting for it, so the runtime is told that this thread is busy: its other work, every packet among it, goes to the other threads.
+		// A runtime of one thread has no other to give it to, and code that runs on none, a test or a harness, needs none.
+		let mut tables = || {
+			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
+				let (public, mut was) = (inbounds[i].public_key, HashMap::new());
+				for derived in previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()).flat_map(|native| &native.keys) {was.insert((derived.device.public, derived.device.id.0), derived);}
+				let keys = devices.iter().filter(|device| device.inbounds.contains(&i)).flat_map(|device| device.secrets.iter().map(|secret| was.get(&(device.public_key, *secret)).map_or_else(|| Arc::new(Derived::new(secret, &public, &device.public_key)), |derived| (*derived).clone()))).collect();
+				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, now.unix_timestamp().max(0) as u64));
+			}
+		};
+		if Handle::try_current().is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread) {tokio::task::block_in_place(tables)} else {tables()}
 		let mut rules = Vec::new();
 		for rule in config.routing.rules.iter().filter(|rule| rule.enabled != Some(false)) {
 			rules.push(Rule {

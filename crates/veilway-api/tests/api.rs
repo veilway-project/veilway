@@ -427,7 +427,7 @@ struct Node {engine: Arc<Engine>, server: Server, dir: PathBuf, socket: PathBuf,
 async fn start(dir: &Path, limits: &Limits) -> (Arc<Engine>, Server) {
 	let (config, report) = veilway_core::config::load(&dir.join("config.json"), false);
 	let config = config.unwrap_or_else(|| panic!("the config file is not valid: {:#?}", report.errors));
-	let engine = Arc::new(veilway_core::start(&config, Options {revision: report.revision, allow_readable: true, state: Some(dir.join("state.json")), ..Options::new(dir)}).await.unwrap());
+	let engine = Arc::new(veilway_core::start(&config, Options {revision: report.revision, allow_readable: true, state: Some(dir.join("state.json")), replay: Some(dir.join("replay")), ..Options::new(dir)}).await.unwrap());
 	let server = veilway_api::serve(engine.clone(), ApiOptions {socket: dir.join("veilway.sock"), config: dir.join("config.json"), limits: limits.clone()}).unwrap();
 	(engine, server)
 }
@@ -516,8 +516,13 @@ async fn every_route_answers() {
 	let reset = call(&node.socket, "POST", "/v1/users/a/usage/reset", &[], None).await;
 	ask("POST", "/v1/users/a/usage/reset");
 	assert_eq!((reset.status, &reset.json["name"], &reset.json["traffic"]["up_bytes"]), (200, &json!("a"), &a["traffic"]["up_bytes"]), "{}", reset.json);
+	// A node without an obfuscated transport keeps no replay memory, so there is none to reset and no replay file is made.
+	let replay = call(&node.socket, "POST", "/v1/replay/reset", &[], None).await;
+	ask("POST", "/v1/replay/reset");
+	assert_eq!((replay.status, replay.code(), node.dir.join("replay").exists()), (409, "replay_absent", false), "{}", replay.json);
 	let stats = get(&node.socket, "/v1/stats").await;
 	ask("GET", "/v1/stats");
+	assert_eq!((&stats.json["replay"], &stats.json["udp_obfs"]["sessions"], &stats.json["udp_obfs"]["unknown"]), (&Value::Null, &json!(0), &json!(0)), "{}", stats.json);
 	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(15)), "{}", stats.json);
 	assert!(stats.json["users"][0]["traffic"]["up_packets"].as_u64().unwrap() >= 2 && stats.json["exits"][0]["traffic"]["down_bytes"].as_u64().unwrap() > 0 && stats.json["drops"]["gate"].is_u64() && stats.json["dns"]["answered"].is_u64(), "{}", stats.json);
 	let sessions = get(&node.socket, "/v1/sessions").await;
@@ -1394,11 +1399,35 @@ async fn a_user_says_the_dns_set_that_names_them_or_their_group() {
 	node.end().await;
 }
 
+// Transports page, "When the floor is ahead of the clock": the reset "asks the running node, through the control socket, to empty its cache and set the floor and the limit to the wall clock plus `W`", and "touches nothing else, usage and quotas included".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replay_reset_is_written_before_it_is_answered_and_touches_no_usage() {
+	let mut setup = setup().await;
+	let (device, secret) = (veilway_wg::generate_key(), veilway_wg::generate_key());
+	setup.doc["inbounds"].as_array_mut().unwrap().push(json!({"tag": "native", "type": "veilway", "private_key": encoded(&veilway_wg::generate_key()), "address": ["10.9.0.1/24"], "transports": [{"type": "udp-obfs", "listen": listen().to_string()}]}));
+	setup.doc["users"].as_array_mut().unwrap().push(json!({"name": "n", "exits": "all", "quota_bytes": 1000, "devices": [{"name": "device", "public_key": veilway_wg::encode_key(&veilway_wg::public_key(&device)), "transport_secrets": [veilway_wg::encode_key(&secret)], "addresses": ["10.9.0.2"]}]}));
+	SECRETS.lock().unwrap().extend([setup.doc["inbounds"][1]["private_key"].as_str().unwrap().to_string(), veilway_wg::encode_key(&secret)]);
+	let node = launch(setup).await;
+	let (before, users) = (get(&node.socket, "/v1/stats").await.json["replay"].clone(), get(&node.socket, "/v1/users").await.json);
+	// A node that never ran here: the file is made, and the floor is the clock plus the window.
+	assert_eq!((&before["ready"], &before["floor_ahead"], before["refusing_secs"].as_u64().is_some_and(|secs| (1..=60).contains(&secs)), &before["entries"], &before["capacity"], &before["resets"]), (&json!(true), &json!(false), true, &json!(0), &json!(262144), &json!(0)), "{before}");
+	assert_eq!(before["floor"].as_u64().unwrap(), before["limit"].as_u64().unwrap());
+	let reset = call(&node.socket, "POST", "/v1/replay/reset", &[], None).await;
+	assert_eq!((reset.status, &reset.json["ready"], &reset.json["resets"], &reset.json["entries"]), (200, &json!(true), &json!(1), &json!(0)), "{}", reset.json);
+	assert!(reset.json["floor"].as_u64().unwrap() >= before["floor"].as_u64().unwrap() && reset.json["floor"] == reset.json["limit"] && reset.json["floor"] == reset.json["disk_limit"], "{}", reset.json);
+	// What the answer says is what the file holds: a floor and a limit in big-endian behind the 16 bytes of its head.
+	let file = std::fs::read(node.dir.join("replay")).unwrap();
+	assert_eq!((file.len(), u64::from_be_bytes(file[16..24].try_into().unwrap()), u64::from_be_bytes(file[24..32].try_into().unwrap())), (68, reset.json["floor"].as_u64().unwrap(), reset.json["limit"].as_u64().unwrap()));
+	assert_eq!(get(&node.socket, "/v1/users").await.json, users, "a replay reset changed what a user has used");
+	no_secret_logged();
+	node.end().await;
+}
+
 #[test]
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();
@@ -1412,7 +1441,8 @@ fn the_openapi_document_has_every_route_and_nothing_dangling() {
 				if status != "200" {assert_eq!(response["content"]["application/json"]["schema"], json!({"$ref": "#/components/schemas/ErrorBody"}), "{method} {path} {status}")}
 			}
 			let takes = |name: &str, place: &str| operation["parameters"].as_array().unwrap().iter().any(|parameter| parameter["name"] == name && parameter["in"] == place && parameter["required"] == true);
-			assert_eq!((takes("name", "path"), takes("If-Match", "header"), operation.get("requestBody").is_some()), (path.contains("{name}"), method == "put", method != "get"), "{method} {path}");
+			// A reset of the replay memory is the one request that changes something and has nothing to say: there is one replay memory and one thing a reset does to it.
+			assert_eq!((takes("name", "path"), takes("If-Match", "header"), operation.get("requestBody").is_some()), (path.contains("{name}"), method == "put", method != "get" && path != "/v1/replay/reset"), "{method} {path}");
 		}
 	}
 	for status in ["409", "422", "428", "400", "413", "415"] {assert!(OPENAPI["paths"]["/v1/config"]["put"]["responses"].get(status).is_some(), "an apply has no {status}")}
