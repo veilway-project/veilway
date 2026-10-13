@@ -144,7 +144,7 @@ pub async fn ping(shared: Arc<Shared>, plan: Arc<Plan>, exit: usize, to: Holder,
 						_ => return,
 					};
 					if built.is_err() || out.len() > usize::from(plan.inbounds[to.inbound].mtu) {continue}
-					shared.counters.exits[exit].down(out.len());
+					plan.exits[exit].traffic.down(out.len());
 					shared.send(&plan, to, &out).await;
 				}
 				_ = tokio::time::sleep(PING_IDLE) => return,

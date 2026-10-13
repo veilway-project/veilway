@@ -2,8 +2,9 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use tracing_subscriber::filter::Directive;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use veilway_core::config::{LogLevel, Report};
+use veilway_core::config::{Log, LogLevel, Report};
 use veilway_core::Options;
 use veilway_wg::ws::{self, TlsFiles};
 
@@ -67,10 +68,11 @@ fn print(report: &Report, config: &Path) -> bool {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	// `RUST_LOG` overrides the level. Without `destinations` the userspace stack is silenced, because its own log lines name the addresses of every flow.
-	let log = |level: &str, destinations: bool| {
-		let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-		tracing_subscriber::fmt().with_env_filter(if destinations {filter} else {filter.add_directive("ipstack=off".parse::<Directive>().expect("a valid directive"))}).init()
+	let filter = |log: &Log| {
+		let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(match log.level {LogLevel::Error => "error", LogLevel::Warn => "warn", LogLevel::Info => "info", LogLevel::Debug => "debug", LogLevel::Trace => "trace"}));
+		if log.destinations {filter} else {filter.add_directive("ipstack=off".parse::<Directive>().expect("a valid directive"))}
 	};
+	let bridge = Log {level: LogLevel::Info, destinations: true};
 	match Cli::parse().command {
 		Command::Genkey => {
 			let private = veilway_wg::generate_key();
@@ -86,16 +88,31 @@ async fn main() -> anyhow::Result<()> {
 				eprintln!("error: {} can be read by group or others and holds keys and passwords; restrict it (chmod 600) or start with --allow-readable-config", config.display());
 				std::process::exit(1);
 			}
-			log(match loaded.log.level {LogLevel::Error => "error", LogLevel::Warn => "warn", LogLevel::Info => "info", LogLevel::Debug => "debug", LogLevel::Trace => "trace"}, loaded.log.destinations);
-			// SIGTERM is how a service manager and `docker stop` end the node, and SIGHUP is what a closing terminal sends it. An l3 exit has firewall rules and sysctls to take back before it goes, so both stop it the way Ctrl-C does.
+			// The filter sits behind a handle, so a reload that changes `log` changes what is written.
+			#[cfg_attr(not(unix), allow(unused_variables))]
+			let (level, relog) = tracing_subscriber::reload::Layer::new(filter(&loaded.log));
+			tracing_subscriber::registry().with(level).with(tracing_subscriber::fmt::layer()).init();
+			// SIGTERM is how a service manager and `docker stop` end the node. An l3 exit has firewall rules and sysctls to take back before it goes, so it stops the node the way Ctrl-C does. SIGHUP reads the config file again.
 			#[cfg(unix)]
 			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);
-			let engine = veilway_core::start(&loaded, Options::new(config.parent().unwrap_or(Path::new("")))).await?;
+			let engine = veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, ..Options::new(config.parent().unwrap_or(Path::new("")))}).await?;
 			#[cfg(unix)]
-			let stopped = tokio::select! {
-				stopped = tokio::signal::ctrl_c() => stopped,
-				_ = terminate.recv() => Ok(()),
-				_ = hangup.recv() => Ok(()),
+			let stopped = loop {
+				tokio::select! {
+					stopped = tokio::signal::ctrl_c() => break stopped,
+					_ = terminate.recv() => break Ok(()),
+					// The reload runs to its end before the next signal is looked at. What the store refused it has logged itself, once, with the paths of the fields.
+					_ = hangup.recv() => match engine.reload_from(&config).await {
+						Ok(applied) => {
+							if relog.reload(filter(&applied.snapshot.config.log)).is_err() {tracing::warn!("the log filter could not be changed")}
+							// A reload has no terminal to print to, and a warning can be the only sign that a rule which kept users apart is gone.
+							for w in &applied.report.warnings {tracing::warn!("config: {w}")}
+							tracing::info!("config generation {} is in force, {} warnings", applied.snapshot.generation, applied.report.warnings.len() + applied.report.more_warnings);
+						}
+						Err(veilway_core::config::ApplyError::Prepare(e)) => tracing::error!("config reload failed and the running config stays in force: {e:#}"),
+						Err(_) => {}
+					},
+				}
 			};
 			#[cfg(not(unix))]
 			let stopped = tokio::signal::ctrl_c().await;
@@ -112,11 +129,11 @@ async fn main() -> anyhow::Result<()> {
 			Ok(())
 		}
 		Command::Bridge {command: Bridge::Client {listen, url, insecure}} => {
-			log("info", true);
+			tracing_subscriber::fmt().with_env_filter(filter(&bridge)).init();
 			ws::run_client(listen, url, insecure).await
 		}
 		Command::Bridge {command: Bridge::Relay {listen, path, target, cert, key, max_conns}} => {
-			log("info", true);
+			tracing_subscriber::fmt().with_env_filter(filter(&bridge)).init();
 			let tls = match (cert, key) {(Some(cert), Some(key)) => Some(TlsFiles {cert, key}), _ => None};
 			ws::serve_limited(tokio::net::TcpListener::bind(listen).await?, tls, path, target, max_conns).await
 		}

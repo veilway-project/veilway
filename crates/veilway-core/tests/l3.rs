@@ -187,6 +187,74 @@ async fn the_l3_exit_carries_every_protocol_through_the_kernel_and_cleans_up() {
 	assert!(!output("ip", &["route", "show"]).1.contains("10.7.0.0/24"), "a pool route outlived the shutdown");
 }
 
+/// A reload brings the l3 exit up and takes it away again, and the interface, its routes and its firewall table come and go with it. A reload that cannot set the interface up leaves the host and the running config as they were,
+/// and one that changes what the interface needs (here a second pool and a smaller MTU) sets it up anew without losing the flows that leave through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_adds_changes_and_removes_the_l3_exit_with_everything_it_sets_up() {
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("skipped: the l3 tests need a TUN device and CAP_NET_ADMIN, set VEILWAY_TEST_L3=1 and VEILWAY_TEST_L3_PEER to run them")}
+	let _turn = HOST.lock().await;
+	let peer: Ipv4Addr = std::env::var("VEILWAY_TEST_L3_PEER").expect("VEILWAY_TEST_L3_PEER names the responder").parse().expect("VEILWAY_TEST_L3_PEER is an IPv4 address");
+	let (private, key, listen, peer, table) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21910)), peer.octets(), format!("veilway_{INTERFACE}"));
+	let without = json!({
+		"version": 1,
+		"dns": {"servers": ["1.1.1.1:53"], "hijack": false},
+		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&private), "address": ["10.7.0.1/24"], "mtu": 1420, "transports": [{"type": "udp", "listen": listen.to_string()}]}],
+		"outbounds": [],
+		"exits": [{"tag": "sink", "backend": {"type": "block"}}],
+		"routing": {"default": "sink", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}]},
+		"users": [{"name": "a", "exits": "all", "devices": [{"name": "device", "public_key": veilway_wg::encode_key(&veilway_wg::public_key(&key)), "addresses": ["10.7.0.2"]}]}]
+	});
+	let wired = |interface: &str| {
+		let mut doc = without.clone();
+		doc["exits"].as_array_mut().unwrap().push(json!({"tag": "node", "backend": {"type": "l3", "interface": interface, "masquerade": true}}));
+		doc["routing"]["default"] = json!("node");
+		doc
+	};
+	let config = Config::parse(without.to_string().as_bytes()).unwrap();
+	assert!(config.validate(false).errors.is_empty());
+	let engine = veilway_core::start(&config, Options::new("")).await.unwrap();
+	let present = || (Path::new(&format!("/sys/class/net/{INTERFACE}")).exists(), output("nft", &["list", "table", "inet", &table]).0, output("ip", &["route", "show"]).1.contains("10.7.0.0/24"));
+	assert_eq!(present(), (false, false, false));
+	let mut a = Client::connect(key, veilway_wg::public_key(&private), listen).await;
+	let ping = |seq: u16| {
+		let mut ping = Vec::new();
+		PacketBuilder::ipv4(DEVICE, peer, 64).icmpv4_echo_request(77, seq).write(&mut ping, b"abcdefgh").unwrap();
+		ping
+	};
+	let echoed = |packet: &[u8]| (packet[9] == 1 && packet[20] == 0).then_some(());
+	a.send_ip(&ping(1)).await;
+	assert!(a.expect(Duration::from_millis(700), echoed).await.is_none(), "a ping got out without an l3 exit");
+	// An interface that cannot be made: the name is the loopback interface's. Nothing of the reload stays, on the host or in the node.
+	let failed = engine.reload(wired("lo").to_string().into_bytes(), None).await.err().expect("an l3 exit on an interface that exists came up").to_string();
+	assert!(failed.contains("`node`"), "{failed}");
+	assert_eq!((present(), output("nft", &["list", "table", "inet", "veilway_lo"]).0, engine.snapshot().generation), ((false, false, false), false, 1));
+	engine.reload(wired(INTERFACE).to_string().into_bytes(), None).await.expect("the reload that adds the l3 exit failed");
+	assert_eq!(present(), (true, true, true), "the reload did not set up the interface, its table and its routes");
+	a.send_ip(&ping(2)).await;
+	a.expect(Duration::from_secs(5), echoed).await.expect("no echo reply through an l3 exit that a reload added");
+	// A second pool and a smaller MTU: the interface is made anew for them, and the ping that was going on goes on.
+	let mut wider = wired(INTERFACE);
+	wider["inbounds"].as_array_mut().unwrap().push(json!({"tag": "small", "type": "wireguard", "private_key": veilway_wg::encode_key(&veilway_wg::generate_key()), "address": ["10.8.0.1/24"], "mtu": 1280, "transports": [{"type": "udp", "listen": "127.0.0.1:21911"}]}));
+	engine.reload(wider.to_string().into_bytes(), None).await.expect("the reload that adds a pool failed");
+	let routes = output("ip", &["route", "show", "dev", INTERFACE]).1;
+	assert!(routes.contains("10.7.0.0/24") && routes.contains("10.8.0.0/24"), "the pools are not routed to the interface: {routes}");
+	assert_eq!(std::fs::read_to_string(format!("/sys/class/net/{INTERFACE}/mtu")).unwrap().trim(), "1280");
+	a.send_ip(&ping(3)).await;
+	a.expect(Duration::from_secs(5), echoed).await.expect("no echo reply after the interface was set up anew");
+	assert_eq!(engine.flows(), 1, "the ping is one flow, before and after");
+	// And away again: the exit is gone from the config, and so is everything it set up.
+	engine.reload(without.to_string().into_bytes(), None).await.expect("the reload that removes the l3 exit failed");
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while present() != (false, false, false) {
+		assert!(Instant::now() < deadline, "the interface, its table or its routes outlived the exit: {:?}", present());
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	assert_eq!((engine.exit("node"), engine.flows()), (None, 0), "the flow through the exit outlived it");
+	a.send_ip(&ping(4)).await;
+	assert!(a.expect(Duration::from_millis(700), echoed).await.is_none(), "a ping got out after its exit was removed");
+	engine.shutdown().await;
+}
+
 /// Without `masquerade` the node leaves forwarding and NAT to the operator, and a device still reaches nothing on the host itself. The kernel takes more addresses for its own than the engine's gate knows:
 /// here the broadcast address of the network this host is on. And an engine that is dropped without `shutdown` takes its firewall table and its interface with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

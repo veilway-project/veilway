@@ -3,11 +3,14 @@ use super::gate;
 use super::netstack::{Packet, ECHO_REPLY_V4, ECHO_REPLY_V6, ECHO_REQUEST_V4, ECHO_REQUEST_V6};
 use super::plan::{Action, IpMatch, Pattern, Plan};
 use crate::config::Protocol;
+use etherparse::{PacketBuilder, TcpHeader};
 use ipnet::IpNet;
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
+use std::pin::pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 
 /// Flows the table carries: in total, per user across all their devices, and per device. A user may have many devices, so the
 /// device share alone would let one user take the whole table, and the total is far above one user's share so that it takes many users to reach it.
@@ -48,10 +51,12 @@ pub enum Reason {
 	TooBig,
 	/// Not a packet: an ICMP error the node owed a device and did not send, because that device had used up its share of them.
 	IcmpLimited,
+	/// Met a config that was replaced while the packet was on its way through the node. The device sends it again.
+	Stale,
 }
 
 impl Reason {
-	pub const COUNT: usize = 14;
+	pub const COUNT: usize = 15;
 }
 
 /// How a flow leaves through its exit.
@@ -104,9 +109,37 @@ impl Key {
 	}
 }
 
+/// What a device last said on a TCP flow, as the reset that ends the flow needs it: the sequence number the device expects next (zero while it has acknowledged nothing) and the one it has sent up to.
+pub type Heard = Option<(u32, u32)>;
+
+/// What `raw`, a TCP segment from a device, says for a reset of its flow. `upper` is where its TCP header starts.
+pub fn heard(raw: &[u8], upper: usize) -> Heard {
+	let tcp = raw.get(upper..upper + 14)?;
+	let (seq, ack, flags) = (u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]), u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]), tcp[13]);
+	let payload = raw.len().saturating_sub(upper + usize::from(tcp[12] >> 4) * 4) as u32;
+	Some((if flags & 0x10 != 0 {ack} else {0}, seq.wrapping_add(payload).wrapping_add(u32::from(flags & 0x02 != 0)).wrapping_add(u32::from(flags & 0x01 != 0))))
+}
+
+/// The reset that ends a TCP flow from the far side, as the device would get it from the host it was talking to.
+pub fn tcp_reset(key: &Key, (seq, ack): (u32, u32)) -> Option<Vec<u8>> {
+	let mut header = TcpHeader::new(key.dport, key.sport, seq, 0);
+	(header.rst, header.ack, header.acknowledgment_number) = (true, true, ack);
+	let builder = match (key.dst, key.src) {
+		(IpAddr::V4(from), IpAddr::V4(to)) => PacketBuilder::ipv4(from.octets(), to.octets(), 64),
+		(IpAddr::V6(from), IpAddr::V6(to)) => PacketBuilder::ipv6(from.octets(), to.octets(), 64),
+		_ => return None,
+	}.tcp_header(header);
+	let mut out = Vec::with_capacity(builder.size(0));
+	builder.write(&mut out, &[]).ok()?;
+	Some(out)
+}
+
 /// `owner` is the device and the user a carried flow counts against. A refusal has none: it counts against nobody.
-/// `closing` is set once a TCP flow that no handler watches has shown a FIN or RST.
-struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool}
+/// `closing` is set once a TCP flow that no handler watches has shown a FIN or RST. `names` is what the user had resolved to the destination when the flow began, which is what `domain` rules saw.
+struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool, names: Vec<Arc<str>>, heard: Heard}
+
+/// A flow that a change of the config ended, for whoever tells its device.
+pub struct Ended {pub key: Key, pub device: [u8; 32], pub heard: Heard}
 
 #[derive(Default)]
 struct Table {
@@ -118,6 +151,8 @@ struct Table {
 	/// Refusals in the order they were made, by key and entry id. One that has expired stays here until the next sweep.
 	refusals: VecDeque<(Key, u64)>,
 	next: u64,
+	/// The generation of the plan whose indexes the decisions are in.
+	generation: u64,
 }
 
 impl Table {
@@ -136,19 +171,23 @@ impl Table {
 }
 
 /// The flow table. A device is counted by its public key and a user by name, which is what identifies them across reloads.
+/// A decision names exits by their index in one plan, so everyone who reads or writes one says which plan they hold (`generation`), and is turned away when the table has moved on to another.
 #[derive(Default)]
-pub struct Flows {table: Mutex<Table>}
+pub struct Flows {table: Mutex<Table>, wake: Notify}
 
 impl Flows {
 	fn lock(&self) -> std::sync::MutexGuard<'_, Table> {self.table.lock().unwrap_or_else(|e| e.into_inner())}
 
 	/// The decision of a live flow and the id of its entry. Looking a flow up counts as traffic on it, except on a refusal,
 	/// which ends a fixed time after it was made so that retrying cannot keep it alive past a change of the rules that apply.
-	pub fn get(&self, key: &Key) -> Option<(u64, Decision)> {
+	/// `heard` is what a TCP segment from the device says, see `Heard`. None leaves what the flow has.
+	pub fn get(&self, key: &Key, generation: u64, heard: Heard) -> Option<(u64, Decision)> {
 		let mut table = self.lock();
+		if table.generation != generation {return None}
 		match table.flows.get_mut(key) {
 			Some(entry) if entry.seen.elapsed() <= entry.idle => {
 				if entry.owner.is_some() {entry.seen = Instant::now()}
+				if heard.is_some() {entry.heard = heard}
 				Some((entry.id, entry.decision))
 			}
 			Some(_) => {
@@ -159,10 +198,22 @@ impl Flows {
 		}
 	}
 
+	/// The public key of the device a live flow belongs to, and the flow's decision. It counts as traffic on the flow, like `get`. A refusal belongs to nobody and gives None.
+	pub fn owned(&self, key: &Key, generation: u64) -> Option<([u8; 32], Decision)> {
+		let mut table = self.lock();
+		if table.generation != generation {return None}
+		let entry = table.flows.get_mut(key).filter(|entry| entry.seen.elapsed() <= entry.idle)?;
+		let device = entry.owner.as_ref()?.0;
+		entry.seen = Instant::now();
+		Some((device, entry.decision))
+	}
+
 	/// Records the decision for a new flow and returns the id of its entry. Err when the table, the user's share of it or the device's is full, which a refusal never is:
 	/// it is remembered only to spare the rules, so it takes the place of the oldest refusal and no room from a flow that carries something.
-	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision) -> Result<u64, ()> {
+	#[allow(clippy::too_many_arguments)]
+	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision, names: Vec<Arc<str>>, heard: Heard, generation: u64) -> Result<u64, Reason> {
 		let mut table = self.lock();
+		if table.generation != generation {return Err(Reason::Stale)}
 		// A flow that expired a moment ago may still sit here until the next sweep.
 		table.remove(&key);
 		table.next += 1;
@@ -175,27 +226,73 @@ impl Flows {
 			table.refusals.push_back((key, id));
 			(None, CLOSED_IDLE)
 		} else {
-			if table.carried >= MAX_FLOWS || table.per_user.get(user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).is_some_and(|count| *count >= MAX_FLOWS_PER_DEVICE) {return Err(())}
+			if table.carried >= MAX_FLOWS || table.per_user.get(user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).is_some_and(|count| *count >= MAX_FLOWS_PER_DEVICE) {return Err(Reason::FlowTableFull)}
 			let user = table.per_user.get_key_value(user).map_or_else(|| Arc::from(user), |(name, _)| name.clone());
 			*table.per_device.entry(device).or_default() += 1;
 			*table.per_user.entry(user.clone()).or_default() += 1;
 			table.carried += 1;
 			(Some((device, user)), FLOW_IDLE)
 		};
-		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false});
+		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false, names, heard});
 		Ok(id)
 	}
 
 	/// Replaces the decision of the entry `id`. Only the handler of a UDP flow does this, once, when its exit's proxy turns out to have no UDP:
 	/// the entry keeps its place and its owner, so a flow that is refused this way stays refused for as long as its packets keep coming.
-	pub fn decide(&self, key: &Key, id: u64, decision: Decision) {
-		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {entry.decision = decision}
+	/// False when the handler's plan is no longer the one in force. Its decision means nothing to the table then, and the handler ends the flow.
+	pub fn decide(&self, key: &Key, id: u64, decision: Decision, generation: u64) -> bool {
+		let mut table = self.lock();
+		if table.generation != generation {return false}
+		if let Some(entry) = table.flows.get_mut(key).filter(|entry| entry.id == id) {entry.decision = decision}
+		true
 	}
 
 	/// Ties the entry `id` to the proxy of its exit, which the handler of a UDP flow does the moment that proxy gives it an association.
-	/// Only a flow that still waits for that answer changes. One the policy has sent another way stays there.
-	pub fn pin(&self, key: &Key, id: u64) {
-		if let Some(Entry {decision: Decision::Exit {by: by @ By::Backend, ..}, ..}) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {*by = By::Proxy}
+	/// Only a flow that still waits for that answer changes. One the policy has sent another way stays there. False as for `decide`.
+	pub fn pin(&self, key: &Key, id: u64, generation: u64) -> bool {
+		let mut table = self.lock();
+		if table.generation != generation {return false}
+		if let Some(Entry {decision: Decision::Exit {by: by @ By::Backend, ..}, ..}) = table.flows.get_mut(key).filter(|entry| entry.id == id) {*by = By::Proxy}
+		true
+	}
+
+	/// Whether the entry `id` is still in the table.
+	pub fn holds(&self, key: &Key, id: u64) -> bool {self.lock().flows.get(key).is_some_and(|entry| entry.id == id)}
+
+	/// The reset that tells the device the TCP flow of entry `id` is over. None for any other flow and for an entry that is gone.
+	pub fn reset(&self, key: &Key, id: u64) -> Option<Vec<u8>> {
+		let heard = self.lock().flows.get(key).filter(|entry| entry.id == id && key.protocol == Protocol::TCP)?.heard?;
+		tcp_reset(key, heard)
+	}
+
+	/// Goes through every flow when a new plan takes over, with the table locked from the first flow to the end of `then`, so no packet meets a table that is half in one plan and half in the other.
+	/// `judge` is given a flow's key, its device and user, its decision in the old plan and the names it began with. It answers with the decision in the new plan when the flow lives on, and None ends the flow.
+	/// Remembered refusals are forgotten, since the next packet is to be decided afresh. `then` gets the flows that ended and puts the new plan, of `generation`, in force.
+	pub fn recheck<R>(&self, generation: u64, mut judge: impl FnMut(&Key, &[u8; 32], &str, Decision, &[Arc<str>]) -> Option<Decision>, then: impl FnOnce(Vec<Ended>) -> R) -> R {
+		let mut table = self.lock();
+		let (keys, mut ended): (Vec<Key>, Vec<Ended>) = (table.flows.keys().copied().collect(), Vec::new());
+		for key in keys {
+			let Some(entry) = table.flows.get_mut(&key) else {continue};
+			let kept = match (&entry.owner, entry.decision) {
+				(None, _) | (_, Decision::Refuse {..}) => None,
+				(Some((device, user)), decision) => {
+					let kept = judge(&key, device, user, decision, &entry.names);
+					if kept.is_none() {ended.push(Ended {key, device: *device, heard: entry.heard})}
+					kept
+				}
+			};
+			match kept {
+				Some(decision) => entry.decision = decision,
+				None => table.remove(&key),
+			}
+		}
+		table.refusals.clear();
+		table.generation = generation;
+		let done = then(ended);
+		drop(table);
+		// Every handler looks at its flow again, and those whose flow is gone end.
+		self.wake.notify_waiters();
+		done
 	}
 
 	/// For a flow no handler watches, one through an l3 exit: how long its packets say to keep it. Once it is `closing` it stays short-lived whatever follows.
@@ -211,12 +308,18 @@ impl Flows {
 		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {entry.idle = idle}
 	}
 
-	/// Returns once the flow has seen no packet in either direction for `idle`, or its entry is gone.
+	/// Returns once the flow has seen no packet in either direction for `idle`, or its entry is gone, which it is within a moment of a reload that ends the flow.
 	pub async fn quiet(&self, key: Key, id: u64, idle: Duration) {
 		loop {
+			// Listening before looking, so a reload between the look and the wait is not missed.
+			let mut woken = pin!(self.wake.notified());
+			woken.as_mut().enable();
 			let Some(seen) = self.lock().flows.get(&key).filter(|entry| entry.id == id).map(|entry| entry.seen) else {return};
 			let Some(left) = idle.checked_sub(seen.elapsed()).filter(|left| !left.is_zero()) else {return};
-			tokio::time::sleep(left).await;
+			tokio::select! {
+				_ = tokio::time::sleep(left) => {}
+				_ = woken => {}
+			}
 		}
 	}
 
@@ -273,63 +376,63 @@ mod tests {
 	#[test]
 	fn the_table_is_bounded_per_device_per_user_and_in_total() {
 		let flows = Flows::default();
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap();}
-		assert!(flows.insert(key(60000), [1; 32], "a", Decision::Deliver).is_err(), "one device went over its share");
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();}
+		assert!(flows.insert(key(60000), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).is_err(), "one device went over its share");
 		// However many devices a user has, their flows together stay inside the user's share.
 		for device in 2..=16u8 {
 			for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {
-				let _ = flows.insert(Key {dport: u16::from(device), ..key(sport)}, [device; 32], "a", Decision::Deliver);
+				let _ = flows.insert(Key {dport: u16::from(device), ..key(sport)}, [device; 32], "a", Decision::Deliver, Vec::new(), None, 0);
 			}
 		}
 		assert_eq!(flows.len(), MAX_FLOWS_PER_USER, "one user went over their share");
-		flows.insert(key(60000), [50; 32], "b", Decision::Deliver).unwrap();
+		flows.insert(key(60000), [50; 32], "b", Decision::Deliver, Vec::new(), None, 0).unwrap();
 		for user in 0..(MAX_FLOWS / MAX_FLOWS_PER_USER) as u16 {
 			for flow in 0..MAX_FLOWS_PER_USER {
 				let device = [(user >> 8) as u8, user as u8, (flow / MAX_FLOWS_PER_DEVICE) as u8].repeat(11);
-				let _ = flows.insert(Key {dport: 1000 + user, ..key(flow as u16)}, device[..32].try_into().unwrap(), &format!("user-{user}"), Decision::Deliver);
+				let _ = flows.insert(Key {dport: 1000 + user, ..key(flow as u16)}, device[..32].try_into().unwrap(), &format!("user-{user}"), Decision::Deliver, Vec::new(), None, 0);
 			}
 		}
 		assert_eq!(flows.len(), MAX_FLOWS);
-		assert!(flows.insert(key(61000), [99; 32], "c", Decision::Deliver).is_err(), "the table went over its size");
+		assert!(flows.insert(key(61000), [99; 32], "c", Decision::Deliver, Vec::new(), None, 0).is_err(), "the table went over its size");
 	}
 
 	#[test]
 	fn a_refusal_takes_no_room_from_a_flow() {
 		let flows = Flows::default();
 		// More refusals than fit, all from one device: none is turned away and none counts against the device or its user.
-		for sport in 0..(MAX_REFUSALS + 100) as u16 {flows.insert(key(sport), [1; 32], "a", REFUSED).unwrap();}
+		for sport in 0..(MAX_REFUSALS + 100) as u16 {flows.insert(key(sport), [1; 32], "a", REFUSED, Vec::new(), None, 0).unwrap();}
 		assert_eq!(flows.len(), MAX_REFUSALS);
-		assert!(flows.get(&key(0)).is_none() && flows.get(&key(99)).is_none(), "the oldest refusals did not give way");
-		assert_eq!(flows.get(&key(100)).map(|(_, decision)| decision), Some(REFUSED));
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [1; 32], "a", Decision::Deliver).unwrap();}
+		assert!(flows.get(&key(0), 0, None).is_none() && flows.get(&key(99), 0, None).is_none(), "the oldest refusals did not give way");
+		assert_eq!(flows.get(&key(100), 0, None).map(|(_, decision)| decision), Some(REFUSED));
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();}
 		assert_eq!(flows.len(), MAX_REFUSALS + MAX_FLOWS_PER_DEVICE);
 		// A full share turns a flow away, never a refusal.
-		assert!(flows.insert(Key {dport: 81, ..key(1)}, [1; 32], "a", Decision::Deliver).is_err());
-		flows.insert(Key {dport: 81, ..key(1)}, [1; 32], "a", REFUSED).unwrap();
+		assert!(flows.insert(Key {dport: 81, ..key(1)}, [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).is_err());
+		flows.insert(Key {dport: 81, ..key(1)}, [1; 32], "a", REFUSED, Vec::new(), None, 0).unwrap();
 		assert_eq!(flows.len(), MAX_REFUSALS + MAX_FLOWS_PER_DEVICE, "a refusal past the limit did not replace the oldest one");
 	}
 
 	#[test]
 	fn a_flow_expires_when_idle_and_frees_its_slot() {
 		let flows = Flows::default();
-		flows.insert(key(1), [1; 32], "a", Decision::Deliver).unwrap();
-		let (id, decision) = flows.get(&key(1)).unwrap();
+		flows.insert(key(1), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();
+		let (id, decision) = flows.get(&key(1), 0, None).unwrap();
 		assert_eq!(decision, Decision::Deliver);
 		flows.hold(&key(1), id + 1, Duration::ZERO);
-		assert!(flows.get(&key(1)).is_some(), "another entry's id changed this one");
+		assert!(flows.get(&key(1), 0, None).is_some(), "another entry's id changed this one");
 		flows.hold(&key(1), id, Duration::ZERO);
 		std::thread::sleep(Duration::from_millis(5));
 		flows.sweep();
 		assert!(flows.is_empty());
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver).unwrap();}
-		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [2; 32], "a", Decision::Deliver).unwrap();}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();}
+		for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {flows.insert(Key {dport: 80, ..key(sport)}, [2; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();}
 	}
 
 	#[test]
 	fn a_flow_no_handler_watches_is_kept_by_what_its_packets_say() {
 		let flows = Flows::default();
 		let leaves = Decision::Exit {exit: 0, by: By::Backend};
-		let id = flows.insert(key(1), [1; 32], "a", leaves).unwrap();
+		let id = flows.insert(key(1), [1; 32], "a", leaves, Vec::new(), None, 0).unwrap();
 		let idle = |flows: &Flows| flows.lock().flows.get(&key(1)).map(|entry| entry.idle);
 		assert_eq!(idle(&flows), Some(FLOW_IDLE));
 		flows.track(&key(1), id, Duration::from_secs(7200), false);
@@ -341,24 +444,81 @@ mod tests {
 		flows.track(&key(1), id, Duration::from_secs(7200), false);
 		assert_eq!(idle(&flows), Some(FLOW_IDLE));
 		// An association ties the flow to its proxy. One that was already sent around the proxy is not taken back.
-		flows.pin(&key(1), id + 1);
-		assert_eq!(flows.get(&key(1)), Some((id, leaves)), "another entry's id changed this one");
-		flows.pin(&key(1), id);
-		assert_eq!(flows.get(&key(1)), Some((id, Decision::Exit {exit: 0, by: By::Proxy})));
+		flows.pin(&key(1), id + 1, 0);
+		assert_eq!(flows.get(&key(1), 0, None), Some((id, leaves)), "another entry's id changed this one");
+		flows.pin(&key(1), id, 0);
+		assert_eq!(flows.get(&key(1), 0, None), Some((id, Decision::Exit {exit: 0, by: By::Proxy})));
 		for around in [Decision::Exit {exit: 0, by: By::Direct}, Decision::Exit {exit: 0, by: By::Via(1)}, Decision::Refuse {reason: Reason::Unsupported, reset: false}] {
-			flows.decide(&key(1), id, around);
-			flows.pin(&key(1), id);
-			assert_eq!(flows.get(&key(1)), Some((id, around)));
+			flows.decide(&key(1), id, around, 0);
+			flows.pin(&key(1), id, 0);
+			assert_eq!(flows.get(&key(1), 0, None), Some((id, around)));
 		}
-		flows.decide(&key(1), id, leaves);
+		flows.decide(&key(1), id, leaves, 0);
 		let refused = Decision::Refuse {reason: Reason::Unsupported, reset: true};
-		flows.decide(&key(1), id + 1, refused);
-		assert_eq!(flows.get(&key(1)), Some((id, leaves)));
-		flows.decide(&key(1), id, refused);
-		assert_eq!(flows.get(&key(1)), Some((id, refused)));
+		flows.decide(&key(1), id + 1, refused, 0);
+		assert_eq!(flows.get(&key(1), 0, None), Some((id, leaves)));
+		flows.decide(&key(1), id, refused, 0);
+		assert_eq!(flows.get(&key(1), 0, None), Some((id, refused)));
 		// It still holds its place in the device's share, unlike a refusal the rules made.
-		for sport in 2..=MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", leaves).unwrap();}
-		assert!(flows.insert(key(60000), [1; 32], "a", leaves).is_err());
+		for sport in 2..=MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [1; 32], "a", leaves, Vec::new(), None, 0).unwrap();}
+		assert!(flows.insert(key(60000), [1; 32], "a", leaves, Vec::new(), None, 0).is_err());
+	}
+
+	#[test]
+	fn a_new_plan_keeps_or_ends_each_flow_and_turns_away_whoever_holds_the_old_one() {
+		let flows = Flows::default();
+		let (stays, goes) = (flows.insert(key(1), [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, vec![Arc::from("example.com")], Some((7, 9)), 0).unwrap(), flows.insert(key(2), [2; 32], "b", Decision::Deliver, Vec::new(), Some((3, 4)), 0).unwrap());
+		flows.insert(key(3), [1; 32], "a", REFUSED, Vec::new(), None, 0).unwrap();
+		assert_eq!(flows.get(&key(1), 0, Some((70, 90))), Some((stays, Decision::Exit {exit: 0, by: By::Backend})));
+		let mut judged = Vec::new();
+		let ended = flows.recheck(1, |key, device, user, decision, names| {
+			judged.push((key.sport, *device, user.to_string(), decision, names.len()));
+			// The first flow lives on under the index its exit has in the new plan.
+			(key.sport == 1).then_some(Decision::Exit {exit: 5, by: By::Backend})
+		}, |ended| ended.iter().map(|flow| (flow.key, flow.device, flow.heard)).collect::<Vec<_>>());
+		judged.sort_by_key(|flow| flow.0);
+		assert_eq!(judged, [(1, [1; 32], "a".to_string(), Decision::Exit {exit: 0, by: By::Backend}, 1), (2, [2; 32], "b".to_string(), Decision::Deliver, 0)], "a remembered refusal was judged, or a flow was not");
+		assert_eq!(ended, [(key(2), [2; 32], Some((3, 4)))]);
+		// Whoever still holds the old plan finds nothing and leaves nothing behind.
+		assert!(flows.get(&key(1), 0, None).is_none() && !flows.decide(&key(1), stays, Decision::Deliver, 0) && !flows.pin(&key(1), stays, 0));
+		assert_eq!(flows.insert(key(4), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0), Err(Reason::Stale));
+		// A flow is its device's under the plan in force only, and one that ended is nobody's.
+		assert_eq!((flows.owned(&key(1), 1), flows.owned(&key(1), 0), flows.owned(&key(2), 1)), (Some(([1; 32], Decision::Exit {exit: 5, by: By::Backend})), None, None));
+		assert_eq!((flows.get(&key(1), 1, None), flows.len(), flows.holds(&key(1), stays), flows.holds(&key(2), goes)), (Some((stays, Decision::Exit {exit: 5, by: By::Backend})), 1, true, false));
+		// The reset of the flow that stayed carries what its device said last.
+		let reset = flows.reset(&key(1), stays).unwrap();
+		assert_eq!((&reset[12..16], &reset[16..20], &reset[20..24], &reset[24..32], reset[33] & 0x14), (&[1, 1, 1, 1][..], &[10, 7, 0, 2][..], &[1, 187, 0, 1][..], &[0, 0, 0, 70, 0, 0, 0, 90][..], 0x14));
+		assert!(flows.reset(&key(2), goes).is_none() && flows.reset(&key(1), stays + 1).is_none());
+		// The user whose flow ended has their share of the table back.
+		for sport in 10..10 + MAX_FLOWS_PER_DEVICE as u16 {flows.insert(key(sport), [2; 32], "b", Decision::Deliver, Vec::new(), None, 1).unwrap();}
+	}
+
+	#[test]
+	fn what_a_segment_says_is_what_its_reset_needs() {
+		let mut header = TcpHeader::new(40000, 443, 1000, 65535);
+		(header.ack, header.acknowledgment_number, header.fin) = (true, 5000, true);
+		let mut raw = Vec::new();
+		PacketBuilder::ipv4([10, 7, 0, 2], [1, 1, 1, 1], 64).tcp_header(header).write(&mut raw, b"abc").unwrap();
+		assert_eq!(heard(&raw, 20), Some((5000, 1004)), "the fin and the payload were not counted");
+		let mut syn = TcpHeader::new(40000, 443, 1000, 65535);
+		syn.syn = true;
+		raw.clear();
+		PacketBuilder::ipv4([10, 7, 0, 2], [1, 1, 1, 1], 64).tcp_header(syn).write(&mut raw, &[]).unwrap();
+		assert_eq!((heard(&raw, 20), heard(&raw[..30], 20)), (Some((0, 1001)), None));
+	}
+
+	#[tokio::test]
+	async fn a_handler_is_woken_when_its_flow_ends() {
+		let flows = Arc::new(Flows::default());
+		let id = flows.insert(key(1), [1; 32], "a", Decision::Deliver, Vec::new(), None, 0).unwrap();
+		let waiting = tokio::spawn({
+			let flows = flows.clone();
+			async move {flows.quiet(key(1), id, Duration::from_secs(3600)).await}
+		});
+		tokio::time::sleep(Duration::from_millis(50)).await;
+		assert!(!waiting.is_finished());
+		flows.recheck(1, |_, _, _, _, _| None, |_| ());
+		tokio::time::timeout(Duration::from_secs(2), waiting).await.expect("the handler of a flow that ended kept waiting").unwrap();
 	}
 
 	#[test]

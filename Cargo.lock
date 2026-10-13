@@ -1551,6 +1551,7 @@ dependencies = [
  "anyhow",
  "clap",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "veilway-core",
  "veilway-wg",

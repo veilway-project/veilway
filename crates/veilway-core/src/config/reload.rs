@@ -5,6 +5,8 @@ use ring::digest::{digest, SHA256};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
@@ -226,19 +228,34 @@ impl<E: fmt::Display> fmt::Display for ApplyError<E> {
 
 impl<E: fmt::Debug + fmt::Display> std::error::Error for ApplyError<E> {}
 
+/// Why `reload_from` did not get as far as the document.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unread {Io(io::ErrorKind), Readable}
+
+impl fmt::Display for Unread {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+		match self {
+			Unread::Io(kind) => write!(f, "cannot read the config file: {kind}"),
+			Unread::Readable => f.write_str("the config file can be read by group or others and holds keys and passwords; restrict it (chmod 600) or start with --allow-readable-config"),
+		}
+	}
+}
+
 /// The running config. Any number of tasks read the current snapshot or wait for the next one.
 pub struct Store {
 	current: watch::Sender<Snapshot>,
 	/// Held for a whole apply, so two applies never interleave. Owned guards, because one travels into the blocking check.
 	applying: Arc<tokio::sync::Mutex<()>>,
-	/// What `reload_from` last refused and logged: the revision of the bad content, or why the file could not be read. The same refusal is not logged again.
-	refused: Mutex<Option<Result<Revision, io::ErrorKind>>>,
+	/// What `reload_from` last refused and logged: the revision of the bad content, or why the file was not read. The same refusal is not logged again.
+	refused: Mutex<Option<Result<Revision, Unread>>>,
+	/// Whether `reload_from` takes a file that group or others can read. `run` refuses such a file at start unless it was told otherwise, and a reload does what the start did.
+	pub allow_readable: bool,
 }
 
 impl Store {
 	/// `report` is what `validate` returned for `config` and has no errors. `revision` is `Revision::of` the bytes it was parsed from.
 	pub fn new(config: Config, revision: Revision, report: Report) -> Store {
-		Store {current: watch::Sender::new(Snapshot {config: Arc::new(config), revision, generation: 1, report: Arc::new(report)}), applying: Arc::default(), refused: Mutex::new(None)}
+		Store {current: watch::Sender::new(Snapshot {config: Arc::new(config), revision, generation: 1, report: Arc::new(report)}), applying: Arc::default(), refused: Mutex::new(None), allow_readable: true}
 	}
 
 	pub fn current(&self) -> Snapshot {self.current.borrow().clone()}
@@ -291,21 +308,27 @@ impl Store {
 	pub async fn reload_from<E>(&self, path: &Path, prepare: impl AsyncFnOnce(&Snapshot, &Diff) -> Result<(), E>) -> Result<Applied, ApplyError<E>> {
 		let applying = self.applying.clone().lock_owned().await;
 		let mut bytes = Vec::new();
+		// The mode is taken from the file that is then read, not from its path, so the file cannot be swapped in between.
 		let read = match File::open(path).await {
-			Ok(file) => file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).await,
-			Err(e) => Err(e),
+			Ok(file) => match file.metadata().await {
+				#[cfg(unix)]
+				Ok(meta) if !self.allow_readable && meta.mode() & 0o044 != 0 => Err(Unread::Readable),
+				Ok(_) => file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).await.map_err(|e| Unread::Io(e.kind())),
+				Err(e) => Err(Unread::Io(e.kind())),
+			},
+			Err(e) => Err(Unread::Io(e.kind())),
 		};
 		let (refusal, result) = match read {
 			Ok(_) => (Ok(Revision::of(&bytes)), self.apply_locked(applying, bytes, None, true, prepare).await),
-			Err(e) => (Err(e.kind()), Err(ApplyError::Invalid(Report {errors: vec![Diagnostic {path: String::new(), message: format!("cannot read the config file: {}", e.kind())}], ..Report::default()}))),
+			Err(why) => (Err(why), Err(ApplyError::Invalid(Report {errors: vec![Diagnostic {path: String::new(), message: why.to_string()}], ..Report::default()}))),
 		};
 		{
 			let mut refused = self.refused.lock().unwrap_or_else(|e| e.into_inner());
 			match (&result, refusal) {
 				(Err(ApplyError::Invalid(_)), _) if *refused == Some(refusal) => {}
-				(Err(ApplyError::Invalid(_)), Err(kind)) => {
+				(Err(ApplyError::Invalid(_)), Err(why)) => {
 					*refused = Some(refusal);
-					warn!(reason = %kind, "config file cannot be read, the running config stays in force");
+					warn!(reason = %why, "config file not read, the running config stays in force");
 				}
 				// Only the paths: the message of a parse error can name a key of the document.
 				(Err(ApplyError::Invalid(report)), Ok(_)) => {

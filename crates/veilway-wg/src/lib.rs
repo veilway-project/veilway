@@ -53,15 +53,23 @@ pub struct Peer{
 	pub public_key:[u8;32],
 	/// Last address a valid datagram arrived from, for roaming.
 	pub endpoint:Option<SocketAddr>,
+	preshared_key:Option<[u8;32]>,
+	keepalive:Option<u16>,
 	tunn:Tunn,
 }
+
+/// Peers one endpoint can hold: a peer's index is the upper 24 bits of every session index it is given.
+const MAX_PEERS:usize=1<<24;
 
 /// Multi-peer WireGuard endpoint. Pure state machine, it never touches sockets.
 pub struct Wg{
 	private:StaticSecret,
 	public:PublicKey,
-	peers:Vec<Peer>,
+	/// A removed peer leaves its place empty, so every other peer keeps the index that is in the session indexes its side holds.
+	peers:Vec<Option<Peer>>,
 	by_key:HashMap<[u8;32], usize>,
+	/// Places that removed peers left, for the peers that are added next.
+	free:Vec<usize>,
 	scratch:Vec<u8>,
 	limiter:Arc<RateLimiter>,
 	last_reset:Instant,
@@ -72,24 +80,49 @@ impl Wg{
 		let private=StaticSecret::from(private_key);
 		let public=PublicKey::from(&private);
 		let limiter=Arc::new(RateLimiter::new(&public, HANDSHAKE_RATE_LIMIT));
-		Wg{private, public, peers:Vec::new(), by_key:HashMap::new(), scratch:vec![0u8;MAX_PACKET], limiter, last_reset:Instant::now()}
+		Wg{private, public, peers:Vec::new(), by_key:HashMap::new(), free:Vec::new(), scratch:vec![0u8;MAX_PACKET], limiter, last_reset:Instant::now()}
 	}
 
 	pub fn public_key(&self)->[u8;32]{self.public.to_bytes()}
 
 	/// Registers a peer and returns its index, which boringtun also uses as the session index prefix.
+	/// The index may be one a removed peer had. Whatever that peer still sends under it fails to decrypt.
 	pub fn add_peer(&mut self, public_key:[u8;32], preshared_key:Option<[u8;32]>, keepalive:Option<u16>)->anyhow::Result<usize>{
 		if self.by_key.contains_key(&public_key){bail!("duplicate peer public key")}
-		let idx=self.peers.len();
+		let idx=self.free.last().copied().unwrap_or(self.peers.len());
+		if idx>=MAX_PEERS{bail!("too many peers")}
 		let tunn=Tunn::new(self.private.clone(), PublicKey::from(public_key), preshared_key, keepalive, idx as u32, Some(self.limiter.clone()));
-		self.peers.push(Peer{public_key, endpoint:None, tunn});
+		let peer=Some(Peer{public_key, endpoint:None, preshared_key, keepalive, tunn});
+		if self.free.pop().is_some(){self.peers[idx]=peer}else{self.peers.push(peer)}
 		self.by_key.insert(public_key, idx);
 		Ok(idx)
 	}
 
-	pub fn peers(&self)->&[Peer]{&self.peers}
+	/// Forgets a peer and every session key it had. Its handshakes and its data are refused from then on. False when there is no such peer.
+	pub fn remove_peer(&mut self, public_key:&[u8;32])->bool{
+		let Some(idx)=self.by_key.remove(public_key) else{return false};
+		self.peers[idx]=None;
+		self.free.push(idx);
+		true
+	}
 
-	pub fn endpoint(&self, idx:usize)->Option<SocketAddr>{self.peers.get(idx).and_then(|p| p.endpoint)}
+	/// Drops every session key of a peer and forgets where it was heard from. It stays a peer and has to shake hands again. False when there is no such peer.
+	pub fn drop_sessions(&mut self, public_key:&[u8;32])->bool{
+		let Some((idx, peer))=self.by_key.get(public_key).and_then(|idx| Some((*idx, self.peers.get_mut(*idx)?.as_mut()?))) else{return false};
+		peer.tunn=Tunn::new(self.private.clone(), PublicKey::from(peer.public_key), peer.preshared_key, peer.keepalive, idx as u32, Some(self.limiter.clone()));
+		peer.endpoint=None;
+		true
+	}
+
+	/// The index of the peer with this public key.
+	pub fn index(&self, public_key:&[u8;32])->Option<usize>{self.by_key.get(public_key).copied()}
+
+	/// The public key of the peer at an index. An index is only good while the caller keeps this endpoint to itself: a peer that is removed gives its index to the next one.
+	pub fn key(&self, idx:usize)->Option<[u8;32]>{Some(self.peers.get(idx)?.as_ref()?.public_key)}
+
+	pub fn peers(&self)->impl Iterator<Item=&Peer>{self.peers.iter().flatten()}
+
+	pub fn endpoint(&self, idx:usize)->Option<SocketAddr>{self.peers.get(idx)?.as_ref()?.endpoint}
 
 	/// Feeds one datagram from the network. Appends datagrams destined back to that peer into `net_out`
 	/// and decrypted IP packets into `ip_out`. Returns the peer the datagram belonged to.
@@ -116,10 +149,9 @@ impl Wg{
 			Err(TunnResult::WriteToNetwork(cookie))=>{tracing::debug!("under load, cookie reply to {from}"); net_out.push(cookie.to_vec()); return None}
 			Err(e)=>{tracing::debug!("datagram from {from} failed the mac check: {e:?}"); return None}
 		};
-		if idx>=self.peers.len(){return None}
 		let before=net_out.len();
 		let Wg{peers, scratch, ..}=self;
-		let peer=&mut peers[idx];
+		let peer=peers.get_mut(idx)?.as_mut()?;
 		let mut input:&[u8]=datagram;
 		let mut decrypted=false;
 		loop{
@@ -142,7 +174,7 @@ impl Wg{
 	/// Encrypts one IP packet for `idx`. With no live session it emits a handshake initiation and queues the packet.
 	pub fn encapsulate(&mut self, idx:usize, packet:&[u8], net_out:&mut Vec<Vec<u8>>){
 		let Wg{peers, scratch, ..}=self;
-		let Some(peer)=peers.get_mut(idx) else{return};
+		let Some(peer)=peers.get_mut(idx).and_then(|peer| peer.as_mut()) else{return};
 		match peer.tunn.encapsulate(packet, scratch){
 			TunnResult::WriteToNetwork(b)=>net_out.push(b.to_vec()),
 			TunnResult::Err(e)=>tracing::debug!("peer {idx} encapsulate: {e:?}"),
@@ -151,7 +183,7 @@ impl Wg{
 	}
 
 	/// Time since that peer's last completed handshake, None while it has no live session.
-	pub fn time_since_last_handshake(&self, idx:usize)->Option<std::time::Duration>{self.peers.get(idx)?.tunn.time_since_last_handshake()}
+	pub fn time_since_last_handshake(&self, idx:usize)->Option<std::time::Duration>{self.peers.get(idx)?.as_ref()?.tunn.time_since_last_handshake()}
 
 	/// Drives every peer's timers. Call roughly every 250ms and send whatever lands in `out`.
 	pub fn update_timers(&mut self, out:&mut Vec<(usize, Vec<u8>)>){
@@ -162,6 +194,7 @@ impl Wg{
 		}
 		let Wg{peers, scratch, ..}=self;
 		for (i, peer) in peers.iter_mut().enumerate(){
+			let Some(peer)=peer else{continue};
 			match peer.tunn.update_timers(scratch){
 				TunnResult::WriteToNetwork(b)=>out.push((i, b.to_vec())),
 				TunnResult::Err(e)=>tracing::debug!("peer {i} timers: {e:?}"),
@@ -238,6 +271,71 @@ mod tests{
 		net.clear();
 		wg.recv_from_network(from, &init, &mut net, &mut ip);
 		assert!(net.iter().all(|d| d.first()!=Some(&3)), "still handing out cookies after a reset");
+	}
+
+	/// A client of `key` that has shaken hands with `wg` from `from`, and the peer index it was given.
+	fn connected(wg:&mut Wg, srv:&[u8;32], key:[u8;32], from:SocketAddr)->(Tunn, usize){
+		let mut client=Tunn::new(StaticSecret::from(key), PublicKey::from(public_key(srv)), None, None, 0, None);
+		let (mut buf, mut out, mut net, mut ip)=(vec![0u8;MAX_PACKET], vec![0u8;MAX_PACKET], Vec::new(), Vec::new());
+		let TunnResult::WriteToNetwork(init)=client.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+		let idx=wg.recv_from_network(from, init, &mut net, &mut ip).expect("the handshake was refused");
+		let TunnResult::WriteToNetwork(keepalive)=client.decapsulate(None, &net[0], &mut out) else{panic!("no keepalive after the response")};
+		net.clear();
+		assert_eq!(wg.recv_from_network(from, keepalive, &mut net, &mut ip), Some(idx));
+		assert!(wg.time_since_last_handshake(idx).is_some());
+		(client, idx)
+	}
+
+	fn data(client:&mut Tunn)->Vec<u8>{
+		let mut buf=vec![0u8;MAX_PACKET];
+		let packet=[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 7, 0, 2, 1, 1, 1, 1];
+		let TunnResult::WriteToNetwork(datagram)=client.encapsulate(&packet, &mut buf) else{panic!("nothing to send")};
+		datagram.to_vec()
+	}
+
+	#[test]
+	fn a_removed_peer_is_refused_and_the_others_keep_their_place(){
+		let (srv, a, b, c)=(generate_key(), generate_key(), generate_key(), generate_key());
+		let mut wg=Wg::new(srv);
+		for key in [a, b]{wg.add_peer(public_key(&key), None, None).unwrap();}
+		let (from_a, from_b):(SocketAddr, SocketAddr)=("127.0.0.1:1111".parse().unwrap(), "127.0.0.1:2222".parse().unwrap());
+		let (mut client_a, ia)=connected(&mut wg, &srv, a, from_a);
+		let (mut client_b, ib)=connected(&mut wg, &srv, b, from_b);
+		assert!(wg.remove_peer(&public_key(&a)) && !wg.remove_peer(&public_key(&a)));
+		assert_eq!((wg.index(&public_key(&a)), wg.index(&public_key(&b)), wg.key(ia), wg.key(ib), wg.peers().count()), (None, Some(ib), None, Some(public_key(&b)), 1));
+		let (mut net, mut ip, mut buf)=(Vec::new(), Vec::new(), vec![0u8;MAX_PACKET]);
+		// Its session is gone: data under it is not decrypted and nothing can be sent to it.
+		assert_eq!(wg.recv_from_network(from_a, &data(&mut client_a), &mut net, &mut ip), None);
+		wg.encapsulate(ia, &[0x45; 20], &mut net);
+		assert!(net.is_empty() && ip.is_empty() && wg.endpoint(ia).is_none() && wg.time_since_last_handshake(ia).is_none());
+		// And it gets no new one.
+		let mut again=Tunn::new(StaticSecret::from(a), PublicKey::from(public_key(&srv)), None, None, 0, None);
+		let TunnResult::WriteToNetwork(init)=again.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+		assert_eq!(wg.recv_from_network(from_a, init, &mut net, &mut ip), None);
+		assert!(net.is_empty(), "a removed peer's handshake was answered");
+		// The other peer never notices.
+		assert_eq!(wg.recv_from_network(from_b, &data(&mut client_b), &mut net, &mut ip), Some(ib));
+		assert_eq!(ip.len(), 1);
+		// The next peer takes the free place, and what the removed one still sends under that index is not taken for it.
+		assert_eq!(wg.add_peer(public_key(&c), None, None).unwrap(), ia);
+		let (_client_c, ic)=connected(&mut wg, &srv, c, "127.0.0.1:3333".parse().unwrap());
+		ip.clear();
+		assert_eq!((ic, wg.recv_from_network(from_a, &data(&mut client_a), &mut net, &mut ip)), (ia, None));
+		assert!(ip.is_empty() && wg.endpoint(ic)==Some("127.0.0.1:3333".parse().unwrap()), "a removed peer reached the peer that took its index");
+	}
+
+	#[test]
+	fn dropped_sessions_need_a_new_handshake(){
+		let (srv, a)=(generate_key(), generate_key());
+		let mut wg=Wg::new(srv);
+		wg.add_peer(public_key(&a), None, None).unwrap();
+		let from:SocketAddr="127.0.0.1:1111".parse().unwrap();
+		let (mut client, idx)=connected(&mut wg, &srv, a, from);
+		assert!(wg.drop_sessions(&public_key(&a)) && !wg.drop_sessions(&[9;32]));
+		let (mut net, mut ip)=(Vec::new(), Vec::new());
+		assert_eq!(wg.recv_from_network(from, &data(&mut client), &mut net, &mut ip), None);
+		assert!(ip.is_empty() && wg.endpoint(idx).is_none() && wg.time_since_last_handshake(idx).is_none());
+		assert_eq!(connected(&mut wg, &srv, a, from).1, idx, "the peer could not shake hands again");
 	}
 
 	#[test]

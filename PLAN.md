@@ -7,8 +7,9 @@ Update this block at the end of every work session.
 - Active phase: 1, step 2 in progress. Done: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
 - Step 2b is done too: every tunnel DNS query is answered by the node's own resolver (UDP and TCP port 53, servers tried in order, REFUSED when the rules refuse), names are remembered per user, and `domain` rules match on them. Fuzz targets: `config`, `packet`, `dns`.
 - Step 2c is done too: rejected traffic gets the matching ICMP error, every `unsupported` policy of a `netstack` exit works (`local`, `reject`, `drop`, `direct`, `via`), and the `l3` exit runs on Linux (one TUN device, kernel forwarding and source NAT through `ip` and `nft`, return traffic only for live flows). Only one `l3` exit per node for now.
-- Last finished step: Phase 1, step 2c
-- Next action: Phase 1, step 2d (reload on SIGHUP with flows re-evaluated, users cut off when disabled or expired, DNS memory cleared with them). Update `THREAT_MODEL.md` in 2d: isolation between users and access to private networks are now decided by routing rules.
+- Step 2d is done too: `veilway run` reloads its config on SIGHUP (`Engine::reload`), a refused or failing file leaves the running config in force, every live flow is decided again under the new config, and a user who is disabled, removed or expired (or a device that is removed or re-keyed) loses sessions, flows and DNS memory within a second. `THREAT_MODEL.md` now describes the engine as built.
+- Last finished step: Phase 1, step 2d
+- Next action: Phase 1, step 3 (quotas and counters with a state file; out of quota plugs into the cut-off path, `Denied` in `engine/plan.rs`).
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 
