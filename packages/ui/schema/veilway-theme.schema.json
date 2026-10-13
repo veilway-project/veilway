@@ -1,0 +1,53 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "veilway-theme.schema.json",
+	"title": "Veilway theme",
+	"description": "Colour tokens plus glass tint and blur strength. A theme file is at most 16384 bytes. The schema describes the shape; the validator also checks text contrast and may refuse or repair a theme that passes this schema.",
+	"type": "object",
+	"additionalProperties": false,
+	"required": ["format", "version", "name", "scheme", "colors", "glass"],
+	"properties": {
+		"format": {"const": "veilway-theme"},
+		"version": {"const": 1},
+		"name": {"type": "string", "minLength": 1, "maxLength": 40, "pattern": "^[\\p{L}\\p{N}][\\p{L}\\p{N} _.-]*$"},
+		"scheme": {"enum": ["dark", "light"]},
+		"colors": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["bg", "field1", "field2", "surface", "sunken", "text", "textMuted", "line", "lineStrong", "accent", "onAccent", "accentInk", "info", "protected", "detectable", "unsafe", "chart1", "chart2", "focus"],
+			"properties": {
+				"bg": {"$ref": "#/$defs/color", "description": "Page background"},
+				"field1": {"$ref": "#/$defs/color", "description": "First backdrop glow"},
+				"field2": {"$ref": "#/$defs/color", "description": "Second backdrop glow"},
+				"surface": {"$ref": "#/$defs/color", "description": "Solid surface and the scrim of every glass surface"},
+				"sunken": {"$ref": "#/$defs/color", "description": "Inputs and wells"},
+				"text": {"$ref": "#/$defs/color", "description": "Primary text"},
+				"textMuted": {"$ref": "#/$defs/color", "description": "Secondary text"},
+				"line": {"$ref": "#/$defs/color", "description": "Dividers"},
+				"lineStrong": {"$ref": "#/$defs/color", "description": "Control borders"},
+				"accent": {"$ref": "#/$defs/color", "description": "Fill of the primary action"},
+				"onAccent": {"$ref": "#/$defs/color", "description": "Text on the accent fill"},
+				"accentInk": {"$ref": "#/$defs/color", "description": "Accent as text or icon on a surface"},
+				"info": {"$ref": "#/$defs/color", "description": "Informational text and marks"},
+				"protected": {"$ref": "#/$defs/color", "description": "Protected rating and success"},
+				"detectable": {"$ref": "#/$defs/color", "description": "Detectable rating and warnings"},
+				"unsafe": {"$ref": "#/$defs/color", "description": "Unsafe rating and errors"},
+				"chart1": {"$ref": "#/$defs/color", "description": "First chart series (download)"},
+				"chart2": {"$ref": "#/$defs/color", "description": "Second chart series (upload)"},
+				"focus": {"$ref": "#/$defs/color", "description": "Keyboard focus ring"}
+			}
+		},
+		"glass": {
+			"type": "object",
+			"additionalProperties": false,
+			"required": ["tint", "blur"],
+			"properties": {
+				"tint": {"type": "number", "minimum": 0, "maximum": 1, "description": "Opacity of the scrim. Raised on import to the lowest value that keeps text readable."},
+				"blur": {"type": "number", "minimum": 0, "maximum": 40, "description": "Backdrop blur in CSS pixels"}
+			}
+		}
+	},
+	"$defs": {
+		"color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"}
+	}
+}

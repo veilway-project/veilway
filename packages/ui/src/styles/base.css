@@ -1,0 +1,32 @@
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+body { margin: 0; }
+.vw-root {
+	font-family: var(--font-sans);
+	font-size: var(--text-3);
+	line-height: var(--leading);
+	font-weight: var(--weight-regular);
+	color: var(--c-text);
+	font-synthesis: none;
+	-webkit-font-smoothing: antialiased;
+	accent-color: var(--c-accent);
+}
+.vw-root :where(h1, h2, h3, h4, p, ul, ol, dl, dd, figure) { margin: 0; }
+.vw-root :where(ul, ol) { padding: 0; list-style: none; }
+.vw-root :where(button, input, select, textarea) { font: inherit; color: inherit; letter-spacing: inherit; }
+.vw-root :where(a) { color: var(--c-accent-ink); text-underline-offset: 0.2em; }
+.vw-root :where(svg) { display: block; flex: none; }
+.vw-root :focus-visible { outline: 2px solid var(--c-focus); outline-offset: 2px; }
+.vw-root ::selection { background: color-mix(in srgb, var(--c-accent) 55%, transparent); color: var(--c-text); }
+.vw-h1 { font-size: var(--text-6); line-height: var(--leading-tight); font-weight: var(--weight-strong); letter-spacing: var(--tracking-display); text-wrap: balance; }
+.vw-h2 { font-size: var(--text-5); line-height: var(--leading-tight); font-weight: var(--weight-strong); letter-spacing: var(--tracking-display); text-wrap: balance; }
+.vw-h3 { font-size: var(--text-4); line-height: var(--leading-tight); font-weight: var(--weight-strong); }
+.vw-muted { color: var(--c-text-muted); }
+.vw-small { font-size: var(--text-2); }
+/* Addresses, keys and identifiers. They read left to right in both languages and never take Persian digits. */
+.vw-code { font-family: var(--font-mono); font-size: 0.94em; direction: ltr; unicode-bidi: isolate; overflow-wrap: anywhere; }
+.vw-num { font-variant-numeric: tabular-nums; }
+.vw-sr { position: absolute; inline-size: 1px; block-size: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.vw-icon { inline-size: 1.25em; block-size: 1.25em; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+/* Icons that point along the reading direction turn around with it. */
+[dir="rtl"] .vw-icon[data-flip] { transform: scaleX(-1); }

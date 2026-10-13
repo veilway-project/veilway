@@ -1,0 +1,25 @@
+{
+	"name": "@veilway/i18n",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Locale packs and formatting helpers for the Veilway panel and clients",
+	"license": "Apache-2.0",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"engines": {
+		"node": ">=22.18"
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "node --test \"test/*.test.ts\""
+	},
+	"dependencies": {
+		"intl-messageformat": "^12.1.3"
+	},
+	"devDependencies": {
+		"@types/node": "^22.20.5",
+		"typescript": "^5.9.3"
+	}
+}
