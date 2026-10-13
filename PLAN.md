@@ -388,7 +388,7 @@ Gate: one process serves two inbounds on two ports with two exits, a routing rul
 4. Client engine: TUN on Windows, macOS and Linux, IPv4 and IPv6, automatic transport fallback.
 5. `faketls` and browser-like client fingerprint spike, with a written result.
 
-Gate: with the client connected over port 443 next to a decoy site, `ping`, DNS, a web page and a UDP app all work; an active probe gets only the decoy; a fronted connection works through a real CDN; exit switching works without reconnecting; throughput is recorded per transport.
+Gate: with the client connected over port 443 next to a decoy site, `ping`, DNS, a web page and a UDP app all work; an active probe gets only the decoy; a fronted connection works through a reverse proxy that stands in for a CDN in the test setup (it ends TLS, rewrites headers and buffers requests as one does; a test through a real CDN is left to operators and is not part of the gate); exit switching works without reconnecting; throughput is recorded per transport.
 
 ### Phase 3: design system (2 sessions)
 
