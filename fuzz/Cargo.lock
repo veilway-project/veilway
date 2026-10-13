@@ -1177,8 +1177,17 @@ name = "veilway-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "ring",
  "serde_json",
  "veilway-core",
+ "veilway-proto",
+]
+
+[[package]]
+name = "veilway-proto"
+version = "0.1.0"
+dependencies = [
+ "ring",
 ]
 
 [[package]]

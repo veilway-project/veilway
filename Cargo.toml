@@ -40,6 +40,7 @@ libc="0.2.150"
 axum={version="0.8", default-features=false, features=["http1", "tokio"]}
 hyper={version="1", features=["http1", "server"]}
 hyper-util={version="0.1", features=["tokio", "service"]}
+proptest={version="1", default-features=false, features=["std"]}
 
 
 # ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout, and it blocks in the Drop of a TCP stream, which kept a node with open flows from ever exiting. See vendor/ipstack ("veilway patch").
