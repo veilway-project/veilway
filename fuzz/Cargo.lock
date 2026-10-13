@@ -1337,6 +1337,8 @@ dependencies = [
  "base64",
  "hpke",
  "ring",
+ "serde",
+ "serde_json",
  "subtle",
 ]
 

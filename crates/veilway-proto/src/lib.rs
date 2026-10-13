@@ -1,6 +1,6 @@
 //! Wire formats of the Veilway protocol, as pure code: no sockets, no clocks and no randomness of its own. Time and random bytes are parameters.
 //!
-//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the keys (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), the timer table (`session`), the stream proof (`proof`), the packets of `udp-obfs` (`udp_obfs`), the replay rule and the replay file (`replay`), the request line of a stream listener (`request`) and the bodies of `fronted` (`fronted`). There is no listener, no socket and no file here. The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
+//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the keys (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), the timer table (`session`), the stream proof (`proof`), the packets of `udp-obfs` (`udp_obfs`), the replay rule and the replay file (`replay`), the request line of a stream listener (`request`) and the bodies of `fronted` (`fronted`), and of the subscription format the link, the signed document, the request and what a client decides (`subscription`). There is no listener, no socket and no file here. The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
 #![forbid(unsafe_code)]
 
 pub mod chunk;
@@ -12,6 +12,7 @@ pub mod proof;
 pub mod replay;
 pub mod request;
 pub mod session;
+pub mod subscription;
 pub mod udp_obfs;
 
 /// The one answer to everything that is not a valid proof, opening packet or data packet for this node. It says nothing about the cause, and a caller must not try to learn one: a refused stream request takes the unauthenticated path and a refused datagram is dropped.

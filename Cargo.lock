@@ -1995,6 +1995,8 @@ dependencies = [
  "hpke",
  "proptest",
  "ring",
+ "serde",
+ "serde_json",
  "subtle",
 ]
 

@@ -1,7 +1,7 @@
 # Where the expected bytes in this crate's tests come from: HKDF and HMAC from Python's standard library, and ChaCha20-Poly1305 written out from RFC 8439, each checked against a published vector before it is used. Nothing here shares code with the crate.
 # Prints the vectors. With a directory as its argument it also writes the seed corpus of the fuzz targets there:
 #   docker run --rm -v "$PWD":/w -w /w python:3 python -I crates/veilway-proto/tests/vectors.py fuzz/corpus
-import hmac, hashlib, struct, sys, os, base64
+import hmac, hashlib, struct, sys, os, base64, json
 
 def extract(salt, ikm): return hmac.new(salt, ikm, hashlib.sha256).digest()
 def expand(prk, info, n):
@@ -183,6 +183,142 @@ body = struct.pack(">H", len(chunk0)) + chunk0 + struct.pack(">H", len(chunk1)) 
 print("fronted_body", len(body), body.hex())
 print("later_query", (b64(bytes(range(16))) + b".7").decode())
 
+# The subscription format. Ed25519 is written out from RFC 8032 over affine coordinates, slow and plain, and checked against tests 1 and 2 of its section 7.1 before it is used.
+D, L = -121665 * pow(121666, P - 2, P) % P, 2 ** 252 + 27742317777372353535851937790883648493
+def xrecover(y, sign):
+    xx = (y * y - 1) * pow(D * y * y + 1, P - 2, P) % P
+    x = pow(xx, (P + 3) // 8, P)
+    if (x * x - xx) % P: x = x * pow(2, (P - 1) // 4, P) % P
+    if (x * x - xx) % P: return None
+    return (P - x) % P if x & 1 != sign else x
+def add(a, b):
+    t = D * a[0] * b[0] * a[1] * b[1] % P
+    return ((a[0] * b[1] + b[0] * a[1]) * pow(1 + t, P - 2, P) % P, (a[1] * b[1] + a[0] * b[0]) * pow(1 - t, P - 2, P) % P)
+def mul(k, p):
+    q = (0, 1)
+    while k:
+        if k & 1: q = add(q, p)
+        p, k = add(p, p), k >> 1
+    return q
+def enc(p): return (p[1] | (p[0] & 1) << 255).to_bytes(32, "little")
+# Decodes as a lax verifier does: a y of p or more is taken less p, and a sign bit on an x of 0 is ignored.
+def dec(b):
+    n = int.from_bytes(b, "little")
+    y = (n & ((1 << 255) - 1)) % P
+    x = xrecover(y, n >> 255)
+    return None if x is None else (x, y)
+G = dec((4 * pow(5, P - 2, P) % P).to_bytes(32, "little"))
+def hint(m): return int.from_bytes(hashlib.sha512(m).digest(), "little")
+def ed_public(seed):
+    a = int.from_bytes(hashlib.sha512(seed).digest()[:32], "little") & ~7 & ((1 << 254) - 1) | (1 << 254)
+    return a, enc(mul(a, G))
+def ed_sign(seed, m):
+    a, pk = ed_public(seed)
+    r = hint(hashlib.sha512(seed).digest()[32:] + m) % L
+    R = enc(mul(r, G))
+    return R + ((r + hint(R + pk + m) * a) % L).to_bytes(32, "little")
+# The verifier the strict rule is written against: it reduces what it decodes, compares points and not bytes, and checks neither the range of S nor the order of the key.
+def ed_lax(pk, m, sig):
+    A, R = dec(pk), dec(sig[:32])
+    return A is not None and R is not None and mul(int.from_bytes(sig[32:], "little"), G) == add(R, mul(hint(sig[:32] + pk + m) % L, A))
+assert ed_public(h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"))[1].hex() == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+assert ed_sign(h("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"), b"").hex() == "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"
+assert ed_public(h("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"))[1].hex() == "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+assert ed_sign(h("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb"), b"\x72").hex() == "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+# The five y coordinates of the points of small order, as envelope.rs lists them: each decodes with either sign bit, and eight times the point is the neutral element. No other y below p gives such a point, since the group has eight of them: one with y = 1, one with y = p - 1, two with y = 0 and four of order 8.
+small_y = [0, 1, P - 1, int.from_bytes(h("26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05"), "little"), int.from_bytes(h("c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a"), "little")]
+assert all(mul(8, dec((y | sign << 255).to_bytes(32, "little"))) == (0, 1) for y in small_y for sign in (0, 1))
+assert len({dec((y | sign << 255).to_bytes(32, "little")) for y in small_y for sign in (0, 1)}) == 8 and mul(8, G) != (0, 1) and mul(L, G) == (0, 1)
+
+# Two provider keys from the seeds 11..11 and 22..22, a third that no client holds from 99..99, a device key 33..33 with the device secret 44..44, and the token 55..55.
+seed1, seed2, seed3, device_private, device_secret, link_token = b"\x11" * 32, b"\x22" * 32, b"\x99" * 32, b"\x33" * 32, b"\x44" * 16, b"\x55" * 16
+(scalar1, sub_pk1), (_, sub_pk2), (_, sub_pk3), device_public = ed_public(seed1), ed_public(seed2), ed_public(seed3), x25519(device_private, BASE)
+def key64(data): return base64.b64encode(data).decode()
+def kid(pk): return b64(hashlib.sha256(pk).digest()[:8])
+def jws_header(pk): return b'{"alg":"EdDSA","typ":"veilway-sub+jws","kid":"' + kid(pk) + b'"}'
+def jws(seed, payload, header=None):
+    signed = b64(header or jws_header(ed_public(seed)[1])) + b"." + b64(payload)
+    return signed + b"." + b64(ed_sign(seed, signed))
+issued = 1_700_000_000
+# A document of one profile with one datagram and one stream transport. With `private` the provider issued the device's key, which is what a whole document in a link carries.
+def payload(serial, keys, private=False, at=issued, **more):
+    keys_of_device = {"public_key": key64(device_public), "addresses": ["10.7.0.2", "fd00::2"], "transport_secrets": [key64(secret)]}
+    if private: keys_of_device["private_key"] = key64(device_private)
+    profile = {"id": "main", "name": "Example", "type": "veilway", "inbound_public_key": key64(inbound), "device": keys_of_device, "gateways": ["10.7.0.1", "fd00::1"], "mtu": 1420, "transport_public_key": key64(node_pk), "transports": [{"type": "udp-obfs", "endpoints": ["192.0.2.10:51820", "[2001:db8::10]:51820"]}, {"type": "tls", "path": "/a-path-of-a-transport", "candidates": [{"address": "192.0.2.10:443", "sni": "node.example.com", "host": "node.example.com", "pins": [key64(hashlib.sha256(b"pin").digest())]}]}], "exits": [{"tag": "de", "name": "Berlin", "country": "DE", "full_ip": True}]}
+    document = {"v": 1, "subscription_id": "example-account-0001", "serial": serial, "issued_at": at, "expires_at": at + 30 * 86400, "signing_keys": [key64(key) for key in keys], "provider": {"name": "Example Provider"}, "profiles": [profile], "devices": [{"name": "phone", "enrolled_at": at, "this": True}]}
+    document.update(more)
+    return json.dumps(document, separators=(",", ":")).encode()
+payload_first, payload_carried = payload(1, [sub_pk1]), payload(1, [sub_pk1], private=True)
+payload_both, payload_second = payload(2, [sub_pk1, sub_pk2]), payload(3, [sub_pk2])
+payload_refusal = json.dumps({"v": 1, "subscription_id": "example-account-0001", "issued_at": issued, "refusal": "device_limit"}, separators=(",", ":")).encode()
+document_first, document_carried, document_refusal = jws(seed1, payload_first), jws(seed1, payload_carried), jws(seed1, payload_refusal)
+fragment = b"#v1." + b64(sub_pk1) + b"." + b64(link_token)
+link_veilway, link_https = b"veilway://sub/sub.example.com/s" + fragment, b"https://sub.example.com/s" + fragment
+link_file = b"v1." + b64(sub_pk1) + b"." + document_carried
+def request(op, name=None):
+    body = {"v": 1, "token": b64(link_token).decode(), "kids": [kid(sub_pk1).decode()], "device_public_key": key64(device_public), "device_secret": b64(device_secret).decode(), "op": op}
+    if name is not None: body["device_name"] = name
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
+fingerprint = hashlib.sha256(sub_pk1).hexdigest()[:32]
+print("sub_key", sub_pk1.hex(), kid(sub_pk1).decode(), " ".join(fingerprint[i:i + 4] for i in range(0, 32, 4)))
+print("sub_header", jws_header(sub_pk1).decode())
+print("sub_document", len(document_first), hashlib.sha256(document_first).hexdigest())
+print("sub_link", link_veilway.decode())
+print("sub_request", request("fetch").decode())
+
+# Signatures that the lax verifier above accepts and the strict rule refuses, each over the message "veilway": S with the group order added, the neutral element as the key in three encodings, and a real key with the neutral element as R in an encoding of p + 1.
+edge_message, edge_signature = b"veilway", ed_sign(seed1, b"veilway")
+edge_high_s = edge_signature[:32] + (int.from_bytes(edge_signature[32:], "little") + L).to_bytes(32, "little")
+edge_neutral = enc(mul(7, G)) + (7).to_bytes(32, "little")
+neutral_keys = [(1).to_bytes(32, "little"), (P + 1).to_bytes(32, "little"), (1 | 1 << 255).to_bytes(32, "little")]
+neutral_r = (P + 1).to_bytes(32, "little")
+edge_neutral_r = neutral_r + (hint(neutral_r + sub_pk1 + edge_message) % L * scalar1 % L).to_bytes(32, "little")
+assert ed_lax(sub_pk1, edge_message, edge_signature) and ed_lax(sub_pk1, edge_message, edge_high_s) and ed_lax(sub_pk1, edge_message, edge_neutral_r) and all(ed_lax(key, edge_message, edge_neutral) for key in neutral_keys)
+print("edge_signature", edge_signature.hex())
+print("edge_high_s", edge_high_s.hex())
+print("edge_neutral", edge_neutral.hex(), [key.hex() for key in neutral_keys])
+print("edge_neutral_r", edge_neutral_r.hex())
+# The same two faults in the signature of a whole document, so that they reach the verifier of the envelope.
+signed_first = document_first.rsplit(b".", 1)[0]
+signature_first = ed_sign(seed1, signed_first)
+document_high_s = signed_first + b"." + b64(signature_first[:32] + (int.from_bytes(signature_first[32:], "little") + L).to_bytes(32, "little"))
+document_neutral_r = signed_first + b"." + b64(neutral_r + (hint(neutral_r + sub_pk1 + signed_first) % L * scalar1 % L).to_bytes(32, "little"))
+assert all(ed_lax(sub_pk1, signed_first, base64.urlsafe_b64decode(document.rsplit(b".", 1)[1] + b"==")) for document in (document_first, document_high_s, document_neutral_r))
+subscription_seeds = {
+    "fuzz_sub_envelope/high-s": b"\x00" + document_high_s,
+    "fuzz_sub_envelope/neutral-r": b"\x00" + document_neutral_r,
+    "fuzz_sub_envelope/document": b"\x00" + document_first,
+    "fuzz_sub_envelope/carried": b"\x00" + document_carried,
+    "fuzz_sub_envelope/refusal": b"\x00" + document_refusal,
+    "fuzz_sub_envelope/two-keys": b"\x00" + jws(seed1, payload_both),
+    "fuzz_sub_envelope/second-key": b"\x00" + jws(seed2, payload_second),
+    "fuzz_sub_envelope/key-not-held": b"\x00" + jws(seed3, payload(4, [sub_pk3])),
+    "fuzz_sub_envelope/other-algorithm": b"\x00" + jws(seed1, payload_first, jws_header(sub_pk1).replace(b"EdDSA", b"ES256")),
+    "fuzz_sub_envelope/unchanged": b"\x01",
+    "fuzz_sub_envelope/one-bit": b"\x01\x00\x40\x01",
+    "fuzz_subscription/import": b"\x01" + payload_carried,
+    "fuzz_subscription/refresh": b"\x00" + payload(2, [sub_pk1], private=True, at=issued + 60),
+    "fuzz_subscription/rotation": b"\x00" + payload(2, [sub_pk1, sub_pk2], private=True, at=issued + 60),
+    "fuzz_subscription/refusal": b"\x00" + payload_refusal,
+    "fuzz_subscription/refresh-with-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, refresh_urls=["https://mirror.example.net/s", "https://sub.example.com/other", "https://sub.example.com:8443/s"]),
+    "fuzz_subscription/rotation-with-link": b"\x04" + payload(2, [sub_pk1, sub_pk2], at=issued + 60),
+    "fuzz_subscription/refusal-with-link": b"\x04" + payload_refusal,
+    "fuzz_subscription/import-content": b"\x01" + payload(5, [sub_pk1], private=True, refresh_urls=["https://mirror.example.net/s"], support=[{"label": "Help", "url": "https://example.com/help"}]),
+    "fuzz_subscription/content": b"\x00" + payload(5, [sub_pk1], private=True, update_interval=7200, refresh_urls=["https://mirror.example.net/s"], usage={"used_bytes": 1, "quota_bytes": 2, "period": "monthly", "period_start": issued, "expires_at": 0, "device_limit": 3}, support=[{"label": "Help", "url": "https://example.com/help"}], cards=[{"type": "stat", "label": "Plan", "value": "Basic", "unit": "GB"}, {"type": "progress", "label": "Used", "used": 1, "total": 2}, {"type": "notice", "severity": "info", "text": "Hello"}, {"type": "link", "label": "Site", "url": "https://example.com/"}], logo={"type": "png", "data": key64(b"\x89PNG")}, accent="#3366cc", notices=[{"severity": "warning", "text": "Maintenance"}]),
+    "fuzz_deeplink/native-veilway": link_veilway,
+    "fuzz_deeplink/native-https": link_https,
+    "fuzz_deeplink/document": b"veilway://doc#" + link_file,
+    "fuzz_deeplink/file": link_file,
+    "fuzz_deeplink/legacy": b"https://sub.example.com/list?token=abc#name",
+    "fuzz_sub_request/fetch": request("fetch"),
+    "fuzz_sub_request/confirm": request("confirm", "phone"),
+    "fuzz_sub_request/release": request("release"),
+    "fuzz_links/plain": b"\x00vless://00000000-0000-0000-0000-000000000000@node.example.com:443?security=tls&type=ws&sni=node.example.com&path=%2Fws#One\ntrojan://password@192.0.2.10:443#Two\nss://" + b64(b"aes-256-gcm:password") + b"@node.example.com:8388#Three\nvmess://" + base64.b64encode(json.dumps({"v": "2", "ps": "Four", "add": "node.example.com", "port": "443", "id": "00000000-0000-0000-0000-000000000000", "scy": "auto", "net": "ws", "tls": "tls"}).encode()) + b"\nhttp://example.com/\n",
+    "fuzz_links/packed": b"\x00" + base64.b64encode(b"trojan://password@node.example.com:443?allowInsecure=1#One\nss://" + b64(b"rc4-md5:password@192.0.2.10:8388") + b"#Two\n"),
+    "fuzz_links/native": b"\x00" + document_first,
+    "fuzz_links/headers": b"\x01subscription-userinfo: upload=1; download=2; total=3; expire=1700000000\nprofile-title: Example\nprofile-update-interval: 12\nsupport-url: https://example.com/help\n",
+}
+
 if len(sys.argv) > 1:
     root = sys.argv[1]
     auth = h("002102") + client_mac
@@ -294,6 +430,6 @@ if len(sys.argv) > 1:
         "fronted_body/stranger": h("01 00 00 00") + sized(b"\x5a" * 21) + sized(b"\xa5" * 16),
         "fronted_body/stranger-short": h("01 01 00 00") + b"\x00\x10" + bytes(15),
     })
-    for name, data in files.items():
+    for name, data in {**files, **subscription_seeds}.items():
         os.makedirs(os.path.dirname(os.path.join(root, name)), exist_ok=True)
         open(os.path.join(root, name), "wb").write(data)

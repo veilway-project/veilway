@@ -1,0 +1,4 @@
+subscription-userinfo: upload=1; download=2; total=3; expire=1700000000
+profile-title: Example
+profile-update-interval: 12
+support-url: https://example.com/help
