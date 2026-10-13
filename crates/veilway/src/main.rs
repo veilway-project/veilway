@@ -1,7 +1,10 @@
+mod doctor;
+
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 #[cfg(unix)]
 use tokio::sync::broadcast::error::RecvError;
 use tracing_subscriber::filter::Directive;
@@ -36,6 +39,24 @@ enum Command {
 	/// Validate a version 1 config and print every error and warning
 	Check {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+	},
+	/// Try everything a config needs of this host and the network (ports, certificates, DNS, every outbound) and change nothing
+	Doctor {
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+		/// Check for a node that is started with the same flag: without it a config file group or others can read is a failure, as it is for `run`
+		#[arg(long)] allow_readable_config: bool,
+		/// The state file `run` would use [default: veilway-state.json next to the config file]
+		#[arg(long)] state: Option<PathBuf>,
+		/// The control socket `run` would use, which also says whether a node runs already [default: veilway.sock next to the config file]
+		#[cfg(unix)]
+		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
+		/// Check for a node that runs without the control API
+		#[cfg(unix)]
+		#[arg(long)] no_api: bool,
+		/// Print one JSON document in the place of the lines
+		#[arg(long)] json: bool,
+		/// Seconds each step on the network may take, which is 10 at most because the node waits no longer either. All of them together have 45
+		#[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=10))] timeout: u64,
 	},
 	/// Print the JSON Schema of config version 1
 	Schema,
@@ -154,6 +175,13 @@ async fn main() -> anyhow::Result<()> {
 			let (_, report) = veilway_core::config::load(&config, true);
 			if print(&report, &config) {std::process::exit(1)}
 			Ok(())
+		}
+		Command::Doctor {config, allow_readable_config, state, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+			#[cfg(unix)]
+			let socket = (!no_api).then(|| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
+			#[cfg(not(unix))]
+			let socket = None;
+			std::process::exit(doctor::run(&config, allow_readable_config, state, socket, json, Duration::from_secs(timeout)).await)
 		}
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());

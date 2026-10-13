@@ -18,6 +18,15 @@ anyhow.workspace=true
 clap.workspace=true
 tracing.workspace=true
 tracing-subscriber.workspace=true
+serde_json.workspace=true
+# `doctor` reads the dates and the names of a certificate, which nothing else in the node looks at.
+x509-parser.workspace=true
 
 [target.'cfg(unix)'.dependencies]
 veilway-api={path="../veilway-api"}
+# The one `access` call `doctor` asks the system with whether a directory can be written.
+libc.workspace=true
+
+[dev-dependencies]
+rcgen.workspace=true
+time.workspace=true

@@ -20,6 +20,23 @@ pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>}
 #[derive(PartialEq, Eq)]
 pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
 
+impl Outbound {
+	/// An outbound of the config as the engine dials through it.
+	pub fn of(outbound: &config::Outbound) -> Outbound {
+		match outbound {
+			config::Outbound::Direct {bind, ..} => Outbound::Direct {bind: bind.map(|ip| ip.0)},
+			config::Outbound::Socks5 {server, username, password, ..} => Outbound::Socks5(Upstream {
+				addr: match &server.host {
+					config::Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", server.port),
+					config::Host::Ip(IpAddr::V4(v4)) => format!("{v4}:{}", server.port),
+					config::Host::Name(name) => format!("{name}:{}", server.port),
+				},
+				auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
+			}),
+		}
+	}
+}
+
 /// What a netstack exit does with one class of traffic its outbound cannot carry: a policy of `unsupported`, with a `via` resolved to its exit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fallback {Local, Reject, Drop, Direct, Via(usize)}
@@ -187,17 +204,7 @@ impl Plan {
 		for exit in &config.exits {
 			let backend = match &exit.backend {
 				config::Backend::Netstack(netstack) => Backend::Netstack {
-					outbound: match &config.outbounds[find(&outbound_tags, &netstack.outbound)?] {
-						config::Outbound::Direct {bind, ..} => Outbound::Direct {bind: bind.map(|ip| ip.0)},
-						config::Outbound::Socks5 {server, username, password, ..} => Outbound::Socks5(Upstream {
-							addr: match &server.host {
-								config::Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", server.port),
-								config::Host::Ip(IpAddr::V4(v4)) => format!("{v4}:{}", server.port),
-								config::Host::Name(name) => format!("{name}:{}", server.port),
-							},
-							auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
-						}),
-					},
+					outbound: Outbound::of(&config.outbounds[find(&outbound_tags, &netstack.outbound)?]),
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
 					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,

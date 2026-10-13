@@ -34,7 +34,7 @@ const DRAIN: Duration = Duration::from_millis(100);
 pub(super) static AROUND: Outbound = Outbound::Direct {bind: None};
 
 /// RFC 1928 section 7 request header: two reserved bytes, the fragment number, then the destination.
-fn udp_header(dst: SocketAddr) -> Vec<u8> {
+pub fn udp_header(dst: SocketAddr) -> Vec<u8> {
 	let mut h = vec![0, 0, 0];
 	match dst.ip() {
 		IpAddr::V4(a) => {
@@ -51,7 +51,7 @@ fn udp_header(dst: SocketAddr) -> Vec<u8> {
 }
 
 /// Strips that header off a reply, refusing fragments and address types we cannot parse. The source is not enforced: the association is per flow and the proxy at the other end is trusted.
-fn unwrap_udp(datagram: &[u8]) -> Option<&[u8]> {
+pub fn unwrap_udp(datagram: &[u8]) -> Option<&[u8]> {
 	if datagram.len() < 4 || datagram[2] != 0 {return None}
 	match datagram[3] {
 		1 if datagram.len() >= 10 => Some(&datagram[10..]),
@@ -60,9 +60,8 @@ fn unwrap_udp(datagram: &[u8]) -> Option<&[u8]> {
 	}
 }
 
-/// Opens a UDP ASSOCIATE on `up` and returns the control connection that owns it plus a socket connected to the relay. The association lives exactly as long as the returned TcpStream.
-async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> {
-	let mut control = TcpStream::connect(up.addr.as_str()).await?;
+/// What a connection to `up` begins with before it may ask for a UDP ASSOCIATE: the choice of a method, and the user name and password when the proxy asks for them.
+pub async fn greet(control: &mut TcpStream, up: &Upstream) -> anyhow::Result<()> {
 	control.write_all(&[5, 2, 0, 2]).await?;
 	let mut chosen = [0u8; 2];
 	control.read_exact(&mut chosen).await?;
@@ -83,6 +82,13 @@ async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> {
 		}
 		m => anyhow::bail!("upstream picked auth method {m}"),
 	}
+	Ok(())
+}
+
+/// Opens a UDP ASSOCIATE on `up` and returns the control connection that owns it plus a socket connected to the relay. The association lives exactly as long as the returned TcpStream.
+pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> {
+	let mut control = TcpStream::connect(up.addr.as_str()).await?;
+	greet(&mut control, up).await?;
 	control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
 	let mut head = [0u8; 4];
 	control.read_exact(&mut head).await?;
@@ -125,6 +131,13 @@ pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<Socks5Stream
 	}
 }
 
+/// A TCP connection to `target` from the node itself, from the address `bind` when the outbound has one.
+pub async fn connect_from(bind: Option<IpAddr>, target: SocketAddr) -> std::io::Result<TcpStream> {
+	let socket = if target.is_ipv4() {TcpSocket::new_v4()?} else {TcpSocket::new_v6()?};
+	if let Some(bind) = bind {socket.bind(SocketAddr::new(bind, 0))?}
+	socket.connect(target).await
+}
+
 /// Runs one accepted flow of the device `from` to its end: through the outbound of `exit`, until either side closes or the flow has been quiet for the exit's idle time.
 /// A UDP flow whose proxy has no UDP ASSOCIATE at its first packet is decided here by the exit's `unsupported.udp` policy, once: the decision goes into the flow table and the flow keeps it.
 /// One the proxy did give an association is tied to that proxy the same way (`By::Proxy`), so a later handler of the flow that gets none refuses it and never sends it around the proxy.
@@ -155,18 +168,11 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 						Ok(mut remote) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
 						Err(e) => return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {e}", plan.show(target)),
 					},
-					Outbound::Direct {bind} => {
-						let connect = async {
-							let socket = if target.is_ipv4() {TcpSocket::new_v4()?} else {TcpSocket::new_v6()?};
-							if let Some(bind) = bind {socket.bind(SocketAddr::new(*bind, 0))?}
-							socket.connect(target).await
-						};
-						match tokio::time::timeout(DIAL_TIMEOUT, connect).await {
-							Ok(Ok(mut remote)) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
-							Ok(Err(e)) => return tracing::debug!("exit {tag}: tcp to {}: direct connect failed: {}", plan.show(target), e.kind()),
-							Err(_) => return tracing::debug!("exit {tag}: tcp to {}: direct connect timed out", plan.show(target)),
-						}
-					}
+					Outbound::Direct {bind} => match tokio::time::timeout(DIAL_TIMEOUT, connect_from(*bind, target)).await {
+						Ok(Ok(mut remote)) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
+						Ok(Err(e)) => return tracing::debug!("exit {tag}: tcp to {}: direct connect failed: {}", plan.show(target), e.kind()),
+						Err(_) => return tracing::debug!("exit {tag}: tcp to {}: direct connect timed out", plan.show(target)),
+					},
 				};
 				if let Err(e) = copied {tracing::debug!("exit {tag}: tcp to {}: {}", plan.show(target), e.kind())}
 			}
@@ -335,7 +341,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 }
 
 /// One DNS exchange over a stream: a 2 byte big endian length goes before the query and comes before the answer.
-async fn framed<S: AsyncRead + AsyncWrite + Unpin>(remote: &mut S, query: &[u8]) -> std::io::Result<Vec<u8>> {
+pub async fn framed<S: AsyncRead + AsyncWrite + Unpin>(remote: &mut S, query: &[u8]) -> std::io::Result<Vec<u8>> {
 	let mut out = Vec::with_capacity(query.len() + 2);
 	out.extend_from_slice(&(query.len() as u16).to_be_bytes());
 	out.extend_from_slice(query);
@@ -347,6 +353,25 @@ async fn framed<S: AsyncRead + AsyncWrite + Unpin>(remote: &mut S, query: &[u8])
 	Ok(answer)
 }
 
+/// Whether `answer` is a response under the id `query` went out with.
+pub fn answers(query: &[u8], answer: &[u8]) -> bool {answer.len() >= dns::HEADER && answer.get(..2) == query.get(..2) && answer[2] & 0x80 != 0}
+
+/// One query to `target` over UDP from the node itself, and the first datagram that answers it. Anything else that arrives on the socket is not the answer. An error is: the server's host said that nothing listens there.
+pub async fn ask_udp(bind: Option<IpAddr>, target: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+	let local = bind.unwrap_or(if target.is_ipv4() {Ipv4Addr::UNSPECIFIED.into()} else {Ipv6Addr::UNSPECIFIED.into()});
+	let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
+	socket.connect(target).await?;
+	socket.send(query).await?;
+	let mut answer = vec![0u8; DNS_UDP_ANSWER];
+	loop {
+		let n = socket.recv(&mut answer).await?;
+		if answers(query, &answer[..n]) {
+			answer.truncate(n);
+			return Ok(answer);
+		}
+	}
+}
+
 /// One query of the node's resolver to `target` through an outbound, and the answer to it. None when none came within `DNS_TIMEOUT`.
 /// Through a proxy the query rides a CONNECT, which works with or without UDP ASSOCIATE. Directly it goes over UDP, and again over TCP when that answer is truncated.
 /// The query goes out under an id the node draws for it, and only a response under that id is the answer. The id the tunnel client chose is known to that client, who could otherwise send the answer to its own query from outside. It is written back before the answer is returned.
@@ -355,30 +380,15 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 	SystemRandom::new().fill(&mut id).ok()?;
 	asked.get_mut(..2)?.copy_from_slice(&id);
 	let (query, client) = (&asked[..], query.get(..2)?);
-	let ours = |answer: &[u8]| answer.len() >= dns::HEADER && answer[..2] == id && answer[2] & 0x80 != 0;
 	let exchange = async {
 		let answer = match outbound {
 			Outbound::Socks5(up) => framed(&mut dial(up, target).await.ok()?, query).await.ok()?,
 			Outbound::Direct {bind} => {
-				let local = bind.unwrap_or(if target.is_ipv4() {Ipv4Addr::UNSPECIFIED.into()} else {Ipv6Addr::UNSPECIFIED.into()});
-				let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await.ok()?;
-				socket.connect(target).await.ok()?;
-				socket.send(query).await.ok()?;
-				let mut answer = vec![0u8; DNS_UDP_ANSWER];
-				// Anything else that arrives on the socket is not the answer. An error is: the server's host said that nothing listens there.
-				let n = loop {
-					let n = socket.recv(&mut answer).await.ok()?;
-					if ours(&answer[..n]) {break n}
-				};
-				answer.truncate(n);
-				if n < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {
-					let socket = if target.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.ok()?;
-					if let Some(bind) = bind {socket.bind(SocketAddr::new(*bind, 0)).ok()?}
-					framed(&mut socket.connect(target).await.ok()?, query).await.ok()?
-				}
+				let answer = ask_udp(*bind, target, query).await.ok()?;
+				if answer.len() < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {framed(&mut connect_from(*bind, target).await.ok()?, query).await.ok()?}
 			}
 		};
-		ours(&answer).then_some(answer)
+		answers(query, &answer).then_some(answer)
 	};
 	let mut answer = tokio::time::timeout(DNS_TIMEOUT, exchange).await.ok().flatten()?;
 	answer.get_mut(..2)?.copy_from_slice(client);

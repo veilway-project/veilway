@@ -17,7 +17,8 @@ tracing.workspace=true
 time.workspace=true
 futures-util.workspace=true
 axum.workspace=true
-hyper.workspace=true
+# The client is what `held` asks a node that already runs with, and what the tests talk to the socket with.
+hyper={workspace=true, features=["client"]}
 hyper-util.workspace=true
 socket2.workspace=true
 
@@ -26,5 +27,3 @@ veilway-wg={path="../veilway-wg"}
 boringtun.workspace=true
 etherparse.workspace=true
 tracing-subscriber.workspace=true
-# The tests talk to the socket with hyper's own client.
-hyper={workspace=true, features=["client"]}

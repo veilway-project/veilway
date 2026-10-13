@@ -4,14 +4,16 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 1, step 2 in progress. Done: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
+- Active phase: 2, not started. Phase 1 is finished and its gate passes. Phase 1 history: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
 - Step 2b is done too: every tunnel DNS query is answered by the node's own resolver (UDP and TCP port 53, servers tried in order, REFUSED when the rules refuse), names are remembered per user, and `domain` rules match on them. Fuzz targets: `config`, `packet`, `dns`.
 - Step 2c is done too: rejected traffic gets the matching ICMP error, every `unsupported` policy of a `netstack` exit works (`local`, `reject`, `drop`, `direct`, `via`), and the `l3` exit runs on Linux (one TUN device, kernel forwarding and source NAT through `ip` and `nft`, return traffic only for live flows). Only one `l3` exit per node for now.
 - Step 2d is done too: `veilway run` reloads its config on SIGHUP (`Engine::reload`), a refused or failing file leaves the running config in force, every live flow is decided again under the new config, and a user who is disabled, removed or expired (or a device that is removed or re-keyed) loses sessions, flows and DNS memory within a second. `THREAT_MODEL.md` now describes the engine as built.
 - Step 3 is done: `quota_bytes` and `quota_period` are enforced (a user over quota is cut off within a second and comes back when the period rolls over or a reload raises the quota), every user, inbound and exit has counters (`Engine::counters`), and usage lives in a state file (`veilway run --state`, default `veilway-state.json` next to the config) that survives reloads and restarts.
 - Step 4 is done: `veilway run` serves the control API on a unix socket (`--api`, mode 600, `crates/veilway-api`): status, config (read with secrets redacted, validate, diff, apply with `If-Match`, saved back to the config file), users, stats with live rates, sessions, exits, an SSE event stream, and `openapi.json`, from which `packages/sdk` is generated. Remote access (mTLS or a scoped token), a logs route and kicking a session are not built.
-- Last finished step: Phase 1, step 4
-- Next action: Phase 1, step 5 (`veilway doctor`), then the Phase 1 gate.
+- Step 5 is done: `veilway doctor` diagnoses a config without changing anything (file mode, listen addresses, certificates, DNS over UDP and TCP, every outbound with TCP and UDP checks, l3 prerequisites, state file, control socket).
+- The Phase 1 gate passes: `sh scripts/gate-phase1.sh` runs the release binary in Docker with two kernel WireGuard clients and checks two inbounds in one process, the default exit, a domain rule to the `l3` exit, ping and IP protocol 253 through `l3`, isolation between peers, live stats from the API and a clean stop.
+- Last finished step: Phase 1, step 5 and the Phase 1 gate
+- Next action: Phase 2, step 1. Its gate needs a real CDN in front of a node, which needs the owner.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 

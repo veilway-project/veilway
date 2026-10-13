@@ -8,16 +8,19 @@ mod routes;
 
 pub use openapi::openapi;
 
+use axum::body::{to_bytes, Body};
 use axum::Router;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use schemars::SchemaGenerator;
+use serde::Deserialize;
 use socket2::{Domain, SockAddr, Socket, Type};
 use std::collections::VecDeque;
 use std::fs::{self, DirBuilder, Permissions};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -31,6 +34,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, Sleep};
+use veilway_core::config::{DEFAULT_INTERFACE, MAX_FILE_BYTES};
 use veilway_core::Engine;
 
 /// The largest request line and headers of one request together. A request with more is refused by the HTTP layer before any of it is looked at.
@@ -153,6 +157,72 @@ impl Drop for Server {
 	}
 }
 
+/// What stands at the path of a control socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+	Nothing,
+	/// Something that is not a socket, which no node replaces.
+	Other,
+	/// A socket nobody answers on, which a node that was killed leaves behind, by its device and inode.
+	Dead(u64, u64),
+	/// A socket somebody answers on: a node runs with it.
+	Answers,
+}
+
+/// Looks at `path` and tries a socket that is there, and changes nothing. A link is not followed.
+pub fn standing(path: &Path) -> io::Result<Standing> {
+	let meta = match fs::symlink_metadata(path) {
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Standing::Nothing),
+		Err(e) => return Err(io::Error::new(e.kind(), format!("the control socket {} cannot be looked at: {}", path.display(), e.kind()))),
+		Ok(meta) if !meta.file_type().is_socket() => return Ok(Standing::Other),
+		Ok(meta) => meta,
+	};
+	// Tried without ever waiting: a listener whose queue of connections is full would hold a connect that waits, and with it the start of a node, for as long as it stays full. It is a listener all the same.
+	match Socket::new(Domain::UNIX, Type::STREAM, None).and_then(|probe| {
+		probe.set_nonblocking(true)?;
+		probe.connect(&SockAddr::unix(path)?)
+	}) {
+		Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => Ok(Standing::Dead(meta.dev(), meta.ino())),
+		Err(e) if e.kind() != io::ErrorKind::WouldBlock => Err(io::Error::new(e.kind(), format!("the control socket {} exists and cannot be tried: {}", path.display(), e.kind()))),
+		_ => Ok(Standing::Answers),
+	}
+}
+
+/// What a node that runs holds of its host: every address it listens on with whether that is over TCP, and the interface of each l3 exit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Held {pub listens: Vec<(SocketAddr, bool)>, pub interfaces: Vec<String>}
+
+/// Asks whatever answers on the socket at `path` for its running config, and changes nothing. None when no answer came within `wait` or the answer is not the one a node gives:
+/// that something takes connections on the path says nothing of what it is.
+pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
+	#[derive(Deserialize)]
+	struct Running {revision: String, generation: u64, document: Document}
+	#[derive(Deserialize)]
+	struct Document {version: u64, inbounds: Vec<Inbound>, exits: Vec<Exit>}
+	#[derive(Deserialize)]
+	struct Inbound {transports: Vec<Transport>}
+	#[derive(Deserialize)]
+	struct Transport {r#type: String, listen: SocketAddr}
+	#[derive(Deserialize)]
+	struct Exit {backend: Backend}
+	#[derive(Deserialize)]
+	struct Backend {r#type: String, interface: Option<String>}
+	let body = tokio::time::timeout(wait, async {
+		let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(UnixStream::connect(path).await.ok()?)).await.ok()?;
+		// The connection ends once the request, which holds the sender, is through.
+		tokio::join!(connection, async move {
+			let response = sender.send_request(hyper::Request::builder().uri("/v1/config").header("host", "veilway").body(Body::empty()).ok()?).await.ok()?;
+			// A running config is no longer than a config file, and its secrets are markers that are shorter than they were.
+			if response.status().is_success() {to_bytes(Body::new(response.into_body()), MAX_FILE_BYTES as usize).await.ok()} else {None}
+		}).1
+	}).await.ok()??;
+	let running = serde_json::from_slice::<Running>(&body).ok().filter(|running| !running.revision.is_empty() && running.generation > 0 && running.document.version == 1)?;
+	Some(Held {
+		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, transport.r#type == "ws")).collect(),
+		interfaces: running.document.exits.into_iter().filter(|exit| exit.backend.r#type == "l3").map(|exit| exit.backend.interface.unwrap_or_else(|| DEFAULT_INTERFACE.to_string())).collect(),
+	})
+}
+
 /// Makes the socket at `options.socket` and serves the API on it until the `Server` is shut down or dropped. It must be called on the runtime the engine runs on.
 /// The socket is made in a new directory of mode 700 next to its path, given mode 600 there, and only then linked to its path, so it is at no moment open to anybody else, whatever the umask and the mode of the directory are.
 /// A socket nobody answers on, which a node that was killed leaves behind, is removed first. A socket somebody answers on is another node and an error, and anything at the path that is not a socket is left as it is and an error,
@@ -160,22 +230,14 @@ impl Drop for Server {
 pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 	let Options {socket: path, config, limits} = options;
 	// The socket file a dead node left at the path, by its device and inode.
-	let dead = match fs::symlink_metadata(&path) {
-		Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-		Err(e) => return Err(io::Error::new(e.kind(), format!("the control socket {} cannot be looked at: {}", path.display(), e.kind()))),
-		Ok(meta) if !meta.file_type().is_socket() => return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} is in the place of the control socket and is not a socket. It is left as it is: remove it, name another path with --api, or start with --no-api", path.display()))),
-		// Tried without ever waiting: a listener whose queue of connections is full would hold a connect that waits, and with it the start of this node, for as long as it stays full. It is a listener all the same.
-		Ok(meta) => match Socket::new(Domain::UNIX, Type::STREAM, None).and_then(|probe| {
-			probe.set_nonblocking(true)?;
-			probe.connect(&SockAddr::unix(&path)?)
-		}) {
-			Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
-				tracing::info!("control api: {} is a socket nobody answers on, left by a node that did not shut down, and is replaced", path.display());
-				Some((meta.dev(), meta.ino()))
-			}
-			Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(io::Error::new(e.kind(), format!("the control socket {} exists and cannot be tried: {}", path.display(), e.kind()))),
-			_ => return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another process answers on the control socket {}: a node already runs with it. Stop that node, name another path with --api, or start with --no-api", path.display()))),
-		},
+	let dead = match standing(&path)? {
+		Standing::Nothing => None,
+		Standing::Other => return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} is in the place of the control socket and is not a socket. It is left as it is: remove it, name another path with --api, or start with --no-api", path.display()))),
+		Standing::Dead(device, inode) => {
+			tracing::info!("control api: {} is a socket nobody answers on, left by a node that did not shut down, and is replaced", path.display());
+			Some((device, inode))
+		}
+		Standing::Answers => return Err(io::Error::new(io::ErrorKind::AddrInUse, format!("another process answers on the control socket {}: a node already runs with it. Stop that node, name another path with --api, or start with --no-api", path.display()))),
 	};
 	let staging = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(format!(".vw-{}", std::process::id()));
 	let staged = staging.join("s");

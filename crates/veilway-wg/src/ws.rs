@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
-use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
@@ -85,16 +85,44 @@ pub struct Route{pub path:String, pub target:SocketAddr, pub id:u64}
 /// What a relay listener serves at one moment: plain ws without an acceptor.
 pub struct Served{pub acceptor:Option<Acceptor>, pub routes:Vec<Route>}
 
-/// Reads a certificate chain and its key. What it says when it fails names neither file.
-pub fn acceptor(tls:&TlsFiles)->anyhow::Result<Acceptor>{
-	let _=rustls::crypto::ring::default_provider().install_default();
-	let certs=CertificateDer::pem_file_iter(&tls.cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).map_err(|e| anyhow::anyhow!("the certificate file: {e}"))?;
-	anyhow::ensure!(!certs.is_empty(), "the certificate file holds no certificate");
-	let key=PrivateKeyDer::from_pem_file(&tls.key).map_err(|e| anyhow::anyhow!("the key file: {e}"))?;
-	let mut cfg=rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-	cfg.alpn_protocols=vec![b"http/1.1".to_vec()];
-	Ok(Acceptor::from(Arc::new(cfg)))
+/// Why a certificate chain and its key cannot be served with: which of the two files, and what kind of fault. Never the words of the PEM reader, which quote the line they stopped at, and that line may be one of a key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TlsFault{CertUnreadable(std::io::ErrorKind), CertNotPem, NoCertificate, KeyUnreadable(std::io::ErrorKind), KeyNotPem, NoKey, Mismatch, Unusable}
+
+impl std::fmt::Display for TlsFault{
+	fn fmt(&self, f:&mut std::fmt::Formatter)->std::fmt::Result{
+		match self{
+			TlsFault::CertUnreadable(kind)=>write!(f, "the certificate file cannot be read ({kind})"),
+			TlsFault::CertNotPem=>f.write_str("the certificate file is not well-formed PEM"),
+			TlsFault::NoCertificate=>f.write_str("the certificate file holds no certificate"),
+			TlsFault::KeyUnreadable(kind)=>write!(f, "the key file cannot be read ({kind})"),
+			TlsFault::KeyNotPem=>f.write_str("the key file is not well-formed PEM"),
+			TlsFault::NoKey=>f.write_str("the key file holds no private key"),
+			TlsFault::Mismatch=>f.write_str("the key is not the key of the first certificate"),
+			TlsFault::Unusable=>f.write_str("the first certificate or the key is of a kind that cannot be served with"),
+		}
+	}
 }
+
+impl std::error::Error for TlsFault{}
+
+/// Reads a certificate chain and its key: what a listener serves with, and the chain as it is sent, the first certificate of the file first.
+pub fn load(tls:&TlsFiles)->Result<(Acceptor, Vec<CertificateDer<'static>>), TlsFault>{
+	let _=rustls::crypto::ring::default_provider().install_default();
+	let certs=CertificateDer::pem_file_iter(&tls.cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).map_err(|e| if let pem::Error::Io(e)=e{TlsFault::CertUnreadable(e.kind())}else{TlsFault::CertNotPem})?;
+	if certs.is_empty(){return Err(TlsFault::NoCertificate)}
+	let key=PrivateKeyDer::from_pem_file(&tls.key).map_err(|e| match e{
+		pem::Error::Io(e)=>TlsFault::KeyUnreadable(e.kind()),
+		pem::Error::NoItemsFound=>TlsFault::NoKey,
+		_=>TlsFault::KeyNotPem,
+	})?;
+	let mut cfg=rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs.clone(), key).map_err(|e| if matches!(e, rustls::Error::InconsistentKeys(_)){TlsFault::Mismatch}else{TlsFault::Unusable})?;
+	cfg.alpn_protocols=vec![b"http/1.1".to_vec()];
+	Ok((Acceptor::from(Arc::new(cfg)), certs))
+}
+
+/// Reads a certificate chain and its key. What it says when it fails names neither path and nothing the files hold.
+pub fn acceptor(tls:&TlsFiles)->anyhow::Result<Acceptor>{Ok(load(tls)?.0)}
 
 /// One listener for several tunnels: `routes` maps each request path to the UDP endpoint its frames are forwarded to.
 /// The certificate is loaded before this returns, so a bad file fails the caller instead of a background task.

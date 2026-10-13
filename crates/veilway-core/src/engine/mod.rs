@@ -9,6 +9,7 @@ mod inbound;
 pub mod l3;
 pub mod netstack;
 pub mod plan;
+pub mod probe;
 pub mod resolver;
 pub mod route;
 pub mod usage;

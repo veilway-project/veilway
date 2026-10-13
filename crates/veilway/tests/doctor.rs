@@ -1,0 +1,526 @@
+//! `veilway doctor` against fakes on the loopback: DNS servers that answer over UDP only or over both, SOCKS5 proxies with and without UDP ASSOCIATE, one that wants a password and one that names a relay on another host,
+//! ports that are taken, and certificates that are good, about to end, expired and of another key. The binary is run the way a user runs it, so what is held against the fakes is its lines, its JSON document and its exit status.
+#![cfg(unix)]
+use serde_json::{json, Value};
+use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
+
+const USER: &str = "doctor-user-7f3a";
+const PASSWORD: &str = "doctor-pass-91c2";
+const WRONG: &str = "doctor-wrong-55d0";
+/// Listen addresses come from below the range the system hands out by itself, so nothing a fake opens while doctor runs can take one first.
+static NEXT_PORT: AtomicU16 = AtomicU16::new(23100);
+
+/// A loopback address whose port nothing holds, over UDP or over TCP.
+fn free() -> SocketAddr {
+	loop {
+		let addr = SocketAddr::from(([127, 0, 0, 1], NEXT_PORT.fetch_add(1, Ordering::Relaxed)));
+		if std::net::UdpSocket::bind(addr).is_ok() && std::net::TcpListener::bind(addr).is_ok() {return addr}
+	}
+}
+
+/// The first address of this machine that is not loopback, which is where a DNS server of a config may be.
+fn host() -> IpAddr {
+	let probe = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+	match probe.connect("192.0.2.1:9").and_then(|_| probe.local_addr()).map(|local| local.ip()) {
+		Ok(ip) if !ip.is_loopback() && !ip.is_unspecified() => ip,
+		other => panic!("this test needs a non-loopback IPv4 address on the machine, found {other:?}"),
+	}
+}
+
+/// The query as a response with no records.
+fn answer(query: &[u8]) -> Vec<u8> {
+	let mut answer = query.to_vec();
+	if let Some(flags) = answer.get_mut(2..4) {(flags[0], flags[1]) = (flags[0] | 0x80, 0x80)}
+	answer
+}
+
+/// A DNS server that answers every query over UDP, and over TCP as well when `tcp` is set. Without it the TCP port is held and refuses every connection.
+async fn dns(tcp: bool) -> SocketAddr {
+	let (socket, udp) = loop {
+		let socket = TcpSocket::new_v4().unwrap();
+		socket.bind(SocketAddr::new(host(), 0)).unwrap();
+		if let Ok(udp) = UdpSocket::bind(socket.local_addr().unwrap()).await {break (socket, udp)}
+	};
+	let addr = udp.local_addr().unwrap();
+	let listener = if tcp {Ok(socket.listen(64).unwrap())} else {Err(socket)};
+	tokio::spawn(async move {
+		let mut query = [0u8; 512];
+		loop {
+			let accepted = async {
+				match &listener {
+					Ok(listener) => listener.accept().await,
+					Err(_) => std::future::pending().await,
+				}
+			};
+			tokio::select! {
+				received = udp.recv_from(&mut query) => if let Ok((n, from)) = received {let _ = udp.send_to(&answer(&query[..n]), from).await;},
+				accepted = accepted => {
+					let Ok((mut stream, _)) = accepted else {continue};
+					tokio::spawn(async move {
+						let mut len = [0u8; 2];
+						if stream.read_exact(&mut len).await.is_err() {return}
+						let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+						if stream.read_exact(&mut query).await.is_err() {return}
+						let answer = answer(&query);
+						let _ = stream.write_all(&[&(answer.len() as u16).to_be_bytes()[..], &answer].concat()).await;
+					});
+				}
+			}
+		}
+	});
+	addr
+}
+
+/// What a fake proxy does: whether it gives a UDP ASSOCIATE, the user name and password it wants, and whether it names a relay on another host than itself.
+#[derive(Clone, Copy, Default)]
+struct Proxy {udp: bool, password: Option<(&'static str, &'static str)>, elsewhere: bool}
+
+/// One connection to a fake proxy, for IPv4 destinations only.
+async fn proxied(mut client: TcpStream, proxy: Proxy) -> std::io::Result<()> {
+	let (mut head, mut request, mut dst, mut sink) = ([0u8; 2], [0u8; 4], [0u8; 6], [0u8; 1]);
+	client.read_exact(&mut head).await?;
+	let mut methods = vec![0u8; usize::from(head[1])];
+	client.read_exact(&mut methods).await?;
+	match proxy.password {
+		Some(_) if !methods.contains(&2) => return client.write_all(&[5, 0xff]).await,
+		Some((user, password)) => {
+			client.write_all(&[5, 2]).await?;
+			client.read_exact(&mut head).await?;
+			let mut name = vec![0u8; usize::from(head[1])];
+			client.read_exact(&mut name).await?;
+			client.read_exact(&mut head[..1]).await?;
+			let mut word = vec![0u8; usize::from(head[0])];
+			client.read_exact(&mut word).await?;
+			let known = name == user.as_bytes() && word == password.as_bytes();
+			client.write_all(&[1, u8::from(!known)]).await?;
+			if !known {return Ok(())}
+		}
+		None => client.write_all(&[5, 0]).await?,
+	}
+	client.read_exact(&mut request).await?;
+	client.read_exact(&mut dst).await?;
+	match request[1] {
+		1 => match TcpStream::connect(SocketAddr::from(([dst[0], dst[1], dst[2], dst[3]], u16::from_be_bytes([dst[4], dst[5]])))).await {
+			Ok(mut remote) => {
+				client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
+				tokio::io::copy_bidirectional(&mut client, &mut remote).await.map(drop)
+			}
+			Err(_) => client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await,
+		},
+		3 if proxy.udp => {
+			let (relay, out) = (UdpSocket::bind("127.0.0.1:0").await?, UdpSocket::bind("0.0.0.0:0").await?);
+			let (port, host) = (relay.local_addr()?.port().to_be_bytes(), if proxy.elsewhere {[192, 0, 2, 1]} else {[0, 0, 0, 0]});
+			client.write_all(&[5, 0, 0, 1, host[0], host[1], host[2], host[3], port[0], port[1]]).await?;
+			let (mut wrapped, mut reply, mut asker) = ([0u8; 2048], [0u8; 2048], None);
+			loop {
+				tokio::select! {
+					received = relay.recv_from(&mut wrapped) => {
+						let (n, from) = received?;
+						if n < 10 || wrapped[3] != 1 {continue}
+						asker = Some(from);
+						out.send_to(&wrapped[10..n], SocketAddr::from(([wrapped[4], wrapped[5], wrapped[6], wrapped[7]], u16::from_be_bytes([wrapped[8], wrapped[9]])))).await?;
+					}
+					received = out.recv_from(&mut reply) => {
+						let (n, _) = received?;
+						if let Some(asker) = asker {relay.send_to(&[&[0, 0, 0, 1, 127, 0, 0, 1, 0, 53][..], &reply[..n]].concat(), asker).await?;}
+					}
+					_ = client.read(&mut sink) => return Ok(()),
+				}
+			}
+		}
+		_ => client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await,
+	}
+}
+
+async fn socks5(proxy: Proxy) -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((client, _)) = listener.accept().await else {continue};
+			tokio::spawn(async move {let _ = proxied(client, proxy).await;});
+		}
+	});
+	addr
+}
+
+/// A new directory for one test.
+fn scratch(test: &str) -> PathBuf {
+	let dir = std::env::temp_dir().join(format!("veilway-doctor-{}-{test}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	dir
+}
+
+/// Writes `text` to `name` in `dir` for its owner alone.
+fn private(dir: &Path, name: &str, text: &str) {
+	std::fs::write(dir.join(name), text).unwrap();
+	std::fs::set_permissions(dir.join(name), std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A self-signed certificate and its key as `<name>.crt` and `<name>.key` in `dir`, valid from `from` days to `until` days from now.
+fn certificate(dir: &Path, name: &str, from: i64, until: i64) {
+	let (mut params, key, now) = (rcgen::CertificateParams::new(vec!["doctor.test".to_string(), "*.doctor.test".to_string()]).unwrap(), rcgen::KeyPair::generate().unwrap(), time::OffsetDateTime::now_utc());
+	(params.not_before, params.not_after) = (now + time::Duration::days(from), now + time::Duration::days(until));
+	private(dir, &format!("{name}.crt"), &params.self_signed(&key).unwrap().pem());
+	private(dir, &format!("{name}.key"), &key.serialize_pem());
+}
+
+/// A config with one inbound of the given transports and one exit for each outbound, and the secrets in it.
+fn config(dir: &Path, servers: &[SocketAddr], transports: Value, outbounds: Value) -> Vec<String> {
+	let (node, device, shared) = (veilway_wg::generate_key(), veilway_wg::generate_key(), veilway_wg::generate_key());
+	let exits: Vec<Value> = outbounds.as_array().unwrap().iter().map(|outbound| json!({"tag": format!("via-{}", outbound["tag"].as_str().unwrap()), "backend": {"type": "netstack", "outbound": outbound["tag"]}})).collect();
+	private(dir, "config.json", &json!({
+		"version": 1,
+		"dns": {"servers": servers.iter().map(|server| server.to_string()).collect::<Vec<_>>()},
+		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&node), "address": ["10.7.0.1/24"], "transports": transports}],
+		"outbounds": outbounds,
+		"routing": {"default": exits[0]["tag"], "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}, {"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]},
+		"exits": exits,
+		"users": [{"name": "a", "exits": "all", "devices": [{"name": "phone", "public_key": veilway_wg::encode_key(&veilway_wg::public_key(&device)), "preshared_key": veilway_wg::encode_key(&shared), "addresses": ["10.7.0.2"]}]}],
+	}).to_string());
+	vec![veilway_wg::encode_key(&node), veilway_wg::encode_key(&shared), USER.to_string(), PASSWORD.to_string(), WRONG.to_string()]
+}
+
+/// Runs `veilway doctor` on the config in `dir`: its exit status, what it printed, and what it wrote to standard error.
+async fn doctor(dir: &Path, args: &[&str]) -> (i32, String, String) {
+	let done = tokio::process::Command::new(env!("CARGO_BIN_EXE_veilway")).arg("doctor").arg("--config").arg(dir.join("config.json")).args(["--timeout", "2"]).args(args).output().await.unwrap();
+	(done.status.code().expect("doctor was killed"), String::from_utf8(done.stdout).unwrap(), String::from_utf8(done.stderr).unwrap())
+}
+
+/// The status of the one check of the JSON document whose subject begins with `subject`.
+fn status<'a>(document: &'a Value, check: &str, subject: &str) -> &'a str {
+	let found: Vec<&Value> = document["checks"].as_array().unwrap().iter().filter(|line| line["check"] == check && line["subject"].as_str().unwrap().starts_with(subject)).collect();
+	assert_eq!(found.len(), 1, "{check} {subject} in {document:#}");
+	found[0]["status"].as_str().unwrap()
+}
+
+fn listing(dir: &Path) -> BTreeSet<String> {std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect()}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_fault_has_its_own_line_and_no_secret_is_printed() {
+	let dir = scratch("faults");
+	let (both, udp_only) = (dns(true).await, dns(false).await);
+	let (full, tcp_only, locked, elsewhere) = (socks5(Proxy {udp: true, ..Proxy::default()}).await, socks5(Proxy::default()).await, socks5(Proxy {udp: true, password: Some((USER, PASSWORD)), ..Proxy::default()}).await, socks5(Proxy {udp: true, elsewhere: true, ..Proxy::default()}).await);
+	// Held for the whole test: a port that is taken over UDP, one that is taken over TCP, and one nothing listens on.
+	let (taken_udp, taken_tcp, dead) = (std::net::UdpSocket::bind(free()).unwrap(), std::net::TcpListener::bind(free()).unwrap(), TcpSocket::new_v4().unwrap());
+	dead.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+	for (name, from, until) in [("good", -1, 90), ("soon", -80, 5), ("expired", -400, -30), ("early", 30, 90)] {certificate(&dir, name, from, until)}
+	let listens: Vec<String> = [free(), free(), taken_udp.local_addr().unwrap(), taken_tcp.local_addr().unwrap(), free(), free(), free(), free()].iter().map(|addr| addr.to_string()).collect();
+	let secrets = config(&dir, &[both, udp_only], json!([
+		{"type": "udp", "listen": listens[0]},
+		{"type": "ws", "listen": listens[1], "path": "/wg", "tls": {"cert": "good.crt", "key": "good.key"}},
+		{"type": "udp", "listen": listens[2]},
+		{"type": "ws", "listen": listens[3], "path": "/wg", "tls": {"cert": "expired.crt", "key": "expired.key"}},
+		{"type": "ws", "listen": listens[4], "path": "/wg", "tls": {"cert": "good.crt", "key": "expired.key"}},
+		{"type": "ws", "listen": listens[5], "path": "/wg", "tls": {"cert": "soon.crt", "key": "soon.key"}},
+		{"type": "ws", "listen": listens[6], "path": "/wg", "tls": {"cert": "early.crt", "key": "early.key"}},
+		{"type": "ws", "listen": listens[7], "path": "/wg", "tls": {"cert": "missing.crt", "key": "good.key"}},
+	]), json!([
+		{"tag": "plain", "type": "direct"},
+		{"tag": "full", "type": "socks5", "server": full.to_string()},
+		{"tag": "tcp-only", "type": "socks5", "server": tcp_only.to_string()},
+		{"tag": "locked", "type": "socks5", "server": locked.to_string(), "username": USER, "password": PASSWORD},
+		{"tag": "wrong", "type": "socks5", "server": locked.to_string(), "username": USER, "password": WRONG},
+		{"tag": "open", "type": "socks5", "server": locked.to_string()},
+		{"tag": "elsewhere", "type": "socks5", "server": elsewhere.to_string()},
+		{"tag": "dead", "type": "socks5", "server": dead.local_addr().unwrap().to_string()},
+	]));
+	let before = listing(&dir);
+	let ((code, plain, plain_errors), (json_code, document, json_errors)) = (doctor(&dir, &[]).await, doctor(&dir, &["--json"]).await);
+	assert_eq!((code, json_code, plain_errors.as_str(), json_errors.as_str()), (1, 1, "", ""), "{plain}");
+	assert_eq!(listing(&dir), before, "doctor left something behind or took something away");
+	let document: Value = serde_json::from_str(&document).expect("--json printed something that is no JSON document");
+	for (check, subject, expected) in [
+		("config", dir.join("config.json").to_str().unwrap(), "ok"),
+		("node", "", "ok"),
+		("listen", "inbound home, transports[0], udp", "ok"),
+		("listen", "inbound home, transports[1], tcp", "ok"),
+		("listen", "inbound home, transports[2], udp", "fail"),
+		("listen", "inbound home, transports[3], tcp", "fail"),
+		("certificate", "inbound home, transports[1].tls", "ok"),
+		("certificate", "inbound home, transports[3].tls", "fail"),
+		("certificate", "inbound home, transports[4].tls", "fail"),
+		("certificate", "inbound home, transports[5].tls", "warn"),
+		("certificate", "inbound home, transports[6].tls", "fail"),
+		("certificate", "inbound home, transports[7].tls", "fail"),
+		("dns", "servers[0], udp", "ok"),
+		("dns", "servers[0], tcp", "ok"),
+		("dns", "servers[1], udp", "ok"),
+		("dns", "servers[1], tcp", "warn"),
+		("outbound", "plain, tcp", "ok"),
+		("outbound", "plain, udp", "ok"),
+		("outbound", "full, tcp connect", "ok"),
+		("outbound", "full, handshake", "ok"),
+		("outbound", "full, connect", "ok"),
+		("outbound", "full, udp associate", "ok"),
+		("outbound", "tcp-only, tcp connect", "ok"),
+		("outbound", "tcp-only, handshake", "ok"),
+		("outbound", "tcp-only, connect", "ok"),
+		("outbound", "tcp-only, udp associate", "warn"),
+		("outbound", "locked, tcp connect", "ok"),
+		("outbound", "locked, handshake", "ok"),
+		("outbound", "locked, connect", "ok"),
+		("outbound", "locked, udp associate", "ok"),
+		("outbound", "wrong, tcp connect", "ok"),
+		("outbound", "wrong, handshake", "fail"),
+		("outbound", "wrong, connect", "skipped"),
+		("outbound", "wrong, udp associate", "skipped"),
+		("outbound", "open, handshake", "fail"),
+		("outbound", "open, udp associate", "skipped"),
+		("outbound", "elsewhere, connect", "ok"),
+		("outbound", "elsewhere, udp associate", "warn"),
+		("outbound", "dead, tcp connect", "fail"),
+		("outbound", "dead, handshake", "skipped"),
+		("outbound", "dead, connect", "skipped"),
+		("outbound", "dead, udp associate", "skipped"),
+		("state", "", "ok"),
+		("socket", "", "ok"),
+	] {assert_eq!(status(&document, check, subject), expected, "{check} {subject}\n{plain}")}
+	let message = |check: &str, subject: &str| document["checks"].as_array().unwrap().iter().find(|line| line["check"] == check && line["subject"].as_str().unwrap().starts_with(subject)).unwrap()["message"].as_str().unwrap().to_string();
+	assert!(message("outbound", "tcp-only, udp associate").contains("this upstream has no UDP"), "{plain}");
+	assert!(message("outbound", "elsewhere, udp associate").contains("another host"), "the rule for the address of the relay was not held against the proxy\n{plain}");
+	assert!(message("certificate", "inbound home, transports[1].tls").contains("doctor.test, *.doctor.test"), "{plain}");
+	assert!(message("certificate", "inbound home, transports[3].tls").contains("expired") && message("certificate", "inbound home, transports[6].tls").contains("not valid for another"), "{plain}");
+	// The lines say what the document says, in its order, and the last line counts them.
+	let (checks, lines) = (document["checks"].as_array().unwrap(), plain.lines().collect::<Vec<_>>());
+	assert_eq!(lines.len(), checks.len() + 1, "{plain}");
+	for (line, check) in lines.iter().zip(checks) {
+		let begins = format!("{:<8}{} {}: ", check["status"].as_str().unwrap(), check["check"].as_str().unwrap(), check["subject"].as_str().unwrap());
+		assert!(line.starts_with(&begins), "`{line}` does not begin with `{begins}`");
+	}
+	let count = |word: &str| checks.iter().filter(|check| check["status"] == word).count();
+	assert_eq!(*lines.last().unwrap(), format!("{} checks: {} ok, {} warn, {} fail, {} skipped", checks.len(), count("ok"), count("warn"), count("fail"), count("skipped")));
+	assert_eq!((&document["ok"], &document["warn"], &document["fail"], &document["skipped"]), (&json!(count("ok")), &json!(count("warn")), &json!(count("fail")), &json!(count("skipped"))));
+	// No key and no password, and no address of a proxy or a DNS server either: only tags, field paths and listen addresses.
+	for hidden in secrets.iter().cloned().chain([both, udp_only, full, tcp_only, locked, elsewhere, dead.local_addr().unwrap()].iter().map(|addr| addr.to_string())) {
+		assert!(!plain.contains(&hidden) && !document.to_string().contains(&hidden), "`{hidden}` is in what doctor printed\n{plain}");
+	}
+	// A socket nobody answers on is what a node that was killed leaves behind, and without the control API a taken address is a failure as well.
+	drop(std::os::unix::net::UnixListener::bind(dir.join("veilway.sock")).unwrap());
+	let (_, dead_socket, _) = doctor(&dir, &["--json"]).await;
+	let dead_socket: Value = serde_json::from_str(&dead_socket).unwrap();
+	assert_eq!((status(&dead_socket, "socket", ""), status(&dead_socket, "listen", "inbound home, transports[2], udp")), ("ok", "fail"), "{dead_socket:#}");
+	assert!(dir.join("veilway.sock").exists(), "doctor removed a socket file");
+	let (_, no_api, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	let no_api: Value = serde_json::from_str(&no_api).unwrap();
+	assert_eq!((status(&no_api, "node", "control socket"), status(&no_api, "socket", "control socket"), status(&no_api, "listen", "inbound home, transports[3], tcp")), ("skipped", "skipped", "fail"), "{no_api:#}");
+	drop((taken_udp, taken_tcp));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Stands on a control socket in the place of a node: every request is answered 200 with `body`.
+fn answering(path: &Path, body: String) -> tokio::task::JoinHandle<()> {
+	let listener = tokio::net::UnixListener::bind(path).unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut stream, _)) = listener.accept().await else {continue};
+			let body = body.clone();
+			tokio::spawn(async move {
+				let mut request = [0u8; 1024];
+				let _ = stream.read(&mut request).await;
+				let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
+			});
+		}
+	})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_taken_address_is_excused_only_for_a_node_that_says_it_holds_it() {
+	let dir = scratch("node");
+	let (both, taken_udp, taken_tcp, socket) = (dns(true).await, std::net::UdpSocket::bind(free()).unwrap(), std::net::TcpListener::bind(free()).unwrap(), dir.join("veilway.sock"));
+	let (udp, tcp) = (taken_udp.local_addr().unwrap().to_string(), taken_tcp.local_addr().unwrap().to_string());
+	config(&dir, &[both], json!([{"type": "udp", "listen": udp}, {"type": "ws", "listen": tcp, "path": "/wg"}]), json!([{"tag": "plain", "type": "direct"}]));
+	let running = |transports: Value| json!({"revision": "0".repeat(64), "generation": 1, "document": {"version": 1, "inbounds": [{"tag": "home", "transports": transports}], "exits": [{"tag": "via-plain", "backend": {"type": "netstack", "outbound": "plain"}}]}}).to_string();
+	let seen = |document: &str| {
+		let document: Value = serde_json::from_str(document).unwrap();
+		[("node", ""), ("listen", "inbound home, transports[0], udp"), ("listen", "inbound home, transports[1], tcp"), ("socket", "")].map(|(check, subject)| status(&document, check, subject).to_string())
+	};
+	// Another program on the socket path is no node: one that takes connections and says nothing, and one that answers something else.
+	let silent = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!((code, seen(&document)), (1, ["warn", "fail", "fail", "fail"].map(str::to_string)), "{document}");
+	drop(silent);
+	std::fs::remove_file(&socket).unwrap();
+	let other = answering(&socket, json!({"hello": "world"}).to_string());
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!((code, seen(&document)), (1, ["warn", "fail", "fail", "fail"].map(str::to_string)), "{document}");
+	other.abort();
+	let _ = other.await;
+	std::fs::remove_file(&socket).unwrap();
+	// A node excuses the addresses it holds and no other: here it has the first one, and the second only over UDP, where the config asks for TCP.
+	let partly = answering(&socket, running(json!([{"type": "udp", "listen": udp}, {"type": "udp", "listen": tcp}])));
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!((code, seen(&document)), (1, ["ok", "ok", "fail", "ok"].map(str::to_string)), "{document}");
+	partly.abort();
+	let _ = partly.await;
+	std::fs::remove_file(&socket).unwrap();
+	let node = answering(&socket, running(json!([{"type": "udp", "listen": udp}, {"type": "ws", "listen": tcp, "path": "/wg"}])));
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!((code, seen(&document)), (0, ["ok", "ok", "ok", "ok"].map(str::to_string)), "{document}");
+	node.abort();
+	drop((taken_udp, taken_tcp));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_certificate_is_read_the_way_the_node_serves_it() {
+	let dir = scratch("chains");
+	let both = dns(true).await;
+	for (name, from, until) in [("good", -1, 90), ("expired", -400, -30)] {certificate(&dir, name, from, until)}
+	let text = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+	// The node serves the first CERTIFICATE block of a file, whatever stands before it, and a client checks every certificate it is sent.
+	private(&dir, "keyfirst.crt", &(text("expired.key") + &text("expired.crt")));
+	private(&dir, "chain.crt", &(text("good.crt") + &text("expired.crt")));
+	private(&dir, "badhead.key", &text("good.key").replacen("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY SECRETTEXT", 1));
+	private(&dir, "badbody.crt", &text("good.crt").replacen('\n', "\n!!!!", 1));
+	assert!(text("badhead.key").contains("SECRETTEXT") && text("badbody.crt").contains("!!!!"));
+	let secrets = config(&dir, &[both], json!([
+		{"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "keyfirst.crt", "key": "expired.key"}},
+		{"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "chain.crt", "key": "good.key"}},
+		{"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "good.crt", "key": "badhead.key"}},
+		{"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "badbody.crt", "key": "good.key"}},
+		{"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "good.crt", "key": "good.key"}},
+	]), json!([{"tag": "plain", "type": "direct"}]));
+	let (code, plain, errors) = doctor(&dir, &["--json"]).await;
+	let document: Value = serde_json::from_str(&plain).unwrap();
+	let message = |at: usize| document["checks"].as_array().unwrap().iter().find(|line| line["check"] == "certificate" && line["subject"].as_str().unwrap().starts_with(&format!("inbound home, transports[{at}].tls"))).unwrap()["message"].as_str().unwrap().to_string();
+	for (at, expected) in ["fail", "fail", "fail", "fail", "ok"].into_iter().enumerate() {assert_eq!(status(&document, "certificate", &format!("inbound home, transports[{at}].tls")), expected, "transports[{at}]\n{document:#}")}
+	assert!(message(0).contains("expired 30 days ago") && message(1).contains("certificate 2 of the chain expired 30 days ago"), "{document:#}");
+	assert!(message(2).contains("the key file") && message(3).contains("the certificate file"), "{document:#}");
+	// Nothing of a file is printed, in the words of doctor or in those of the library that read it.
+	for leaked in ["illegal", "base64", "Invalid", "83, 69, 67", "[45", "SECRETTEXT"].into_iter().map(str::to_string).chain(secrets) {assert!(!plain.contains(&leaked) && !errors.contains(&leaked), "`{leaked}` is in what doctor printed\n{plain}")}
+	assert_eq!(code, 1);
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_others_can_read_fails_as_it_does_for_run_and_a_full_standard_output_changes_no_status() {
+	let dir = scratch("readable");
+	let both = dns(true).await;
+	config(&dir, &[both], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let (code, document, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	assert_eq!((code, status(&serde_json::from_str(&document).unwrap(), "config", dir.join("config.json").to_str().unwrap())), (0, "ok"), "{document}");
+	std::fs::set_permissions(dir.join("config.json"), std::fs::Permissions::from_mode(0o644)).unwrap();
+	let (code, document, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	let parsed: Value = serde_json::from_str(&document).unwrap();
+	assert_eq!((code, &parsed["fail"]), (1, &json!(1)), "{document}");
+	assert!(parsed["checks"].as_array().unwrap().iter().any(|line| line["check"] == "config" && line["status"] == "fail" && line["message"].as_str().unwrap().contains("`veilway run` would not start")), "{document}");
+	let (code, document, errors) = doctor(&dir, &["--json", "--no-api", "--allow-readable-config"]).await;
+	assert_eq!((code, errors.as_str(), &serde_json::from_str::<Value>(&document).unwrap()["fail"]), (0, "", &json!(0)), "{document}");
+	// Standard output that takes nothing: the status is still the one the checks stand for, and nothing is said of a panic.
+	#[cfg(target_os = "linux")]
+	for (args, expected) in [(&["--no-api"][..], 1), (&["--no-api", "--allow-readable-config"][..], 0), (&["--no-api", "--allow-readable-config", "--json"][..], 0)] {
+		let done = tokio::process::Command::new(env!("CARGO_BIN_EXE_veilway")).arg("doctor").arg("--config").arg(dir.join("config.json")).args(args).stdout(std::fs::File::options().write(true).open("/dev/full").unwrap()).output().await.unwrap();
+		assert_eq!((done.status.code(), String::from_utf8_lossy(&done.stderr).as_ref()), (Some(expected), ""), "{args:?}");
+	}
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Takes the whole time doctor gives its network checks, and a little more than a minute before it had one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_proxies_in_numbers_are_cut_off_well_under_a_minute() {
+	let dir = scratch("slow");
+	// A proxy that uses up most of every wait: it greets after 6 s, gives a UDP relay after 2 more, and then nothing answers on the relay or on a CONNECT. With --timeout 10 that is 24 s for one outbound.
+	let (both, listener, relay) = (dns(true).await, TcpListener::bind("127.0.0.1:0").await.unwrap(), UdpSocket::bind("127.0.0.1:0").await.unwrap());
+	let (proxy, port) = (listener.local_addr().unwrap(), relay.local_addr().unwrap().port().to_be_bytes());
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut client, _)) = listener.accept().await else {continue};
+			tokio::spawn(async move {
+				let (mut head, mut request, mut sink) = ([0u8; 2], [0u8; 10], [0u8; 64]);
+				if client.read_exact(&mut head).await.is_err() || client.read_exact(&mut sink[..usize::from(head[1]).min(64)]).await.is_err() {return}
+				tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+				if client.write_all(&[5, 0]).await.is_err() || client.read_exact(&mut request).await.is_err() {return}
+				if request[1] == 3 {
+					tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+					let _ = client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, port[0], port[1]]).await;
+				}
+				while client.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+			});
+		}
+	});
+	config(&dir, &[both], json!([{"type": "udp", "listen": free().to_string()}]), Value::Array((0..200).map(|at| json!({"tag": format!("slow-{at:03}"), "type": "socks5", "server": proxy.to_string()})).collect()));
+	let started = std::time::Instant::now();
+	let done = tokio::process::Command::new(env!("CARGO_BIN_EXE_veilway")).arg("doctor").arg("--config").arg(dir.join("config.json")).args(["--timeout", "10", "--json"]).output().await.unwrap();
+	let (took, document): (_, Value) = (started.elapsed(), serde_json::from_slice(&done.stdout).expect("--json printed something that is no JSON document"));
+	assert!(took < std::time::Duration::from_secs(55), "doctor took {took:?}");
+	let cut = document["checks"].as_array().unwrap().iter().filter(|line| line["check"] == "outbound" && line["status"] == "skipped" && line["message"].as_str().unwrap().contains("out of time")).count();
+	assert!(cut > 0 && cut < 200, "{cut} outbounds were cut off\n{document:#}");
+	assert_eq!((done.status.code(), status(&document, "outbound", "slow-000, handshake"), status(&document, "outbound", "slow-000, udp associate"), status(&document, "dns", "servers[0], udp")), (Some(1), "ok", "fail", "ok"), "{document:#}");
+	drop(relay);
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_has_everything_ends_with_status_zero() {
+	let dir = scratch("healthy");
+	let (both, proxy) = (dns(true).await, socks5(Proxy {udp: true, password: Some((USER, PASSWORD)), ..Proxy::default()}).await);
+	certificate(&dir, "good", -1, 90);
+	let secrets = config(&dir, &[both], json!([{"type": "udp", "listen": free().to_string()}, {"type": "ws", "listen": free().to_string(), "path": "/wg", "tls": {"cert": "good.crt", "key": "good.key"}}]), json!([
+		{"tag": "proxy", "type": "socks5", "server": proxy.to_string(), "username": USER, "password": PASSWORD},
+		{"tag": "plain", "type": "direct", "bind": host().to_string()},
+	]));
+	private(&dir, "veilway-state.json", r#"{"version":1,"users":{"a":{"used_bytes":7,"period_start":0,"up_bytes":4,"up_packets":1,"down_bytes":3,"down_packets":1}}}"#);
+	let before = listing(&dir);
+	let ((code, plain, errors), (json_code, document, _)) = (doctor(&dir, &[]).await, doctor(&dir, &["--json"]).await);
+	let document: Value = serde_json::from_str(&document).unwrap();
+	// One warning comes from the config itself and has nothing to do with the host: a test can only put its DNS server on a private address, which the rule against private networks refuses.
+	assert_eq!((code, json_code, errors.as_str(), &document["fail"], &document["warn"], &document["skipped"]), (0, 0, "", &json!(0), &json!(1), &json!(0)), "{plain}");
+	assert!(plain.lines().all(|line| line.starts_with("ok      ") || line.starts_with("warn    config routing.rules[1]: ") || line.ends_with("1 warn, 0 fail, 0 skipped")), "{plain}");
+	assert!(plain.contains("it is a state file of 1 users"), "{plain}");
+	assert_eq!(listing(&dir), before, "doctor left something behind or took something away");
+	for secret in &secrets {assert!(!plain.contains(secret) && !document.to_string().contains(secret), "`{secret}` is in what doctor printed")}
+	// A state file the node would move aside is a failure, and doctor leaves it where it is.
+	std::fs::write(dir.join("veilway-state.json"), "no state file").unwrap();
+	let (code, broken, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!((code, status(&serde_json::from_str(&broken).unwrap(), "state", ""), std::fs::read_to_string(dir.join("veilway-state.json")).unwrap().as_str(), listing(&dir)), (1, "fail", "no state file", before));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dns_server_that_is_gone_fails_what_asks_it_within_the_timeout() {
+	let dir = scratch("silent");
+	// A UDP port that takes every query and answers none, with a TCP port that takes every connection and says nothing.
+	let quiet = TcpListener::bind(SocketAddr::new(host(), 0)).await.unwrap();
+	let (silent, hush) = (quiet.local_addr().unwrap(), UdpSocket::bind(quiet.local_addr().unwrap()).await.unwrap());
+	let proxy = socks5(Proxy {udp: true, ..Proxy::default()}).await;
+	config(&dir, &[silent], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}, {"tag": "proxy", "type": "socks5", "server": proxy.to_string()}]));
+	let started = std::time::Instant::now();
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	let document: Value = serde_json::from_str(&document).unwrap();
+	assert!(started.elapsed() < std::time::Duration::from_secs(8), "doctor took {:?} with a timeout of 2 s", started.elapsed());
+	for (check, subject, expected) in [("dns", "servers[0], udp", "fail"), ("dns", "servers[0], tcp", "warn"), ("outbound", "plain, tcp", "ok"), ("outbound", "plain, udp", "fail"), ("outbound", "proxy, handshake", "ok"), ("outbound", "proxy, connect", "fail"), ("outbound", "proxy, udp associate", "fail")] {
+		assert_eq!(status(&document, check, subject), expected, "{check} {subject}\n{document:#}");
+	}
+	assert_eq!(code, 1);
+	drop((quiet, hush));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn a_config_that_cannot_be_read_ends_with_status_two_and_one_that_is_wrong_with_one() {
+	let dir = scratch("unreadable");
+	let (code, plain, _) = doctor(&dir, &[]).await;
+	assert!(code == 2 && plain.starts_with("fail    config ") && plain.contains("cannot read the config file"), "{code}: {plain}");
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	let document: Value = serde_json::from_str(&document).expect("--json printed something that is no JSON document");
+	assert_eq!((code, &document["fail"], &document["skipped"]), (2, &json!(1), &json!(1)), "{document:#}");
+	// A document that parses and names an exit it does not define: every error is a line, and nothing it names is tried.
+	let secrets = config(&dir, &["192.0.2.53:53".parse().unwrap()], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let wrong = std::fs::read_to_string(dir.join("config.json")).unwrap().replace(r#""default":"via-plain""#, r#""default":"nowhere""#);
+	assert!(wrong.contains("nowhere"));
+	private(&dir, "config.json", &wrong);
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	let parsed: Value = serde_json::from_str(&document).unwrap();
+	assert_eq!((code, status(&parsed, "config", "routing.default"), status(&parsed, "checks", "")), (1, "fail", "skipped"), "{parsed:#}");
+	assert!(parsed["checks"].as_array().unwrap().iter().all(|line| line["check"] == "config" || line["check"] == "checks"), "{parsed:#}");
+	for secret in &secrets {assert!(!document.contains(secret), "`{secret}` is in what doctor printed")}
+	std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -37,7 +37,7 @@ impl Running {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::Running;
+pub use linux::{survey, Running, Survey};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -46,7 +46,8 @@ mod linux {
 	use std::fs::{self, File, OpenOptions};
 	use std::io::{self, Read, Write};
 	use std::os::fd::AsRawFd;
-	use std::os::unix::fs::OpenOptionsExt;
+	use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+	use std::path::Path;
 	use std::process::{Command, Stdio};
 	use tokio::io::unix::AsyncFd;
 	use tokio::io::Interest;
@@ -81,6 +82,36 @@ mod linux {
 		// The command is shown without its networks and numbers, which are values of the config. Its place in the config is clear from the exit the error is reported for.
 		ensure!(output.status.success(), "`{program} {}` failed: {}", args.iter().filter(|arg| arg.parse::<IpNet>().is_err() && arg.parse::<u32>().is_err()).copied().collect::<Vec<_>>().join(" "), String::from_utf8_lossy(&output.stderr).trim());
 		Ok(())
+	}
+
+	/// What `Running::start` needs of the host, as the host stands right now.
+	#[derive(Clone, Debug, PartialEq, Eq)]
+	pub struct Survey {
+		/// Whether this process holds `CAP_NET_ADMIN`. None when the kernel does not say.
+		pub net_admin: Option<bool>,
+		/// Why `/dev/net/tun` cannot be opened, when it cannot.
+		pub tun: Result<(), io::ErrorKind>,
+		/// Whether `ip` and `nft` are programs on the `PATH`.
+		pub ip: bool,
+		pub nft: bool,
+		/// For IPv4 and then IPv6: whether the host forwards, and whether this process may change that. None when the switch cannot be read.
+		pub forwarding: [Option<(bool, bool)>; 2],
+		/// Whether an interface of the name already exists.
+		pub taken: bool,
+	}
+
+	/// Looks at everything `Running::start` would use or change for an interface named `interface`, and changes none of it: a device file opened without the request that makes an interface makes none, and a switch opened for writing and never written keeps its value.
+	pub fn survey(interface: &str) -> Survey {
+		let found = |program: &str| std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| fs::metadata(dir.join(program)).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)));
+		Survey {
+			// `CAP_NET_ADMIN` is bit 12 of the effective set.
+			net_admin: fs::read_to_string("/proc/self/status").ok().and_then(|status| status.lines().find_map(|line| line.strip_prefix("CapEff:")).and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())).map(|held| held & 1 << 12 != 0),
+			tun: OpenOptions::new().read(true).write(true).custom_flags(libc::O_NONBLOCK).open("/dev/net/tun").map(drop).map_err(|e| e.kind()),
+			ip: found("ip"),
+			nft: found("nft"),
+			forwarding: [FORWARD_V4, FORWARD_V6].map(|path| fs::read_to_string(path).ok().map(|value| (value.trim() == "1", OpenOptions::new().write(true).open(path).is_ok()))),
+			taken: Path::new("/sys/class/net").join(interface).exists(),
+		}
 	}
 
 	impl Running {

@@ -83,7 +83,7 @@ pub struct Staged {
 
 /// A bound socket that is not listening yet. IPv6 sockets are always IPv6-only, so a wildcard address of one family never takes the port of the other.
 /// `released` says the node itself gave this address back in its last commit. The task that held the old socket ends a moment after it is told to, so such an address is tried again for a while when it is still taken.
-async fn bind(addr: SocketAddr, kind: Type, released: bool) -> io::Result<Socket> {
+pub(super) async fn bind(addr: SocketAddr, kind: Type, released: bool) -> io::Result<Socket> {
 	let mut tries = if released {REBIND_TRIES} else {1};
 	loop {
 		let bound = Socket::new(Domain::for_address(addr), kind, None).and_then(|socket| {
