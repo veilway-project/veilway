@@ -116,6 +116,8 @@ chmod 600 config.json
 
 The server logs its public key on startup. `RUST_LOG=debug` gives more detail.
 
+What each user has used is kept in `veilway-state.json` next to the config file, so quotas hold across restarts. `--state <file>` puts it somewhere else.
+
 ### 5. Connect a peer
 
 With any WireGuard app, over UDP:

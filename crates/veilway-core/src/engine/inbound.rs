@@ -62,7 +62,7 @@ impl Shared {
 			peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(Weak::upgrade))
 		};
 		let Some((endpoint, socket)) = route else {return};
-		plan.users[device.user].state.traffic.down(packet.len());
+		self.spend(&plan.users[device.user], false, packet.len());
 		inbound.traffic.down(packet.len());
 		for datagram in &out {let _ = socket.send_to(datagram, endpoint).await;}
 	}
@@ -146,7 +146,7 @@ impl Shared {
 		// A device this plan does not know was cut off between its packet being decrypted and now.
 		let Some(&device) = plan.by_key.get(&peer) else {return self.count(Reason::Stale)};
 		let (from, user) = (Holder {device, inbound: at}, plan.devices[device].user);
-		plan.users[user].state.traffic.up(raw.len());
+		self.spend(&plan.users[user], true, raw.len());
 		plan.inbounds[at].traffic.up(raw.len());
 		let Some(packet) = netstack::parse(&raw) else {return self.count(Reason::Unparsable)};
 		if packet.fragment {return self.count(Reason::Fragment)}
@@ -176,7 +176,6 @@ impl Shared {
 			tracing::debug!("inbound {}: user {}: new flow, protocol {} to {}: {decision:?}", plan.inbounds[at].tag, plan.users[user].name, packet.protocol, plan.show(SocketAddr::new(packet.dst, packet.dport)));
 			(id, decision)
 		};
-		if let Decision::Exit {exit, ..} = decision {plan.exits[exit].traffic.up(raw.len())}
 		self.carry(plan, from, raw, &packet, key, id, decision).await
 	}
 
@@ -203,14 +202,12 @@ impl Shared {
 			}
 			Decision::Dns => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)},
 			Decision::Exit {exit, by} => {
-				// What a `via` hands on counts for the exit that carries it as well as for the one the rules chose.
-				let carrier = if let By::Via(target) = by {
-					plan.exits[target].traffic.up(raw.len());
-					target
-				} else {exit};
+				// An exit counts a packet where the packet is handed to it, so one that is dropped on the way counts for none, and only the exit that carries it counts it: what a `via` hands on is the traffic of the exit it was handed to.
+				let (carrier, len) = (if let By::Via(target) = by {target} else {exit}, raw.len());
 				match (by, &plan.exits[carrier].backend) {
 					(By::Local, _) => match netstack::echo_reply(&raw, packet) {
 						Some(reply) => {
+							plan.exits[exit].traffic.up(len);
 							plan.exits[exit].traffic.down(reply.len());
 							self.send(plan, from, &reply).await;
 						}
@@ -222,11 +219,12 @@ impl Shared {
 						let ping = (packet.src, packet.dst, u16::from_be_bytes([message[4], message[5]]));
 						let (device, user, mut pings) = (plan.devices[from.device].public_key, plan.users[plan.devices[from.device].user].name.as_str(), self.pings.lock().unwrap_or_else(|e| e.into_inner()));
 						match pings.get(&ping) {
-							Some((.., to)) => if to.try_send(message.to_vec()).is_err() {self.count(Reason::QueueFull)},
+							Some((.., to)) => if to.try_send(message.to_vec()).is_ok() {plan.exits[exit].traffic.up(len)} else {self.count(Reason::QueueFull)},
 							None if pings.len() >= icmp::MAX_PINGS || pings.values().filter(|(_, of, _)| **of == *user).count() >= icmp::MAX_PINGS_PER_USER || pings.values().filter(|(of, ..)| *of == device).count() >= icmp::MAX_PINGS_PER_DEVICE => self.count(Reason::FlowTableFull),
 							None => {
 								let (to, requests) = mpsc::channel(icmp::PING_QUEUE);
 								let _ = to.try_send(message.to_vec());
+								plan.exits[exit].traffic.up(len);
 								pings.insert(ping, (device, Arc::from(user), to));
 								tokio::spawn(icmp::ping(self.clone(), plan.clone(), exit, from, ping, requests));
 							}
@@ -240,9 +238,10 @@ impl Shared {
 							return self.icmp_error(plan, from, &raw, packet, Kind::TooBig(port.mtu)).await;
 						}
 						if packet.protocol == Protocol::TCP && raw.get(packet.upper + TCP_FLAGS).is_some_and(|flags| flags & FIN_OR_RST != 0) {self.flows.track(&key, id, FLOW_IDLE, true)}
-						if port.to.try_send(raw).is_err() {self.count(Reason::QueueFull)}
+						if port.to.try_send(raw).is_ok() {plan.exits[carrier].traffic.up(len)} else {self.count(Reason::QueueFull)}
 					}
-					_ if transport => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)},
+					// A TCP segment is the exit's once the exit's stack has it. A datagram is counted by the handler of its flow, see `flows::run`: only there is it known whether an outbound took it, and which.
+					_ if transport => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)} else if packet.protocol == Protocol::TCP {plan.exits[carrier].traffic.up(len)},
 					_ => self.count(Reason::Unsupported),
 				}
 			}
@@ -260,8 +259,8 @@ impl Shared {
 		// Destination unreachable, time exceeded and parameter problem, and for ICMPv6 packet too big as well.
 		let error = matches!((packet.protocol, packet.icmp), (Protocol::ICMP, Some((3 | 11 | 12, _))) | (Protocol::ICMPV6, Some((1..=4, _))));
 		let key = if error {raw.get(packet.upper + 8..).and_then(netstack::quoted).filter(|quoted| quoted.src == packet.dst && !quoted.fragment).map(|quoted| Key::of(&quoted))} else {Key::of(&packet).reversed()};
-		let (key, id, chosen, by) = match key.and_then(|key| self.flows.get(&key, plan.generation, None).map(|flow| (key, flow))) {
-			Some((key, (id, Decision::Exit {exit: chosen, by}))) if (chosen == exit && by == By::Backend) || by == By::Via(exit) => (key, id, chosen, by),
+		let (key, id, by) = match key.and_then(|key| self.flows.get(&key, plan.generation, None).map(|flow| (key, flow))) {
+			Some((key, (id, Decision::Exit {exit: chosen, by}))) if (chosen == exit && by == By::Backend) || by == By::Via(exit) => (key, id, by),
 			_ => return self.count(Reason::NoFlow),
 		};
 		// The interface has the smallest MTU of all inbounds, so this only happens when the host was set up otherwise. The sender is out on the network and gets no answer from here.
@@ -275,8 +274,8 @@ impl Shared {
 			};
 			self.flows.track(&key, id, idle, closing);
 		}
+		// For this exit alone, which carried it, whichever exit the rules chose for the flow.
 		plan.exits[exit].traffic.down(raw.len());
-		if chosen != exit {plan.exits[chosen].traffic.down(raw.len())}
 		self.send(plan, to, &raw).await
 	}
 }
@@ -324,10 +323,8 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 					shared.count(Reason::Stale);
 					continue;
 				};
-				if let Decision::Exit {exit, by} = decision {
-					plan.exits[exit].traffic.down(raw.len());
-					if let By::Via(target) = by {plan.exits[target].traffic.down(raw.len())}
-				}
+				// A datagram was counted when the handler of its flow took it from an outbound. A TCP flow is always carried by the exit the rules chose.
+				if let (Protocol::TCP, Decision::Exit {exit, ..}) = (packet.protocol, decision) {plan.exits[exit].traffic.down(raw.len())}
 				shared.send(&plan, to, &raw).await;
 			}
 		}

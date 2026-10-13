@@ -1,6 +1,7 @@
 target/
 *.pem
 config.json
+veilway-state.json*
 apps/desktop/src-tauri/resources/wintun.dll
 apps/desktop/src-tauri/gen/
 .DS_Store

@@ -5,6 +5,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use etherparse::{Icmpv4Type, IpNumber, NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use veilway_core::config::{Applied, ApplyError, Config, Revision};
 use veilway_core::engine::dns::response;
 use veilway_core::engine::icmp::{MAX_PINGS_PER_DEVICE, MAX_PINGS_PER_USER};
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
-use veilway_core::{DnsTotals, Engine, Options, Reason, Totals};
+use veilway_core::{Denied, DnsTotals, Engine, Options, Reason, Totals, Usage};
 
 const GATEWAY:[u8;4]=[10, 7, 0, 1];
 const PEER_A:[u8;4]=[10, 7, 0, 2];
@@ -1938,6 +1939,7 @@ async fn a_rejected_udp_flow_stays_rejected(){
 	for round in 0..3u8{refused_with(&mut a, &ip_udp(PEER_A, PUBLIC, 43250, 9999, &[round;8]), PORT_UNREACHABLE).await}
 	assert_eq!((hits.load(Ordering::SeqCst), node.engine.dropped(Reason::Unsupported), node.engine.flows()), (0, 3, 1));
 	assert_eq!(seen.lock().unwrap().iter().filter(|s| s.starts_with("associate")).count(), 1, "the proxy was asked again for a flow that was already decided");
+	assert_eq!(node.engine.exit("main"), Some(Totals::default()), "datagrams the proxy never took were counted for its exit");
 }
 
 /// `unsupported.udp: {"via": ...}`: when the proxy of the exit refuses the association, the flow is handed to another
@@ -1970,7 +1972,8 @@ async fn udp_goes_via_another_exit_when_the_proxy_has_none(){
 	assert_eq!(seen_first.lock().unwrap().as_slice(), ["associate 0.0.0.0:0"]);
 	assert_eq!(seen_second.lock().unwrap().iter().filter(|s| *s=="udp 93.184.216.34:9999").count(), 3);
 	let (main, onward)=(node.engine.exit("main").unwrap(), node.engine.exit("second").unwrap());
-	assert!(main.up_packets==3 && main.down_packets==3 && onward.up_packets>=2 && onward.down_packets==3, "main {main:?}, second {onward:?}");
+	// The exit that carries the flow counts it, 32 bytes up and 37 down for each round, and the exit the rules chose carried nothing.
+	assert_eq!((main, onward), (Totals::default(), Totals{up_packets:3, up_bytes:96, down_packets:3, down_bytes:111}));
 	// TCP never takes the detour.
 	handshake(&mut a, PUBLIC, 43301, 80).await;
 	eventually("tcp did not go through the proxy of its own exit", || seen_first.lock().unwrap().contains(&"93.184.216.34:80".to_string())).await;
@@ -2642,4 +2645,403 @@ async fn a_reload_of_the_file_that_runs_leaves_the_plan_in_force(){
 	std::fs::remove_file(&path).unwrap();
 	assert!(Arc::ptr_eq(&plan, &node.engine.plan()), "a reload of the bytes that already run put another plan in force");
 	assert_eq!((flow.say(&mut a, b"still here").await, node.engine.flows(), closed.load(Ordering::SeqCst), node.engine.dropped(Reason::Stale)), (Answer::Accepted, 1, 0, stale));
+}
+
+/// What the node counts for one user right now.
+fn usage(node:&Node, name:&str)->Usage{node.engine.counters().users.into_iter().find(|user| user.name==name).unwrap_or_else(|| panic!("the node has no user {name}"))}
+
+/// The payload of the next UDP datagram a client receives for its port `sport` within three seconds. Other packets are passed over.
+async fn datagram(client:&mut Client, sport:u16)->Option<Vec<u8>>{
+	let deadline=Instant::now()+Duration::from_secs(3);
+	while let Some(left)=deadline.checked_duration_since(Instant::now()){
+		let packet=client.recv_ip(left).await?;
+		let Ok(parsed)=PacketHeaders::from_ip_slice(&packet) else{continue};
+		let (Some(TransportHeader::Udp(udp)), PayloadSlice::Udp(payload))=(parsed.transport, parsed.payload) else{continue};
+		if udp.destination_port==sport{return Some(payload.to_vec())}
+	}
+	None
+}
+
+/// The path of a state file in a new directory of its own, which the test removes when it is done.
+fn state_file(test:&str)->PathBuf{
+	let dir=std::env::temp_dir().join(format!("veilway-e2e-state-{}-{test}", std::process::id()));
+	let _=std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	dir.join("state.json")
+}
+
+/// What a state file holds for one user. None while there is no file, or none that can be read, or no such user in it.
+fn saved(path:&Path, name:&str)->Option<Value>{
+	let document:Value=serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+	assert_eq!(document["version"], 1);
+	document["users"].get(name).cloned()
+}
+
+/// The entry a state file has for a user the node counts `usage` for.
+fn entry(usage:&Usage)->Value{
+	json!({"used_bytes":usage.used_bytes, "period_start":usage.period_start, "up_bytes":usage.traffic.up_bytes, "up_packets":usage.traffic.up_packets, "down_bytes":usage.traffic.down_bytes, "down_packets":usage.traffic.down_packets})
+}
+
+/// User `b` may use 1200 bytes. The packet that takes the count across that cuts them off the way a reload that disables them does: within a second their flow is reset and its upstream connection closed,
+/// after that the device hears nothing and cannot shake hands, and user `a` notices none of it.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_user_who_crosses_the_quota_is_cut_off_within_a_second(){
+	let Live{node, closed, ..}=live(false, Options::new(""), |setup| setup.doc["users"][1]["quota_bytes"]=json!(1200)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, 44000, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, 44001, 80).await;
+	assert_eq!(theirs.say(&mut b, b"in time").await, Answer::Accepted);
+	let before=usage(&node, "b");
+	assert!(before.used_bytes>0 && before.used_bytes<1200 && before.quota_bytes==Some(1200) && before.denied.is_none(), "{before:?}");
+	// One datagram of 1028 bytes takes the count across the quota. The TCP flow is quiet by now, so the reset it gets is the cut-off and nothing else.
+	let started=Instant::now();
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44002, 9999, &[b'x';1000])).await;
+	assert!(theirs.reset(&mut b, Duration::from_secs(1)).await, "the flow of a user who ran out of quota was not reset within a second");
+	eventually("the upstream connection of a user who ran out of quota stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert!(started.elapsed()<Duration::from_secs(1), "cutting a user off for their quota took {:?}", started.elapsed());
+	assert_eq!(theirs.say(&mut b, b"anyone").await, Answer::Silence, "a device that was cut off was still answered");
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_secs(1)).await.is_none(), "a user who ran out of quota completed a handshake");
+	let after=usage(&node, "b");
+	assert!(after.used_bytes>=1200 && after.denied==Some(Denied::Quota), "{after:?}");
+	assert_eq!((ours.say(&mut a, b"still here").await, usage(&node, "a").denied, node.engine.flows(), closed.load(Ordering::SeqCst)), (Answer::Accepted, None, 1, 1), "cutting off one user disturbed another");
+}
+
+/// A quota counts every inner IP byte in both directions: what the node refuses and what it answers itself as much as what it carries. Here nothing is carried anywhere and the quota is spent all the same.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn traffic_that_is_refused_or_answered_by_the_node_counts_against_the_quota(){
+	let Live{node, ..}=live(false, Options::new(""), |setup| setup.doc["users"][0]["quota_bytes"]=json!(250)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(usage(&node, "a").used_bytes, 0);
+	// A SYN to another user, which a rule rejects: 40 bytes up, and the 40 bytes of the reset down.
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44010, 80).await, Answer::Reset);
+	assert_eq!(usage(&node, "a").used_bytes, 80);
+	// A ping the node answers itself: 36 bytes each way.
+	a.send_ip(&echo_request(PEER_A, PUBLIC, 9, 1, b"abcdefgh")).await;
+	a.recv_ip(Duration::from_secs(3)).await.expect("no echo reply");
+	assert_eq!(usage(&node, "a").used_bytes, 152);
+	// A datagram to the gateway, which the gate refuses: 32 bytes up, and down the 60 bytes of an ICMP error that quotes it.
+	refused_with(&mut a, &ip_udp(PEER_A, GATEWAY, 44011, 9999, b"ping"), PROHIBITED).await;
+	let spent=usage(&node, "a");
+	assert_eq!((spent.used_bytes, spent.traffic.up_bytes+spent.traffic.down_bytes, spent.denied), (244, 244, None));
+	a.send_ip(&ip_tcp(PEER_A, PEER_B, syn(44012, 80), &[])).await;
+	eventually("a user who spent their quota on refused traffic was not cut off", || usage(&node, "a").denied==Some(Denied::Quota)).await;
+	assert!(Client::try_connect(node.keys[0], node.public, node.addr, Duration::from_secs(1)).await.is_none(), "a user who ran out of quota completed a handshake");
+}
+
+/// The node's clock is the test's: it stands at noon on Wednesday 14 January 2026 and moves only when the test moves it. User `b` spends their quota and is let in again when the next period starts,
+/// at 00:00 UTC of the next day, of the next Monday or of the 1st of the next month, and not one second before. A clock that steps back starts no count over and lets nobody in.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_quota_period_that_starts_over_lets_the_user_in_again_and_a_clock_that_steps_back_does_not(){
+	const NOON:i64=1768392000;
+	static SKEW:AtomicI64=AtomicI64::new(0);
+	fn clock()->OffsetDateTime{OffsetDateTime::from_unix_timestamp(NOON+SKEW.load(Ordering::SeqCst)).unwrap()}
+	let stamp=|at:&str| OffsetDateTime::parse(at, &Rfc3339).unwrap().unix_timestamp();
+	assert_eq!(NOON, stamp("2026-01-14T12:00:00Z"));
+	for (round, (period, began, next)) in [("daily", "2026-01-14T00:00:00Z", "2026-01-15T00:00:00Z"), ("weekly", "2026-01-12T00:00:00Z", "2026-01-19T00:00:00Z"), ("monthly", "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z")].into_iter().enumerate(){
+		let (began, next, sport)=(stamp(began), stamp(next), 44020+10*round as u16);
+		SKEW.store(0, Ordering::SeqCst);
+		let Live{node, ..}=live(false, Options{now:clock, ..Options::new("")}, |setup|{
+			setup.doc["users"][1]["quota_bytes"]=json!(600);
+			setup.doc["users"][1]["quota_period"]=json!(period);
+		}).await;
+		assert_eq!((usage(&node, "b").period_start, usage(&node, "a").period_start), (began, 0), "{period}");
+		let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+		b.send_ip(&ip_udp(PEER_B, PUBLIC, sport, 9999, &[b'x';700])).await;
+		eventually("a user who spent their quota was not cut off", || usage(&node, "b").denied==Some(Denied::Quota)).await;
+		// Whatever was on its way to the device when it was cut off has been counted by now.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		let spent=usage(&node, "b");
+		assert!(spent.used_bytes>=728, "{period}: {spent:?}");
+		// Forty days back, which is before the period began, and then one second before the next period begins.
+		for skew in [-40*86400, next-1-NOON]{
+			SKEW.store(skew, Ordering::SeqCst);
+			tokio::time::sleep(Duration::from_millis(700)).await;
+			assert_eq!(usage(&node, "b"), spent, "{period}: the clock moved by {skew}s and the count or the user's standing changed");
+			assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(500)).await.is_none(), "{period}: the clock moved by {skew}s and a user without quota completed a handshake");
+		}
+		SKEW.store(next-NOON, Ordering::SeqCst);
+		eventually("a user was not let in again when their quota period started over", || usage(&node, "b").denied.is_none()).await;
+		let fresh=usage(&node, "b");
+		assert_eq!((fresh.used_bytes, fresh.period_start, fresh.traffic), (0, next, spent.traffic), "{period}");
+		let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+		b.send_ip(&ip_udp(PEER_B, PUBLIC, sport+1, 9999, b"again")).await;
+		assert_eq!(datagram(&mut b, sport+1).await.as_deref(), Some(&b"echo:again"[..]), "{period}");
+		// 33 bytes up and 38 down. The clock goes back into the period before, where the count started over once already.
+		assert_eq!(usage(&node, "b").used_bytes, 71, "{period}");
+		SKEW.store(0, Ordering::SeqCst);
+		tokio::time::sleep(Duration::from_millis(700)).await;
+		let back=usage(&node, "b");
+		assert_eq!((back.used_bytes, back.period_start, back.denied), (71, next, None), "{period}: a clock that stepped back changed the count");
+	}
+}
+
+/// A user who is out of quota stays out until the operator gives them more. A reload that raises the quota above what they used lets them in with the count they had,
+/// one that lowers it under the count cuts them off within a second, and one that takes the quota away lets them in again.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_that_raises_the_quota_lets_the_user_in_and_one_that_lowers_it_under_their_usage_cuts_them_off(){
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |setup| setup.doc["users"][1]["quota_bytes"]=json!(600)).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44060, 9999, &[b'x';700])).await;
+	eventually("a user who spent their quota was not cut off", || usage(&node, "b").denied==Some(Denied::Quota)).await;
+	// A reload that leaves the quota alone leaves the user out.
+	let key=veilway_wg::generate_key();
+	doc["users"].as_array_mut().unwrap().push(user("c", &key, "10.7.0.9"));
+	reload(&node, &doc).await.unwrap();
+	Client::connect(key, node.public, node.addr).await;
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "a reload that did not touch the quota let a user without quota in");
+	doc["users"][1]["quota_bytes"]=json!(100000);
+	reload(&node, &doc).await.unwrap();
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut b, PEER_B, PUBLIC, 44061, 80).await;
+	assert_eq!(flow.say(&mut b, b"let in").await, Answer::Accepted);
+	let raised=usage(&node, "b");
+	assert!(raised.used_bytes>728 && raised.quota_bytes==Some(100000) && raised.denied.is_none(), "the count started over with the new quota: {raised:?}");
+	doc["users"][1]["quota_bytes"]=json!(700);
+	let started=Instant::now();
+	reload(&node, &doc).await.unwrap();
+	assert!(flow.reset(&mut b, Duration::from_secs(1)).await, "the flow of a user whose quota was lowered under their usage was not reset within a second");
+	eventually("the upstream connection of that user stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert!(started.elapsed()<Duration::from_secs(1), "cutting the user off took {:?}", started.elapsed());
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "a user whose quota was lowered under their usage completed a handshake");
+	assert_eq!(usage(&node, "b").denied, Some(Denied::Quota));
+	doc["users"][1].as_object_mut().unwrap().remove("quota_bytes");
+	reload(&node, &doc).await.unwrap();
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	Flow::open(&mut b, PEER_B, PUBLIC, 44062, 80).await;
+	let free=usage(&node, "b");
+	assert!(free.used_bytes>raised.used_bytes && free.quota_bytes.is_none() && free.denied.is_none(), "{free:?}");
+}
+
+/// A reload that fails in its prepare step leaves every count as it was. Here the document gives user `b`, who is out of quota, a quota period that began after their count did, and an inbound on a port somebody else has:
+/// the count does not start over and the user stays out. The same document without that inbound goes through, and then the count does start over.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_that_fails_starts_no_count_over(){
+	let Live{node, mut doc, ..}=live(false, Options::new(""), |setup| setup.doc["users"][1]["quota_bytes"]=json!(600)).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44110, 9999, &[b'x';700])).await;
+	eventually("a user who spent their quota was not cut off", || usage(&node, "b").denied==Some(Denied::Quota)).await;
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let spent=usage(&node, "b");
+	assert!(spent.used_bytes>=728 && spent.period_start==0, "{spent:?}");
+	let taken=listen();
+	let holder=std::net::UdpSocket::bind(taken).unwrap();
+	doc["users"][1]["quota_period"]=json!("daily");
+	let mut busy=doc.clone();
+	busy["inbounds"].as_array_mut().unwrap().push(inbound("office", &veilway_wg::generate_key(), "10.8.0.1/24", udp(taken)));
+	let said=refusal(reload(&node, &busy).await);
+	assert!(said.contains("inbounds[1].transports[0].listen"), "{said}");
+	// Longer than the node takes to look at every count again.
+	tokio::time::sleep(Duration::from_millis(700)).await;
+	assert_eq!(usage(&node, "b"), spent, "a reload that failed changed a count or a user's standing");
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "a reload that failed let a user without quota in");
+	drop(holder);
+	reload(&node, &doc).await.unwrap();
+	let fresh=usage(&node, "b");
+	assert!(fresh.used_bytes==0 && fresh.period_start>0 && fresh.denied.is_none() && fresh.traffic==spent.traffic, "{fresh:?}");
+	Client::connect(node.keys[1], node.public, node.addr).await;
+}
+
+/// What stands at the path of the state file and is no regular file is never read, moved or written over, whatever it is: here a directory with a file in it.
+/// The node runs all the same and keeps usage in memory.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_directory_at_the_path_of_the_state_file_is_left_alone(){
+	let path=state_file("directory");
+	std::fs::create_dir(&path).unwrap();
+	std::fs::write(path.join("kept"), b"somebody's").unwrap();
+	let Live{node, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44120, 80).await, Answer::Reset);
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert_eq!(usage(&node, "a").used_bytes, 80);
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	assert_eq!((std::fs::read(path.join("kept")).ok().as_deref(), std::fs::read_dir(path.parent().unwrap()).unwrap().count()), (Some(&b"somebody's"[..]), 1), "the directory at the path of the state file was touched");
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// Usage lives in the state file and belongs to a user's name. It goes on through a reload, a user who is renamed is another user who starts from nothing while the old name's entry goes,
+/// the last write at shutdown holds every byte, and a node that starts on the file holds a user to what they had used before: a restart gives nobody their quota again.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn usage_survives_a_reload_and_a_restart_through_the_state_file(){
+	let path=state_file("restart");
+	let Live{node, mut doc, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |_| {}).await;
+	// No file was there, which is nobody having used anything, and the node wrote one at once.
+	eventually("the state file was not written at start", || saved(&path, "b").is_some()).await;
+	assert_eq!((saved(&path, "a"), usage(&node, "a").traffic), (Some(json!({"used_bytes":0, "period_start":0, "up_bytes":0, "up_packets":0, "down_bytes":0, "down_packets":0})), Totals::default()));
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 44070, 80).await;
+	assert_eq!(flow.say(&mut a, b"before the reload").await, Answer::Accepted);
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44071, 9999, b"theirs")).await;
+	assert_eq!(datagram(&mut b, 44071).await.as_deref(), Some(&b"echo:theirs"[..]));
+	let early=usage(&node, "a");
+	doc["users"][1]["name"]=json!("renamed");
+	reload(&node, &doc).await.unwrap();
+	eventually("the entry of a name the config no longer has stayed in the state file", || saved(&path, "b").is_none() && saved(&path, "renamed").is_some()).await;
+	assert_eq!((usage(&node, "renamed").used_bytes, usage(&node, "renamed").traffic, node.engine.user("b")), (0, Totals::default(), None));
+	assert_eq!(flow.say(&mut a, b"after the reload").await, Answer::Accepted, "a reload that renamed another user disturbed this one");
+	// The last acknowledgement of the flow is counted a moment after it was sent.
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let last=usage(&node, "a");
+	assert!(last.used_bytes>early.used_bytes && last.used_bytes==last.traffic.up_bytes+last.traffic.down_bytes, "{early:?} then {last:?}");
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	assert_eq!(saved(&path, "a"), Some(entry(&last)), "the write at shutdown does not hold what the user had used");
+	#[cfg(unix)]
+	assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions())&0o777, 0o600, "the state file is not mode 600");
+	assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1, "the state file is not alone in its directory");
+	// Another node, with other keys, on the same file. User `a` may use exactly what they have used already.
+	let Live{node, mut doc, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |setup|{
+		setup.doc["users"][0]["quota_bytes"]=json!(last.used_bytes);
+		setup.doc["users"][1]["name"]=json!("renamed");
+	}).await;
+	assert_eq!(usage(&node, "a"), Usage{quota_bytes:Some(last.used_bytes), denied:Some(Denied::Quota), ..last.clone()});
+	assert!(Client::try_connect(node.keys[0], node.public, node.addr, Duration::from_secs(1)).await.is_none(), "a restart gave a user their quota again");
+	doc["users"][0].as_object_mut().unwrap().remove("quota_bytes");
+	reload(&node, &doc).await.unwrap();
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	Flow::open(&mut a, PEER_A, PUBLIC, 44072, 80).await;
+	let more=usage(&node, "a");
+	assert!(more.used_bytes>last.used_bytes && more.traffic.up_packets>last.traffic.up_packets && more.traffic.down_bytes>last.traffic.down_bytes, "{last:?} then {more:?}");
+	doc["users"].as_array_mut().unwrap().remove(1);
+	reload(&node, &doc).await.unwrap();
+	eventually("the entry of a user who was removed stayed in the state file", || saved(&path, "renamed").is_none() && saved(&path, "a").is_some_and(|a| a["used_bytes"].as_u64()>=Some(more.used_bytes))).await;
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// A state file the node cannot trust never keeps it down and never decides anything: one that does not parse, one of a version this build does not know, one that is too large,
+/// and one that group or others can write is each kept under its name with `.bad` behind it, and every user starts from zero. A file only the node can write is believed, and what it says is clamped.
+#[cfg(unix)]
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_state_file_the_node_cannot_trust_is_moved_aside_and_usage_starts_from_zero(){
+	use std::os::unix::fs::PermissionsExt;
+	// In every file that could be read user `a` has used 5000 bytes, and the config lets them use 1000.
+	let document=|version:u64| json!({"version":version, "users":{"a":{"used_bytes":5000, "period_start":0, "up_bytes":5000, "up_packets":3, "down_bytes":0, "down_packets":0}, "gone":{"used_bytes":1, "period_start":0, "up_bytes":1, "up_packets":1, "down_bytes":0, "down_packets":0}}}).to_string().into_bytes();
+	let mut oversized=document(1);
+	oversized.resize((16<<20)+1, b' ');
+	for (case, bytes, mode, trusted) in [("corrupt", b"{\"version\":1, \"users\":{\"a\":".to_vec(), 0o600, false), ("version", document(2), 0o600, false), ("oversized", oversized, 0o600, false), ("group-writable", document(1), 0o620, false), ("world-writable", document(1), 0o602, false), ("readable", document(1), 0o644, true)]{
+		let path=state_file(case);
+		let bad=path.with_extension("json.bad");
+		std::fs::write(&path, &bytes).unwrap();
+		std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+		let Live{node, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |setup| setup.doc["users"][0]["quota_bytes"]=json!(1000)).await;
+		let found=usage(&node, "a");
+		eventually("the node did not write a state file of its own", || saved(&path, "a").is_some() && saved(&path, "gone").is_none()).await;
+		assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777, 0o600, "{case}: the state file the node wrote is not mode 600");
+		if trusted{
+			assert_eq!((found.used_bytes, found.traffic, found.denied, bad.exists()), (5000, Totals{up_packets:3, up_bytes:5000, down_packets:0, down_bytes:0}, Some(Denied::Quota), false), "{case}");
+			assert!(Client::try_connect(node.keys[0], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "{case}: a user the state file has out of quota completed a handshake");
+		}else{
+			assert_eq!((found.used_bytes, found.traffic, found.denied), (0, Totals::default(), None), "{case}: the node believed a state file it cannot trust");
+			assert!(std::fs::read(&bad).is_ok_and(|kept| kept==bytes), "{case}: the file was not kept as it was under .bad");
+			let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+			assert_eq!(knock(&mut a, PEER_A, PEER_B, 44080, 80).await, Answer::Reset, "{case}");
+		}
+		let Node{engine, ..}=node;
+		engine.shutdown().await;
+		std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+	}
+	// Counts no node could have written are taken for the nearest count one could.
+	let path=state_file("clamped");
+	std::fs::write(&path, r#"{"version":1,"users":{"a":{"used_bytes":18446744073709551615,"period_start":0,"up_bytes":1e40,"up_packets":-7,"down_bytes":9007199254740993,"down_packets":2.5}}}"#).unwrap();
+	std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+	let Live{node, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |_| {}).await;
+	const MOST:u64=9007199254740991;
+	let found=usage(&node, "a");
+	assert_eq!((found.used_bytes, found.traffic, path.with_extension("json.bad").exists()), (MOST, Totals{up_packets:0, up_bytes:MOST, down_packets:2, down_bytes:MOST}, false));
+	// It goes on counting from there and writes down no count a reader of JSON could get wrong.
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44081, 80).await, Answer::Reset);
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	assert_eq!(saved(&path, "a"), Some(json!({"used_bytes":MOST, "period_start":0, "up_bytes":MOST, "up_packets":1, "down_bytes":MOST, "down_packets":3})));
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// A state file that cannot be written keeps no node down and no user out, and the write is tried again: here the directory of the file only appears while the node runs.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_state_file_that_cannot_be_written_is_tried_again(){
+	let dir=state_file("unwritable").with_file_name("later");
+	let path=dir.join("state.json");
+	let Live{node, mut doc, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44100, 80).await, Answer::Reset);
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	assert!(!dir.exists() && usage(&node, "a").used_bytes==80);
+	std::fs::create_dir(&dir).unwrap();
+	// Removing a user asks for a write at once, which is sooner than the next try would have come by itself.
+	doc["users"].as_array_mut().unwrap().remove(1);
+	reload(&node, &doc).await.unwrap();
+	eventually("a state file whose first write failed was never written", || saved(&path, "a")==Some(entry(&usage(&node, "a")))).await;
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+}
+
+/// A directory at the name of the temporary file makes every write fail. Each one is counted, where whoever watches the node can see it, and the file is written as soon as the directory is gone.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn writes_of_the_state_file_that_fail_are_counted(){
+	let path=state_file("blocked");
+	let blocker=path.with_extension("json.tmp");
+	std::fs::create_dir(&blocker).unwrap();
+	let Live{node, mut doc, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |_| {}).await;
+	eventually("the write at start failed and was not counted", || node.engine.state_write_failures()==1).await;
+	// Removing a user asks for a write at once.
+	doc["users"].as_array_mut().unwrap().remove(1);
+	reload(&node, &doc).await.unwrap();
+	eventually("a second write that failed was not counted", || node.engine.state_write_failures()==2).await;
+	assert!(!path.exists() && blocker.is_dir(), "the directory in the way of the state file was touched");
+	std::fs::remove_dir(&blocker).unwrap();
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	assert!(saved(&path, "a").is_some() && saved(&path, "b").is_none(), "the state file was not written once nothing stood in its way");
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// One user sends UDP, a DNS query and TCP through one inbound and one exit, so the three counters have to agree: the user and the inbound packet for packet,
+/// and the exit too, except that it counts a DNS message the resolver sent through it without the 28 bytes of the IP and UDP headers the device put around it.
+/// A reload that turns the order of users, inbounds and exits around loses none of it, because a counter belongs to a name or a tag.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn the_counters_of_a_user_an_inbound_and_an_exit_add_up_and_follow_a_reload(){
+	let Live{node, mut doc, ..}=live(true, Options::new(""), |setup| setup.doc["dns"]["hijack"]=json!(true)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	a.send_ip(&ip_udp(PEER_A, PUBLIC, 44090, 9999, b"over udp")).await;
+	assert_eq!(datagram(&mut a, 44090).await.as_deref(), Some(&b"echo:over udp"[..]));
+	let answer=ask(&mut a, PEER_A, [1, 1, 1, 1], 44091, &dns_query(7, "example.com", 1), Duration::from_secs(3)).await.expect("no answer to a dns query");
+	assert_eq!(resolved(&answer, 7), vec![IpAddr::from(PUBLIC)]);
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 44092, 80).await;
+	assert_eq!(flow.say(&mut a, b"over tcp").await, Answer::Accepted);
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let before=node.engine.counters();
+	let names=|list:&[(String, Totals)]| list.iter().map(|(tag, _)| tag.clone()).collect::<Vec<_>>();
+	assert_eq!((before.users.iter().map(|user| user.name.as_str()).collect::<Vec<_>>(), names(&before.inbounds), names(&before.exits)), (vec!["a", "b"], vec!["home".to_string()], vec!["main".to_string(), "second".to_string()]));
+	let (user, home, main)=(before.users[0].traffic, before.inbounds[0].1, before.exits[0].1);
+	// Up: one datagram, one query, and the SYN, three acknowledgements and one segment of the flow.
+	assert_eq!((user.up_packets, user, before.users[0].used_bytes), (7, home, user.up_bytes+user.down_bytes));
+	assert_eq!(main, Totals{up_packets:user.up_packets, up_bytes:user.up_bytes-28, down_packets:user.down_packets, down_bytes:user.down_bytes-28});
+	assert_eq!((before.users[1].traffic, before.exits[1].1), (Totals::default(), Totals::default()));
+	assert_eq!((node.engine.user("a"), node.engine.inbound("home"), node.engine.exit("main")), (Some(user), Some(home), Some(main)));
+	// Everything changes its place, and UDP now leaves through the other exit, which ends the one UDP flow there is. Its device is told with an ICMP error, which is one packet down for the user and the inbound.
+	doc["users"].as_array_mut().unwrap().reverse();
+	doc["exits"].as_array_mut().unwrap().reverse();
+	doc["inbounds"].as_array_mut().unwrap().insert(0, inbound("office", &veilway_wg::generate_key(), "10.8.0.1/24", udp(listen())));
+	add_rule(&mut doc, json!({"tag":"udp-out", "protocol":["udp"], "action":{"exit":"second"}}));
+	reload(&node, &doc).await.unwrap();
+	let after=node.engine.counters();
+	assert_eq!((after.users.iter().map(|user| user.name.as_str()).collect::<Vec<_>>(), names(&after.inbounds), names(&after.exits)), (vec!["b", "a"], vec!["office".to_string(), "home".to_string()], vec!["second".to_string(), "main".to_string()]));
+	assert_eq!((after.users[1].traffic, after.inbounds[1].1, after.exits[1].1), (Totals{down_packets:user.down_packets+1, down_bytes:user.down_bytes+56, ..user}, Totals{down_packets:home.down_packets+1, down_bytes:home.down_bytes+56, ..home}, main), "a counter did not follow its name or tag through a reload");
+	assert_eq!((after.users[0].traffic, after.inbounds[0].1, after.exits[0].1), (Totals::default(), Totals::default(), Totals::default()));
+	a.send_ip(&ip_udp(PEER_A, PUBLIC, 44093, 9999, b"other way")).await;
+	assert_eq!(datagram(&mut a, 44093).await.as_deref(), Some(&b"echo:other way"[..]));
+	assert_eq!(flow.say(&mut a, b"same flow").await, Answer::Accepted, "a reload that only moved things around ended a flow");
+	tokio::time::sleep(Duration::from_millis(300)).await;
+	let last=node.engine.counters();
+	// The datagram and its answer are all the other exit carried, and the flow went on through the one it was on.
+	assert_eq!(last.exits[0].1, Totals{up_packets:1, up_bytes:37, down_packets:1, down_bytes:42});
+	let onward=last.exits[1].1;
+	assert!((onward.up_packets, onward.up_bytes)==(main.up_packets+2, main.up_bytes+89) && onward.down_packets>main.down_packets && onward.down_bytes>=main.down_bytes+49, "{main:?} then {onward:?}");
+	assert_eq!((last.users[1].traffic, last.users[1].traffic.up_packets), (last.inbounds[1].1, user.up_packets+3));
 }

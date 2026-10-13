@@ -11,8 +11,9 @@ pub mod netstack;
 pub mod plan;
 pub mod resolver;
 pub mod route;
+pub mod usage;
 
-pub use plan::Plan;
+pub use plan::{Denied, Plan};
 pub use route::Reason;
 
 use crate::config::{Applied, ApplyError, Config, Diff, Revision, Snapshot, Store};
@@ -22,16 +23,18 @@ use route::Flows;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify, Semaphore};
+use tokio::time::MissedTickBehavior;
 use veilway_wg::ws;
 
 /// Packets in flight between a tunnel and its stack in either direction.
 const QUEUE: usize = 4096;
-/// How often the engine looks at the clock for users whose `expires_at` has passed. A user is cut off within this long of that moment, plus the time the cut-off itself takes.
+/// How often the engine looks at the clock for users whose `expires_at` has passed, and at every user's count for a quota that is spent or a quota period that has started over.
+/// A user is cut off within this long of that moment, plus the time the cut-off itself takes.
 const EXPIRY_EVERY: Duration = Duration::from_millis(250);
 /// The flow table is swept once in this many looks at the clock, which is once a second.
 const SWEEP_EVERY: u32 = 4;
@@ -42,16 +45,18 @@ pub struct Options {
 	pub dir: PathBuf,
 	/// Whether an address belongs to this host, for the destination gate. Tests replace it to reach a responder on the machine they run on.
 	pub is_local: fn(IpAddr) -> bool,
-	/// The node's clock, which `expires_at` is held against. Tests replace it to move time.
+	/// The node's clock, which `expires_at` and the quota periods are held against. Tests replace it to move time.
 	pub now: fn() -> OffsetDateTime,
 	/// The revision of the bytes the config was parsed from, so that a reload of the same file is known to change nothing. Without it the first reload counts as a change.
 	pub revision: Option<Revision>,
 	/// Whether `reload_from` takes a file that group or others can read, as `--allow-readable-config` says at start.
 	pub allow_readable: bool,
+	/// The state file, which carries every user's usage across restarts, see `usage`. It is not relative to `dir`. Without one usage is kept in memory and gone with the process.
+	pub state: Option<PathBuf>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -101,9 +106,31 @@ pub struct ExitState {
 	udp_flips: AtomicU64,
 }
 
-/// What the engine keeps for a user while it runs. It belongs to the user's name: a reload that keeps the name keeps this, wherever the user stands in the list.
+/// One user's counters as `Engine::counters` gives them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Usage {
+	pub name: String,
+	/// Everything the user sent and received since the state file first knew the name, or since start without a state file.
+	pub traffic: Totals,
+	/// Bytes in both directions since `period_start`, which is what `quota_bytes` is held against.
+	pub used_bytes: u64,
+	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.
+	pub period_start: i64,
+	pub quota_bytes: Option<u64>,
+	pub denied: Option<Denied>,
+}
+
+/// Every counter of the node at one moment, in the order of the config. They are totals: whoever asks twice works out the rates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counters {pub users: Vec<Usage>, pub inbounds: Vec<(String, Totals)>, pub exits: Vec<(String, Totals)>}
+
+/// What the engine keeps for a user while it runs. It belongs to the user's name: a reload that keeps the name keeps this, wherever the user stands in the list, and the state file carries the counts in it over a restart.
 pub struct UserState {
 	pub traffic: Traffic,
+	/// Bytes of inner IP traffic in both directions since `since`. It counts whether or not the user has a quota, so a quota that is given later is held against what was used.
+	used: AtomicU64,
+	/// The start of the quota period `used` belongs to, in Unix seconds. It only ever moves forward, so a clock that steps back starts no count over.
+	since: AtomicI64,
 	/// What the user resolved through the node. Nothing in it is ever read for another user.
 	names: Mutex<Names>,
 	/// The queries of the user that may still wait for an upstream at once.
@@ -111,11 +138,16 @@ pub struct UserState {
 }
 
 impl Default for UserState {
-	fn default() -> UserState {UserState {traffic: Traffic::default(), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT)}}
+	fn default() -> UserState {UserState {traffic: Traffic::default(), used: AtomicU64::new(0), since: AtomicI64::new(0), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT)}}
 }
 
 impl UserState {
 	pub fn names(&self) -> MutexGuard<'_, Names> {self.names.lock().unwrap_or_else(|e| e.into_inner())}
+
+	pub fn used(&self) -> u64 {self.used.load(Ordering::Relaxed)}
+
+	/// Starts the count over when `start`, the start of the quota period the clock is in, lies after the period the count belongs to. Whoever sees the new period first does it, once.
+	pub fn roll(&self, start: i64) {if self.since.fetch_max(start, Ordering::Relaxed) < start {self.used.store(0, Ordering::Relaxed)}}
 }
 
 /// Everything the engine's tasks share. What belongs to one user, device, inbound or exit hangs off the plan instead, see `plan`.
@@ -130,6 +162,13 @@ pub struct Shared {
 	relays: Arc<ws::Stats>,
 	is_local: fn(IpAddr) -> bool,
 	now: fn() -> OffsetDateTime,
+	/// Wakes the task that looks at the clock: a packet has taken a user across their quota.
+	over: Notify,
+	/// Wakes the task that writes the state file before its time has come.
+	save: Notify,
+	saver: tokio::sync::Mutex<usage::Saver>,
+	/// Writes of the state file that failed since start.
+	unwritten: AtomicU64,
 }
 
 impl Shared {
@@ -137,6 +176,14 @@ impl Shared {
 	pub fn plan(&self) -> Arc<Plan> {self.plan.read().unwrap_or_else(|e| e.into_inner()).clone()}
 
 	fn count(&self, reason: Reason) {self.drops[reason as usize].fetch_add(1, Ordering::Relaxed);}
+
+	/// Counts one inner IP packet of a user, towards the node (`up`) or towards the device, for the user's totals and against their quota. Every packet comes through here, whatever becomes of it, so traffic that is refused or answered by the node counts.
+	/// It is atomics only. The one packet that takes the count across the quota wakes the task that cuts the user off, and any crossing that is missed is seen at that task's next look, `EXPIRY_EVERY` later at most.
+	fn spend(&self, user: &plan::User, up: bool, bytes: usize) {
+		if up {user.state.traffic.up(bytes)} else {user.state.traffic.down(bytes)}
+		let before = user.state.used.fetch_add(bytes as u64, Ordering::Relaxed);
+		if user.quota.is_some_and(|quota| before < quota && before.saturating_add(bytes as u64) >= quota) {self.over.notify_one()}
+	}
 }
 
 /// A running engine. Its tasks live until the process exits and go on serving the config they have, and `shutdown` takes back what an l3 exit set up on the host. Dropping it does so too, without waiting for the l3 tasks to end.
@@ -147,10 +194,12 @@ impl Drop for Engine {
 }
 
 impl Engine {
-	/// Stops the l3 exit and removes its interface, routes and firewall rules from the host. Everything else the engine holds goes with the process.
+	/// Stops the l3 exit and removes its interface, routes and firewall rules from the host, then writes the state file one last time. Everything else the engine holds goes with the process.
+	/// The host comes first and the write is given `usage::LAST_WRITE` and no longer: a disk that hangs must not leave the firewall rules of a node that is going away in place.
 	pub async fn shutdown(self) {
 		let wired = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 		if let Some(wired) = wired {wired.running.close().await}
+		if tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, true)).await.is_err() {tracing::error!("the state file was not written within {}s of the shutdown, so usage since its last write is lost", usage::LAST_WRITE.as_secs())}
 	}
 
 	/// Puts a new config document in force: it is parsed and validated, everything it needs from the host is prepared while the running config keeps working, and then it replaces that config in one step.
@@ -178,6 +227,22 @@ impl Engine {
 	pub fn inbound(&self, tag: &str) -> Option<Totals> {self.plan().inbounds.iter().find(|inbound| inbound.tag == tag).map(|inbound| inbound.traffic.totals())}
 
 	pub fn exit(&self, tag: &str) -> Option<Totals> {self.plan().exits.iter().find(|exit| exit.tag == tag).map(|exit| exit.traffic.totals())}
+
+	/// The counters of every user, inbound and exit of the config that runs, taken from one plan. A counter belongs to a name or a tag and goes on counting across reloads for as long as the config keeps that name or tag.
+	/// An exit counts what is handed to it and what is taken from it, as inner IP packets: a TCP segment when the exit's stack takes it or gives it, a datagram when the exit's outbound takes it or gives it,
+	/// a packet when the queue of the l3 interface takes it or the interface gives it to a live flow, a ping the node answers or sends on, and a DNS message of the node's resolver, which has no headers of a device around it.
+	/// What is refused or dropped before that counts for no exit, and a flow that a `via` policy moved counts for the exit that carries it and not for the exit the rules chose.
+	pub fn counters(&self) -> Counters {
+		let plan = self.plan();
+		Counters {
+			users: plan.users.iter().map(|user| Usage {name: user.name.clone(), traffic: user.state.traffic.totals(), used_bytes: user.state.used(), period_start: user.state.since.load(Ordering::Relaxed), quota_bytes: user.quota, denied: user.denied}).collect(),
+			inbounds: plan.inbounds.iter().map(|inbound| (inbound.tag.clone(), inbound.traffic.totals())).collect(),
+			exits: plan.exits.iter().map(|exit| (exit.tag.clone(), exit.traffic.totals())).collect(),
+		}
+	}
+
+	/// Writes of the state file that failed since start. While it grows, a node that stops loses what its users have used since the last write that went through.
+	pub fn state_write_failures(&self) -> u64 {self.shared.unwritten.load(Ordering::Relaxed)}
 
 	/// Packets dropped or refused for `reason` since start.
 	pub fn dropped(&self, reason: Reason) -> u64 {self.shared.drops[reason as usize].load(Ordering::Relaxed)}
@@ -221,7 +286,14 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	anyhow::ensure!(report.errors.is_empty(), "the config has {} errors: validate it before it is started", report.errors.len() + report.more_errors);
 	let mut store = Store::new(config.clone(), options.revision.unwrap_or_else(|| Revision::of(&[])), report);
 	store.allow_readable = options.allow_readable;
-	let shared = Arc::new(Shared {plan: RwLock::default(), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now});
+	// What the state file remembers goes in as the users of a plan that was never in force. The first plan takes each user's state from it by name, the way every later plan takes it from the one before, and a name the config no longer has is left behind.
+	// A path the node may not write to is no path from here on: usage then lives in memory, as it does without a state file.
+	let (remembered, state) = options.state.map_or((Vec::new(), None), |path| {
+		let (users, writable) = usage::load(&path);
+		(users, writable.then_some(path))
+	});
+	let remembered = Plan {users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, quota: None, period: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
+	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None}), unwritten: AtomicU64::new(0)});
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind.
 	let mut host = Host::new(options.dir);
 	let staged = host.prepare(&shared, &store.current().config, &[]).await?;
@@ -232,13 +304,42 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		async move {
 			let (mut tick, mut ticks) = (tokio::time::interval(EXPIRY_EVERY), 0u32);
 			loop {
-				tick.tick().await;
-				ticks = ticks.wrapping_add(1);
-				if ticks % SWEEP_EVERY == 0 {shared.flows.sweep()}
+				tokio::select! {
+					_ = tick.tick() => {
+						ticks = ticks.wrapping_add(1);
+						if ticks % SWEEP_EVERY == 0 {shared.flows.sweep()}
+					}
+					_ = shared.over.notified() => {}
+				}
 				// Held against the clock again at every tick, never slept towards, so a clock that jumps ahead cuts a user off as promptly as time that passes.
-				if shared.plan().next_expiry.is_some_and(|at| at <= (shared.now)()) {host.lock().await.expire(&shared)}
+				let (plan, now) = (shared.plan(), (shared.now)());
+				let starts = usage::starts(now);
+				// A count whose period is over starts over here, for the plan in force, which is what brings it below the quota.
+				// A user's count has turned when the quota is spent and the user is not denied for it, or the user is denied for it and the count is below the quota again.
+				let turned = plan.users.iter().any(|user| user.quota.is_some_and(|quota| {
+					if let Some(period) = user.period {user.state.roll(starts[period as usize])}
+					matches!((user.denied, user.state.used() >= quota), (None, true) | (Some(Denied::Quota), false))
+				}));
+				if turned || plan.next_expiry.is_some_and(|at| at <= now) {host.lock().await.expire(&shared)}
 			}
 		}
 	});
+	if state.is_some() {
+		tokio::spawn({
+			let shared = shared.clone();
+			async move {
+				// The first write comes at once: it drops the entries of users the config no longer names, and says at start when the file cannot be written.
+				let mut tick = tokio::time::interval(usage::WRITE_EVERY);
+				tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+				loop {
+					tokio::select! {
+						_ = tick.tick() => {}
+						_ = shared.save.notified() => {}
+					}
+					usage::save(&shared, false).await;
+				}
+			}
+		});
+	}
 	Ok(Engine {shared, store: Arc::new(store), host, l3})
 }

@@ -19,6 +19,8 @@ enum Command {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
 		/// Start even though group or others can read the config file, which holds keys and passwords
 		#[arg(long)] allow_readable_config: bool,
+		/// Where every user's usage is kept across restarts [default: veilway-state.json next to the config file]
+		#[arg(long)] state: Option<PathBuf>,
 	},
 	/// Validate a version 1 config and print every error and warning
 	Check {
@@ -80,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("public_key:  {}", veilway_wg::encode_key(&veilway_wg::public_key(&private)));
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config} => {
+		Command::Run {config, allow_readable_config, state} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -95,7 +97,8 @@ async fn main() -> anyhow::Result<()> {
 			// SIGTERM is how a service manager and `docker stop` end the node. An l3 exit has firewall rules and sysctls to take back before it goes, so it stops the node the way Ctrl-C does. SIGHUP reads the config file again.
 			#[cfg(unix)]
 			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);
-			let engine = veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, ..Options::new(config.parent().unwrap_or(Path::new("")))}).await?;
+			let dir = config.parent().unwrap_or(Path::new(""));
+			let engine = veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state.unwrap_or_else(|| dir.join("veilway-state.json"))), ..Options::new(dir)}).await?;
 			#[cfg(unix)]
 			let stopped = loop {
 				tokio::select! {

@@ -281,7 +281,8 @@ impl Host {
 		}
 	}
 
-	/// Cuts off the users whose `expires_at` has passed since the plan in force was made: the config that runs is compiled again at the present time and switched to.
+	/// Cuts off the users whose `expires_at` has passed or whose quota was spent since the plan in force was made, and lets those in again whose quota period has started over:
+	/// the config that runs is compiled again at the present time, with the counts as they are now, and switched to.
 	pub fn expire(&mut self, shared: &Arc<Shared>) {
 		let (Some(config), old) = (&self.config, shared.plan()) else {return};
 		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect()) {
@@ -289,7 +290,7 @@ impl Host {
 				plan.l3 = old.l3.clone();
 				self.switch(shared, plan);
 			}
-			Err(e) => tracing::error!("the running config could not be compiled again to cut off the users that expired: {e:#}"),
+			Err(e) => tracing::error!("the running config could not be compiled again to cut off the users that expired or ran out of quota: {e:#}"),
 		}
 	}
 
@@ -297,6 +298,7 @@ impl Host {
 	/// every live flow is decided again and ends unless the new plan decides the same for it through an exit that is still the same exit, the device of each flow that ends is told once (a TCP reset, or an ICMP error for UDP),
 	/// the devices that are cut off lose their session keys, and the plan is swapped. After that their user's DNS memory is cleared and each is logged.
 	/// This is the one cut-off path: a device is cut off when the new plan no longer has it as it was, whatever the reason. A user who runs out of quota comes through here too, denied by `Plan::new` like one who expired, see `plan::Denied`.
+	/// The state file is written right after a switch that cut a user off for their quota or left a user's name behind, so neither waits for the next write.
 	fn switch(&self, shared: &Arc<Shared>, plan: Plan) -> (Arc<Plan>, Arc<Plan>) {
 		let (old, plan) = (shared.plan(), Arc::new(plan));
 		let users: HashMap<&str, &User> = plan.users.iter().map(|user| (user.name.as_str(), user)).collect();
@@ -312,6 +314,7 @@ impl Host {
 					None => "the user was removed",
 					Some(Some(Denied::Disabled)) => "the user was disabled",
 					Some(Some(Denied::Expired)) => "the user expired",
+					Some(Some(Denied::Quota)) => "the user ran out of quota",
 					Some(None) => "the device was removed",
 				},
 			}))
@@ -368,7 +371,7 @@ impl Host {
 				let Some(peer) = peers.wg.index(&flow.device).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {continue};
 				let Some((endpoint, socket)) = peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(Weak::upgrade)) else {continue};
 				peers.wg.encapsulate(peer, &packet, &mut datagrams);
-				old.users[old.devices[from.device].user].state.traffic.down(packet.len());
+				shared.spend(&old.users[old.devices[from.device].user], false, packet.len());
 				inbound.traffic.down(packet.len());
 				out.extend(datagrams.into_iter().map(|datagram| (socket.clone(), endpoint, datagram)));
 			}
@@ -387,6 +390,10 @@ impl Host {
 					let mut peers = plan.inbounds[*at].tunnel.lock();
 					if peers.wg.index(&device.public_key).is_none() {peers.add(device.public_key, device.preshared_key)}
 				}
+			}
+			// `Plan::new` held each count against the period the plan was compiled in without touching it. The plan is in force from here, so this is where a count whose period is over starts over.
+			for user in &plan.users {
+				if let Some(period) = user.period {user.state.roll(plan.starts[period as usize])}
 			}
 			plan.shown.store(plan.log_destinations, Ordering::Relaxed);
 			*shared.plan.write().unwrap_or_else(|e| e.into_inner()) = plan.clone();
@@ -408,6 +415,7 @@ impl Host {
 		}
 		if cut.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices were cut off", cut.len() - MAX_NAMES_LOGGED)}
 		if ended > 0 {tracing::info!("{ended} flow(s) ended with the config they were routed by")}
+		if old.users.iter().any(|was| users.get(was.name.as_str()).is_none_or(|is| is.denied == Some(Denied::Quota) && was.denied != is.denied)) {shared.save.notify_one()}
 		(old, plan)
 	}
 }
