@@ -134,6 +134,21 @@ packages/
 vendor/ipstack      patched, unchanged
 ```
 
+### Splitting into several repositories
+
+The tree above is one repository today. It is split along the lines of what ships and is released by itself, so that no single repository holds everything:
+
+| Repository | Holds | Depends on |
+|---|---|---|
+| `veilway` | The core: every crate, the `veilway` binary, the control API with its OpenAPI document and the generated TypeScript client, the fuzz targets, the plan and the threat model | Nothing of the others |
+| `veilway-ui` | `packages/ui` and `packages/i18n`: the design system and the locale packs | Nothing of the others |
+| `veilway-panel` | The panel server and its web app. It starts life in its own repository in Phase 4 | The core's client and API by a pinned version, `veilway-ui` by a pinned version |
+| `veilway-desktop` | `apps/desktop` | The core's client and protocol crates by a pinned tag, `veilway-ui` by a pinned version |
+| `veilway-android` | The Android app, from Phase 7 | The same |
+| `veilway-docs`, `.github` | As today | |
+
+Rules for the split: it happens at a phase gate with no work in flight, never in the middle of a phase; each part keeps its history (the files are moved with their commits, not copied); every repository carries the licence, the notice, the contributor agreement and the same identity and push rules; a dependency between repositories is always a pinned tag or version, never a branch; and a change that crosses repositories lands in the core first, is tagged, and is then taken up by the others. The first split is `veilway-ui` and `veilway-desktop` out of `veilway`, at the Phase 2 gate. Until then everything stays where it is.
+
 ## Core design
 
 ### Config model
