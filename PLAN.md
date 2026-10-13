@@ -4,7 +4,7 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 2, not started. Phase 1 is finished and its gate passes. Phase 1 history: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
+- Active phase: 2, step 2 in progress. Phase 1 is finished and its gate passes. Phase 1 history: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
 - Step 2b is done too: every tunnel DNS query is answered by the node's own resolver (UDP and TCP port 53, servers tried in order, REFUSED when the rules refuse), names are remembered per user, and `domain` rules match on them. Fuzz targets: `config`, `packet`, `dns`.
 - Step 2c is done too: rejected traffic gets the matching ICMP error, every `unsupported` policy of a `netstack` exit works (`local`, `reject`, `drop`, `direct`, `via`), and the `l3` exit runs on Linux (one TUN device, kernel forwarding and source NAT through `ip` and `nft`, return traffic only for live flows). Only one `l3` exit per node for now.
 - Step 2d is done too: `veilway run` reloads its config on SIGHUP (`Engine::reload`), a refused or failing file leaves the running config in force, every live flow is decided again under the new config, and a user who is disabled, removed or expired (or a device that is removed or re-keyed) loses sessions, flows and DNS memory within a second. `THREAT_MODEL.md` now describes the engine as built.
@@ -12,8 +12,10 @@ Update this block at the end of every work session.
 - Step 4 is done: `veilway run` serves the control API on a unix socket (`--api`, mode 600, `crates/veilway-api`): status, config (read with secrets redacted, validate, diff, apply with `If-Match`, saved back to the config file), users, stats with live rates, sessions, exits, an SSE event stream, and `openapi.json`, from which `packages/sdk` is generated. Remote access (mTLS or a scoped token), a logs route and kicking a session are not built.
 - Step 5 is done: `veilway doctor` diagnoses a config without changing anything (file mode, listen addresses, certificates, DNS over UDP and TCP, every outbound with TCP and UDP checks, l3 prerequisites, state file, control socket).
 - The Phase 1 gate passes: `sh scripts/gate-phase1.sh` runs the release binary in Docker with two kernel WireGuard clients and checks two inbounds in one process, the default exit, a domain rule to the `l3` exit, ping and IP protocol 253 through `l3`, isolation between peers, live stats from the API and a clean stop.
-- Last finished step: Phase 1, step 5 and the Phase 1 gate
-- Next action: Phase 2, step 1. Its gate needs a real CDN in front of a node, which needs the owner.
+- Since the gate: `veilway usage reset` and `POST /v1/users/{name}/usage/reset`, an l3 exit that goes down is brought up again by the node, and a node with open flows stops within 5 seconds of SIGTERM.
+- Phase 2 step 1 is done: the draft spec for transports, framing and the control channel is in `veilway-docs` (`protocol/`, `security/obfuscation.md`), after two rounds of adversarial review. Its overview ends with "Implementation status of this draft": the control channel, chunk framing and timers are settled enough to implement, the replay rule, stream proof, stream listener and the transports are pending another review, `faketls` and `quic` are goals only.
+- Last finished step: Phase 2, step 1
+- Next action: Phase 2, step 2. Part A is the wire formats in `crates/veilway-proto`, part B wires the control channel into the engine. Before step 3, the stream proof and the stream listener of the spec need one more review round.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 
@@ -170,7 +172,7 @@ The three classes are: ICMP echo, UDP when the upstream has no UDP ASSOCIATE (DN
 
 An **exit** is a named egress: a tag, a display name, a country code and a backend (or a balancer over several). One inbound can offer many exits. The client picks one and can switch without reconnecting.
 
-- `veilway` inbound: the client selects the exit over the control channel inside the tunnel. The server only accepts exits that user is allowed to use, and moves the user's flows to the new exit.
+- `veilway` inbound: the client selects the exit over the control channel inside the tunnel. The server only accepts exits that user is allowed to use. The selection belongs to one device, and switching ends that device's flows that followed the user's exit (a reset for TCP, an ICMP error for UDP), so their next packets leave through the new exit. The tunnel itself does not reconnect.
 - `wireguard` inbound: an exit is bound per peer, since stock WireGuard has no way to ask.
 - The catalogue (name, country, load, whether it is up, full IP or not) reaches clients through the subscription and the control channel, so a provider sells "one address, 12 locations" and the user picks from a list.
 
@@ -200,13 +202,13 @@ Everything native is a VPN: the client has a virtual network interface, whole IP
 The protocol is three layers, and only the outer two are new:
 
 1. **Tunnel: WireGuard, unchanged.** Noise IK handshake, ChaCha20-Poly1305, key rotation and replay protection exactly as boringtun implements them. The client's key is the user identity. No invented cryptography, and a stock WireGuard client can still connect to a `wireguard` inbound.
-2. **Transport: how those WireGuard datagrams cross the network.** Plain UDP, obfuscated UDP, TLS, WebSocket, fake TLS, fronted HTTP, later QUIC. This is where censorship resistance lives; see the next section. Framing adds length and padding so WireGuard's fixed packet sizes do not show through.
-3. **Control channel: a small authenticated API inside the tunnel**, reachable only at the gateway address. It is what plain WireGuard lacks: exit selection and the exit catalogue, address and DNS assignment (IPv4 and IPv6), MTU discovery, usage and quota for the client's stats screen, server notices, and transport hints such as "this node also answers on these fronts".
+2. **Transport: how those WireGuard datagrams cross the network.** Plain UDP, obfuscated UDP, TLS, WebSocket, fake TLS, fronted HTTP, later QUIC. This is where censorship resistance lives; see the next section. Framing adds length and padding so WireGuard's fixed packet sizes do not show through. A client proves itself to an obfuscated transport with a transport secret that is per device, not per user, and is not derived from any WireGuard key.
+3. **Control channel: a small authenticated API inside the tunnel**, reachable only at the gateway address. It is what plain WireGuard lacks: exit selection and the exit catalogue, a report of the device's addresses and resolver (IPv4 and IPv6) that the client compares with its signed profile and never applies (report-only in version 1), MTU discovery, usage and quota for the client's stats screen, server notices, and transport hints such as "this node also answers on these fronts".
 
 Rules for building it:
 
-- A server never answers an unauthenticated peer in a way that identifies it. Over TLS-like transports, anything that is not a valid client is handed to a decoy (a real site or a reverse proxy to one).
-- IP packets inside a TCP-based transport mean TCP inside TCP: one lost segment stalls everything behind it. It cannot be designed away, only reduced. Prefer datagram transports when the network allows, let the client fall back to stream transports automatically, spread a tunnel over a few parallel connections, and never add a second retransmission layer.
+- A server never answers an unauthenticated peer in a way that identifies it. Over TLS-like transports, anything that is not a valid client is handed to a decoy (the operator's own web site).
+- IP packets inside a TCP-based transport mean TCP inside TCP: one lost segment stalls everything behind it. It cannot be designed away, only reduced. Whether datagram or stream transports come first is a choice of the profile, not a fixed preference: a profile lists its transports in the provider's order, every transport has a class (cover, then no cover, then plain), the client falls back between them automatically, and it uses a transport of a lower class than the best one in the profile only with the user's consent. Spread a tunnel over a few parallel connections, and never add a second retransmission layer.
 - IPv6 inside the tunnel is supported from the start, not blackholed as the current code does today.
 - Write the spec for transports and the control channel first (in `veilway-docs`), have the `brutal-critic` agent attack it, then implement. The obfuscation layer is labelled "experimental, not externally reviewed" until someone outside the project has looked at it; the encryption underneath is WireGuard's and is described as such.
 
@@ -215,9 +217,9 @@ Rules for building it:
 | Transport | What it is | Status |
 |---|---|---|
 | `udp` | Plain WireGuard datagrams | v1, already implemented |
-| `udp-obfs` | UDP with randomised headers, junk packets and padding so it does not match the WireGuard signature | v1 |
-| `tls` | Real TLS 1.3 with your own certificate (ACME built in) | v1 |
-| `ws` | WebSocket over TLS, works behind CDNs and reverse proxies | v1, already implemented |
+| `udp-obfs` | UDP with randomised headers and padding, and no junk packets, so it does not match the WireGuard signature | v1 |
+| `tls` | Real TLS 1.3 with your own certificate. In version 1 the operator supplies the certificate and key as files. Built-in issuance is to be specified later, because a challenge answered on the listener's own port is a probe surface | v1 |
+| `ws` | WebSocket over TLS, works behind CDNs and reverse proxies | v1. The legacy format on `wireguard` inbounds is already implemented, the native `ws` on `veilway` inbounds is new in version 1 |
 | `faketls` | REALITY-style: the server borrows the handshake of a real third-party site, clients prove themselves inside the ClientHello, everyone else is forwarded to that site. No domain or certificate needed | v1 after a spike |
 | `fronted` | HTTP through a CDN with fronting options, see below | v1 |
 | `quic` | QUIC datagrams, shaped like HTTP/3 (the standard for IP over HTTP/3 is MASQUE CONNECT-IP, RFC 9484) | Later |
@@ -237,11 +239,13 @@ Client TLS fingerprint matters as much as the server: a rustls ClientHello does 
 
 Every profile gets one of three ratings, computed by the core so panel and clients agree:
 
-- **Protected**: verified TLS or fake TLS around an encrypted protocol, and only for a transport that has passed the probe and fingerprint tests on that release and whose address carries no weaker listener (`THREAT_MODEL.md` invariant 7a). Until those tests are recorded, every native profile is rated Detectable.
-- **Detectable**: encrypted but easy to fingerprint (plain WireGuard UDP).
+- **Protected**: verified TLS or fake TLS around an encrypted protocol, and only for a transport that has passed the probe, length and timing, client fingerprint and server TLS tests on that release and whose address carries no weaker listener (`THREAT_MODEL.md` invariant 7a). In version 1 of the native protocol no native profile gets it: `ws` and `fronted` are the only native transports that could be rated higher later, once those tests are recorded for a release.
+- **Detectable**: encrypted but easy to fingerprint (plain WireGuard UDP, and in version 1 every native profile: `udp`, `udp-obfs` and the built `ws` for good, `tls` whatever its tests show because the TLS handshake a prober meets there is the node's own).
 - **Unsafe**: no encryption or broken verification (plain HTTP/SOCKS, VMess without TLS, `allowInsecure`, weak Shadowsocks ciphers).
 
-The panel recommends Protected when creating an inbound and asks for confirmation on anything less. Clients show a visible warning on Detectable and Unsafe profiles and need one explicit tap to connect to an Unsafe one.
+A weaker listener is a `udp-obfs`, `udp` or legacy `ws` transport, a plain `wireguard` inbound, an Xray inbound, a panel or a subscription endpoint on the same address. The client computes that cap itself for every transport and address in its own subscription. For what it cannot see there it depends on a cap in the signed profile, which can only lower a rating.
+
+The panel recommends the highest rating the node can offer when creating an inbound and asks for confirmation on anything less. Clients show a visible warning on Detectable and Unsafe profiles and need one explicit tap to connect to an Unsafe one.
 
 ### Control API and SDK
 
@@ -367,7 +371,7 @@ Gate: one process serves two inbounds on two ports with two exits, a routing rul
 ### Phase 2: native protocol and transports (4 to 5 sessions)
 
 1. Spec for transport framing, fronting options and the control channel in `veilway-docs`, reviewed by `brutal-critic`, revised.
-2. Control channel (exits, addresses, DNS, MTU, usage, notices) and transport framing with padding, with fuzz targets and property tests.
+2. Control channel (exits, a report of addresses and DNS that is never applied, MTU, usage, notices) and transport framing with padding, with fuzz targets and property tests.
 3. Transports `tls`, `ws`, `udp-obfs` and `fronted`, with decoy fallback for unauthenticated peers and the front-candidate prober.
 4. Client engine: TUN on Windows, macOS and Linux, IPv4 and IPv6, automatic transport fallback.
 5. `faketls` and browser-like client fingerprint spike, with a written result.
@@ -407,7 +411,7 @@ Complete the docs in both languages, two SDK examples (a minimal custom client, 
 
 1. **Scope.** This is several products. Mitigation: gates, and nothing past Phase 5 starts before the alpha is usable.
 2. **Protocol safety.** The encryption is WireGuard's, which removes the largest risk. What is new (obfuscation, fronting, the control channel) can still leak or be fingerprinted. Mitigation: spec before code, fuzzing, an honest "experimental" label on the obfuscation, outside review before any claim.
-3. **Layer 3 over TCP is slower than a proxy on lossy links.** It is the price of being a real VPN. Mitigation: datagram transports first, automatic fallback, parallel connections, and published measurements instead of promises.
+3. **Layer 3 over TCP is slower than a proxy on lossy links.** It is the price of being a real VPN. Mitigation: datagram transports where the profile and the user put them first, automatic fallback, parallel connections, and published measurements instead of promises.
 4. **Censorship arms race.** Fake TLS, fronting and fingerprint mimicry go stale. Mitigation: transports are plugins, and the client can update its fingerprint without a protocol change.
 5. **Tauri on Android and glass performance.** Mitigation: the Phase 7 spike decides, with a native fallback already named.
 Also: **one maintainer.** Mitigation: boring technology where possible, generated SDKs, tests as the safety net.
