@@ -117,6 +117,127 @@
         ],
         "type": "object"
       },
+      "Control": {
+        "description": "What the control channel of the `veilway` inbounds did since start. Everything but `open` only grows.",
+        "properties": {
+          "accepted": {
+            "description": "TCP connections to the control port that the node took, and those that proved a transport secret of their device.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "auth_failed": {
+            "description": "Connections closed for a wrong credential.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "authenticated": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "byes": {
+            "description": "`bye` messages written before a cut-off or a stop.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exits_dropped": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exits_refused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exits_selected": {
+            "description": "Exit selections that were taken, that were refused, and that a reload dropped.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "malformed": {
+            "description": "Connections closed for a message that was malformed, not allowed where it came, or outside its bounds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mtus_set": {
+            "description": "MTUs that devices set.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "open": {
+            "description": "Authenticated connections open right now.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "probe_runs": {
+            "description": "MTU probe runs that were started, probes from devices that were confirmed, probes the node sent, and datagrams to the probe port that were no probe of a live run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "probes_confirmed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "probes_refused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "probes_sent": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rate_limited": {
+            "description": "Requests answered \"rate limited\".",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "replaced": {
+            "description": "Connections closed to make room for a newer one of the same device.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "timed_out": {
+            "description": "Connections closed because the opening exchange was not done within 10 seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "accepted",
+          "authenticated",
+          "auth_failed",
+          "malformed",
+          "timed_out",
+          "replaced",
+          "rate_limited",
+          "exits_selected",
+          "exits_refused",
+          "exits_dropped",
+          "probe_runs",
+          "probes_confirmed",
+          "probes_sent",
+          "probes_refused",
+          "mtus_set",
+          "byes",
+          "open"
+        ],
+        "type": "object"
+      },
       "Denied": {
         "enum": [
           "disabled",
@@ -178,6 +299,9 @@
           "log": {
             "type": "boolean"
           },
+          "notices": {
+            "type": "boolean"
+          },
           "outbounds": {
             "$ref": "#/components/schemas/Changes"
           },
@@ -210,6 +334,7 @@
           "log",
           "routing_default",
           "rules_reordered",
+          "notices",
           "inbound_changes",
           "user_changes"
         ],
@@ -281,7 +406,7 @@
         "type": "object"
       },
       "Document": {
-        "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\". In a request the marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. An outbound whose server is new or has changed needs its username and password written out.",
+        "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\", and every entry of transport_secrets holds a marker that names it, \"<redacted:\" with eight hex digits and \">\". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out.",
         "type": "object"
       },
       "ErrorBody": {
@@ -619,6 +744,12 @@
       "Session": {
         "description": "A device with a live session on one inbound. The address the device connects from is not part of it.",
         "properties": {
+          "control_connections": {
+            "description": "The authenticated control connections the device has open.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
           "device": {
             "type": "string"
           },
@@ -636,8 +767,25 @@
           "inbound": {
             "type": "string"
           },
+          "mtu": {
+            "description": "The MTU the device set on the control channel. Null for a device that set none, whose tunnel has the `mtu` of its inbound.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "public_key": {
             "type": "string"
+          },
+          "selected_exit": {
+            "description": "The exit the device chose on the control channel for the action `\"user\"`. Null for a device that chose none and leaves through its user's exit.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "transport": {
             "anyOf": [
@@ -661,7 +809,10 @@
           "inbound",
           "transport",
           "handshake_age_secs",
-          "flows"
+          "flows",
+          "selected_exit",
+          "control_connections",
+          "mtu"
         ],
         "type": "object"
       },
@@ -688,6 +839,9 @@
       },
       "Stats": {
         "properties": {
+          "control": {
+            "$ref": "#/components/schemas/Control"
+          },
           "dns": {
             "$ref": "#/components/schemas/Dns"
           },
@@ -757,7 +911,8 @@
           "flows",
           "ws_stalled",
           "ws_refused",
-          "state_write_failures"
+          "state_write_failures",
+          "control"
         ],
         "type": "object"
       },
@@ -983,6 +1138,13 @@
             },
             "type": "array"
           },
+          "devices_secrets_changed": {
+            "description": "Kept devices whose transport secrets changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "lost_access": {
             "description": "The user could connect and no longer can.",
             "type": "boolean"
@@ -997,6 +1159,7 @@
           "devices_removed",
           "devices_readdressed",
           "devices_rekeyed",
+          "devices_secrets_changed",
           "lost_access"
         ],
         "type": "object"

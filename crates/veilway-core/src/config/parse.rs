@@ -1,7 +1,7 @@
 //! Strict JSON reading. serde's own error texts quote the offending value, so nothing here passes one through:
 //! the document is first read into a small tree, then deserialized by a deserializer whose error type only
 //! ever says where the problem is and what was expected.
-use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
+use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, TransportSecret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::de::{self, DeserializeSeed, Deserializer, Expected, IgnoredAny, IntoDeserializer, MapAccess, SeqAccess, Unexpected, Visitor};
@@ -281,6 +281,7 @@ impl Config {
 
 	/// `parse` for a document in which a secret may hold `REDACTED` in the place of its value, which is how the control API shows a config and takes it back.
 	/// The marker stands for the value of the same object in `running`: the `private_key` of the inbound with that tag, the `preshared_key` of the device with that `public_key`,
+	/// each entry of `transport_secrets` of the device with that `public_key` (there the marker carries digits that name one secret of that device, and stands for that one wherever it is in the list, so a list that loses or gains an entry keeps exactly what its markers name),
 	/// and the `username` and `password` of the socks5 outbound with that tag and that `server`. The server is part of it because that is who the node sends them to: kept for another one, they would go to whoever the document names.
 	/// A marker `running` has no value for is an error at the path of its field, and so is the marker anywhere else, where it is no valid value. The result holds the real secrets.
 	/// Next to it come the tags of the outbounds whose `username` or `password` the document spells out, which is what lets a caller say "changed" for them without saying whether they are what runs.
@@ -324,13 +325,26 @@ impl Config {
 		}
 		if let Some(Json::Arr(users)) = root.get_mut("users") {
 			let shared: HashMap<[u8; 32], &Secret<Key>> = running.users.iter().flat_map(|user| &user.devices).filter_map(|device| device.preshared_key.as_ref().map(|key| (device.public_key.0, key))).collect();
+			let secrets: HashMap<[u8; 32], &Vec<TransportSecret>> = running.users.iter().flat_map(|user| &user.devices).filter_map(|device| device.transport_secrets.as_ref().map(|list| (device.public_key.0, list))).collect();
 			for (u, user) in users.iter_mut().enumerate() {
 				let Json::Obj(user) = user else {continue};
 				let Some(Json::Arr(devices)) = user.get_mut("devices") else {continue};
 				for (d, device) in devices.iter_mut().enumerate() {
 					let Json::Obj(device) = device else {continue};
+					let public = named(device, "public_key").and_then(|key| <[u8; 32]>::try_from(STANDARD.decode(key).ok()?).ok());
+					// A marker in the list names one secret of the running device by its digits, and stands for that one, whatever place either has in its list. One that names none of them is an error, and so is the plain marker, which says nothing of which secret is meant.
+					if let Some(Json::Arr(list)) = device.get_mut("transport_secrets") {
+						for (s, secret) in list.iter_mut().enumerate() {
+							let Json::Str(value) = secret else {continue};
+							if !value.starts_with("<redacted") {continue}
+							match public.and_then(|key| secrets.get(&key)).and_then(|kept| kept.iter().find(|kept| super::reload::marker(&kept.0) == *value)) {
+								Some(kept) => *value = STANDARD.encode(kept.0),
+								None => report.error(format!("users[{u}].devices[{d}].transport_secrets[{s}]"), "expected a transport secret: the marker of one names a secret of the running device with this public_key, as the config that was read shows it, and that device has no secret this marker names. A secret that is new has to be sent itself"),
+							}
+						}
+					}
 					if !marked(device, "preshared_key") {continue}
-					match named(device, "public_key").and_then(|key| <[u8; 32]>::try_from(STANDARD.decode(key).ok()?).ok()).and_then(|key| shared.get(&key)) {
+					match public.and_then(|key| shared.get(&key)) {
 						Some(kept) => drop(device.insert("preshared_key".to_string(), Json::Str(STANDARD.encode(kept.expose().0)))),
 						None => report.error(format!("users[{u}].devices[{d}].preshared_key"), "expected a key: the marker stands for the preshared key of the running device with this public_key, and no device runs under it with one"),
 					}

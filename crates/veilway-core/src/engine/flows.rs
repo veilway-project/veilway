@@ -267,7 +267,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 		_ = shared.flows.quiet(key, id, idle) => {
 			// Idle, or ended by a reload. The stack says nothing when its stream is dropped, so an idle TCP flow is reset from here. One a reload ended has had its reset from there, and its entry is gone.
 			tracing::debug!("exit {tag}: a flow to {} was idle for {idle:?} or was ended", plan.show(target));
-			if let Some(reset) = shared.flows.reset(&key, id) {shared.send(&plan, from, &reset).await}
+			if let Some(reset) = shared.flows.reset(&key, id) {shared.send(&plan, from, &reset).await;}
 		}
 	}
 	shared.flows.hold(&key, id, CLOSED_IDLE);

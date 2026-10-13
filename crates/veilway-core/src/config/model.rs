@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_SECRETS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -199,6 +199,23 @@ text_value!(Key, "a WireGuard key: 44 characters of standard base64 with padding
 		_ => Err("a WireGuard key: 44 characters of standard base64 with padding"),
 	}
 }, |key| STANDARD.encode(key.0));
+
+/// A device transport secret as its 32 decoded bytes: uniformly random, and written like a WireGuard key. It is a secret like those inside a `Secret`: `Debug` shows nothing of it, and `Config::redacted` writes a marker in its place.
+/// That marker is not the one of the other secrets. A device may have two of these, and a marker that comes back has to say which of them it stands for, so it names its secret, see `reload::marker`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TransportSecret(pub [u8; 32]);
+
+impl fmt::Debug for TransportSecret {
+	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {f.write_str("TransportSecret(..)")}
+}
+
+text_value!(TransportSecret, "a transport secret: 44 characters of standard base64 with padding", "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", |s| {
+	match STANDARD.decode(s).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+		Some(secret) if s.len() == KEY_CHARS && secret != [0; 32] => Ok(TransportSecret(secret)),
+		Some(_) if s.len() == KEY_CHARS => Err("a secret that is not all zero"),
+		_ => Err("a transport secret: 44 characters of standard base64 with padding"),
+	}
+}, |secret| if REDACTING.get() {super::reload::marker(&secret.0)} else {STANDARD.encode(secret.0)});
 
 /// An address and port: a DNS server or a listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -436,6 +453,28 @@ pub struct Config {
 	pub routing: Routing,
 	#[schemars(length(max = MAX_USERS))]
 	pub users: Vec<User>,
+	/// What the operator tells every device on the control channel of a `veilway` inbound, as plain text.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_NOTICES))]
+	pub notices: Vec<Notice>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeSeverity {#[default] Information, Warning}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Notice {
+	/// Defaults to "information".
+	#[serde(default, skip_serializing_if = "NoticeSeverity::is_information")]
+	pub severity: NoticeSeverity,
+	#[schemars(length(min = 1, max = MAX_NOTICE_BYTES))]
+	pub text: String,
+}
+
+impl NoticeSeverity {
+	fn is_information(&self) -> bool {*self == NoticeSeverity::Information}
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -495,7 +534,12 @@ pub struct DnsSet {
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum InboundType {Wireguard}
+pub enum InboundType {
+	/// Plain WireGuard. Its gateway answers DNS and nothing else.
+	Wireguard,
+	/// The same tunnel with the control channel at its gateway address. Every device with an address in it has a transport secret.
+	Veilway,
+}
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -820,6 +864,10 @@ pub struct Device {
 	pub public_key: Key,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub preshared_key: Option<Secret<Key>>,
+	/// One, or two while the secret is rotated. Needed by a device with an address in a `veilway` inbound.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_TRANSPORT_SECRETS))]
+	pub transport_secrets: Option<Vec<TransportSecret>>,
 	#[schemars(length(min = 1, max = MAX_DEVICE_ADDRESSES))]
 	pub addresses: Vec<Ip>,
 }

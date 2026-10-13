@@ -124,7 +124,7 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 	};
 	for (at, server) in set.servers.iter().enumerate() {
 		let action = route::evaluate(&plan, inbound, user, server.ip(), protocol, 53, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
-		let exit = if let Action::Exit(exit) = action {*exit} else {plan.users[user].exit.unwrap_or(plan.default_exit)};
+		let exit = if let Action::Exit(exit) = action {*exit} else {plan.exit_of(from.device)};
 		let refusal = match (action, &plan.exits[exit].backend) {
 			(Action::Block | Action::Reject, _) => Some(Reason::Rule),
 			// The server is a destination like any other, and the node's own addresses are known only to the host.

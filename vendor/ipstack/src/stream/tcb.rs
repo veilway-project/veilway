@@ -60,6 +60,9 @@ pub(crate) struct Tcb {
     max_count_for_dup_ack: usize,
     rto: std::time::Duration,
     max_retransmit_count: usize,
+    // veilway patch: the largest segment the peer said it takes, in the MSS option of its SYN. Upstream cuts segments to the MTU
+    // of the stack alone, so a peer on a smaller link got segments it had asked not to get.
+    peer_mss: u16,
 }
 
 impl Tcb {
@@ -92,13 +95,23 @@ impl Tcb {
             max_count_for_dup_ack,
             rto,
             max_retransmit_count,
+            peer_mss: u16::MAX,
         }
+    }
+
+    /// veilway patch: takes the MSS option of the peer's SYN. RFC 9293 3.7.1: a sender never sends a segment larger than the
+    /// peer announced. Below 536, the size every host takes, the option is not followed further, so a peer cannot ask for
+    /// its data one byte a packet.
+    pub(super) fn set_peer_mss(&mut self, mss: u16) {
+        self.peer_mss = mss.max(536);
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
-        std::cmp::min(send_window, mtu.saturating_sub(ip_header_size + tcp_header_size))
+        // veilway patch: and never more than the peer's MSS, which counts the payload with the TCP options of a segment.
+        let mss = (self.peer_mss as usize).saturating_sub(tcp_header_size.saturating_sub(20));
+        send_window.min(mtu.saturating_sub(ip_header_size + tcp_header_size)).min(mss)
     }
 
     pub fn update_duplicate_ack_count(&mut self, rcvd_ack: SeqNum) {

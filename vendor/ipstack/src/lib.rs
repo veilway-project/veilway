@@ -20,7 +20,8 @@ mod stream;
 
 pub use self::error::{IpStackError, Result};
 pub use self::stream::{IpStackStream, IpStackTcpStream, IpStackUdpStream, IpStackUnknownTransport};
-pub use self::stream::{TcpConfig, TcpOptions};
+// veilway patch: `TcpSendState`.
+pub use self::stream::{TcpConfig, TcpOptions, TcpSendState};
 pub use etherparse::IpNumber;
 
 #[cfg(unix)]

@@ -102,7 +102,7 @@ fn inbound(tag: &str, restart: bool, stopped: &[usize], started: &[usize]) -> Ve
 	vec![InboundChange {tag: tag.to_string(), restart, transports_stopped: stopped.to_vec(), transports_started: started.to_vec()}]
 }
 
-fn alice() -> UserChange {UserChange {name: "alice".to_string(), devices_added: vec![], devices_removed: vec![], devices_readdressed: vec![], devices_rekeyed: vec![], lost_access: false}}
+fn alice() -> UserChange {UserChange {name: "alice".to_string(), devices_added: vec![], devices_removed: vec![], devices_readdressed: vec![], devices_rekeyed: vec![], devices_secrets_changed: vec![], lost_access: false}}
 
 fn store() -> Store {Store::new(config(&good()), Revision::of(&bytes(&good())), Report::default())}
 
@@ -156,6 +156,7 @@ fn every_category_is_reported() {
 		log: true,
 		routing_default: true,
 		rules_reordered: false,
+		notices: false,
 		inbound_changes: inbound("home", true, &[], &[]),
 		user_changes: vec![UserChange {devices_readdressed: vec![Key([0x21; 32])], ..alice()}],
 	});

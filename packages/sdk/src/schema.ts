@@ -249,6 +249,76 @@ export interface components {
             errors: number;
             stage: components["schemas"]["Stage"];
         };
+        /** @description What the control channel of the `veilway` inbounds did since start. Everything but `open` only grows. */
+        Control: {
+            /**
+             * Format: uint64
+             * @description TCP connections to the control port that the node took, and those that proved a transport secret of their device.
+             */
+            accepted: number;
+            /**
+             * Format: uint64
+             * @description Connections closed for a wrong credential.
+             */
+            auth_failed: number;
+            /** Format: uint64 */
+            authenticated: number;
+            /**
+             * Format: uint64
+             * @description `bye` messages written before a cut-off or a stop.
+             */
+            byes: number;
+            /** Format: uint64 */
+            exits_dropped: number;
+            /** Format: uint64 */
+            exits_refused: number;
+            /**
+             * Format: uint64
+             * @description Exit selections that were taken, that were refused, and that a reload dropped.
+             */
+            exits_selected: number;
+            /**
+             * Format: uint64
+             * @description Connections closed for a message that was malformed, not allowed where it came, or outside its bounds.
+             */
+            malformed: number;
+            /**
+             * Format: uint64
+             * @description MTUs that devices set.
+             */
+            mtus_set: number;
+            /**
+             * Format: uint64
+             * @description Authenticated connections open right now.
+             */
+            open: number;
+            /**
+             * Format: uint64
+             * @description MTU probe runs that were started, probes from devices that were confirmed, probes the node sent, and datagrams to the probe port that were no probe of a live run.
+             */
+            probe_runs: number;
+            /** Format: uint64 */
+            probes_confirmed: number;
+            /** Format: uint64 */
+            probes_refused: number;
+            /** Format: uint64 */
+            probes_sent: number;
+            /**
+             * Format: uint64
+             * @description Requests answered "rate limited".
+             */
+            rate_limited: number;
+            /**
+             * Format: uint64
+             * @description Connections closed to make room for a newer one of the same device.
+             */
+            replaced: number;
+            /**
+             * Format: uint64
+             * @description Connections closed because the opening exchange was not done within 10 seconds.
+             */
+            timed_out: number;
+        };
         /** @enum {string} */
         Denied: "disabled" | "expired" | "quota";
         Device: {
@@ -268,6 +338,7 @@ export interface components {
             inbound_changes: components["schemas"]["InboundChange"][];
             inbounds: components["schemas"]["Changes"];
             log: boolean;
+            notices: boolean;
             outbounds: components["schemas"]["Changes"];
             routing_default: boolean;
             rules: components["schemas"]["Changes"];
@@ -294,7 +365,7 @@ export interface components {
             /** Format: uint64 */
             throttled: number;
         };
-        /** @description A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker "<redacted>". In a request the marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. An outbound whose server is new or has changed needs its username and password written out. */
+        /** @description A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker "<redacted>", and every entry of transport_secrets holds a marker that names it, "<redacted:" with eight hex digits and ">". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out. */
         Document: Record<string, never>;
         /** @description The one shape of every answer that is not a success. */
         ErrorBody: {
@@ -410,6 +481,11 @@ export interface components {
         };
         /** @description A device with a live session on one inbound. The address the device connects from is not part of it. */
         Session: {
+            /**
+             * Format: uint
+             * @description The authenticated control connections the device has open.
+             */
+            control_connections: number;
             device: string;
             /**
              * Format: uint
@@ -419,7 +495,14 @@ export interface components {
             /** Format: uint64 */
             handshake_age_secs: number;
             inbound: string;
+            /**
+             * Format: uint16
+             * @description The MTU the device set on the control channel. Null for a device that set none, whose tunnel has the `mtu` of its inbound.
+             */
+            mtu: number | null;
             public_key: string;
+            /** @description The exit the device chose on the control channel for the action `"user"`. Null for a device that chose none and leaves through its user's exit. */
+            selected_exit: string | null;
             /** @description Null when the transport the device came over is gone. */
             transport: components["schemas"]["Transport"] | null;
             user: string;
@@ -430,6 +513,7 @@ export interface components {
         /** @enum {string} */
         Stage: "validate" | "prepare";
         Stats: {
+            control: components["schemas"]["Control"];
             dns: components["schemas"]["Dns"];
             /** @description Packets that were not carried since start, by reason. */
             drops: {
@@ -529,6 +613,8 @@ export interface components {
             devices_readdressed: string[];
             devices_rekeyed: string[];
             devices_removed: string[];
+            /** @description Kept devices whose transport secrets changed. */
+            devices_secrets_changed: string[];
             /** @description The user could connect and no longer can. */
             lost_access: boolean;
             name: string;

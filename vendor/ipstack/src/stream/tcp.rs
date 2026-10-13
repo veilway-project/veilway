@@ -174,6 +174,20 @@ pub struct IpStackTcpStream {
     config: Arc<TcpConfig>,
 }
 
+/// veilway patch: the sequence numbers of one connection, readable while its stream is held by a task that cannot be asked.
+/// The node ends a control connection of a device it cuts off with one segment it builds itself, and that segment has to
+/// follow whatever the stack has sent, acknowledged or not.
+#[derive(Clone)]
+pub struct TcpSendState(std::sync::Arc<std::sync::Mutex<Tcb>>);
+
+impl TcpSendState {
+    /// The sequence number of the next byte the stack would send, and the one it expects from the peer next.
+    pub fn next(&self) -> (u32, u32) {
+        let tcb = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (tcb.get_seq().0, tcb.get_ack().0)
+    }
+}
+
 impl IpStackTcpStream {
     pub(crate) fn new(
         src_addr: SocketAddr,
@@ -184,7 +198,7 @@ impl IpStackTcpStream {
         destroy_messenger: Option<::tokio::sync::oneshot::Sender<()>>,
         config: Arc<TcpConfig>,
     ) -> Result<IpStackTcpStream, IpStackError> {
-        let tcb = Tcb::new(
+        let mut tcb = Tcb::new(
             SeqNum(tcp.sequence_number),
             mtu,
             config.max_unacked_bytes,
@@ -193,6 +207,13 @@ impl IpStackTcpStream {
             config.rto,
             config.max_retransmit_count,
         );
+        // veilway patch: the peer's MSS bounds every segment sent to it, see `Tcb::set_peer_mss`.
+        if let Some(mss) = tcp.options_iterator().find_map(|option| match option {
+            Ok(TcpOptionElement::MaximumSegmentSize(mss)) => Some(mss),
+            _ => None,
+        }) {
+            tcb.set_peer_mss(mss);
+        }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
             if !tcp.rst
@@ -259,6 +280,12 @@ impl IpStackTcpStream {
     /// ```
     pub fn local_addr(&self) -> SocketAddr {
         self.src_addr
+    }
+
+    /// veilway patch: a handle on where this connection stands, for whoever has to write its last segment without the
+    /// stream, see `TcpSendState`.
+    pub fn send_state(&self) -> TcpSendState {
+        TcpSendState(self.tcb.clone())
     }
 
     /// Returns the remote socket address of the TCP connection.

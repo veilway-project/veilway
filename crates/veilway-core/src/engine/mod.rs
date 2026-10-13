@@ -1,5 +1,6 @@
 //! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to.
 //! Only an `l3` exit uses a TUN device and kernel routing, and only for the flows that were routed to it.
+pub mod control;
 pub mod dns;
 mod flows;
 pub mod gate;
@@ -14,6 +15,7 @@ pub mod resolver;
 pub mod route;
 pub mod usage;
 
+pub use control::ControlTotals;
 pub use plan::{Denied, Plan};
 pub use route::Reason;
 
@@ -24,6 +26,7 @@ use route::Flows;
 use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
@@ -89,6 +92,12 @@ pub struct Peer {
 	pub over: Option<Over>,
 	/// The flows the device has in the flow table, through all its inbounds together.
 	pub flows: usize,
+	/// The exit the device chose on the control channel for the action `"user"`. None for a device that chose none, which leaves through its user's exit.
+	pub exit: Option<String>,
+	/// The authenticated control connections the device has open, through all its inbounds together.
+	pub control: usize,
+	/// The MTU the device set on the control channel. None for a device that set none, whose tunnel has the `mtu` of its inbound.
+	pub mtu: Option<u16>,
 }
 
 /// What the engine knows of the upstream of one exit, as `Engine::exit_health` gives it.
@@ -118,10 +127,12 @@ pub struct Options {
 	pub allow_readable: bool,
 	/// The state file, which carries every user's usage across restarts, see `usage`. It is not relative to `dir`. Without one usage is kept in memory and gone with the process.
 	pub state: Option<PathBuf>,
+	/// The range, in milliseconds, the control channel draws the shortest time between two `usage` pushes of one connection from. It is `veilway_proto::control::USAGE_PUSH`, 30 to 90 s, and tests replace it so as not to wait that long.
+	pub usage_push: RangeInclusive<u32>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, usage_push: veilway_proto::control::USAGE_PUSH}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -204,10 +215,12 @@ pub struct UserState {
 	names: Mutex<Names>,
 	/// The queries of the user that may still wait for an upstream at once.
 	in_flight: Semaphore,
+	/// Bytes of the control channel's own inner packets, which are in `traffic` and in `used` like any others. They are counted once more here so that the channel can tell what the user carried from what it sent itself.
+	control: AtomicU64,
 }
 
 impl Default for UserState {
-	fn default() -> UserState {UserState {traffic: Traffic::default(), used: AtomicU64::new(0), since: AtomicI64::new(0), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT)}}
+	fn default() -> UserState {UserState {traffic: Traffic::default(), used: AtomicU64::new(0), since: AtomicI64::new(0), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT), control: AtomicU64::new(0)}}
 }
 
 impl UserState {
@@ -252,6 +265,7 @@ pub struct Shared {
 	/// Writes of the state file that failed since start.
 	unwritten: AtomicU64,
 	events: broadcast::Sender<Event>,
+	control: control::Channel,
 }
 
 impl Shared {
@@ -305,7 +319,9 @@ impl Drop for Engine {
 impl Engine {
 	/// Stops the l3 exit and removes its interface, routes and firewall rules from the host, then writes the state file one last time. Everything else the engine holds goes with the process.
 	/// The host comes first and the write is given `usage::LAST_WRITE` and no longer: a disk that hangs must not leave the firewall rules of a node that is going away in place.
+	/// Before any of that every open control connection is told to say `bye`, on a best effort: the byes are given `control::BYE_WAIT` to leave and no longer.
 	pub async fn shutdown(self) {
+		if self.shared.dismiss() > 0 {tokio::time::sleep(control::BYE_WAIT).await}
 		let wired = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 		if let Some(wired) = wired {wired.running.close().await}
 		if tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, true)).await.is_err() {tracing::error!("the state file was not written within {}s of the shutdown, so usage since its last write is lost", usage::LAST_WRITE.as_secs())}
@@ -388,7 +404,7 @@ impl Engine {
 			};
 			out.extend(asked.iter().zip(seen).map(|(at, (handshake, over))| {
 				let device = &plan.devices[*at];
-				Peer {user: plan.users[device.user].name.clone(), device: device.name.clone(), public_key: device.public_key, inbound: inbound.tag.clone(), handshake, over, flows: flows.as_ref().map_or_else(|| self.shared.flows.of_device(&device.public_key), |flows| flows.get(&device.public_key).copied().unwrap_or(0))}
+				Peer {user: plan.users[device.user].name.clone(), device: device.name.clone(), public_key: device.public_key, inbound: inbound.tag.clone(), handshake, over, flows: flows.as_ref().map_or_else(|| self.shared.flows.of_device(&device.public_key), |flows| flows.get(&device.public_key).copied().unwrap_or(0)), exit: plan.chosen(*at, device.control.selected().as_deref()).map(|exit| plan.exits[exit].tag.clone()), control: device.control.open(), mtu: device.control.mtu()}
 			}));
 		}
 		out
@@ -471,6 +487,9 @@ impl Engine {
 		DnsTotals {answered: resolver.answered.load(Ordering::Relaxed), refused: resolver.refused.load(Ordering::Relaxed), failed: resolver.failed.load(Ordering::Relaxed), malformed: resolver.malformed.load(Ordering::Relaxed), throttled: resolver.throttled.load(Ordering::Relaxed)}
 	}
 
+	/// What the control channel of the `veilway` inbounds did since start.
+	pub fn control(&self) -> ControlTotals {self.shared.control.totals()}
+
 	/// Names the node remembers for a user right now: those the user resolved through it whose answer has not expired.
 	pub fn dns_names(&self, user: &str) -> Option<usize> {self.plan().users.iter().find(|u| u.name == user).map(|user| user.state.names().names(Instant::now()))}
 
@@ -498,12 +517,12 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	store.allow_readable = options.allow_readable;
 	// What the state file remembers goes in as the users of a plan that was never in force. The first plan takes each user's state from it by name, the way every later plan takes it from the one before, and a name the config no longer has is left behind.
 	// A path the node may not write to is no path from here on: usage then lives in memory, as it does without a state file.
-	let (remembered, state) = options.state.map_or((Vec::new(), None), |path| {
-		let (users, writable) = usage::load(&path);
-		(users, writable.then_some(path))
+	let (remembered, chosen, state) = options.state.map_or((Vec::new(), Vec::new(), None), |path| {
+		let (users, devices, writable) = usage::load(&path);
+		(users, devices, writable.then_some(path))
 	});
-	let remembered = Plan {users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
-	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS)});
+	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
+	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(options.usage_push)});
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind.
 	let mut host = Host::new(options.dir);
 	let staged = host.prepare(&shared, &store.current().config, &[]).await?;
@@ -517,7 +536,10 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 				tokio::select! {
 					_ = tick.tick() => {
 						ticks = ticks.wrapping_add(1);
-						if ticks % SWEEP_EVERY == 0 {shared.flows.sweep()}
+						if ticks % SWEEP_EVERY == 0 {
+							shared.flows.sweep();
+							shared.tend();
+						}
 					}
 					_ = shared.over.notified() => {}
 				}

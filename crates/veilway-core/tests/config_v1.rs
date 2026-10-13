@@ -297,7 +297,7 @@ fn unknown_keys_and_values_are_refused_as_possibly_newer() {
 	assert!(refused("", |d| d["a\u{202e}b\n"] = json!(1)).contains("unknown key \"a\\u{202e}b\\n\""));
 	for message in [
 		refused("log.level", |d| d["log"] = json!({"level": "loud"})),
-		refused("inbounds[0].type", |d| d["inbounds"][0]["type"] = json!("veilway")),
+		refused("inbounds[0].type", |d| d["inbounds"][0]["type"] = json!("openvpn")),
 		refused("inbounds[0].transports[0].type", |d| d["inbounds"][0]["transports"][0]["type"] = json!("quic")),
 		refused("outbounds[1].type", |d| d["outbounds"][1]["type"] = json!("http")),
 		refused("exits[0].backend.type", |d| d["exits"][0]["backend"]["type"] = json!("tun")),

@@ -2,7 +2,7 @@
 use crate::{uniform, NoRandom, Random};
 use std::{ops::RangeInclusive, time::Duration};
 
-/// "First tunnel packet deadline: 10 s after the proof was accepted." A pending session that is not established by then is ended.
+/// "First tunnel packet deadline: 10 s after the proof was accepted." A pending session that is not established by then is ended. The node sends nothing on a pending session: its first answer goes out at the moment the session is established.
 pub const FIRST_PACKET: Duration = Duration::from_secs(10);
 /// "A device may have 2 pending sessions, and further proofs are refused while it has."
 pub const PENDING: usize = 2;
@@ -12,7 +12,7 @@ pub const LIVENESS: Duration = Duration::from_secs(10);
 pub const KEEPALIVE: RangeInclusive<u32> = 20_000..=40_000;
 /// The bounds inside which a profile may set the idle keepalive range, in milliseconds.
 pub const KEEPALIVE_BOUNDS: RangeInclusive<u32> = 10_000..=60_000;
-/// The node's echo of a lone keepalive goes out after a delay drawn from this range, in milliseconds.
+/// The node's echo of a lone keepalive goes out after a delay drawn from this range, in milliseconds, unless the node sent something else in that time. Only an established session is echoed to.
 pub const ECHO: RangeInclusive<u32> = 0..=3_000;
 /// A chunk that would hold exactly one WireGuard keepalive is held back for a delay drawn from this range, in milliseconds.
 pub const LONE_KEEPALIVE: RangeInclusive<u32> = 0..=3_000;

@@ -1,9 +1,10 @@
 //! One inbound at run time: its WireGuard tunnel, the sockets it is reached over, and the path every decrypted packet takes before it may go anywhere.
 use super::icmp::{self, Kind};
 use super::netstack::{self, Packet};
+use super::netstack::Fit;
 use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
-use super::{flows, gate, l3, resolver, Over, Shared};
+use super::{control, flows, gate, l3, resolver, Over, Shared};
 use crate::config::Protocol;
 use ipstack::{IpStack, IpStackStream};
 use std::net::SocketAddr;
@@ -12,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::AbortHandle;
+use veilway_proto::control::PORT;
 use veilway_wg::{Wg, MAX_PACKET};
 
 const TIMER_EVERY: Duration = Duration::from_millis(250);
@@ -53,18 +55,31 @@ impl Shared {
 	/// Encrypts one IP packet for the device that holds an address and sends it where that device was last heard from.
 	/// The device is found by its public key, so a holder from a plan that has been replaced never reaches whoever took its place.
 	/// A device without a live session is sent nothing: a peer that is given a packet then keeps it for the next handshake, and a device that was cut off or has only just been added would get what was meant for the session before.
-	pub(super) async fn send(&self, plan: &Plan, to: Holder, packet: &[u8]) {
+	/// A packet above the MTU the device set on the control channel is one the node wrote or forwards as its sender would have: it is fragmented the way the sending host does it, IPv4 or IPv6 (control channel page, "What the node does with a device's MTU").
+	/// That covers what the stack of a netstack exit builds, UDP and TCP alike: the stack cuts its segments to the inbound's `mtu` and knows nothing of a device's. Whoever forwards a packet somebody else sent decides by `netstack::forward` before it comes here.
+	/// A device that set no MTU is sent every packet as it is, as before there was a control channel. The answer is the bytes that went into the tunnel, fragment headers included, and 0 for a device without a session.
+	pub(super) async fn send(&self, plan: &Plan, to: Holder, packet: &[u8]) -> usize {
+		let Some(mtu) = plan.devices[to.device].control.mtu().filter(|mtu| packet.len() > usize::from(*mtu)) else {return self.transmit(plan, to, packet).await};
+		let (pieces, mut sent) = (netstack::fragments(packet, mtu, Some(plan.devices[to.device].control.fragment())), 0);
+		if pieces.is_empty() {self.count(Reason::TooBig)}
+		for piece in &pieces {sent += self.transmit(plan, to, piece).await}
+		sent
+	}
+
+	/// `send` for a packet that goes out whole whatever MTU the device set: an MTU probe, and what `send` has cut to fit.
+	pub(super) async fn transmit(&self, plan: &Plan, to: Holder, packet: &[u8]) -> usize {
 		let (inbound, device, mut out) = (&plan.inbounds[to.inbound], &plan.devices[to.device], Vec::new());
 		let route = {
 			let mut peers = inbound.tunnel.lock();
-			let Some(peer) = peers.wg.index(&device.public_key).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {return};
+			let Some(peer) = peers.wg.index(&device.public_key).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {return 0};
 			peers.wg.encapsulate(peer, packet, &mut out);
 			peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade()))
 		};
-		let Some((endpoint, socket)) = route else {return};
+		let Some((endpoint, socket)) = route else {return 0};
 		self.spend(&plan.users[device.user], false, packet.len());
 		inbound.traffic.down(packet.len());
 		for datagram in &out {let _ = socket.send_to(datagram, endpoint).await;}
+		packet.len()
 	}
 
 	/// Sends the device that sent `raw` the ICMP error for it, from the gateway of the tunnel it came through, which is the router that turned it away. Each device is sent only so many, see `icmp::Limit`.
@@ -72,7 +87,7 @@ impl Shared {
 		let Some(gateway) = plan.inbounds[to.inbound].pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == packet.src.is_ipv4()) else {return};
 		let Some(error) = icmp::error(raw, packet, kind, gateway, &plan.pools) else {return};
 		if !plan.devices[to.device].limit.lock().unwrap_or_else(|e| e.into_inner()).take(Instant::now()) {return self.count(Reason::IcmpLimited)}
-		self.send(plan, to, &error).await
+		self.send(plan, to, &error).await;
 	}
 
 	/// Counts a packet that is not carried. When the flow is to be answered, TCP gets a reset and everything else the ICMP error that matches the reason.
@@ -80,7 +95,7 @@ impl Shared {
 		self.count(reason);
 		if !answer {return}
 		if packet.protocol == Protocol::TCP {
-			if let Some(rst) = netstack::tcp_rst(raw) {self.send(plan, from, &rst).await}
+			if let Some(rst) = netstack::tcp_rst(raw) {self.send(plan, from, &rst).await;}
 			return;
 		}
 		let kind = match (reason, packet.protocol) {
@@ -94,14 +109,16 @@ impl Shared {
 		self.icmp_error(plan, from, raw, packet, kind).await
 	}
 
-	/// What is to be done with a flow of `user` that came in on inbound `at`, by the gate, the rules and the exits of `plan`. `names` is what the user had resolved to the destination when the flow began.
+	/// What is to be done with a flow of `device` that came in on inbound `at`, by the gate, the rules and the exits of `plan`. `names` is what the user had resolved to the destination when the flow began.
 	/// A new flow is decided here from its first packet, and when the plan changes every live flow is decided again from its key, so the two can never disagree.
-	pub(super) fn decide(&self, plan: &Plan, at: usize, user: usize, key: &Key, names: &[Arc<str>]) -> Decision {
-		let (transport, gateway) = (key.protocol == Protocol::TCP || key.protocol == Protocol::UDP, plan.is_gateway(key.dst));
+	pub(super) fn decide(&self, plan: &Plan, at: usize, device: usize, key: &Key, names: &[Arc<str>]) -> Decision {
+		let (transport, gateway, user) = (key.protocol == Protocol::TCP || key.protocol == Protocol::UDP, plan.is_gateway(key.dst), plan.devices[device].user);
+		// Before the rules and before any exit, the way gateway DNS is: no rule can block, redirect or open it, and `dns.hijack` has nothing to say about it. Only the gateway of the inbound the flow came in through answers, and only on a `veilway` inbound.
+		if key.protocol == Protocol::TCP && key.dport == PORT && plan.control(at, key.dst) {return Decision::Control}
 		// A flow of ICMP is known by its type and code, which stand where the ports of another flow do.
 		let icmp = (key.protocol == Protocol::ICMP || key.protocol == Protocol::ICMPV6).then_some((key.sport as u8, key.dport as u8));
 		let dport = if icmp.is_some() {0} else {key.dport};
-		// A gateway answers DNS and nothing else. With hijack on, every UDP and TCP port 53 flow is DNS for the node wherever it was sent.
+		// A gateway answers DNS, the control channel on a `veilway` inbound, and nothing else. With hijack on, every UDP and TCP port 53 flow is DNS for the node wherever it was sent.
 		let dns = dport == 53 && transport && (gateway || plan.hijack);
 		let local = !dns && !gateway && plan.pool_of(key.dst).is_some();
 		if (gateway && !dns) || (!dns && !local && gate::refused(key.dst, &plan.pools)) {return Decision::Refuse {reason: Reason::Gate, reset: true}}
@@ -109,7 +126,7 @@ impl Shared {
 		if dns {return Decision::Dns}
 		// A flow may only leave through an exit in its user's `exits`, whatever chose it. That is final: the flow is rejected and never falls through to another rule.
 		let entitled = |exit: usize| plan.users[user].entitled.as_ref().is_none_or(|list| list.contains(&exit));
-		match route::evaluate(plan, at, user, key.dst, key.protocol, dport, icmp, &|patterns| names.iter().any(|name| patterns.iter().any(|pattern| pattern.matches(name)))) {
+		match self.action(plan, at, user, key, names) {
 			Action::Block => Decision::Refuse {reason: Reason::Rule, reset: false},
 			Action::Reject => Decision::Refuse {reason: Reason::Rule, reset: true},
 			// Traffic between users never leaves through an exit: any outcome but a refusal is delivery inside the node.
@@ -117,7 +134,7 @@ impl Shared {
 			// The node's own addresses are known only to the host.
 			_ if (self.is_local)(key.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 			action => {
-				let exit = if let Action::Exit(exit) = action {*exit} else {plan.users[user].exit.unwrap_or(plan.default_exit)};
+				let exit = if let Action::Exit(exit) = action {*exit} else {plan.exit_of(device)};
 				match &plan.exits[exit].backend {
 					_ if !entitled(exit) => Decision::Refuse {reason: Reason::Entitlement, reset: true},
 					Backend::Block => Decision::Refuse {reason: Reason::BlockExit, reset: false},
@@ -160,15 +177,19 @@ impl Shared {
 		let gateway = plan.is_gateway(packet.dst);
 		let dns = packet.dport == 53 && transport && (gateway || plan.hijack);
 		let local = !dns && !gateway && plan.pool_of(packet.dst).is_some();
+		// The control channel of a `veilway` inbound, at the gateway the packet came in through. Its UDP port takes MTU probes and nothing else, and answers none of them over UDP, so a datagram to it is no flow.
+		let control = transport && packet.dport == PORT && plan.control(at, packet.dst);
+		if control && packet.protocol == Protocol::UDP {return self.probed(plan, from, &raw, &packet)}
+		if control {self.own(&plan.users[user], raw.len())}
 		// The gate is asked for every packet, so what it refuses takes no place in the flow table.
-		if (gateway && !dns) || (!dns && !local && gate::refused(packet.dst, &plan.pools)) {return self.refuse(plan, from, &raw, &packet, Reason::Gate, true).await}
+		if !control && ((gateway && !dns) || (!dns && !local && gate::refused(packet.dst, &plan.pools))) {return self.refuse(plan, from, &raw, &packet, Reason::Gate, true).await}
 		let (key, heard) = (Key::of(&packet), if packet.protocol == Protocol::TCP {route::heard(&raw, packet.upper)} else {None});
 		// The answer to a flow that was delivered between users belongs to that flow, whatever the rules say about the other direction.
 		// It is looked for first: a refusal remembered for this side's own earlier try must not shut the answer out.
 		let (id, decision) = if local && key.reversed().and_then(|back| self.flows.get(&back, plan.generation, None)).is_some_and(|(_, decision)| decision == Decision::Deliver) {(0, Decision::Deliver)}
 		else if let Some(known) = self.flows.get(&key, plan.generation, heard) {known} else {
-			let names = if dns {Vec::new()} else {plan.users[user].state.names().of(packet.dst, Instant::now())};
-			let decision = self.decide(plan, at, user, &key, &names);
+			let names = if dns || control {Vec::new()} else {plan.users[user].state.names().of(packet.dst, Instant::now())};
+			let decision = self.decide(plan, at, device, &key, &names);
 			let id = match self.flows.insert(key, plan.devices[device].public_key, &plan.users[user].name, decision, names, heard, plan.generation) {
 				Ok(id) => id,
 				Err(reason) => return self.count(reason),
@@ -196,11 +217,22 @@ impl Shared {
 						self.count(Reason::TooBig);
 						self.icmp_error(plan, from, &raw, packet, Kind::TooBig(plan.inbounds[to.inbound].mtu)).await
 					}
-					Some(to) => self.send(plan, to, &raw).await,
+					// A device that set a smaller MTU is a link of that size: what may be fragmented is, and the sender of the rest is told. The MTU is read once, and what was decided by it goes out as decided.
+					Some(to) => {
+						let mtu = plan.mtu_of(to);
+						match netstack::forward(&raw, mtu) {
+							Fit::Whole => drop(self.transmit(plan, to, &raw).await),
+							Fit::Pieces(pieces) => for piece in &pieces {self.transmit(plan, to, piece).await;},
+							Fit::TooBig => {
+								self.count(Reason::TooBig);
+								self.icmp_error(plan, from, &raw, packet, Kind::TooBig(mtu)).await
+							}
+						}
+					}
 					None => self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await,
 				}
 			}
-			Decision::Dns => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)},
+			Decision::Dns | Decision::Control => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)},
 			Decision::Exit {exit, by} => {
 				// An exit counts a packet where the packet is handed to it, so one that is dropped on the way counts for none, and only the exit that carries it counts it: what a `via` hands on is the traffic of the exit it was handed to.
 				let (carrier, len) = (if let By::Via(target) = by {target} else {exit}, raw.len());
@@ -278,7 +310,23 @@ impl Shared {
 		}
 		// For this exit alone, which carried it, whichever exit the rules chose for the flow.
 		plan.exits[exit].traffic.down(raw.len());
-		self.send(plan, to, &raw).await
+		// The device may have set a smaller MTU than its inbound has, and then the node is the router in front of a link of that size: IPv4 that allows it is fragmented, and the sender of anything else is sent "fragmentation needed" or "packet too big" with that MTU,
+		// from the gateway of the device's tunnel, back through the interface the packet came in by and within the ICMP errors the device may cause. Whether that error reaches the sender is the host's forwarding and NAT to say: with `masquerade` the kernel has to take it for an answer to the flow it translates.
+		let mtu = plan.mtu_of(to);
+		match netstack::forward(&raw, mtu) {
+			Fit::Whole => drop(self.transmit(plan, to, &raw).await),
+			Fit::Pieces(pieces) => for piece in &pieces {self.transmit(plan, to, piece).await;},
+			Fit::TooBig => {
+				self.count(Reason::TooBig);
+				let gateway = plan.inbounds[to.inbound].pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == packet.src.is_ipv4());
+				let Some(error) = gateway.and_then(|gateway| icmp::error(&raw, &packet, Kind::TooBig(mtu), gateway, &plan.pools)) else {return};
+				// A share of its own: whoever sends the device large packets from outside must not use up the errors the device is owed for what it sends itself.
+				if !plan.devices[to.device].control.outside() {return self.count(Reason::IcmpLimited)}
+				let (Some((_, port)), len) = (plan.l3.as_ref().filter(|(wired, _)| *wired == exit), error.len()) else {return};
+				// It leaves through the exit towards a sender outside the tunnel, so the exit counts it and the user, whose tunnel never carries it, does not.
+				if port.to.try_send(error).is_ok() {plan.exits[exit].traffic.up(len)} else {self.count(Reason::QueueFull)}
+			}
+		}
 	}
 }
 
@@ -327,7 +375,9 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 				};
 				// A datagram was counted when the handler of its flow took it from an outbound. A TCP flow is always carried by the exit the rules chose.
 				if let (Protocol::TCP, Decision::Exit {exit, ..}) = (packet.protocol, decision) {plan.exits[exit].traffic.down(raw.len())}
-				shared.send(&plan, to, &raw).await;
+				// What the control channel sends is counted as its own with the bytes that really went out, the headers of fragments included.
+				let sent = shared.send(&plan, to, &raw).await;
+				if decision == Decision::Control {shared.own(&plan.users[plan.devices[to.device].user], sent)}
 			}
 		}
 	});
@@ -370,6 +420,7 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 				match shared.flows.get(&key, plan.generation, None) {
 					Some((id, Decision::Exit {exit, by})) => drop(tokio::spawn(flows::run(shared.clone(), plan, key, id, exit, by, from, stream, mtu))),
 					Some((id, Decision::Dns)) => drop(tokio::spawn(resolver::serve(shared.clone(), key, id, plan.devices[from.device].public_key, stream, mtu))),
+					Some((id, Decision::Control)) => drop(tokio::spawn(control::serve(shared.clone(), key, id, plan.devices[from.device].public_key, stream))),
 					_ => {}
 				}
 			}

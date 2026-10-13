@@ -271,6 +271,9 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 			Over::Ws => model::Transport::Ws,
 		}),
 		flows: peer.flows,
+		selected_exit: peer.exit,
+		control_connections: peer.control,
+		mtu: peer.mtu,
 	})).collect()})
 }
 
@@ -426,7 +429,7 @@ impl Api {
 			let (up, down) = rates.get(&(kind, name)).copied().unwrap_or_default();
 			model::Rated {name: name.to_string(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down}
 		};
-		let dns = self.engine.dns();
+		let (dns, control) = (self.engine.dns(), self.engine.control());
 		model::Stats {
 			window_secs: window,
 			users: counters.users.iter().map(|usage| rated(crate::USER, &usage.name, usage.traffic)).collect(),
@@ -438,6 +441,7 @@ impl Api {
 			ws_stalled: self.engine.ws_stalled(),
 			ws_refused: self.engine.ws_refused(),
 			state_write_failures: self.engine.state_write_failures(),
+			control: model::Control {accepted: control.accepted, authenticated: control.authenticated, auth_failed: control.auth_failed, malformed: control.malformed, timed_out: control.timed_out, replaced: control.replaced, rate_limited: control.rate_limited, exits_selected: control.exits_selected, exits_refused: control.exits_refused, exits_dropped: control.exits_dropped, probe_runs: control.probe_runs, probes_confirmed: control.probes_confirmed, probes_sent: control.probes_sent, probes_refused: control.probes_refused, mtus_set: control.mtus_set, byes: control.byes, open: control.open},
 		}
 	}
 }
