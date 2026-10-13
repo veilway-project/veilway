@@ -253,6 +253,8 @@ Rules for building it:
 | `ws` | WebSocket over TLS, works behind CDNs and reverse proxies | v1. The legacy format on `wireguard` inbounds is already implemented, the native `ws` on `veilway` inbounds is new in version 1 |
 | `faketls` | REALITY-style: the server borrows the handshake of a real third-party site, clients prove themselves inside the ClientHello, everyone else is forwarded to that site. No domain or certificate needed | v1 after a spike |
 | `fronted` | HTTP through a CDN with fronting options, see below | v1 |
+| `ws-plain` | WebSocket with no TLS between the client and the front, for networks where TLS to a front is throttled or filtered by name and plain HTTP passes. A transport type of its own with its own key, path and consent, the weakest obfuscated option. The provider may give it an appearance: frames dressed as media, which costs almost nothing, or as text of a web page, which is slow and a last resort. The content stays sealed either way, and neither is called undetectable | v1 if its design passes review, the appearances after it |
+| `dns` | The tunnel carried in DNS queries and answers to a name the operator delegates to the node, through the resolvers a network still allows. Very slow, and it puts load on resolvers that belong to others, so it is the transport for when nothing else is left | Later, after a design with its own review: what it costs third-party resolvers, and what a resolver sees |
 | `quic` | QUIC datagrams, shaped like HTTP/3 (the standard for IP over HTTP/3 is MASQUE CONNECT-IP, RFC 9484) | Later |
 
 **Domain fronting, built in.** For networks where the server's address or name is blocked outright, every TLS-based transport takes the same set of fronting options instead of hard-coding one trick:
