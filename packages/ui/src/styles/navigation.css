@@ -1,0 +1,85 @@
+/* The shell measures itself, not the screen: a 380px client window on a wide desktop gets the bar, a browser tab gets the rail. */
+.vw-shell { container: shell / inline-size; }
+.vw-shell-grid { display: flex; flex-direction: column; min-block-size: 100%; }
+.vw-shell-main { flex: 1; display: grid; align-content: start; gap: var(--s-5); min-inline-size: 0; padding: var(--s-4) var(--s-4) var(--s-5); }
+/* Bar: the default, under the content. The page scrolls beneath it. */
+.vw-nav { z-index: 20; padding: var(--s-1); }
+.vw-nav[data-layout="auto"] { order: 2; position: sticky; inset-block-end: var(--s-2); margin: 0 var(--s-2) var(--s-2); }
+.vw-nav ul { display: grid; grid-auto-flow: var(--nav-flow, column); grid-auto-columns: minmax(0, 1fr); gap: var(--s-1); }
+.vw-nav-header { display: var(--nav-header, none); padding: var(--s-2) var(--s-2) var(--s-3); }
+.vw-nav-item {
+	position: relative;
+	display: flex;
+	flex-direction: var(--nav-item-direction, column);
+	align-items: center;
+	justify-content: var(--nav-item-justify, center);
+	gap: var(--nav-item-gap, 2px);
+	inline-size: 100%;
+	min-block-size: var(--nav-item-height, 52px);
+	padding-block: var(--nav-item-pad-block, var(--s-2) var(--s-1));
+	padding-inline: var(--nav-item-pad-inline, 2px);
+	border: 0;
+	border-radius: var(--r-2);
+	background: none;
+	color: var(--c-text-muted);
+	font-size: var(--nav-item-size, var(--text-1));
+	line-height: var(--leading-tight);
+	text-align: start;
+	cursor: pointer;
+	transition: background-color var(--dur-1) var(--ease);
+}
+.vw-nav-item span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-inline-size: 100%; }
+.vw-nav-item:hover { background: var(--hover); color: var(--c-text); }
+.vw-nav-item[aria-current="page"] { background: var(--hover); color: var(--c-text); font-weight: var(--weight-strong); }
+.vw-nav-item[aria-current="page"] .vw-icon { color: var(--c-accent-ink); }
+/* The mark on the current item is one stroke of the app icon, at the icon's slant. */
+.vw-nav-item[aria-current="page"]::after {
+	content: "";
+	position: absolute;
+	inset-block-start: var(--nav-mark-top, 0);
+	inset-inline-start: var(--nav-mark-start, calc(50% - 9px));
+	inline-size: var(--nav-mark-width, 18px);
+	block-size: var(--nav-mark-height, 3px);
+	background: var(--c-accent-ink);
+	transform: skewX(calc(-1 * var(--slant)));
+}
+.vw-nav[data-layout="rail"] {
+	--nav-flow: row;
+	--nav-header: block;
+	--nav-item-direction: row;
+	--nav-item-justify: flex-start;
+	--nav-item-gap: var(--s-3);
+	--nav-item-height: 40px;
+	--nav-item-pad-block: 0;
+	--nav-item-pad-inline: var(--s-4) var(--s-3);
+	--nav-item-size: var(--text-3);
+	--nav-mark-top: calc(50% - 9px);
+	--nav-mark-start: 5px;
+	--nav-mark-width: 4px;
+	--nav-mark-height: 18px;
+	padding: var(--s-2);
+}
+@container shell (min-width: 760px) {
+	.vw-shell-grid { display: grid; grid-template-columns: 224px minmax(0, 1fr); gap: var(--s-5); padding: var(--s-4); }
+	.vw-shell-main { padding: 0 0 var(--s-6); }
+	.vw-nav[data-layout="auto"] {
+		--nav-flow: row;
+		--nav-header: block;
+		--nav-item-direction: row;
+		--nav-item-justify: flex-start;
+		--nav-item-gap: var(--s-3);
+		--nav-item-height: 40px;
+		--nav-item-pad-block: 0;
+		--nav-item-pad-inline: var(--s-4) var(--s-3);
+		--nav-item-size: var(--text-3);
+		--nav-mark-top: calc(50% - 9px);
+		--nav-mark-start: 5px;
+		--nav-mark-width: 4px;
+		--nav-mark-height: 18px;
+		order: 0;
+		align-self: start;
+		inset-block: var(--s-4) auto;
+		margin: 0;
+		padding: var(--s-2);
+	}
+}

@@ -1,0 +1,12 @@
+/* Fonts come from npm packages and are bundled, never fetched from a font host. All three are under the SIL Open Font License 1.1. */
+@import "@fontsource-variable/atkinson-hyperlegible-next/wght.css";
+@import "@fontsource-variable/atkinson-hyperlegible-mono/wght.css";
+@import "@fontsource-variable/vazirmatn/wght.css";
+@import "./colors.css";
+@import "./tokens.css";
+@import "./material.css";
+@import "./base.css";
+@import "./controls.css";
+@import "./navigation.css";
+@import "./surfaces.css";
+@import "./data.css";

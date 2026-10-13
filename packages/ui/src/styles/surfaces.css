@@ -1,0 +1,71 @@
+.vw-overlay { position: fixed; inset: 0; z-index: 40; background: color-mix(in srgb, var(--shadow-ink) 58%, transparent); animation: vw-fade var(--dur-2) var(--ease); }
+.vw-dialog {
+	position: fixed;
+	inset-block-start: 50%;
+	inset-inline-start: 50%;
+	z-index: 50;
+	display: grid;
+	gap: var(--s-3);
+	inline-size: min(480px, calc(100vw - 2 * var(--s-4)));
+	max-block-size: calc(100dvh - 2 * var(--s-4));
+	overflow: auto;
+	padding: var(--s-5);
+	transform: translate(-50%, -50%);
+	animation: vw-rise var(--dur-2) var(--ease);
+}
+[dir="rtl"] .vw-dialog { transform: translate(50%, -50%); }
+.vw-dialog-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s-3); margin-block-start: calc(-1 * var(--s-2)); margin-inline-end: calc(-1 * var(--s-2)); }
+.vw-dialog-foot { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-2); margin-block-start: var(--s-3); }
+@keyframes vw-fade { from { opacity: 0; } }
+@keyframes vw-rise { from { opacity: 0; translate: 0 8px; } }
+
+.vw-toast-viewport { position: fixed; inset-block-end: var(--s-4); inset-inline-end: var(--s-4); z-index: 70; display: grid; gap: var(--s-2); inline-size: min(380px, calc(100vw - 2 * var(--s-4))); margin: 0; padding: 0; list-style: none; outline-offset: 4px; }
+@media (max-width: 760px) {
+	.vw-toast-viewport { inset-block-end: 84px; }
+}
+.vw-toast { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--s-3); padding-block: var(--s-3); padding-inline: var(--s-4) var(--s-2); animation: vw-rise var(--dur-2) var(--ease); }
+.vw-toast > .vw-icon { margin-block-start: 0.5em; color: var(--tone-ink); }
+.vw-toast > div { display: grid; padding-block: 0.36em; }
+.vw-toast-title { font-weight: var(--weight-strong); }
+.vw-toast[data-state="closed"] { animation: vw-fade var(--dur-1) var(--ease) reverse; }
+[data-tone="info"] { --tone-ink: var(--c-info); --tone-wash: var(--wash-info); }
+[data-tone="success"] { --tone-ink: var(--c-protected); --tone-wash: var(--wash-protected); }
+[data-tone="warning"] { --tone-ink: var(--c-detectable); --tone-wash: var(--wash-detectable); }
+[data-tone="danger"] { --tone-ink: var(--c-unsafe); --tone-wash: var(--wash-unsafe); }
+
+/* A banner is opaque, washed with its tone. It is a statement from the app and should not look like something floating past. */
+.vw-banner { display: flex; flex-wrap: wrap; align-items: start; gap: var(--s-3); padding: var(--s-3) var(--s-4); border: 1px solid color-mix(in srgb, var(--tone-ink) 42%, var(--tone-wash)); border-radius: var(--r-2); background: var(--tone-wash); color: var(--c-text); }
+.vw-banner > .vw-icon { margin-block-start: 0.15em; color: var(--tone-ink); }
+.vw-banner-text { flex: 1 1 16rem; display: grid; gap: 2px; min-inline-size: 0; }
+.vw-banner-text p { max-inline-size: 72ch; }
+
+.vw-state { display: grid; justify-items: start; gap: var(--s-2); max-inline-size: 46ch; padding: var(--s-5) 0; }
+.vw-state-icon { display: grid; place-items: center; inline-size: 40px; block-size: 40px; margin-block-end: var(--s-2); border: 1px solid var(--c-line-strong); border-radius: var(--r-2); background: var(--c-sunken); color: var(--c-text-muted); }
+.vw-state[data-kind="error"] .vw-state-icon { color: var(--c-unsafe); border-color: var(--c-unsafe); background: var(--wash-unsafe); }
+.vw-state .vw-button { margin-block-start: var(--s-2); }
+
+/* Three bars of the icon as a rating. Shape first (solid bars, hollow bars, a strike), then the word, then the colour. */
+.vw-rating { display: inline-flex; align-items: center; gap: var(--s-2); padding: 2px var(--s-2); border: 1px solid color-mix(in srgb, var(--rating-ink) 42%, var(--rating-wash)); border-radius: var(--r-1); background: var(--rating-wash); color: var(--rating-ink); font-size: var(--text-2); line-height: 1.5; white-space: nowrap; vertical-align: middle; }
+.vw-rating[data-rating="protected"] { --rating-ink: var(--c-protected); --rating-wash: var(--wash-protected); }
+.vw-rating[data-rating="detectable"] { --rating-ink: var(--c-detectable); --rating-wash: var(--wash-detectable); }
+.vw-rating[data-rating="unsafe"] { --rating-ink: var(--c-unsafe); --rating-wash: var(--wash-unsafe); }
+.vw-rating-glyph { inline-size: 20px; block-size: 14px; overflow: visible; }
+.vw-rating-glyph polygon { fill: none; stroke: currentColor; stroke-width: 1.2; stroke-linejoin: round; }
+.vw-rating-glyph polygon[data-solid] { fill: currentColor; }
+.vw-rating-glyph line { stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; }
+.vw-rating-text { display: grid; }
+.vw-rating[data-detail] { display: flex; align-items: start; gap: var(--s-3); padding: var(--s-3); border-radius: var(--r-2); white-space: normal; }
+.vw-rating[data-detail] .vw-rating-glyph { inline-size: 30px; block-size: 21px; margin-block-start: 0.1em; }
+.vw-rating[data-detail] .vw-rating-text span { color: var(--c-text); }
+
+/* Provider content. Dashed, flat and opaque, where everything the app says is solid-edged glass. Status colours are not available in here: a provider cannot dress a notice as an app warning. */
+.vw-provider { display: grid; gap: var(--s-4); padding: var(--s-4); border: 1px dashed var(--c-line-strong); border-radius: var(--r-3); background: var(--c-sunken); --fill: var(--provider-mark, var(--c-text-muted)); }
+.vw-provider-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: var(--s-3); padding-block-end: var(--s-3); border-block-end: 1px dashed var(--c-line-strong); }
+.vw-provider-logo { display: grid; place-items: center; inline-size: 36px; block-size: 36px; border: 2px solid var(--fill); border-radius: 50%; font-weight: var(--weight-strong); object-fit: cover; }
+.vw-provider-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-4); }
+.vw-provider-cards > li { grid-column: 1 / -1; min-inline-size: 0; }
+.vw-provider-cards > .vw-provider-stat { grid-column: auto; display: grid; }
+.vw-provider-stat .vw-stat-value { font-size: var(--text-5); }
+.vw-provider-notice { display: flex; gap: var(--s-2); align-items: start; }
+.vw-provider-notice .vw-icon { margin-block-start: 0.15em; color: var(--c-text-muted); }
+.vw-provider .vw-button { max-inline-size: 100%; flex-wrap: wrap; }

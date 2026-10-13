@@ -1,0 +1,41 @@
+/* Liquid glass. A glass surface is the theme's surface colour laid as a scrim over a blurred, saturated copy of whatever is behind it. The scrim opacity (--glass-tint) never goes under the value at which all text passes AA over pure black and pure white; test/contrast.test.ts holds that line. */
+:root, [data-scheme], [data-material] {
+	--glass-bg: color-mix(in srgb, var(--c-surface) calc(var(--glass-tint) * 100%), transparent);
+	--glass-filter: blur(var(--glass-blur)) saturate(1.6);
+	/* The edge of a pane of float glass is green. Here it is the accent, mixed into the border. */
+	--glass-edge: color-mix(in srgb, var(--c-accent-ink) 24%, var(--c-line));
+	--glass-specular: light-dark(rgb(255 255 255 / 0.9), rgb(255 255 255 / 0.17));
+}
+/* Solid fallbacks: the OS asks for less transparency, the browser cannot blur, or the user chose solid. data-material="glass" is the user overriding the OS. */
+@media (prefers-reduced-transparency: reduce) {
+	:root:not([data-material="glass"]) { --glass-bg: var(--c-surface); --glass-filter: none; }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+	:root, [data-scheme], [data-material] { --glass-bg: var(--c-surface); --glass-filter: none; }
+}
+[data-material="solid"] { --glass-bg: var(--c-surface); --glass-filter: none; }
+.vw-glass {
+	background: var(--glass-bg);
+	-webkit-backdrop-filter: var(--glass-filter);
+	backdrop-filter: var(--glass-filter);
+	border: 1px solid var(--glass-edge);
+	border-radius: var(--r-3);
+	box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-2);
+}
+.vw-glass[data-depth="1"] { box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-1); }
+.vw-glass[data-depth="3"] { box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-3); }
+/* A well is a recess inside a surface. It is opaque: glass is never stacked on glass. */
+.vw-well {
+	background: var(--c-sunken);
+	border: 1px solid var(--c-line);
+	border-radius: var(--r-2);
+}
+/* The page behind the glass: two glows and the slanted bands of the app icon. Together the layers stay under the strength the contrast rules allow for text set straight on the backdrop (FIELD_STRENGTH in src/theme/tokens.ts). */
+.vw-backdrop {
+	background-color: var(--c-bg);
+	background-image:
+		linear-gradient(115.6deg, transparent 0 46%, color-mix(in srgb, var(--c-field-1) 22%, transparent) 46% 58%, transparent 58% 61%, color-mix(in srgb, var(--c-field-1) 16%, transparent) 61% 64.4%, transparent 64.4% 66.2%, color-mix(in srgb, var(--c-field-1) 10%, transparent) 66.2% 69.6%, transparent 69.6% 71.4%, color-mix(in srgb, var(--c-field-1) 5%, transparent) 71.4% 74.8%, transparent 74.8%),
+		radial-gradient(80% 60% at 0% 0%, color-mix(in srgb, var(--c-field-1) 46%, transparent), transparent 70%),
+		radial-gradient(90% 80% at 100% 100%, color-mix(in srgb, var(--c-field-2) 52%, transparent), transparent 72%);
+	background-attachment: fixed;
+}
