@@ -2626,7 +2626,10 @@ async fn the_answers_to_a_flow_never_reach_whoever_takes_its_address(){
 	});
 	tokio::time::sleep(Duration::from_millis(15)).await;
 	reload(&node, &doc).await.unwrap();
-	let mut c=Client::connect(key, node.public, node.addr).await;
+	// The node's one socket still holds the flood of `a`, which a busy machine lets pile up and overflow, so an initiation can wait for long or be lost, and a device asks again as WireGuard does.
+	let (give_up, mut c)=(Instant::now()+Duration::from_secs(30), None);
+	while c.is_none() && Instant::now()<give_up{c=Client::try_connect(key, node.public, node.addr, Duration::from_secs(3)).await}
+	let mut c=c.expect("the new device never completed a handshake");
 	let (deadline, mut leaked)=(Instant::now()+Duration::from_millis(1500), 0);
 	while let Some(packet)=c.recv_ip(deadline.saturating_duration_since(Instant::now())).await{
 		if packet.windows(11).any(|window| window==b"secret-of-a"){leaked+=1}
@@ -2911,6 +2914,9 @@ async fn a_reload_that_raises_the_quota_lets_the_user_in_and_one_that_lowers_it_
 	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
 	let mut flow=Flow::open(&mut b, PEER_B, PUBLIC, 44061, 80).await;
 	assert_eq!(flow.say(&mut b, b"let in").await, Answer::Accepted);
+	// The reset of this flow starts where the device last acknowledged, and the node takes a device's packets in order: the answer to a datagram sent after that acknowledgement says the node has it. Without this a reload on a busy machine can come first, and its reset starts at the old place.
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44063, 9999, b"after")).await;
+	datagram(&mut b, 44063).await.expect("no udp reply");
 	let raised=usage(&node, "b");
 	assert!(raised.used_bytes>728 && raised.quota_bytes==Some(100000) && raised.denied.is_none(), "the count started over with the new quota: {raised:?}");
 	doc["users"][1]["quota_bytes"]=json!(700);

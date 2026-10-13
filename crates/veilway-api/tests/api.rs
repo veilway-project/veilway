@@ -172,7 +172,8 @@ async fn send(socket: &Path, method: &str, path: &str, revision: Option<&str>, d
 /// Bytes on a connection of their own, and whatever comes back until the node closes it or `budget` is over.
 async fn raw(socket: &Path, request: &[u8], budget: Duration) -> (Vec<u8>, bool) {
 	let mut stream = UnixStream::connect(socket).await.unwrap();
-	stream.write_all(request).await.unwrap();
+	// The node may answer and close before it has taken all of an oversized head, which makes this write fail. What it said is what is looked at.
+	let _ = stream.write_all(request).await;
 	let (mut got, mut buf, deadline) = (Vec::new(), vec![0u8; 65536], Instant::now() + budget);
 	loop {
 		match timeout(deadline.saturating_duration_since(Instant::now()), stream.read(&mut buf)).await {
@@ -774,9 +775,9 @@ async fn an_apply_that_is_refused_changes_neither_the_node_nor_the_file() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_request_that_goes_wrong_is_answered_in_one_shape() {
-	let mut setup = setup().await;
-	(setup.limits.body, setup.limits.request) = (64 << 10, Duration::from_secs(1));
-	let node = launch(setup).await;
+	let mut roomy = setup().await;
+	roomy.limits.body = 64 << 10;
+	let node = launch(roomy).await;
 	let (doc, revision) = node.shown().await;
 	let padded = |bytes: usize| {
 		let mut large = doc.clone();
@@ -823,7 +824,12 @@ async fn every_request_that_goes_wrong_is_answered_in_one_shape() {
 		let (answer, closed) = raw(&node.socket, head.as_bytes(), Duration::from_secs(3)).await;
 		assert!(closed && (answer.is_empty() || answer.starts_with(b"HTTP/1.1 4")) && !answer.windows(4).any(|window| window == b"\"ver"), "an oversized request head was served: {:?}", String::from_utf8_lossy(&answer[..answer.len().min(80)]));
 	}
-	// A request that is not finished in time: a body that never comes is answered and dropped, and so is a connection that never says what it wants.
+	assert_eq!(node.engine.snapshot().generation, 2, "one request above was an apply, of the running document with a charset, and no other put anything in force");
+	node.end().await;
+	// A request that is not finished in time: a body that never comes is answered and dropped, and so is a connection that never says what it wants. Only this node has a request time of one second, so that no other request above can be late for it on a busy machine.
+	let mut setup = setup().await;
+	setup.limits.request = Duration::from_secs(1);
+	let node = launch(setup).await;
 	let started = Instant::now();
 	let (answer, _) = raw(&node.socket, b"POST /v1/config/validate HTTP/1.1\r\nhost: veilway\r\ncontent-type: application/json\r\ncontent-length: 10\r\n\r\n{", Duration::from_secs(4)).await;
 	let answer = String::from_utf8_lossy(&answer);
@@ -837,7 +843,7 @@ async fn every_request_that_goes_wrong_is_answered_in_one_shape() {
 	let mut events = Events::open(&node.socket).await;
 	let started = Instant::now();
 	while started.elapsed() < Duration::from_millis(2500) {events.until("stats", |_| true).await;}
-	assert_eq!((get(&node.socket, "/v1/status").await.status, node.engine.snapshot().generation), (200, 2), "one request above was an apply, of the running document with a charset, and no other put anything in force");
+	assert_eq!(get(&node.socket, "/v1/status").await.status, 200);
 	drop(events);
 	node.end().await;
 }
@@ -1202,17 +1208,24 @@ async fn documents_are_checked_two_at_a_time_and_the_next_one_waits_its_turn() {
 	let (small, _) = node.shown().await;
 	let mut large = small.clone();
 	crowd(&mut large, 12000);
-	// Eight large documents at once. By the time the first of them is answered the others have long been sent and wait for their turn, and a small one that comes then waits behind them, however little there is to check in it.
-	let (answered, mut busy) = (Arc::new(AtomicUsize::new(0)), tokio::task::JoinSet::new());
+	// Eight large documents at once, each written to its socket whole. A document waits for its turn only once the node has it, so the small one is sent when the first is answered and every other has been handed over, however late the machine let them be.
+	let (answered, written, mut busy) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), tokio::task::JoinSet::new());
+	let body = large.to_string();
+	let request = format!("POST /v1/config/validate HTTP/1.1\r\nhost: veilway\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
 	for _ in 0..8 {
-		let (socket, large, answered) = (node.socket.clone(), large.clone(), answered.clone());
+		let (socket, request, answered, written) = (node.socket.clone(), request.clone(), answered.clone(), written.clone());
 		busy.spawn(async move {
-			let status = send(&socket, "POST", "/v1/config/validate", None, &large).await.status;
+			let mut stream = UnixStream::connect(&socket).await.unwrap();
+			stream.write_all(request.as_bytes()).await.unwrap();
+			written.fetch_add(1, Ordering::SeqCst);
+			let mut line = [0u8; 12];
+			stream.read_exact(&mut line).await.unwrap();
 			answered.fetch_add(1, Ordering::SeqCst);
-			status
+			String::from_utf8_lossy(&line[9..]).parse::<u16>().unwrap()
 		});
 	}
 	assert_eq!(busy.join_next().await.unwrap().unwrap(), 200);
+	timeout(Duration::from_secs(60), async {while written.load(Ordering::SeqCst) < 8 {tokio::time::sleep(Duration::from_millis(10)).await}}).await.expect("a large document was never handed to the node");
 	assert_eq!(send(&node.socket, "POST", "/v1/config/validate", None, &small).await.json["valid"], json!(true));
 	let before = answered.load(Ordering::SeqCst);
 	while let Some(status) = busy.join_next().await {assert_eq!(status.unwrap(), 200)}
