@@ -280,9 +280,10 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 		inbound: peer.inbound,
 		transport: peer.over.map(|over| match over {
 			Over::Udp => model::Transport::Udp,
-			Over::Ws => model::Transport::Ws,
+			Over::Ws | Over::WsNative => model::Transport::Ws,
 			Over::UdpObfs => model::Transport::UdpObfs,
 			Over::Tls => model::Transport::Tls,
+			Over::Fronted => model::Transport::Fronted,
 		}),
 		flows: peer.flows,
 		selected_exit: peer.exit,

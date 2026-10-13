@@ -498,10 +498,10 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					}
 				}
 				Some(Some(ClientMessage::ProbeStart)) => {
-					// "It applies on `udp` and `udp-obfs`. On a stream transport nothing fragments, the node answers `probe_start` with `error` code 2."
+					// "It applies on `udp` and `udp-obfs`. On a stream transport nothing fragments, the node answers `probe_start` with `error` code 2." The two are named and everything else is refused, so a transport that is added later is refused until somebody decides otherwise: over a stream no probe is ever lost, and a run would put a burst of fixed sizes on a transport whose sizes are meant to say little.
 					let datagram = {
 						let peers = plan.inbounds[from.inbound].tunnel.lock();
-						peers.wg.index(&device).and_then(|peer| peers.over(peer)).is_some_and(|over| over != Over::Ws)
+						peers.wg.index(&device).and_then(|peer| peers.over(peer)).is_some_and(|over| matches!(over, Over::Udp | Over::UdpObfs))
 					};
 					let mut token = [0u8; 8];
 					let started = datagram && random(&mut token).is_ok();

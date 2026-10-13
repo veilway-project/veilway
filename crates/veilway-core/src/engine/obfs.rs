@@ -374,7 +374,7 @@ impl Listener {
 		let Some(slot) = sessions.get_mut(&session.source).and_then(|slots| slots.iter_mut().find(|slot| slot.device == session.device)) else {return false};
 		if !slot.pending.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, session)) {return false}
 		// A pool that has no place leaves the session pending, and it ends at its deadline.
-		match limits.establish(&session.seat, self.cap.load(Ordering::Relaxed), now.ms) {
+		match limits.establish(&session.seat, self.cap.load(Ordering::Relaxed), usize::MAX, now.ms) {
 			Seated::Established => {}
 			Seated::Full => {
 				state.counters.dropped[Dropped::Pool as usize].fetch_add(1, Ordering::Relaxed);
@@ -419,7 +419,7 @@ impl Listener {
 		// What is recorded so has an allowance of its own for each device, as large as the one for accepted proofs, so that a device which sends more than it may fills the cache no faster than twice what the specification allows it. Beyond that the packet is dropped unrecorded.
 		let (mut why, mut refused, device) = (Dropped::NoReplay, false, opening.device.public);
 		// The session as the limits will know it. It is one of its device's sessions from the moment the limits are charged for it, and nobody's when they are not.
-		let seat = Seat::new(device, opening.device.id, None, self.tunnel.clone(), self.pool.clone(), state.counters.ended.clone(), Transport::UdpObfs.idle(), now.ms);
+		let seat = Seat::new(device, opening.device.id, None, self.tunnel.clone(), self.pool.clone(), None, state.counters.ended.clone(), Transport::UdpObfs.idle(), now.ms);
 		let decision = replay.and_then(|replay| replay.with(|memory| opening.accept(memory, now.secs, |_| {
 			refused = !self.charge(limits, &seat, from, now.ms, &mut why);
 			!refused || limits.refuse(device, now.ms)

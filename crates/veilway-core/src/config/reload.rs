@@ -1,6 +1,6 @@
 //! Reloading: the running config behind a watch channel, the diff between two configs and the two-phase apply.
 //! Nothing here holds or logs a value from a document except tags, user names and device public keys.
-use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, User, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
+use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, Transport, User, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, HashSet};
@@ -160,7 +160,7 @@ impl Diff {
 				transports_started: (0..is.transports.len()).filter(|i| !was.transports.contains(&is.transports[*i])).collect(),
 			};
 			// A changed `type` restarts nothing: the tunnel is the same, and what its gateway answers goes by the config in force.
-			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.padding != is.padding || was.transport_keys != is.transport_keys || was.upgrade_cookie != is.upgrade_cookie || was.upgrade_headers() != is.upgrade_headers()).then_some(change)
+			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.padding != is.padding || was.transport_keys != is.transport_keys || was.upgrade_cookie != is.upgrade_cookie || [true, false].iter().any(|tls| was.transports.iter().chain(&is.transports).any(|transport| if *tls {matches!(transport, Transport::Tls {..})} else {matches!(transport, Transport::WsNative {..})}) && was.upgrade_headers(*tls) != is.upgrade_headers(*tls))).then_some(change)
 		}).collect();
 		inbounds.changed.retain(|tag| inbound_changes.iter().any(|change| change.tag == *tag));
 		// Objects that differ as written are compared again with their defaults filled in.

@@ -456,7 +456,7 @@
           "type": "string"
         },
         "transport_keys": {
-          "description": "The node transport keys, private halves: one, or two while the key is rotated. Needed by an inbound with a `tls` transport. Profiles carry the public half of the first.",
+          "description": "The node transport keys, private halves: one, or two while the key is rotated. Needed by an inbound with a `tls`, native `ws` or `fronted` transport. Profiles carry the public half of the first.",
           "items": {
             "$ref": "#/$defs/TransportKey"
           },
@@ -478,12 +478,12 @@
           "$ref": "#/$defs/InboundType"
         },
         "upgrade_cookie": {
-          "description": "The name of the cookie on the upgrade answer of a `tls` transport. It has no default and carries no meaning: its value is random text of a random length.",
+          "description": "The name of the cookie on the upgrade answer of a `tls` or native `ws` transport. It has no default and carries no meaning: its value is random text of a random length.",
           "pattern": "^[A-Za-z0-9_-]{1,32}$",
           "type": "string"
         },
         "upgrade_headers": {
-          "description": "The header fields the upgrade answer takes from the decoy origin, in this order. Defaults to `Server`, `Date` for a `tls` transport.",
+          "description": "The header fields the upgrade answer takes from the decoy origin, in this order. Defaults to `Server`, `Date` for a `tls` transport and to none for a native `ws` transport, where the web server in front adds its own.",
           "items": {
             "pattern": "^[A-Za-z0-9-]{1,64}$",
             "type": "string"
@@ -789,6 +789,11 @@
           "type": "integer"
         }
       ]
+    },
+    "Proxy": {
+      "description": "an address such as 127.0.0.1 or a network such as 10.0.0.0/8 with no host bits set",
+      "pattern": "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$",
+      "type": "string"
     },
     "QuotaPeriod": {
       "enum": [
@@ -1166,6 +1171,97 @@
             "decoy"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The native WebSocket session behind the operator's own web server, for a `veilway` inbound: `ws` with a `decoy`. The node never ends TLS here. It reads plain HTTP from `trusted_proxies`, and whoever is not a user is answered by `decoy.origin`.",
+          "properties": {
+            "client_address_header": {
+              "description": "The header field in which the proxies name the address a request came from, such as `X-Forwarded-For`. Without it every visitor counts as the proxy itself.",
+              "pattern": "^[A-Za-z0-9-]{1,64}$",
+              "type": "string"
+            },
+            "decoy": {
+              "$ref": "#/$defs/Decoy"
+            },
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "description": "The path a proof arrives on, as the web server in front hands it on, which the origin must serve nothing at.",
+              "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+              "type": "string"
+            },
+            "trusted_proxies": {
+              "description": "The operator's own reverse proxies, as addresses and networks. Only a connection from one of them can carry a user, and only from them is `client_address_header` believed.",
+              "items": {
+                "$ref": "#/$defs/Proxy"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "ws",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path",
+            "decoy",
+            "trusted_proxies"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Polling with HTTP requests through a CDN that allows nothing better, behind the operator's own web server, for a `veilway` inbound. Its keys are those of the native `ws`.",
+          "properties": {
+            "client_address_header": {
+              "pattern": "^[A-Za-z0-9-]{1,64}$",
+              "type": "string"
+            },
+            "decoy": {
+              "$ref": "#/$defs/Decoy"
+            },
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+              "type": "string"
+            },
+            "trusted_proxies": {
+              "items": {
+                "$ref": "#/$defs/Proxy"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "fronted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path",
+            "decoy",
+            "trusted_proxies"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1178,6 +1274,27 @@
       "additionalProperties": false,
       "description": "Node capacity numbers of one listener (transports page, \"Numbers that are judgement calls\").",
       "properties": {
+        "decoy_requests_per_source": {
+          "description": "Requests one source may have waiting for the decoy origin at once on a `ws` or `fronted` listener. Defaults to 16.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "fronted_sessions": {
+          "description": "Established `fronted` sessions the listener holds at once, each of which keeps its last response, up to 65536 bytes. Defaults to 1024, which is 64 MiB when full.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "proxy_connections": {
+          "description": "Connections from `trusted_proxies` a `ws` or `fronted` listener holds at once. Defaults to twice its `fronted_sessions`. Requests of strangers that wait for the decoy origin hold at most half of them.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 2,
+          "type": "integer"
+        },
         "relayed": {
           "description": "Connections of a stream listener that are relayed to the decoy origin. Defaults to 1024.",
           "format": "uint32",

@@ -84,7 +84,16 @@ pub enum Event {
 
 /// How a device's last authenticated datagram reached its inbound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Over {Udp, Ws, UdpObfs, Tls}
+pub enum Over {
+	Udp,
+	/// The `ws` of a `wireguard` inbound, which relays WireGuard datagrams as they are.
+	Ws,
+	UdpObfs,
+	Tls,
+	/// The native `ws` of a `veilway` inbound, behind the operator's web server.
+	WsNative,
+	Fronted,
+}
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.
 #[derive(Clone, Debug)]
@@ -600,6 +609,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 							let clock = limits::Clock::of((shared.now)());
 							shared.limits.sweep(clock);
 							shared.obfs.sweep(clock);
+							shared.stream.sweep();
 						}
 					}
 					_ = shared.over.notified() => {}

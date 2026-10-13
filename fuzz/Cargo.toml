@@ -16,8 +16,8 @@ veilway-proto={path="../crates/veilway-proto"}
 veilway-wg={path="../crates/veilway-wg"}
 # The chunk target seals plaintexts itself, with the library the crate opens them with, and the subscription targets sign documents with it.
 ring="0.17"
-# The tls_listener target runs the node's own connection tasks over pipes in memory, and gives the node a clock of its own.
-tokio={version="1", features=["rt", "io-util", "time"]}
+# The tls_listener target runs the node's own connection tasks over pipes in memory, and gives the node a clock of its own. The targets of the proxy path pause the runtime's clock, so that a hold time, a head that never ends and five quiet minutes cost them nothing.
+tokio={version="1", features=["rt", "io-util", "time", "test-util"]}
 time="0.3"
 
 [[bin]]
@@ -156,6 +156,20 @@ bench=false
 [[bin]]
 name="tls_listener"
 path="fuzz_targets/tls_listener.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="proxy_listener"
+path="fuzz_targets/proxy_listener.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fronted_session"
+path="fuzz_targets/fronted_session.rs"
 test=false
 doc=false
 bench=false

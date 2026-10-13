@@ -6,6 +6,10 @@ license.workspace=true
 repository.workspace=true
 publish.workspace=true
 
+[features]
+# A way to seal a chunk no client would send, for the tests of what a receiver does with one. No build of a node turns it on.
+bench=[]
+
 [dependencies]
 ring.workspace=true
 hpke.workspace=true

@@ -96,9 +96,9 @@ pub struct Staged {
 	ws: Vec<(SocketAddr, TcpListener)>,
 	/// For every address `ws` transports listen on, what its certificate files hold now.
 	acceptors: HashMap<SocketAddr, Option<ws::Acceptor>>,
-	/// The stream listeners the node does not have yet, and for every address stream transports listen on, what its certificate files hold now and where its decoy origin is now.
+	/// The stream listeners the node does not have yet, and for every address stream transports listen on, what its certificate files hold now, when it ends TLS, and where its decoy origin is now.
 	tls: Vec<(SocketAddr, TcpListener)>,
-	streams: HashMap<SocketAddr, (ws::Acceptor, SocketAddr)>,
+	streams: HashMap<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
 	tunnels: Vec<(Arc<Tunnel>, IpStack, Receiver<Vec<u8>>)>,
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
@@ -182,13 +182,13 @@ impl Host {
 			if shared.replay.set(guard.clone()).is_ok() {tokio::spawn(guard.run(shared.now));}
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
-		let (mut listeners, mut streams) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (ws::Acceptor, SocketAddr)>::new());
+		let (mut listeners, mut streams) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate() {
 				match transport {
 					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
 					Transport::Udp {..} | Transport::UdpObfs {..} => {}
-					Transport::Tls {listen, tls, decoy, ..} => {
+					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} => {
 						if !self.tls.contains_key(&listen.0) && !listeners.iter().any(|(addr, _)| *addr == listen.0) {
 							listeners.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
 								socket.listen(1024)?;
@@ -197,10 +197,13 @@ impl Host {
 						}
 						// Once for each address, on every reload: the certificate is read again, and the name of the decoy origin is resolved again ("resolved once per reload"). Transports that share an address have the same files and the same origin.
 						if streams.contains_key(&listen.0) {continue}
-						let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
-						let acceptor = ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?;
-						#[cfg(unix)]
-						if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
+						// "A native `ws` or `fronted` listener never ends TLS itself. A listener where the node ends TLS is `tls`."
+						let acceptor = if let Transport::Tls {tls, ..} = transport {
+							let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
+							#[cfg(unix)]
+							if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
+							Some(ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?)
+						} else {None};
 						let origin = match &decoy.origin.0.host {
 							Named::Ip(ip) => SocketAddr::new(*ip, decoy.origin.0.port),
 							Named::Name(name) => tokio::time::timeout(RESOLVE, lookup_host((name.as_str(), decoy.origin.0.port))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].decoy.origin: the name of the decoy origin of inbound `{}` does not resolve", inbound.tag))?,
@@ -322,17 +325,22 @@ impl Host {
 						});
 						routes.entry(listen.0).or_default().push((path.clone(), tls.clone(), inbound.tunnel.clone(), id));
 					}
-					Transport::Tls {..} => {}
+					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} => {}
 				}
 			}
 		}
-		// What each stream listener serves from here on: the certificate and the origin as `prepare` found them, and one route for each `tls` transport on its address.
+		// What each stream listener serves from here on: the certificate and the origin as `prepare` found them, and one route for each `tls`, native `ws` or `fronted` transport on its address. Transports that share an address have one decoy, one list of proxies and one set of pools, which the first of them gives.
 		let mut serving: HashMap<SocketAddr, stream::Served> = HashMap::new();
 		for (inbound, written) in plan.inbounds.iter().zip(self.config.iter().flat_map(|config| &config.inbounds)) {
 			for transport in &inbound.transports {
-				let Transport::Tls {listen, path, decoy, limits, ..} = transport else {continue};
-				let Some((acceptor, origin)) = streams.get(&listen.0) else {continue};
-				serving.entry(listen.0).or_insert_with(|| stream::Served {acceptor: Some(acceptor.clone()), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(*limits)}).routes.push(stream::Route::tls(path.clone(), inbound.tunnel.clone(), written.upgrade_cookie.clone().unwrap_or_default(), written.upgrade_headers()));
+				let (Some(decoy), Some((acceptor, origin)), cookie) = (transport.decoy(), streams.get(&transport.listen()), written.upgrade_cookie.clone().unwrap_or_default()) else {continue};
+				let (route, limits) = match transport {
+					Transport::Tls {path, limits, ..} => (stream::Route::tls(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(true)), *limits),
+					Transport::WsNative {path, limits, ..} => (stream::Route::ws(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(false)), *limits),
+					Transport::Fronted {path, limits, ..} => (stream::Route::fronted(path.clone(), inbound.tunnel.clone()), *limits),
+					_ => continue,
+				};
+				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits))}).routes.push(route);
 			}
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();
@@ -349,7 +357,10 @@ impl Host {
 		});
 		for (addr, socket) in listeners {
 			let Some(served) = serving.remove(&addr) else {continue};
-			tracing::info!("stream listener {addr}: tls, {} path(s), at most {} established sessions, {} undecided connections and {} relayed to the decoy origin at {}", served.routes.len(), served.pools.sessions, served.pools.undecided, served.pools.relayed, served.host);
+			match &served.front {
+				None => tracing::info!("stream listener {addr}: tls, {} path(s), at most {} established sessions, {} undecided connections and {} relayed to the decoy origin at {}", served.routes.len(), served.pools.sessions, served.pools.undecided, served.pools.relayed, served.host),
+				Some(front) => tracing::info!("stream listener {addr}: behind the operator's web server, {} path(s) of ws and fronted, at most {} established sessions of which {} fronted, {} connections of {} trusted proxies or networks of them, and {} requests of one source waiting for the decoy origin at {}, of {} in all", served.routes.len(), served.pools.sessions, front.fronted, front.connections, front.trusted.len(), front.per_source, served.host, front.waiting()),
+			}
 			let listener = shared.stream.listen(addr, served);
 			self.tls.insert(addr, (listener.clone(), [Task(stream::accept(shared, listener.clone(), socket)), Task(stream::learn(&listener))]));
 		}

@@ -299,7 +299,7 @@ pub struct Stats {
 	pub replay: Option<Replay>,
 }
 
-/// What the stream listeners of the `tls` transports did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending` and `sessions` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key.
+/// What the stream listeners of the `tls` transports, and of the `ws` and `fronted` transports of `veilway` inbounds, did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending`, `sessions`, `proxies`, `decoys` and `fronted` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key.
 #[derive(Serialize, JsonSchema)]
 pub struct Stream {
 	/// Connections that have not been decided yet, right now: inside their TLS handshake or their request line.
@@ -366,6 +366,32 @@ pub struct Stream {
 	/// How often the header fields of the upgrade answer were learnt from a decoy origin, and how often that failed. While the last try failed, the upgrade answer carries only `Date` of `upgrade_headers`.
 	pub upgrade_learned: u64,
 	pub upgrade_learn_failed: u64,
+	/// The proxy path of the `ws` and `fronted` listeners, right now: connections of trusted proxies, requests on them that are in a decoy origin's hands or whose body is still read with nothing proven, and established `fronted` sessions.
+	pub proxies: usize,
+	pub decoys: usize,
+	pub fronted: usize,
+	/// Connections taken from a trusted proxy, and requests read on them. `proxy_unnamed` are those of them, on a listener with a `client_address_header`, in which that header named no source: the proxy itself stood for the visitor, so the limits per source were one limit for all of them. `proxy_idle` are connections closed after 300 seconds without a request.
+	pub proxy_accepted: u64,
+	pub proxy_requests: u64,
+	pub proxy_unnamed: u64,
+	pub proxy_idle: u64,
+	/// Requests handed to a decoy origin on the proxy path. `forwards_unframed` are those of them the node could not tell the end of, which it relayed to the end of the origin's answer and then closed the proxy's connection behind. `forwards_cut` are connections closed at once because one source had more than its share of requests waiting, or all strangers together more than half the proxy pool.
+	pub forwards: u64,
+	pub forwards_unframed: u64,
+	pub forwards_cut: u64,
+	/// Requests of the proxy path decided "not a user" for a reason only that path has: a head above 16,384 bytes or not complete within 10 seconds, a `fronted` request that names a session with a number out of order or while another request of it is in flight, one whose body was late, did not open or was a repeat with other bytes, and an opening request whose session no WireGuard packet established.
+	pub stranger_head: u64,
+	pub stranger_session: u64,
+	pub stranger_body: u64,
+	pub stranger_unestablished: u64,
+	/// `fronted` requests that were accepted, and repeats of the last accepted request that were answered with the stored response.
+	pub polls: u64,
+	pub poll_repeats: u64,
+	/// Requests of trusted proxies that were HTTP/1.0. None of them can be a user's: a web server that speaks HTTP/1.0 to the node shuts every user out, and has to be told to speak HTTP/1.1.
+	pub proxy_http10: u64,
+	/// Requests that were sent to a decoy origin once more on a new connection, because the connection kept from the request before had been closed by the origin. `origin_dropped` are connections to a decoy origin that the node dropped between two requests because the origin said something or closed them there: nothing of that is passed on to the proxy.
+	pub forwards_redialed: u64,
+	pub origin_dropped: u64,
 }
 
 impl From<veilway_core::StreamTotals> for Stream {
@@ -378,6 +404,9 @@ impl From<veilway_core::StreamTotals> for Stream {
 			handshakes: totals.handshakes, tunnel: totals.tunnel, queue_full: totals.queue_full, chunks_sent: totals.chunks_sent,
 			ended_deadline: totals.ended_deadline, ended_idle: totals.ended_idle, ended_packets: totals.ended_packets, ended_displaced: totals.ended_displaced, ended_revoked: totals.ended_revoked, ended_closed: totals.ended_closed, ended_invalid: totals.ended_invalid, ended_unserved: totals.ended_unserved,
 			upgrade_learned: totals.upgrade_learned, upgrade_learn_failed: totals.upgrade_learn_failed,
+			proxies: totals.proxies, decoys: totals.decoys, fronted: totals.fronted, proxy_accepted: totals.proxy_accepted, proxy_requests: totals.proxy_requests, proxy_unnamed: totals.proxy_unnamed, proxy_idle: totals.proxy_idle, forwards: totals.forwards, forwards_unframed: totals.forwards_unframed, forwards_cut: totals.forwards_cut,
+			stranger_head: totals.stranger_head, stranger_session: totals.stranger_session, stranger_body: totals.stranger_body, stranger_unestablished: totals.stranger_unestablished, polls: totals.polls, poll_repeats: totals.poll_repeats,
+			proxy_http10: totals.proxy_http10, forwards_redialed: totals.forwards_redialed, origin_dropped: totals.origin_dropped,
 		}
 	}
 }
@@ -468,9 +497,10 @@ impl From<veilway_core::ReplayStatus> for Replay {
 	fn from(status: veilway_core::ReplayStatus) -> Replay {Replay {ready: status.ready, clock: status.clock, floor: status.floor, limit: status.limit, disk_limit: status.disk, entries: status.entries, capacity: status.capacity, floor_ahead: status.floor_ahead, refusing_secs: status.wait, refused_floor_ahead: status.refused_floor_ahead, writes: status.writes, write_failures: status.write_failures, slow_writes: status.slow_writes, limit_lowered: status.lowered, resets: status.resets}}
 }
 
+/// The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls}
+pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted}
 
 /// A device with a live session on one inbound. The address the device connects from is not part of it.
 #[derive(Serialize, JsonSchema)]

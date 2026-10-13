@@ -34,7 +34,7 @@ use veilway_core::config::{Config, Diff, REDACTED};
 use veilway_core::engine::stream::{Bench, Pools};
 use veilway_core::{Engine, Options, Over, StreamTotals};
 use veilway_proto::chunk::{Opener, Padding, Sealer, NORMAL_DEFAULT, WIDE_DEFAULT};
-use veilway_proto::control::PORT;
+use veilway_proto::control::{kind, ClientMessage, ErrorCode, NodeMessage, PORT};
 use veilway_proto::keys::ControlKey;
 use veilway_proto::opening::ClientOpening;
 use veilway_proto::proof::{self, Name};
@@ -605,7 +605,7 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 	let (answer, _) = segment(&a.recv(SECOND, |packet| segment(packet).is_some_and(|(tcp, _)| (tcp.source_port, tcp.destination_port) == (PORT, sport))).await.expect("the control port did not answer")).unwrap();
 	let (mut seq, mut ack, mut up) = (5001u32, answer.sequence_number.wrapping_add(1), Vec::new());
 	let mut opening = ClientOpening::start(ControlKey::derive(&secret(0), &public(&NODE), &public(&KEYS[0])), 1, Duration::ZERO, &mut random, &mut up).unwrap();
-	let opened = loop {
+	let (mut opened, mut rest) = loop {
 		let (mut header, mut out) = (TcpHeader::new(sport, PORT, seq, 65535), Vec::new());
 		(header.ack, header.psh, header.acknowledgment_number) = (true, true, ack);
 		PacketBuilder::ipv4(address(0), GATEWAY, 64).tcp_header(header).write(&mut out, &up).unwrap();
@@ -615,9 +615,29 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 		let (tcp, data) = segment(&a.recv(Duration::from_secs(3), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the control channel went quiet")).unwrap();
 		ack = tcp.sequence_number.wrapping_add(data.len() as u32);
 		let mut input = &data[..];
-		if let Some(opened) = opening.receive(started.elapsed(), &mut input, &mut up).expect("the node broke the opening exchange") {break opened}
+		if let Some(opened) = opening.receive(started.elapsed(), &mut input, &mut up).expect("the node broke the opening exchange") {break (opened, input.to_vec())}
 	};
 	assert_eq!(opened.version, 1);
+	// "It applies on `udp` and `udp-obfs`. On a stream transport nothing fragments, the node answers `probe_start` with `error` code 2": no run is started over `tls`, where no probe could ever be lost.
+	let (mut header, mut out, mut ask) = (TcpHeader::new(sport, PORT, seq, 65535), Vec::new(), Vec::new());
+	ClientMessage::ProbeStart.encode(&mut ask).unwrap();
+	(header.ack, header.psh, header.acknowledgment_number) = (true, true, ack);
+	PacketBuilder::ipv4(address(0), GATEWAY, 64).tcp_header(header).write(&mut out, &ask).unwrap();
+	a.send(&out).await;
+	let refusal = loop {
+		let mut input = &rest[..];
+		match opened.messages.read(&mut input).expect("the node sent what no client reads") {
+			Some(NodeMessage::Error {code, answers}) => break (code, answers),
+			Some(NodeMessage::ProbeToken {..}) => panic!("a probe run was started over tls"),
+			Some(_) => rest = input.to_vec(),
+			None => {
+				let (tcp, data) = segment(&a.recv(Duration::from_secs(3), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the probe run was not answered")).unwrap();
+				ack = tcp.sequence_number.wrapping_add(data.len() as u32);
+				rest = [input, &data[..]].concat();
+			}
+		}
+	};
+	assert_eq!((refusal, node.engine.control().probe_runs), ((ErrorCode::NotApplicable, kind::PROBE_START), 0));
 	// Usage is counted, the session is a `tls` one, and nothing of the user's connection reached the origin: the node asked it once for its header fields, and the connection it opened for the user was closed unused.
 	let (peers, totals, control) = (node.engine.peers(Some("a")), node.totals(), node.engine.control());
 	assert_eq!((peers.len(), peers[0].over, peers[0].handshake.is_some()), (1, Some(Over::Tls), true));
@@ -1592,8 +1612,10 @@ fn the_new_keys_are_validated_shown_and_compared() {
 		("a share above the pool", &|doc| doc["inbounds"][0]["transports"][0]["limits"] = json!({"undecided": 8, "undecided_per_source": 9}), format!("{transport}.limits.undecided_per_source")),
 		("too many relayed connections", &|doc| doc["inbounds"][0]["transports"][0]["limits"] = json!({"relayed": 65537}), format!("{transport}.limits.relayed")),
 		("a decoy on udp", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "udp", "listen": "127.0.0.1:51820", "decoy": {"origin": "http://127.0.0.1:8080"}})), "inbounds[0].transports[1]".to_string()),
-		("the native ws, which is not built", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "ws", "listen": "127.0.0.1:8081", "path": "/assets/app-ws-path.js"})), "inbounds[0].transports[1].type".to_string()),
-		("fronted, which is not built", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "fronted", "listen": "127.0.0.1:8081"})), "inbounds[0].transports[1].type".to_string()),
+		("the ws of a wireguard inbound, which has no decoy", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "ws", "listen": "127.0.0.1:8081", "path": "/assets/app-ws-path.js"})), "inbounds[0].transports[1].type".to_string()),
+		("fronted without its keys", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "fronted", "listen": "127.0.0.1:8081"})), "inbounds[0].transports[1]".to_string()),
+		("the pools of the proxy path on a listener that has only direct peers", &|doc| doc["inbounds"][0]["transports"][0]["limits"] = json!({"proxy_connections": 64}), format!("{transport}.limits.proxy_connections")),
+		("the proxies of the proxy path on a listener that ends TLS", &|doc| doc["inbounds"][0]["transports"][0]["trusted_proxies"] = json!(["127.0.0.1"]), transport.to_string()),
 		("two tls transports on one address with one path", &|doc| {
 			let again = doc["inbounds"][0]["transports"][0].clone();
 			doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(again);

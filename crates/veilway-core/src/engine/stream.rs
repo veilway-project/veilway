@@ -3,6 +3,8 @@
 //! Whoever is not a user is handed to the operator's own web server with every byte it sent, and from then on the node reads nothing of the connection as a protocol. The node composes no byte for such a peer: no status line, no header and no error page.
 //! What it cannot hide is stated on the transports page and not here: the TLS handshake of a `tls` listener is the node's own, which is why `tls` is rated Detectable, an answer through the node is later than one from the origin by a hop, and a request line that arrives slowly is held until its end.
 //! Timers of a session follow the node's wall clock, as those of `udp-obfs` do. The deadlines of a connection that has proven nothing follow the runtime's clock.
+//! A `ws` or `fronted` listener is the other kind: it is meant for the operator's own web server, whose connections carry the requests of many visitors one after another. Such a connection is read request by request (`front`). A request that is not a user's is handed to the origin as it was read, head and body,
+//! and the answer is handed back as the origin sent it. The node follows both only to know where they end (`veilway_proto::http`), and where it cannot tell with certainty it stops telling requests apart on that connection: it relays to the end of the answer and closes. A `fronted` session is a row in the listener's table that requests come to (`Polling`).
 #[cfg(feature = "bench")]
 use super::inbound::Peers;
 use super::inbound::{Tunnel, Via};
@@ -13,12 +15,15 @@ use super::replay::Guard;
 use super::{Over, Shared};
 #[cfg(feature = "bench")]
 use crate::config::Config;
-use crate::config::{DEFAULT_RELAYED, DEFAULT_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE};
+use crate::config::{DEFAULT_DECOY_REQUESTS, DEFAULT_FRONTED_SESSIONS, DEFAULT_RELAYED, DEFAULT_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE, MAX_PROXY_CONNECTIONS};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use ipnet::IpNet;
+use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use rustls::ProtocolVersion;
 use socket2::SockRef;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -29,7 +34,7 @@ use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset};
 #[cfg(feature = "bench")]
 use tokio::io::DuplexStream;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
@@ -37,6 +42,8 @@ use tokio::task::AbortHandle;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use veilway_proto::chunk::{ChunkError, Opener, Padding, Sealer, MAX_ITEMS, MAX_PLAINTEXT, MAX_SEALED};
+use veilway_proto::fronted::{self, BodyError, BODY_MAX, BODY_MIN, BODY_TIME, HOLD};
+use veilway_proto::http::{self, Answer, Framing};
 use veilway_proto::proof::{Name, SessionKeys};
 use veilway_proto::replay::{Decision, Refusal, WRITE_DEADLINE};
 use veilway_proto::request::{Line, Method, Scan, Scanner, HEAD_MAX, HEAD_TIME, LINE_MAX, LINE_TIME};
@@ -53,6 +60,13 @@ pub const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
 pub const DECOY_CONNECT: Duration = Duration::from_secs(5);
 /// "Idle time before a relayed connection may be closed for room: 60 s."
 pub const RELAY_IDLE: Duration = Duration::from_secs(60);
+/// "Wait between requests on a trusted proxy's connection: 300 s."
+pub const PROXY_IDLE: Duration = Duration::from_secs(300);
+/// How much of a request head that is over its size limit is still read, only to find the address its proxy named. Such a head is handed on as bytes whatever it holds, and nothing in it can make a user.
+/// A web server takes heads of several times the node's limit (nginx: four buffers of 8 k), and the address a stranger is known to the origin by must not depend on how long its head is.
+const SOURCE_HEAD: usize = 65_536;
+/// The head of the answer to a `fronted` request, before the length of its body: "with status 200", and "both bodies are sent with `Content-Type: application/octet-stream` and a `Content-Length`". The web server in front adds what it adds to every answer.
+const POLLED: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: ";
 /// "Stream send queue: 256 datagrams per connection."
 pub const SEND_QUEUE: usize = 256;
 /// "Upgrade header learning: once at start and on reload, again every 60 s while it has failed."
@@ -126,14 +140,22 @@ pub enum Stranger {
 	/// The device's or the source's allowance of accepted proofs is spent.
 	DeviceRate,
 	SourceRate,
+	/// On the proxy path: a request head above its size limit, or not complete within its time.
+	Head,
+	/// A `fronted` request that names no session the node has, a number that is not the next one or the last one again, or a session with another request in flight.
+	Session,
+	/// A `fronted` request whose body did not arrive in time, did not open as chunks of its session, or was a repeat with another body.
+	Body,
+	/// The opening request of a `fronted` session that no WireGuard packet of its device established.
+	Unestablished,
 }
 
-const STRANGERS: usize = Stranger::SourceRate as usize + 1;
+const STRANGERS: usize = Stranger::Unestablished as usize + 1;
 
 #[derive(Clone, Copy)]
-enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed}
+enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped}
 
-const COUNTS: usize = Count::LearnFailed as usize + 1;
+const COUNTS: usize = Count::OriginDropped as usize + 1;
 
 #[derive(Default)]
 pub struct Counters {counts: [AtomicU64; COUNTS], strangers: [AtomicU64; STRANGERS], ended: Arc<[AtomicU64; ENDS]>}
@@ -208,6 +230,32 @@ pub struct StreamTotals {
 	/// How often the header fields of an upgrade answer were learnt from a decoy origin, and how often that failed.
 	pub upgrade_learned: u64,
 	pub upgrade_learn_failed: u64,
+	/// The proxy path of the `ws` and `fronted` listeners, right now: connections of trusted proxies, requests on them that are in a decoy origin's hands or whose body is still read without proof of who sent it, and established `fronted` sessions.
+	pub proxies: usize,
+	pub decoys: usize,
+	pub fronted: usize,
+	/// Connections that were taken from a trusted proxy, requests that were read on them, those among them on a listener with a `client_address_header` in which that header named no source, so that the proxy itself stood for it, and connections that were closed after 300 s without a request.
+	pub proxy_accepted: u64,
+	pub proxy_requests: u64,
+	pub proxy_unnamed: u64,
+	pub proxy_idle: u64,
+	/// Requests that were handed to a decoy origin, those among them the node could not tell the end of, whose connection carried no request after them, and connections that were closed because their source, or all strangers together, had too many requests waiting.
+	pub forwards: u64,
+	pub forwards_unframed: u64,
+	pub forwards_cut: u64,
+	/// Requests of the proxy path decided "not a user" for a reason only that path has: a head over its limits, a `fronted` request that names no session or comes out of order or while another is in flight, one whose body was late or did not open, and an opening request whose session was never established.
+	pub stranger_head: u64,
+	pub stranger_session: u64,
+	pub stranger_body: u64,
+	pub stranger_unestablished: u64,
+	/// `fronted` requests that were accepted, and repeats of the last accepted request that were answered with the stored response.
+	pub polls: u64,
+	pub poll_repeats: u64,
+	/// Requests of trusted proxies whose line says `HTTP/1.0`. None of them can be a user's, so a web server that speaks HTTP/1.0 to the node shuts every user out, and this is where that shows.
+	pub proxy_http10: u64,
+	/// Requests that were sent to the origin a second time, on a new connection, because the connection that was kept from the request before turned out closed, and connections to the origin that were dropped between two requests because the origin said something or closed them there.
+	pub forwards_redialed: u64,
+	pub origin_dropped: u64,
 }
 
 /// Where the decoy origin of a listener is.
@@ -279,6 +327,12 @@ pub struct Route {
 impl Route {
 	/// The route of a `tls` transport.
 	pub fn tls(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Tls, method: Method::Get, over: Over::Tls, transport: Transport::Tls, cookie, headers}}
+
+	/// The route of a native `ws` transport: the session of `tls`, opened by a request that came through the operator's web server.
+	pub fn ws(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Ws, method: Method::Get, over: Over::WsNative, transport: Transport::Ws, cookie, headers}}
+
+	/// The route of a `fronted` transport, whose requests are `POST`s and whose answers are no upgrade.
+	pub fn fronted(path: String, tunnel: Arc<Tunnel>) -> Route {Route {id: 0, path, tunnel, name: Name::Fronted, method: Method::Post, over: Over::Fronted, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new()}}
 }
 
 /// The pools of one listener (transports page, "Node capacity numbers").
@@ -292,9 +346,35 @@ impl Pools {
 	}
 }
 
-/// What a listener serves at one moment. A connection takes it once, when it is accepted, and works on that one value.
+/// What makes a listener one of the proxy path: the web server in front of it, and the pools that path has (transports page, "Pools and what happens when one is full").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Front {
+	/// `trusted_proxies`. A peer inside them is a proxy, and "a peer outside them is a direct peer that is never a user and always goes to the decoy".
+	pub trusted: Vec<IpNet>,
+	/// `client_address_header`. None for a listener that takes every request to come from its proxy.
+	pub header: Option<String>,
+	/// "Proxy connections: twice the `fronted` sessions", "`fronted` sessions: 4,096", and "one source may have 16 requests in flight to the decoy".
+	pub connections: usize,
+	pub fronted: usize,
+	pub per_source: usize,
+}
+
+impl Front {
+	pub fn of(trusted: Vec<IpNet>, header: Option<String>, limits: Option<crate::config::TransportLimits>) -> Front {
+		let (limits, fronted) = (limits.unwrap_or_default(), limits.and_then(|limits| limits.fronted_sessions).unwrap_or(DEFAULT_FRONTED_SESSIONS));
+		Front {trusted, header, connections: limits.proxy_connections.unwrap_or((2 * fronted).min(MAX_PROXY_CONNECTIONS)) as usize, fronted: fronted as usize, per_source: limits.decoy_requests_per_source.unwrap_or(DEFAULT_DECOY_REQUESTS) as usize}
+	}
+
+	/// How many requests of strangers may be in a decoy origin's hands at once, whatever their sources: half the proxy pool. The transports page gives a share to each source and none to all of them, and with that alone enough sources hold every proxy connection, after which the web server in front is left waiting and no user's request arrives.
+	/// With this bound, strangers hold half of the pool at the most, and the default pool of twice the `fronted` sessions leaves each of those a connection for its one request in flight. Over it, the connection with the oldest waiting request of any stranger is closed.
+	pub fn waiting(&self) -> usize {(self.connections / 2).max(1)}
+
+	fn trusts(&self, peer: IpAddr) -> bool {self.trusted.iter().any(|net| net.contains(&peer.to_canonical()))}
+}
+
+/// What a listener serves at one moment. A connection takes it once, when it is accepted, and works on that one value. A proxy connection takes it again for every request.
 pub struct Served {
-	/// What ends TLS on the listener. None for a listener that reads plain HTTP, which a harness has and a `tls` transport never.
+	/// What ends TLS on the listener. None for a listener that reads plain HTTP: one of the proxy path, or a harness.
 	pub acceptor: Option<Acceptor>,
 	pub routes: Vec<Route>,
 	pub origin: Origin,
@@ -303,13 +383,15 @@ pub struct Served {
 	/// What the node's own requests to the origin carry as `Host`.
 	pub host: String,
 	pub pools: Pools,
+	/// Set for a `ws` or `fronted` listener. "A listener serves one kind of peer."
+	pub front: Option<Front>,
 }
 
-/// One connection in the undecided pool. Dropping it takes the connection out, wherever it has got to.
-struct Place {listener: Arc<Listener>, id: u64, source: Source, bump: Arc<Notify>}
+/// One connection in the undecided pool, or one request of the proxy path among those that wait with nothing proven. Dropping it takes it out, wherever it has got to.
+struct Place {listener: Arc<Listener>, table: fn(&Listener) -> MutexGuard<'_, Undecided>, id: u64, source: Source, bump: Arc<Notify>}
 
 impl Drop for Place {
-	fn drop(&mut self) {self.listener.undecided().leave(self.id, self.source);}
+	fn drop(&mut self) {(self.table)(&self.listener).leave(self.id, self.source);}
 }
 
 #[derive(Default)]
@@ -328,6 +410,34 @@ impl Undecided {
 
 /// One connection in the relayed pool: when a byte last crossed it, in Unix milliseconds, and what closes it when the pool needs its place.
 struct Relayed {last: AtomicI64, kill: Notify}
+
+/// What only the one request in flight of a `fronted` session has: the node's side of the chunks, the session's allowance of handshakes, and what waits to go to the device.
+struct Turn {sealer: Sealer, handshakes: Handshakes, waiting: mpsc::Receiver<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
+
+/// What a `fronted` session is between two requests. Nothing here changes but under the hand of a request whose every chunk opened at the expected numbers, or of the proof that opened the session: "a live session it named is left exactly as it was".
+struct Polled {
+	/// Taken by the request in flight for as long as it is: "no other request of that session may be in flight".
+	turn: Option<Box<Turn>>,
+	opener: fronted::Opener,
+	/// The number of the last accepted request, 0 for the opening one, with the length and the SHA-256 of its body and the response it got: "The node stores one response per session, for the repeat."
+	/// The body is kept only to know a repeat by, and its digest does that: the response, a body of at most 65,536 bytes, is all of that size a session keeps between two requests. None for the opening request, which has no repeat.
+	number: u32,
+	body: Option<(usize, [u8; 32])>,
+	response: Option<Arc<Vec<u8>>>,
+}
+
+/// One `fronted` session: a row of its listener's table that requests name by its `sid`, with the queue of what the node has for its device.
+struct Polling {id: u64, route: u64, session: Arc<Session>, state: Mutex<Polled>}
+
+/// A place in the proxy pool, which counts its connection among those of trusted proxies for as long as the connection has it.
+struct Lease {_place: OwnedSemaphorePermit, held: Arc<AtomicI64>}
+
+impl Drop for Lease {
+	fn drop(&mut self) {self.held.fetch_sub(1, Ordering::Relaxed);}
+}
+
+/// The connection to the decoy origin that a proxy connection keeps between two requests it handed there, and whose address its PROXY protocol header named.
+struct Kept {read: ReadHalf<Stream>, write: WriteHalf<Stream>, source: IpAddr}
 
 /// One session of a stream transport: a connection, a device, and the queue of what the node has for that device.
 pub struct Session {
@@ -364,12 +474,24 @@ pub struct Listener {
 	/// One permit for each connection the listener holds, in whatever state. With none left the listener stops accepting.
 	room: Arc<Semaphore>,
 	permits: Mutex<usize>,
+	/// The proxy pool: one permit for each connection of a trusted proxy. "The node stops accepting on that listener and leaves new connections in the system's queue" when none is left.
+	proxies: Arc<Semaphore>,
+	seats: Mutex<usize>,
+	/// How many connections of trusted proxies hold a place of that pool right now. The accept loop has one more in hand while it waits for the next connection.
+	fronts: Arc<AtomicI64>,
+	/// The requests of the proxy path that wait with nothing proven: in a decoy origin's hands, or with a body still to come that nothing has vouched for. Each can close its connection, and the oldest of a source, or of all, does when there are too many.
+	decoys: Mutex<Undecided>,
+	/// Every `fronted` session by its `sid`, pending or established, and how many of them are established.
+	polling: Mutex<HashMap<[u8; 16], Arc<Polling>>>,
+	polled: Arc<AtomicI64>,
 	/// What the decoy origin sent for each header field of its answer to the node's own request, first values only. None while that has not been learnt.
 	learned: RwLock<Option<Arc<Vec<(String, String)>>>>,
 	relearn: Notify,
 	/// When it was last said that the decoy origin cannot be reached. None while it can.
 	down: Mutex<Option<Instant>>,
 	closed: AtomicBool,
+	/// Wakes every proxy connection when the listener closes.
+	shut: Notify,
 	counters: Arc<Counters>,
 }
 
@@ -380,8 +502,9 @@ pub struct State {listeners: Mutex<Vec<Weak<Listener>>>, counters: Arc<Counters>
 impl State {
 	/// A listener on `addr` that serves nothing yet.
 	pub fn listen(&self, addr: SocketAddr, served: Served) -> Arc<Listener> {
-		let permits = served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE;
-		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), counters: self.counters.clone()});
+		let seats = served.front.as_ref().map_or(0, |front| front.connections);
+		let permits = served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE + seats;
+		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools, front: served.front.clone()})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), proxies: Arc::new(Semaphore::new(seats)), seats: Mutex::new(seats), fronts: Arc::default(), decoys: Mutex::default(), polling: Mutex::default(), polled: Arc::default(), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), shut: Notify::new(), counters: self.counters.clone()});
 		listener.serve(served);
 		let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
 		listeners.retain(|listener| listener.strong_count() > 0);
@@ -389,12 +512,24 @@ impl State {
 		listener
 	}
 
+	/// Once a second: a `fronted` session that has ended leaves its listener's table. Nothing else holds such a session between two requests, so nothing else could take it out.
+	pub fn sweep(&self) {
+		let listeners: Vec<Arc<Listener>> = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
+		for listener in &listeners {
+			let over: Vec<Arc<Polling>> = listener.polling().values().filter(|polling| polling.session.seat.over()).cloned().collect();
+			for polling in &over {listener.forget(polling)}
+		}
+	}
+
 	pub fn totals(&self) -> StreamTotals {
 		let listeners: Vec<Arc<Listener>> = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
-		let (mut undecided, mut relayed, mut pending, mut sessions) = (0, 0, 0, 0);
+		let (mut undecided, mut relayed, mut pending, mut sessions, mut proxies, mut decoys, mut fronted) = (0, 0, 0, 0, 0, 0, 0);
 		for listener in &listeners {
 			undecided += listener.undecided().all.len();
 			relayed += listener.relayed().len();
+			proxies += listener.fronts.load(Ordering::Relaxed).max(0) as usize;
+			decoys += listener.decoys().all.len();
+			fronted += listener.polled.load(Ordering::Relaxed).max(0) as usize;
 			for (_, seat) in listener.sessions().values() {
 				if seat.pending() {pending += 1} else if seat.established() {sessions += 1}
 			}
@@ -410,6 +545,9 @@ impl State {
 			handshakes: count(Count::Handshakes), tunnel: count(Count::Tunnel), queue_full: count(Count::QueueFull), chunks_sent: count(Count::Chunks),
 			ended_deadline: ended(Ended::Deadline), ended_idle: ended(Ended::Idle), ended_packets: ended(Ended::Packets), ended_displaced: ended(Ended::Displaced), ended_revoked: ended(Ended::Revoked), ended_closed: ended(Ended::Closed), ended_invalid: ended(Ended::Invalid), ended_unserved: ended(Ended::Unserved),
 			upgrade_learned: count(Count::Learned), upgrade_learn_failed: count(Count::LearnFailed),
+			proxies, decoys, fronted, proxy_accepted: count(Count::Proxied), proxy_requests: count(Count::Requests), proxy_unnamed: count(Count::Unnamed), proxy_idle: count(Count::ProxyIdle), forwards: count(Count::Forwarded), forwards_unframed: count(Count::Unframed), forwards_cut: count(Count::Cut),
+			stranger_head: stranger(Stranger::Head), stranger_session: stranger(Stranger::Session), stranger_body: stranger(Stranger::Body), stranger_unestablished: stranger(Stranger::Unestablished), polls: count(Count::Polls), poll_repeats: count(Count::Repeats),
+			proxy_http10: count(Count::Legacy), forwards_redialed: count(Count::Redialed), origin_dropped: count(Count::OriginDropped),
 		}
 	}
 }
@@ -445,6 +583,28 @@ impl Listener {
 
 	fn sessions(&self) -> MutexGuard<'_, HashMap<u64, (u64, Arc<Seat>)>> {self.sessions.lock().unwrap_or_else(|e| e.into_inner())}
 
+	fn decoys(&self) -> MutexGuard<'_, Undecided> {self.decoys.lock().unwrap_or_else(|e| e.into_inner())}
+
+	fn polling(&self) -> MutexGuard<'_, HashMap<[u8; 16], Arc<Polling>>> {self.polling.lock().unwrap_or_else(|e| e.into_inner())}
+
+	/// Gives a connection of a trusted proxy the place in the proxy pool that was taken for it.
+	fn lease(&self, place: OwnedSemaphorePermit) -> Lease {
+		self.fronts.fetch_add(1, Ordering::Relaxed);
+		Lease {_place: place, held: self.fronts.clone()}
+	}
+
+	/// Counts a connection of the proxy path that is closed at once, because its source or all strangers together had too many requests waiting, or because the listener closed.
+	fn cut(&self) -> Handed {
+		self.counters.count(Count::Cut);
+		Handed::Cut
+	}
+
+	/// Takes a `fronted` session out of the listener's tables, whatever became of it.
+	fn forget(&self, polling: &Arc<Polling>) {
+		self.polling().retain(|_, held| !Arc::ptr_eq(held, polling));
+		self.sessions().remove(&polling.id);
+	}
+
 	/// What the listener serves right now.
 	pub fn served(&self) -> Arc<Served> {self.served.read().unwrap_or_else(|e| e.into_inner()).clone()}
 
@@ -459,9 +619,12 @@ impl Listener {
 			if !served.routes.iter().any(|kept| kept.id == *route) {seat.end(Ended::Unserved)}
 		}
 		// The permits follow the pools. Smaller pools take back only the permits no connection holds right now, so the listener may hold more connections than the new pools ask for until the next reload counts again.
-		let (wanted, mut permits) = (served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE, self.permits.lock().unwrap_or_else(|e| e.into_inner()));
-		if wanted > *permits {self.room.add_permits(wanted - *permits)}
-		*permits = if wanted < *permits {*permits - self.room.forget_permits(*permits - wanted)} else {wanted};
+		let seats = served.front.as_ref().map_or(0, |front| front.connections);
+		for (room, held, wanted) in [(&self.room, &self.permits, served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE + seats), (&self.proxies, &self.seats, seats)] {
+			let mut permits = held.lock().unwrap_or_else(|e| e.into_inner());
+			if wanted > *permits {room.add_permits(wanted - *permits)}
+			*permits = if wanted < *permits {*permits - room.forget_permits(*permits - wanted)} else {wanted};
+		}
 		*self.served.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(served);
 		self.relearn.notify_one();
 	}
@@ -470,8 +633,9 @@ impl Listener {
 	pub fn close(&self) {
 		self.closed.store(true, Ordering::Release);
 		for (_, seat) in self.sessions().values() {seat.end(Ended::Unserved)}
-		for (_, bump) in self.undecided().all.values() {bump.notify_one()}
+		for (_, bump) in self.undecided().all.values().chain(self.decoys().all.values()) {bump.notify_one()}
 		for relayed in self.relayed().values() {relayed.kill.notify_one()}
+		self.shut.notify_waiters();
 	}
 
 	/// Says once, and once a minute at the most, that the decoy origin cannot be reached, and once when it can be again.
@@ -491,8 +655,10 @@ impl Listener {
 	}
 
 	/// Step 7 of "Verifying" for a stream proof, which the replay rule calls last and only for a proof it would accept. "Session: New proofs are refused and take the unauthenticated path."
-	fn charge(&self, shared: &Shared, seat: &Arc<Seat>, from: IpAddr, now: i64, cap: usize, why: &mut Stranger) -> bool {
-		if self.pool.load(Ordering::Relaxed) >= cap as i64 {
+	/// `fronted` is the pool of `fronted` sessions for a proof that opens one, which is held to both.
+	#[allow(clippy::too_many_arguments)]
+	fn charge(&self, shared: &Shared, seat: &Arc<Seat>, from: IpAddr, now: i64, cap: usize, fronted: Option<usize>, why: &mut Stranger) -> bool {
+		if self.pool.load(Ordering::Relaxed) >= cap as i64 || fronted.is_some_and(|fronted| self.polled.load(Ordering::Relaxed) >= fronted as i64) {
 			*why = Stranger::Pool;
 			return false;
 		}
@@ -536,6 +702,8 @@ pub fn accept(shared: &Arc<Shared>, listener: Arc<Listener>, socket: TcpListener
 	tokio::spawn(async move {
 		loop {
 			let Ok(permit) = listener.room.clone().acquire_owned().await else {return};
+			// "Proxy: The node stops accepting on that listener and leaves new connections in the system's queue." A listener of the proxy path takes a connection from the system only when its proxy pool has a place for it, whoever it then turns out to be from.
+			let seat = if listener.served().front.is_some() {listener.proxies.clone().acquire_owned().await.ok()} else {None};
 			let (tcp, peer) = match socket.accept().await {
 				Ok(accepted) => accepted,
 				Err(_) => {
@@ -546,8 +714,22 @@ pub fn accept(shared: &Arc<Shared>, listener: Arc<Listener>, socket: TcpListener
 			};
 			listener.counters.count(Count::Accepted);
 			let served = listener.served();
-			let place = enter(&listener, Source::of(peer.ip()), served.pools);
-			tokio::spawn(direct(shared.clone(), listener.clone(), served, tcp, peer, place, permit));
+			// The peer of the socket decides, and nothing it sends does: "a peer outside them is a direct peer that is never a user and always goes to the decoy." It gives its place in the proxy pool back at once.
+			match seat.filter(|_| served.front.as_ref().is_some_and(|front| front.trusts(peer.ip()))) {
+				Some(seat) => {
+					listener.counters.count(Count::Proxied);
+					let _ = tcp.set_nodelay(true);
+					let Ok(local) = tcp.local_addr() else {
+						listener.counters.count(Count::Broken);
+						continue;
+					};
+					tokio::spawn(front(shared.clone(), listener.clone(), Box::new(tcp), peer, local, listener.lease(seat), permit));
+				}
+				None => {
+					let place = enter(&listener, Listener::undecided, Source::of(peer.ip()), served.pools.undecided, served.pools.per_source);
+					tokio::spawn(direct(shared.clone(), listener.clone(), served, tcp, peer, place, permit));
+				}
+			}
 		}
 	}).abort_handle()
 }
@@ -555,13 +737,14 @@ pub fn accept(shared: &Arc<Shared>, listener: Arc<Listener>, socket: TcpListener
 /// Puts a new connection into the undecided pool: "Accepted from a direct peer, no decision yet."
 /// "The oldest undecided connection is decided as not a user at once. The same happens to a source's oldest undecided connection when that source reaches its share." Whoever is displaced is out of the pool before this returns.
 /// Only connections that have proven nothing are in this pool, so only strangers are ever displaced: "Strangers may displace strangers. Nothing a stranger does displaces a session."
-fn enter(listener: &Arc<Listener>, source: Source, pools: Pools) -> Place {
-	let (id, bump, mut undecided) = (listener.ids.fetch_add(1, Ordering::Relaxed), Arc::new(Notify::new()), listener.undecided());
-	if let Some(displaced) = undecided.by_source.get(&source).filter(|ids| ids.len() >= pools.per_source).and_then(|ids| ids.front().copied()) {
+/// The requests of the proxy path that wait with nothing proven are held the same way, in a table of their own: "one source may have 16 requests in flight to the decoy. Over that, the proxy connection that carries that source's oldest waiting request is closed."
+fn enter(listener: &Arc<Listener>, table: fn(&Listener) -> MutexGuard<'_, Undecided>, source: Source, all: usize, per_source: usize) -> Place {
+	let (id, bump, mut undecided) = (listener.ids.fetch_add(1, Ordering::Relaxed), Arc::new(Notify::new()), table(listener));
+	if let Some(displaced) = undecided.by_source.get(&source).filter(|ids| ids.len() >= per_source).and_then(|ids| ids.front().copied()) {
 		if let Some((_, bump)) = undecided.all.get(&displaced) {bump.notify_one()}
 		undecided.leave(displaced, source);
 	}
-	while undecided.all.len() >= pools.undecided {
+	while undecided.all.len() >= all {
 		let Some((displaced, (of, bump))) = undecided.all.first_key_value().map(|(displaced, (of, bump))| (*displaced, (*of, bump.clone()))) else {break};
 		bump.notify_one();
 		undecided.leave(displaced, of);
@@ -569,7 +752,7 @@ fn enter(listener: &Arc<Listener>, source: Source, pools: Pools) -> Place {
 	undecided.all.insert(id, (source, bump.clone()));
 	undecided.by_source.entry(source).or_default().push_back(id);
 	drop(undecided);
-	Place {listener: listener.clone(), id, source, bump}
+	Place {listener: listener.clone(), table, id, source, bump}
 }
 
 /// One accepted TCP connection of a direct peer, from the TLS handshake on. Step 1: "TLS, if this listener ends it, within the handshake deadline. A handshake that does not finish in time, or whose connection is displaced from the undecided pool before it finishes, is closed."
@@ -597,7 +780,8 @@ async fn direct(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served
 				Err(count) => return listener.counters.count(count),
 			}
 		}
-		None => (Box::new(tcp), true),
+		// A listener of the proxy path reads plain HTTP, and whoever reaches it from outside `trusted_proxies` is never a user: its line is verified with the same work and with dummy inputs. Only a harness has a listener that is neither.
+		None => (Box::new(tcp), served.front.is_none()),
 	};
 	conn(shared, listener, served, io, peer, local, user, place).await
 }
@@ -644,7 +828,7 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 	};
 	// 5. "Evaluate, at the end of the request line."
 	let proved = match line {
-		Ok(line) => prove(&shared, &listener, &served, &buf[..line], user, peer.ip(), &place).await.map(|accepted| (line, accepted)),
+		Ok(line) => prove(&shared, &listener, &served, &buf[..line], |route| user && route.over == Over::Tls, peer.ip(), Some(&place)).await.map(|accepted| (line, accepted)),
 		Err(why) => Err(why),
 	};
 	match proved {
@@ -714,7 +898,8 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 /// The path is compared with every path of the listener, and the token is opened under the keys of every route of the listener, whichever path the line has: the work of a line does not say which path it had, or whether it had one of them.
 /// What that work does not make equal is on the transports page under "Timing", and nothing is added here to hide it.
 /// A line that passed steps 1 to 4 is a device's, and `place` is given up for it: from there on the connection is no stranger's, and no stranger's connection displaces it.
-async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], user: bool, from: IpAddr, place: &Place) -> Result<Accepted, Stranger> {
+/// `able` says of a route whether a line on this connection can be a user's on it at all, by what is known besides the line: the kind of peer, and on the proxy path the head of the request. On the proxy path "a `GET` for a `ws` path or a `POST` for a `fronted` path can be a user's", and `from` is the source its proxy named.
+async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], able: impl Fn(&Route) -> bool, from: IpAddr, place: Option<&Place>) -> Result<Accepted, Stranger> {
 	let Some(line) = Line::parse(line) else {return Err(Stranger::Syntax)};
 	let (plan, paths): (Arc<Plan>, Vec<&[u8]>) = (shared.plan(), served.routes.iter().map(|route| route.path.as_bytes()).collect());
 	let (at, query) = (line.path_among(&paths), line.query.unwrap_or_default());
@@ -722,21 +907,22 @@ async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line:
 	let mut found = None;
 	for (index, (route, native)) in served.routes.iter().zip(&natives).enumerate() {
 		let Some((prover, tags)) = native.as_ref().and_then(|(native, tags)| Some((native.prover.as_ref()?, tags))) else {continue};
-		if let Ok(opened) = prover.node.open((user && at == Some(index) && line.method == route.method).then_some(route.name), query, &tags.table) {found = Some((index, opened))}
+		if let Ok(opened) = prover.node.open((able(route) && at == Some(index) && line.method == route.method).then_some(route.name), query, &tags.table) {found = Some((index, opened))}
 	}
 	let Some((index, mut opened)) = found else {return Err(Stranger::Proof)};
-	place.listener.undecided().leave(place.id, place.source);
+	if let Some(place) = place {(place.table)(&place.listener).leave(place.id, place.source);}
 	let ((route, native), now) = ((&served.routes[index], natives[index].as_ref().map(|(native, _)| *native)), Clock::of((shared.now)()));
 	let (Some(native), Some(replay)) = (native, shared.replay.get()) else {return Err(Stranger::NoReplay)};
 	// The session as the limits will know it. It is one of its device's sessions from the moment the limits are charged for it, and nobody's when they are not.
 	// It remembers the node transport key its token opened under as well as the device secret: its chunk keys come from that key too, so the session ends when the config no longer has it.
-	let seat = Seat::new(opened.device.public, opened.device.id, native.prover.as_ref().and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), listener.counters.ended.clone(), route.transport.idle(), now.ms);
+	let polled = (route.over == Over::Fronted).then(|| (listener.polled.clone(), served.front.as_ref().map_or(0, |front| front.fronted)));
+	let seat = Seat::new(opened.device.public, opened.device.id, native.prover.as_ref().and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), polled.as_ref().map(|(polled, _)| polled.clone()), listener.counters.ended.clone(), route.transport.idle(), now.ms);
 	let (mut writes, mut waiting): (_, Option<(Instant, Held)>) = (replay.writes(), None);
 	loop {
 		// A write that ends after the rule was asked is one this proof has not seen yet, and wakes it.
 		writes.borrow_and_update();
 		let (now, mut why) = (Clock::of((shared.now)()), Stranger::NoReplay);
-		opened = match replay.with(|memory| opened.accept(memory, now.secs, |_| listener.charge(shared, &seat, from, now.ms, served.pools.sessions, &mut why))) {
+		opened = match replay.with(|memory| opened.accept(memory, now.secs, |_| listener.charge(shared, &seat, from, now.ms, served.pools.sessions, polled.as_ref().map(|(_, cap)| *cap), &mut why))) {
 			None => return Err(Stranger::NoReplay),
 			// The first tunnel packet deadline runs from here, "10 s after the proof was accepted", and not from before a wait for a limit.
 			Some(Decision::Accepted(accepted)) => {
@@ -801,6 +987,59 @@ async fn put(writer: &mut WriteHalf<Stream>, seat: &Seat, bytes: &[u8]) -> bool 
 			writer.flush().await
 		} => written.is_ok(),
 	}
+}
+
+/// One WireGuard datagram that came in on a session, from the chunk it travelled in to the tunnel (transports page, "WireGuard on an obfuscated transport"). What WireGuard answers to it goes to `net` and what it carried to `ip`.
+/// Whether it was a keepalive, for a packet of the session's device. None for a datagram that is none, or that the session's allowance of handshakes has no room for: it leaves nothing behind.
+#[allow(clippy::too_many_arguments)]
+fn take(shared: &Shared, listener: &Listener, served: &Served, session: &Arc<Session>, handshakes: &Handshakes, peer: SocketAddr, now: Clock, datagram: &[u8], net: &mut Vec<Vec<u8>>, ip: &mut Vec<Vec<u8>>) -> Option<bool> {
+	let seat = &session.seat;
+	// "Excess messages are dropped silently and counted", and an initiation the session took before is dropped before the allowance is charged, see `Handshakes::admit`.
+	if datagram.first() == Some(&1) {
+		match handshakes.admit(datagram, now.ms) {
+			Initiation::Taken => {}
+			Initiation::Repeat => {
+				listener.counters.count(Count::Tunnel);
+				return None;
+			}
+			Initiation::Excess => {
+				listener.counters.count(Count::Handshakes);
+				return None;
+			}
+		}
+	}
+	// "Binding. A session belongs to the one device its proof named." What WireGuard does not take as a packet of that device leaves nothing behind.
+	let (answers, carried) = (net.len(), ip.len());
+	let bound = {
+		let mut peers = seat.tunnel.lock();
+		let bound = peers.wg.recv_bound(&seat.device, peer, datagram, net, ip).filter(|bound| bound.proven);
+		// "A peer's endpoint moves between sessions only after a packet authenticated under that peer's keys."
+		if let Some(bound) = bound.filter(|_| seat.live()) {peers.heard(bound.peer, Via::Stream(Arc::downgrade(session)))}
+		bound
+	};
+	// "A session is pending until a WireGuard packet of its device has authenticated on it." A pool that has filled up since the proof leaves the session pending, and it ends at its deadline.
+	let seated = match bound {
+		None => None,
+		Some(bound) if seat.pending() => match shared.limits.establish(seat, served.pools.sessions, served.front.as_ref().map_or(usize::MAX, |front| front.fronted), now.ms) {
+			Seated::Established => {
+				listener.counters.count(Count::Established);
+				let mut peers = seat.tunnel.lock();
+				if peers.wg.index(&seat.device) == Some(bound.peer) {peers.heard(bound.peer, Via::Stream(Arc::downgrade(session)))}
+				Some(bound)
+			}
+			full => {
+				if full == Seated::Full {listener.counters.count(Count::EstablishFull)}
+				None
+			}
+		},
+		Some(bound) => Some(bound),
+	};
+	if seated.is_none() {
+		if bound.is_none() {listener.counters.count(Count::Tunnel)}
+		net.truncate(answers);
+		ip.truncate(carried);
+	}
+	seated.map(|bound| bound.keepalive)
 }
 
 /// How the loop of a session came to its end.
@@ -896,54 +1135,7 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 					seat.active.store(now.ms, Ordering::Relaxed);
 					for datagram in items {
 						datagrams += 1;
-						// "Excess messages are dropped silently and counted", and an initiation the session took before is dropped before the allowance is charged, see `Handshakes::admit`.
-						if datagram.first() == Some(&1) {
-							match handshakes.admit(datagram, now.ms) {
-								Initiation::Taken => {}
-								Initiation::Repeat => {
-									listener.counters.count(Count::Tunnel);
-									continue;
-								}
-								Initiation::Excess => {
-									listener.counters.count(Count::Handshakes);
-									continue;
-								}
-							}
-						}
-						// "Binding. A session belongs to the one device its proof named." What WireGuard does not take as a packet of that device leaves nothing behind.
-						let (answers, carried) = (net.len(), ip.len());
-						let bound = {
-							let mut peers = seat.tunnel.lock();
-							let bound = peers.wg.recv_bound(&seat.device, peer, datagram, &mut net, &mut ip).filter(|bound| bound.proven);
-							// "A peer's endpoint moves between sessions only after a packet authenticated under that peer's keys."
-							if let Some(bound) = bound.filter(|_| seat.live()) {peers.heard(bound.peer, Via::Stream(Arc::downgrade(&session)))}
-							bound
-						};
-						// "A session is pending until a WireGuard packet of its device has authenticated on it." A pool that has filled up since the proof leaves the session pending, and it ends at its deadline.
-						let seated = match bound {
-							None => None,
-							Some(bound) if seat.pending() => match shared.limits.establish(&seat, served.pools.sessions, now.ms) {
-								Seated::Established => {
-									listener.counters.count(Count::Established);
-									let mut peers = seat.tunnel.lock();
-									if peers.wg.index(&seat.device) == Some(bound.peer) {peers.heard(bound.peer, Via::Stream(Arc::downgrade(&session)))}
-									Some(bound)
-								}
-								full => {
-									if full == Seated::Full {listener.counters.count(Count::EstablishFull)}
-									None
-								}
-							},
-							Some(bound) => Some(bound),
-						};
-						match seated {
-							Some(bound) => keepalive = bound.keepalive,
-							None => {
-								if bound.is_none() {listener.counters.count(Count::Tunnel)}
-								net.truncate(answers);
-								ip.truncate(carried);
-							}
-						}
+						if let Some(lone) = take(shared, listener, served, &session, &handshakes, peer, now, datagram, &mut net, &mut ip) {keepalive = lone}
 					}
 					// "At the moment a session becomes established it sends one chunk on it: the WireGuard handshake response when an initiation established it, and otherwise a padding-only chunk."
 					// What WireGuard answers goes out at once, with whatever waited for a lone keepalive's delay to pass.
@@ -1118,6 +1310,577 @@ async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[
 	}
 }
 
+/// One connection of a trusted proxy, request by request (transports page, "Accept state machine", "Trusted proxy peer"). `seat` is its place in the proxy pool, which it gives back when it ends or becomes the connection of a WebSocket session.
+/// "It is never closed to make room for a direct peer": what closes it is its proxy, the origin behind a request it carried, 300 s without a request, or the rule for strangers' requests.
+/// Between two requests that went to the origin it keeps the connection it opened there, and watches it. Whatever the origin does on that connection while no request is in its hands (a byte, a close, a reset) answers nothing the proxy asked: the origin's connection is dropped, nothing is passed on, and the proxy's connection stays.
+/// The proxy's next request may be a user's, and an origin that says `408` on a quiet connection, or closes it by its keep-alive timer, would otherwise put that in front of a user. With no node in between the web server in front would own that quiet upstream connection and discard it the same way.
+/// A request of a user ends it too: the origin's connection is closed unused, because the origin never saw the request.
+async fn front(shared: Arc<Shared>, listener: Arc<Listener>, io: Stream, peer: SocketAddr, local: SocketAddr, seat: Lease, _room: OwnedSemaphorePermit) {
+	let ((mut from_proxy, mut to_proxy), mut buf, mut filled, mut eof, mut kept, mut early) = (tokio::io::split(io), vec![0u8; HEAD_MAX], 0, false, None::<Kept>, [0u8; 1]);
+	loop {
+		// A `fronted` body is read behind its head, into room that is given back with the request.
+		if filled <= HEAD_MAX && buf.len() != HEAD_MAX {
+			buf.resize(HEAD_MAX, 0);
+			buf.shrink_to(HEAD_MAX);
+		}
+		// 1. "Read the whole request head, within the limits for a head. The proxy has buffered it already, so waiting for it adds no delay that a prober could measure." The time of a head runs from its first byte, and before that the connection waits for its next request.
+		let (idle, mut limit, shut) = (Instant::now() + PROXY_IDLE, (filled > 0).then(|| Instant::now() + HEAD_TIME), listener.shut.notified());
+		tokio::pin!(shut);
+		shut.as_mut().enable();
+		if listener.closed.load(Ordering::Acquire) {return}
+		let whole = loop {
+			if let Some(end) = http::head_end(&buf[..filled.min(HEAD_MAX)]) {break Ok(end)}
+			if filled >= HEAD_MAX {break Err(Stranger::Head)}
+			if eof {
+				if filled == 0 {return}
+				break Err(Stranger::Closed);
+			}
+			tokio::select! {
+				biased;
+				_ = &mut shut => return,
+				read = from_proxy.read(&mut buf[filled..]) => match read {
+					Ok(read) if read > 0 => {
+						filled += read;
+						limit.get_or_insert_with(|| Instant::now() + HEAD_TIME);
+					}
+					Ok(_) => eof = true,
+					Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => eof = true,
+					Err(_) => return listener.counters.count(Count::Broken),
+				},
+				_ = async {
+					match kept.as_mut() {
+						Some(kept) => drop(kept.read.read(&mut early).await),
+						None => std::future::pending().await,
+					}
+				}, if kept.is_some() => {
+					listener.counters.count(Count::OriginDropped);
+					kept = None;
+				}
+				_ = sleep_until(limit.unwrap_or(idle)) => {
+					if limit.is_some() {break Err(Stranger::Head)}
+					// "A proxy connection is closed after 300 s without a request."
+					listener.counters.count(Count::ProxyIdle);
+					let _ = timeout(CLOSE_WAIT, to_proxy.shutdown()).await;
+					return;
+				}
+			}
+		};
+		// A head over the size limit is nobody's, and is handed on as the bytes it is. It is still read on, to where it ends, to `SOURCE_HEAD` bytes or to the end of its time, for one thing only: the address its proxy named.
+		// Without that a stranger with a long head would be the proxy itself to the origin, in its log, in its limits and in whatever it grants its own host. Nothing that is read here decides who is a user.
+		let mut headed = whole.ok();
+		if whole.is_err() && filled >= HEAD_MAX {
+			buf.resize(SOURCE_HEAD, 0);
+			let mut seen = HEAD_MAX - 3;
+			headed = loop {
+				if let Some(end) = http::head_end(&buf[seen..filled]) {break Some(seen + end)}
+				seen = filled - 3;
+				if filled >= SOURCE_HEAD || eof {break None}
+				tokio::select! {
+					biased;
+					_ = &mut shut => return,
+					read = from_proxy.read(&mut buf[filled..]) => match read {
+						Ok(read) if read > 0 => filled += read,
+						Ok(_) => eof = true,
+						Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => eof = true,
+						Err(_) => return listener.counters.count(Count::Broken),
+					},
+					_ = sleep_until(limit.unwrap_or(idle)) => break None,
+				}
+			};
+		}
+		listener.counters.count(Count::Requests);
+		let served = listener.served();
+		let Some(way) = &served.front else {return};
+		// The list in force now decides, not the one the connection was accepted under: a proxy that a reload took out of `trusted_proxies` is a direct peer from its next request on, "never a user", and believed about nobody's address.
+		let trusted = way.trusts(peer.ip());
+		// "A head that is over the size limit or not complete in time is not a user: forward what was read", which then is all the node has of it, and is not told apart from what follows it.
+		let end = whole.unwrap_or(filled);
+		let mut request = http::request(&buf[..end]);
+		if whole.is_err() {request.body = None}
+		// A web server that speaks HTTP/1.0 to the node hands on no request a user could have sent, and nothing else would say so.
+		if trusted && buf[..request.line].ends_with(b" HTTP/1.0\r\n") {listener.counters.count(Count::Legacy)}
+		// 2. "The source for every limit and log line is the rightmost address in the header named by `client_address_header` that is not itself inside `trusted_proxies`. If the header is absent or unreadable, it is the peer."
+		let named = headed.filter(|_| trusted).and_then(|head| way.header.as_ref().and_then(|name| http::forwarded(&buf[..head], name.as_bytes(), |address| way.trusts(address))));
+		if named.is_none() && way.header.is_some() && trusted {listener.counters.count(Count::Unnamed)}
+		let source = named.unwrap_or(peer.ip().to_canonical());
+		// 3. "Evaluate the request line as a direct peer's is evaluated, with that source. Here a `GET` for a `ws` path or a `POST` for a `fronted` path can be a user's. Steps 1 to 4 of Verifying run for every request": for every one whose line passes the test that uses no secret, as for a direct peer.
+		// What makes a request no user's by its head is known before that and changes none of the work: on `fronted`, step 1 of its state machine, "exactly one `Content-Length`, from 18 to 65,536, and no `Transfer-Encoding`", and on `ws` a head that is HTTP/1.1 as the node reads it, with no body.
+		let (framed, line) = (matches!(request.body, Some(Framing::Length(length)) if (BODY_MIN as u64..=BODY_MAX as u64).contains(&length)), &buf[..request.line]);
+		let proved = match whole {
+			Err(why) => Err(why),
+			Ok(_) if Scanner::new().feed(line) != Scan::Line(request.line) => Err(Stranger::Syntax),
+			Ok(_) => prove(&shared, &listener, &served, line, |route| trusted && if route.over == Over::Fronted {framed} else {request.body == Some(Framing::None)}, source, None).await,
+		};
+		let (asked, mut why) = match proved {
+			// 4. "A user. For a WebSocket open, the connection leaves the proxy pool: continue with WebSocket session. A head that is not a WebSocket upgrade closes the connection with no HTTP answer."
+			Ok(accepted) if served.routes[accepted.route].over != Over::Fronted => {
+				listener.counters.count(Count::Proofs);
+				drop((kept, seat));
+				return session(&shared, &listener, &served, from_proxy.unsplit(to_proxy), SocketAddr::new(source, 0), buf, filled, request.line, accepted).await;
+			}
+			Ok(accepted) => {
+				listener.counters.count(Count::Proofs);
+				(Some(Ok(accepted)), Stranger::Proof)
+			}
+			// "`fronted`", "State machine", step 2: "a later request (`<path>?<sid>.<n>`)", whose `sid` "must be known". It is looked up only for a `POST` to a `fronted` path of this listener whose head passed step 1.
+			Err(Stranger::Proof) if framed && trusted => (Line::parse(line).filter(|line| line.method == Method::Post).and_then(|line| {
+				let paths: Vec<&[u8]> = served.routes.iter().map(|route| route.path.as_bytes()).collect();
+				let (route, (sid, number)) = (&served.routes[line.path_among(&paths)?], fronted::later(line.query?)?);
+				let polling = listener.polling().get(&sid).cloned()?;
+				(route.over == Over::Fronted && polling.route == route.id).then_some(Err((polling, number)))
+			}), Stranger::Proof),
+			Err(why) => (None, why),
+		};
+		let mut place = None;
+		if let (Some(asked), Some(Framing::Length(length))) = (asked, request.body) {
+			let total = end + length as usize;
+			match poll(&shared, &listener, &served, way, &mut from_proxy, &mut to_proxy, &mut buf, &mut filled, &mut eof, end, total, source, asked).await {
+				// "A `fronted` request is handled as `fronted` says, and the node returns to step 1."
+				Poll::Answered => {
+					kept = None;
+					buf.copy_within(total..filled, 0);
+					filled -= total;
+					continue;
+				}
+				Poll::Lost => return,
+				Poll::Stranger(reason, waiting) => (why, place) = (reason, waiting),
+			}
+		}
+		// 5. "Not a user. Forward this request to a connection to the decoy origin and relay its response, then return to step 1."
+		listener.counters.strangers[why as usize].fetch_add(1, Ordering::Relaxed);
+		match forward(&listener, &served, way, &mut from_proxy, &mut to_proxy, &mut buf, &mut filled, &mut eof, end, request, kept.take(), source, local, place).await {
+			Handed::Next(origin) => kept = origin,
+			Handed::Close => {
+				let _ = timeout(CLOSE_WAIT, to_proxy.shutdown()).await;
+				return;
+			}
+			Handed::Reset => return from_proxy.unsplit(to_proxy).reset(),
+			Handed::Cut => return,
+		}
+	}
+}
+
+/// How a request that was handed to the decoy origin left its proxy connection.
+enum Handed {
+	/// The answer is complete and the proxy keeps its connection. The origin's stays with the proxy connection for its next request, unless the origin ended it behind the answer.
+	Next(Option<Kept>),
+	/// The origin closed its connection, or the node no longer knows where a request begins: the proxy's is closed, once all of the answer was handed on.
+	Close,
+	/// The origin reset its connection, and the proxy's is reset.
+	Reset,
+	/// The proxy's connection broke, or was closed to make room: it is dropped as it is.
+	Cut,
+}
+
+/// How the request side of a forwarded request ended.
+enum Up {
+	/// The whole request is with the origin and its answer is complete.
+	Whole,
+	/// The proxy closed its side, and the origin was told so.
+	Shut,
+	/// The origin takes no more of what the proxy sends.
+	Unsent,
+	Broken,
+}
+
+/// How the answer side of a forwarded request ended.
+enum Down {
+	/// The origin closed its connection, with everything it sent handed on.
+	Closed,
+	/// The answer is complete and nothing behind it on this connection can be told apart.
+	Finished,
+	/// The answer is complete, the request was whole, and the origin then said something or ended its connection: its connection is dropped and the proxy's goes on.
+	Dropped,
+	Reset,
+	Broken,
+}
+
+/// Hands one request of a proxy connection to the decoy origin, and the origin's answer back (step 5 of the proxy path). This is HTTP forwarding with nothing written by the node: the head goes to the origin byte for byte as it was read, the body behind it as far as its framing says, and the answer comes back as the origin sent it, to where its framing says it ends.
+/// "Forwarding uses an existing HTTP/1.1 implementation. Header fields are passed in order, except hop-by-hop fields" is not followed: an implementation that parses a head and writes it again changes it (case, order, blanks, folded lines), and what a stranger gets would then be the node's reading of its request and not the request. The proxy in front and the origin behind both speak HTTP/1.1 to each other, so the hop-by-hop fields the proxy wrote for its upstream are the origin's to read.
+/// "A request with both `Content-Length` and `Transfer-Encoding`, with more than one `Content-Length`, with a `Transfer-Encoding` other than exactly `chunked`, or that the implementation refuses, closes both connections with no response" is not followed either: the origin answers such a request itself, and a proxy that got no answer where the site gives a `400` would show the node.
+/// Such a request, and every other the node cannot tell the end of (`http::request`), is relayed as the bytes it is, with everything the proxy sends behind it, to the end of the origin's answer, and then the proxy's connection is closed: the node never guesses where the next request starts, so it cannot disagree with the origin about it.
+/// `end` is how many bytes of `buf` are the head, `kept` the connection to the origin this proxy connection kept from its last request, and `place` the request's place among those that wait, when it has one already. One source has only so many of those, and so have all strangers together (`Front::waiting`).
+#[allow(clippy::too_many_arguments)]
+async fn forward(listener: &Arc<Listener>, served: &Served, way: &Front, from_proxy: &mut ReadHalf<Stream>, to_proxy: &mut WriteHalf<Stream>, buf: &mut [u8], filled: &mut usize, eof: &mut bool, end: usize, request: http::Request, kept: Option<Kept>, source: IpAddr, local: SocketAddr, place: Option<Place>) -> Handed {
+	let place = place.unwrap_or_else(|| enter(listener, Listener::decoys, Source::of(source), way.waiting(), way.per_source));
+	listener.counters.count(Count::Forwarded);
+	// "On the proxy path it carries the source taken from the forwarded-address header": a connection to the origin has named one address, so with `proxy_protocol` it carries the requests of that address only. The header has no port of the visitor's, and the PROXY protocol header says 0 for it.
+	let (mut origin, mut relay, mut first) = (kept.filter(|kept| !served.proxy || kept.source == source).map(|kept| (kept.read, kept.write)), vec![0u8; RELAY_BUFFER], 0);
+	// A connection that was kept may have been closed by the origin a moment ago, with the word of it still on its way: a web server in front would send its request once more on a new one, and so does the node, once.
+	// It can only do so for a request that is whole in the buffer, which is tried on the kept connection without being taken out of it. Nothing back, or the end of the connection, and the request goes to a new connection as if the old one had never been.
+	let entire = origin.as_ref().and(request.body).and_then(|framing| http::Body::new(framing).feed(&buf[end..*filled]).ok()).filter(|(_, complete)| *complete).map(|(taken, _)| end + taken);
+	if let (Some((from, to)), Some(entire)) = (origin.as_mut(), entire) {
+		let heard = tokio::select! {
+			biased;
+			_ = place.bump.notified() => return listener.cut(),
+			heard = async {
+				to.write_all(&buf[..entire]).await?;
+				from.read(&mut relay).await
+			} => heard,
+		};
+		match heard {
+			Ok(read) if read > 0 => first = read,
+			_ => {
+				listener.counters.count(Count::Redialed);
+				origin = None;
+			}
+		}
+	}
+	// `sent` says the whole request is with the origin already, and `first` how much of its answer was read.
+	let (sent, taken) = (first > 0, if first > 0 {entire.unwrap_or(end)} else {end});
+	let (mut from_origin, mut to_origin) = match origin {
+		Some(origin) => origin,
+		None => {
+			let dialed = tokio::select! {
+				biased;
+				_ = place.bump.notified() => return listener.cut(),
+				dialed = served.origin.dial(if served.proxy {Proxy::Peer(SocketAddr::new(source, 0), local)} else {Proxy::None}) => dialed,
+			};
+			// "If the origin cannot be reached, the proxy connection is closed with no response, counted as `decoy_down`. The front then gives the visitor its own error, as it would if the site were down."
+			let Ok(origin) = dialed else {
+				listener.counters.count(Count::DecoyDown);
+				listener.decoy(false);
+				return Handed::Close;
+			};
+			listener.decoy(true);
+			tokio::io::split(origin)
+		}
+	};
+	// `blind` says the node no longer tells requests apart on this connection, `whole` that all of the request is with the origin, `done` that its answer is complete, and `shut` that the origin was told the proxy closed its side. Each side of the exchange wakes the other when it changes one.
+	let (blind, whole, done, shut, turned) = (AtomicBool::new(request.body.is_none()), AtomicBool::new(sent), AtomicBool::new(false), AtomicBool::new(false), Notify::new());
+	let (get, set) = (|flag: &AtomicBool| flag.load(Ordering::Relaxed), |flag: &AtomicBool| flag.store(true, Ordering::Relaxed));
+	if get(&blind) {listener.counters.count(Count::Unframed)}
+	let ended = {
+		let up = async {
+			let mut body = http::Body::new(request.body.unwrap_or(Framing::Close));
+			// `head` is how many bytes at the start of the buffer are the head and still to be written. It goes out in one write with whatever of the body came with it: an origin that reads a head and what follows it at once must not get the two apart because the node stood between. HAProxy answers a head with two framings one way when its body is there and another way when it is not.
+			let mut head = if sent {0} else {end};
+			if sent {
+				buf.copy_within(taken..*filled, 0);
+				*filled -= taken;
+			}
+			loop {
+				// How much of what was read belongs to this request: all of it once the node no longer tells, and else what the framing of the body says.
+				let take = head + if get(&blind) {*filled - head} else if get(&whole) {0} else {
+					match body.feed(&buf[head..*filled]) {
+						Ok((taken, complete)) => {
+							whole.store(complete, Ordering::Relaxed);
+							taken
+						}
+						Err(_) => {
+							listener.counters.count(Count::Unframed);
+							set(&blind);
+							*filled - head
+						}
+					}
+				};
+				if take > 0 {
+					if to_origin.write_all(&buf[..take]).await.is_err() {return Up::Unsent}
+					buf.copy_within(take..*filled, 0);
+					(*filled, head) = (*filled - take, 0);
+				}
+				if get(&whole) && get(&done) && !get(&blind) {return Up::Whole}
+				// A proxy that closed its side has closed it for the origin once nothing it sent is left that the origin has not got. Requests it sent behind this one are still to be read, and are answered first.
+				if *eof && (get(&blind) || !get(&whole) || *filled == 0) {
+					let _ = to_origin.shutdown().await;
+					set(&shut);
+					return Up::Shut;
+				}
+				// With the request whole, the proxy is still read for as far as the buffer goes, so that its close is seen while the origin takes its time: what comes is its next request, which stays where it is.
+				if *eof || *filled == buf.len() {
+					turned.notified().await;
+					continue;
+				}
+				tokio::select! {
+					_ = turned.notified() => {}
+					read = from_proxy.read(&mut buf[*filled..]) => match read {
+						Ok(read) if read > 0 => *filled += read,
+						Ok(_) => *eof = true,
+						Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => *eof = true,
+						Err(_) => return Up::Broken,
+					},
+				}
+			}
+		};
+		let down = async {
+			let (mut answer, mut open, mut read) = (http::Response::new(request.bodiless, request.tunnel), false, first);
+			loop {
+				if read == 0 {
+					read = match from_origin.read(&mut relay).await {
+						Ok(read) if read > 0 => read,
+						// With the request whole and its answer complete, the exchange is over and the origin has no request in its hands: what it does then is not passed on, whichever of the two is seen first here, that or the end of the exchange.
+						_ if get(&done) && get(&whole) => return Down::Dropped,
+						Ok(_) => return Down::Closed,
+						Err(e) => return if e.kind() == io::ErrorKind::ConnectionReset {Down::Reset} else {Down::Closed},
+					};
+				}
+				// Bytes behind a complete answer are no answer to anything the proxy asked: they are what the origin made of a body, or of a request the node could not tell the end of. The proxy never gets them, on a connection its next request may be a user's on. While the request is still being sent, both connections end here.
+				if get(&done) {return if get(&whole) {Down::Dropped} else {Down::Finished}}
+				let said = if open {Answer::Open} else {answer.feed(&relay[..read])};
+				let give = if let Answer::Done(used) = said {used} else {read};
+				// "Every byte the origin sent is written out to the peer before the node waits for anything else": every byte of the answer, and none behind its last.
+				if to_proxy.write_all(&relay[..give]).await.is_err() || to_proxy.flush().await.is_err() {return Down::Broken}
+				match said {
+					Answer::More => {}
+					// The end of the first answer ends the exchange when the node no longer tells requests apart, when the proxy closed its side, when the origin sent more than the answer, and when the origin said the answer is its last (`Connection: close`), so that the proxy's connection is closed with the answer and not a moment later by chance.
+					Answer::Done(used) if used < read || answer.last() || get(&blind) || get(&shut) => return Down::Finished,
+					Answer::Done(_) => {
+						set(&done);
+						turned.notify_one();
+					}
+					// The connection itself is the answer, to where the origin ends it.
+					Answer::Open => {
+						open = true;
+						set(&blind);
+						turned.notify_one();
+					}
+				}
+				read = 0;
+			}
+		};
+		tokio::pin!(up, down);
+		tokio::select! {
+			biased;
+			_ = place.bump.notified() => None,
+			down = &mut down => Some(Ok(down)),
+			up = &mut up => match up {
+				Up::Whole => Some(Err(true)),
+				Up::Broken => Some(Err(false)),
+				// The origin's answer is still handed on, to its end.
+				Up::Shut | Up::Unsent => if get(&done) {Some(Ok(Down::Finished))} else {
+					tokio::select! {
+						biased;
+						_ = place.bump.notified() => None,
+						down = &mut down => Some(Ok(down)),
+					}
+				},
+			},
+		}
+	};
+	match ended {
+		None => listener.cut(),
+		Some(Err(true)) => Handed::Next(Some(Kept {read: from_origin, write: to_origin, source})),
+		Some(Ok(Down::Dropped)) => {
+			listener.counters.count(Count::OriginDropped);
+			Handed::Next(None)
+		}
+		Some(Err(false)) | Some(Ok(Down::Broken)) => Handed::Cut,
+		Some(Ok(Down::Reset)) => Handed::Reset,
+		Some(Ok(Down::Closed | Down::Finished)) => Handed::Close,
+	}
+}
+
+/// What became of a `fronted` request.
+enum Poll {
+	/// It was answered: `200` with what the node had for the device.
+	Answered,
+	/// It takes the unauthenticated path, for this reason, with its place among the requests that wait if it has one. Whatever was read of it is where it was read to.
+	Stranger(Stranger, Option<Place>),
+	/// The proxy's connection is gone.
+	Lost,
+}
+
+/// One `fronted` request that passed steps 1 to 4 of its state machine as far as its head goes (transports page, "`fronted`", "State machine"): the opening request of a proof that was just accepted, which makes the session here, or a later request that names a session of this listener, with its number.
+/// From step 5 on: the body is read whole into `buf` behind the head, up to `total` bytes in all, and nothing of the session is looked at or touched until all of it is there. Then, with the session held and nothing waited for: a repeat is known by its bytes, and anything else must open chunk by chunk at the expected numbers.
+/// "If any chunk does not open, nothing of the body is processed. For a later request the session stays as it was, so a stranger who learns a `sid` cannot disturb it." The only things a request that proves nothing touches are its own connection and its own place among the requests that wait, which is what bounds how many bodies can be read at once for somebody who learnt a `sid`.
+/// "Request `n` + 1 that arrives while request `n` is still held is not queued: it takes the unauthenticated path." A request is in flight from the moment its chunks opened to the moment its answer is stored, and no longer.
+#[allow(clippy::too_many_arguments)]
+async fn poll(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served, way: &Front, from_proxy: &mut ReadHalf<Stream>, to_proxy: &mut WriteHalf<Stream>, buf: &mut Vec<u8>, filled: &mut usize, eof: &mut bool, end: usize, total: usize, source: IpAddr, asked: Result<Accepted, (Arc<Polling>, u32)>) -> Poll {
+	let (deadline, opening) = (Instant::now() + BODY_TIME, asked.is_ok());
+	let (polling, number, place) = match asked {
+		// 3. "An accepted proof is spent and creates a pending session, whatever happens next."
+		Ok(accepted) => {
+			let (route, id, (queue, waiting), seat) = (&served.routes[accepted.route], listener.ids.fetch_add(1, Ordering::Relaxed), mpsc::channel(SEND_QUEUE), accepted.seat);
+			let Ok(padding) = Padding::new(accepted.wide, accepted.normal, &mut random) else {
+				seat.end(Ended::Closed);
+				return Poll::Stranger(Stranger::Body, None);
+			};
+			let polling = Arc::new(Polling {id, route: route.id, session: Arc::new(Session {seat: seat.clone(), over: route.over, queue, counters: listener.counters.clone()}), state: Mutex::new(Polled {turn: Some(Box::new(Turn {sealer: Sealer::new(accepted.keys.s2c, padding), handshakes: Handshakes::new(Clock::of((shared.now)()).ms), waiting, held: VecDeque::new(), lone: None})), opener: fronted::Opener::new(accepted.keys.c2s), number: 0, body: None, response: None})});
+			listener.sessions().insert(id, (route.id, seat.clone()));
+			// A session id is 16 bytes from the exporter of a fresh proof. Should one ever be a live session's, that session is left alone and the new one is nobody's.
+			let taken = match listener.polling().entry(accepted.keys.sid) {
+				Entry::Occupied(_) => true,
+				Entry::Vacant(free) => {
+					free.insert(polling.clone());
+					false
+				}
+			};
+			// A reload, or the end of the listener, between the request and now.
+			if taken || listener.closed.load(Ordering::Acquire) || !listener.served().routes.iter().any(|kept| kept.id == route.id) {seat.end(Ended::Unserved)}
+			if taken {
+				listener.sessions().remove(&id);
+				return Poll::Stranger(Stranger::Session, None);
+			}
+			(polling, 0, None)
+		}
+		// 4. "The `sid` must be known, no other request of that session may be in flight, and `n` must be one more than the last accepted, or equal to it for a repeat." Whoever sends this has proven nothing yet, so the session is only looked at: a request that cannot be the next one or the last one is not read any further.
+		Err((polling, number)) => {
+			let ordered = {
+				let state = polling.state.lock().unwrap_or_else(|e| e.into_inner());
+				!polling.session.seat.over() && state.turn.is_some() && (state.number.checked_add(1) == Some(number) || state.number == number)
+			};
+			if !ordered {return Poll::Stranger(Stranger::Session, None)}
+			(polling, number, Some(enter(listener, Listener::decoys, Source::of(source), way.waiting(), way.per_source)))
+		}
+	};
+	let seat = &polling.session.seat;
+	// 5. "The node reads the whole body, which must arrive within 10 s, before it acts on any of it."
+	if buf.len() < total {buf.resize(total, 0)}
+	let arrived = loop {
+		if *filled >= total {break true}
+		if *eof {break false}
+		tokio::select! {
+			biased;
+			_ = async {
+				match &place {
+					Some(place) => place.bump.notified().await,
+					None => std::future::pending().await,
+				}
+			} => {
+				listener.cut();
+				return Poll::Lost;
+			}
+			// Only the opening request waits on its session: it is the one request the session has. A request that has proven nothing must not take the word meant for the one in flight.
+			_ = seat.gone(), if opening => break false,
+			read = from_proxy.read(&mut buf[*filled..]) => match read {
+				Ok(read) if read > 0 => *filled += read,
+				Ok(_) => *eof = true,
+				Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => *eof = true,
+				Err(_) => {
+					if opening {
+						seat.end(Ended::Closed);
+						listener.forget(&polling);
+					}
+					return Poll::Lost;
+				}
+			},
+			_ = sleep_until(deadline) => break false,
+		}
+	};
+	// 6 to 8, with the session held and nothing waited for.
+	let now = Clock::of((shared.now)());
+	let verdict = if !arrived {Err(Stranger::Body)} else {
+		let (mut state, mut scratch) = (polling.state.lock().unwrap_or_else(|e| e.into_inner()), Vec::new());
+		let (Polled {turn, opener, number: last, body: stored, response}, body) = (&mut *state, &buf[end..total]);
+		if seat.over() || turn.is_none() {Err(Stranger::Session)} else if number > 0 && number == *last {
+			// 8. "A repeat of the last accepted request with the same body gets the stored response again, because a CDN may retry." It is known by its bytes, before anything is opened: a body that was accepted does not open a second time.
+			response.clone().filter(|_| stored.is_some_and(|(length, hash)| length == body.len() && hash.as_slice() == digest(&SHA256, body).as_ref())).map(Ok).ok_or(Stranger::Body)
+		} else if !opening && last.checked_add(1) != Some(number) {Err(Stranger::Session)} else {
+			// 6. "Every chunk of the body must open under `k_c2s` at the expected chunk numbers. Chunk numbers advance only when the request is accepted."
+			match opener.open(body, &mut scratch) {
+				Ok(opened) => {
+					let datagrams: Vec<Vec<u8>> = opened.commit().into_iter().flatten().map(<[u8]>::to_vec).collect();
+					(*last, *response, *stored) = (number, None, (!opening).then(|| (body.len(), <[u8; 32]>::try_from(digest(&SHA256, body).as_ref()).unwrap_or_default())));
+					// "A session is active at a moment when the receiver accepts from it a chunk that cannot be a replay": on `fronted`, "an accepted request".
+					seat.active.store(now.ms, Ordering::Relaxed);
+					turn.take().map(|turn| Err((turn, datagrams))).ok_or(Stranger::Session)
+				}
+				Err(BodyError::Refused) => Err(Stranger::Body),
+				// 7. "A chunk that is invalid, in a body whose every chunk opened, came from the session's client. The session is ended and the request takes the unauthenticated path."
+				Err(BodyError::Ended(_)) => {
+					seat.end(Ended::Invalid);
+					Err(Stranger::Body)
+				}
+			}
+		}
+	};
+	let (turn, datagrams) = match verdict {
+		Err(why) => {
+			// "For an opening request the pending session is dropped at once."
+			if opening {
+				seat.end(Ended::Invalid);
+				listener.forget(&polling);
+			}
+			return Poll::Stranger(why, place);
+		}
+		Ok(Ok(response)) => {
+			drop(place);
+			listener.counters.count(Count::Repeats);
+			return if to_proxy.write_all(&response).await.is_ok() && to_proxy.flush().await.is_ok() {Poll::Answered} else {Poll::Lost};
+		}
+		Ok(Err(accepted)) => accepted,
+	};
+	// The request is the session's own from here on, and the one in flight. Its turn goes back to the session however this ends.
+	drop(place);
+	listener.counters.count(Count::Polls);
+	let (mut flight, mut net, mut ip) = (Flight {polling: &polling, turn: Some(turn)}, Vec::new(), Vec::new());
+	let Some(turn) = flight.turn.as_deref_mut() else {return Poll::Lost};
+	for datagram in &datagrams {take(shared, listener, served, &polling.session, &turn.handshakes, SocketAddr::new(source, 0), now, datagram, &mut net, &mut ip);}
+	if !ip.is_empty() {
+		let plan = shared.plan();
+		if let Some(at) = plan.inbound_of(&seat.tunnel) {
+			for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet).await}
+		}
+	}
+	// "Its first answer on a new session comes when the session is established, as on every transport", and "the node sends nothing on a pending session". A session that is pending has this one request and can get no other while it is held, so it waits for the first tunnel packet deadline, and is then nobody's.
+	if seat.pending() {
+		seat.gone().await;
+		listener.forget(&polling);
+		return Poll::Stranger(Stranger::Unestablished, None);
+	}
+	// 9. "The node answers an accepted request as soon as it has downstream data for the session, and otherwise after the hold time, with status 200." What WireGuard answers to the request goes first.
+	for datagram in net.drain(..).rev() {turn.held.push_front((datagram, false))}
+	let hold = Instant::now() + HOLD;
+	let withheld = loop {
+		while turn.held.len() < MAX_ITEMS {
+			let Ok(next) = turn.waiting.try_recv() else {break};
+			turn.held.push_back(next);
+		}
+		// "A chunk that would hold exactly one WireGuard keepalive is held back for the lone keepalive delay and joins whatever else is sent in that time."
+		let lone = turn.held.len() == 1 && turn.held[0].0.len() == 32 && turn.held[0].0[0] == 4;
+		if !lone {turn.lone = None} else if turn.lone.is_none() {turn.lone = Some(Instant::now() + session::delay(&LONE_KEEPALIVE, &mut random).unwrap_or_default())}
+		let withheld = turn.lone.is_some_and(|until| until > Instant::now());
+		if seat.over() || Instant::now() >= hold || (!turn.held.is_empty() && !withheld) {break withheld}
+		tokio::select! {
+			_ = seat.gone() => {}
+			Some(next) = turn.waiting.recv() => turn.held.push_back(next),
+			_ = sleep_until(turn.lone.map_or(hold, |until| until.min(hold))) => {}
+		}
+	};
+	// "The sender puts every datagram that is waiting at the moment it writes into one chunk, up to the limit, and never waits for more." What does not fit this body waits for the next request.
+	let mut body = Vec::new();
+	while !withheld && !turn.held.is_empty() {
+		let (mut count, mut size) = (0, 0);
+		while count < turn.held.len().min(MAX_ITEMS) && size + 2 + turn.held[count].0.len() <= MAX_PLAINTEXT {
+			size += 2 + turn.held[count].0.len();
+			count += 1;
+		}
+		let (items, wide): (Vec<&[u8]>, bool) = (turn.held.iter().take(count).map(|(datagram, _)| datagram.as_slice()).collect(), turn.held.iter().take(count).any(|(datagram, wide)| *wide || matches!(datagram.first(), Some(1 | 2))));
+		match fronted::append(&mut turn.sealer, &items, wide, &mut random, &mut body) {
+			Ok(()) => listener.counters.count(Count::Chunks),
+			Err(ChunkError::Size) if !body.is_empty() => break,
+			// "A sender closes the session before it would send chunk number 2^60."
+			Err(ChunkError::Number) => seat.end(Ended::Packets),
+			Err(_) => {}
+		}
+		turn.held.drain(..count.max(1));
+	}
+	// "A request or response with nothing to carry holds one padding-only chunk, so no body is ever empty."
+	if body.is_empty() {
+		if fronted::append(&mut turn.sealer, &[], false, &mut random, &mut body).is_err() {
+			seat.end(Ended::Packets);
+			return Poll::Stranger(Stranger::Body, None);
+		}
+		listener.counters.count(Count::Chunks);
+	}
+	// "The node stores one response per session, for the repeat": stored before it is written, so a repeat of a request whose answer never reached the front is answered too.
+	let response = Arc::new([POLLED.as_bytes(), body.len().to_string().as_bytes(), b"\r\n\r\n", &body].concat());
+	{
+		let mut state = polling.state.lock().unwrap_or_else(|e| e.into_inner());
+		(state.response, state.turn) = (Some(response.clone()), flight.turn.take());
+	}
+	if to_proxy.write_all(&response).await.is_ok() && to_proxy.flush().await.is_ok() {Poll::Answered} else {Poll::Lost}
+}
+
+/// Gives the turn of a `fronted` session back when the request that took it is over, however it ended.
+struct Flight<'a> {polling: &'a Polling, turn: Option<Box<Turn>>}
+
+impl Drop for Flight<'_> {
+	fn drop(&mut self) {
+		if let Some(turn) = self.turn.take() {self.polling.state.lock().unwrap_or_else(|e| e.into_inner()).turn = Some(turn)}
+	}
+}
+
 /// Learns the header fields of the upgrade answer for one listener until the handle it returns is aborted: "The node learns the origin's values by one `GET /` to the origin at start and on every reload. If that request fails, the node sends only `Date` from the list, logs at warn, and tries again every 60 s until it succeeds, logging at info when it does. Nothing else about the origin's responses is copied."
 /// "The node's own requests to the origin carry the host of the `decoy.origin` URL as `Host`."
 pub fn learn(listener: &Arc<Listener>) -> AbortHandle {
@@ -1131,6 +1894,11 @@ pub fn learn(listener: &Arc<Listener>) -> AbortHandle {
 				_ = tokio::time::sleep(LEARN_AGAIN), if failing => {}
 			}
 			let served = held.served();
+			// A listener whose upgrade answers take nothing from the origin asks it nothing: "The default list is empty on a `ws` listener", and a `fronted` transport has no upgrade answer.
+			if !served.routes.iter().flat_map(|route| &route.headers).any(|name| !name.eq_ignore_ascii_case("date")) {
+				failing = false;
+				continue;
+			}
 			let asked = timeout(LEARN_TIME, async {
 				let (mut origin, mut head, mut filled) = (served.origin.dial(if served.proxy {Proxy::Own} else {Proxy::None}).await?, vec![0u8; LEARN_HEAD], 0);
 				origin.write_all(format!("GET / HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", served.host).as_bytes()).await?;
@@ -1170,7 +1938,7 @@ pub struct Bench {pub shared: Arc<Shared>, listener: Arc<Listener>, origins: mps
 #[cfg(feature = "bench")]
 #[doc(hidden)]
 impl Bench {
-	/// A node on `document`, a config with one `veilway` inbound that has a `tls` transport, whose listener reads plain HTTP from pipes in memory. `pools` are the listener's and `now` is the node's clock.
+	/// A node on `document`, a config whose first inbound is a `veilway` inbound with `tls` transports, or with `ws` and `fronted` ones, whose one listener reads plain HTTP from pipes in memory. `pools` are the listener's and `now` is the node's clock. The pools of the proxy path are the document's.
 	pub fn new(document: &str, pools: Pools, now: fn() -> OffsetDateTime) -> anyhow::Result<Bench> {
 		let config = Config::parse(document.as_bytes()).map_err(|e| anyhow::anyhow!("{e}"))?;
 		let inbound = config.inbounds.first().ok_or_else(|| anyhow::anyhow!("no inbound"))?;
@@ -1180,17 +1948,33 @@ impl Bench {
 		for device in &plan.devices {tunnel.lock().add(device.public_key, device.preshared_key)}
 		let shared = Arc::new(Shared::new(plan, super::gate::is_local, now, None, None, veilway_proto::control::USAGE_PUSH));
 		let _ = shared.replay.set(Arc::new(Guard::unwritten(config.replay.cache(), super::replay::seconds(now()))));
-		let ((origin, origins), path) = (mpsc::unbounded_channel(), config.inbounds[0].transports.iter().find_map(|transport| if let crate::config::Transport::Tls {path, ..} = transport {Some(path.clone())} else {None}).ok_or_else(|| anyhow::anyhow!("no tls transport"))?);
-		let listener = shared.stream.listen(SocketAddr::from(([127, 0, 0, 1], 443)), Served {acceptor: None, routes: vec![Route::tls(path, tunnel, inbound.upgrade_cookie.clone().unwrap_or_default(), inbound.upgrade_headers())], origin: Origin::Memory(origin), proxy: false, host: String::new(), pools});
+		let ((origin, origins), cookie) = (mpsc::unbounded_channel(), inbound.upgrade_cookie.clone().unwrap_or_default());
+		let routes: Vec<Route> = inbound.transports.iter().filter_map(|transport| match transport {
+			crate::config::Transport::Tls {path, ..} => Some(Route::tls(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(true))),
+			crate::config::Transport::WsNative {path, ..} => Some(Route::ws(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(false))),
+			crate::config::Transport::Fronted {path, ..} => Some(Route::fronted(path.clone(), tunnel.clone())),
+			_ => None,
+		}).collect();
+		anyhow::ensure!(!routes.is_empty(), "no stream transport");
+		let front = inbound.transports.iter().find_map(|transport| transport.proxied()).map(|proxied| Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits));
+		let listener = shared.stream.listen(SocketAddr::from(([127, 0, 0, 1], 443)), Served {acceptor: None, routes, origin: Origin::Memory(origin), proxy: false, host: String::new(), pools, front});
 		Ok(Bench {shared, listener, origins})
+	}
+
+	/// A connection of a trusted proxy at `peer`, as the accept of a `ws` or `fronted` listener takes it. None when the proxy pool has no place for it, where a listener leaves the connection in the system's queue.
+	pub fn proxy(&self, peer: SocketAddr) -> Option<(DuplexStream, JoinHandle<()>)> {
+		let ((ours, theirs), seat, room) = (tokio::io::duplex(RELAY_BUFFER), self.listener.proxies.clone().try_acquire_owned().ok()?, self.listener.room.clone().try_acquire_owned().ok()?);
+		self.listener.counters.count(Count::Accepted);
+		self.listener.counters.count(Count::Proxied);
+		Some((theirs, tokio::spawn(front(self.shared.clone(), self.listener.clone(), Box::new(ours), peer, self.listener.addr, self.listener.lease(seat), room))))
 	}
 
 	/// A connection of a direct peer at `peer`, as the listener's accept takes it: the peer's end of it, and the task that serves it.
 	pub fn connect(&self, peer: SocketAddr) -> (DuplexStream, JoinHandle<()>) {
 		let ((ours, theirs), served) = (tokio::io::duplex(RELAY_BUFFER), self.listener.served());
-		let place = enter(&self.listener, Source::of(peer.ip()), served.pools);
+		let (place, user) = (enter(&self.listener, Listener::undecided, Source::of(peer.ip()), served.pools.undecided, served.pools.per_source), served.front.is_none());
 		self.listener.counters.count(Count::Accepted);
-		(theirs, tokio::spawn(conn(self.shared.clone(), self.listener.clone(), served, Box::new(ours), peer, self.listener.addr, true, place)))
+		(theirs, tokio::spawn(conn(self.shared.clone(), self.listener.clone(), served, Box::new(ours), peer, self.listener.addr, user, place)))
 	}
 
 	/// The next connection the node opened to the origin, when there is one.
@@ -1200,6 +1984,7 @@ impl Bench {
 	pub fn tick(&self) {
 		let clock = Clock::of((self.shared.now)());
 		self.shared.limits.sweep(clock);
+		self.shared.stream.sweep();
 		if let Some(replay) = self.shared.replay.get() {replay.serve(clock.secs)}
 	}
 

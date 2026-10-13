@@ -647,7 +647,7 @@ export interface components {
             users: number;
             version: string;
         };
-        /** @description What the stream listeners of the `tls` transports did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending` and `sessions` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key. */
+        /** @description What the stream listeners of the `tls` transports, and of the `ws` and `fronted` transports of `veilway` inbounds, did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending`, `sessions`, `proxies`, `decoys` and `fronted` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key. */
         Stream: {
             /** Format: uint64 */
             accept_failed: number;
@@ -665,6 +665,8 @@ export interface components {
             chunks_sent: number;
             /** Format: uint64 */
             decoy_down: number;
+            /** Format: uint */
+            decoys: number;
             /** Format: uint64 */
             ended_closed: number;
             /**
@@ -688,6 +690,22 @@ export interface components {
             establish_full: number;
             /** Format: uint64 */
             established: number;
+            /**
+             * Format: uint64
+             * @description Requests handed to a decoy origin on the proxy path. `forwards_unframed` are those of them the node could not tell the end of, which it relayed to the end of the origin's answer and then closed the proxy's connection behind. `forwards_cut` are connections closed at once because one source had more than its share of requests waiting, or all strangers together more than half the proxy pool.
+             */
+            forwards: number;
+            /** Format: uint64 */
+            forwards_cut: number;
+            /**
+             * Format: uint64
+             * @description Requests that were sent to a decoy origin once more on a new connection, because the connection kept from the request before had been closed by the origin. `origin_dropped` are connections to a decoy origin that the node dropped between two requests because the origin said something or closed them there: nothing of that is passed on to the proxy.
+             */
+            forwards_redialed: number;
+            /** Format: uint64 */
+            forwards_unframed: number;
+            /** Format: uint */
+            fronted: number;
             /** Format: uint64 */
             handshake_displaced: number;
             /**
@@ -704,11 +722,20 @@ export interface components {
             handshakes: number;
             /** Format: uint64 */
             head_refused: number;
+            /** Format: uint64 */
+            origin_dropped: number;
             /**
              * Format: uint
              * @description Sessions whose proof was accepted and on which WireGuard has not authenticated yet, right now.
              */
             pending: number;
+            /** Format: uint64 */
+            poll_repeats: number;
+            /**
+             * Format: uint64
+             * @description `fronted` requests that were accepted, and repeats of the last accepted request that were answered with the stored response.
+             */
+            polls: number;
             /**
              * Format: uint64
              * @description Proofs that were accepted, proofs that waited for the write of a higher limit, users whose request head was over a limit or no WebSocket upgrade, sessions that became established, and sessions that could not because the session pool had filled up since their proof.
@@ -716,6 +743,27 @@ export interface components {
             proofs_accepted: number;
             /** Format: uint64 */
             proofs_waited: number;
+            /**
+             * Format: uint
+             * @description The proxy path of the `ws` and `fronted` listeners, right now: connections of trusted proxies, requests on them that are in a decoy origin's hands or whose body is still read with nothing proven, and established `fronted` sessions.
+             */
+            proxies: number;
+            /**
+             * Format: uint64
+             * @description Connections taken from a trusted proxy, and requests read on them. `proxy_unnamed` are those of them, on a listener with a `client_address_header`, in which that header named no source: the proxy itself stood for the visitor, so the limits per source were one limit for all of them. `proxy_idle` are connections closed after 300 seconds without a request.
+             */
+            proxy_accepted: number;
+            /**
+             * Format: uint64
+             * @description Requests of trusted proxies that were HTTP/1.0. None of them can be a user's: a web server that speaks HTTP/1.0 to the node shuts every user out, and has to be told to speak HTTP/1.1.
+             */
+            proxy_http10: number;
+            /** Format: uint64 */
+            proxy_idle: number;
+            /** Format: uint64 */
+            proxy_requests: number;
+            /** Format: uint64 */
+            proxy_unnamed: number;
             /** Format: uint64 */
             queue_full: number;
             /** Format: uint64 */
@@ -765,13 +813,22 @@ export interface components {
              */
             sessions: number;
             /** Format: uint64 */
+            stranger_body: number;
+            /** Format: uint64 */
             stranger_closed: number;
             /** Format: uint64 */
             stranger_displaced: number;
+            /**
+             * Format: uint64
+             * @description Requests of the proxy path decided "not a user" for a reason only that path has: a head above 16,384 bytes or not complete within 10 seconds, a `fronted` request that names a session with a number out of order or while another request of it is in flight, one whose body was late, did not open or was a repeat with other bytes, and an opening request whose session no WireGuard packet established.
+             */
+            stranger_head: number;
             /** Format: uint64 */
             stranger_origin: number;
             /** Format: uint64 */
             stranger_proof: number;
+            /** Format: uint64 */
+            stranger_session: number;
             /** Format: uint64 */
             stranger_slow: number;
             /**
@@ -779,6 +836,8 @@ export interface components {
              * @description Connections decided "not a user", by the class of the reason: a byte that cannot be part of a user's request line or a line above 4,096 bytes, `stranger_syntax`. A line that was not complete within 10 seconds, `stranger_slow`. A peer that closed its side first, `stranger_closed`. A connection decided at once to make room in the undecided pool, `stranger_displaced`. A connection whose decoy origin said something or closed while the request line was not complete, `stranger_origin`. A complete request line that is no proof of a device, `stranger_proof`, which is where a wrong path, a wrong token and a removed device are counted alike.
              */
             stranger_syntax: number;
+            /** Format: uint64 */
+            stranger_unestablished: number;
             /** Format: uint64 */
             tunnel: number;
             /**
@@ -805,8 +864,11 @@ export interface components {
             /** Format: uint64 */
             up_packets: number;
         };
-        /** @enum {string} */
-        Transport: "udp" | "ws" | "udp-obfs" | "tls";
+        /**
+         * @description The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
+         * @enum {string}
+         */
+        Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted";
         /** @description What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key. */
         UdpObfs: {
             /** Format: uint64 */
