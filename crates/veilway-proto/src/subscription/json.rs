@@ -36,7 +36,8 @@ pub(crate) enum Json {
 	Number,
 	Str(String),
 	Arr(Vec<Json>),
-	Obj(BTreeMap<String, Json>),
+	/// Each member with its place among the members of its object as the text wrote them, from 0: the translations of a text are counted in that order.
+	Obj(BTreeMap<String, (usize, Json)>),
 }
 
 #[derive(Clone, Copy)]
@@ -77,7 +78,7 @@ impl<'de> Visitor<'de> for Build<'_> {
 		let (inner, mut members) = (self.enter()?, BTreeMap::new());
 		while let Some(name) = map.next_key::<String>()? {
 			if let Some(error) = if name.contains('\0') {Some(JsonError::Nul)} else if name.len() > super::STRING_MAX {Some(JsonError::Name)} else if members.contains_key(&name) {Some(JsonError::Duplicate)} else {None} {return Err(self.fail(error))}
-			members.insert(name, map.next_value_seed(inner)?);
+			members.insert(name, (members.len(), map.next_value_seed(inner)?));
 		}
 		Ok(Json::Obj(members))
 	}
@@ -96,12 +97,13 @@ pub(crate) type Named<T> = Result<T, &'static str>;
 
 /// The members of one object. Each reader gives `None` for a member that is absent, and the member's name as the error when it has another type or lies outside its range. `null` is another type, never an absent member.
 #[derive(Clone, Copy)]
-pub(crate) struct Members<'a>(pub(crate) &'a BTreeMap<String, Json>);
+pub(crate) struct Members<'a>(pub(crate) &'a BTreeMap<String, (usize, Json)>);
 
 impl<'a> Members<'a> {
 	pub(crate) fn of(value: &'a Json) -> Option<Self> {if let Json::Obj(members) = value {Some(Self(members))} else {None}}
+	pub(crate) fn get(&self, name: &str) -> Option<&'a Json> {self.0.get(name).map(|(_, value)| value)}
 	pub(crate) fn uint(&self, name: &'static str, range: RangeInclusive<u64>) -> Named<Option<u64>> {
-		match self.0.get(name) {
+		match self.get(name) {
 			None => Ok(None),
 			Some(Json::Uint(value)) if range.contains(value) => Ok(Some(*value)),
 			Some(_) => Err(name),
@@ -109,14 +111,14 @@ impl<'a> Members<'a> {
 	}
 	/// A string of at most `limit` bytes.
 	pub(crate) fn string(&self, name: &'static str, limit: usize) -> Named<Option<&'a str>> {
-		match self.0.get(name) {
+		match self.get(name) {
 			None => Ok(None),
 			Some(Json::Str(value)) if value.len() <= limit => Ok(Some(value)),
 			Some(_) => Err(name),
 		}
 	}
 	pub(crate) fn boolean(&self, name: &'static str) -> Named<Option<bool>> {
-		match self.0.get(name) {
+		match self.get(name) {
 			None => Ok(None),
 			Some(Json::Bool(value)) => Ok(Some(*value)),
 			Some(_) => Err(name),
@@ -124,14 +126,14 @@ impl<'a> Members<'a> {
 	}
 	/// A list whose length lies in `count`.
 	pub(crate) fn list(&self, name: &'static str, count: RangeInclusive<usize>) -> Named<Option<&'a [Json]>> {
-		match self.0.get(name) {
+		match self.get(name) {
 			None => Ok(None),
 			Some(Json::Arr(items)) if count.contains(&items.len()) => Ok(Some(items)),
 			Some(_) => Err(name),
 		}
 	}
 	pub(crate) fn object(&self, name: &'static str) -> Named<Option<Members<'a>>> {
-		match self.0.get(name) {
+		match self.get(name) {
 			None => Ok(None),
 			Some(value) => Members::of(value).map(Some).ok_or(name),
 		}

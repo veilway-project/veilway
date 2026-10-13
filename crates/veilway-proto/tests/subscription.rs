@@ -2,7 +2,7 @@
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
 use std::fs;
-use veilway_proto::{control::{Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Offer, Refreshed, Replaced, Review, Standing, GRACE}, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Secret, BODY_MAX, CARRIED_MAX}, NoRandom};
+use veilway_proto::{control::{self, Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Offer, Refreshed, Replaced, Review, Standing, GRACE}, direction, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Direction, Secret, Tag, Text, Translation, BODY_MAX, CARRIED_MAX}, NoRandom};
 
 // The clock of every test: 100 s after the documents of vectors.py were issued.
 const ISSUED: u64 = 1_700_000_000;
@@ -475,6 +475,198 @@ fn display_text_is_filtered_then_cut_and_never_markup() {
 	assert!(matches!(&document.cards[0], Card::Stat {value, unit: Some(unit), ..} if value.as_str() == "1234567890123456" && unit.as_str() == "12345678"));
 }
 
+// The languages of an app: its display language and then the user's fallbacks, each as the app fills it in.
+fn tags(list: &[&str]) -> Vec<Tag> {list.iter().map(|tag| Tag::read(tag).unwrap_or_else(|| panic!("{tag}"))).collect()}
+
+// A text as a document writes it, in the place of the provider's name of the document of the vectors. It is put in as written, member by member, because the order of the members is part of the rule.
+fn said(written: &str) -> Result<Text, PayloadError> {
+	match read_raw(serde_json::to_string(&with(rich(), &[("/provider/name", json!("@@text@@"))])).unwrap().replace("\"@@text@@\"", written).as_bytes()) {
+		Ok(Payload::Subscription(read)) => Ok(read.provider),
+		Ok(Payload::Refusal(_)) => panic!("{written}"),
+		Err(error) => Err(error),
+	}
+}
+
+fn kept(text: &Text) -> Vec<(&str, &str)> {text.translations().map(|translation| (translation.tag.as_str(), translation.text)).collect()}
+
+#[test]
+fn a_language_tag_has_one_spelling() {
+	for (tag, parts) in [("fa", ("fa", None, None)), ("en", ("en", None, None)), ("ckb", ("ckb", None, None)), ("fa-Arab", ("fa", Some("Arab"), None)), ("fa-IR", ("fa", None, Some("IR"))), ("fa-Arab-IR", ("fa", Some("Arab"), Some("IR"))), ("zh-Hant-TW", ("zh", Some("Hant"), Some("TW"))), ("ckb-Arab-IQ", ("ckb", Some("Arab"), Some("IQ"))), ("und", ("und", None, None)), ("fas", ("fas", None, None)), ("xx-Xxxx-XX", ("xx", Some("Xxxx"), Some("XX")))] {
+		let read = Tag::read(tag).unwrap_or_else(|| panic!("{tag}"));
+		assert_eq!((read.as_str(), read.parts()), (tag, parts));
+	}
+	// Another case, an underscore, a part too long or too short, the parts in another order, other subtags of BCP 47, and anything that is not ASCII.
+	for tag in ["", "f", "fars", "FA", "Fa", "fA", "fa-ir", "fa-Ir", "fa-arab", "fa-ARAB", "fa-aRab", "fa-Arab-ir", "fa-Arab-IRN", "fa-Arab-I", "fa-IR-Arab", "fa-Arab-Arab", "fa-IR-IR", "fa-Arab-IR-x", "ckb-Arab-IQQ", "zh-Hant-TWN", "fa_IR", "fa-", "-fa", "fa--IR", "fa-Arab-", "fa -IR", " fa", "fa ", "fa\n", "default", "Default", "x-private", "en-US-POSIX", "es-419", "de-1996", "en-a-bbb", "sr-Latn-RS-x-y", "i-klingon", "f\u{e0}", "\u{6f}\u{301}", "fa-\u{410}rab", "f1", "12", "fa-Ar1b", "fa-I1"] {assert_eq!(Tag::read(tag), None, "{tag:?}")}
+}
+
+// The document of the vectors that is written in several languages: what each text holds, and what readers of several languages are shown.
+#[test]
+fn the_document_in_several_languages_reads_as_what_it_says() {
+	// The seed is read as it is written, so that the translations come in the order of the document.
+	let Ok(Payload::Subscription(document)) = read_raw(&seed("fuzz_subscription/languages")[1..]) else {panic!("a document")};
+	let (profile, persian, german, none) =(&document.profiles[0], tags(&["fa-Arab-IR"]), tags(&["de-Latn-DE"]), tags(&[]));
+	assert_eq!((document.provider.as_str(), kept(&document.provider)), ("Example Provider", vec![("fa", "ارائه\u{200c}دهنده نمونه"), ("de", "Beispielanbieter")]));
+	assert_eq!((profile.name.as_str(), kept(&profile.name), profile.exits.len(), profile.notices.len(), document.notices.len(), document.left_out), ("Example", vec![("fa", "نمونه")], 2, 1, 1, 0));
+	assert_eq!((profile.exits[0].name.as_str(), kept(&profile.exits[0].name), profile.exits[1].name.as_str(), kept(&profile.exits[1].name)), ("Frankfurt", vec![("fa", "فرانکفورت"), ("de", "Frankfurt am Main"), ("zh-Hant-TW", "法蘭克福")], "Amsterdam", vec![]));
+	// The joiner of Persian spelling is still in what is shown, in each place where the words need it.
+	assert_eq!((profile.notices[0].severity, profile.notices[0].text.as_str(), kept(&profile.notices[0].text)), (Severity::Information, "Maintenance tonight", vec![("fa", "امشب سرور به\u{200c}روزرسانی می\u{200c}شود")]));
+	assert_eq!((document.notices[0].severity, document.notices[0].text.as_str(), kept(&document.notices[0].text)), (Severity::Warning, "Welcome", vec![("fa-Arab-IR", "خوش آمدید"), ("fa", "خوش آمدید"), ("en-GB", "Welcome back")]));
+	assert_eq!((document.support[0].label.as_str(), kept(&document.support[0].label)), ("Help", vec![("fa", "راهنما")]));
+	assert!(matches!(&document.cards[..], [Card::Stat {label, value, unit: Some(unit)}, Card::Notice(notice), Card::Link {label: site, ..}] if kept(label) == [("fa", "طرح")] && kept(value) == [("fa", "پایه")] && kept(unit) == [("fa", "گیگابایت")] && kept(&notice.text) == [("fa", "سلام")] && kept(site) == [("fa", "وب\u{200c}سایت")] && (label.as_str(), value.as_str(), unit.as_str(), notice.text.as_str(), site.as_str()) == ("Plan", "Basic", "GB", "Hello", "Site")));
+	// What a reader of Persian, one of German and one of neither is shown, with the tag that marks a translation.
+	assert_eq!((document.provider.pick(&persian), document.provider.pick(&german), document.provider.pick(&none), document.provider.pick(&tags(&["ja-Jpan-JP"]))), (("ارائه\u{200c}دهنده نمونه", Some(&persian_tag())), ("Beispielanbieter", Some(&Tag::read("de").unwrap())), ("Example Provider", None), ("Example Provider", None)));
+	assert_eq!((profile.name.pick(&german), profile.name.pick(&tags(&["de-Latn-DE", "fa-Arab-IR"])), profile.exits[1].name.pick(&persian)), (("Example", None), ("نمونه", Some(&persian_tag())), ("Amsterdam", None)));
+	// Where the user decides, `default` is always there, and the translation stands beside it.
+	assert_eq!((document.provider.decided(&persian), document.provider.decided(&none), profile.name.decided(&german)), (("Example Provider", Some(Translation {tag: &persian_tag(), text: "ارائه\u{200c}دهنده نمونه"})), ("Example Provider", None), ("Example", None)));
+	// The direction is that of the text that is shown, whatever its tag.
+	assert_eq!((direction(document.provider.pick(&persian).0), direction(document.provider.pick(&german).0), direction(profile.exits[0].name.pick(&tags(&["zh-Hant-TW"])).0)), (Direction::RightToLeft, Direction::LeftToRight, Direction::LeftToRight));
+	assert_eq!(format!("{document:?}"), "Subscription(example-account-0001, serial 6, 1 profiles, 0 refused)");
+}
+
+fn persian_tag() -> Tag {Tag::read("fa").unwrap()}
+
+// "Display text as a string or an object of translations is part of version 1": a document written with strings reads as it did, its texts have no translation, and the same document with every text as an object of `default` alone is the same document.
+#[test]
+fn a_text_as_a_string_is_the_same_text_as_an_object_with_default_alone() {
+	for name in ["content", "import", "import-content", "refresh", "rotation", "refresh-with-link", "rotation-with-link"] {
+		let (written, mut objects) = (payload(name), payload(name));
+		let mut places = vec!["/provider/name".to_owned()];
+		for (index, profile) in written["profiles"].as_array().unwrap().iter().enumerate() {
+			places.push(format!("/profiles/{index}/name"));
+			places.extend((0..profile["exits"].as_array().map_or(0, Vec::len)).map(|exit| format!("/profiles/{index}/exits/{exit}/name")));
+		}
+		for (list, members) in [("support", &["label"][..]), ("notices", &["text"]), ("cards", &["label", "value", "unit", "text"])] {
+			for (index, item) in written[list].as_array().into_iter().flatten().enumerate() {places.extend(members.iter().filter(|member| item.get(**member).is_some()).map(|member| format!("/{list}/{index}/{member}")))}
+		}
+		for place in &places {
+			let default = objects.pointer(place).unwrap().clone();
+			put(&mut objects, place, Some(json!({"default": default})));
+		}
+		let (strings, same) = (subscription(&written), subscription(&objects));
+		assert!(strings == same && format!("{strings:?}") == format!("{same:?}") && strings.left_out == 0 && same.left_out == 0, "{name}");
+		let texts: Vec<&Text> = [&strings.provider].into_iter().chain(strings.profiles.iter().flat_map(|profile| [&profile.name].into_iter().chain(profile.exits.iter().map(|exit| &exit.name)))).chain(strings.support.iter().map(|link| &link.label)).chain(strings.notices.iter().map(|notice| &notice.text)).collect();
+		assert!(texts.len() >= 3 && texts.iter().all(|text| text.translations().count() == 0 && text.pick(&tags(&["fa-Arab-IR", "en-Latn-US"])) == (text.as_str(), None) && text.decided(&tags(&["fa-Arab-IR"])) == (text.as_str(), None)), "{name}");
+	}
+	// The seed that is a whole document in several languages is one a client imports.
+	assert_eq!(carried(&sign(0x11, &payload("import-languages")), &[]).unwrap().accept(None, &[]).unwrap().held.subscription().profiles[0].notices.len(), 1);
+}
+
+// "How the client picks": for the display language and then each fallback, the four tags in turn, then `default`. Nothing is guessed.
+#[test]
+fn a_translation_is_picked_in_four_steps_per_language_and_never_guessed() {
+	let all = said(r#"{"default":"D","sr":"4","sr-RS":"3","sr-Cyrl":"2","sr-Cyrl-RS":"1","sr-Latn":"L","sr-ME":"M","en":"E"}"#).unwrap();
+	let pick = |text: &Text, languages: &[&str]| text.pick(&tags(languages)).0.to_owned();
+	assert_eq!((pick(&all, &["sr-Cyrl-RS"]), pick(&all, &["sr-Cyrl-BA"]), pick(&all, &["sr-Latn-RS"]), pick(&all, &["sr-Latn-ME"]), pick(&all, &["sr-Glag-RS"]), pick(&all, &["sr-Glag-BA"])), ("1".to_owned(), "2".to_owned(), "L".to_owned(), "L".to_owned(), "3".to_owned(), "4".to_owned()));
+	// An app's tag without a script or without a region leaves out the steps that need it.
+	assert_eq!((pick(&all, &["sr-RS"]), pick(&all, &["sr-Cyrl"]), pick(&all, &["sr"]), pick(&all, &["sr-ME"]), pick(&all, &["sr-BA"])), ("3".to_owned(), "2".to_owned(), "4".to_owned(), "M".to_owned(), "4".to_owned()));
+	// Each step in turn as the text loses the one before.
+	for (written, shown) in [(r#"{"default":"D","sr":"4","sr-RS":"3","sr-Cyrl":"2"}"#, "2"), (r#"{"default":"D","sr":"4","sr-RS":"3"}"#, "3"), (r#"{"default":"D","sr":"4"}"#, "4"), (r#"{"default":"D","sr-Latn":"L","sr-ME":"M","sr-Latn-RS":"x","sr-Cyrl-ME":"y"}"#, "D"), (r#"{"default":"D"}"#, "D"), (r#""D""#, "D")] {assert_eq!(pick(&said(written).unwrap(), &["sr-Cyrl-RS"]), shown, "{written}")}
+	// The display language is asked through all four steps before the first fallback is asked at all, and the fallbacks in their order.
+	assert_eq!((pick(&all, &["sr-Glag-BA", "en-Latn-US"]), pick(&all, &["de-Latn-DE", "en-Latn-US", "sr-Cyrl-RS"]), pick(&all, &["de-Latn-DE", "sr-Cyrl-RS", "en-Latn-US"]), pick(&all, &["de-Latn-DE", "fr-Latn-FR"]), pick(&all, &[])), ("4".to_owned(), "E".to_owned(), "1".to_owned(), "D".to_owned(), "D".to_owned()));
+	// No similar language: not a three-letter code for a two-letter one or the other way round, not another language of the same script or region, and `und` matches nothing, also when it is what the app asks for.
+	let near = said(r#"{"default":"D","fas":"three","und":"U","ar-Arab-IR":"arabic","prs":"dari","en-GB":"british"}"#).unwrap();
+	assert_eq!(kept(&near).len(), 5);
+	for languages in [&["fa-Arab-IR"][..], &["fa"], &["und"], &["und-Arab-IR"], &["en-Latn-US"], &["en"], &["ar-Arab-EG"], &["ar"], &["pes"]] {assert_eq!((near.pick(&tags(languages)), near.translation(&tags(languages))), (("D", None), None), "{languages:?}")}
+	assert_eq!((pick(&near, &["fas"]), pick(&near, &["ar-Arab-IR"]), pick(&near, &["en-Latn-GB"]), pick(&near, &["und", "prs-Arab-AF"])), ("three".to_owned(), "arabic".to_owned(), "british".to_owned(), "dari".to_owned()));
+}
+
+// What a text comes to: `default` and the translations that were kept, or the error of a document whose provider has no name.
+type Said<'a> = Result<(&'a str, Vec<(&'a str, &'a str)>), PayloadError>;
+
+// "Text in several languages", rule by rule: what a text is left with, or the refusal where `default` made it wrong.
+#[test]
+fn a_bad_translation_is_dropped_and_only_default_can_make_a_text_wrong() {
+	let (wrong, long): (Said, String) = (Err(PayloadError::Member("name")), "\u{e9}".repeat(100));
+	let nine = |names: &[&str]| format!("{{{}}}", names.iter().enumerate().map(|(index, name)| if *name == "default" {"\"default\":\"D\"".to_owned()} else {format!("\"{name}\":\"{index}\"")}).collect::<Vec<_>>().join(","));
+	let table: Vec<(String, Said)> = vec![
+		// The two forms.
+		(r#""Name""#.into(), Ok(("Name", vec![]))), (r#"{"default":"Name"}"#.into(), Ok(("Name", vec![]))), (r#"{"default":"Name","fa":"نام","de":"Name"}"#.into(), Ok(("Name", vec![("fa", "نام"), ("de", "Name")]))),
+		// "Only `default` can make a text wrong": missing, of another type, or a name that shows nothing.
+		(r#"{}"#.into(), wrong.clone()), (r#"{"fa":"نام"}"#.into(), wrong.clone()), (r#"{"default":5,"fa":"نام"}"#.into(), wrong.clone()), (r#"{"default":null}"#.into(), wrong.clone()), (r#"{"default":["Name"]}"#.into(), wrong.clone()), (r#"{"default":{"default":"Name"}}"#.into(), wrong.clone()), (r#"{"Default":"Name"}"#.into(), wrong.clone()),
+		(r#"{"default":"","fa":"نام"}"#.into(), wrong.clone()), ("{\"default\":\"\u{200b} \u{301}\",\"fa\":\"نام\"}".into(), wrong.clone()), (r#"["Name"]"#.into(), wrong.clone()), (r#"5"#.into(), wrong.clone()), (r#"null"#.into(), wrong.clone()), (r#"true"#.into(), wrong.clone()),
+		// A member whose name is no legal tag is dropped, and the rest stays.
+		(r#"{"default":"Name","FA":"a","fa-ir":"b","fa_IR":"c","fars":"d","f":"e","fa-Arab-IR-x":"f","zh-Hant-TWN":"g","en-US-POSIX":"h","es-419":"i","x-private":"j","":"k","defaults":"l","fa":"نام"}"#.into(), Ok(("Name", vec![("fa", "نام")]))),
+		// A value that is no string is dropped, and the rest stays.
+		(r#"{"default":"Name","fa":5,"de":null,"en":["x"],"fr":{"default":"x"},"it":true,"es":"Nombre"}"#.into(), Ok(("Name", vec![("es", "Nombre")]))),
+		// The same filter, the same limit and the same need to show something as `default`. What is empty after the filter is dropped.
+		("{\"default\":\"Name\",\"fa\":\"\u{202e}نا\u{200b}م\u{85}\",\"de\":\"<b>Name</b>\"}".into(), Ok(("Name", vec![("fa", "نام"), ("de", "<b>Name</b>")]))),
+		(format!(r#"{{"default":"Name","fr":"{long}"}}"#), Ok(("Name", vec![("fr", &long[..128])]))),
+		("{\"default\":\"Name\",\"fa\":\"\",\"de\":\"\u{200b}\u{200c}\",\"en\":\"   \",\"fr\":\"\u{301}\",\"it\":\"\u{200c}\",\"es\":\"x\"}".into(), Ok(("Name", vec![("es", "x")]))),
+		// The joiner of a translation is judged as in any text.
+		("{\"default\":\"Name\",\"fa\":\"می\u{200c}خواهم\",\"de\":\"Na\u{200c}me\"}".into(), Ok(("Name", vec![("fa", "می\u{200c}خواهم"), ("de", "Name")]))),
+		// Eight translations are kept. Of nine the first eight as the document wrote them, wherever `default` stands and whatever the order of their names.
+		(nine(&["default", "aa", "bb", "cc", "dd", "ee", "ff", "gg", "hh"]), Ok(("D", vec![("aa", "1"), ("bb", "2"), ("cc", "3"), ("dd", "4"), ("ee", "5"), ("ff", "6"), ("gg", "7"), ("hh", "8")]))),
+		(nine(&["zz", "yy", "xx", "ww", "default", "vv", "uu", "tt", "ss", "aa"]), Ok(("D", vec![("zz", "0"), ("yy", "1"), ("xx", "2"), ("ww", "3"), ("vv", "5"), ("uu", "6"), ("tt", "7"), ("ss", "8")]))),
+		(nine(&["zz", "yy", "xx", "ww", "vv", "uu", "tt", "ss", "aa", "bb", "cc", "default"]), Ok(("D", vec![("zz", "0"), ("yy", "1"), ("xx", "2"), ("ww", "3"), ("vv", "4"), ("uu", "5"), ("tt", "6"), ("ss", "7")]))),
+		// A name that is no tag takes none of the eight places.
+		(nine(&["default", "AA", "aa", "b", "bb", "cc_DD", "cc", "dd", "ee", "ff", "gg", "hh", "ii"]), Ok(("D", vec![("aa", "2"), ("bb", "4"), ("cc", "6"), ("dd", "7"), ("ee", "8"), ("ff", "9"), ("gg", "10"), ("hh", "11")]))),
+		// A legal tag takes its place whatever its value comes to: one of the first eight that is dropped is not made up for by the ninth.
+		(r#"{"default":"D","aa":5,"bb":"","cc":"3","dd":"4","ee":"5","ff":"6","gg":"7","hh":"8","ii":"9"}"#.into(), Ok(("D", vec![("cc", "3"), ("dd", "4"), ("ee", "5"), ("ff", "6"), ("gg", "7"), ("hh", "8")]))),
+		// `und` and a three-letter code are tags like any other: they are kept, and match no language of an app.
+		(r#"{"default":"Name","und":"x","fas":"y"}"#.into(), Ok(("Name", vec![("und", "x"), ("fas", "y")]))),
+		// "The same tag twice is a duplicate key", also when one of the two is written with an escape, and so is a second `default`.
+		(r#"{"default":"Name","fa":"a","fa":"b"}"#.into(), Err(PayloadError::Json(JsonError::Duplicate))), ("{\"default\":\"Name\",\"fa\":\"a\",\"\\u0066a\":\"b\"}".into(), Err(PayloadError::Json(JsonError::Duplicate))), (r#"{"default":"Name","default":"Name"}"#.into(), Err(PayloadError::Json(JsonError::Duplicate))),
+	];
+	for (written, want) in table {assert_eq!(said(&written).as_ref().map(|text| (text.as_str(), kept(text))), want.as_ref().map(|(default, translations)| (*default, translations.clone())), "{}", &written[..written.len().min(120)])}
+	// "Every translation is a JSON value and counts toward the document's limits on values and on size": a text of 20,000 members is over the limit on values whatever they are named, and one under it keeps eight.
+	let many = |count: usize| format!("{{\"default\":\"D\"{}}}", (0..count).map(|index| format!(",\"{}{}{}\":\"x\"", (b'a' + (index / 676) as u8) as char, (b'a' + (index / 26 % 26) as u8) as char, (b'a' + (index % 26) as u8) as char)).collect::<String>());
+	assert_eq!((said(&many(17_000)).map(|text| kept(&text).len()), said(&many(20_000)).err()), (Ok(8), Some(PayloadError::Json(JsonError::Values))));
+	// Where a text is wrong, the result is the one its place has: the profile is refused, and the exit, the link, the notice, the card and the listed device are left out. A device's name is one string, and an object in its place is another type.
+	let (missing, fault) = (json!({"fa": "x"}), Want::Profile(Fault::Member("name")));
+	for (pointer, value, want) in [("/profiles/0/name", missing.clone(), fault), ("/profiles/0/name", json!({"default": " ", "fa": "x"}), fault), ("/profiles/0/name", json!({"default": "Name", "FA": "x", "fa": 5, "de": ""}), Want::Fine), ("/support/0/label", missing.clone(), Want::LeftOut(1)), ("/support/0/label", json!({"default": "", "fa": "x"}), Want::Fine), ("/notices/0/text", missing.clone(), Want::LeftOut(1)), ("/notices/0/text", json!({"default": 1}), Want::LeftOut(1)), ("/cards/0/label", missing.clone(), Want::LeftOut(1)), ("/cards/0/value", missing.clone(), Want::LeftOut(1)), ("/cards/0/unit", missing.clone(), Want::LeftOut(1)), ("/cards/1/label", missing.clone(), Want::LeftOut(1)), ("/cards/2/text", missing.clone(), Want::LeftOut(1)), ("/cards/3/label", missing.clone(), Want::LeftOut(1)), ("/cards/0/unit", json!({"default": "GB", "fa": 1}), Want::Fine), ("/devices/0/name", json!({"default": "phone"}), Want::LeftOut(1)), ("/devices/0/name", json!({"default": "phone", "fa": "x"}), Want::LeftOut(1))] {judge(&format!("{pointer} = {value}"), &with(rich(), &[(pointer, value.clone())]), want)}
+	let exits = subscription(&with(rich(), &[("/profiles/0/exits", json!([{"tag": "de", "name": {"fa": "x"}}, {"tag": "nl", "name": {"default": "\u{200b}", "fa": "x"}}, {"tag": "fr", "name": {"default": "Paris", "fa": "\u{200b}", "FR": "x", "de": 1}}, {"tag": "se", "name": {"default": "Stockholm", "fa": "استکهلم"}}]))]));
+	assert_eq!(exits.profiles[0].exits.iter().map(|exit| (exit.tag.as_str(), exit.name.as_str(), kept(&exit.name))).collect::<Vec<_>>(), [("fr", "Paris", vec![]), ("se", "Stockholm", vec![("fa", "استکهلم")])]);
+	// The notices of a profile: at most 4, a list of another type or a longer one is a member of the profile out of its range, and a notice in it that does not read is left out by itself.
+	let notice = json!({"severity": "info", "text": {"default": "Maintenance", "fa": "تعمیرات"}});
+	for (value, want) in [(json!([]), Want::Fine), (Value::Array(vec![notice.clone(); 4]), Want::Fine), (Value::Array(vec![notice.clone(); 5]), Want::Profile(Fault::Member("notices"))), (json!("Maintenance"), Want::Profile(Fault::Member("notices"))), (json!({"0": notice.clone()}), Want::Profile(Fault::Member("notices"))), (Value::Null, Want::Profile(Fault::Member("notices")))] {judge(&format!("/profiles/0/notices = {value}"), &with(rich(), &[("/profiles/0/notices", value.clone())]), want)}
+	let notices = subscription(&with(rich(), &[("/profiles/0/notices", json!([notice, {"severity": "fatal", "text": "x"}, {"severity": "warning", "text": {"fa": "x"}}, {"severity": "warning", "text": "\u{e9}".repeat(200)}]))]));
+	assert_eq!((notices.profiles[0].notices.iter().map(|notice| (notice.severity, notice.text.as_str().len(), kept(&notice.text))).collect::<Vec<_>>(), notices.profiles[1].notices.len(), notices.left_out), (vec![(Severity::Information, 11, vec![("fa", "تعمیرات")]), (Severity::Warning, 280, vec![])], 0, 0));
+}
+
+fn sent_exit(tag: &str, name: &str) -> control::Exit {control::Exit {tag: tag.into(), name: name.into(), country: None, all_protocols: false, selected: false, configured: false, working: true, load: control::Load::Low}}
+
+// "Languages" on the control channel page: a translation stands for what a node sent only when `default`, as the document wrote it, is byte for byte what the node sent.
+#[test]
+fn a_translation_stands_for_a_nodes_text_only_when_default_is_the_same_bytes() {
+	let document = subscription(&payload("languages"));
+	let (profile, persian) = (&document.profiles[0], tags(&["fa-Arab-IR"]));
+	assert_eq!(profile.exit_name(&sent_exit("de", "Frankfurt")).map(|name| name.pick(&persian).0), Some("فرانکفورت"));
+	// Another name under the tag, the name under another tag, a tag the catalogue does not have, and every way two names can look alike without being the same bytes.
+	for (tag, name) in [("de", "Frankfurt am Main"), ("de", "frankfurt"), ("de", "Frankfurt "), ("de", " Frankfurt"), ("de", "Frankfurt\u{200b}"), ("de", "Fran\u{200c}kfurt"), ("de", "Frankfurt\0"), ("de", ""), ("de", "فرانکفورت"), ("de", "Amsterdam"), ("nl", "Frankfurt"), ("fr", "Frankfurt"), ("d", "Frankfurt")] {assert_eq!(profile.exit_name(&sent_exit(tag, name)), None, "{tag} {name:?}")}
+	assert_eq!(profile.exit_name(&sent_exit("nl", "Amsterdam")).map(|name| name.pick(&persian)), Some(("Amsterdam", None)));
+	// The raw `default` is what is compared, before the filter and the cut: a name the filter changes matches only what was written, and so does a text longer than its limit.
+	let (composed, apart, long) = ("Caf\u{e9}", "Cafe\u{301}", "a".repeat(300));
+	let raw = subscription(&with(payload("languages"), &[("/profiles/0/exits", json!([{"tag": "a", "name": {"default": "Frank\u{200b}furt", "fa": "x"}}, {"tag": "b", "name": {"default": composed, "fa": "y"}}, {"tag": "c", "name": {"default": "\u{202e}Berlin ", "fa": "z"}}])), ("/profiles/0/notices", json!([{"severity": "info", "text": {"default": long, "fa": "طولانی"}}, {"severity": "info", "text": {"default": "Both", "fa": "از نمایه"}}])), ("/notices", json!([{"severity": "warning", "text": {"default": "Both", "fa": "از اشتراک"}}, {"severity": "warning", "text": {"default": "Welcome", "fa": "خوش آمدید"}}]))]));
+	let node = &raw.profiles[0];
+	assert_eq!((node.exits[0].name.as_str(), node.exits[2].name.as_str(), node.notices[0].text.as_str().len()), ("Frankfurt", "Berlin ", 280));
+	assert_eq!((node.exit_name(&sent_exit("a", "Frankfurt")), node.exit_name(&sent_exit("a", "Frank\u{200b}furt")).map(|name| name.pick(&persian).0), node.exit_name(&sent_exit("b", apart)), node.exit_name(&sent_exit("b", composed)).map(|name| name.pick(&persian).0), node.exit_name(&sent_exit("c", "Berlin ")), node.exit_name(&sent_exit("c", "\u{202e}Berlin ")).map(|name| name.pick(&persian).0)), (None, Some("x"), None, Some("y"), None, Some("z")));
+	// A notice: the profile's own first, then the subscription's, whose place says that the two are one notice on the screen. The severity is the node's and is not looked at.
+	let notice = |text: &str, severity: Severity| control::Notice {severity, text: text.into()};
+	let found = |text: &str, severity: Severity| raw.notice_text(node, &notice(text, severity)).map(|(text, place)| (text.pick(&persian).0.to_owned(), place));
+	assert_eq!((found(&long, Severity::Warning), found(&long[..280], Severity::Information), found("Both", Severity::Information), found("Both", Severity::Warning), found("Welcome", Severity::Information), found("Welcome ", Severity::Warning), found("welcome", Severity::Warning), found("", Severity::Warning), found("از نمایه", Severity::Information)), (Some(("طولانی".to_owned(), None)), None, Some(("از نمایه".to_owned(), None)), Some(("از نمایه".to_owned(), None)), Some(("خوش آمدید".to_owned(), Some(1))), None, None, None, None));
+	// A reader with no language of the text sees `default`, which is then what the node sent, filtered.
+	assert_eq!(raw.notice_text(node, &notice("Welcome", Severity::Warning)).map(|(text, _)| text.pick(&tags(&["de-Latn-DE"]))), Some(("Welcome", None)));
+	// Through another profile of the document the profile's own notices are not found, and the subscription's are.
+	let two = subscription(&with(rich(), &[("/profiles/0/notices", json!([{"severity": "info", "text": "Only here"}]))]));
+	assert_eq!((two.notice_text(&two.profiles[0], &notice("Only here", Severity::Information)).map(|(_, place)| place), two.notice_text(&two.profiles[1], &notice("Only here", Severity::Information)), two.notice_text(&two.profiles[1], &notice("Maintenance", Severity::Information)).map(|(_, place)| place)), (Some(None), None, Some(Some(0))));
+}
+
+// "The direction of a provider text is taken from the first character in it that has a strong direction. A text with none, such as one of digits only, is left to right."
+#[test]
+fn the_direction_of_a_text_is_that_of_its_first_strong_character() {
+	use Direction::{LeftToRight, RightToLeft};
+	for (text, want) in [
+		("Frankfurt", LeftToRight), ("فرانکفورت", RightToLeft), ("שלום", RightToLeft), ("ܫܠܡܐ", RightToLeft), ("ދިވެހި", RightToLeft), ("\u{7ca}\u{7cb}", RightToLeft), ("\u{1e900}\u{1e901}", RightToLeft), ("法蘭克福", LeftToRight), ("हिन्दी", LeftToRight), ("ශ්\u{200d}රී ලංකා", LeftToRight),
+		// No strong character: digits of either kind, spaces, punctuation, symbols and marks alone.
+		("", LeftToRight), ("12345", LeftToRight), ("۱۲۳", LeftToRight), ("١٢٣", LeftToRight), (" .,:;!?()[]-+*/%", LeftToRight), ("\u{1f600} \u{2192}", LeftToRight), ("\u{301}\u{64e}", LeftToRight),
+		// The first strong character decides, whatever stands before it and whatever follows.
+		("123 فارسی", RightToLeft), ("(۱) فارسی English", RightToLeft), ("\u{1f600} فارسی", RightToLeft), ("VPN فارسی", LeftToRight), ("فارسی VPN", RightToLeft), ("100% English فارسی", LeftToRight), ("\u{64e}a", LeftToRight), ("-\u{5d0}a", RightToLeft),
+	] {assert_eq!(direction(text), want, "{text:?}")}
+	// The tag of a text says nothing about its direction: Persian written in Latin letters under `fa` is left to right, and Persian letters under `en` are right to left.
+	let text = said(r#"{"default":"Tehran","fa":"Tehran","en":"تهران"}"#).unwrap();
+	assert_eq!((direction(text.pick(&tags(&["fa-Arab-IR"])).0), direction(text.pick(&tags(&["en-Latn-US"])).0), direction(text.as_str())), (LeftToRight, RightToLeft, LeftToRight));
+}
+
 #[test]
 fn an_address_inside_the_devices_own_networks_is_not_dialled() {
 	let network = |address: &str, prefix: u8| Network::new(address.parse().unwrap(), prefix).unwrap();
@@ -829,6 +1021,19 @@ fn nothing_prints_a_document_a_secret_an_address_or_a_path() {
 	for (index, text) in printed.iter().enumerate() {
 		for hidden in secrets.iter().map(String::as_str).chain(places) {assert!(!text.contains(hidden), "{index} prints {hidden}: {}", &text[..text.len().min(300)])}
 	}
+	// No text a provider wrote for a reader is printed either, in `default` or in any translation: not by a text, by what holds one, or by a translation that was picked, which prints its tag.
+	let spoken = subscription(&with(payload("languages"), &[("/devices/0/name", json!("Telefon"))]));
+	let (node, persian) = (&spoken.profiles[0], tags(&["fa-Arab-IR"]));
+	let said = [
+		format!("{spoken:?}"), format!("{:?}", (&spoken.provider, &spoken.profiles, &spoken.support, &spoken.cards, &spoken.notices, &spoken.devices)), format!("{:?}", (&node.name, &node.exits, &node.notices)),
+		format!("{:?}", (spoken.provider.translation(&persian), spoken.provider.translations().collect::<Vec<_>>(), spoken.provider.decided(&persian).1, node.exits[0].name.pick(&persian).1)),
+		format!("{:?}", (node.exit_name(&sent_exit("de", "Frankfurt")), spoken.notice_text(node, &control::Notice {severity: Severity::Warning, text: "Maintenance tonight".into()}))),
+		format!("{:?}", carried(&sign(0x11, &payload("languages")), &[]).unwrap().accept(None, &[]).unwrap()),
+	];
+	for (index, text) in said.iter().enumerate() {
+		for hidden in ["Example", "Provider", "Beispiel", "Frankfurt", "Amsterdam", "Maintenance", "Welcome", "Help", "Plan", "Basic", "GB", "Hello", "Site", "Telefon", "نمونه", "ارائه", "فرانکفورت", "امشب", "خوش", "راهنما", "طرح", "پایه", "گیگابایت", "سلام", "سایت", "法蘭克福", "\u{200c}"] {assert!(!text.contains(hidden), "{index} prints {hidden}: {}", text.chars().take(300).collect::<String>())}
+	}
+	assert_eq!((format!("{:?}", spoken.provider), said[3].as_str()), ("Text(16 bytes, 2 translations)".to_owned(), "(Some(Translation(fa)), [Translation(de), Translation(fa)], Some(Translation(fa)), Some(Tag(\"fa\")))"));
 	// What they do print, for a few of them.
 	assert_eq!((printed[1].as_str(), printed[3].as_str(), printed[4].as_str(), printed[5].as_str()), ("Subscription(example-account-0001, serial 5, 2 profiles, 0 refused)", "Profile(main, 5 transports, 1 exits)", "DeviceKeys(2 addresses, 1 transport secrets, ..)", "[UdpObfs(2 endpoints), Tls(1 candidates), Ws(1 candidates), Fronted(1 candidates), Udp(1 endpoints)]"));
 	assert_eq!((printed[12].as_str(), format!("{:?}", Link::parse(legacy).unwrap())), (format!("Held(Subscription(example-account-0001, serial 1, 1 profiles, 0 refused), [{:?}], {} bytes, 0 confirmed hosts)", key(0x11), held.document().len()).as_str(), "Legacy(Legacy { url: Url(sub.example.com, ..) })".to_owned()));

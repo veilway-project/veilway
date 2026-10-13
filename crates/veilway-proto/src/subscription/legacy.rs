@@ -207,7 +207,7 @@ fn shadowsocks(rest: &str) -> Option<Entry> {
 fn vmess(rest: &str) -> Option<Entry> {
 	let root = json::parse(&LENIENT.decode(rest.trim_end_matches('=').replace('+', "-").replace('/', "_")).ok()?).ok()?;
 	let members = Members::of(&root)?;
-	let field = |key: &str| match members.0.get(key) {
+	let field = |key: &str| match members.get(key) {
 		Some(Json::Str(text)) if text.len() <= STRING_MAX => Some(text.clone()),
 		Some(Json::Uint(number)) => Some(number.to_string()),
 		Some(Json::Bool(true)) => Some("true".to_owned()),

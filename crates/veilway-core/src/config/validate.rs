@@ -170,8 +170,9 @@ impl Config {
 		let mut interfaces: HashMap<&str, usize> = HashMap::new();
 		for (i, exit) in self.exits.iter().enumerate().take(MAX_EXITS) {
 			let at = format!("exits[{i}]");
-			// Control characters, then what renders as nothing or reorders text: soft hyphen, Arabic letter mark, zero-width characters and direction marks, line and paragraph separators with the embeddings and overrides, word joiner and invisible operators, isolates, the byte order mark and the tag characters.
-			if exit.name.as_ref().is_some_and(|name| !(1..=MAX_EXIT_NAME_CHARS).contains(&name.chars().count()) || name.chars().any(|c| c.is_control() || matches!(c, '\u{ad}' | '\u{61c}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}'))) {
+			// One filter for every text a node hands to a client, the one a client applies before it shows it (`veilway_proto::control::display`): a name it would change is refused here, so what an operator sees accepted is what a user sees.
+			// It keeps the joiners correct spelling needs, a zero width non-joiner inside a Persian word among them, and removes control, direction and other invisible characters.
+			if exit.name.as_ref().is_some_and(|name| !(1..=MAX_EXIT_NAME_CHARS).contains(&name.chars().count()) || veilway_proto::control::display(name, MAX_EXIT_NAME_CHARS, usize::MAX) != *name) {
 				r.error(format!("{at}.name"), format!("expected 1 to {MAX_EXIT_NAME_CHARS} characters with no control, bidirectional formatting, zero-width, line separator or other invisible characters"));
 			}
 			if exit.country.as_ref().is_some_and(|c| c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase())) {r.error(format!("{at}.country"), "expected two uppercase letters")}

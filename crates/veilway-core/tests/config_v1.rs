@@ -718,14 +718,16 @@ fn exits_and_backends() {
 		"exits[3].backend.interface": |d| d["exits"][3]["backend"] = json!({"type": "l3"});
 		"exits[3].backend.interface": |d| d["exits"][3]["backend"] = json!({"type": "l3", "interface": "veilway0"});
 	};
-	for invisible in ['\u{ad}', '\u{61c}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{2060}', '\u{2062}', '\u{2064}', '\u{2069}', '\u{feff}', '\u{e0000}', '\u{e0041}', '\u{e007f}'] {
+	// A joiner between Latin letters is refused like any invisible character. The same character inside a Persian word is spelling, see below.
+	for invisible in ['\u{ad}', '\u{61c}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2028}', '\u{2029}', '\u{202a}', '\u{2060}', '\u{2062}', '\u{2064}', '\u{2065}', '\u{2069}', '\u{feff}', '\u{e0000}', '\u{e0041}', '\u{e007f}', '\u{e0080}'] {
 		error_at("exits[0].name", |d| d["exits"][0]["name"] = json!(format!("Main{invisible}exit")));
 	}
-	for visible in ['\u{ac}', '\u{ae}', '\u{200a}', '\u{2027}', '\u{202f}', '\u{205f}', '\u{2065}', '\u{e0080}'] {
+	for visible in ['\u{ac}', '\u{ae}', '\u{200a}', '\u{2027}', '\u{202f}', '\u{205f}'] {
 		clean(|d| d["exits"][0]["name"] = json!(format!("Main{visible}exit")));
 	}
 	all_clean! {
 		|d| d["exits"][0]["name"] = json!("Amsterdam \u{1f1f3}\u{1f1f1} \u{0627}\u{0635}\u{0644}\u{06cc}");
+		|d| d["exits"][0]["name"] = json!("\u{062e}\u{0627}\u{0646}\u{0647}\u{200c}\u{0647}\u{0627}");
 		|d| d["exits"][0]["name"] = json!("n".repeat(64));
 		|d| d["exits"][0]["country"] = json!("ZZ");
 		|d| d["exits"][1]["backend"]["proxy_only"] = json!(false);
