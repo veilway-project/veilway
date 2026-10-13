@@ -1723,12 +1723,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
+ "rcgen",
+ "serde_json",
+ "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "veilway-api",
  "veilway-core",
  "veilway-wg",
+ "x509-parser",
 ]
 
 [[package]]

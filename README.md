@@ -108,6 +108,14 @@ chmod 600 config.json
 ./target/release/veilway check --config config.json
 ```
 
+`veilway doctor` then tries what the config needs of this host and of the network, and changes nothing: every listen address, every certificate, every DNS server over UDP and TCP, every outbound (for a SOCKS5 proxy the connection, the handshake, a CONNECT and a UDP ASSOCIATE, each on its own line), the `l3` prerequisites, the state file and the control socket. It prints one line per check with `ok`, `warn`, `fail` or `skipped`, and never a key, a password or the address of a proxy or a DNS server.
+
+```
+./target/release/veilway doctor --config config.json
+```
+
+It takes `--allow-readable-config`, `--state`, `--api` and `--no-api` like `run`, `--json` for one JSON document, and `--timeout <seconds>` for each step on the network (5 by default, 10 at most, and 45 for all of them together, after which what is left is `skipped`). A taken listen address is only `ok` when the node on the control socket says it holds it. The exit status is 0 when nothing failed, 1 when a check failed and 2 when the config file could not be read.
+
 ### 4. Run the server
 
 ```

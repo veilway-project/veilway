@@ -562,6 +562,12 @@ async fn the_socket_is_for_the_node_alone_and_only_ever_replaces_a_dead_socket()
 	let busy = serve(node.socket.clone()).err().expect("a second server took the socket of a running one");
 	assert!(busy.kind() == std::io::ErrorKind::AddrInUse && busy.to_string().contains("another process answers"), "{busy}");
 	assert_eq!(get(&node.socket, "/v1/status").await.status, 200, "the running node lost its socket to one that failed to start");
+	// A node says what it holds of the host, which is what `doctor` excuses a taken address on. Something else that listens on a socket path says nothing.
+	let held = veilway_api::held(&node.socket, Duration::from_secs(5)).await.expect("a running node did not say what it holds");
+	assert!(held.listens.contains(&(node.addr, false)) && held.interfaces.is_empty(), "{held:?}");
+	let mute = std::os::unix::net::UnixListener::bind(node.dir.join("mute.sock")).unwrap();
+	assert_eq!(veilway_api::held(&node.dir.join("mute.sock"), Duration::from_millis(300)).await, None);
+	drop(mute);
 	// What a node that was killed leaves behind: a socket file nobody listens on. Whatever its mode was, the new one has 600.
 	let stale = node.dir.join("stale.sock");
 	drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());

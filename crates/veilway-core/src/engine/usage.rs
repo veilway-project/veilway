@@ -5,7 +5,7 @@ use crate::config::MAX_QUOTA_BYTES;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -83,13 +83,58 @@ pub struct Saver {
 /// Only a regular file is ever read, moved or written over. Anything else at the path (a directory, a link, a device, a pipe) is left as it is, and the node keeps usage in memory.
 /// An entry that is no entry is passed over: its user starts from zero and everybody else keeps what the file says.
 pub fn load(path: &Path) -> (Vec<(String, UserState)>, bool) {
-	let alone = |why: String| {
-		tracing::error!("state file {}: {why}. It is left as it is and nothing is written there: usage is kept in memory and is gone when the node stops", path.display());
-		(Vec::new(), false)
-	};
+	match read(path) {
+		(Found::Absent, ..) => (Vec::new(), true),
+		(Found::Alone(why), ..) => {
+			tracing::error!("state file {}: {why}. It is left as it is and nothing is written there: usage is kept in memory and is gone when the node stops", path.display());
+			(Vec::new(), false)
+		}
+		(Found::Good {skipped, ..}, users, _) => {
+			if skipped > 0 {tracing::error!("state file {}: {skipped} of its entries are not what a node writes for a user. Those users start from zero and everybody else keeps what the file says", path.display())}
+			(users, true)
+		}
+		(Found::Bad(why), _, opened) => {
+			let mut bad = path.as_os_str().to_owned();
+			bad.push(".bad");
+			let replaced = fs::symlink_metadata(&bad).is_ok();
+			match fs::rename(path, &bad) {
+				Ok(()) => {
+					// Names and usage are for nobody else under the new name either. The mode is set through the handle, so it is the file that was looked at whose mode changes, whatever stands at either name by now,
+					// and only once the file is out of the way: a file that could not be trusted must not come back as one that can.
+					#[cfg(unix)]
+					if let Some(file) = &opened {let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));}
+					tracing::error!("state file {}: {why}. It is kept as {}{} and every user's usage starts from zero", path.display(), Path::new(&bad).display(), if replaced {", in the place of an older file of that name"} else {""})
+				}
+				Err(stuck) => tracing::error!("state file {}: {why}. It could not be moved aside ({}) and every user's usage starts from zero", path.display(), stuck.kind()),
+			}
+			drop(opened);
+			(Vec::new(), true)
+		}
+	}
+}
+
+/// What stands at the path of a state file, as `load` takes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+	/// Nothing, which is how a node starts for the first time.
+	Absent,
+	/// Something the node neither reads nor moves nor writes over, and why. Usage is then kept in memory.
+	Alone(String),
+	/// A file the node moves aside at start, and why. Every user's usage then starts from zero.
+	Bad(String),
+	/// A state file: the users it holds, and how many of its entries are no entry and passed over.
+	Good {users: usize, skipped: usize},
+}
+
+/// What `load` would find at `path`. Nothing is moved, written or logged to find out.
+pub fn inspect(path: &Path) -> Found {read(path).0}
+
+/// Reads the state file at `path` and changes nothing: what was found, the users of a good file, and the file as it was opened.
+fn read(path: &Path) -> (Found, Vec<(String, UserState)>, Option<File>) {
+	let alone = |why: String| (Found::Alone(why), Vec::new(), None);
 	// Looked at before it is opened, and without following a link: somebody who names `/dev/null` or a directory for no state file must find it there afterwards.
 	match fs::symlink_metadata(path) {
-		Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), true),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return (Found::Absent, Vec::new(), None),
 		Err(e) => return alone(format!("it cannot be looked at ({})", e.kind())),
 		Ok(meta) if !meta.is_file() => return alone("it is not a regular file".to_string()),
 		Ok(_) => {}
@@ -103,7 +148,7 @@ pub fn load(path: &Path) -> (Vec<(String, UserState)>, bool) {
 	#[cfg(unix)]
 	if opened.as_ref().is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP)) {return alone("it is not a regular file".to_string())}
 	if opened.as_ref().is_ok_and(|(meta, _)| !meta.is_file()) {return alone("it is not a regular file".to_string())}
-	let read = || -> anyhow::Result<(usize, Vec<(String, UserState)>)> {
+	let parsed = (|| -> anyhow::Result<(usize, Vec<(String, UserState)>)> {
 		let (meta, file) = match &opened {
 			Ok((meta, file)) => (meta, file),
 			Err(e) => anyhow::bail!("it cannot be opened ({})", e.kind()),
@@ -123,28 +168,11 @@ pub fn load(path: &Path) -> (Vec<(String, UserState)>, bool) {
 			..UserState::default()
 		}))).collect();
 		Ok((entries - users.len(), users))
-	};
-	match read() {
-		Ok((skipped, users)) => {
-			if skipped > 0 {tracing::error!("state file {}: {skipped} of its entries are not what a node writes for a user. Those users start from zero and everybody else keeps what the file says", path.display())}
-			(users, true)
-		}
-		Err(e) => {
-			let mut bad = path.as_os_str().to_owned();
-			bad.push(".bad");
-			let replaced = fs::symlink_metadata(&bad).is_ok();
-			match fs::rename(path, &bad) {
-				Ok(()) => {
-					// Names and usage are for nobody else under the new name either. The mode is set through the handle, so it is the file that was looked at whose mode changes, whatever stands at either name by now,
-					// and only once the file is out of the way: a file that could not be trusted must not come back as one that can.
-					#[cfg(unix)]
-					if let Ok((_, file)) = &opened {let _ = file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600));}
-					tracing::error!("state file {}: {e:#}. It is kept as {}{} and every user's usage starts from zero", path.display(), Path::new(&bad).display(), if replaced {", in the place of an older file of that name"} else {""})
-				}
-				Err(stuck) => tracing::error!("state file {}: {e:#}. It could not be moved aside ({}) and every user's usage starts from zero", path.display(), stuck.kind()),
-			}
-			(Vec::new(), true)
-		}
+	})();
+	let opened = opened.ok().map(|(_, file)| file);
+	match parsed {
+		Ok((skipped, users)) => (Found::Good {users: users.len(), skipped}, users, opened),
+		Err(e) => (Found::Bad(format!("{e:#}")), Vec::new(), opened),
 	}
 }
 
