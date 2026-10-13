@@ -166,6 +166,18 @@ fn every_category_is_reported() {
 fn each_flag_stands_alone() {
 	assert!(between(&good(), &good()).is_empty());
 	assert_eq!(diff(|doc| doc["dns"]["hijack"] = json!(false)), Diff {dns: true, ..Diff::default()});
+	// A set that is added, given another server, or given to somebody else is a change of `dns` and of nothing else. No sets and an empty list of them are the same.
+	let family = |doc: &mut Value| doc["dns"]["sets"] = json!([{"tag": "family", "servers": ["1.1.1.3:53"], "groups": ["staff"]}]);
+	let from = with(family);
+	assert_eq!(diff(family), Diff {dns: true, ..Diff::default()});
+	for edit in [|doc: &mut Value| doc["dns"]["sets"][0]["servers"] = json!(["9.9.9.9:53"]), |doc: &mut Value| doc["dns"]["sets"][0]["groups"] = json!(["guest"]), |doc: &mut Value| doc["dns"]["sets"][0]["users"] = json!(["bob"]), |doc: &mut Value| doc["dns"]["sets"][0]["tag"] = json!("kids")] as [fn(&mut Value); 4] {
+		let to = with(|doc| {
+			family(doc);
+			edit(doc);
+		});
+		assert_eq!(between(&from, &to), Diff {dns: true, ..Diff::default()});
+	}
+	assert!(between(&from, &from).is_empty() && diff(|doc| doc["dns"]["sets"] = json!([])).is_empty());
 	assert_eq!(diff(|doc| doc["log"] = json!({"destinations": true})), Diff {log: true, ..Diff::default()});
 	assert_eq!(diff(|doc| doc["routing"]["default"] = json!("node")), Diff {routing_default: true, ..Diff::default()});
 	assert_eq!(diff(|doc| doc["routing"]["rules"].as_array_mut().unwrap().swap(0, 2)), Diff {rules_reordered: true, ..Diff::default()});

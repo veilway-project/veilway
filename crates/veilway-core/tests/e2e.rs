@@ -3161,3 +3161,232 @@ async fn the_counters_of_a_user_an_inbound_and_an_exit_add_up_and_follow_a_reloa
 	assert!((onward.up_packets, onward.up_bytes)==(main.up_packets+2, main.up_bytes+89) && onward.down_packets>main.down_packets && onward.down_bytes>=main.down_bytes+49, "{main:?} then {onward:?}");
 	assert_eq!((last.users[1].traffic, last.users[1].traffic.up_packets), (last.inbounds[1].1, user.up_packets+3));
 }
+
+/// What the server of a set says, one zone for each level a set can name its users at, so an answer tells which server gave it.
+const ZONE_USER:Zone=&[("example.com", &[[198, 51, 100, 1]])];
+const ZONE_GROUP:Zone=&[("example.com", &[[198, 51, 100, 2]])];
+const ZONE_INBOUND:Zone=&[("example.com", &[[198, 51, 100, 3]])];
+
+/// The document of `launch_direct` with the group `family` declared and `sets` as its `dns.sets`, for `launch_local` once a test has changed it.
+fn setup_sets(servers:&[SocketAddr], sets:Value)->Setup{
+	let mut setup=setup(SocketAddr::from((Ipv4Addr::LOCALHOST, 9)));
+	setup.doc["dns"]=json!({"servers":servers.iter().map(|server| server.to_string()).collect::<Vec<_>>(), "hijack":true, "sets":sets});
+	setup.doc["groups"]=json!(["family"]);
+	setup.doc["outbounds"]=json!([{"tag":"plain", "type":"direct"}]);
+	setup.doc["exits"]=json!([{"tag":"main", "backend":{"type":"netstack", "outbound":"plain"}}]);
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
+	setup
+}
+
+/// Starts a node that takes no address for its own, so servers on this machine pass the destination gate.
+async fn launch_local(setup:Setup)->Node{launch_with(setup, Options{is_local:|_| false, ..Options::new("")}).await}
+
+/// The one address `example.com` has in the answer to a query `client` sends from `src`.
+async fn example(client:&mut Client, src:[u8;4], sport:u16)->IpAddr{
+	let found=resolved(&ask(client, src, [9, 9, 9, 9], sport, &dns_query(sport, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), sport);
+	assert_eq!(found.len(), 1, "the answer has not one address");
+	found[0]
+}
+
+/// The set that names a user comes before the one that names a group of theirs, that one before the one that names the
+/// inbound a query came through, and `dns.servers` is for whoever is left. Each query reaches the servers of that one list.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_query_goes_to_the_most_specific_set_and_to_no_other(){
+	let host=host_ip();
+	let ((default, default_hits, _), (own, own_hits, _), (family, family_hits, _), (lab, lab_hits, _))=(dns_server(host, ZONE, false).await, dns_server(host, ZONE_USER, false).await, dns_server(host, ZONE_GROUP, false).await, dns_server(host, ZONE_INBOUND, false).await);
+	let hits=|| [&default_hits, &own_hits, &family_hits, &lab_hits].map(|hits| hits.load(Ordering::SeqCst));
+	let mut setup=setup_sets(&[default], json!([
+		{"tag":"own", "servers":[own.to_string()], "users":["c"]},
+		{"tag":"family", "servers":[family.to_string()], "groups":["family"]},
+		{"tag":"lab", "servers":[lab.to_string()], "inbounds":["office"]}
+	]));
+	let (office, office_listen, keys)=(veilway_wg::generate_key(), listen(), [veilway_wg::generate_key(), veilway_wg::generate_key(), veilway_wg::generate_key()]);
+	setup.doc["inbounds"].as_array_mut().unwrap().push(inbound("office", &office, "10.8.0.1/24", udp(office_listen)));
+	// On `office`: c is named by a set, is in the group and came through the inbound, d is in the group and came through the inbound, e only came through the inbound. On `home`: b is in the group, a is in nothing.
+	for (name, key, address, member) in [("c", &keys[0], "10.8.0.2", true), ("d", &keys[1], "10.8.0.3", true), ("e", &keys[2], "10.8.0.4", false)]{
+		let mut user=user(name, key, address);
+		if member{user["groups"]=json!(["family"])}
+		setup.doc["users"].as_array_mut().unwrap().push(user);
+	}
+	setup.doc["users"][1]["groups"]=json!(["family"]);
+	let node=launch_local(setup).await;
+	let office_public=veilway_wg::public_key(&office);
+	let (mut a, mut b)=(Client::connect(node.keys[0], node.public, node.addr).await, Client::connect(node.keys[1], node.public, node.addr).await);
+	let (mut c, mut d, mut e)=(Client::connect(keys[0], office_public, office_listen).await, Client::connect(keys[1], office_public, office_listen).await, Client::connect(keys[2], office_public, office_listen).await);
+	assert_eq!((example(&mut c, [10, 8, 0, 2], 47001).await, hits()), (IpAddr::from([198, 51, 100, 1]), [0, 1, 0, 0]), "a user a set names was not asked for at that set alone");
+	assert_eq!((example(&mut d, [10, 8, 0, 3], 47002).await, hits()), (IpAddr::from([198, 51, 100, 2]), [0, 1, 1, 0]), "the set of a user's group did not come before the set of the inbound");
+	assert_eq!((example(&mut e, [10, 8, 0, 4], 47003).await, hits()), (IpAddr::from([198, 51, 100, 3]), [0, 1, 1, 1]), "a user no set names was not asked for at the set of the inbound");
+	assert_eq!((example(&mut b, PEER_B, 47004).await, hits()), (IpAddr::from([198, 51, 100, 2]), [0, 1, 2, 1]), "the set of a user's group did not come before dns.servers");
+	assert_eq!((example(&mut a, PEER_A, 47005).await, hits()), (IpAddr::from(PUBLIC), [1, 1, 2, 1]), "a user nothing names was not asked for at dns.servers");
+	assert_eq!(node.engine.dns(), DnsTotals{answered:5, ..DnsTotals::default()});
+	for name in ["a", "b", "c", "d", "e"]{assert_eq!(node.engine.dns_names(name), Some(1), "user {name}")}
+}
+
+/// A query is a flow to a server of the user's own set, routed by the rules like any other, and what it resolves steers
+/// the `domain` rules for a user on a set as it does for one on `dns.servers`. Neither user's queries ever go to the other's server.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn users_on_two_sets_ask_two_servers_and_domain_rules_work_on_both(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (dns, _, _)=dns_server(Ipv4Addr::LOCALHOST, ZONE, false).await;
+	let (first, seen_first)=socks5_proxy(dns, backend, echo, false).await;
+	let (second, seen_second)=socks5_proxy(dns, backend, echo, false).await;
+	let mut setup=setup(first);
+	setup.doc["dns"]=json!({"servers":["1.1.1.1:53"], "hijack":true, "sets":[{"tag":"adblock", "servers":["9.9.9.9:53", "9.9.9.10:53"], "users":["b"]}]});
+	add_exit(&mut setup.doc, "second", second);
+	add_rule(&mut setup.doc, json!({"tag":"by-name", "domain":["site.example.com"], "action":{"exit":"second"}}));
+	let node=launch(setup).await;
+	let (mut a, mut b)=(Client::connect(node.keys[0], node.public, node.addr).await, Client::connect(node.keys[1], node.public, node.addr).await);
+	// A name no rule names leaves through the default exit, to the server of each user's own list.
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 47010, &dns_query(1, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 1), [IpAddr::from(PUBLIC)]);
+	assert_eq!(resolved(&ask(&mut b, PEER_B, GATEWAY, 47011, &dns_query(2, "example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 2), [IpAddr::from(PUBLIC)]);
+	assert_eq!((recorded(&seen_first), recorded(&seen_second)), (vec!["1.1.1.1:53".to_string(), "9.9.9.9:53".to_string()], Vec::new()));
+	// The name of the rule: the query of a user on a set follows the rule too, and still goes to the server of the set.
+	assert_eq!(resolved(&ask(&mut b, PEER_B, GATEWAY, 47012, &dns_query(3, "site.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 3), [IpAddr::from(OTHER)]);
+	assert_eq!(recorded(&seen_second), ["9.9.9.9:53"], "the query of a user on a set did not leave through the exit of the domain rule, to the server of the set");
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b")), (Some(1), Some(2)));
+	assert_eq!(knock(&mut b, PEER_B, OTHER, 47013, 80).await, Answer::Accepted);
+	eventually("the flow of a user on a set did not follow the domain rule", || recorded(&seen_second)==["9.9.9.9:53", "93.184.216.35:80"]).await;
+	// User a never asked for that name, and their own query for it goes to their own server.
+	assert_eq!(knock(&mut a, PEER_A, OTHER, 47014, 80).await, Answer::Accepted);
+	eventually("the flow of user a never reached the default exit", || recorded(&seen_first).len()==3).await;
+	assert_eq!(resolved(&ask(&mut a, PEER_A, GATEWAY, 47015, &dns_query(4, "site.example.com", 1), Duration::from_secs(5)).await.expect("no dns answer"), 4), [IpAddr::from(OTHER)]);
+	assert_eq!((recorded(&seen_first), recorded(&seen_second)), (vec!["1.1.1.1:53".to_string(), "9.9.9.9:53".to_string(), "93.184.216.35:80".to_string()], vec!["9.9.9.9:53".to_string(), "93.184.216.35:80".to_string(), "1.1.1.1:53".to_string()]));
+	assert_eq!(node.engine.dns(), DnsTotals{answered:4, ..DnsTotals::default()});
+}
+
+/// A set never falls back: when none of its servers answers, the query fails with SERVFAIL, and when the rules refuse its
+/// servers the answer is REFUSED. `dns.servers` works for everybody else all the while and is never asked for the user of the set.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_set_whose_servers_are_silent_or_refused_fails_without_the_default(){
+	let host=host_ip();
+	let (silent, also_silent)=(UdpSocket::bind((host, 0)).await.unwrap(), UdpSocket::bind((host, 0)).await.unwrap());
+	let (default, default_hits, default_tcp)=dns_server(host, ZONE, false).await;
+	let setup=setup_sets(&[default], json!([{"tag":"quiet", "servers":[silent.local_addr().unwrap().to_string(), also_silent.local_addr().unwrap().to_string()], "users":["b"]}]));
+	let mut doc=setup.doc.clone();
+	let node=launch_local(setup).await;
+	let (mut a, mut b)=(Client::connect(node.keys[0], node.public, node.addr).await, Client::connect(node.keys[1], node.public, node.addr).await);
+	let (query, started)=(dns_query(21, "example.com", 1), Instant::now());
+	let failure=ask(&mut b, PEER_B, GATEWAY, 47020, &query, Duration::from_secs(14)).await.expect("a query no server of the set answered got no answer from the node");
+	assert!(started.elapsed()>=Duration::from_secs(10), "the two servers of the set were not given their five seconds each");
+	assert_eq!((&failure[..4], &failure[4..12], &failure[12..]), (&[0, 21, 0x81, 0x82][..], &[0, 1, 0, 0, 0, 0, 0, 0][..], &query[12..]), "the node did not answer SERVFAIL");
+	let mut asked=[0u8;512];
+	for (which, socket) in [("first", &silent), ("second", &also_silent)]{
+		let n=timeout(Duration::from_secs(1), socket.recv(&mut asked)).await.unwrap_or_else(|_| panic!("the {which} server of the set was never asked")).unwrap();
+		assert_eq!(asked[2..n], query[2..], "the query did not reach the {which} server of the set as it was asked");
+	}
+	assert_eq!((default_hits.load(Ordering::SeqCst), default_tcp.load(Ordering::SeqCst), node.engine.dns(), node.engine.dns_names("b")), (0, 0, DnsTotals{failed:1, ..DnsTotals::default()}, Some(0)), "a set that failed fell back to dns.servers");
+	assert_eq!(example(&mut a, PEER_A, 47021).await, IpAddr::from(PUBLIC));
+	// The rules refuse the servers of the set: the user of the set is told so at once, and nothing is asked anywhere for them.
+	add_rule(&mut doc, json!({"tag":"no-quiet", "user":["b"], "ip":[format!("{host}/32")], "action":"block"}));
+	reload(&node, &doc).await.unwrap();
+	let refused=ask(&mut b, PEER_B, GATEWAY, 47022, &dns_query(22, "example.com", 1), Duration::from_secs(3)).await.expect("a query the rules refuse was not answered");
+	assert_eq!(refused[..4], [0, 22, 0x81, 0x85], "the node did not answer REFUSED");
+	assert!(timeout(Duration::from_millis(300), silent.recv(&mut asked)).await.is_err(), "a refused query reached a server of the set");
+	assert_eq!(example(&mut a, PEER_A, 47023).await, IpAddr::from(PUBLIC));
+	assert_eq!((default_hits.load(Ordering::SeqCst), default_tcp.load(Ordering::SeqCst), node.engine.dns()), (2, 0, DnsTotals{answered:2, refused:1, failed:1, ..DnsTotals::default()}));
+}
+
+/// A reload that gives a user another set takes effect at their next query, on the session they have, and clears what the
+/// node remembered of the names they resolved before. So does a change of the servers of the list they are on, a set or
+/// `dns.servers`. The same servers under another tag or in another order clear nothing, and nobody else is touched.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_that_moves_a_user_to_another_set_takes_effect_and_clears_their_names(){
+	let host=host_ip();
+	let ((default, default_hits, _), (family, family_hits, _), (other, other_hits, _))=(dns_server(host, ZONE, false).await, dns_server(host, ZONE_GROUP, false).await, dns_server(host, ZONE_USER, false).await);
+	let hits=|| [&default_hits, &family_hits, &other_hits].map(|hits| hits.load(Ordering::SeqCst));
+	let setup=setup_sets(&[default], json!([{"tag":"family", "servers":[family.to_string()], "groups":["family"]}]));
+	let mut doc=setup.doc.clone();
+	let node=launch_local(setup).await;
+	let (mut a, mut b)=(Client::connect(node.keys[0], node.public, node.addr).await, Client::connect(node.keys[1], node.public, node.addr).await);
+	assert_eq!((example(&mut a, PEER_A, 47030).await, example(&mut b, PEER_B, 47031).await, hits()), (IpAddr::from(PUBLIC), IpAddr::from(PUBLIC), [2, 0, 0]));
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b")), (Some(1), Some(1)));
+	// User a joins the group the set names.
+	doc["users"][0]["groups"]=json!(["family"]);
+	assert!(reload(&node, &doc).await.unwrap().diff.users.changed==["a"]);
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b")), (Some(0), Some(1)), "the names of the user who was moved were kept, or those of somebody else were cleared");
+	assert_eq!((example(&mut a, PEER_A, 47032).await, example(&mut b, PEER_B, 47033).await, hits()), (IpAddr::from([198, 51, 100, 2]), IpAddr::from(PUBLIC), [3, 1, 0]), "the reload did not take effect on the session the user had");
+	assert_eq!(node.engine.dns_names("a"), Some(1));
+	// The set gets another server: what its old server said is forgotten for its user, and for nobody on another list.
+	doc["dns"]["sets"][0]["servers"]=json!([other.to_string()]);
+	assert!(reload(&node, &doc).await.unwrap().diff.dns);
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b")), (Some(0), Some(1)), "a set that changed its servers kept the names of its users, or cleared somebody else's");
+	assert_eq!((example(&mut a, PEER_A, 47034).await, hits(), node.engine.dns_names("a")), (IpAddr::from([198, 51, 100, 1]), [3, 1, 1], Some(1)));
+	// A set that names the user takes them from the set of their group, to other servers.
+	doc["dns"]["sets"].as_array_mut().unwrap().push(json!({"tag":"own", "servers":[family.to_string()], "users":["a"]}));
+	reload(&node, &doc).await.unwrap();
+	assert_eq!((node.engine.dns_names("a"), example(&mut a, PEER_A, 47035).await, hits()), (Some(0), IpAddr::from([198, 51, 100, 2]), [3, 2, 1]));
+	// Back to the set of the group, which now has the server the user's own set had: another list of the same servers is no change.
+	doc["dns"]["sets"].as_array_mut().unwrap().pop();
+	doc["dns"]["sets"][0]["servers"]=json!([family.to_string()]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!(node.engine.dns_names("a"), Some(1), "the same servers under another tag cleared the names of the user");
+	// With every set gone the user is back on dns.servers.
+	doc["dns"].as_object_mut().unwrap().remove("sets");
+	reload(&node, &doc).await.unwrap();
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b"), example(&mut a, PEER_A, 47036).await, hits()), (Some(0), Some(1), IpAddr::from(PUBLIC), [4, 2, 1]));
+	// dns.servers is a list like any other: a server more is a change for everybody on it, and the same servers in another order are none.
+	doc["dns"]["servers"]=json!([default.to_string(), other.to_string()]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b"), example(&mut a, PEER_A, 47037).await, hits()), (Some(0), Some(0), IpAddr::from(PUBLIC), [5, 2, 1]));
+	doc["dns"]["servers"]=json!([other.to_string(), default.to_string()]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!((node.engine.dns_names("a"), example(&mut a, PEER_A, 47038).await, hits()), (Some(1), IpAddr::from([198, 51, 100, 1]), [5, 2, 2]), "the same servers in another order cleared the names of their users");
+	assert_eq!(node.engine.dns(), DnsTotals{answered:9, ..DnsTotals::default()});
+}
+
+/// The list a query goes to is decided for the inbound it comes through, and so is what a reload clears: a device with an
+/// address in two inbounds forgets its user's names when the servers of either inbound change, whatever the other one has.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_that_gives_one_inbound_of_a_device_a_set_clears_the_names_of_its_user(){
+	let host=host_ip();
+	let ((default, default_hits, _), (lab, lab_hits, _))=(dns_server(host, ZONE, false).await, dns_server(host, ZONE_INBOUND, false).await);
+	let hits=|| [&default_hits, &lab_hits].map(|hits| hits.load(Ordering::SeqCst));
+	let mut setup=setup_sets(&[default], json!([]));
+	let (office, office_listen)=(veilway_wg::generate_key(), listen());
+	setup.doc["inbounds"].as_array_mut().unwrap().push(inbound("office", &office, "10.8.0.1/24", udp(office_listen)));
+	setup.doc["users"][1]["devices"][0]["addresses"]=json!(["10.7.0.3", "10.8.0.3"]);
+	let mut doc=setup.doc.clone();
+	let node=launch_local(setup).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	assert_eq!((example(&mut b, PEER_B, 47050).await, hits(), node.engine.dns_names("b")), (IpAddr::from(PUBLIC), [1, 0], Some(1)));
+	// `home` goes into a set and `office` stays on dns.servers, which the device is still on as well.
+	doc["dns"]["sets"]=json!([{"tag":"lab", "servers":[lab.to_string()], "inbounds":["home"]}]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!(node.engine.dns_names("b"), Some(0), "names resolved through an inbound outlived the servers of that inbound");
+	assert_eq!((example(&mut b, PEER_B, 47051).await, hits(), node.engine.dns_names("b")), (IpAddr::from([198, 51, 100, 3]), [1, 1], Some(1)));
+	// The two inbounds swap their lists: the device is on the same two lists as before, and each inbound has other servers.
+	doc["dns"]["sets"][0]["inbounds"]=json!(["office"]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!(node.engine.dns_names("b"), Some(0), "two inbounds that swapped their lists kept the names of a user on both");
+	assert_eq!((example(&mut b, PEER_B, 47052).await, hits()), (IpAddr::from(PUBLIC), [2, 1]));
+}
+
+/// A query that waits for a server when a reload gives its user another set is answered by the server it was sent to,
+/// and that answer is not remembered: the memory was cleared of what the old set said.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_answer_that_comes_after_its_user_changed_sets_is_relayed_and_not_remembered(){
+	let host=host_ip();
+	let slow=UdpSocket::bind((host, 0)).await.unwrap();
+	let (family, family_hits, _)=dns_server(host, ZONE_GROUP, false).await;
+	let setup=setup_sets(&[slow.local_addr().unwrap()], json!([{"tag":"family", "servers":[family.to_string()], "groups":["family"]}]));
+	let mut doc=setup.doc.clone();
+	let node=launch_local(setup).await;
+	let (mut a, mut b)=(Client::connect(node.keys[0], node.public, node.addr).await, Client::connect(node.keys[1], node.public, node.addr).await);
+	// The server holds its answer back until the reload that `change` describes has gone through.
+	for (client, src, id, name, change) in [(&mut a, PEER_A, 41u16, "example.com", json!({"groups":["family"]})), (&mut b, PEER_B, 42, "www.example.com", json!({"exits":["main"]}))]{
+		doc["users"][0].as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
+		let late=async{
+			let mut asked=[0u8;512];
+			let (n, from)=timeout(Duration::from_secs(3), slow.recv_from(&mut asked)).await.expect("the server was never asked").unwrap();
+			reload(&node, &doc).await.unwrap();
+			slow.send_to(&dns_reply(ZONE, &asked[..n], false), from).await.unwrap();
+		};
+		let query=dns_query(id, name, 1);
+		let (answer, _)=tokio::join!(ask(client, src, GATEWAY, 47040+id, &query, Duration::from_secs(5)), late);
+		assert_eq!(resolved(&answer.expect("the answer of the server the query went to was not relayed"), id).len(), 1);
+		// User a was given the set of the group while their query waited. User b waited through a reload that left their set alone.
+		assert_eq!((node.engine.dns_names("a"), node.engine.dns_names("b"), family_hits.load(Ordering::SeqCst)), (Some(0), Some(usize::from(id==42)), 0), "after the reload that query {id} waited through");
+	}
+	assert_eq!((example(&mut a, PEER_A, 47043).await, node.engine.dns_names("a"), family_hits.load(Ordering::SeqCst)), (IpAddr::from([198, 51, 100, 2]), Some(1), 1));
+}

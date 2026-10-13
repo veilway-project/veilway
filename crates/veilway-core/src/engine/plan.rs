@@ -55,8 +55,17 @@ pub struct Exit {
 	pub outbound: Option<String>,
 	pub traffic: Arc<Traffic>,
 	pub state: Arc<ExitState>,
-	/// Failures in a row of each DNS server through this exit, server by server. They start over when the list of servers changes.
-	pub failures: Arc<[AtomicU32; MAX_DNS_SERVERS]>,
+	/// Failures in a row of each DNS server through this exit, for each list of `Plan::dns` and server by server. A server in two lists has a count in each, so the log line of a count names one place in the config.
+	/// The counts of a list start over when its servers change.
+	pub failures: Vec<Arc<[AtomicU32; MAX_DNS_SERVERS]>>,
+}
+
+/// One list of servers the node's resolver asks, in the order it tries them. The first of a plan is `dns.servers`, which has no tag. After it come the sets of `dns.sets`.
+pub struct DnsSet {pub tag: String, pub servers: Vec<SocketAddr>}
+
+impl DnsSet {
+	/// Whether both lists ask the same servers, in whatever order. What a user resolved stands for as long as this holds for the list their queries go to.
+	pub fn same(&self, other: &DnsSet) -> bool {self.servers.len() == other.servers.len() && self.servers.iter().all(|server| other.servers.contains(server))}
 }
 
 pub struct Inbound {
@@ -66,6 +75,8 @@ pub struct Inbound {
 	pub pools: Vec<IpNet>,
 	pub mtu: u16,
 	pub transports: Vec<Transport>,
+	/// The servers for queries that come through this inbound from a user no set speaks for, as an index into `Plan::dns`.
+	pub dns: usize,
 	pub traffic: Arc<Traffic>,
 	/// The tunnel as it runs. A reload that leaves the key, the pools and the MTU alone hands the same one on, with its sessions.
 	pub tunnel: Arc<Tunnel>,
@@ -82,6 +93,8 @@ pub struct User {
 	/// None is every exit.
 	pub entitled: Option<Vec<usize>>,
 	pub exit: Option<usize>,
+	/// The set that names the user, or else one of their groups, as an index into `Plan::dns`. None for a user who goes by the inbound a query comes through.
+	pub dns: Option<usize>,
 	/// `quota_bytes`, which the count in `state` is held against.
 	pub quota: Option<u64>,
 	pub period: Option<QuotaPeriod>,
@@ -149,8 +162,8 @@ pub struct Plan {
 	pub log_destinations: bool,
 	/// What `show` goes by: `log_destinations` of the plan in force, shared by every plan so that a flow that began under an earlier one stops showing destinations with everybody else.
 	pub shown: Arc<AtomicBool>,
-	/// The servers the node's resolver asks, in the order it tries them.
-	pub dns: Vec<SocketAddr>,
+	/// Every list of servers the node's resolver asks. Never empty in a plan that was compiled.
+	pub dns: Vec<DnsSet>,
 	pub hijack: bool,
 	pub inbounds: Vec<Inbound>,
 	/// Every user of the config, enabled or not, so counters and rules keep their indexes.
@@ -182,7 +195,8 @@ impl Plan {
 	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>) -> anyhow::Result<Plan> {
 		let stale = || anyhow!("the config names something it does not define; it was not validated");
 		anyhow::ensure!(tunnels.len() == config.inbounds.len(), "one tunnel for each inbound");
-		let dns: Vec<SocketAddr> = config.dns.servers.iter().map(|server| server.0).collect();
+		let dns: Vec<DnsSet> = std::iter::once((String::new(), &config.dns.servers)).chain(config.dns.sets.iter().map(|set| (set.tag.clone(), &set.servers))).map(|(tag, servers)| DnsSet {tag, servers: servers.iter().map(|server| server.0).collect()}).collect();
+		let [set_of_user, set_of_group, set_of_inbound] = config.dns.named();
 		let (was_exit, was_inbound, was_user): (HashMap<&str, &Exit>, HashMap<&str, &Inbound>, HashMap<&str, &User>) = (previous.exits.iter().map(|exit| (exit.tag.as_str(), exit)).collect(), previous.inbounds.iter().map(|inbound| (inbound.tag.as_str(), inbound)).collect(), previous.users.iter().map(|user| (user.name.as_str(), user)).collect());
 		let index = |names: Vec<&str>| names.into_iter().enumerate().map(|(i, name)| (name.to_string(), i)).collect::<HashMap<String, usize>>();
 		let find = |map: &HashMap<String, usize>, name: &str| map.get(name).copied().ok_or_else(stale);
@@ -221,7 +235,7 @@ impl Plan {
 				outbound: if let config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None},
 				traffic: was.map(|was| was.traffic.clone()).unwrap_or_default(),
 				state: was.map(|was| was.state.clone()).unwrap_or_default(),
-				failures: was.filter(|_| previous.dns == dns).map(|was| was.failures.clone()).unwrap_or_default(),
+				failures: dns.iter().map(|set| was.zip(previous.dns.iter().position(|old| old.tag == set.tag && old.servers == set.servers)).and_then(|(was, at)| was.failures.get(at)).cloned().unwrap_or_default()).collect(),
 			});
 		}
 		let inbounds: Vec<Inbound> = config.inbounds.iter().zip(tunnels).map(|(inbound, tunnel)| Inbound {
@@ -230,6 +244,7 @@ impl Plan {
 			pools: inbound.address.iter().map(|net| net.0).collect(),
 			mtu: inbound.mtu.unwrap_or(DEFAULT_MTU),
 			transports: inbound.transports.clone(),
+			dns: set_of_inbound.get(inbound.tag.as_str()).map_or(0, |set| set + 1),
 			traffic: was_inbound.get(inbound.tag.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(),
 			tunnel,
 		}).collect();
@@ -252,6 +267,7 @@ impl Plan {
 					Exits::List(list) => Some(list.iter().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?),
 				},
 				exit: user.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?,
+				dns: set_of_user.get(user.name.as_str()).or_else(|| user.groups.iter().find_map(|group| set_of_group.get(group.as_str()))).map(|set| set + 1),
 				quota: user.quota_bytes,
 				period: user.quota_period,
 				denied,
@@ -325,6 +341,10 @@ impl Plan {
 
 	/// The inbound a tunnel belongs to under this plan. None for a tunnel the plan no longer has.
 	pub fn inbound_of(&self, tunnel: &Arc<Tunnel>) -> Option<usize> {self.inbounds.iter().position(|inbound| Arc::ptr_eq(&inbound.tunnel, tunnel))}
+
+	/// The list of `dns` a query of `user` goes to when it comes through `inbound`. Most specific first: the set that names the user, the set that names one of their groups, the set that names the inbound, `dns.servers`.
+	/// It is one list and never another after it: a query that none of its servers answers fails.
+	pub fn dns_of(&self, user: usize, inbound: usize) -> usize {self.users[user].dns.unwrap_or(self.inbounds[inbound].dns)}
 
 	/// A destination or DNS name for a log line: shown only when the config's `log.destinations` allows it.
 	pub fn show(&self, destination: impl Display) -> String {if self.shown.load(Ordering::Relaxed) {destination.to_string()} else {"<hidden>".to_string()}}

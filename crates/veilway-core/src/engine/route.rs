@@ -331,6 +331,11 @@ impl Flows {
 		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {entry.idle = idle}
 	}
 
+	/// Counts as a packet on the entry `id`, for a handler that has just written one to the stack: the packet itself only counts once the stack has handed it on, and a handler that looks at the flow before then would find it as quiet as it was.
+	pub fn touch(&self, key: &Key, id: u64) {
+		if let Some(entry) = self.lock().flows.get_mut(key).filter(|entry| entry.id == id) {entry.seen = Instant::now()}
+	}
+
 	/// Returns once the flow has seen no packet in either direction for `idle`, or its entry is gone, which it is within a moment of a reload that ends the flow.
 	pub async fn quiet(&self, key: Key, id: u64, idle: Duration) {
 		loop {

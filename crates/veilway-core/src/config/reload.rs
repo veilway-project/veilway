@@ -198,7 +198,7 @@ impl Diff {
 			exits: changes(&old.exits, &new.exits, |exit| exit.tag.as_str(), |was, is| was == is || effective(old, was) == effective(new, is)),
 			rules: changes(&old.routing.rules, &new.routing.rules, |rule| rule.tag.as_str(), |was, is| was == is || Rule {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Rule {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
 			users,
-			dns: old.dns.servers != new.dns.servers || old.dns.hijack.unwrap_or(true) != new.dns.hijack.unwrap_or(true),
+			dns: old.dns.servers != new.dns.servers || old.dns.hijack.unwrap_or(true) != new.dns.hijack.unwrap_or(true) || old.dns.sets != new.dns.sets,
 			// `level` and `destinations` are read with their defaults, so `Log` already holds effective values.
 			log: old.log != new.log,
 			routing_default: old.routing.default != new.routing.default,

@@ -204,6 +204,8 @@ fn users_of(api: &Api, only: Option<&str>) -> Vec<model::User> {
 	for (public, age) in peers.iter().filter_map(|peer| peer.handshake.map(|age| (peer.public_key, age))) {
 		handshakes.entry(public).and_modify(|youngest| *youngest = age.min(*youngest)).or_insert(age);
 	}
+	// For every user the sets are indexed once. For one user they are gone through as they are, and nothing is built.
+	let (sets, named) = (&snapshot.config.dns.sets, only.is_none().then(|| snapshot.config.dns.named()));
 	snapshot.config.users.iter().filter(|user| only.is_none_or(|only| user.name == only)).map(|user| {
 		let usage = usage.get(user.name.as_str());
 		model::User {
@@ -219,6 +221,10 @@ fn users_of(api: &Api, only: Option<&str>) -> Vec<model::User> {
 			quota_period: user.quota_period,
 			used_bytes: usage.map_or(0, |usage| usage.used_bytes),
 			period_start: usage.map_or(0, |usage| usage.period_start),
+			dns_set: match &named {
+				Some([of_user, of_group, _]) => of_user.get(user.name.as_str()).or_else(|| user.groups.iter().find_map(|group| of_group.get(group.as_str()))).map(|set| &sets[*set]),
+				None => sets.iter().find(|set| set.users.contains(&user.name)).or_else(|| sets.iter().find(|set| user.groups.iter().any(|group| set.groups.contains(group)))),
+			}.map(|set| set.tag.clone()),
 			traffic: usage.map(|usage| usage.traffic).unwrap_or_default().into(),
 			devices: user.devices.iter().map(|device| model::Device {name: device.name.clone(), public_key: key(&device.public_key), addresses: device.addresses.iter().map(|address| address.0.to_string()).collect(), handshake_age_secs: handshakes.get(&device.public_key.0).map(Duration::as_secs)}).collect(),
 		}

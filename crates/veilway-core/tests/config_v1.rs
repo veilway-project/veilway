@@ -483,6 +483,120 @@ fn dns() {
 	};
 }
 
+/// Three sets on the known-good document: one for user `bob`, one for group `staff`, one for inbound `office`. User `carol` is added on `office`, in no group, so each set has somebody whose queries go to it.
+fn sets(d: &mut Value) {
+	push(d, "/users", json!({"name": "carol", "exits": "all", "devices": [{"name": "tablet", "public_key": key(0x23), "addresses": ["10.8.0.3"]}]}));
+	d["dns"]["sets"] = json!([
+		{"tag": "adblock", "servers": ["9.9.9.11:53"], "users": ["bob"]},
+		{"tag": "family", "servers": ["1.1.1.3:53", "[2606:4700:4700::1113]:53"], "groups": ["staff"]},
+		{"tag": "lab", "servers": ["9.9.9.9:53"], "inbounds": ["office"]}
+	]);
+}
+
+#[test]
+fn dns_sets() {
+	let set = |d: &mut Value, key: &str, value: Value| {
+		sets(d);
+		d["dns"]["sets"][0][key] = value;
+	};
+	all_clean! {
+		|d| sets(d);
+		|d| d["dns"]["sets"] = json!([]);
+		|d| set(d, "servers", json!(["1.1.1.1:53", "1.1.1.3:53", "9.9.9.9:53", "8.8.8.8:53"]));
+		|d| set(d, "groups", json!(["guest"]));
+		|d| d["dns"] = json!({"servers": ["1.1.1.1:53"], "hijack": false, "sets": []});
+		|d| {sets(d); d["dns"]["hijack"] = json!(true)};
+	};
+	// Thirty-two sets are within the limit. Thirty of them name a group nobody is in, which is a warning for each and no error.
+	let full = check(&with(|d| {
+		let groups: Vec<String> = ["staff".to_string(), "guest".to_string()].into_iter().chain((0..30).map(|i| format!("g{i}"))).collect();
+		d["dns"]["sets"] = groups.iter().enumerate().map(|(i, group)| json!({"tag": format!("s{i}"), "servers": [format!("9.9.9.{}:53", i + 1)], "groups": [group]})).collect();
+		d["groups"] = groups.into();
+	}));
+	assert!(full.errors.is_empty() && full.warnings.iter().map(|w| w.path.clone()).eq((2..32).map(|i| format!("dns.sets[{i}]"))), "{full:#?}");
+	// A set that can be stepped around decides nothing, so sets need `hijack`.
+	assert!(check(&with(|d| {sets(d); d["dns"]["hijack"] = json!(false)})).errors.iter().any(|e| e.path == "dns.hijack" && e.message.contains("dns.sets")));
+	// A set that names somebody and still gets no query: its group has no user left, or every user of its inbound goes by a more specific set.
+	cases! {warning_at:
+		"dns.sets[1]": |d| {sets(d); d["dns"]["sets"][1]["groups"] = json!(["guest"])};
+		"dns.sets[2]": |d| {sets(d); d["dns"]["sets"][0]["users"] = json!(["bob", "carol"])};
+		"dns.sets[2]": |d| {sets(d); d["users"][2]["groups"] = json!(["staff"])};
+	};
+	// An address the destination gate refuses is no server, in `dns.servers` and in a set, and neither is an IPv6 address that carries one.
+	for (path, list) in [("dns.servers[0]", "/dns/servers"), ("dns.sets[1].servers[0]", "/dns/sets/1/servers")] {
+		for refused in ["[64:ff9b::7f00:1]:53", "[2002:a07:9::]:53", "[64:ff9b::a07:9]:53", "[::127.0.0.1]:53", "[2001:0:a9fe:101::1]:53", "255.255.255.255:53", "0.1.2.3:53"] {
+			let report = check(&with(|d| {
+				sets(d);
+				*d.pointer_mut(list).unwrap() = json!([refused]);
+			}));
+			assert!(report.errors.len() == 1 && report.errors[0].path == path, "{refused} at {path}: {report:#?}");
+		}
+	}
+	all_clean! {
+		|d| {sets(d); d["dns"]["sets"][1]["servers"] = json!(["[64:ff9b::101:103]:53", "[2002:101:103::]:53"])};
+	};
+	cases! {error_at:
+		"dns.sets": |d| d["dns"]["sets"] = (0..33).map(|i| json!({"tag": format!("s{i}"), "servers": ["9.9.9.9:53"]})).collect();
+		"dns.sets[1].tag": |d| {sets(d); d["dns"]["sets"][1]["tag"] = json!("adblock")};
+		"dns.sets[0].tag": |d| set(d, "tag", json!("direct"));
+		"dns.sets[0].tag": |d| set(d, "tag", json!("Family"));
+		"dns.sets[0].tag": |d| set(d, "tag", json!(""));
+		"dns.sets[0].servers": |d| set(d, "servers", json!([]));
+		"dns.sets[0].servers": |d| set(d, "servers", json!(["1.1.1.1:53", "1.0.0.1:53", "8.8.8.8:53", "8.8.4.4:53", "9.9.9.9:53"]));
+		"dns.sets[0].servers[1]": |d| set(d, "servers", json!(["9.9.9.9:53", "9.9.9.9:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["127.0.0.1:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["[::1]:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["169.254.1.1:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["[fe80::1]:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["0.0.0.0:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["224.0.0.251:53"]));
+		"dns.sets[0].servers[1]": |d| set(d, "servers", json!(["9.9.9.9:53", "10.8.0.9:53"]));
+		"dns.sets[0].servers[0]": |d| set(d, "servers", json!(["[fd7a:115c:a1e0::53]:53"]));
+		"dns.sets[0].inbounds[0]": |d| set(d, "inbounds", json!(["nowhere"]));
+		"dns.sets[0].groups[0]": |d| set(d, "groups", json!(["nobody"]));
+		"dns.sets[0].users[1]": |d| set(d, "users", json!(["bob", "dave"]));
+		"dns.sets[0].users[1]": |d| set(d, "users", json!(["bob", "bob"]));
+		"dns.sets[1].users[0]": |d| {sets(d); d["dns"]["sets"][1]["users"] = json!(["bob"])};
+		"dns.sets[2].groups[1]": |d| {sets(d); d["dns"]["sets"][2]["groups"] = json!(["guest", "staff"])};
+		"dns.sets[2].inbounds[0]": |d| set(d, "inbounds", json!(["office"]));
+		"dns.sets[0].inbounds": |d| set(d, "inbounds", (0..65).map(|i| format!("in{i}")).collect());
+		"dns.sets[0].groups": |d| set(d, "groups", (0..257).map(|i| format!("g{i}")).collect());
+		"users[0].groups": |d| {sets(d); d["dns"]["sets"][2]["groups"] = json!(["guest"]); d["users"][0]["groups"] = json!(["guest", "staff"])};
+	};
+	// The user whose groups lead to two sets is named with both of them, and a set that names the user settles it.
+	let torn = |d: &mut Value| {
+		sets(d);
+		d["dns"]["sets"][2]["groups"] = json!(["guest"]);
+		d["users"][0]["groups"] = json!(["staff", "guest"]);
+	};
+	let report = check(&with(torn));
+	assert_eq!(report.errors.len(), 1, "{report:#?}");
+	assert!(report.errors[0].path == "users[0].groups" && report.errors[0].message.contains("dns.sets[1].groups[0]") && report.errors[0].message.contains("dns.sets[2].groups[0]"), "{report:#?}");
+	assert!(check(&with(|d| {torn(d); d["dns"]["sets"][0]["users"] = json!(["bob", "alice"])})).errors.is_empty());
+	all_clean! {
+		|d| {sets(d); d["dns"]["sets"][1]["groups"] = json!(["staff", "guest"]); d["users"][0]["groups"] = json!(["staff", "guest"])};
+	};
+	// A name that is named twice says where it was named first.
+	let twice = check(&with(|d| {sets(d); d["dns"]["sets"][2]["users"] = json!(["bob"])}));
+	assert!(twice.errors.len() == 1 && twice.errors[0].message.contains("dns.sets[0].users[0]"), "{twice:#?}");
+	warning_at("dns.sets[0]", |d| {sets(d); remove(d, "/dns/sets/0", "users")});
+	cases! {refused:
+		"dns.sets[0]": |d| {sets(d); remove(d, "/dns/sets/0", "tag")};
+		"dns.sets[0]": |d| {sets(d); remove(d, "/dns/sets/0", "servers")};
+		"dns.sets[1]": |d| {sets(d); d["dns"]["sets"][1]["future_key"] = json!(1)};
+		"dns.sets[2].servers[0]": |d| {sets(d); d["dns"]["sets"][2]["servers"] = json!(["9.9.9.9"])};
+		"dns.sets[2].inbounds": |d| {sets(d); d["dns"]["sets"][2]["inbounds"] = json!("office")};
+		"dns.sets": |d| d["dns"]["sets"] = json!({});
+	};
+	// The servers of a set are the node's resolver like `dns.servers`: a rule that refuses one of them is warned about by its path.
+	let report = check(&with(|d| {sets(d); d["dns"]["sets"][1]["servers"] = json!(["1.1.1.3:53", "192.168.1.1:53"])}));
+	assert_eq!(report.warnings.iter().map(|w| (w.path.as_str(), w.message.contains("dns.sets[1].servers[1]"))).collect::<Vec<_>>(), [("routing.rules[1]", true)], "{report:#?}");
+	// A document with sets comes back from its own text as it was, and one without them is written without the key.
+	let (with_sets, without) = (parse(&with(sets)).unwrap(), parse(&good()).unwrap());
+	assert_eq!(parse(&serde_json::to_value(&with_sets).unwrap()).unwrap(), with_sets);
+	assert!(without.dns.sets.is_empty() && serde_json::to_value(&without).unwrap()["dns"].get("sets").is_none());
+}
+
 #[test]
 fn inbound_pools_and_mtu() {
 	cases! {error_at:

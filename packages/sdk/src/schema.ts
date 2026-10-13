@@ -503,6 +503,8 @@ export interface components {
             /** @description Why the user cannot connect right now. Null for a user who can. */
             denied: components["schemas"]["Denied"] | null;
             devices: components["schemas"]["Device"][];
+            /** @description The tag of the DNS set that names the user, or else one of their groups. Null when no set does: the user's queries then go to the set that names the inbound they come through, or to `dns.servers`. */
+            dns_set: string | null;
             enabled: boolean;
             expires_at: string | null;
             name: string;

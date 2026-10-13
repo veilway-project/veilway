@@ -504,6 +504,30 @@ async fn a_dns_server_that_is_gone_fails_what_asks_it_within_the_timeout() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// The servers of every DNS set are asked like those of `dns.servers`, each on a line that names its set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_servers_of_every_dns_set_have_their_own_lines() {
+	let dir = scratch("sets");
+	let (both, udp_only, quiet) = (dns(true).await, dns(false).await, TcpListener::bind(SocketAddr::new(host(), 0)).await.unwrap());
+	let (silent, hush) = (quiet.local_addr().unwrap(), UdpSocket::bind(quiet.local_addr().unwrap()).await.unwrap());
+	config(&dir, &[both], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let mut document: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+	document["dns"]["sets"] = json!([{"tag": "family", "servers": [udp_only.to_string(), both.to_string()], "users": ["a"]}, {"tag": "lab", "servers": [silent.to_string()], "inbounds": ["home"]}]);
+	private(&dir, "config.json", &document.to_string());
+	let (code, document, errors) = doctor(&dir, &["--json"]).await;
+	let document: Value = serde_json::from_str(&document).unwrap_or_else(|e| panic!("{e}: {document} {errors}"));
+	for (subject, expected) in [("servers[0], udp", "ok"), ("servers[0], tcp", "ok"), ("set family, servers[0], udp", "ok"), ("set family, servers[0], tcp", "warn"), ("set family, servers[1], udp", "ok"), ("set family, servers[1], tcp", "ok"), ("set lab, servers[0], udp", "fail"), ("set lab, servers[0], tcp", "warn")] {
+		assert_eq!(status(&document, "dns", subject), expected, "{subject}\n{document:#}");
+	}
+	// They stand in the order of the config, before the outbounds, and after them doctor says that it tried no outbound towards the servers of a set.
+	let checks: Vec<&str> = document["checks"].as_array().unwrap().iter().filter(|line| line["check"] == "dns" || line["check"] == "outbound").map(|line| line["subject"].as_str().unwrap()).collect();
+	assert_eq!(checks[..10], ["servers[0], udp", "servers[0], tcp", "set family, servers[0], udp", "set family, servers[0], tcp", "set family, servers[1], udp", "set family, servers[1], tcp", "set lab, servers[0], udp", "set lab, servers[0], tcp", "sets, through the outbounds", "plain, tcp"], "{document:#}");
+	assert_eq!(status(&document, "dns", "sets, through the outbounds"), "skipped");
+	assert_eq!(code, 1);
+	drop((quiet, hush));
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn a_config_that_cannot_be_read_ends_with_status_two_and_one_that_is_wrong_with_one() {
 	let dir = scratch("unreadable");
