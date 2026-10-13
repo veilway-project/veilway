@@ -53,6 +53,10 @@ impl fmt::Debug for Revision {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {write!(f, "Revision({self})")}
 }
 
+/// What stands in the place of one transport secret in a document the control API shows: the marker with eight hex digits that name the secret, for this process alone. They are the start of its HMAC-SHA-256 under `KEY`, behind a label no config begins with,
+/// so they tell two secrets of a device apart and tell nobody anything about either. A marker that comes back stands for the secret of the same device that has these digits, wherever it stands in the list, see `Config::parse_keeping`.
+pub(crate) fn marker(secret: &[u8; 32]) -> String {format!("<redacted:{}>", hmac::sign(&KEY, &[&b"veilway transport secret marker\0"[..], secret].concat()).as_ref().iter().take(4).map(|byte| format!("{byte:02x}")).collect::<String>())}
+
 /// One config as it runs. Cloning it is cheap.
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -103,6 +107,8 @@ pub struct UserChange {
 	pub devices_readdressed: Vec<Key>,
 	/// Kept devices whose preshared key was set, changed or removed.
 	pub devices_rekeyed: Vec<Key>,
+	/// Kept devices whose transport secrets are not the ones they were, in whatever order. A control connection that proved itself with a secret that is gone is ended.
+	pub devices_secrets_changed: Vec<Key>,
 	/// The user could connect and no longer can: disabled, or `expires_at` is not after the given time.
 	pub lost_access: bool,
 }
@@ -121,6 +127,7 @@ pub struct Diff {
 	pub routing_default: bool,
 	/// The rules present in both configs are in a different order, which can change what they decide.
 	pub rules_reordered: bool,
+	pub notices: bool,
 	/// One entry per tag in `inbounds.changed`.
 	pub inbound_changes: Vec<InboundChange>,
 	/// One entry per name in `users.changed`.
@@ -150,7 +157,8 @@ impl Diff {
 				transports_stopped: (0..was.transports.len()).filter(|i| !is.transports.contains(&was.transports[*i])).collect(),
 				transports_started: (0..is.transports.len()).filter(|i| !was.transports.contains(&is.transports[*i])).collect(),
 			};
-			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty()).then_some(change)
+			// A changed `type` restarts nothing: the tunnel is the same, and what its gateway answers goes by the config in force.
+			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind).then_some(change)
 		}).collect();
 		inbounds.changed.retain(|tag| inbound_changes.iter().any(|change| change.tag == *tag));
 		// Objects that differ as written are compared again with their defaults filled in.
@@ -166,6 +174,10 @@ impl Diff {
 				devices_removed: was.devices.iter().filter(|device| !is.devices.iter().any(|i| i.public_key == device.public_key)).map(|device| device.public_key).collect(),
 				devices_readdressed: kept().filter(|(w, device)| w.addresses.len() != device.addresses.len() || w.addresses.iter().any(|a| !device.addresses.contains(a))).map(|(_, device)| device.public_key).collect(),
 				devices_rekeyed: kept().filter(|(w, device)| w.preshared_key != device.preshared_key).map(|(_, device)| device.public_key).collect(),
+				devices_secrets_changed: kept().filter(|(w, device)| {
+					let (was, is) = (w.transport_secrets.as_deref().unwrap_or(&[]), device.transport_secrets.as_deref().unwrap_or(&[]));
+					was.len() != is.len() || was.iter().any(|secret| !is.contains(secret))
+				}).map(|(_, device)| device.public_key).collect(),
 				lost_access: able(was) && !able(is),
 			})
 		}).collect();
@@ -202,6 +214,7 @@ impl Diff {
 			// `level` and `destinations` are read with their defaults, so `Log` already holds effective values.
 			log: old.log != new.log,
 			routing_default: old.routing.default != new.routing.default,
+			notices: old.notices != new.notices,
 			rules_reordered: !old.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| new_rules.contains(tag)).eq(new.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| old_rules.contains(tag))),
 			inbound_changes,
 			user_changes,

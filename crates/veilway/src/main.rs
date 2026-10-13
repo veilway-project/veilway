@@ -66,6 +66,8 @@ enum Command {
 	Schema,
 	/// Print a fresh private key and its public key
 	Genkey,
+	/// Print a fresh transport secret for a device of a veilway inbound
+	Gensecret,
 	/// WireGuard over WebSocket bridge
 	Bridge {#[command(subcommand)] command: Bridge},
 }
@@ -135,6 +137,10 @@ async fn main() -> anyhow::Result<()> {
 			let private = veilway_wg::generate_key();
 			println!("private_key: {}", veilway_wg::encode_key(&private));
 			println!("public_key:  {}", veilway_wg::encode_key(&veilway_wg::public_key(&private)));
+			Ok(())
+		}
+		Command::Gensecret => {
+			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
 		Command::Run {config, allow_readable_config, state, #[cfg(unix)] api, #[cfg(unix)] no_api} => {

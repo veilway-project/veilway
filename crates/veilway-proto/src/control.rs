@@ -19,11 +19,11 @@ pub const NODE_LIMIT: usize = 65_535;
 pub const TAG_MAX: usize = 64;
 /// The words the config's tag rule reserves. None of them is a tag on the wire.
 pub const RESERVED_TAGS: [&str; 8] = ["all", "any", "block", "reject", "drop", "local", "direct", "user"];
-/// The longest display name a node writes for an exit, in bytes.
+/// The longest display name this crate writes for an exit, in bytes. The wire has no limit of its own for display text ("Framing"): this is what a node holds itself to, and 64 characters never take more.
 pub const NAME_MAX: usize = 256;
 /// A client shows at most this many characters of an exit's name.
 pub const NAME_SHOWN: usize = 64;
-/// The longest notice, in bytes, as a node writes it and as a client shows it.
+/// A client shows a notice cut to this many bytes, on a character boundary. This crate writes none that is longer, though the wire would carry it.
 pub const NOTICE_MAX: usize = 280;
 pub const EXITS_PER_MESSAGE: usize = 64;
 pub const EXITS_MAX: usize = 256;
@@ -377,7 +377,7 @@ fn tag(out: &mut Vec<u8>, tag: &str, none: bool) -> Result<(), EncodeError> {
 	Ok(())
 }
 
-// A node writes display text only inside the limit of its field, though a client would cut a longer one.
+// Any length that fits the message is a valid body, and a reader takes it. A node still writes no text longer than a client shows.
 fn text(out: &mut Vec<u8>, text: &Untrusted, limit: usize) -> Result<(), EncodeError> {
 	if text.0.len() > limit {return Err(EncodeError::Value)}
 	out.extend_from_slice(&(text.0.len() as u16).to_be_bytes());
@@ -964,6 +964,12 @@ mod tests {
 		let notice = Notice {severity: Severity::Warning, text: "line one\nline two\t\u{202e}tluser\u{202c} \u{1f600} \u{645}\u{631}\u{62d}\u{628}\u{627}".into()};
 		assert_eq!(notice.shown_text(), "line oneline twotluser \u{1f600} \u{645}\u{631}\u{62d}\u{628}\u{627}");
 		assert_eq!(display("\u{e9}\u{e9}\u{e9}", 5, 5), "\u{e9}\u{e9}");
+		// The cut falls on a character boundary: a character that would cross the 280th byte is left out whole.
+		let crossing = Notice {severity: Severity::Information, text: format!("{}\u{e9}tail", "a".repeat(279)).into()};
+		assert_eq!(crossing.shown_text(), "a".repeat(279));
+		assert_eq!(Exit {name: format!("{}\u{1f600}", "\u{645}".repeat(64)).into(), ..exit("de")}.shown_name(), "\u{645}".repeat(64));
+		// Bytes that are not UTF-8 are a malformed body, in a name as in a notice or a tag.
+		assert_eq!(NodeMessage::decode(&framed("91 01 01 02 6465 0002 c328 4445 0b 02")), Err(DecodeError::Text));
 		assert_eq!(display("abc", 0, 9), "");
 		assert!(display(&('\0'..='\u{ffff}').collect::<String>(), usize::MAX, usize::MAX).chars().all(|c| !c.is_control() && !('\u{200b}'..='\u{200f}').contains(&c) && !('\u{2028}'..='\u{202e}').contains(&c) && !('\u{2060}'..='\u{206f}').contains(&c) && c != '\u{feff}'));
 	}

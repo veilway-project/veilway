@@ -135,6 +135,77 @@ pub fn echo_reply(raw: &[u8], packet: &Packet) -> Option<Vec<u8>> {
 	Some(out)
 }
 
+/// What becomes of a packet somebody else sent when it meets a link of a given MTU.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fit {
+	Whole,
+	/// IPv4 that allows it, cut into fragments that fit.
+	Pieces(Vec<Vec<u8>>),
+	/// IPv4 that prohibits fragmentation, and every IPv6 packet: it is dropped and its sender is told ("fragmentation needed", "packet too big").
+	TooBig,
+}
+
+/// What a router does with `raw`, a whole packet, on its way over a link of `mtu` (control channel page, "What the node does with a device's MTU").
+pub fn forward(raw: &[u8], mtu: u16) -> Fit {
+	if raw.len() <= usize::from(mtu) {return Fit::Whole}
+	// Bit 6 of the flags byte is "do not fragment".
+	let pieces = if raw[0] >> 4 == 4 && raw.get(6).is_some_and(|flags| flags & 0x40 == 0) {fragments(raw, mtu, None)} else {Vec::new()};
+	if pieces.is_empty() {Fit::TooBig} else {Fit::Pieces(pieces)}
+}
+
+/// `raw`, a whole packet larger than `mtu`, cut into fragments of at most `mtu` bytes. With `id` the node is the host that sends the packet: the fragments carry that identification, and an IPv6 packet gets fragment headers, which only its source may add.
+/// Without it the node forwards an IPv4 packet, whose identification stays as its sender wrote it. The first IPv4 fragment keeps every option, and the others those that say they go into every fragment (RFC 791, 3.1).
+/// Empty for what is not cut: a packet that fits, a packet that is a fragment already, an IPv6 packet that is forwarded or that starts with a header that belongs before a fragment header or may, and an `mtu` that leaves no room.
+pub fn fragments(raw: &[u8], mtu: u16, id: Option<u32>) -> Vec<Vec<u8>> {
+	let (mtu, mut out) = (usize::from(mtu), Vec::new());
+	if raw.len() <= mtu {return out}
+	match raw[0] >> 4 {
+		4 => {
+			let header = usize::from(raw[0] & 0x0f) * 4;
+			let room = mtu.saturating_sub(header) / 8 * 8;
+			if header < 20 || raw.len() <= header || raw.len() > 65535 || room == 0 || u16::from_be_bytes([raw[6], raw[7]]) & 0x3fff != 0 {return out}
+			// The header of every fragment but the first: an option is kept when the top bit of its type says "copied", and the rest is padded to whole words.
+			let (mut later, mut at) = (raw[..20].to_vec(), 20);
+			while at < header && raw[at] != 0 {
+				let size = if raw[at] == 1 {1} else {usize::from(raw.get(at + 1).copied().unwrap_or(0))};
+				if size == 0 || (raw[at] != 1 && size < 2) || at + size > header {break}
+				if raw[at] & 0x80 != 0 {later.extend_from_slice(&raw[at..at + size])}
+				at += size;
+			}
+			later.resize(later.len().div_ceil(4) * 4, 0);
+			later[0] = 0x40 | (later.len() / 4) as u8;
+			let count = (raw.len() - header).div_ceil(room);
+			for (at, part) in raw[header..].chunks(room).enumerate() {
+				let head = if at == 0 {&raw[..header]} else {&later[..]};
+				let mut piece = [head, part].concat();
+				piece[2..4].copy_from_slice(&((head.len() + part.len()) as u16).to_be_bytes());
+				if let Some(id) = id {piece[4..6].copy_from_slice(&(id as u16).to_be_bytes())}
+				// The offset counts in units of 8 bytes, and bit 13 says more fragments follow.
+				piece[6..8].copy_from_slice(&(((at * room / 8) as u16) | if at + 1 < count {0x2000} else {0}).to_be_bytes());
+				piece[10..12].copy_from_slice(&[0, 0]);
+				let mut sum = piece[..head.len()].chunks(2).map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]]))).sum::<u32>();
+				while sum >> 16 != 0 {sum = (sum & 0xffff) + (sum >> 16)}
+				piece[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+				out.push(piece);
+			}
+		}
+		6 => {
+			let (Some(id), room) = (id, mtu.saturating_sub(48) / 8 * 8) else {return out};
+			// Hop-by-hop options and a routing header belong before the fragment header, and destination options may stand before a routing header. The node writes none of the three, so a packet that starts with one is left alone.
+			if raw.len() <= 40 || room == 0 || matches!(raw[6], 0 | 43 | 44 | 60) {return out}
+			let count = (raw.len() - 40).div_ceil(room);
+			for (at, part) in raw[40..].chunks(room).enumerate() {
+				let mut piece = [&raw[..40], &[raw[6], 0][..], &(((at * room) as u16) | u16::from(at + 1 < count)).to_be_bytes(), &id.to_be_bytes(), part].concat();
+				piece[4..6].copy_from_slice(&((8 + part.len()) as u16).to_be_bytes());
+				piece[6] = 44;
+				out.push(piece);
+			}
+		}
+		_ => {}
+	}
+	out
+}
+
 /// Packet-boundary preserving device for ipstack: one read yields exactly one IP packet and one write consumes exactly one. `tokio::io::duplex` cannot do this, it coalesces writes into a stream.
 pub struct PacketDev {rx: Receiver<Vec<u8>>, tx: Sender<Vec<u8>>}
 
@@ -263,6 +334,83 @@ mod tests {
 		assert_eq!(quoted(&six[..42]).unwrap().icmp, Some((ECHO_REQUEST_V6, 0)));
 		assert!(quoted(&six[..41]).is_none() && quoted(&six[..39]).is_none());
 		assert!(quoted(&[0x70; 60]).is_none() && quoted(&[]).is_none());
+	}
+
+	// What a receiver makes of fragments: the payload put together by offset, with the header of the first.
+	fn reassembled(pieces: &[Vec<u8>]) -> Vec<u8> {
+		let v6 = pieces[0][0] >> 4 == 6;
+		let (header, mut parts): (usize, Vec<(usize, &[u8])>) = if v6 {(40, pieces.iter().map(|piece| (usize::from(u16::from_be_bytes([piece[42], piece[43]]) & 0xfff8), &piece[48..])).collect())} else {(20, pieces.iter().map(|piece| (usize::from(u16::from_be_bytes([piece[6], piece[7]]) & 0x1fff) * 8, &piece[20..])).collect())};
+		parts.sort();
+		assert!(parts.iter().scan(0, |end, (offset, part)| Some(std::mem::replace(end, offset + part.len()) == *offset)).all(|joined| joined), "the fragments leave a gap or overlap");
+		[&pieces[0][..header], &parts.iter().flat_map(|(_, part)| part.iter().copied()).collect::<Vec<u8>>()].concat()
+	}
+
+	#[test]
+	fn a_packet_the_node_sends_is_fragmented_to_fit_and_reads_back_whole() {
+		for (size, mtu) in [(1385, 1280), (1400, 1300), (4000, 1280), (1281, 1280), (65000, 1500)] {
+			let (mut four, mut six, payload) = (Vec::new(), Vec::new(), (0..size).map(|at| at as u8).collect::<Vec<u8>>());
+			PacketBuilder::ipv4([93, 184, 216, 34], [10, 7, 0, 2], 64).udp(9000, 40000).write(&mut four, &payload).unwrap();
+			PacketBuilder::ipv6([0x20; 16], [0xfd; 16], 64).udp(9000, 40000).write(&mut six, &payload).unwrap();
+			let pieces = fragments(&four, mtu, Some(0x1234_5678));
+			assert!(pieces.len() == (four.len() - 20).div_ceil(usize::from((mtu - 20) / 8 * 8)) && pieces.iter().all(|piece| piece.len() <= usize::from(mtu)), "{size} over {mtu}");
+			for (at, piece) in pieces.iter().enumerate() {
+				// Every fragment is a packet of its own length under the same identification, with a header that sums to zero, and all but the last say that more follow.
+				let sum = piece[..20].chunks(2).map(|pair| u32::from(u16::from_be_bytes([pair[0], pair[1]]))).sum::<u32>();
+				assert_eq!((usize::from(u16::from_be_bytes([piece[2], piece[3]])), &piece[4..6], piece[6] & 0x20 != 0, piece[6] & 0x40, (sum & 0xffff) + (sum >> 16)), (piece.len(), &[0x56, 0x78][..], at + 1 < pieces.len(), 0, 0xffff));
+				assert!(parse(piece).is_some_and(|parsed| parsed.fragment));
+			}
+			let mut whole = reassembled(&pieces);
+			// But for what fragmenting writes into the header, it is the packet that was cut.
+			for at in [4, 5, 6, 7, 10, 11] {(whole[at], four[at]) = (0, 0)}
+			whole[2..4].copy_from_slice(&(four.len() as u16).to_be_bytes());
+			assert_eq!(whole, four);
+			let pieces = fragments(&six, mtu, Some(0x1234_5678));
+			assert!(pieces.len() == (six.len() - 40).div_ceil(usize::from((mtu - 48) / 8 * 8)) && pieces.iter().all(|piece| piece.len() <= usize::from(mtu)));
+			for (at, piece) in pieces.iter().enumerate() {
+				assert_eq!((usize::from(u16::from_be_bytes([piece[4], piece[5]])) + 40, piece[6], piece[40], piece[43] & 1 != 0, &piece[44..48]), (piece.len(), 44, 17, at + 1 < pieces.len(), &[0x12, 0x34, 0x56, 0x78][..]));
+				assert!(parse(piece).is_some_and(|parsed| parsed.fragment));
+			}
+			let mut whole = reassembled(&pieces);
+			whole[4..6].copy_from_slice(&((six.len() - 40) as u16).to_be_bytes());
+			whole[6] = 17;
+			assert_eq!(whole, six);
+		}
+	}
+
+	#[test]
+	fn a_packet_the_node_forwards_is_fragmented_only_where_its_sender_allowed_it() {
+		let (mut four, mut six) = (Vec::new(), Vec::new());
+		PacketBuilder::ipv4([93, 184, 216, 34], [10, 7, 0, 2], 64).udp(9000, 40000).write(&mut four, &[7; 1400]).unwrap();
+		PacketBuilder::ipv6([0x20; 16], [0xfd; 16], 64).udp(9000, 40000).write(&mut six, &[7; 1400]).unwrap();
+		four[4..6].copy_from_slice(&[0xab, 0xcd]);
+		assert_eq!((forward(&four, 1428), forward(&six, 1448)), (Fit::Whole, Fit::Whole));
+		// IPv4 that prohibits fragmentation, and every IPv6 packet: the sender hears of it.
+		four[6] |= 0x40;
+		assert_eq!((forward(&four, 1280), forward(&six, 1280)), (Fit::TooBig, Fit::TooBig));
+		// IPv4 that allows it keeps the identification its sender gave it.
+		four[6] &= !0x40;
+		let Fit::Pieces(pieces) = forward(&four, 1280) else {panic!("not fragmented")};
+		assert!(pieces.len() == 2 && pieces.iter().all(|piece| piece.len() <= 1280 && piece[4..6] == [0xab, 0xcd]) && reassembled(&pieces)[20..] == four[20..]);
+		// A fragment is never cut again by the node, an IPv6 packet is never cut by anyone but its sender, and neither is one that starts with a header every hop reads.
+		four[6] |= 0x20;
+		assert_eq!(forward(&four, 1280), Fit::TooBig);
+		assert!(fragments(&six, 1280, None).is_empty() && fragments(&six, 40, Some(1)).is_empty() && fragments(&four[..20], 1280, Some(1)).is_empty() && fragments(&[], 1280, Some(1)).is_empty());
+		for first in [0, 43, 44, 60] {
+			six[6] = first;
+			assert!(fragments(&six, 1280, Some(1)).is_empty(), "an ipv6 packet that starts with header {first} was cut");
+		}
+		// A packet that fits is not cut, whoever asks: one piece that is no fragment would be a packet with another identification and nothing else.
+		four[6] = 0;
+		assert!(fragments(&four, 1428, Some(1)).is_empty() && fragments(&four, 1500, None).is_empty());
+		// Options: the first fragment keeps all of them, the others only those marked as copied. Here a record route (7, not copied), a no-operation and a strict source route (137, copied).
+		let mut with = vec![0x49, 0, 0, 0, 0xab, 0xcd, 0, 0, 64, 17, 0, 0, 93, 184, 216, 34, 10, 7, 0, 2, 7, 7, 4, 0, 0, 0, 0, 1, 137, 7, 4, 1, 2, 3, 4, 0];
+		with.extend((0..2000).map(|at| at as u8));
+		let total = with.len() as u16;
+		with[2..4].copy_from_slice(&total.to_be_bytes());
+		let pieces = fragments(&with, 1280, None);
+		assert_eq!(pieces.iter().map(|piece| (piece[0], piece.len())).collect::<Vec<_>>(), [(0x49, 1276), (0x47, 28 + 2000 - 1240)]);
+		assert_eq!((&pieces[1][20..28], [&pieces[0][36..], &pieces[1][28..]].concat() == with[36..]), (&[137, 7, 4, 1, 2, 3, 4, 0][..], true));
+		assert!(pieces.iter().all(|piece| parse(piece).is_some_and(|parsed| parsed.fragment && parsed.len == piece.len())));
 	}
 
 	#[test]

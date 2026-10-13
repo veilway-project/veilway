@@ -5,7 +5,7 @@ use super::plan::{Action, IpMatch, Pattern, Plan};
 use crate::config::Protocol;
 use etherparse::{PacketBuilder, TcpHeader};
 use ipnet::IpNet;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::pin::pin;
 use std::sync::{Arc, Mutex};
@@ -103,6 +103,8 @@ pub enum Decision {
 	Exit {exit: usize, by: By},
 	/// Tunnel DNS: the node's own resolver answers it, and each query on the flow is routed by itself.
 	Dns,
+	/// The control channel of a `veilway` inbound: a TCP connection to the gateway the flow came in through, which the node ends itself, see `control`.
+	Control,
 	/// Handed to the device that holds the destination address.
 	Deliver,
 	Refuse {reason: Reason, reset: bool},
@@ -144,22 +146,29 @@ pub fn heard(raw: &[u8], upper: usize) -> Heard {
 }
 
 /// The reset that ends a TCP flow from the far side, as the device would get it from the host it was talking to.
-pub fn tcp_reset(key: &Key, (seq, ack): (u32, u32)) -> Option<Vec<u8>> {
-	let mut header = TcpHeader::new(key.dport, key.sport, seq, 0);
-	(header.rst, header.ack, header.acknowledgment_number) = (true, true, ack);
+pub fn tcp_reset(key: &Key, heard: (u32, u32)) -> Option<Vec<u8>> {tcp_end(key, heard, None)}
+
+/// The last segment of a TCP flow the node ends itself, written without its stack: `last` and a FIN. `next` is where the stack stands, the sequence number of the next byte it would send and the one it expects from the device,
+/// so the segment follows whatever the stack has sent, acknowledged or not. Nobody sends it again: when it or anything before it is lost, the device never reads it.
+pub fn tcp_last(key: &Key, next: (u32, u32), last: &[u8]) -> Option<Vec<u8>> {tcp_end(key, next, Some(last))}
+
+fn tcp_end(key: &Key, (seq, ack): (u32, u32), last: Option<&[u8]>) -> Option<Vec<u8>> {
+	let (mut header, data, last) = (TcpHeader::new(key.dport, key.sport, seq, if last.is_some() {65535} else {0}), last.is_some(), last.unwrap_or(&[]));
+	(header.rst, header.fin, header.psh, header.ack, header.acknowledgment_number) = (!data, data, data, true, ack);
 	let builder = match (key.dst, key.src) {
 		(IpAddr::V4(from), IpAddr::V4(to)) => PacketBuilder::ipv4(from.octets(), to.octets(), 64),
 		(IpAddr::V6(from), IpAddr::V6(to)) => PacketBuilder::ipv6(from.octets(), to.octets(), 64),
 		_ => return None,
 	}.tcp_header(header);
-	let mut out = Vec::with_capacity(builder.size(0));
-	builder.write(&mut out, &[]).ok()?;
+	let mut out = Vec::with_capacity(builder.size(last.len()));
+	builder.write(&mut out, last).ok()?;
 	Some(out)
 }
 
 /// `owner` is the device and the user a carried flow counts against. A refusal has none: it counts against nobody.
 /// `closing` is set once a TCP flow that no handler watches has shown a FIN or RST. `names` is what the user had resolved to the destination when the flow began, which is what `domain` rules saw.
-struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool, names: Vec<Arc<str>>, heard: Heard}
+/// `gone` wakes whoever waits in `Flows::quiet` for this entry when it leaves the table, and nobody else: what ends one device's flows costs no other device's handler a look at the table. A refusal has no handler and no `gone`.
+struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool, names: Vec<Arc<str>>, heard: Heard, gone: Option<Arc<Notify>>}
 
 /// A flow that a change of the config ended, for whoever tells its device.
 pub struct Ended {pub key: Key, pub device: [u8; 32], pub heard: Heard}
@@ -167,7 +176,8 @@ pub struct Ended {pub key: Key, pub device: [u8; 32], pub heard: Heard}
 #[derive(Default)]
 struct Table {
 	flows: HashMap<Key, Entry>,
-	per_device: HashMap<[u8; 32], usize>,
+	/// The carried flows of each device, so that what concerns one device never goes through the table.
+	per_device: HashMap<[u8; 32], HashSet<Key>>,
 	per_user: HashMap<Arc<str>, usize>,
 	/// Entries that are not refusals.
 	carried: usize,
@@ -180,11 +190,12 @@ struct Table {
 
 impl Table {
 	fn remove(&mut self, key: &Key) {
-		let Some(Entry {owner: Some((device, user)), ..}) = self.flows.remove(key) else {return};
+		let Some(Entry {owner: Some((device, user)), gone, ..}) = self.flows.remove(key) else {return};
+		if let Some(gone) = gone {gone.notify_waiters()}
 		self.carried -= 1;
-		if let Some(count) = self.per_device.get_mut(&device) {
-			*count -= 1;
-			if *count == 0 {self.per_device.remove(&device);}
+		if let Some(keys) = self.per_device.get_mut(&device) {
+			keys.remove(key);
+			if keys.is_empty() {self.per_device.remove(&device);}
 		}
 		if let Some(count) = self.per_user.get_mut(&user) {
 			*count -= 1;
@@ -196,7 +207,7 @@ impl Table {
 /// The flow table. A device is counted by its public key and a user by name, which is what identifies them across reloads.
 /// A decision names exits by their index in one plan, so everyone who reads or writes one says which plan they hold (`generation`), and is turned away when the table has moved on to another.
 #[derive(Default)]
-pub struct Flows {table: Mutex<Table>, wake: Notify}
+pub struct Flows {table: Mutex<Table>}
 
 impl Flows {
 	fn lock(&self) -> std::sync::MutexGuard<'_, Table> {self.table.lock().unwrap_or_else(|e| e.into_inner())}
@@ -249,14 +260,15 @@ impl Flows {
 			table.refusals.push_back((key, id));
 			(None, CLOSED_IDLE)
 		} else {
-			if table.carried >= MAX_FLOWS || table.per_user.get(user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).is_some_and(|count| *count >= MAX_FLOWS_PER_DEVICE) {return Err(Reason::FlowTableFull)}
+			if table.carried >= MAX_FLOWS || table.per_user.get(user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).is_some_and(|keys| keys.len() >= MAX_FLOWS_PER_DEVICE) {return Err(Reason::FlowTableFull)}
 			let user = table.per_user.get_key_value(user).map_or_else(|| Arc::from(user), |(name, _)| name.clone());
-			*table.per_device.entry(device).or_default() += 1;
+			table.per_device.entry(device).or_default().insert(key);
 			*table.per_user.entry(user.clone()).or_default() += 1;
 			table.carried += 1;
 			(Some((device, user)), FLOW_IDLE)
 		};
-		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false, names, heard});
+		let gone = owner.is_some().then(|| Arc::new(Notify::new()));
+		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false, names, heard, gone});
 		Ok(id)
 	}
 
@@ -311,11 +323,8 @@ impl Flows {
 		}
 		table.refusals.clear();
 		table.generation = generation;
-		let done = then(ended);
-		drop(table);
-		// Every handler looks at its flow again, and those whose flow is gone end.
-		self.wake.notify_waiters();
-		done
+		// The handler of every flow that ended was woken as its entry left the table, and ends.
+		then(ended)
 	}
 
 	/// For a flow no handler watches, one through an l3 exit: how long its packets say to keep it. Once it is `closing` it stays short-lived whatever follows.
@@ -339,10 +348,11 @@ impl Flows {
 	/// Returns once the flow has seen no packet in either direction for `idle`, or its entry is gone, which it is within a moment of a reload that ends the flow.
 	pub async fn quiet(&self, key: Key, id: u64, idle: Duration) {
 		loop {
-			// Listening before looking, so a reload between the look and the wait is not missed.
-			let mut woken = pin!(self.wake.notified());
+			let Some((seen, gone)) = self.lock().flows.get(&key).filter(|entry| entry.id == id).and_then(|entry| Some((entry.seen, entry.gone.clone()?))) else {return};
+			// Listening before looking again, so an entry that leaves between the look above and the wait is not missed.
+			let mut woken = pin!(gone.notified());
 			woken.as_mut().enable();
-			let Some(seen) = self.lock().flows.get(&key).filter(|entry| entry.id == id).map(|entry| entry.seen) else {return};
+			if !self.holds(&key, id) {return}
 			let Some(left) = idle.checked_sub(seen.elapsed()).filter(|left| !left.is_zero()) else {return};
 			tokio::select! {
 				_ = tokio::time::sleep(left) => {}
@@ -362,10 +372,30 @@ impl Flows {
 	pub fn len(&self) -> usize {self.lock().flows.len()}
 
 	/// The carried flows each device has right now, by its public key. A device without one is not in it.
-	pub fn per_device(&self) -> HashMap<[u8; 32], usize> {self.lock().per_device.clone()}
+	pub fn per_device(&self) -> HashMap<[u8; 32], usize> {self.lock().per_device.iter().map(|(device, keys)| (*device, keys.len())).collect()}
 
 	/// The carried flows one device has right now.
-	pub fn of_device(&self, device: &[u8; 32]) -> usize {self.lock().per_device.get(device).copied().unwrap_or(0)}
+	pub fn of_device(&self, device: &[u8; 32]) -> usize {self.lock().per_device.get(device).map_or(0, HashSet::len)}
+
+	/// The carried flows of one device under the plan of `generation`: the key and entry id of each, its decision and the names it began with. At most `MAX_FLOWS_PER_DEVICE`, and no other device's flow is looked at.
+	pub fn of(&self, device: &[u8; 32], generation: u64) -> Vec<(Key, u64, Decision, Vec<Arc<str>>)> {
+		let table = self.lock();
+		if table.generation != generation {return Vec::new()}
+		table.per_device.get(device).into_iter().flatten().filter_map(|key| table.flows.get(key).map(|entry| (*key, entry.id, entry.decision, entry.names.clone()))).collect()
+	}
+
+	/// Ends the entries named by key and id that are still in the table, for whoever tells their device, and wakes their handlers and no other. Their next packets are decided afresh. Nothing ends when the table has moved on to another plan than that of `generation`.
+	pub fn end(&self, flows: &[(Key, u64)], generation: u64) -> Vec<Ended> {
+		let mut table = self.lock();
+		if table.generation != generation {return Vec::new()}
+		let mut ended = Vec::new();
+		for (key, id) in flows {
+			let Some(Entry {owner: Some((device, _)), heard, ..}) = table.flows.get(key).filter(|entry| entry.id == *id) else {continue};
+			ended.push(Ended {key: *key, device: *device, heard: *heard});
+			table.remove(key);
+		}
+		ended
+	}
 
 	pub fn is_empty(&self) -> bool {self.len() == 0}
 }
@@ -539,6 +569,74 @@ mod tests {
 		raw.clear();
 		PacketBuilder::ipv4([10, 7, 0, 2], [1, 1, 1, 1], 64).tcp_header(syn).write(&mut raw, &[]).unwrap();
 		assert_eq!((heard(&raw, 20), heard(&raw[..30], 20)), (Some((0, 1001)), None));
+	}
+
+	#[test]
+	fn one_device_s_flows_are_found_and_ended_without_the_rest_of_the_table() {
+		let flows = Flows::default();
+		let leaves = Decision::Exit {exit: 0, by: By::Backend};
+		let mine: Vec<(Key, u64)> = (1..=3).map(|sport| (key(sport), flows.insert(key(sport), [1; 32], "a", leaves, vec![Arc::from("example.com")], Some((7, 9)), 0).unwrap())).collect();
+		let theirs = flows.insert(key(9), [2; 32], "b", leaves, Vec::new(), None, 0).unwrap();
+		flows.insert(key(8), [1; 32], "a", REFUSED, Vec::new(), None, 0).unwrap();
+		let mut found = flows.of(&[1; 32], 0);
+		found.sort_by_key(|(key, ..)| key.sport);
+		assert_eq!(found.iter().map(|(key, id, decision, names)| ((*key, *id), *decision, names.len())).collect::<Vec<_>>(), mine.iter().map(|flow| (*flow, leaves, 1)).collect::<Vec<_>>(), "a refusal or another device's flow was found");
+		assert!(flows.of(&[1; 32], 1).is_empty() && flows.of(&[3; 32], 0).is_empty());
+		// By key and id: an entry that was replaced since is not ended, nor is another device's, and whoever holds another plan ends nothing.
+		assert!(flows.end(&mine, 1).is_empty());
+		let ended = flows.end(&[mine[0], (mine[1].0, mine[1].1 + 100), (key(9), theirs + 1), (key(50), 1)], 0);
+		assert_eq!(ended.iter().map(|flow| (flow.key, flow.device, flow.heard)).collect::<Vec<_>>(), [(key(1), [1; 32], Some((7, 9)))]);
+		assert_eq!((flows.of_device(&[1; 32]), flows.of_device(&[2; 32]), flows.holds(&key(1), mine[0].1), flows.holds(&key(2), mine[1].1), flows.per_device().len()), (2, 1, false, true, 2));
+	}
+
+	#[test]
+	fn the_last_segment_of_a_flow_the_node_ends_itself_carries_its_bytes_and_a_fin() {
+		let last = tcp_last(&key(40000), (7000, 9000), b"bye").unwrap();
+		assert_eq!((&last[12..16], &last[16..20], &last[20..24], &last[24..32], last[33], &last[40..]), (&[1, 1, 1, 1][..], &[10, 7, 0, 2][..], &[1, 187, 0x9c, 0x40][..], &[0, 0, 0x1b, 0x58, 0, 0, 0x23, 0x28][..], 0x19, &b"bye"[..]));
+		assert_eq!(heard(&last, 20), Some((9000, 7004)));
+		assert_eq!(tcp_reset(&key(40000), (7000, 9000)).unwrap()[33], 0x14);
+	}
+
+	// Invariant 14, for the control channel: a device that changes its exit again and again ends its own flows, and costs the handler of nobody else's flow so much as a look. Each handler here counts how often it was polled.
+	#[tokio::test]
+	async fn ending_one_device_s_flows_wakes_no_other_device_s_handler() {
+		use std::future::Future;
+		let (flows, leaves, polls) = (Arc::new(Flows::default()), Decision::Exit {exit: 0, by: By::Backend}, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+		let mut others = Vec::new();
+		// A table full of other users' flows, each with its handler.
+		for user in 0..(MAX_FLOWS / MAX_FLOWS_PER_DEVICE - 1) as u32 {
+			for sport in 0..MAX_FLOWS_PER_DEVICE as u16 {
+				let (flow, device) = (Key {src: IpAddr::from((0x0a00_0100 + user).to_be_bytes()), ..key(sport)}, [1 + user as u8; 32]);
+				let (id, flows, polls) = (flows.insert(flow, device, &format!("user-{user}"), leaves, Vec::new(), None, 0).unwrap(), flows.clone(), polls.clone());
+				others.push(tokio::spawn(async move {
+					let mut waiting = pin!(flows.quiet(flow, id, Duration::from_secs(86_400)));
+					std::future::poll_fn(|cx| {
+						polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+						waiting.as_mut().poll(cx)
+					}).await
+				}));
+			}
+		}
+		// Every handler has looked at its flow once and waits.
+		while polls.load(std::sync::atomic::Ordering::Relaxed) < others.len() {tokio::time::sleep(Duration::from_millis(20)).await}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		let settled = polls.load(std::sync::atomic::Ordering::Relaxed);
+		assert_eq!(settled, others.len());
+		// The device alternates: each round its flows are found, ended and open again, as after a `set_exit`. Rounds with nothing to end are in it too.
+		for round in 0..50 {
+			let mine: Vec<(Key, u64)> = (0..8).map(|sport| (key(sport), flows.insert(key(sport), [0xee; 32], "switcher", leaves, Vec::new(), None, 0).unwrap())).collect();
+			let handlers: Vec<_> = mine.iter().map(|(flow, id)| tokio::spawn({
+				let (flows, flow, id) = (flows.clone(), *flow, *id);
+				async move {flows.quiet(flow, id, Duration::from_secs(86_400)).await}
+			})).collect();
+			tokio::task::yield_now().await;
+			assert_eq!(flows.of(&[0xee; 32], 0).len(), 8);
+			assert_eq!((flows.end(&mine, 0).len(), flows.end(&mine, 0).len(), flows.end(&[], 0).len()), (8, 0, 0), "round {round}");
+			for handler in handlers {tokio::time::timeout(Duration::from_secs(2), handler).await.expect("the handler of a flow that ended kept waiting").unwrap()}
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		assert_eq!((polls.load(std::sync::atomic::Ordering::Relaxed), others.iter().filter(|handler| handler.is_finished()).count(), flows.len()), (settled, 0, others.len()), "another device's handler was woken or ended");
+		for handler in others {handler.abort()}
 	}
 
 	#[tokio::test]

@@ -33,6 +33,11 @@ pub const MAX_RULE_ENTRIES: usize = 1024;
 pub const MAX_USERS: usize = 65536;
 pub const MAX_DEVICES: usize = 16;
 pub const MAX_DEVICE_ADDRESSES: usize = 16;
+/// A device has two transport secrets only while one is rotated out (protocol overview, "Rotation").
+pub const MAX_TRANSPORT_SECRETS: usize = 2;
+/// The control channel carries at most this many notices, of at most this many bytes each.
+pub const MAX_NOTICES: usize = 4;
+pub const MAX_NOTICE_BYTES: usize = 280;
 pub const MAX_DNS_SERVERS: usize = 4;
 pub const MAX_DNS_SETS: usize = 32;
 pub const MAX_INBOUND_ADDRESSES: usize = 2;
@@ -163,6 +168,13 @@ pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	#[cfg(unix)]
 	File::open(target.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
 	Ok(())
+}
+
+/// A new device transport secret as a config writes it: 32 bytes from the system's secure random source, in base64. One goes into `transport_secrets` of a device and into that device's profile, and nowhere else.
+pub fn transport_secret() -> io::Result<String> {
+	let mut secret = [0u8; 32];
+	SystemRandom::new().fill(&mut secret).map_err(|_| io::Error::other("the system gave no random bytes"))?;
+	Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret))
 }
 
 /// The JSON Schema of config version 1, as committed in `schema/config.v1.json`.

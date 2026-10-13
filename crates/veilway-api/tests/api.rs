@@ -494,7 +494,7 @@ async fn every_route_answers() {
 	let diff = send(&node.socket, "POST", "/v1/config/diff", None, &changed).await;
 	ask("POST", "/v1/config/diff");
 	assert_eq!((diff.status, &diff.json["valid"], &diff.json["diff"]["users"], &diff.json["diff"]["exits"], &diff.json["diff"]["inbounds"]), (200, &json!(true), &json!({"added": ["d"], "changed": ["b"], "removed": []}), &json!({"added": [], "changed": [], "removed": ["sink"]}), &json!({"added": [], "changed": [], "removed": []})), "{}", diff.json);
-	assert_eq!(diff.json["diff"]["user_changes"], json!([{"name": "b", "devices_added": [], "devices_removed": [], "devices_readdressed": [], "devices_rekeyed": [], "lost_access": true}]));
+	assert_eq!(diff.json["diff"]["user_changes"], json!([{"name": "b", "devices_added": [], "devices_removed": [], "devices_readdressed": [], "devices_rekeyed": [], "devices_secrets_changed": [], "lost_access": true}]));
 	let diff = send(&node.socket, "POST", "/v1/config/diff", None, &invalid).await;
 	assert_eq!((diff.status, &diff.json["valid"], &diff.json["diff"]), (200, &json!(false), &Value::Null));
 	assert_eq!(node.engine.snapshot().generation, 1, "a validate or a diff changed the running config");

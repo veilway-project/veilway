@@ -108,6 +108,8 @@ impl Config {
 			if !(1..=MAX_TRANSPORTS).contains(&inbound.transports.len()) {r.error(format!("{at}.transports"), format!("expected 1 to {MAX_TRANSPORTS} transports"))}
 			for (j, transport) in inbound.transports.iter().enumerate().take(MAX_TRANSPORTS) {
 				let at = format!("{at}.transports[{j}]");
+				// Protocol overview, "Config and profile fields this draft assumes": on a `veilway` inbound `ws` is the native format, which is not built, and neither are `udp-obfs`, `tls` and `fronted`. The `ws` that is built is the one of a `wireguard` inbound, and it is never taken for the other.
+				if inbound.kind == InboundType::Veilway && !matches!(transport, Transport::Udp {..}) {r.error(format!("{at}.type"), "expected \"udp\": this build has no other transport for a veilway inbound. The ws of a veilway inbound is the native format, which is not built yet, and not the ws of a wireguard inbound")}
 				if let Transport::Ws {listen, path, tls} = transport {
 					if !path.starts_with('/') || path.len() > MAX_WS_PATH_BYTES || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~/-".contains(&b)) || path.split('/').any(|part| part == "..") {
 						r.error(format!("{at}.path"), format!("expected a path that starts with /, is at most {MAX_WS_PATH_BYTES} bytes from A-Z a-z 0-9 . _ ~ / - and has no .. component"));
@@ -216,7 +218,9 @@ impl Config {
 		spans.sort_unstable();
 		if self.users.len() > MAX_USERS {r.error("users", format!("expected at most {MAX_USERS} users"))}
 		let user_names = index(&mut r, |i| format!("users[{i}].name"), self.users.iter().take(MAX_USERS).map(|user| user.name.as_str()));
-		let (mut device_keys, mut addresses) = (HashSet::new(), HashSet::new());
+		let (mut device_keys, mut addresses, mut secrets) = (HashSet::new(), HashSet::new(), HashSet::new());
+		// Every WireGuard key the document holds, public or not. No transport secret is one of them: a key has one use.
+		let wireguard: HashSet<[u8; 32]> = self.inbounds.iter().take(MAX_INBOUNDS).map(|inbound| inbound.private_key.expose().0).chain(inbound_keys.keys().copied()).chain(self.users.iter().take(MAX_USERS).flat_map(|user| user.devices.iter().take(MAX_DEVICES)).flat_map(|device| std::iter::once(device.public_key.0).chain(device.preshared_key.as_ref().map(|key| key.expose().0)))).collect();
 		// Per user: the exits they are entitled to, their groups, and the inbounds their devices live in.
 		let mut sets: Vec<[Bits; 3]> = Vec::with_capacity(self.users.len().min(MAX_USERS));
 		for (i, user) in self.users.iter().enumerate().take(MAX_USERS) {
@@ -261,7 +265,7 @@ impl Config {
 				if !ident(&device.name, true) {r.error(at("name"), NAME_RULE)}
 				if inbound_keys.contains_key(&device.public_key.0) {r.error(at("public_key"), "expected a key that is not the public key of an inbound")} else if !device_keys.insert(device.public_key.0) {r.error(at("public_key"), "expected a key no other device uses")}
 				if !(1..=MAX_DEVICE_ADDRESSES).contains(&device.addresses.len()) {r.error(at("addresses"), format!("expected 1 to {MAX_DEVICE_ADDRESSES} addresses"))}
-				let mut families: Vec<(usize, bool)> = Vec::new();
+				let (mut families, mut native): (Vec<(usize, bool)>, bool) = (Vec::new(), false);
 				for (k, Ip(ip)) in device.addresses.iter().enumerate().take(MAX_DEVICE_ADDRESSES) {
 					let at = || at(&format!("addresses[{k}]"));
 					let (v6, n) = number(*ip);
@@ -272,13 +276,31 @@ impl Config {
 							if *ip == pool.addr() || *ip == pool.network() || (!v6 && *ip == pool.broadcast()) {r.error(at(), "expected a host address that is not the gateway, network or broadcast address of its pool")}
 							if families.contains(&(inbound, v6)) {r.error(at(), "expected at most one IPv4 and one IPv6 address per inbound")} else {families.push((inbound, v6))}
 							if small {homes.set(inbound)}
+							native |= self.inbounds[inbound].kind == InboundType::Veilway;
 						}
 					}
 					if !addresses.insert(*ip) {r.error(at(), "expected an address no other device uses")}
 				}
+				match &device.transport_secrets {
+					None if native => r.error(at("transport_secrets"), "expected 1 or 2 transport secrets: the device has an address in a veilway inbound and proves itself to its control channel with one. `veilway gensecret` makes one"),
+					None => {}
+					Some(list) => {
+						if !(1..=MAX_TRANSPORT_SECRETS).contains(&list.len()) {r.error(at("transport_secrets"), format!("expected 1 or {MAX_TRANSPORT_SECRETS} transport secrets"))}
+						if !native {r.warning(at("transport_secrets"), "never used: the device has no address in a veilway inbound")}
+						for (k, secret) in list.iter().enumerate().take(MAX_TRANSPORT_SECRETS) {
+							if wireguard.contains(&secret.0) {r.error(at(&format!("transport_secrets[{k}]")), "expected a secret that is not a WireGuard key of this config")} else if !secrets.insert(secret.0) {r.error(at(&format!("transport_secrets[{k}]")), "expected a secret no other device uses, and not the same secret twice")}
+						}
+					}
+				}
 			}
 			sets.push([entitled, member, homes]);
 		}
+		if self.notices.len() > MAX_NOTICES {r.error("notices", format!("expected at most {MAX_NOTICES} notices"))}
+		for (i, notice) in self.notices.iter().enumerate().take(MAX_NOTICES) {
+			// Held to what a client shows: text its filter would change or cut is refused here, so a device shows what the operator wrote.
+			if notice.text.is_empty() || veilway_proto::control::display(&notice.text, usize::MAX, MAX_NOTICE_BYTES) != notice.text {r.error(format!("notices[{i}].text"), format!("expected 1 to {MAX_NOTICE_BYTES} bytes of plain text with no control, bidirectional formatting, zero-width or other invisible characters"))}
+		}
+		if !self.notices.is_empty() && !self.inbounds.iter().any(|inbound| inbound.kind == InboundType::Veilway) {r.warning("notices", "no inbound is a veilway inbound, so no device is shown these")}
 		if self.dns.sets.len() > MAX_DNS_SETS {r.error("dns.sets", format!("expected at most {MAX_DNS_SETS} sets"))}
 		tags(&mut r, "dns.sets", self.dns.sets.iter().take(MAX_DNS_SETS).map(|set| set.tag.as_str()));
 		// Every list of servers of the document with its path: `dns.servers`, then that of each set. The same rules hold for all of them.

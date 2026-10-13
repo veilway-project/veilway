@@ -74,6 +74,8 @@ pub struct UserChange {
 	pub devices_removed: Vec<String>,
 	pub devices_readdressed: Vec<String>,
 	pub devices_rekeyed: Vec<String>,
+	/// Kept devices whose transport secrets changed.
+	pub devices_secrets_changed: Vec<String>,
 	/// The user could connect and no longer can.
 	pub lost_access: bool,
 }
@@ -90,6 +92,7 @@ pub struct Diff {
 	pub log: bool,
 	pub routing_default: bool,
 	pub rules_reordered: bool,
+	pub notices: bool,
 	pub inbound_changes: Vec<InboundChange>,
 	pub user_changes: Vec<UserChange>,
 }
@@ -107,20 +110,21 @@ impl From<&config::Diff> for Diff {
 			log: diff.log,
 			routing_default: diff.routing_default,
 			rules_reordered: diff.rules_reordered,
+			notices: diff.notices,
 			inbound_changes: diff.inbound_changes.iter().map(|change| InboundChange {tag: change.tag.clone(), restart: change.restart, transports_stopped: change.transports_stopped.clone(), transports_started: change.transports_started.clone()}).collect(),
-			user_changes: diff.user_changes.iter().map(|change| UserChange {name: change.name.clone(), devices_added: keys(&change.devices_added), devices_removed: keys(&change.devices_removed), devices_readdressed: keys(&change.devices_readdressed), devices_rekeyed: keys(&change.devices_rekeyed), lost_access: change.lost_access}).collect(),
+			user_changes: diff.user_changes.iter().map(|change| UserChange {name: change.name.clone(), devices_added: keys(&change.devices_added), devices_removed: keys(&change.devices_removed), devices_readdressed: keys(&change.devices_readdressed), devices_rekeyed: keys(&change.devices_rekeyed), devices_secrets_changed: keys(&change.devices_secrets_changed), lost_access: change.lost_access}).collect(),
 		}
 	}
 }
 
-/// A config version 1 document. Its own schema is `schema/config.v1.json`, with one difference: here every secret (`private_key`, `preshared_key`, `username`, `password`) may hold the marker `<redacted>`.
+/// A config version 1 document. Its own schema is `schema/config.v1.json`, with one difference: here every secret (`private_key`, `preshared_key`, `username`, `password`) may hold the marker `<redacted>`, and every entry of `transport_secrets` a marker that names it, `<redacted:` with eight hex digits and `>`.
 #[derive(Serialize)]
 #[serde(transparent)]
 pub struct Document(pub Value);
 
 impl JsonSchema for Document {
 	fn schema_name() -> Cow<'static, str> {"Document".into()}
-	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\". In a request the marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. An outbound whose server is new or has changed needs its username and password written out."})}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\", and every entry of transport_secrets holds a marker that names it, \"<redacted:\" with eight hex digits and \">\". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out."})}
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -234,6 +238,39 @@ pub struct Rated {
 #[derive(Serialize, JsonSchema)]
 pub struct Dns {pub answered: u64, pub refused: u64, pub failed: u64, pub malformed: u64, pub throttled: u64}
 
+/// What the control channel of the `veilway` inbounds did since start. Everything but `open` only grows.
+#[derive(Serialize, JsonSchema)]
+pub struct Control {
+	/// TCP connections to the control port that the node took, and those that proved a transport secret of their device.
+	pub accepted: u64,
+	pub authenticated: u64,
+	/// Connections closed for a wrong credential.
+	pub auth_failed: u64,
+	/// Connections closed for a message that was malformed, not allowed where it came, or outside its bounds.
+	pub malformed: u64,
+	/// Connections closed because the opening exchange was not done within 10 seconds.
+	pub timed_out: u64,
+	/// Connections closed to make room for a newer one of the same device.
+	pub replaced: u64,
+	/// Requests answered "rate limited".
+	pub rate_limited: u64,
+	/// Exit selections that were taken, that were refused, and that a reload dropped.
+	pub exits_selected: u64,
+	pub exits_refused: u64,
+	pub exits_dropped: u64,
+	/// MTU probe runs that were started, probes from devices that were confirmed, probes the node sent, and datagrams to the probe port that were no probe of a live run.
+	pub probe_runs: u64,
+	pub probes_confirmed: u64,
+	pub probes_sent: u64,
+	pub probes_refused: u64,
+	/// MTUs that devices set.
+	pub mtus_set: u64,
+	/// `bye` messages written before a cut-off or a stop.
+	pub byes: u64,
+	/// Authenticated connections open right now.
+	pub open: u64,
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct Stats {
 	/// The seconds the rates were taken over: 5 once the node has run that long, 0 before its second sample.
@@ -250,6 +287,7 @@ pub struct Stats {
 	pub ws_refused: u64,
 	/// Writes of the usage state file that failed since start.
 	pub state_write_failures: u64,
+	pub control: Control,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -268,6 +306,12 @@ pub struct Session {
 	pub handshake_age_secs: u64,
 	/// The flows of the device, through all its inbounds together.
 	pub flows: usize,
+	/// The exit the device chose on the control channel for the action `"user"`. Null for a device that chose none and leaves through its user's exit.
+	pub selected_exit: Option<String>,
+	/// The authenticated control connections the device has open.
+	pub control_connections: usize,
+	/// The MTU the device set on the control channel. Null for a device that set none, whose tunnel has the `mtu` of its inbound.
+	pub mtu: Option<u16>,
 }
 
 #[derive(Serialize, JsonSchema)]

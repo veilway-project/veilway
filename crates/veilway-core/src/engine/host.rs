@@ -3,9 +3,9 @@
 use super::icmp::{self, Kind};
 use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
-use super::plan::{Backend, Denied, Fallback, Outbound, Plan, User};
+use super::plan::{Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{l3, CutOff, Event, Over, Shared, QUEUE};
+use super::{control, l3, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{Config, Protocol, Tls, Transport, DEFAULT_MTU, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
@@ -23,6 +23,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
+use veilway_proto::control::{ByeReason, NodeMessage, PORT};
 use veilway_wg::ws::{self, TlsFiles};
 use veilway_wg::Wg;
 
@@ -101,6 +102,27 @@ pub(super) async fn bind(addr: SocketAddr, kind: Type, released: bool) -> io::Re
 		}
 		tokio::time::sleep(REBIND_EVERY).await;
 	}
+}
+
+/// What tells the device of a flow that the flow was ended from the node's side, and the tunnel address it goes to: a reset for TCP, as from the host the device was talking to, and for UDP an ICMP error from the gateway.
+/// Other protocols have nothing at the device that an error without the packet it answers could end. None as well when the device no longer holds the address the flow came from.
+pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
+	let from = plan.by_address.get(&flow.key.src).copied().filter(|from| plan.devices[from.device].public_key == flow.device)?;
+	let packet = match flow.key.protocol {
+		Protocol::TCP => flow.heard.and_then(|heard| route::tcp_reset(&flow.key, heard)),
+		Protocol::UDP => {
+			let mut raw = Vec::new();
+			let built = match (flow.key.src, flow.key.dst) {
+				(IpAddr::V4(src), IpAddr::V4(dst)) => PacketBuilder::ipv4(src.octets(), dst.octets(), 64).udp(flow.key.sport, flow.key.dport).write(&mut raw, &[]),
+				(IpAddr::V6(src), IpAddr::V6(dst)) => PacketBuilder::ipv6(src.octets(), dst.octets(), 64).udp(flow.key.sport, flow.key.dport).write(&mut raw, &[]),
+				_ => return None,
+			};
+			let gateway = plan.inbounds[from.inbound].pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == flow.key.src.is_ipv4());
+			built.ok().and_then(|_| netstack::parse(&raw)).zip(gateway).and_then(|(packet, gateway)| icmp::error(&raw, &packet, Kind::Prohibited, gateway, &plan.pools))
+		}
+		_ => None,
+	};
+	Some(from).zip(packet)
 }
 
 impl Host {
@@ -216,7 +238,7 @@ impl Host {
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
-		let (old, plan) = if same {(shared.plan(), shared.plan())} else {self.switch(shared, plan)};
+		let (old, plan) = if same {(shared.plan(), shared.plan())} else {self.switch(shared, plan, true)};
 		self.config = Some(config);
 		// Dropping the interface of an exit that is gone takes its routes and its firewall table with it.
 		if plan.l3.is_none() || l3.is_some() {*self.l3.lock().unwrap_or_else(|e| e.into_inner()) = l3}
@@ -293,7 +315,7 @@ impl Host {
 		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect()) {
 			Ok(mut plan) => {
 				plan.l3 = old.l3.clone();
-				self.switch(shared, plan);
+				self.switch(shared, plan, false);
 			}
 			Err(e) => tracing::error!("the running config could not be compiled again to cut off the users that expired or ran out of quota: {e:#}"),
 		}
@@ -304,23 +326,25 @@ impl Host {
 	/// the devices that are cut off lose their session keys, and the plan is swapped. After that their user's DNS memory is cleared and each is logged.
 	/// This is the one cut-off path: a device is cut off when the new plan no longer has it as it was, whatever the reason. A user who runs out of quota comes through here too, denied by `Plan::new` like one who expired, see `plan::Denied`.
 	/// The state file is written right after a switch that cut a user off for their quota or left a user's name behind, so neither waits for the next write.
-	fn switch(&self, shared: &Arc<Shared>, plan: Plan) -> (Arc<Plan>, Arc<Plan>) {
+	/// `reloaded` says the plan may come from another config than the one before it. A plan that only cuts users off or lets them in again changes nothing the control channel told anybody who is still there.
+	fn switch(&self, shared: &Arc<Shared>, plan: Plan, reloaded: bool) -> (Arc<Plan>, Arc<Plan>) {
 		let (old, plan) = (shared.plan(), Arc::new(plan));
 		let users: HashMap<&str, &User> = plan.users.iter().map(|user| (user.name.as_str(), user)).collect();
 		// A device is the same device while it has the same key, the same user, the same addresses and the same preshared key. Any other device of the old plan is cut off.
-		let cut: HashMap<[u8; 32], &str> = old.devices.iter().filter_map(|was| {
+		// Next to the reason stands what the control channel says of it in a `bye` ("Being cut off"). A device whose addresses or preshared key changed is none of the four cases a `bye` has, so it is told nothing and finds out as it did before.
+		let cut: HashMap<[u8; 32], (&str, Option<ByeReason>)> = old.devices.iter().filter_map(|was| {
 			let name = old.users[was.user].name.as_str();
 			Some((was.public_key, match plan.by_key.get(&was.public_key).map(|at| &plan.devices[*at]) {
-				Some(is) if plan.users[is.user].name != name => "its key was given to another user",
-				Some(is) if is.addresses != was.addresses => "its addresses changed",
-				Some(is) if is.preshared_key != was.preshared_key => "its preshared key changed",
+				Some(is) if plan.users[is.user].name != name => ("its key was given to another user", Some(ByeReason::Disabled)),
+				Some(is) if is.addresses != was.addresses => ("its addresses changed", None),
+				Some(is) if is.preshared_key != was.preshared_key => ("its preshared key changed", None),
 				Some(_) => return None,
 				None => match users.get(name).map(|user| user.denied) {
-					None => "the user was removed",
-					Some(Some(Denied::Disabled)) => "the user was disabled",
-					Some(Some(Denied::Expired)) => "the user expired",
-					Some(Some(Denied::Quota)) => "the user ran out of quota",
-					Some(None) => "the device was removed",
+					None => ("the user was removed", Some(ByeReason::Disabled)),
+					Some(Some(Denied::Disabled)) => ("the user was disabled", Some(ByeReason::Disabled)),
+					Some(Some(Denied::Expired)) => ("the user expired", Some(ByeReason::Expired)),
+					Some(Some(Denied::Quota)) => ("the user ran out of quota", Some(ByeReason::Quota)),
+					Some(None) => ("the device was removed", Some(ByeReason::Disabled)),
 				},
 			}))
 		}).collect();
@@ -339,9 +363,11 @@ impl Host {
 			let (is, was) = (plan.by_address.get(&key.src).copied()?, old.by_address.get(&key.src).copied()?);
 			let holder = &plan.devices[is.device];
 			if holder.public_key != *device || plan.users[holder.user].name != user || !Arc::ptr_eq(&plan.inbounds[is.inbound].tunnel, &old.inbounds[was.inbound].tunnel) {return None}
-			match (decision, shared.decide(&plan, is.inbound, holder.user, key, names)) {
+			match (decision, shared.decide(&plan, is.inbound, is.device, key, names)) {
 				(Decision::Deliver, Decision::Deliver) => Some(Decision::Deliver),
 				(Decision::Dns, Decision::Dns) => Some(Decision::Dns),
+				// A control connection lives on while its inbound is still a `veilway` inbound and its device still has the secret it proved, which is looked at once the plan is in force.
+				(Decision::Control, Decision::Control) => Some(Decision::Control),
 				(Decision::Exit {exit: was, by}, Decision::Exit {exit, by: now}) if exits.get(was).copied().flatten() == Some(exit) => {
 					// What its handler has since made of a TCP or UDP flow (through the proxy, around it, or by way of another exit) stands, for as long as that other exit is the same exit and one of the user's.
 					let by = if let By::Via(target) = by {By::Via(exits.get(target).copied().flatten().filter(|target| plan.users[holder.user].entitled.as_ref().is_none_or(|list| list.contains(target)))?)} else {by};
@@ -356,26 +382,24 @@ impl Host {
 			for flow in &ended {
 				if flow.key.protocol == Protocol::ICMP || flow.key.protocol == Protocol::ICMPV6 {pings.insert((flow.key.src, flow.key.dst));}
 				let Some(from) = old.by_address.get(&flow.key.src).copied().filter(|from| old.devices[from.device].public_key == flow.device) else {continue};
-				let inbound = &old.inbounds[from.inbound];
-				// The reset goes out under the session the device still has, which is why this comes before the keys are dropped. Other protocols have nothing at the device that an error without the packet it answers could end.
-				let packet = match flow.key.protocol {
-					Protocol::TCP => flow.heard.and_then(|heard| route::tcp_reset(&flow.key, heard)),
-					Protocol::UDP => {
-						let mut raw = Vec::new();
-						let built = match (flow.key.src, flow.key.dst) {
-							(IpAddr::V4(src), IpAddr::V4(dst)) => PacketBuilder::ipv4(src.octets(), dst.octets(), 64).udp(flow.key.sport, flow.key.dport).write(&mut raw, &[]),
-							(IpAddr::V6(src), IpAddr::V6(dst)) => PacketBuilder::ipv6(src.octets(), dst.octets(), 64).udp(flow.key.sport, flow.key.dport).write(&mut raw, &[]),
-							_ => continue,
-						};
-						let gateway = inbound.pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == flow.key.src.is_ipv4());
-						built.ok().and_then(|_| netstack::parse(&raw)).zip(gateway).and_then(|(packet, gateway)| icmp::error(&raw, &packet, Kind::Prohibited, gateway, &old.pools))
-					}
-					_ => None,
-				};
+				let (inbound, device) = (&old.inbounds[from.inbound], &old.devices[from.device]);
+				// "It first sends, on every authenticated connection of that device, a last `usage` if the cause is quota, and then `bye` with the reason. It does this on a best effort: the cut-off does not wait for it."
+				// The connection's own task could only write it after this switch, when the keys are gone, so it is written here in its place, as the last segment of the connection, see `route::tcp_last`.
+				// It is written where the stack stands on the connection, behind everything the stack has sent, whether the device has acknowledged that or not.
+				let bye = cut.get(&flow.device).and_then(|(_, reason)| *reason).filter(|_| flow.key.protocol == Protocol::TCP && flow.key.dport == PORT && old.control(from.inbound, flow.key.dst)).zip(device.control.last(&flow.key)).and_then(|(reason, next)| {
+					let mut last = Vec::new();
+					if reason == ByeReason::Quota {NodeMessage::Usage(control::usage(&old.users[device.user])).encode(&mut last).ok()?}
+					NodeMessage::Bye {reason}.encode(&mut last).ok()?;
+					route::tcp_last(&flow.key, next, &last)
+				});
+				// The reset goes out under the session the device still has, which is why this comes before the keys are dropped.
+				let packet = bye.clone().or_else(|| farewell(&old, flow).map(|(_, packet)| packet));
 				let (Some(packet), mut peers, mut datagrams) = (packet, inbound.tunnel.lock(), Vec::new()) else {continue};
 				let Some(peer) = peers.wg.index(&flow.device).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {continue};
 				let Some((endpoint, socket)) = peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade())) else {continue};
 				peers.wg.encapsulate(peer, &packet, &mut datagrams);
+				// Counted where it is written into the tunnel of a device that has a session, and nowhere before.
+				if bye.is_some() {shared.control.counters.byes.fetch_add(1, Ordering::Relaxed);}
 				shared.spend(&old.users[old.devices[from.device].user], false, packet.len());
 				inbound.traffic.down(packet.len());
 				out.extend(datagrams.into_iter().map(|datagram| (socket.clone(), endpoint, datagram)));
@@ -404,6 +428,20 @@ impl Host {
 			*shared.plan.write().unwrap_or_else(|e| e.into_inner()) = plan.clone();
 			(out, pings, ended.len())
 		});
+		// The plan is in force by now, which is the order `control::State::recheck` counts on: every exit a device chose is held against the `exits` its user has from here on, and one that is not among them is dropped.
+		// The plan before the first one holds what the state file remembered, so this is also where a file that names an exit the user may not use is put right.
+		let gone: Vec<(&str, &str, Arc<str>)> = plan.devices.iter().filter(|_| reloaded).filter_map(|device| device.control.recheck(&plan, &plan.users[device.user]).map(|tag| (plan.users[device.user].name.as_str(), device.name.as_str(), tag))).collect();
+		shared.control.counters.exits_dropped.fetch_add(gone.len() as u64, Ordering::Relaxed);
+		for (user, device, tag) in gone.iter().take(MAX_NAMES_LOGGED) {tracing::info!("user {user} device {device}: its exit selection {tag} is dropped: that is no exit of the user's `exits` any more, so the device leaves through the user's exit");}
+		if gone.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices had their exit selection dropped", gone.len() - MAX_NAMES_LOGGED)}
+		// A control connection proved one transport secret. When the config no longer has that secret for the device, the connection ends, like the session of a transport that was opened with it will (protocol overview, "Rotation").
+		// The WireGuard session of a `udp` transport was opened with no secret, so it stays.
+		for (was, is) in old.devices.iter().filter(|was| !cut.contains_key(&was.public_key)).filter_map(|was| plan.by_key.get(&was.public_key).map(|at| (was, &plan.devices[*at]))).filter(|(was, is)| was.secrets != is.secrets) {
+			let ended = is.control.revoke(&is.secrets);
+			if ended > 0 {tracing::info!("user {} device {}: {ended} control connection(s) ended, the transport secret they proved is no longer in the config", plan.users[is.user].name, was.name)}
+		}
+		// Every open control connection looks at what it told its device, and sends what this plan changed of it.
+		if reloaded {shared.control.plans.send_replace(plan.generation);}
 		// Every packet of every user waits while the flow table is locked, so how long that was is always said.
 		tracing::info!("a plan was put in force: the flow table was locked for {:?} while every live flow was decided again", started.elapsed());
 		// Never waited for: a socket that cannot take a reset right now loses it, like any packet on a full queue.
@@ -428,7 +466,7 @@ impl Host {
 		for (was, at) in old.exits.iter().zip(&exits) {
 			if at.is_none() && was.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() && tags.contains_key(was.tag.as_str()) {shared.publish(Event::ExitUdpChanged {exit: was.tag.clone(), udp: true})}
 		}
-		for (was, reason) in old.devices.iter().filter_map(|was| cut.get(&was.public_key).map(|reason| (was, reason))).take(MAX_NAMES_LOGGED) {
+		for (was, reason) in old.devices.iter().filter_map(|was| cut.get(&was.public_key).map(|(reason, _)| (was, reason))).take(MAX_NAMES_LOGGED) {
 			tracing::info!("user {} device {}: cut off, {reason}: its session keys and its flows are gone and the user's dns memory is cleared", old.users[was.user].name, was.name);
 		}
 		if cut.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices were cut off", cut.len() - MAX_NAMES_LOGGED)}

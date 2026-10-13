@@ -154,6 +154,16 @@
         },
         "public_key": {
           "$ref": "#/$defs/Key"
+        },
+        "transport_secrets": {
+          "description": "One, or two while the secret is rotated. Needed by a device with an address in a `veilway` inbound.",
+          "items": {
+            "$ref": "#/$defs/TransportSecret"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -447,10 +457,18 @@
       "type": "object"
     },
     "InboundType": {
-      "enum": [
-        "wireguard"
-      ],
-      "type": "string"
+      "oneOf": [
+        {
+          "const": "wireguard",
+          "description": "Plain WireGuard. Its gateway answers DNS and nothing else.",
+          "type": "string"
+        },
+        {
+          "const": "veilway",
+          "description": "The same tunnel with the control channel at its gateway address. Every device with an address in it has a transport secret.",
+          "type": "string"
+        }
+      ]
     },
     "Ip": {
       "description": "an IPv4 or IPv6 address without a prefix",
@@ -489,6 +507,31 @@
         "info",
         "debug",
         "trace"
+      ],
+      "type": "string"
+    },
+    "Notice": {
+      "additionalProperties": false,
+      "properties": {
+        "severity": {
+          "$ref": "#/$defs/NoticeSeverity",
+          "description": "Defaults to \"information\"."
+        },
+        "text": {
+          "maxLength": 280,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "NoticeSeverity": {
+      "enum": [
+        "information",
+        "warning"
       ],
       "type": "string"
     },
@@ -958,6 +1001,11 @@
         }
       ]
     },
+    "TransportSecret": {
+      "description": "a transport secret: 44 characters of standard base64 with padding",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "type": "string"
+    },
     "UdpPolicy": {
       "description": "\"reject\", \"drop\", \"direct\" or {\"via\": \"<exit tag>\"}",
       "oneOf": [
@@ -1124,6 +1172,15 @@
         "destinations": false,
         "level": "info"
       }
+    },
+    "notices": {
+      "description": "What the operator tells every device on the control channel of a `veilway` inbound, as plain text.",
+      "items": {
+        "$ref": "#/$defs/Notice"
+      },
+      "maxItems": 4,
+      "type": "array",
+      "uniqueItems": true
     },
     "outbounds": {
       "items": {

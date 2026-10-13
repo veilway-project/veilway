@@ -1,10 +1,15 @@
 //! What users have used: the periods a quota count starts over in, and the state file that carries the counts across reloads and restarts.
 //! The config document never holds any of it. The file is keyed by user name, like everything else the engine keeps for a user.
+//! Next to the users it holds the exit each device chose on the control channel, keyed by the device's public key (control channel page, "Exit selection").
 use super::{Shared, Traffic, UserState};
-use crate::config::MAX_QUOTA_BYTES;
+use crate::config::{MAX_QUOTA_BYTES, MAX_USERS};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,10 +17,15 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
-/// The only version of the file this build reads and writes.
+/// The only version of the file this build reads and writes. The exits devices chose came into the file as a key of its own, `devices`, which a build from before there was one passes over: a file this build wrote is read by that build with every user's count in it.
 pub const VERSION: u64 = 1;
-/// A state file larger than this is not read. An entry takes at most 253 bytes, so the file of a config with as many users as a config may have stays below it.
+/// A state file larger than this is not read. An entry of a user takes at most 253 bytes, so the file of a config with as many users as a config may have stays below it, and `save` writes only as many devices as still fit.
 pub const MAX_FILE_BYTES: u64 = 16 << 20;
+/// The exits of at most this many devices are kept in the file, and no more than the file has room for next to its users. The rest of the devices that chose one have chosen none after a restart.
+pub const MAX_SELECTIONS: usize = 65536;
+/// What one user and one device take in the file at most, in bytes, with the comma behind them.
+const USER_BYTES: usize = 253;
+const DEVICE_BYTES: usize = 128;
 /// The largest count the file holds, which is the largest integer JSON carries exactly. A count above it is this one.
 pub const MAX_COUNT: u64 = MAX_QUOTA_BYTES;
 /// How far apart the writes of the file are while nothing asks for one sooner.
@@ -65,12 +75,81 @@ impl<'de> Deserialize<'de> for Start {
 #[derive(Serialize, Deserialize)]
 struct Entry {used_bytes: Count, period_start: Start, up_bytes: Count, up_packets: Count, down_bytes: Count, down_packets: Count}
 
-#[derive(Serialize)]
-struct Document {version: u64, users: BTreeMap<String, Entry>}
+/// One device in the file: the tag of the exit it chose.
+#[derive(Serialize, Deserialize)]
+struct Chosen {exit: String}
 
-/// The file as it is read. Each entry is left as the text it is and looked at by itself, so one that is no entry costs its own user their count and nobody else theirs.
-#[derive(Deserialize)]
-struct Stored<'a> {version: u64, #[serde(borrow)] users: BTreeMap<String, &'a RawValue>}
+/// `devices` is keyed by the device's public key in base64 and holds only devices that chose an exit. It is left out while there is none.
+#[derive(Serialize)]
+struct Document {version: u64, users: BTreeMap<String, Entry>, #[serde(skip_serializing_if = "BTreeMap::is_empty")] devices: BTreeMap<String, Chosen>}
+
+/// What a state file says: every user with their counts, every device that chose an exit with the tag of that exit, and how many entries of either kind are no entry, or one too many, and were passed over.
+#[derive(Default)]
+pub struct Parsed {pub users: Vec<(String, UserState)>, pub devices: Vec<([u8; 32], String)>, pub skipped: usize}
+
+/// Reads the entries of `users` or of `devices` one after the other and hands each to `keep` as the text it is, so no entry is held while the next is read.
+struct Entries<F>(F);
+
+impl<'de, F: FnMut(String, &str)> DeserializeSeed<'de> for Entries<F> {
+	type Value = ();
+	fn deserialize<D: Deserializer<'de>>(self, from: D) -> Result<(), D::Error> {from.deserialize_map(self)}
+}
+
+impl<'de, F: FnMut(String, &str)> Visitor<'de> for Entries<F> {
+	type Value = ();
+	fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {f.write_str("an object of entries")}
+	fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<(), A::Error> {
+		while let Some(name) = map.next_key::<String>()? {(self.0)(name, map.next_value::<&RawValue>()?.get())}
+		Ok(())
+	}
+}
+
+/// The file as it is read: its version, and what `Entries` kept of its users and devices. Any other key is passed over.
+struct Stored(Option<u64>, Parsed, bool);
+
+impl<'de> Visitor<'de> for Stored {
+	type Value = Stored;
+	fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {f.write_str("a state file")}
+	fn visit_map<A: MapAccess<'de>>(mut self, mut map: A) -> Result<Stored, A::Error> {
+		while let Some(key) = map.next_key::<String>()? {
+			let Stored(version, Parsed {users, devices, skipped}, found) = &mut self;
+			match key.as_str() {
+				"version" => *version = Some(map.next_value()?),
+				// Each entry is looked at by itself, so one that is no entry costs its own user their count and nobody else theirs. A file holds no more users than a config may have: what comes after that many is counted and not kept.
+				"users" => {
+					*found = true;
+					map.next_value_seed(Entries(|name: String, raw: &str| match serde_json::from_str::<Entry>(raw).ok().filter(|_| users.len() < MAX_USERS) {
+						Some(entry) => users.push((name, UserState {
+							traffic: Traffic {up_packets: AtomicU64::new(entry.up_packets.0), up_bytes: AtomicU64::new(entry.up_bytes.0), down_packets: AtomicU64::new(entry.down_packets.0), down_bytes: AtomicU64::new(entry.down_bytes.0)},
+							used: AtomicU64::new(entry.used_bytes.0),
+							since: AtomicI64::new(entry.period_start.0),
+							..UserState::default()
+						})),
+						None => *skipped += 1,
+					}))?
+				}
+				// A device's exit is kept only when its key is a key and its tag is a tag, and no more of them than a node writes.
+				"devices" => map.next_value_seed(Entries(|key: String, raw: &str| match <[u8; 32]>::try_from(STANDARD.decode(key).unwrap_or_default()).ok().zip(serde_json::from_str::<Chosen>(raw).ok()).filter(|(_, chosen)| devices.len() < MAX_SELECTIONS && veilway_proto::control::is_tag(&chosen.exit)) {
+					Some((key, chosen)) => devices.push((key, chosen.exit)),
+					None => *skipped += 1,
+				}))?,
+				_ => drop(map.next_value::<IgnoredAny>()?),
+			}
+		}
+		Ok(self)
+	}
+}
+
+/// Reads the bytes of a state file. Nothing in them is trusted: a count is clamped, an entry that is no entry is passed over, and a device's exit is kept only when its key is a key and its tag is a tag.
+/// Whether that tag is an exit its user may use is for the plan to say, see `control::State::recheck`. An error is a file that is no state file of the version this build reads.
+/// The file is gone through once, entry by entry, and nothing is kept of an entry but what the result holds: what a file of the largest size costs is its own bytes and at most `MAX_USERS` users and `MAX_SELECTIONS` devices, whatever it is filled with.
+pub fn parse(bytes: &[u8]) -> anyhow::Result<Parsed> {
+	let mut from = serde_json::Deserializer::from_slice(bytes);
+	let Stored(version, parsed, users) = from.deserialize_map(Stored(None, Parsed::default(), false)).and_then(|stored| from.end().map(|_| stored)).map_err(|e| anyhow::anyhow!("it is not a state file ({:?} at line {} column {})", e.classify(), e.line(), e.column()))?;
+	let version = version.filter(|_| users).ok_or_else(|| anyhow::anyhow!("it is not a state file (no version or no users)"))?;
+	anyhow::ensure!(version == VERSION, "it has version {version} and this build reads version {VERSION}");
+	Ok(parsed)
+}
 
 /// Where the state file is and what is known of it. Without a path usage lives in memory only.
 pub struct Saver {
@@ -79,22 +158,24 @@ pub struct Saver {
 	pub(super) written: Vec<u8>,
 	/// When a row of failed writes was last logged. None while writes go through.
 	pub(super) failing: Option<Instant>,
+	/// How many devices that chose an exit the last write had no room for.
+	pub(super) left_out: usize,
 }
 
 /// What the state file at `path` says of each user, and whether the node may write there. A file that is not there says nothing, which is how a node starts for the first time.
 /// A file that cannot be read, is too large, is no state file of this version, or that group or others can write is moved aside under its name with `.bad` behind it and mode 600, and says nothing either: the node starts counting from zero and never stays down for it.
 /// Only a regular file is ever read, moved or written over. Anything else at the path (a directory, a link, a device, a pipe) is left as it is, and the node keeps usage in memory.
 /// An entry that is no entry is passed over: its user starts from zero and everybody else keeps what the file says.
-pub fn load(path: &Path) -> (Vec<(String, UserState)>, bool) {
+pub fn load(path: &Path) -> (Vec<(String, UserState)>, Vec<([u8; 32], String)>, bool) {
 	match read(path) {
-		(Found::Absent, ..) => (Vec::new(), true),
+		(Found::Absent, ..) => (Vec::new(), Vec::new(), true),
 		(Found::Alone(why), ..) => {
 			tracing::error!("state file {}: {why}. It is left as it is and nothing is written there: usage is kept in memory and is gone when the node stops", path.display());
-			(Vec::new(), false)
+			(Vec::new(), Vec::new(), false)
 		}
-		(Found::Good {skipped, ..}, users, _) => {
-			if skipped > 0 {tracing::error!("state file {}: {skipped} of its entries are not what a node writes for a user. Those users start from zero and everybody else keeps what the file says", path.display())}
-			(users, true)
+		(Found::Good {skipped, ..}, parsed, _) => {
+			if skipped > 0 {tracing::error!("state file {}: {skipped} of its entries are not what a node writes for a user or a device. Those users start from zero, those devices have chosen no exit, and everybody else keeps what the file says", path.display())}
+			(parsed.users, parsed.devices, true)
 		}
 		(Found::Bad(why), _, opened) => {
 			let mut bad = path.as_os_str().to_owned();
@@ -111,7 +192,7 @@ pub fn load(path: &Path) -> (Vec<(String, UserState)>, bool) {
 				Err(stuck) => tracing::error!("state file {}: {why}. It could not be moved aside ({}) and every user's usage starts from zero", path.display(), stuck.kind()),
 			}
 			drop(opened);
-			(Vec::new(), true)
+			(Vec::new(), Vec::new(), true)
 		}
 	}
 }
@@ -133,11 +214,12 @@ pub enum Found {
 pub fn inspect(path: &Path) -> Found {read(path).0}
 
 /// Reads the state file at `path` and changes nothing: what was found, the users of a good file, and the file as it was opened.
-fn read(path: &Path) -> (Found, Vec<(String, UserState)>, Option<File>) {
-	let alone = |why: String| (Found::Alone(why), Vec::new(), None);
+fn read(path: &Path) -> (Found, Parsed, Option<File>) {
+	let nothing = Parsed::default;
+	let alone = |why: String| (Found::Alone(why), nothing(), None);
 	// Looked at before it is opened, and without following a link: somebody who names `/dev/null` or a directory for no state file must find it there afterwards.
 	match fs::symlink_metadata(path) {
-		Err(e) if e.kind() == io::ErrorKind::NotFound => return (Found::Absent, Vec::new(), None),
+		Err(e) if e.kind() == io::ErrorKind::NotFound => return (Found::Absent, nothing(), None),
 		Err(e) => return alone(format!("it cannot be looked at ({})", e.kind())),
 		Ok(meta) if !meta.is_file() => return alone("it is not a regular file".to_string()),
 		Ok(_) => {}
@@ -151,7 +233,7 @@ fn read(path: &Path) -> (Found, Vec<(String, UserState)>, Option<File>) {
 	#[cfg(unix)]
 	if opened.as_ref().is_err_and(|e| e.raw_os_error() == Some(libc::ELOOP)) {return alone("it is not a regular file".to_string())}
 	if opened.as_ref().is_ok_and(|(meta, _)| !meta.is_file()) {return alone("it is not a regular file".to_string())}
-	let parsed = (|| -> anyhow::Result<(usize, Vec<(String, UserState)>)> {
+	let parsed = (|| -> anyhow::Result<Parsed> {
 		let (meta, file) = match &opened {
 			Ok((meta, file)) => (meta, file),
 			Err(e) => anyhow::bail!("it cannot be opened ({})", e.kind()),
@@ -161,21 +243,12 @@ fn read(path: &Path) -> (Found, Vec<(String, UserState)>, Option<File>) {
 		anyhow::ensure!(std::os::unix::fs::MetadataExt::mode(meta) & 0o022 == 0, "group or others can write it");
 		let mut bytes = Vec::new();
 		anyhow::ensure!(meta.len() <= MAX_FILE_BYTES && file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)? as u64 <= MAX_FILE_BYTES, "it is larger than {} MiB", MAX_FILE_BYTES >> 20);
-		let stored: Stored = serde_json::from_slice(&bytes).map_err(|e| anyhow::anyhow!("it is not a state file ({:?} at line {} column {})", e.classify(), e.line(), e.column()))?;
-		anyhow::ensure!(stored.version == VERSION, "it has version {} and this build reads version {VERSION}", stored.version);
-		let entries = stored.users.len();
-		let users: Vec<(String, UserState)> = stored.users.into_iter().filter_map(|(name, raw)| serde_json::from_str::<Entry>(raw.get()).ok().map(|entry| (name, UserState {
-			traffic: Traffic {up_packets: AtomicU64::new(entry.up_packets.0), up_bytes: AtomicU64::new(entry.up_bytes.0), down_packets: AtomicU64::new(entry.down_packets.0), down_bytes: AtomicU64::new(entry.down_bytes.0)},
-			used: AtomicU64::new(entry.used_bytes.0),
-			since: AtomicI64::new(entry.period_start.0),
-			..UserState::default()
-		}))).collect();
-		Ok((entries - users.len(), users))
+		parse(&bytes)
 	})();
 	let opened = opened.ok().map(|(_, file)| file);
 	match parsed {
-		Ok((skipped, users)) => (Found::Good {users: users.len(), skipped}, users, opened),
-		Err(e) => (Found::Bad(format!("{e:#}")), Vec::new(), opened),
+		Ok(parsed) => (Found::Good {users: parsed.users.len(), skipped: parsed.skipped}, parsed, opened),
+		Err(e) => (Found::Bad(format!("{e:#}")), nothing(), opened),
 	}
 }
 
@@ -188,13 +261,19 @@ pub async fn save(shared: &Shared, last: bool) {
 	let Some(path) = (if last {saver.path.take()} else {saver.path.clone()}) else {return};
 	let (plan, written, target) = (shared.plan(), std::mem::take(&mut saver.written), path.clone());
 	// Put together and written off the runtime's own threads, so no packet waits for a disk.
-	let done = tokio::task::spawn_blocking(move || -> io::Result<Vec<u8>> {
+	let done = tokio::task::spawn_blocking(move || -> io::Result<(Vec<u8>, usize)> {
 		let count = |counter: &AtomicU64| Count(counter.load(Ordering::Relaxed).min(MAX_COUNT));
-		let bytes = serde_json::to_vec(&Document {version: VERSION, users: plan.users.iter().map(|user| {
+		let users: BTreeMap<String, Entry> = plan.users.iter().map(|user| {
 			let (state, traffic) = (&user.state, &user.state.traffic);
 			(user.name.clone(), Entry {used_bytes: count(&state.used), period_start: Start(state.since.load(Ordering::Relaxed)), up_bytes: count(&traffic.up_bytes), up_packets: count(&traffic.up_packets), down_bytes: count(&traffic.down_bytes), down_packets: count(&traffic.down_packets)})
-		}).collect()})?;
-		if bytes == written {return Ok(written)}
+		}).collect();
+		// Every device of the config that chose an exit, those of a user who is denied right now included, by its key. A device the config no longer has is not in it, so its entry goes with the commit that removed it.
+		// Only as many as leave the file one this build reads again, the same ones at every write: the users come first, and a selection that is not kept costs its device one `set_exit`.
+		let chosen: BTreeMap<String, Chosen> = plan.states.iter().filter_map(|(key, (_, state))| state.selected().map(|exit| (STANDARD.encode(key), Chosen {exit: exit.to_string()}))).collect();
+		let room = MAX_SELECTIONS.min((MAX_FILE_BYTES as usize).saturating_sub(64 + users.len() * USER_BYTES) / DEVICE_BYTES);
+		let (left_out, devices): (usize, BTreeMap<String, Chosen>) = (chosen.len().saturating_sub(room), chosen.into_iter().take(room).collect());
+		let bytes = serde_json::to_vec(&Document {version: VERSION, users, devices})?;
+		if bytes == written {return Ok((written, left_out))}
 		let mut tmp = target.clone().into_os_string();
 		tmp.push(".tmp");
 		// What a write that was cut short left behind may have any mode, and `create_new` never follows a link somebody put in its place.
@@ -207,11 +286,12 @@ pub async fn save(shared: &Shared, last: bool) {
 		file.write_all(&bytes)?;
 		file.sync_all()?;
 		fs::rename(&tmp, &target)?;
-		Ok(bytes)
+		Ok((bytes, left_out))
 	}).await.unwrap_or_else(|e| Err(io::Error::other(e)));
 	match done {
-		Ok(bytes) => {
+		Ok((bytes, left_out)) => {
 			if saver.failing.take().is_some() {tracing::info!("state file {}: it is written again", path.display())}
+			if left_out != std::mem::replace(&mut saver.left_out, left_out) && left_out > 0 {tracing::warn!("state file {}: {left_out} devices that chose an exit are not in it, because it holds the choices of at most {MAX_SELECTIONS} devices and no more than fit in {} MiB next to the users. Those devices have chosen no exit after a restart", path.display(), MAX_FILE_BYTES >> 20)}
 			saver.written = bytes;
 		}
 		// Nothing counts as written now, so the next round writes whether or not anything has changed by then.
@@ -305,7 +385,54 @@ mod tests {
 	fn the_file_of_the_largest_config_is_one_this_build_reads() {
 		let entry = || Entry {used_bytes: Count(MAX_COUNT), period_start: Start(-(MAX_COUNT as i64)), up_bytes: Count(MAX_COUNT), up_packets: Count(MAX_COUNT), down_bytes: Count(MAX_COUNT), down_packets: Count(MAX_COUNT)};
 		let users: BTreeMap<String, Entry> = (0..MAX_USERS).map(|user| (format!("{user:0>width$}", width = MAX_NAME_BYTES), entry())).collect();
-		assert!(serde_json::to_vec(&Document {version: VERSION, users}).unwrap().len() as u64 <= MAX_FILE_BYTES);
+		let users = serde_json::to_vec(&Document {version: VERSION, users, devices: BTreeMap::new()}).unwrap().len();
+		// One device with the longest tag there is, and the comma behind it.
+		let device = serde_json::to_vec(&BTreeMap::from([(STANDARD.encode([0xff; 32]), Chosen {exit: "x".repeat(64)})])).unwrap().len() - 1;
+		assert!(users <= 64 + MAX_USERS * USER_BYTES && device <= DEVICE_BYTES && (users as u64) <= MAX_FILE_BYTES);
+		// With fewer users there is room for every device `save` may write, and with as many as there may be the room it works out still leaves a file this build reads.
+		assert!(64 + 8192 * USER_BYTES + MAX_SELECTIONS * DEVICE_BYTES <= MAX_FILE_BYTES as usize && (MAX_FILE_BYTES as usize - 64 - MAX_USERS * USER_BYTES) / DEVICE_BYTES >= 1024);
+	}
+
+	#[test]
+	fn a_file_says_what_each_device_chose_and_nothing_in_it_is_trusted() {
+		let (entry, key) = (r#"{"used_bytes":7,"period_start":5,"up_bytes":4,"up_packets":1,"down_bytes":3,"down_packets":1}"#, STANDARD.encode([0x21; 32]));
+		let read = |version: u64, devices: &str| parse(format!(r#"{{"version":{version},"users":{{"a":{entry}}},"devices":{devices}}}"#).as_bytes()).map(|parsed| (parsed.users.len(), parsed.devices, parsed.skipped)).map_err(|e| e.to_string());
+		assert_eq!(read(1, &format!(r#"{{"{key}":{{"exit":"alt"}}}}"#)), Ok((1, vec![([0x21; 32], "alt".to_string())], 0)));
+		// The version stays 1: the devices are a key a build from before them passes over, as this one passes over a key it does not know. Another version is no state file, and neither is what has no version or no users.
+		assert!(read(2, "{}").is_err() && read(0, "{}").is_err() && read(1, "[]").is_err() && read(1, "7").is_err());
+		assert_eq!(parse(format!(r#"{{"users":{{"a":{entry}}},"later":[1,{{"x":null}}],"version":1}}"#).as_bytes()).map(|parsed| (parsed.users.len(), parsed.devices.len(), parsed.skipped)).ok(), Some((1, 0, 0)));
+		for broken in [r#"{"users":{}}"#.to_string(), r#"{"version":1}"#.to_string(), r#"{"version":1,"users":{}} x"#.to_string(), format!(r#"{{"version":1,"users":{{"a":{entry}"#), r#"{"version":"1","users":{}}"#.to_string(), "[]".to_string(), String::new()] {assert!(parse(broken.as_bytes()).is_err(), "{broken}")}
+		// A key that is no key, a tag that is no tag or is a reserved word, a field too many and what is no object: each costs its own device its choice and nobody else anything.
+		for (case, other) in [("a short key", r#""c2hvcnQ=":{"exit":"alt"}"#.to_string()), ("text for a key", r#""not base64":{"exit":"alt"}"#.to_string()), ("an uppercase tag", format!(r#""{}":{{"exit":"ALT"}}"#, STANDARD.encode([0x22; 32]))), ("a reserved word", format!(r#""{}":{{"exit":"user"}}"#, STANDARD.encode([0x22; 32]))), ("an empty tag", format!(r#""{}":{{"exit":""}}"#, STANDARD.encode([0x22; 32]))), ("a tag of 65 bytes", format!(r#""{}":{{"exit":"{}"}}"#, STANDARD.encode([0x22; 32]), "x".repeat(65))), ("a number for a tag", format!(r#""{}":{{"exit":7}}"#, STANDARD.encode([0x22; 32]))), ("no object", format!(r#""{}":"alt""#, STANDARD.encode([0x22; 32]))), ("no exit", format!(r#""{}":{{}}"#, STANDARD.encode([0x22; 32])))] {
+			assert_eq!(read(1, &format!(r#"{{"{key}":{{"exit":"alt"}},{other}}}"#)), Ok((1, vec![([0x21; 32], "alt".to_string())], 1)), "{case}");
+		}
+	}
+
+	// A file as large as a file may be, filled with whatever takes the least room for an entry: what is kept of it is bounded by the number of users and devices a node writes, not by what the file holds.
+	// With `VEILWAY_MEASURE` set it also says how long each took and what the process had used at its most, which is how the numbers in the review of this parser were taken.
+	#[test]
+	fn a_file_at_the_size_limit_costs_no_more_than_the_entries_a_node_writes() {
+		let filled = |entry: &str, devices: bool| {
+			let (mut bytes, mut entries) = (if devices {br#"{"version":1,"users":{},"devices":{"#.to_vec()} else {br#"{"version":1,"users":{"#.to_vec()}, 0usize);
+			while bytes.len() + 32 + entry.len() < MAX_FILE_BYTES as usize {
+				if entries > 0 {bytes.push(b',')}
+				bytes.extend_from_slice(format!("\"{entries:x}\":{entry}").as_bytes());
+				entries += 1;
+			}
+			bytes.extend_from_slice(b"}}");
+			(bytes, entries)
+		};
+		let (entry, peak) = (r#"{"used_bytes":0,"period_start":0,"up_bytes":0,"up_packets":0,"down_bytes":0,"down_packets":0}"#, || fs::read_to_string("/proc/self/status").ok().and_then(|status| status.lines().find_map(|line| line.strip_prefix("VmHWM:")?.trim().strip_suffix(" kB")?.trim().parse::<u64>().ok())).unwrap_or(0) >> 10);
+		for (what, entry, devices) in [("junk users", "0", false), ("junk devices", "0", true), ("well formed users", entry, false), ("well formed devices under keys that are none", r#"{"exit":"alt"}"#, true)] {
+			let ((bytes, entries), before) = (filled(entry, devices), peak());
+			let (started, parsed) = (Instant::now(), parse(&bytes).unwrap());
+			assert_eq!(parsed.users.len() + parsed.devices.len() + parsed.skipped, entries, "{what}");
+			assert!(parsed.users.len() <= MAX_USERS && parsed.devices.len() <= MAX_SELECTIONS, "{what}");
+			if std::env::var_os("VEILWAY_MEASURE").is_some() {eprintln!("MEASURE {what}: {} MiB, {entries} entries, {} kept, parsed in {:?}, peak {} MiB ({} MiB before the parse, with the file in memory)", bytes.len() >> 20, parsed.users.len() + parsed.devices.len(), started.elapsed(), peak(), before)}
+		}
+		// As many well formed users as fit: no more than a config may have are kept.
+		let (bytes, entries) = filled(entry, false);
+		assert!(entries > MAX_USERS && parse(&bytes).is_ok_and(|parsed| (parsed.users.len(), parsed.skipped) == (MAX_USERS, entries - MAX_USERS)));
 	}
 
 	/// A new directory for one test, which removes it when it is done.
@@ -331,7 +458,7 @@ mod tests {
 			("no object", "0".to_string(), None),
 		] {
 			fs::write(&path, format!(r#"{{"version":1,"users":{{"a":{good},"b":{other}}}}}"#)).unwrap();
-			let (users, writable) = load(&path);
+			let (users, _, writable) = load(&path);
 			let since = |name: &str| users.iter().find(|(user, _)| user == name).map(|(_, state)| (state.since.load(Ordering::Relaxed), state.used()));
 			assert_eq!((since("a"), since("b").map(|(start, _)| start), writable, dir.join("state.json.bad").exists()), (Some((5, 7)), start, true, false), "{case}");
 		}
@@ -348,7 +475,7 @@ mod tests {
 		for mode in [0o644, 0o666] {
 			fs::write(&path, format!("no state file, mode {mode:o}")).unwrap();
 			fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
-			let (users, writable) = load(&path);
+			let (users, _, writable) = load(&path);
 			assert!(users.is_empty() && writable);
 			assert_eq!((fs::read_to_string(&bad).unwrap(), fs::metadata(&bad).unwrap().permissions().mode() & 0o777, path.exists()), (format!("no state file, mode {mode:o}"), 0o600, false));
 		}
@@ -371,7 +498,7 @@ mod tests {
 				_ => fs::create_dir(&path).map(|_| None).unwrap(),
 			};
 			let before = fs::symlink_metadata(&path).unwrap().file_type();
-			let (users, writable) = load(&path);
+			let (users, _, writable) = load(&path);
 			assert!(users.is_empty() && !writable, "{case}: what stands at the path was read or may be written over");
 			assert_eq!((fs::symlink_metadata(&path).unwrap().file_type(), dir.join("state.json.bad").exists(), fs::read_dir(&dir).unwrap().count()), (before, false, 2), "{case}");
 			if case == "directory" {fs::remove_dir(&path).unwrap()} else {fs::remove_file(&path).unwrap()}
