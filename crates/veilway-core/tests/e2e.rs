@@ -769,7 +769,7 @@ async fn an_idle_tcp_flow_lives_exactly_as_long_as_tcp_idle_secs(){
 
 #[test]
 fn egress_never_dials_directly(){
-	let mut dirs=vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+	let (mut dirs, mut decoy_dials, mut origins_built)=(vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")], 0, 0);
 	while let Some(dir)=dirs.pop(){
 		for entry in std::fs::read_dir(&dir).unwrap(){
 			let path=entry.unwrap().path();
@@ -778,16 +778,25 @@ fn egress_never_dials_directly(){
 				continue;
 			}
 			let text=std::fs::read_to_string(&path).unwrap();
-			// The only TcpStream dial allowed is the control connection to the proxy itself, and the only other
+			// The only TcpStream dial allowed for a user's traffic is the control connection to the proxy itself, and the only other
 			// sockets that reach out belong to the `direct` outbound, which lives in one file.
+			// The stream listener dials one more place, and no user's traffic goes there: the decoy origin of its config, which is the operator's own web server and the one address a stranger's bytes are handed to.
 			for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
-				assert!(line.contains("up.addr"), "{} dials {} without the proxy", path.display(), line.trim());
+				let decoy=path.ends_with("engine/stream.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(to))");
+				assert!(line.contains("up.addr")|| decoy, "{} dials {} without the proxy", path.display(), line.trim());
+				decoy_dials+=decoy as usize;
 			}
 			for line in text.lines().filter(|l| l.contains("TcpSocket::new")|| l.contains(".connect(target)")){
 				assert!(path.ends_with("engine/flows.rs"), "{} dials {} outside the direct outbound", path.display(), line.trim());
 			}
+			// Where that dial goes is made in one place, from the config's `decoy.origin`. The only other line that names it is the one that takes it apart to dial.
+			for line in text.lines().filter(|l| l.contains("Origin::Tcp(")&& !l.trim_start().starts_with("Origin::Tcp(to)=>")&& !l.trim_start().starts_with("Origin::Tcp(to) =>")){
+				assert!(path.ends_with("engine/host.rs")&& line.contains("stream::Origin::Tcp(*origin)"), "{} makes a decoy origin in {}", path.display(), line.trim());
+				origins_built+=1;
+			}
 		}
 	}
+	assert_eq!((decoy_dials, origins_built), (1, 1));
 }
 
 async fn close_reaches_upstream(server_closes:bool, sport:u16)->bool{

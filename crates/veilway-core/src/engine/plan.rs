@@ -5,6 +5,7 @@ use super::{control, icmp, l3, usage, ExitState, Traffic, UserState};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
 use std::fmt::{self, Display};
 use std::net::{IpAddr, SocketAddr};
@@ -15,7 +16,7 @@ use time::OffsetDateTime;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use veilway_proto::chunk::{NORMAL_DEFAULT, WIDE_DEFAULT};
 use veilway_proto::keys::{self, TagKey};
-use veilway_proto::udp_obfs;
+use veilway_proto::{proof, udp_obfs, NoRandom};
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
 #[derive(PartialEq, Eq)]
@@ -85,11 +86,20 @@ impl fmt::Debug for Proved {
 
 /// What one transport secret of one device gives on one inbound: the key its tags are computed with, and the entry the tag table holds for it. It is made once and handed from plan to plan for as long as the secret, the device and the inbound's key stay,
 /// with the tags it last computed, so a plan that is compiled inside an epoch computes none again.
-pub struct Derived {tags: TagKey, pub device: Arc<keys::Device<Proved>>, epochs: Mutex<Vec<(u64, [u8; 16])>>}
+pub struct Derived {
+	tags: TagKey,
+	/// The device tag, which names the device inside a stream proof: "It has no time step and never changes for a given secret."
+	named: [u8; 16],
+	pub device: Arc<keys::Device<Proved>>,
+	epochs: Mutex<Vec<(u64, [u8; 16])>>,
+}
 
 impl Derived {
 	/// `inbound` and `device` are the WireGuard public keys of the inbound and of the device.
-	pub fn new(secret: &[u8; 32], inbound: &[u8; 32], device: &[u8; 32]) -> Derived {Derived {tags: TagKey::derive(secret, inbound), device: Arc::new(keys::Device::derive(Proved(*secret), secret, inbound, device)), epochs: Mutex::default()}}
+	pub fn new(secret: &[u8; 32], inbound: &[u8; 32], device: &[u8; 32]) -> Derived {
+		let tags = TagKey::derive(secret, inbound);
+		Derived {named: tags.device_tag(), tags, device: Arc::new(keys::Device::derive(Proved(*secret), secret, inbound, device)), epochs: Mutex::default()}
+	}
 
 	/// The epoch tag of each of `epochs`, which are the three a table holds. Those of the epochs before are forgotten.
 	fn tags(&self, epochs: [u64; 3]) -> [[u8; 16]; 3] {
@@ -100,7 +110,7 @@ impl Derived {
 	}
 }
 
-/// The tag table of one inbound at one epoch (transports page, "How the node finds the device"): the epoch tags of the previous, the current and the next epoch of every transport secret of every device that may connect. It is built whole and swapped in whole.
+/// The tag table of one inbound at one epoch (transports page, "How the node finds the device"): of every transport secret of every device that may connect, the epoch tags of the previous, the current and the next epoch where the inbound has a `udp-obfs` transport, and the device tag where it has a transport that takes the stream proof. It is built whole and swapped in whole.
 pub struct Tags {
 	/// The epoch number the table was built in.
 	pub epoch: u64,
@@ -109,9 +119,21 @@ pub struct Tags {
 	pub collisions: usize,
 }
 
-/// What a `veilway` inbound with a `udp-obfs` transport holds for it.
+/// What opens the tokens of the stream proofs of one inbound: its node transport keys, and the node of `veilway_proto::proof` made with them. Making one draws 8,192 dummy keys, so it is handed from plan to plan for as long as the inbound's keys stay.
+pub struct Prover {pub keys: Vec<[u8; 32]>, pub node: proof::Node}
+
+impl Prover {
+	/// `inbound` is the WireGuard public key of the inbound and `keys` the private halves of its transport keys, which validation holds to one or two that differ.
+	pub fn new(keys: &[[u8; 32]], inbound: &[u8; 32]) -> anyhow::Result<Prover> {Ok(Prover {keys: keys.to_vec(), node: proof::Node::new(keys, inbound, &mut |bytes: &mut [u8]| SystemRandom::new().fill(bytes).map_err(|_| NoRandom)).map_err(|e| anyhow!("the node transport keys of an inbound cannot be used: {e}"))?})}
+}
+
+/// What a `veilway` inbound with an obfuscated transport holds for it.
 pub struct Native {
 	pub node: udp_obfs::Node,
+	/// Set for an inbound with a transport that takes the stream proof.
+	pub prover: Option<Arc<Prover>>,
+	/// Whether the inbound has a `udp-obfs` transport, whose opening packets name a device by an epoch tag.
+	epochs: bool,
 	/// The upper bounds of wide and of normal padding on what the node sends.
 	pub wide: u32,
 	pub normal: u32,
@@ -123,18 +145,20 @@ pub struct Native {
 
 impl Native {
 	/// `now` is the wall clock in Unix seconds, which decides the epochs of the first table.
-	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, now: u64) -> Native {
-		let native = Native {node: udp_obfs::Node::new(inbound), wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, table: keys::Table::new(), collisions: 0}))};
+	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, epochs: bool, prover: Option<Arc<Prover>>, now: u64) -> Native {
+		let native = Native {node: udp_obfs::Node::new(inbound), prover, epochs, wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, table: keys::Table::new(), collisions: 0}))};
 		native.swap(native.build(now));
 		native
 	}
 
 	/// The table for the epochs around `now`. It costs one HMAC for each tag that was not computed before, so it runs away from the packet path.
+	/// "Each entry knows which kind it is. A device tag is valid only in a stream proof and an epoch tag only on an opening packet": a kind of tag no transport of the inbound asks for is not in the table at all.
 	pub fn build(&self, now: u64) -> Tags {
 		let (epochs, mut table, mut collisions) = (udp_obfs::epochs(now), keys::Table::new(), 0);
 		for derived in &self.keys {
+			if self.prover.is_some() && !table.device(derived.named, derived.device.clone()) {collisions += 1}
 			// The first epochs of all time name the same epoch twice, and a tag is in the table once.
-			for (at, tag) in derived.tags(epochs).into_iter().enumerate() {
+			for (at, tag) in derived.tags(epochs).into_iter().enumerate().filter(|_| self.epochs) {
 				if !epochs[..at].contains(&epochs[at]) && !table.epoch(tag, derived.device.clone()) {collisions += 1}
 			}
 		}
@@ -407,15 +431,19 @@ impl Plan {
 		// What a secret gives is taken from the plan before where that has it for the same device under the same inbound key.
 		// The keys and the tags of a large inbound take a while to make. A plan is compiled on a thread of the runtime with a reload or a cut-off waiting for it, so the runtime is told that this thread is busy: its other work, every packet among it, goes to the other threads.
 		// A runtime of one thread has no other to give it to, and code that runs on none, a test or a harness, needs none.
-		let mut tables = || {
+		let mut tables = || -> anyhow::Result<()> {
 			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
 				let (public, mut was) = (inbounds[i].public_key, HashMap::new());
 				for derived in previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()).flat_map(|native| &native.keys) {was.insert((derived.device.public, derived.device.id.0), derived);}
 				let keys = devices.iter().filter(|device| device.inbounds.contains(&i)).flat_map(|device| device.secrets.iter().map(|secret| was.get(&(device.public_key, *secret)).map_or_else(|| Arc::new(Derived::new(secret, &public, &device.public_key)), |derived| (*derived).clone()))).collect();
-				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, now.unix_timestamp().max(0) as u64));
+				// The transport keys open tokens only where a transport of the inbound takes them. What opens them is the plan before's while the keys are the same keys in the same order.
+				let secret: Vec<[u8; 32]> = inbound.transport_keys.iter().flatten().filter(|_| inbound.proved()).map(|key| key.0).collect();
+				let prover = if secret.is_empty() {None} else if let Some(kept) = previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()?.prover.as_ref()).find(|kept| kept.keys == secret) {Some(kept.clone())} else {Some(Arc::new(Prover::new(&secret, &public)?))};
+				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, inbound.enveloped(), prover, now.unix_timestamp().max(0) as u64));
 			}
+			Ok(())
 		};
-		if Handle::try_current().is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread) {tokio::task::block_in_place(tables)} else {tables()}
+		(if Handle::try_current().is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread) {tokio::task::block_in_place(tables)} else {tables()})?;
 		let mut rules = Vec::new();
 		for rule in config.routing.rules.iter().filter(|rule| rule.enabled != Some(false)) {
 			rules.push(Rule {

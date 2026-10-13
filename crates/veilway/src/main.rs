@@ -72,7 +72,10 @@ enum Command {
 	/// Print the JSON Schema of config version 1
 	Schema,
 	/// Print a fresh private key and its public key
-	Genkey,
+	Genkey {
+		/// Make a node transport key for `transport_keys` of an inbound with a tls transport, and print the public half its profiles carry. It is no WireGuard key and never used as one
+		#[arg(long)] transport: bool,
+	},
 	/// Print a fresh transport secret for a device of a veilway inbound
 	Gensecret,
 	/// WireGuard over WebSocket bridge
@@ -154,7 +157,13 @@ async fn main() -> anyhow::Result<()> {
 	};
 	let bridge = Log {level: LogLevel::Info, destinations: true};
 	match Cli::parse().command {
-		Command::Genkey => {
+		Command::Genkey {transport: true} => {
+			let (private, public) = veilway_core::config::transport_key()?;
+			println!("transport_key:        {private}");
+			println!("transport_public_key: {public}");
+			Ok(())
+		}
+		Command::Genkey {transport: false} => {
 			let private = veilway_wg::generate_key();
 			println!("private_key: {}", veilway_wg::encode_key(&private));
 			println!("public_key:  {}", veilway_wg::encode_key(&veilway_wg::public_key(&private)));

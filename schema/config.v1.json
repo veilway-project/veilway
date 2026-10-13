@@ -132,6 +132,23 @@
         }
       ]
     },
+    "Decoy": {
+      "additionalProperties": false,
+      "description": "The decoy origin of a stream listener: the operator's own web server, which answers everyone who is not a user.",
+      "properties": {
+        "origin": {
+          "$ref": "#/$defs/Origin"
+        },
+        "proxy_protocol": {
+          "description": "Whether the node sends the PROXY protocol header, version 2, at the start of every connection to the origin. Defaults to false.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "origin"
+      ],
+      "type": "object"
+    },
     "Device": {
       "additionalProperties": false,
       "properties": {
@@ -438,6 +455,16 @@
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
           "type": "string"
         },
+        "transport_keys": {
+          "description": "The node transport keys, private halves: one, or two while the key is rotated. Needed by an inbound with a `tls` transport. Profiles carry the public half of the first.",
+          "items": {
+            "$ref": "#/$defs/TransportKey"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
         "transports": {
           "items": {
             "$ref": "#/$defs/Transport"
@@ -449,6 +476,21 @@
         },
         "type": {
           "$ref": "#/$defs/InboundType"
+        },
+        "upgrade_cookie": {
+          "description": "The name of the cookie on the upgrade answer of a `tls` transport. It has no default and carries no meaning: its value is random text of a random length.",
+          "pattern": "^[A-Za-z0-9_-]{1,32}$",
+          "type": "string"
+        },
+        "upgrade_headers": {
+          "description": "The header fields the upgrade answer takes from the decoy origin, in this order. Defaults to `Server`, `Date` for a `tls` transport.",
+          "items": {
+            "pattern": "^[A-Za-z0-9-]{1,64}$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
@@ -537,6 +579,11 @@
         "information",
         "warning"
       ],
+      "type": "string"
+    },
+    "Origin": {
+      "description": "an http:// URL of the operator's own web server with nothing behind the host and port, such as http://127.0.0.1:8080. This build has no https:// origin",
+      "pattern": "^http://([a-z0-9.-]{1,253}|\\[[0-9A-Fa-f:.]+\\])(:[1-9][0-9]{0,4})?/?$",
       "type": "string"
     },
     "OtherPolicy": {
@@ -1084,17 +1131,78 @@
             "listen"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The native WebSocket session inside TLS that the node ends itself, for a `veilway` inbound. Whoever is not a user is relayed to `decoy.origin`.",
+          "properties": {
+            "decoy": {
+              "$ref": "#/$defs/Decoy"
+            },
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "description": "The path a proof arrives on, which the origin must serve nothing at.",
+              "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+              "type": "string"
+            },
+            "tls": {
+              "$ref": "#/$defs/Tls"
+            },
+            "type": {
+              "const": "tls",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path",
+            "tls",
+            "decoy"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "TransportKey": {
+      "description": "a transport key: 44 characters of standard base64 with padding",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "type": "string"
     },
     "TransportLimits": {
       "additionalProperties": false,
       "description": "Node capacity numbers of one listener (transports page, \"Numbers that are judgement calls\").",
       "properties": {
+        "relayed": {
+          "description": "Connections of a stream listener that are relayed to the decoy origin. Defaults to 1024.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
         "sessions": {
           "description": "Established sessions the listener holds at once. Defaults to 16384.",
           "format": "uint32",
           "maximum": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "undecided": {
+          "description": "Connections of a stream listener that have not sent their request line yet. Defaults to 512.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "undecided_per_source": {
+          "description": "How many of those one source may have. A source is an IPv4 address or an IPv6 /64. Defaults to 64.",
+          "format": "uint32",
+          "maximum": 65536,
           "minimum": 1,
           "type": "integer"
         }

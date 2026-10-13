@@ -529,6 +529,79 @@ async fn the_servers_of_every_dns_set_have_their_own_lines() {
 }
 
 /// Writes the replay file a node leaves that was killed with this floor and this limit.
+/// A web server that answers a request for its page with the status line `page`, and one for any other path with `other`, or never when that is None.
+async fn web(page: &'static str, other: Option<&'static str>) -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		while let Ok((mut stream, _)) = listener.accept().await {
+			tokio::spawn(async move {
+				let (mut head, mut read) = (Vec::new(), [0u8; 1024]);
+				while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+					match stream.read(&mut read).await {
+						Ok(count) if count > 0 => head.extend_from_slice(&read[..count]),
+						_ => return,
+					}
+				}
+				let Some(status) = (if head.starts_with(b"GET / ") {Some(page)} else {other}) else {return tokio::time::sleep(std::time::Duration::from_secs(60)).await};
+				let _ = stream.write_all(format!("HTTP/1.1 {status}\r\nServer: fake/1.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await;
+			});
+		}
+	});
+	addr
+}
+
+/// Transports page, "What the decoy origin must be": "The origin must also not send the transport path back to the node by a rule of its own. `veilway doctor` checks this by a request", and "the origin must not serve anything at a transport path".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_decoy_origin_of_a_tls_transport_is_asked_for_its_page_and_for_the_path() {
+	let (dir, server, listen, path) = (scratch("decoy"), dns(true).await, free(), "/assets/doctor-9c41b7.js");
+	certificate(&dir, "node", -1, 90);
+	config(&dir, &[server], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let written: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+	// What doctor says of the two decoy lines for a config whose origin is `origin`, after `change` had its way with the document.
+	let asked = |origin: SocketAddr, change: &dyn Fn(&mut Value)| {
+		let mut document = written.clone();
+		(document["inbounds"][0]["type"], document["inbounds"][0]["transport_keys"], document["inbounds"][0]["upgrade_cookie"], document["users"][0]["devices"][0]["transport_secrets"]) = (json!("veilway"), json!([veilway_wg::encode_key(&[0x51; 32])]), json!("sid"), json!([veilway_wg::encode_key(&[0xa1; 32])]));
+		document["inbounds"][0]["transports"] = json!([{"type": "tls", "listen": listen.to_string(), "path": path, "tls": {"cert": "node.crt", "key": "node.key"}, "decoy": {"origin": format!("http://{origin}")}}]);
+		change(&mut document);
+		private(&dir, "config.json", &document.to_string());
+		let dir = dir.clone();
+		async move {
+			let (_, printed, _) = doctor(&dir, &["--json"]).await;
+			let document: Value = serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {printed}"));
+			// The path is a secret of the subscription: doctor sends it to the origin and prints it nowhere.
+			assert!(!printed.contains(path), "{printed}");
+			let message = |part: &str| document["checks"].as_array().unwrap().iter().find(|line| line["check"] == "decoy" && line["subject"].as_str().unwrap().ends_with(part)).map(|line| line["message"].as_str().unwrap().to_string()).unwrap_or_default();
+			((status(&document, "decoy", "inbound home, transports[0].decoy, origin").to_string(), message("origin")), (status(&document, "decoy", "inbound home, transports[0].decoy, path").to_string(), message("path")), (status(&document, "certificate", "inbound home, transports[0].tls").to_string(), status(&document, "listen", &format!("inbound home, transports[0], tcp {listen}")).to_string()))
+		}
+	};
+	// A site that has its page and misses the path, which is what a decoy origin is.
+	let ((origin, _), (missed, _), files) = asked(web("200 OK", Some("404 Not Found")).await, &|_| {}).await;
+	assert_eq!((origin.as_str(), missed.as_str(), files), ("ok", "ok", ("ok".to_string(), "ok".to_string())));
+	// One that serves something at the path, one that hands the path on and gets an error from where it handed it, and one that never answers for it.
+	let ((_, _), (served, message), _) = asked(web("200 OK", Some("200 OK")).await, &|_| {}).await;
+	assert!(served == "warn" && message.contains("must serve nothing there"), "{served}: {message}");
+	let ((_, _), (handed, message), _) = asked(web("200 OK", Some("502 Bad Gateway")).await, &|_| {}).await;
+	assert!(handed == "fail" && message.contains("goes round between the two"), "{handed}: {message}");
+	let ((origin, _), (silent, message), _) = asked(web("200 OK", None).await, &|_| {}).await;
+	assert!(origin == "ok" && silent == "fail" && message.contains("gave no answer for the path"), "{origin} {silent}: {message}");
+	// A field of `upgrade_headers` the origin does not send is named, and one it sends is not.
+	let ((named, message), (missed, _), _) = asked(web("200 OK", Some("404 Not Found")).await, &|document| document["inbounds"][0]["upgrade_headers"] = json!(["X-Absent", "Server", "Date"])).await;
+	assert!(named == "warn" && missed == "ok" && message.contains("did not send X-Absent,") && !message.contains("Server"), "{named}: {message}");
+	// The line of the page says which `Host` the request carried, and the line of the path that the origin's log has it now.
+	let ((_, page), (_, logged), _) = asked(web("200 OK", Some("404 Not Found")).await, &|_| {}).await;
+	assert!(page.contains("`Host: 127.0.0.1:") && logged.contains("in the origin's access log"), "{page} / {logged}");
+	// A plain listener that sends everyone to `https://` is a redirect for ever behind the node's TLS. One that redirects within plain HTTP is not.
+	let ((secure, message), _, _) = asked(web("301 Moved Permanently\r\nLocation: HTTPS://site.example/", Some("404 Not Found")).await, &|_| {}).await;
+	assert!(secure == "warn" && message.contains("without the redirect"), "{secure}: {message}");
+	let ((plain, _), _, _) = asked(web("302 Found\r\nLocation: http://site.example/home", Some("404 Not Found")).await, &|_| {}).await;
+	assert_eq!(plain, "ok");
+	// Nobody there: strangers would be closed with no answer, and the line says that users are not.
+	let ((down, message), (skipped, _), _) = asked(free(), &|_| {}).await;
+	assert!(down == "fail" && skipped == "skipped" && message.contains("Users are not affected"), "{down} {skipped}: {message}");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn replay(dir: &Path, floor: u64, limit: u64) {
 	let body = [&b"VWREPLAY"[..], &1u32.to_be_bytes(), &[0; 4], &floor.to_be_bytes(), &limit.to_be_bytes(), &0u32.to_be_bytes()].concat();
 	std::fs::write(dir.join("veilway-replay"), [&body[..], ring::digest::digest(&ring::digest::SHA256, &body).as_ref()].concat()).unwrap();

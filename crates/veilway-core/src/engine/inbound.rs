@@ -5,7 +5,7 @@ use super::netstack::Fit;
 use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
 use super::obfs::{self, Room};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
-use super::{control, flows, gate, l3, resolver, Over, Shared};
+use super::{control, flows, gate, l3, resolver, stream, Over, Shared};
 use crate::config::Protocol;
 use ipstack::{IpStack, IpStackStream};
 use std::io;
@@ -26,21 +26,25 @@ const UNSENT_EVERY: Duration = Duration::from_secs(60);
 const TCP_FLAGS: usize = 13;
 const FIN_OR_RST: u8 = 0x05;
 
-/// How a peer's last authenticated datagram reached its tunnel, which is the way replies leave: a socket that carries WireGuard as it is, or a `udp-obfs` session on a socket. Nothing leaves once the transport, or the session, is gone.
+/// How a peer's last authenticated datagram reached its tunnel, which is the way replies leave: a socket that carries WireGuard as it is, a `udp-obfs` session on a socket, or the session of a stream transport on its connection. Nothing leaves once the transport, or the session, is gone.
 #[derive(Clone)]
-pub enum Via {None, Socket(Weak<UdpSocket>, Over), Obfs(Weak<UdpSocket>, Weak<obfs::Session>)}
+pub enum Via {None, Socket(Weak<UdpSocket>, Over), Obfs(Weak<UdpSocket>, Weak<obfs::Session>), Stream(Weak<stream::Session>)}
 
 /// A way to a peer that is there right now.
 #[derive(Clone)]
-pub enum Route {Socket(Arc<UdpSocket>, SocketAddr), Obfs(Arc<UdpSocket>, Arc<obfs::Session>)}
+pub enum Route {Socket(Arc<UdpSocket>, SocketAddr), Obfs(Arc<UdpSocket>, Arc<obfs::Session>), Stream(Arc<stream::Session>)}
 
 impl Route {
-	/// Sends one WireGuard datagram. `control` says it holds a control channel packet, which a `udp-obfs` session pads wide like a handshake message (transports page, "Padding", rule 2), and `room` how large the session may make its packet.
-	/// `tunnel` is the peer's, which counts a datagram no socket took.
+	/// Whether what leaves this way travels in chunks, whose padding goes by what a datagram holds.
+	pub fn padded(&self) -> bool {!matches!(self, Route::Socket(..))}
+
+	/// Sends one WireGuard datagram. `control` says it holds a control channel packet, which a session of an obfuscated transport pads wide like a handshake message (transports page, "Padding", rule 2), and `room` how large a `udp-obfs` session may make its packet.
+	/// `tunnel` is the peer's, which counts a datagram no socket took. A stream session never waits: its connection has a queue, and a datagram the queue has no room for is dropped and counted.
 	pub async fn send(&self, tunnel: &Arc<Tunnel>, datagram: &[u8], control: bool, room: Room) {
 		match self {
 			Route::Socket(socket, to) => tunnel.sent(socket.send_to(datagram, *to).await),
 			Route::Obfs(socket, session) => session.send(tunnel, socket, datagram, control, room).await,
+			Route::Stream(session) => session.push(datagram, control),
 		}
 	}
 
@@ -49,6 +53,7 @@ impl Route {
 		match self {
 			Route::Socket(socket, to) => tunnel.sent(socket.try_send_to(datagram, *to)),
 			Route::Obfs(socket, session) => if let Some(sealed) = session.seal(Some(datagram), control, Room::Inbound) {tunnel.sent(socket.try_send_to(&sealed, session.source))},
+			Route::Stream(session) => session.push(datagram, control),
 		}
 	}
 }
@@ -81,6 +86,7 @@ impl Peers {
 			Via::None => None,
 			Via::Socket(socket, _) => socket.upgrade().zip(self.wg.endpoint(peer)).map(|(socket, to)| Route::Socket(socket, to)),
 			Via::Obfs(socket, session) => socket.upgrade().zip(session.upgrade().filter(|session| session.live())).map(|(socket, session)| Route::Obfs(socket, session)),
+			Via::Stream(session) => session.upgrade().filter(|session| session.live()).map(Route::Stream),
 		}
 	}
 
@@ -90,6 +96,7 @@ impl Peers {
 			Via::None => None,
 			Via::Socket(socket, over) => (socket.strong_count() > 0).then_some(*over),
 			Via::Obfs(socket, session) => (socket.strong_count() > 0 && session.upgrade().is_some_and(|session| session.live())).then_some(Over::UdpObfs),
+			Via::Stream(session) => session.upgrade().filter(|session| session.live()).map(|session| session.over),
 		}
 	}
 }
@@ -151,7 +158,7 @@ impl Shared {
 		self.spend(&plan.users[device.user], false, packet.len());
 		inbound.traffic.down(packet.len());
 		// What the control channel sends is a TCP segment from the gateway's control port.
-		let control = matches!(route, Route::Obfs(..)) && netstack::parse(packet).is_some_and(|parsed| parsed.protocol == Protocol::TCP && parsed.sport == PORT && plan.control(to.inbound, parsed.src));
+		let control = route.padded() && netstack::parse(packet).is_some_and(|parsed| parsed.protocol == Protocol::TCP && parsed.sport == PORT && plan.control(to.inbound, parsed.src));
 		for datagram in &out {route.send(&inbound.tunnel, datagram, control, room).await}
 		packet.len()
 	}

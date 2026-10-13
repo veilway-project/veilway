@@ -2,4 +2,4 @@
 pub mod config;
 pub mod engine;
 
-pub use engine::{start, ControlTotals, Counters, CutOff, Denied, DnsTotals, Engine, Event, ExitHealth, ObfsTotals, Options, Over, Peer, Reason, ReplayStatus, Reset, Stage, Totals, Usage};
+pub use engine::{start, ControlTotals, Counters, CutOff, Denied, DnsTotals, Engine, Event, ExitHealth, ObfsTotals, Options, Over, Peer, Reason, ReplayStatus, Reset, Stage, StreamTotals, Totals, Usage};

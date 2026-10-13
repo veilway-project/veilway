@@ -1002,6 +1002,9 @@
             "minimum": 0,
             "type": "integer"
           },
+          "stream": {
+            "$ref": "#/components/schemas/Stream"
+          },
           "udp_obfs": {
             "$ref": "#/components/schemas/UdpObfs"
           },
@@ -1043,6 +1046,7 @@
           "send_failed",
           "control",
           "udp_obfs",
+          "stream",
           "replay"
         ],
         "type": "object"
@@ -1101,6 +1105,318 @@
         ],
         "type": "object"
       },
+      "Stream": {
+        "description": "What the stream listeners of the `tls` transports did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending` and `sessions` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key.",
+        "properties": {
+          "accept_failed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "accepted": {
+            "description": "Connections the listeners took from the system, and failures to take one, which is what a host that is out of file descriptors shows.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "broken": {
+            "description": "Connections that broke before they were decided, with an error that is no close: a reset inside the request line, or a connection whose own address could not be read.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "chunks_sent": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "decoy_down": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_closed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_deadline": {
+            "description": "Sessions that ended, by reason: no WireGuard packet within 10 seconds of the proof, no chunk for 300 seconds, every chunk number used, the device's ninth session, a device or transport secret the config no longer has, a connection that closed or a peer that closed the session, a chunk that did not open or a frame the protocol does not allow, and a transport the config no longer has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_displaced": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_idle": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_invalid": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_revoked": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_unserved": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "establish_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "established": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshake_displaced": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshake_failed": {
+            "description": "TLS handshakes that failed, that did not finish within 10 seconds, and that were closed to make room in the undecided pool.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshake_slow": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshakes": {
+            "description": "Inside sessions: handshake initiations above a session's allowance, datagrams WireGuard did not take as a packet of the session's device, datagrams for a device that were dropped because the send queue of its connection held 256, and chunks the node sent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "head_refused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending": {
+            "description": "Sessions whose proof was accepted and on which WireGuard has not authenticated yet, right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "proofs_accepted": {
+            "description": "Proofs that were accepted, proofs that waited for the write of a higher limit, users whose request head was over a limit or no WebSocket upgrade, sessions that became established, and sessions that could not because the session pool had filled up since their proof.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "proofs_waited": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queue_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_cache_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_device_rate": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_floor": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_limit": {
+            "description": "A timestamp above the written limit whose write did not end within 2 seconds or for which 64 other proofs waited already, and proofs that came while the node took none at all.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_no_replay": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_pending": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_pool": {
+            "description": "By a limit: the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_seen": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_source_rate": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_window": {
+            "description": "Proofs of a device that were refused all the same, each of which took the decoy path too. By the replay rule: a timestamp outside the window of 60 seconds, at or below the floor, a token that was accepted before, and any while the cache is full.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relayed": {
+            "description": "Connections that are relayed to a decoy origin right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relays": {
+            "description": "Connections that were connected to a decoy origin and relayed, relayed connections that were closed to make room for another, and strangers that were closed with no answer because the origin could not be reached. While `decoy_down` grows the node can be told from its decoy.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relays_evicted": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions": {
+            "description": "Established sessions right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_closed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_displaced": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_origin": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_proof": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_slow": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stranger_syntax": {
+            "description": "Connections decided \"not a user\", by the class of the reason: a byte that cannot be part of a user's request line or a line above 4,096 bytes, `stranger_syntax`. A line that was not complete within 10 seconds, `stranger_slow`. A peer that closed its side first, `stranger_closed`. A connection decided at once to make room in the undecided pool, `stranger_displaced`. A connection whose decoy origin said something or closed while the request line was not complete, `stranger_origin`. A complete request line that is no proof of a device, `stranger_proof`, which is where a wrong path, a wrong token and a removed device are counted alike.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tunnel": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "undecided": {
+            "description": "Connections that have not been decided yet, right now: inside their TLS handshake or their request line.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upgrade_learn_failed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "upgrade_learned": {
+            "description": "How often the header fields of the upgrade answer were learnt from a decoy origin, and how often that failed. While the last try failed, the upgrade answer carries only `Date` of `upgrade_headers`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "undecided",
+          "relayed",
+          "pending",
+          "sessions",
+          "accepted",
+          "accept_failed",
+          "broken",
+          "handshake_failed",
+          "handshake_slow",
+          "handshake_displaced",
+          "stranger_syntax",
+          "stranger_slow",
+          "stranger_closed",
+          "stranger_displaced",
+          "stranger_origin",
+          "stranger_proof",
+          "refused_window",
+          "refused_floor",
+          "refused_seen",
+          "refused_cache_full",
+          "refused_limit",
+          "refused_no_replay",
+          "refused_pool",
+          "refused_pending",
+          "refused_device_rate",
+          "refused_source_rate",
+          "relays",
+          "relays_evicted",
+          "decoy_down",
+          "proofs_accepted",
+          "proofs_waited",
+          "head_refused",
+          "established",
+          "establish_full",
+          "handshakes",
+          "tunnel",
+          "queue_full",
+          "chunks_sent",
+          "ended_deadline",
+          "ended_idle",
+          "ended_packets",
+          "ended_displaced",
+          "ended_revoked",
+          "ended_closed",
+          "ended_invalid",
+          "ended_unserved",
+          "upgrade_learned",
+          "upgrade_learn_failed"
+        ],
+        "type": "object"
+      },
       "Traffic": {
         "description": "Inner IP packets and their bytes since the node first knew the name. Up is from the device into the node.",
         "properties": {
@@ -1137,7 +1453,8 @@
         "enum": [
           "udp",
           "ws",
-          "udp-obfs"
+          "udp-obfs",
+          "tls"
         ],
         "type": "string"
       },

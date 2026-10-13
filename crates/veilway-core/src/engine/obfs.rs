@@ -3,54 +3,35 @@
 //! Whatever is not a valid packet for this node gets silence: nothing is sent, nothing is logged, and a counter says why.
 //! Time is the node's wall clock, which a test moves. A clock that steps back lets a session live at most one more of its own time limits, and one that steps ahead ends sessions early, whose clients open new ones.
 use super::inbound::{Peers, Tunnel, Via};
-use super::plan::{Derived, Native, Plan, Proved};
+use super::limits::{self, Handshakes, Initiation, Seat, Seated, Spent, ENDS};
+pub use super::limits::{Clock, Ended, DEVICE_PROOFS, DEVICE_SESSIONS, MAX_SOURCES, SESSION_HANDSHAKES};
+use super::plan::{Derived, Native, Plan};
 use super::replay::{self, Guard};
 use super::Shared;
-use crate::config::{ProofRate, DEFAULT_PROOFS_PER_SOURCE};
-use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
-use time::OffsetDateTime;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use veilway_proto::chunk::{ChunkError, Padding};
 use veilway_proto::replay::{Decision, Refusal, WRITE_DEADLINE};
-use veilway_proto::session::{self, Transport, ECHO, FIRST_PACKET, LONE_KEEPALIVE, PENDING};
+use veilway_proto::session::{self, Transport, ECHO, LONE_KEEPALIVE};
 use veilway_proto::udp_obfs::{self, Receiver, Sender, DATA_MIN, OLD_READABLE, OVERHEAD, SOURCE_SESSIONS};
 use veilway_proto::NoRandom;
 use veilway_wg::{Wg, MAX_PACKET};
 
-/// "Sessions per device: 8." A device at this limit replaces its own oldest session once the new one is established.
-pub const DEVICE_SESSIONS: usize = 8;
-/// "Accepted proofs per device: burst 16, then 1 a second."
-pub const DEVICE_PROOFS: ProofRate = ProofRate {burst: 16, rate: 1};
-/// "WireGuard handshake initiations per session: burst 3, then 1 a second."
-pub const SESSION_HANDSHAKES: ProofRate = ProofRate {burst: 3, rate: 1};
-/// How many sources the node keeps a rate for at once. A source is in the table only after a proof of a device was accepted from it, and leaves when its allowance is whole again, so only devices of the config fill it. When it is full, a proof from a source that is not in it is refused.
-pub const MAX_SOURCES: usize = 65536;
 /// How many opening packets a listener keeps at once for the write of a higher limit, each for the write deadline at the most. Only a packet that a device in the tag table sealed is kept, and the largest is about 16 kB.
 pub const HELD: usize = 64;
-/// How many of the handshake initiations a session took to WireGuard it remembers, to drop one of them that comes again without charging the session's allowance.
-const INITIATIONS: usize = 8;
 /// How many echoes of one session wait for their delay at once. A device sends an idle keepalive every 10 seconds at the most, and an echo waits 3 at the most.
 const MAX_ECHOES: u8 = 4;
 /// A tag table that is swapped in later than this after its epoch began is counted and logged as late. The table before it holds the tags of the new epoch too, so nobody is refused for it until a whole epoch has passed.
 pub const LATE: u64 = 10;
 /// How often the task of `tables` looks whether the epoch has changed.
 const TABLE_EVERY: Duration = Duration::from_millis(250);
-
-/// The node's clock as a listener reads it: Unix time in milliseconds for its timers and in seconds for the replay rule.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Clock {pub ms: i64, pub secs: u64}
-
-impl Clock {
-	pub fn of(now: OffsetDateTime) -> Clock {Clock {ms: (now.unix_timestamp_nanos() / 1_000_000) as i64, secs: replay::seconds(now)}}
-}
 
 /// How large a session may make the packet around one datagram.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,28 +79,10 @@ pub enum Dropped {
 	Unsendable,
 }
 
-/// Why a session ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ended {
-	/// No WireGuard packet of its device authenticated within the first tunnel packet deadline.
-	Deadline,
-	/// No activity for the idle time of the transport.
-	Idle,
-	/// The node sent 2^31 packets on it.
-	Packets,
-	/// A newer session of the same source and device took its place: a pending one at once, an established one after it stayed readable for 10 s.
-	Replaced,
-	/// Its device was at its session limit and established another.
-	Displaced,
-	/// The config no longer has its device as it was, or the transport secret it was opened with.
-	Revoked,
-}
-
 const DROPS: usize = Dropped::Unsendable as usize + 1;
-const ENDS: usize = Ended::Revoked as usize + 1;
 
 #[derive(Default)]
-struct Counters {dropped: [AtomicU64; DROPS], ended: [AtomicU64; ENDS], opened: AtomicU64, established: AtomicU64, sent: AtomicU64, waited: AtomicU64, spent: AtomicU64, rebuilds: AtomicU64, late: AtomicU64, failed: AtomicU64, collisions: AtomicU64}
+struct Counters {dropped: [AtomicU64; DROPS], ended: Arc<[AtomicU64; ENDS]>, opened: AtomicU64, established: AtomicU64, sent: AtomicU64, waited: AtomicU64, spent: AtomicU64, rebuilds: AtomicU64, late: AtomicU64, failed: AtomicU64, collisions: AtomicU64}
 
 /// What the `udp-obfs` listeners did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -172,47 +135,15 @@ pub struct ObfsTotals {
 
 fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| NoRandom)}
 
-/// An allowance of `burst` at once and `rate` a second, in thousandths.
-struct Bucket {left: u64, at: i64}
-
-impl Bucket {
-	fn full(of: ProofRate, now: i64) -> Bucket {Bucket {left: u64::from(of.burst) * 1000, at: now}}
-
-	/// Fills up for the time since it was last looked at. A clock that stepped back fills nothing.
-	fn fill(&mut self, of: ProofRate, now: i64) -> &mut Bucket {
-		(self.left, self.at) = (self.left.saturating_add((now.saturating_sub(self.at).max(0) as u64).saturating_mul(u64::from(of.rate))).min(u64::from(of.burst) * 1000), now);
-		self
-	}
-
-	fn has(&self) -> bool {self.left >= 1000}
-
-	/// Spends one, when there is one.
-	fn take(&mut self) -> bool {
-		let has = self.has();
-		if has {self.left -= 1000}
-		has
-	}
-
-	fn whole(&self, of: ProofRate) -> bool {self.left >= u64::from(of.burst) * 1000}
-}
-
-const WAITING: u8 = 0;
-const LIVE: u8 = 1;
-const RETIRED: u8 = 2;
-const OVER: u8 = 3;
-
 /// One `udp-obfs` association: a source address and port, a device, and the two keys its opening packet gave.
 pub struct Session {
 	pub source: SocketAddr,
 	/// The WireGuard public key of the device the opening packet named. Only its packets are read on the session.
 	pub device: [u8; 32],
-	secret: Proved,
+	/// The session as the node's limits know it: pending until a WireGuard packet of the device has authenticated on it, then established: live, or retired when a newer session of the same source and device took over and it is only still readable.
+	seat: Arc<Seat>,
 	receiver: Mutex<Receiver>,
 	sender: Mutex<Sender>,
-	/// Pending until a WireGuard packet of the device has authenticated on it, then established: live, or retired when a newer session of the same source and device took over and it is only still readable.
-	phase: AtomicU8,
-	/// The established sessions of the listener it belongs to.
-	pool: Arc<AtomicI64>,
 	counters: Arc<Counters>,
 	/// The size of the opening packet: "The first answer is no larger than the opening packet it answers."
 	budget: usize,
@@ -220,35 +151,23 @@ pub struct Session {
 	/// The inbound's `mtu`, and the MTU the device was last sent a packet by, which is less when the device set one on the control channel. What WireGuard sends by itself is padded within that one too.
 	mtu: u16,
 	path: AtomicU16,
-	/// When the proof was accepted and when the session was last active, in Unix milliseconds, and when it became established.
-	opened: AtomicI64,
-	active: AtomicI64,
-	since: AtomicI64,
 	sent: AtomicU64,
 	/// Echoes that wait for their delay to pass, `MAX_ECHOES` at most.
 	echoes: AtomicU8,
-	/// The allowance of handshake initiations, and the hashes of the last `INITIATIONS` the session took to WireGuard. One of those again is a recorded packet, which WireGuard would drop as a repeat: it is dropped here first, and costs the device's allowance nothing.
-	handshakes: Mutex<(Bucket, VecDeque<[u8; 32]>)>,
+	handshakes: Handshakes,
 }
 
 impl Session {
-	fn phase(&self) -> u8 {self.phase.load(Ordering::Acquire)}
-
 	/// Established and the one its device is answered on.
-	pub fn live(&self) -> bool {self.phase() == LIVE}
+	pub fn live(&self) -> bool {self.seat.live()}
 
-	fn over(&self) -> bool {self.phase() == OVER}
+	fn over(&self) -> bool {self.seat.over()}
 
 	/// How many packets the node has sent on it.
 	pub fn sent(&self) -> u64 {self.sent.load(Ordering::Relaxed)}
 
 	/// Ends the session, once. It is taken out of its listener's table at that listener's next sweep, and nothing is read or sent on it from here on.
-	fn end(&self, why: Ended) {
-		let was = self.phase.swap(OVER, Ordering::AcqRel);
-		if was == OVER {return}
-		if was != WAITING {self.pool.fetch_sub(1, Ordering::Relaxed);}
-		self.counters.ended[why as usize].fetch_add(1, Ordering::Relaxed);
-	}
+	fn end(&self, why: Ended) {self.seat.end(why)}
 
 	/// Sends one WireGuard datagram the node has for the session's device. "A chunk that would hold exactly one WireGuard keepalive is held back for the lone keepalive delay": on a datagram transport a chunk holds one datagram, so the keepalive leaves by itself when the delay is over.
 	/// WireGuard makes a keepalive for a peer once in several seconds at the most, so no more of them wait at once than there are sessions.
@@ -266,7 +185,7 @@ impl Session {
 	/// "The node sends nothing on a pending session", and the first packet it sends on an established one is the first answer, which is no larger than the opening packet: a datagram that does not fit that goes unsent and a padding-only packet takes its place.
 	/// `wide` says the datagram holds a control channel packet. A WireGuard handshake message is padded wide whatever it says.
 	pub fn seal(&self, datagram: Option<&[u8]>, wide: bool, room: Room) -> Option<Vec<u8>> {
-		if !matches!(self.phase(), LIVE | RETIRED) {return None}
+		if !self.seat.established() {return None}
 		let (handshake, needed, mut out) = (datagram.is_some_and(|datagram| matches!(datagram.first(), Some(1 | 2))), datagram.map_or(DATA_MIN, |datagram| datagram.len() + 2 + DATA_MIN), Vec::new());
 		let mut sender = self.sender.lock().unwrap_or_else(|e| e.into_inner());
 		let first = !self.answered.swap(true, Ordering::AcqRel);
@@ -328,42 +247,9 @@ pub struct Listener {
 	held: Mutex<VecDeque<(SocketAddr, Vec<u8>, i64)>>,
 }
 
-/// What a device has across every listener: its allowance of accepted proofs, its allowance of proofs that a limit refused and that are recorded as spent all the same, and its sessions.
-struct Account {proofs: Bucket, refused: Bucket, sessions: Vec<Weak<Session>>}
-
-impl Account {
-	fn new(now: i64) -> Account {Account {proofs: Bucket::full(DEVICE_PROOFS, now), refused: Bucket::full(DEVICE_PROOFS, now), sessions: Vec::new()}}
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum Source {V4([u8; 4]), V6([u8; 8])}
-
-impl Source {
-	/// "A source is an IPv4 address or an IPv6 /64."
-	fn of(ip: IpAddr) -> Source {
-		match ip {
-			IpAddr::V4(v4) => Source::V4(v4.octets()),
-			IpAddr::V6(v6) => Source::V6(std::array::from_fn(|at| v6.octets()[at])),
-		}
-	}
-}
-
+/// What every `udp-obfs` listener of the node shares: the counters, and the way to each of them. The limits per device and per source are the node's and every native transport's, see `limits`.
 #[derive(Default)]
-struct Limits {devices: HashMap<[u8; 32], Account>, sources: HashMap<Source, Bucket>}
-
-/// What every `udp-obfs` listener of the node shares: the limits per device and per source, which are the node's and not a listener's, and the counters.
-pub struct State {
-	listeners: Mutex<Vec<Weak<Listener>>>,
-	limits: Mutex<Limits>,
-	counters: Arc<Counters>,
-	/// `replay.per_source` of the config in force.
-	burst: AtomicU32,
-	rate: AtomicU32,
-}
-
-impl Default for State {
-	fn default() -> State {State {listeners: Mutex::default(), limits: Mutex::default(), counters: Arc::default(), burst: AtomicU32::new(DEFAULT_PROOFS_PER_SOURCE.burst), rate: AtomicU32::new(DEFAULT_PROOFS_PER_SOURCE.rate)}}
-}
+pub struct State {listeners: Mutex<Vec<Weak<Listener>>>, counters: Arc<Counters>}
 
 /// Buffers one reader keeps between datagrams, and what the last datagram left in them: `out` is what to send to its source, in order, and `ip` the IP packets that came out of the tunnel.
 #[derive(Default)]
@@ -384,8 +270,6 @@ impl State {
 		None
 	}
 
-	fn limits(&self) -> MutexGuard<'_, Limits> {self.limits.lock().unwrap_or_else(|e| e.into_inner())}
-
 	fn listeners(&self) -> Vec<Arc<Listener>> {
 		let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
 		listeners.retain(|listener| listener.strong_count() > 0);
@@ -399,26 +283,10 @@ impl State {
 		listener
 	}
 
-	/// `replay.per_source` of a config that is put in force.
-	pub fn per_source(&self, of: ProofRate) {
-		self.burst.store(of.burst, Ordering::Relaxed);
-		self.rate.store(of.rate, Ordering::Relaxed);
-	}
-
-	/// Once a second: every session whose time is over ends, what has ended leaves the tables, and an allowance that is whole again is forgotten.
+	/// Once a second, after `limits::State::sweep` has ended every session whose time is over: what has ended leaves the tables, and an opening packet that waited too long is dropped.
 	pub fn sweep(&self, now: Clock) {
 		for listener in self.listeners() {
 			listener.sessions().retain(|_, slots| {
-				for slot in slots.iter_mut() {
-					// A clock that stepped back must not keep a session for as long as it stepped: the session's times are brought back with it.
-					for session in [slot.pending.as_ref(), slot.live.as_ref(), slot.old.as_ref().map(|(session, _)| session)].into_iter().flatten() {
-						session.opened.fetch_min(now.ms, Ordering::Relaxed);
-						session.active.fetch_min(now.ms, Ordering::Relaxed);
-						// "A pending session that is not established within the first tunnel packet deadline is ended", and "the node ends a session with no activity for 180 s".
-						if session.phase() == WAITING && now.ms - session.opened.load(Ordering::Relaxed) >= FIRST_PACKET.as_millis() as i64 {session.end(Ended::Deadline)}
-						if session.phase() != WAITING && now.ms - session.active.load(Ordering::Relaxed) >= Transport::UdpObfs.idle().as_millis() as i64 {session.end(Ended::Idle)}
-					}
-				}
 				slots.retain_mut(|slot| slot.tidy(now.ms));
 				!slots.is_empty()
 			});
@@ -428,30 +296,6 @@ impl State {
 			held.retain(|(.., came)| now.ms.saturating_sub(*came) < WRITE_DEADLINE.as_millis() as i64);
 			self.counters.dropped[Dropped::Limit as usize].fetch_add((kept - held.len()) as u64, Ordering::Relaxed);
 		}
-		let (mut limits, of) = (self.limits(), ProofRate {burst: self.burst.load(Ordering::Relaxed), rate: self.rate.load(Ordering::Relaxed)});
-		limits.devices.retain(|_, account| {
-			account.sessions.retain(|session| session.upgrade().is_some_and(|session| !session.over()));
-			!account.sessions.is_empty() || !account.proofs.fill(DEVICE_PROOFS, now.ms).whole(DEVICE_PROOFS) || !account.refused.fill(DEVICE_PROOFS, now.ms).whole(DEVICE_PROOFS)
-		});
-		limits.sources.retain(|_, bucket| !bucket.fill(of, now.ms).whole(of));
-	}
-
-	/// Ends every session of a device that `cut` says the node has just cut off, for whatever reason, and every session whose device the plan no longer has in the session's inbound or whose transport secret the plan no longer has for that device:
-	/// "When the old one is removed, sessions opened with it are dropped within one second, by the path that cuts off a disabled user." A device that is cut off loses its WireGuard sessions, and no `udp-obfs` session of it outlives them.
-	/// It runs once the plan is in force, so the tag table that could still open such a session is gone by then. How many ended.
-	pub fn cut(&self, plan: &Plan, cut: impl Fn(&[u8; 32]) -> bool) -> usize {
-		let mut ended = 0;
-		for listener in self.listeners() {
-			let at = plan.inbound_of(&listener.tunnel);
-			for session in listener.sessions().values().flatten().flat_map(|slot| [slot.pending.as_ref(), slot.live.as_ref(), slot.old.as_ref().map(|(session, _)| session)]).flatten().filter(|session| !session.over()) {
-				let device = plan.by_key.get(&session.device).map(|device| &plan.devices[*device]);
-				if cut(&session.device) || !device.zip(at).is_some_and(|(device, at)| device.inbounds.contains(&at) && device.secrets.contains(&session.secret.0)) {
-					session.end(Ended::Revoked);
-					ended += 1;
-				}
-			}
-		}
-		ended
 	}
 
 	/// Says and counts the tags of a table that another secret had already and that were left out, for the plan that is put in force and for the table of a new epoch.
@@ -464,11 +308,7 @@ impl State {
 		let (mut pending, mut sessions) = (0, 0);
 		for listener in self.listeners() {
 			for session in listener.sessions().values().flatten().flat_map(|slot| [slot.pending.as_ref(), slot.live.as_ref(), slot.old.as_ref().map(|(session, _)| session)]).flatten() {
-				match session.phase() {
-					WAITING => pending += 1,
-					LIVE | RETIRED => sessions += 1,
-					_ => {}
-				}
+				if session.seat.pending() {pending += 1} else if session.seat.established() {sessions += 1}
 			}
 		}
 		let (dropped, ended, count) = (|why: Dropped| self.counters.dropped[why as usize].load(Ordering::Relaxed), |why: Ended| self.counters.ended[why as usize].load(Ordering::Relaxed), |counter: &AtomicU64| counter.load(Ordering::Relaxed));
@@ -494,8 +334,9 @@ impl Listener {
 	pub fn waiting(&self) -> Vec<(SocketAddr, Vec<u8>, i64)> {self.held.lock().unwrap_or_else(|e| e.into_inner()).drain(..).collect()}
 
 	/// Step 7 of "Verifying" and the rest of step 6 of the node state machine, which the replay rule calls last and only for a packet it would accept: "The rate limits for that device and for that source have room, and the device has fewer than 2 pending sessions. They are charged only now."
-	/// Nothing is spent unless all of it has room. `why` is set when there is none.
-	fn charge(&self, state: &State, from: SocketAddr, device: [u8; 32], now: i64, why: &mut Dropped) -> bool {
+	/// Nothing is spent unless all of it has room, and then `seat` is a pending session of its device. `why` is set when there is none.
+	fn charge(&self, limits: &limits::State, seat: &Arc<Seat>, from: SocketAddr, now: i64, why: &mut Dropped) -> bool {
+		let device = seat.device;
 		// "A source that already has sessions of 4 other devices: drop." A pending session of the same source and device is the one this packet takes the place of, so it does not count against the device.
 		let replaced = {
 			let mut sessions = self.sessions();
@@ -514,58 +355,38 @@ impl Listener {
 			*why = Dropped::Pool;
 			return false;
 		}
-		let (mut limits, of, source) = (state.limits(), ProofRate {burst: state.burst.load(Ordering::Relaxed), rate: state.rate.load(Ordering::Relaxed)}, Source::of(from.ip()));
-		let Limits {devices, sources} = &mut *limits;
-		let account = devices.entry(device).or_insert_with(|| Account::new(now));
-		account.sessions.retain(|session| session.upgrade().is_some_and(|session| !session.over()));
-		if account.sessions.iter().filter_map(Weak::upgrade).filter(|session| session.phase() == WAITING && !replaced.as_ref().is_some_and(|replaced| Arc::ptr_eq(replaced, session))).count() >= PENDING {
-			*why = Dropped::Pending;
-			return false;
+		match limits.charge(seat, from.ip(), now, replaced.as_ref().map(|replaced| &replaced.seat)) {
+			Ok(()) => true,
+			Err(spent) => {
+				*why = match spent {
+					Spent::Pending => Dropped::Pending,
+					Spent::DeviceRate => Dropped::DeviceRate,
+					Spent::SourceRate => Dropped::SourceRate,
+				};
+				false
+			}
 		}
-		if !account.proofs.fill(DEVICE_PROOFS, now).has() {
-			*why = Dropped::DeviceRate;
-			return false;
-		}
-		if !sources.contains_key(&source) && sources.len() >= MAX_SOURCES {
-			*why = Dropped::SourceRate;
-			return false;
-		}
-		let bucket = sources.entry(source).or_insert_with(|| Bucket::full(of, now));
-		if !bucket.fill(of, now).has() {
-			*why = Dropped::SourceRate;
-			return false;
-		}
-		bucket.left -= 1000;
-		account.proofs.left -= 1000;
-		true
 	}
 
 	/// Makes a pending session established, the moment a WireGuard packet of its device has authenticated on it. False when it may not be: it was replaced or ended meanwhile, or the listener's pool has no place.
-	/// "Only an established session counts against the device's session limit, and only at the moment it becomes established does it replace the device's oldest session when the limit is reached."
-	fn establish(&self, state: &State, session: &Arc<Session>, now: Clock) -> bool {
+	fn establish(&self, state: &State, limits: &limits::State, session: &Arc<Session>, now: Clock) -> bool {
 		let mut sessions = self.sessions();
 		let Some(slot) = sessions.get_mut(&session.source).and_then(|slots| slots.iter_mut().find(|slot| slot.device == session.device)) else {return false};
 		if !slot.pending.as_ref().is_some_and(|pending| Arc::ptr_eq(pending, session)) {return false}
-		{
-			// The device's sessions are counted, the session goes live and the oldest gives way under one hold of the limits, so two listeners never both find room for a device's eighth session.
-			let limits = state.limits();
-			let held: Vec<Arc<Session>> = limits.devices.get(&session.device).map(|account| account.sessions.iter().filter_map(Weak::upgrade).filter(|held| matches!(held.phase(), LIVE | RETIRED)).collect()).unwrap_or_default();
-			let oldest = held.iter().filter(|_| held.len() >= DEVICE_SESSIONS).min_by_key(|held| held.since.load(Ordering::Relaxed));
-			// A pool that filled up since the proof was accepted, or that a reload made smaller than what it holds: the session stays pending and ends at its deadline, and nothing is displaced for it. The one place it may still take is the one its device's oldest session gives up in this same pool.
-			if self.pool.load(Ordering::Relaxed) >= self.cap.load(Ordering::Relaxed) as i64 && !oldest.is_some_and(|oldest| Arc::ptr_eq(&oldest.pool, &self.pool)) {
+		// A pool that has no place leaves the session pending, and it ends at its deadline.
+		match limits.establish(&session.seat, self.cap.load(Ordering::Relaxed), now.ms) {
+			Seated::Established => {}
+			Seated::Full => {
 				state.counters.dropped[Dropped::Pool as usize].fetch_add(1, Ordering::Relaxed);
 				return false;
 			}
-			if session.phase.compare_exchange(WAITING, LIVE, Ordering::AcqRel, Ordering::Acquire).is_err() {return false}
-			if let Some(oldest) = oldest {oldest.end(Ended::Displaced)}
+			Seated::Gone => return false,
 		}
-		self.pool.fetch_add(1, Ordering::Relaxed);
-		session.since.store(now.ms, Ordering::Relaxed);
 		state.counters.established.fetch_add(1, Ordering::Relaxed);
 		slot.pending = None;
 		// "Keep an older established session of the same source and device readable for 10 s before removing it. No other device's session is touched."
 		if let Some(before) = slot.live.replace(session.clone()) {
-			let _ = before.phase.compare_exchange(LIVE, RETIRED, Ordering::AcqRel, Ordering::Acquire);
+			before.seat.retire();
 			if let Some((older, _)) = slot.old.replace((before, now.ms + OLD_READABLE.as_millis() as i64)) {older.end(Ended::Replaced)}
 		}
 		true
@@ -576,7 +397,7 @@ impl Listener {
 	/// A stranger's datagram costs one look at the sessions of its source, one HMAC and one table lookup. Nothing here allocates by what a datagram says, and no lock is held across another's IO: there is none in here.
 	/// `held` is None for a datagram off the socket, and for an opening packet that waited for a limit it is when it came, see `waiting`.
 	#[allow(clippy::too_many_arguments)]
-	pub fn datagram(self: &Arc<Self>, state: &State, native: &Native, replay: Option<&Guard>, socket: &Weak<UdpSocket>, from: SocketAddr, packet: &[u8], held: Option<i64>, now: Clock, work: &mut Work) -> Option<Handled> {
+	pub fn datagram(self: &Arc<Self>, state: &State, limits: &limits::State, native: &Native, replay: Option<&Guard>, socket: &Weak<UdpSocket>, from: SocketAddr, packet: &[u8], held: Option<i64>, now: Clock, work: &mut Work) -> Option<Handled> {
 		let Work {scratch, net, ip, out} = work;
 		net.clear();
 		ip.clear();
@@ -587,7 +408,7 @@ impl Listener {
 		let known: Vec<Arc<Session>> = self.sessions().get(&from).map(|slots| slots.iter().flat_map(|slot| [slot.live.clone(), slot.pending.clone(), slot.old.as_ref().filter(|(_, until)| *until > now.ms).map(|(session, _)| session.clone())]).flatten().filter(|session| !session.over()).collect()).unwrap_or_default();
 		for session in &known {
 			let opened = session.receiver.lock().unwrap_or_else(|e| e.into_inner()).open(packet, scratch);
-			if let Ok(datagram) = opened {return self.tunnelled(state, socket, session, datagram, now, net, ip, out)}
+			if let Ok(datagram) = opened {return self.tunnelled(state, limits, socket, session, datagram, now, net, ip, out)}
 		}
 		// 3. "Shorter than 76 bytes: drop." 4. The mask and the table: "A miss: drop." 5. The packet opened under the key of the device the tag named: "A failure: drop."
 		let tags = native.tags();
@@ -597,9 +418,11 @@ impl Listener {
 		// A packet the replay rule has nothing against and a limit refuses is recorded as spent all the same, and opens no session: left unrecorded it would be good for whoever saw it on its way, from any address, until its timestamp left the window.
 		// What is recorded so has an allowance of its own for each device, as large as the one for accepted proofs, so that a device which sends more than it may fills the cache no faster than twice what the specification allows it. Beyond that the packet is dropped unrecorded.
 		let (mut why, mut refused, device) = (Dropped::NoReplay, false, opening.device.public);
+		// The session as the limits will know it. It is one of its device's sessions from the moment the limits are charged for it, and nobody's when they are not.
+		let seat = Seat::new(device, opening.device.id, None, self.tunnel.clone(), self.pool.clone(), state.counters.ended.clone(), Transport::UdpObfs.idle(), now.ms);
 		let decision = replay.and_then(|replay| replay.with(|memory| opening.accept(memory, now.secs, |_| {
-			refused = !self.charge(state, from, device, now.ms, &mut why);
-			!refused || state.limits().devices.entry(device).or_insert_with(|| Account::new(now.ms)).refused.fill(DEVICE_PROOFS, now.ms).take()
+			refused = !self.charge(limits, &seat, from, now.ms, &mut why);
+			!refused || limits.refuse(device, now.ms)
 		})));
 		let accepted = match decision {
 			Some(Decision::Accepted(_)) if refused => {
@@ -632,8 +455,8 @@ impl Listener {
 		// 7. "Record the salt. Create a pending session for this source and this device, in place of a pending session of the same source and device if there is one, and process the chunk."
 		let Ok(padding) = Padding::new(native.wide, native.normal, &mut random) else {return state.dropped(Dropped::Unsendable)};
 		let session = Arc::new(Session {
-			source: from, device, secret: accepted.device.id, receiver: Mutex::new(Receiver::new(accepted.keys.c2s)), sender: Mutex::new(Sender::new(accepted.keys.s2c, padding)), phase: AtomicU8::new(WAITING), pool: self.pool.clone(), counters: state.counters.clone(),
-			budget: packet.len(), answered: AtomicBool::new(false), mtu: native.mtu, path: AtomicU16::new(native.mtu), opened: AtomicI64::new(now.ms), active: AtomicI64::new(now.ms), since: AtomicI64::new(now.ms), sent: AtomicU64::new(0), echoes: AtomicU8::new(0), handshakes: Mutex::new((Bucket::full(SESSION_HANDSHAKES, now.ms), VecDeque::new())),
+			source: from, device, seat, receiver: Mutex::new(Receiver::new(accepted.keys.c2s)), sender: Mutex::new(Sender::new(accepted.keys.s2c, padding)), counters: state.counters.clone(),
+			budget: packet.len(), answered: AtomicBool::new(false), mtu: native.mtu, path: AtomicU16::new(native.mtu), sent: AtomicU64::new(0), echoes: AtomicU8::new(0), handshakes: Handshakes::new(now.ms),
 		});
 		{
 			let mut sessions = self.sessions();
@@ -644,25 +467,22 @@ impl Listener {
 			});
 			if let Some(before) = slots[at].pending.replace(session.clone()) {before.end(Ended::Replaced)}
 		}
-		if let Some(account) = state.limits().devices.get_mut(&device) {account.sessions.push(Arc::downgrade(&session))}
 		state.counters.opened.fetch_add(1, Ordering::Relaxed);
-		self.tunnelled(state, socket, &session, Some(accepted.datagram), now, net, ip, out)
+		self.tunnelled(state, limits, socket, &session, Some(accepted.datagram), now, net, ip, out)
 	}
 
 	/// Steps 8 and 9: what a chunk that opened on a session holds goes to the tunnel as a datagram of the session's device and of no other.
 	#[allow(clippy::too_many_arguments)]
-	fn tunnelled(&self, state: &State, socket: &Weak<UdpSocket>, session: &Arc<Session>, datagram: Option<&[u8]>, now: Clock, net: &mut Vec<Vec<u8>>, ip: &mut Vec<Vec<u8>>, out: &mut Vec<Vec<u8>>) -> Option<Handled> {
+	fn tunnelled(&self, state: &State, limits: &limits::State, socket: &Weak<UdpSocket>, session: &Arc<Session>, datagram: Option<&[u8]>, now: Clock, net: &mut Vec<Vec<u8>>, ip: &mut Vec<Vec<u8>>, out: &mut Vec<Vec<u8>>) -> Option<Handled> {
 		// A padding-only chunk holds nothing. It is no activity: a recorded one opens again.
 		let datagram = datagram?;
-		// "Excess messages are dropped silently and counted." An initiation the session took to WireGuard before is a recorded packet sent again, which WireGuard would drop as a repeat. It is dropped here, before the allowance is charged:
-		// "The replay rule comes before any rate limit is charged. Otherwise one old token from a log, sent once a second, would keep a device's allowance empty", and with it the device from its next rekey.
+		// "Excess messages are dropped silently and counted." An initiation the session took to WireGuard before is a recorded packet sent again, which WireGuard would drop as a repeat. It is dropped before the allowance is charged, see `Handshakes::admit`.
 		if datagram.first() == Some(&1) {
-			let (hash, mut handshakes) = (digest(&SHA256, datagram), session.handshakes.lock().unwrap_or_else(|e| e.into_inner()));
-			let (allowance, taken) = &mut *handshakes;
-			if taken.iter().any(|taken| taken[..] == *hash.as_ref()) {return state.dropped(Dropped::Tunnel)}
-			if !allowance.fill(SESSION_HANDSHAKES, now.ms).take() {return state.dropped(Dropped::Handshakes)}
-			if taken.len() >= INITIATIONS {taken.pop_front();}
-			taken.push_back(std::array::from_fn(|at| hash.as_ref()[at]));
+			match session.handshakes.admit(datagram, now.ms) {
+				Initiation::Taken => {}
+				Initiation::Repeat => return state.dropped(Dropped::Tunnel),
+				Initiation::Excess => return state.dropped(Dropped::Handshakes),
+			}
 		}
 		let bound = {
 			let mut peers = self.tunnel.lock();
@@ -677,10 +497,10 @@ impl Listener {
 			return state.dropped(Dropped::Tunnel);
 		};
 		// "On `udp-obfs` only a chunk that holds a WireGuard packet which authenticates is activity."
-		session.active.store(now.ms, Ordering::Relaxed);
-		if session.phase() == WAITING {
+		session.seat.active.store(now.ms, Ordering::Relaxed);
+		if session.seat.pending() {
 			// "If it does not, send nothing. An older session stays as it was, and the pending one ends at its deadline."
-			if !self.establish(state, session, now) {
+			if !self.establish(state, limits, session, now) {
 				net.clear();
 				ip.clear();
 				return None;
@@ -705,7 +525,7 @@ impl Listener {
 async fn handle(shared: &Arc<Shared>, listener: &Arc<Listener>, socket: &Arc<UdpSocket>, from: SocketAddr, packet: &[u8], held: Option<i64>, work: &mut Work) {
 	let plan = shared.plan();
 	let Some((at, native)) = plan.inbound_of(&listener.tunnel).and_then(|at| plan.inbounds[at].native.as_ref().map(|native| (at, native))) else {return};
-	let handled = listener.datagram(&shared.obfs, native, shared.replay.get().map(|guard| &**guard), &Arc::downgrade(socket), from, packet, held, Clock::of((shared.now)()), work);
+	let handled = listener.datagram(&shared.obfs, &shared.limits, native, shared.replay.get().map(|guard| &**guard), &Arc::downgrade(socket), from, packet, held, Clock::of((shared.now)()), work);
 	for sealed in &work.out {listener.tunnel.sent(socket.send_to(sealed, from).await)}
 	let Some(handled) = handled else {return};
 	if let Some((session, mark)) = handled.echo {
@@ -777,7 +597,7 @@ pub async fn tables(shared: Arc<Shared>) {
 
 /// A listener with all it needs and no socket, no engine and no file, for the fuzz target of the datagram path and for tests of the state machine alone: a node never has one.
 #[doc(hidden)]
-pub struct Bench {listener: Arc<Listener>, state: State, native: Native, replay: Guard, work: Work}
+pub struct Bench {listener: Arc<Listener>, state: State, limits: limits::State, native: Native, replay: Guard, work: Work}
 
 #[doc(hidden)]
 impl Bench {
@@ -787,13 +607,13 @@ impl Bench {
 		for (device, _) in devices {peers.add(*device, None)}
 		let (state, keys) = (State::default(), devices.iter().flat_map(|(device, secrets)| secrets.iter().map(|secret| Arc::new(Derived::new(secret, &public, device)))).collect());
 		let listener = state.listen(Arc::new(Tunnel::new("bench".to_string(), peers, mpsc::channel(1).0)), cap);
-		Bench {listener, state, native: Native::new(&public, None, 1390, keys, now), replay: Guard::unwritten(1024, now), work: Work::default()}
+		Bench {listener, state, limits: limits::State::default(), native: Native::new(&public, None, 1390, keys, true, None, now), replay: Guard::unwritten(1024, now), work: Work::default()}
 	}
 
 	/// One datagram from `from` at the wall clock `now`, in Unix milliseconds. What the node would send back to `from`, and how many IP packets came out of the tunnel.
 	pub fn datagram(&mut self, from: SocketAddr, packet: &[u8], now: i64) -> (&[Vec<u8>], usize) {
 		let clock = Clock {ms: now, secs: (now / 1000).max(0) as u64};
-		let handled = self.listener.datagram(&self.state, &self.native, Some(&self.replay), &Weak::new(), from, packet, None, clock, &mut self.work);
+		let handled = self.listener.datagram(&self.state, &self.limits, &self.native, Some(&self.replay), &Weak::new(), from, packet, None, clock, &mut self.work);
 		(&self.work.out, if handled.is_some() {self.work.ip.len()} else {0})
 	}
 
@@ -801,11 +621,12 @@ impl Bench {
 	/// Then the opening packets that waited for a limit go to the replay rule again. For each of them: its source, the packet, what the node would send back to that source, and how many IP packets came out of the tunnel.
 	pub fn tick(&mut self, now: i64) -> Vec<(SocketAddr, Vec<u8>, Vec<Vec<u8>>, usize)> {
 		let clock = Clock {ms: now, secs: (now / 1000).max(0) as u64};
+		self.limits.sweep(clock);
 		self.state.sweep(clock);
 		if self.native.tags().epoch != udp_obfs::epoch(clock.secs) {self.native.swap(self.native.build(clock.secs))}
 		self.replay.serve(clock.secs);
 		self.listener.waiting().into_iter().map(|(from, packet, came)| {
-			let handled = self.listener.datagram(&self.state, &self.native, Some(&self.replay), &Weak::new(), from, &packet, Some(came), clock, &mut self.work);
+			let handled = self.listener.datagram(&self.state, &self.limits, &self.native, Some(&self.replay), &Weak::new(), from, &packet, Some(came), clock, &mut self.work);
 			(from, packet, self.work.out.clone(), if handled.is_some() {self.work.ip.len()} else {0})
 		}).collect()
 	}

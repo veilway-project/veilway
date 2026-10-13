@@ -298,8 +298,20 @@ impl Config {
 		if let Some(Json::Arr(inbounds)) = root.get_mut("inbounds") {
 			for (i, inbound) in inbounds.iter_mut().enumerate() {
 				let Json::Obj(inbound) = inbound else {continue};
+				let was = named(inbound, "tag").and_then(|tag| running.inbounds.iter().find(|was| was.tag == tag));
+				// A marker in the list names one transport key of the running inbound by its digits, as a marker in `transport_secrets` names a secret of its device.
+				if let Some(Json::Arr(list)) = inbound.get_mut("transport_keys") {
+					for (k, key) in list.iter_mut().enumerate() {
+						let Json::Str(value) = key else {continue};
+						if !value.starts_with("<redacted") {continue}
+						match was.and_then(|was| was.transport_keys.as_ref()).and_then(|kept| kept.iter().find(|kept| super::reload::marker(&kept.0) == *value)) {
+							Some(kept) => *value = STANDARD.encode(kept.0),
+							None => report.error(format!("inbounds[{i}].transport_keys[{k}]"), "expected a transport key: the marker of one names a key of the running inbound with this tag, as the config that was read shows it, and that inbound has no key this marker names. A key that is new has to be sent itself"),
+						}
+					}
+				}
 				if !marked(inbound, "private_key") {continue}
-				match named(inbound, "tag").and_then(|tag| running.inbounds.iter().find(|was| was.tag == tag)) {
+				match was {
 					Some(was) => drop(inbound.insert("private_key".to_string(), Json::Str(STANDARD.encode(was.private_key.expose().0)))),
 					None => report.error(format!("inbounds[{i}].private_key"), "expected a key: the marker stands for the key of the running inbound with this tag, and no inbound runs under it"),
 				}

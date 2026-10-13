@@ -227,7 +227,7 @@ pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
 	let (_, body) = request(path, "GET", "/v1/config", None, wait).await.ok().filter(|(status, _)| (200..300).contains(status))?;
 	let running = serde_json::from_slice::<Running>(&body).ok().filter(|running| !running.revision.is_empty() && running.generation > 0 && running.document.version == 1)?;
 	Some(Held {
-		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, transport.r#type == "ws")).collect(),
+		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, transport.r#type == "ws" || transport.r#type == "tls")).collect(),
 		interfaces: running.document.exits.into_iter().filter(|exit| exit.backend.r#type == "l3").map(|exit| exit.backend.interface.unwrap_or_else(|| DEFAULT_INTERFACE.to_string())).collect(),
 	})
 }

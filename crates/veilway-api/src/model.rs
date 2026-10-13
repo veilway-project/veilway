@@ -294,8 +294,92 @@ pub struct Stats {
 	pub send_failed: u64,
 	pub control: Control,
 	pub udp_obfs: UdpObfs,
+	pub stream: Stream,
 	/// The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory.
 	pub replay: Option<Replay>,
+}
+
+/// What the stream listeners of the `tls` transports did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending` and `sessions` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key.
+#[derive(Serialize, JsonSchema)]
+pub struct Stream {
+	/// Connections that have not been decided yet, right now: inside their TLS handshake or their request line.
+	pub undecided: usize,
+	/// Connections that are relayed to a decoy origin right now.
+	pub relayed: usize,
+	/// Sessions whose proof was accepted and on which WireGuard has not authenticated yet, right now.
+	pub pending: usize,
+	/// Established sessions right now.
+	pub sessions: usize,
+	/// Connections the listeners took from the system, and failures to take one, which is what a host that is out of file descriptors shows.
+	pub accepted: u64,
+	pub accept_failed: u64,
+	/// Connections that broke before they were decided, with an error that is no close: a reset inside the request line, or a connection whose own address could not be read.
+	pub broken: u64,
+	/// TLS handshakes that failed, that did not finish within 10 seconds, and that were closed to make room in the undecided pool.
+	pub handshake_failed: u64,
+	pub handshake_slow: u64,
+	pub handshake_displaced: u64,
+	/// Connections decided "not a user", by the class of the reason: a byte that cannot be part of a user's request line or a line above 4,096 bytes, `stranger_syntax`. A line that was not complete within 10 seconds, `stranger_slow`. A peer that closed its side first, `stranger_closed`. A connection decided at once to make room in the undecided pool, `stranger_displaced`. A connection whose decoy origin said something or closed while the request line was not complete, `stranger_origin`. A complete request line that is no proof of a device, `stranger_proof`, which is where a wrong path, a wrong token and a removed device are counted alike.
+	pub stranger_syntax: u64,
+	pub stranger_slow: u64,
+	pub stranger_closed: u64,
+	pub stranger_displaced: u64,
+	pub stranger_origin: u64,
+	pub stranger_proof: u64,
+	/// Proofs of a device that were refused all the same, each of which took the decoy path too. By the replay rule: a timestamp outside the window of 60 seconds, at or below the floor, a token that was accepted before, and any while the cache is full.
+	pub refused_window: u64,
+	pub refused_floor: u64,
+	pub refused_seen: u64,
+	pub refused_cache_full: u64,
+	/// A timestamp above the written limit whose write did not end within 2 seconds or for which 64 other proofs waited already, and proofs that came while the node took none at all.
+	pub refused_limit: u64,
+	pub refused_no_replay: u64,
+	/// By a limit: the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.
+	pub refused_pool: u64,
+	pub refused_pending: u64,
+	pub refused_device_rate: u64,
+	pub refused_source_rate: u64,
+	/// Connections that were connected to a decoy origin and relayed, relayed connections that were closed to make room for another, and strangers that were closed with no answer because the origin could not be reached. While `decoy_down` grows the node can be told from its decoy.
+	pub relays: u64,
+	pub relays_evicted: u64,
+	pub decoy_down: u64,
+	/// Proofs that were accepted, proofs that waited for the write of a higher limit, users whose request head was over a limit or no WebSocket upgrade, sessions that became established, and sessions that could not because the session pool had filled up since their proof.
+	pub proofs_accepted: u64,
+	pub proofs_waited: u64,
+	pub head_refused: u64,
+	pub established: u64,
+	pub establish_full: u64,
+	/// Inside sessions: handshake initiations above a session's allowance, datagrams WireGuard did not take as a packet of the session's device, datagrams for a device that were dropped because the send queue of its connection held 256, and chunks the node sent.
+	pub handshakes: u64,
+	pub tunnel: u64,
+	pub queue_full: u64,
+	pub chunks_sent: u64,
+	/// Sessions that ended, by reason: no WireGuard packet within 10 seconds of the proof, no chunk for 300 seconds, every chunk number used, the device's ninth session, a device or transport secret the config no longer has, a connection that closed or a peer that closed the session, a chunk that did not open or a frame the protocol does not allow, and a transport the config no longer has.
+	pub ended_deadline: u64,
+	pub ended_idle: u64,
+	pub ended_packets: u64,
+	pub ended_displaced: u64,
+	pub ended_revoked: u64,
+	pub ended_closed: u64,
+	pub ended_invalid: u64,
+	pub ended_unserved: u64,
+	/// How often the header fields of the upgrade answer were learnt from a decoy origin, and how often that failed. While the last try failed, the upgrade answer carries only `Date` of `upgrade_headers`.
+	pub upgrade_learned: u64,
+	pub upgrade_learn_failed: u64,
+}
+
+impl From<veilway_core::StreamTotals> for Stream {
+	fn from(totals: veilway_core::StreamTotals) -> Stream {
+		Stream {
+			undecided: totals.undecided, relayed: totals.relayed, pending: totals.pending, sessions: totals.sessions, accepted: totals.accepted, accept_failed: totals.accept_failed, broken: totals.broken, handshake_failed: totals.handshake_failed, handshake_slow: totals.handshake_slow, handshake_displaced: totals.handshake_displaced,
+			stranger_syntax: totals.stranger_syntax, stranger_slow: totals.stranger_slow, stranger_closed: totals.stranger_closed, stranger_displaced: totals.stranger_displaced, stranger_origin: totals.stranger_origin, stranger_proof: totals.stranger_proof,
+			refused_window: totals.refused_window, refused_floor: totals.refused_floor, refused_seen: totals.refused_seen, refused_cache_full: totals.refused_cache_full, refused_limit: totals.refused_limit, refused_no_replay: totals.refused_no_replay, refused_pool: totals.refused_pool, refused_pending: totals.refused_pending, refused_device_rate: totals.refused_device_rate, refused_source_rate: totals.refused_source_rate,
+			relays: totals.relays, relays_evicted: totals.relays_evicted, decoy_down: totals.decoy_down, proofs_accepted: totals.proofs_accepted, proofs_waited: totals.proofs_waited, head_refused: totals.head_refused, established: totals.established, establish_full: totals.establish_full,
+			handshakes: totals.handshakes, tunnel: totals.tunnel, queue_full: totals.queue_full, chunks_sent: totals.chunks_sent,
+			ended_deadline: totals.ended_deadline, ended_idle: totals.ended_idle, ended_packets: totals.ended_packets, ended_displaced: totals.ended_displaced, ended_revoked: totals.ended_revoked, ended_closed: totals.ended_closed, ended_invalid: totals.ended_invalid, ended_unserved: totals.ended_unserved,
+			upgrade_learned: totals.upgrade_learned, upgrade_learn_failed: totals.upgrade_learn_failed,
+		}
+	}
 }
 
 /// What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key.
@@ -386,7 +470,7 @@ impl From<veilway_core::ReplayStatus> for Replay {
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs}
+pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls}
 
 /// A device with a live session on one inbound. The address the device connects from is not part of it.
 #[derive(Serialize, JsonSchema)]

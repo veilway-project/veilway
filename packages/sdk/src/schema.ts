@@ -608,6 +608,7 @@ export interface components {
              * @description Writes of the usage state file that failed since start.
              */
             state_write_failures: number;
+            stream: components["schemas"]["Stream"];
             udp_obfs: components["schemas"]["UdpObfs"];
             users: components["schemas"]["Rated"][];
             /**
@@ -646,6 +647,153 @@ export interface components {
             users: number;
             version: string;
         };
+        /** @description What the stream listeners of the `tls` transports did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending` and `sessions` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key. */
+        Stream: {
+            /** Format: uint64 */
+            accept_failed: number;
+            /**
+             * Format: uint64
+             * @description Connections the listeners took from the system, and failures to take one, which is what a host that is out of file descriptors shows.
+             */
+            accepted: number;
+            /**
+             * Format: uint64
+             * @description Connections that broke before they were decided, with an error that is no close: a reset inside the request line, or a connection whose own address could not be read.
+             */
+            broken: number;
+            /** Format: uint64 */
+            chunks_sent: number;
+            /** Format: uint64 */
+            decoy_down: number;
+            /** Format: uint64 */
+            ended_closed: number;
+            /**
+             * Format: uint64
+             * @description Sessions that ended, by reason: no WireGuard packet within 10 seconds of the proof, no chunk for 300 seconds, every chunk number used, the device's ninth session, a device or transport secret the config no longer has, a connection that closed or a peer that closed the session, a chunk that did not open or a frame the protocol does not allow, and a transport the config no longer has.
+             */
+            ended_deadline: number;
+            /** Format: uint64 */
+            ended_displaced: number;
+            /** Format: uint64 */
+            ended_idle: number;
+            /** Format: uint64 */
+            ended_invalid: number;
+            /** Format: uint64 */
+            ended_packets: number;
+            /** Format: uint64 */
+            ended_revoked: number;
+            /** Format: uint64 */
+            ended_unserved: number;
+            /** Format: uint64 */
+            establish_full: number;
+            /** Format: uint64 */
+            established: number;
+            /** Format: uint64 */
+            handshake_displaced: number;
+            /**
+             * Format: uint64
+             * @description TLS handshakes that failed, that did not finish within 10 seconds, and that were closed to make room in the undecided pool.
+             */
+            handshake_failed: number;
+            /** Format: uint64 */
+            handshake_slow: number;
+            /**
+             * Format: uint64
+             * @description Inside sessions: handshake initiations above a session's allowance, datagrams WireGuard did not take as a packet of the session's device, datagrams for a device that were dropped because the send queue of its connection held 256, and chunks the node sent.
+             */
+            handshakes: number;
+            /** Format: uint64 */
+            head_refused: number;
+            /**
+             * Format: uint
+             * @description Sessions whose proof was accepted and on which WireGuard has not authenticated yet, right now.
+             */
+            pending: number;
+            /**
+             * Format: uint64
+             * @description Proofs that were accepted, proofs that waited for the write of a higher limit, users whose request head was over a limit or no WebSocket upgrade, sessions that became established, and sessions that could not because the session pool had filled up since their proof.
+             */
+            proofs_accepted: number;
+            /** Format: uint64 */
+            proofs_waited: number;
+            /** Format: uint64 */
+            queue_full: number;
+            /** Format: uint64 */
+            refused_cache_full: number;
+            /** Format: uint64 */
+            refused_device_rate: number;
+            /** Format: uint64 */
+            refused_floor: number;
+            /**
+             * Format: uint64
+             * @description A timestamp above the written limit whose write did not end within 2 seconds or for which 64 other proofs waited already, and proofs that came while the node took none at all.
+             */
+            refused_limit: number;
+            /** Format: uint64 */
+            refused_no_replay: number;
+            /** Format: uint64 */
+            refused_pending: number;
+            /**
+             * Format: uint64
+             * @description By a limit: the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.
+             */
+            refused_pool: number;
+            /** Format: uint64 */
+            refused_seen: number;
+            /** Format: uint64 */
+            refused_source_rate: number;
+            /**
+             * Format: uint64
+             * @description Proofs of a device that were refused all the same, each of which took the decoy path too. By the replay rule: a timestamp outside the window of 60 seconds, at or below the floor, a token that was accepted before, and any while the cache is full.
+             */
+            refused_window: number;
+            /**
+             * Format: uint
+             * @description Connections that are relayed to a decoy origin right now.
+             */
+            relayed: number;
+            /**
+             * Format: uint64
+             * @description Connections that were connected to a decoy origin and relayed, relayed connections that were closed to make room for another, and strangers that were closed with no answer because the origin could not be reached. While `decoy_down` grows the node can be told from its decoy.
+             */
+            relays: number;
+            /** Format: uint64 */
+            relays_evicted: number;
+            /**
+             * Format: uint
+             * @description Established sessions right now.
+             */
+            sessions: number;
+            /** Format: uint64 */
+            stranger_closed: number;
+            /** Format: uint64 */
+            stranger_displaced: number;
+            /** Format: uint64 */
+            stranger_origin: number;
+            /** Format: uint64 */
+            stranger_proof: number;
+            /** Format: uint64 */
+            stranger_slow: number;
+            /**
+             * Format: uint64
+             * @description Connections decided "not a user", by the class of the reason: a byte that cannot be part of a user's request line or a line above 4,096 bytes, `stranger_syntax`. A line that was not complete within 10 seconds, `stranger_slow`. A peer that closed its side first, `stranger_closed`. A connection decided at once to make room in the undecided pool, `stranger_displaced`. A connection whose decoy origin said something or closed while the request line was not complete, `stranger_origin`. A complete request line that is no proof of a device, `stranger_proof`, which is where a wrong path, a wrong token and a removed device are counted alike.
+             */
+            stranger_syntax: number;
+            /** Format: uint64 */
+            tunnel: number;
+            /**
+             * Format: uint
+             * @description Connections that have not been decided yet, right now: inside their TLS handshake or their request line.
+             */
+            undecided: number;
+            /** Format: uint64 */
+            upgrade_learn_failed: number;
+            /**
+             * Format: uint64
+             * @description How often the header fields of the upgrade answer were learnt from a decoy origin, and how often that failed. While the last try failed, the upgrade answer carries only `Date` of `upgrade_headers`.
+             */
+            upgrade_learned: number;
+        };
         /** @description Inner IP packets and their bytes since the node first knew the name. Up is from the device into the node. */
         Traffic: {
             /** Format: uint64 */
@@ -658,7 +806,7 @@ export interface components {
             up_packets: number;
         };
         /** @enum {string} */
-        Transport: "udp" | "ws" | "udp-obfs";
+        Transport: "udp" | "ws" | "udp-obfs" | "tls";
         /** @description What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key. */
         UdpObfs: {
             /** Format: uint64 */
