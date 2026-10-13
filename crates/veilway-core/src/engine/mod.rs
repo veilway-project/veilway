@@ -311,6 +311,13 @@ impl Engine {
 		if tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, true)).await.is_err() {tracing::error!("the state file was not written within {}s of the shutdown, so usage since its last write is lost", usage::LAST_WRITE.as_secs())}
 	}
 
+	/// The first step of `shutdown` as something to call from any thread, without the runtime and without the engine: it takes back at once what the l3 exit set up on the host, and does nothing when a `shutdown` has done so or is doing so.
+	/// It is for a stop that has run out of time. Whoever holds it does not keep the engine alive.
+	pub fn restorer(&self) -> impl Fn() + Clone + Send + 'static {
+		let l3 = self.l3.clone();
+		move || drop(l3.lock().unwrap_or_else(|e| e.into_inner()).take())
+	}
+
 	/// Puts a new config document in force: it is parsed and validated, everything it needs from the host is prepared while the running config keeps working, and then it replaces that config in one step.
 	/// With `base`, the reload is refused unless that is the revision that runs. Any error leaves the running config whole. An error of the prepare step names tags and field paths and never a value from the document.
 	pub async fn reload(&self, document: Vec<u8>, base: Option<Revision>) -> Result<Applied, ApplyError<anyhow::Error>> {self.put(document, base, None).await.map(|(applied, _)| applied)}

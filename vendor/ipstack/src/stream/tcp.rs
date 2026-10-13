@@ -452,11 +452,14 @@ impl Drop for IpStackTcpStream {
         log::trace!("{nt} {state:?}: [drop] session dropping, ========================= ");
         if let Some(task_handle) = self.task_handle.take() {
             if !task_handle.is_finished() {
+                // veilway patch: upstream blocked here, with `block_in_place` and `block_on`, until the task had taken the
+                // exit signal and ended. A runtime that shuts down drops its tasks from its worker threads, so every worker
+                // came to wait for a task that only another worker could have ended, and the process never exited. It also
+                // panicked on a current-thread runtime. The task is told to end and left to do so: it holds nothing the
+                // stream needs back. A full channel already holds an exit signal, every message in it is one.
                 if let Some(notifier) = self.exit_notifier.take() {
-                    _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(notifier.send(())));
+                    _ = notifier.try_send(());
                 }
-                // synchronously wait for the task to finish
-                _ = tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(task_handle));
             } else {
                 log::trace!("{nt} {state:?}: [drop] task already finished, no need to wait exiting");
             }

@@ -25,7 +25,7 @@ A WireGuard peer connects over UDP or over WebSocket (one WireGuard datagram is 
 | `scripts/gate-phase1.sh` | The Phase 1 gate: the release binary, two kernel WireGuard clients and a responder in Docker containers |
 | `crates/veilway-client` | Single-peer client engine plus the Windows Wintun, route, DNS (NRPT) layer |
 | `apps/desktop` | Tauri 2 desktop app. Outside the cargo workspace, own `Cargo.lock`, UI in `ui/` |
-| `vendor/ipstack` | Patched ipstack 1.0.1 (upstream never reports EOF after a peer FIN). Keeps its own code style |
+| `vendor/ipstack` | Patched ipstack 1.0.1 (upstream never reports EOF after a peer FIN, and blocks in a stream's `Drop`, which hung the process at shutdown). Keeps its own code style |
 
 ## Commands
 

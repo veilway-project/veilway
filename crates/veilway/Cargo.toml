@@ -30,3 +30,6 @@ libc.workspace=true
 [dev-dependencies]
 rcgen.workspace=true
 time.workspace=true
+# The WireGuard peer and the packets of the shutdown test, which opens flows through the binary as it is shipped.
+boringtun.workspace=true
+etherparse.workspace=true

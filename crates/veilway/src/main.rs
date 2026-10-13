@@ -3,6 +3,7 @@ mod doctor;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 #[cfg(unix)]
@@ -118,6 +119,9 @@ fn print(report: &Report, config: &Path) -> bool {
 	!report.errors.is_empty()
 }
 
+/// How long a node that was told to stop may still run, whatever it has open and whatever holds it up. A service manager kills what takes longer than its own limit, which for `docker stop` is 10 seconds.
+const STOP_DEADLINE: Duration = Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	// `RUST_LOG` overrides the level. Without `destinations` the userspace stack is silenced, because its own log lines name the addresses of every flow.
@@ -182,12 +186,43 @@ async fn main() -> anyhow::Result<()> {
 			};
 			#[cfg(not(unix))]
 			let stopped = tokio::signal::ctrl_c().await;
+			// From here the process has `STOP_DEADLINE`, and a thread of its own holds it to that: a timer of the runtime does not fire while the runtime's threads are held up, and the runtime itself is taken down after `main` and waits for every one of them.
+			let (open, sessions, kept, restore) = (engine.flows(), engine.peers(None).iter().filter(|peer| peer.handshake.is_some()).count(), Arc::new(AtomicBool::new(false)), engine.restorer());
+			std::thread::spawn({
+				let (kept, restore) = (kept.clone(), restore.clone());
+				move || {
+					std::thread::sleep(STOP_DEADLINE);
+					let kept = kept.load(Ordering::SeqCst);
+					if kept {tracing::warn!("the node gave back what it held on the host and wrote its state file, but its tasks had not ended {}s after it was told to stop, so the process ends here: {open} flows and {sessions} sessions were open when the stop began", STOP_DEADLINE.as_secs())} else {tracing::warn!("the shutdown was not finished {}s after the node was told to stop, so the process ends here and usage since the last write of the state file may be lost: {open} flows and {sessions} sessions were open when the stop began", STOP_DEADLINE.as_secs())}
+					restore();
+					std::process::exit(if kept {0} else {1})
+				}
+			});
+			let ordered = async {
+				#[cfg(unix)]
+				if let Some(control) = control {control.shutdown().await}
+				match Arc::try_unwrap(engine) {
+					Ok(engine) => engine.shutdown().await,
+					Err(_) => tracing::error!("the engine is still in use and was not shut down in order: usage since the last write of the state file is lost"),
+				}
+			};
+			// A signal that cannot be listened for is no second signal.
 			#[cfg(unix)]
-			if let Some(control) = control {control.shutdown().await}
-			match Arc::try_unwrap(engine) {
-				Ok(engine) => engine.shutdown().await,
-				Err(_) => tracing::error!("the engine is still in use and was not shut down in order: usage since the last write of the state file is lost"),
+			let again = async {
+				tokio::select! {
+					signal = tokio::signal::ctrl_c() => if signal.is_err() {std::future::pending::<()>().await},
+					_ = terminate.recv() => {}
+				}
+			};
+			#[cfg(not(unix))]
+			let again = async {if tokio::signal::ctrl_c().await.is_err() {std::future::pending::<()>().await}};
+			// Whoever asks twice does not want to wait. The shutdown is dropped where it stands, which gives back to the host what its first step still held, and what it had not taken yet is given back right after.
+			if tokio::select! {_ = ordered => false, _ = again => true} {
+				restore();
+				tracing::warn!("a second signal ended the shutdown before it was finished: what the node held on the host is given back, and usage since the last write of the state file may be lost. {open} flows and {sessions} sessions were open when the stop began");
+				std::process::exit(1);
 			}
+			kept.store(true, Ordering::SeqCst);
 			Ok(stopped?)
 		}
 		Command::Check {config} => {
