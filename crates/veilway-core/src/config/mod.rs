@@ -34,6 +34,7 @@ pub const MAX_USERS: usize = 65536;
 pub const MAX_DEVICES: usize = 16;
 pub const MAX_DEVICE_ADDRESSES: usize = 16;
 pub const MAX_DNS_SERVERS: usize = 4;
+pub const MAX_DNS_SETS: usize = 32;
 pub const MAX_INBOUND_ADDRESSES: usize = 2;
 pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_EXIT_NAME_CHARS: usize = 64;

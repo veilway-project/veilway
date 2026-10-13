@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -10,6 +10,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use time::format_description::well_known::Rfc3339;
@@ -459,6 +460,37 @@ pub struct Dns {
 	/// Defaults to true.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub hijack: Option<bool>,
+	/// Other lists of servers, each for the inbounds, groups and users it names. Whoever no set names asks `servers`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_DNS_SETS))]
+	pub sets: Vec<DnsSet>,
+}
+
+impl Dns {
+	/// The set that names each user, each group and each inbound, as indexes into `sets`. In a document that validates nothing is named by two sets.
+	pub fn named(&self) -> [HashMap<&str, usize>; 3] {
+		let of = |list: fn(&DnsSet) -> &Vec<String>| self.sets.iter().enumerate().flat_map(|(at, set)| list(set).iter().map(move |name| (name.as_str(), at))).collect();
+		[of(|set| &set.users), of(|set| &set.groups), of(|set| &set.inbounds)]
+	}
+}
+
+/// A set that names a user decides for that user, before one that names a group of theirs, before one that names the inbound a query came through.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DnsSet {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	#[schemars(length(min = 1, max = 4))]
+	pub servers: Vec<Addr>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_INBOUNDS), inner(pattern(TAG_PATTERN)))]
+	pub inbounds: Vec<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_GROUPS), inner(pattern(NAME_PATTERN)))]
+	pub groups: Vec<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_USERS), inner(pattern(NAME_PATTERN)))]
+	pub users: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]

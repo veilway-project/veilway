@@ -112,12 +112,17 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 		return None;
 	};
 	let (tag, who, asked) = (plan.inbounds[inbound].tag.as_str(), plan.users[user].name.as_str(), query.question.name.as_deref());
+	// One list of servers and no other: a query that none of them answers fails, whatever the other lists of the config could have said to it.
+	let list = plan.dns_of(user, inbound);
+	let set = &plan.dns[list];
+	// For log lines: nothing for `dns.servers`, so those read as they always did.
+	let listed = || if set.tag.is_empty() {String::new()} else {format!(" of dns set {}", set.tag)};
 	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {
 		resolver.throttled.fetch_add(1, Ordering::Relaxed);
-		tracing::debug!("inbound {tag}: user {who}: more than {MAX_IN_FLIGHT} dns queries at once");
+		tracing::debug!("inbound {tag}: user {who}{}: more than {MAX_IN_FLIGHT} dns queries at once", listed());
 		return Some(query.reply(dns::SERVFAIL));
 	};
-	for (at, server) in plan.dns.iter().enumerate() {
+	for (at, server) in set.servers.iter().enumerate() {
 		let action = route::evaluate(&plan, inbound, user, server.ip(), protocol, 53, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
 		let exit = if let Action::Exit(exit) = action {*exit} else {plan.users[user].exit.unwrap_or(plan.default_exit)};
 		let refusal = match (action, &plan.exits[exit].backend) {
@@ -131,7 +136,7 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 		if let Some(reason) = refusal {
 			shared.count(reason);
 			resolver.refused.fetch_add(1, Ordering::Relaxed);
-			tracing::debug!("inbound {tag}: user {who}: dns query for {} refused: {reason:?}", plan.show(asked.unwrap_or("<no domain>")));
+			tracing::debug!("inbound {tag}: user {who}{}: dns query for {} refused: {reason:?}", listed(), plan.show(asked.unwrap_or("<no domain>")));
 			return Some(query.reply(dns::REFUSED));
 		}
 		// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
@@ -141,28 +146,32 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 			Backend::L3 {masquerade: true, ..} => &flows::AROUND,
 			_ => continue,
 		};
-		let Some(failures) = plan.exits[exit].failures.get(at) else {continue};
+		let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {continue};
 		// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
 		if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != server.is_ipv4()) {continue}
 		plan.exits[exit].traffic.up(message.len());
 		let Some(answer) = flows::lookup(outbound, *server, &message).await else {
-			if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {} ({}) stopped answering through exit {}", at + 1, plan.dns.len(), plan.show(server), plan.exits[exit].tag)}
+			if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) stopped answering through exit {}", at + 1, set.servers.len(), listed(), plan.show(server), plan.exits[exit].tag)}
 			continue;
 		};
-		if failures.swap(0, Ordering::Relaxed) >= DOWN_AFTER {tracing::info!("dns: server {} of {} ({}) answers again through exit {}", at + 1, plan.dns.len(), plan.show(server), plan.exits[exit].tag)}
+		if failures.swap(0, Ordering::Relaxed) >= DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) answers again through exit {}", at + 1, set.servers.len(), listed(), plan.show(server), plan.exits[exit].tag)}
 		plan.exits[exit].traffic.down(answer.len());
 		resolver.answered.fetch_add(1, Ordering::Relaxed);
 		// Only an answer to the question that was asked is remembered, and only under a name a rule could name.
 		let remembered = asked.zip(dns::response(&answer)).is_some_and(|(name, response)| response.rcode == 0 && response.question.as_ref() == Some(&query.question) && {
 			// A user who was cut off while this query was out gets nothing written into a memory that was just cleared. The cut-off ends the flow first and clears the memory after, so the flow is looked at with the memory locked.
 			let mut names = plan.users[user].state.names();
-			shared.flows.holds(&flow.0, flow.1) && names.record(name, &response.addresses, &plan.pools, Instant::now())
+			// Nor does an answer of the servers the user had go into the memory once a reload has given them others: a reload puts its plan in force first and clears the memory after, so the plan in force is looked at with the memory locked too.
+			// It is held to what `Host::switch` clears by: the servers of the list for this user through the inbound of this tag.
+			let now = shared.plan();
+			let moved = !Arc::ptr_eq(&now, &plan) && now.by_address.get(&flow.0.src).is_none_or(|at| now.inbounds[at.inbound].tag != tag || !now.dns[now.dns_of(now.devices[at.device].user, at.inbound)].same(set));
+			!moved && shared.flows.holds(&flow.0, flow.1) && names.record(name, &response.addresses, &plan.pools, Instant::now())
 		});
-		tracing::debug!("inbound {tag}: user {who}: dns query for {} answered through exit {}{}", plan.show(asked.unwrap_or("<no domain>")), plan.exits[exit].tag, if remembered {", remembered"} else {""});
+		tracing::debug!("inbound {tag}: user {who}{}: dns query for {} answered through exit {}{}", listed(), plan.show(asked.unwrap_or("<no domain>")), plan.exits[exit].tag, if remembered {", remembered"} else {""});
 		return Some(answer);
 	}
 	resolver.failed.fetch_add(1, Ordering::Relaxed);
-	tracing::debug!("inbound {tag}: user {who}: dns query for {}: no server answered", plan.show(asked.unwrap_or("<no domain>")));
+	tracing::debug!("inbound {tag}: user {who}{}: dns query for {}: no server answered", listed(), plan.show(asked.unwrap_or("<no domain>")));
 	Some(query.reply(dns::SERVFAIL))
 }
 
@@ -191,6 +200,8 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 							dns::clip(&mut answer, cap);
 							// One write is one datagram here, and a short write would duplicate rather than continue.
 							if stream.write(&answer).await.is_err() {return}
+							// An answer that took longer than `CLOSED_IDLE`, as the SERVFAIL after two silent servers does, comes to a flow that has been quiet for that long. Without this the flow would count as over the moment this handler ends, before the answer has left the stack, and the answer would be dropped with it.
+							shared.flows.touch(&key, id);
 						}
 						// Nothing is waited for, so the flow has no reason to outlive its last answer by long. A query that comes later on the same ports starts it again.
 						_ = shared.flows.quiet(key, id, ANSWERED_IDLE), if pending.is_empty() => return,

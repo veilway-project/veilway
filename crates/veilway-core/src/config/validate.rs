@@ -1,6 +1,7 @@
 //! Everything that relates one value of the document to another. Messages name other places by path and never repeat a value.
 use super::model::{domain, ident};
 use super::*;
+use crate::engine::gate;
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -278,15 +279,51 @@ impl Config {
 			}
 			sets.push([entitled, member, homes]);
 		}
-		if !(1..=MAX_DNS_SERVERS).contains(&self.dns.servers.len()) {r.error("dns.servers", format!("expected 1 to {MAX_DNS_SERVERS} servers"))}
-		index(&mut r, |i| format!("dns.servers[{i}]"), self.dns.servers.iter().take(MAX_DNS_SERVERS));
-		for (i, Addr(server)) in self.dns.servers.iter().enumerate().take(MAX_DNS_SERVERS) {
-			let ip = server.ip();
-			let link_local = match ip {
-				IpAddr::V4(a) => a.is_link_local(),
-				IpAddr::V6(a) => a.is_unicast_link_local(),
-			};
-			if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || link_local || pools.iter().any(|(pool, _)| pool.contains(&ip)) {r.error(format!("dns.servers[{i}]"), "expected an address that is not loopback, link-local, unspecified, multicast or inside an inbound pool")}
+		if self.dns.sets.len() > MAX_DNS_SETS {r.error("dns.sets", format!("expected at most {MAX_DNS_SETS} sets"))}
+		tags(&mut r, "dns.sets", self.dns.sets.iter().take(MAX_DNS_SETS).map(|set| set.tag.as_str()));
+		// Every list of servers of the document with its path: `dns.servers`, then that of each set. The same rules hold for all of them.
+		let resolvers: Vec<(String, &Vec<Addr>)> = std::iter::once(("dns.servers".to_string(), &self.dns.servers)).chain(self.dns.sets.iter().enumerate().take(MAX_DNS_SETS).map(|(i, set)| (format!("dns.sets[{i}].servers"), &set.servers))).collect();
+		for (at, servers) in &resolvers {
+			if !(1..=MAX_DNS_SERVERS).contains(&servers.len()) {r.error(at, format!("expected 1 to {MAX_DNS_SERVERS} servers"))}
+			index(&mut r, |i| format!("{at}[{i}]"), servers.iter().take(MAX_DNS_SERVERS));
+			for (i, Addr(server)) in servers.iter().enumerate().take(MAX_DNS_SERVERS) {
+				// What the destination gate refuses at run time is refused here, the IPv6 forms that carry such an IPv4 address included: a server every query to which is refused resolves nothing.
+				if gate::refused(server.ip(), &pools) {r.error(format!("{at}[{i}]"), "expected an address that is not loopback, link-local, unspecified, broadcast, multicast, in 0.0.0.0/8 or inside an inbound pool, and no IPv6 address that embeds such an IPv4 address (IPv4-compatible, NAT64, 6to4, Teredo)")}
+			}
+		}
+		if self.dns.hijack == Some(false) && !self.dns.sets.is_empty() {r.error("dns.hijack", "expected true or no key while dns.sets has a set: with hijack off a device reaches any resolver it likes by sending its queries to another address than the gateway, so a set would decide nothing")}
+		// The set that names each inbound, group and user, with the path of that entry. Nothing is named twice, so whose queries go where never depends on the order of the sets.
+		let mut named: [HashMap<&str, (usize, String)>; 3] = Default::default();
+		for (i, set) in self.dns.sets.iter().enumerate().take(MAX_DNS_SETS) {
+			if set.inbounds.is_empty() && set.groups.is_empty() && set.users.is_empty() {r.warning(format!("dns.sets[{i}]"), "names no inbound, group or user, so no query goes to its servers")}
+			let lists = [("inbounds", &set.inbounds, MAX_INBOUNDS, &inbound_tags, "expected the tag of an inbound, found a tag no inbound has"), ("groups", &set.groups, MAX_GROUPS, &groups, "expected a group declared in groups"), ("users", &set.users, MAX_USERS, &user_names, "expected the name of a user, found a name no user has")];
+			for (k, (key, list, limit, known, unknown)) in lists.into_iter().enumerate() {
+				if list.len() > limit {r.error(format!("dns.sets[{i}].{key}"), format!("expected at most {limit} entries"))}
+				for (j, name) in list.iter().enumerate().take(limit) {
+					let at = format!("dns.sets[{i}].{key}[{j}]");
+					if !known.contains_key(name.as_str()) {r.error(&at, unknown)}
+					match named[k].get(name.as_str()) {
+						Some((_, first)) => r.error(&at, format!("expected an entry that no set names more than once, found the same entry as {first}")),
+						None => drop(named[k].insert(name, (i, at))),
+					}
+				}
+			}
+		}
+		// The sets some user's queries go to. A user no set names goes by their groups, which have to lead to one set, and a user nothing speaks for goes by the inbounds their devices are in.
+		let mut reached = [false; MAX_DNS_SETS];
+		for (i, user) in self.users.iter().enumerate().take(if self.dns.sets.is_empty() {0} else {MAX_USERS}) {
+			let mut theirs = user.groups.iter().filter_map(|group| named[1].get(group.as_str()));
+			match (named[2].get(user.name.as_str()), theirs.next()) {
+				(Some((set, _)), _) => reached[*set] = true,
+				(None, Some((first, at))) => {
+					reached[*first] = true;
+					if let Some((_, other)) = theirs.find(|(set, _)| set != first) {r.error(format!("users[{i}].groups"), format!("the groups of this user are named by two sets, at {at} and at {other}: name the user in the `users` of one set, or keep the groups in one set"))}
+				}
+				(None, None) => for (tag, (set, _)) in &named[0] {reached[*set] |= !small || inbound_tags.get(tag).is_some_and(|inbound| sets[i][2].has(*inbound))},
+			}
+		}
+		for (i, _) in self.dns.sets.iter().enumerate().take(MAX_DNS_SETS).filter(|(i, set)| !reached[*i] && set.users.is_empty() && !(set.inbounds.is_empty() && set.groups.is_empty())) {
+			r.warning(format!("dns.sets[{i}]"), "no query goes to its servers: the groups it names have no user, and every user of the inbounds it names goes by a set that names them or one of their groups");
 		}
 		// Whether every address of a network is matched by an `ip` entry. `geoip:private` leaves the inbound pools to the `tunnel:` names, which leave out the gateways.
 		let inside = |entry: &IpEntry, net: &IpNet| match entry {
@@ -394,13 +431,13 @@ impl Config {
 		if !rules.iter().any(|rule| refuses(rule, Some(&IpEntry::Private)) && rule.inbound.is_none()) {
 			r.warning("routing.rules", "no enabled block or reject rule has geoip:private in ip and no other condition, so private networks behind the exits are reachable");
 		}
-		for (s, Addr(server)) in self.dns.servers.iter().enumerate().take(MAX_DNS_SERVERS) {
+		for (at, Addr(server)) in resolvers.iter().flat_map(|(at, servers)| servers.iter().enumerate().take(MAX_DNS_SERVERS).map(move |(s, server)| (format!("{at}[{s}]"), server))) {
 			// The first enabled rule a query to this server on port 53 can match, over UDP or TCP. A rule that sends it to an exit counts whatever else it asks for.
 			let first = rules.iter().enumerate().find(|(_, rule)| {
 				((refuses(rule, None) && rule.inbound.is_none()) || (live(rule) && matches!(rule.action, Action::Exit(_) | Action::User) && rule.icmp_type.is_none())) && rule.ip.as_ref().is_none_or(|list| list.iter().any(|entry| inside(entry, &IpNet::from(server.ip()))))
 					&& rule.protocol.as_ref().is_none_or(|list| list.iter().any(|p| p.0 == Protocol::TCP || p.0 == Protocol::UDP)) && rule.port.as_ref().is_none_or(|list| list.iter().any(|range| range.lo <= 53 && 53 <= range.hi))
 			});
-			if let Some((i, _)) = first.filter(|(_, rule)| refuses(rule, None)) {r.warning(format!("routing.rules[{i}]"), format!("refuses dns.servers[{s}] on port 53 before any rule sends it to an exit, so the node cannot reach its own resolver"))}
+			if let Some((i, _)) = first.filter(|(_, rule)| refuses(rule, None)) {r.warning(format!("routing.rules[{i}]"), format!("refuses {at} on port 53 before any rule sends it to an exit, so the node cannot reach its own resolver"))}
 		}
 		if shadow && r.errors.is_empty() {
 			let shape = |rule: &Rule| [rule.inbound.is_some(), rule.user.is_some(), rule.group.is_some(), rule.ip.is_some(), rule.domain.is_some(), rule.protocol.is_some(), rule.port.is_some(), rule.icmp_type.is_some(), rule.icmp_code.is_some()];

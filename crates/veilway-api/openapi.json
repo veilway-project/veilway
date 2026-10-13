@@ -889,6 +889,13 @@
             },
             "type": "array"
           },
+          "dns_set": {
+            "description": "The tag of the DNS set that names the user, or else one of their groups. Null when no set does: the user's queries then go to the set that names the inbound they come through, or to `dns.servers`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -943,6 +950,7 @@
           "quota_period",
           "used_bytes",
           "period_start",
+          "dns_set",
           "traffic",
           "devices"
         ],

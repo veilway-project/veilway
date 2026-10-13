@@ -200,6 +200,8 @@ pub struct User {
 	pub used_bytes: u64,
 	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`, or who had none when their usage was last reset.
 	pub period_start: i64,
+	/// The tag of the DNS set that names the user, or else one of their groups. Null when no set does: the user's queries then go to the set that names the inbound they come through, or to `dns.servers`.
+	pub dns_set: Option<String>,
 	pub traffic: Traffic,
 	pub devices: Vec<Device>,
 }

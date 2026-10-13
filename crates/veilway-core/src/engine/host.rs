@@ -410,6 +410,19 @@ impl Host {
 		for (socket, endpoint, datagram) in &out {let _ = socket.try_send_to(datagram, *endpoint);}
 		// The flows went first and the memory goes after them, which is the order `resolver::answer` counts on.
 		for was in old.devices.iter().filter(|was| cut.contains_key(&was.public_key)) {old.users[was.user].state.names().clear()}
+		// A user whose queries go to other servers from here on forgets what the servers before told them, so no `domain` rule goes on matching by the word of a resolver that is no longer theirs.
+		// It is looked at inbound by inbound, for the inbound of the same tag: the servers of the list a device's queries go to through it, in whatever order. Another list of the same servers changes nothing, and the same list with other servers does.
+		// The plan is in force by now, which is the order `resolver::answer` counts on.
+		let mut moved: Vec<(&str, &str)> = Vec::new();
+		for (was, is) in old.devices.iter().filter(|was| !cut.contains_key(&was.public_key)).filter_map(|was| plan.by_key.get(&was.public_key).map(|at| (was, &plan.devices[*at]))) {
+			let name = old.users[was.user].name.as_str();
+			// The devices of a user stand together, so the last name is the only one to look at.
+			let left = was.inbounds.iter().map(|at| (old.inbounds[*at].tag.as_str(), &old.dns[old.dns_of(was.user, *at)])).find(|(tag, list)| !is.inbounds.iter().any(|at| plan.inbounds[*at].tag == *tag && plan.dns[plan.dns_of(is.user, *at)].same(list))).filter(|_| moved.last().is_none_or(|(last, _)| *last != name));
+			if let Some((tag, _)) = left {
+				old.users[was.user].state.names().clear();
+				moved.push((name, tag));
+			}
+		}
 		shared.pings.lock().unwrap_or_else(|e| e.into_inner()).retain(|(src, dst, _), (device, ..)| !cut.contains_key(device) && !pings.contains(&(*src, *dst)));
 		// An exit that is not what it was has an upstream nothing is known about.
 		for (was, at) in old.exits.iter().zip(&exits) {
@@ -419,6 +432,10 @@ impl Host {
 			tracing::info!("user {} device {}: cut off, {reason}: its session keys and its flows are gone and the user's dns memory is cleared", old.users[was.user].name, was.name);
 		}
 		if cut.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices were cut off", cut.len() - MAX_NAMES_LOGGED)}
+		for (name, tag) in moved.iter().take(MAX_NAMES_LOGGED) {
+			tracing::info!("user {name}: the dns servers for their queries through inbound {tag} are not the ones they were, so the user's dns memory is cleared");
+		}
+		if moved.len() > MAX_NAMES_LOGGED {tracing::info!("{} more users had their dns memory cleared because their dns servers changed", moved.len() - MAX_NAMES_LOGGED)}
 		if ended > 0 {tracing::info!("{ended} flow(s) ended with the config they were routed by")}
 		// A user is an event when what `denied` says of them turns, not when one of their devices changes. The plan before the first one holds what the state file remembered and nobody was connected under it.
 		for was in old.users.iter().filter(|_| old.generation > 0) {

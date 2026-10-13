@@ -502,7 +502,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (users, writable) = usage::load(&path);
 		(users, writable.then_some(path))
 	});
-	let remembered = Plan {users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, quota: None, period: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
+	let remembered = Plan {users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
 	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS)});
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind.
 	let mut host = Host::new(options.dir);

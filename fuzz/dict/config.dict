@@ -5,6 +5,7 @@
 "dns"
 "servers"
 "hijack"
+"sets"
 "groups"
 "inbounds"
 "outbounds"

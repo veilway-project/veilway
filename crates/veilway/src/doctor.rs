@@ -65,8 +65,8 @@ fn answered(asked: &str, query: &[u8], outcome: Option<io::Result<Vec<u8>>>, too
 	}
 }
 
-/// One DNS server asked from the node itself, over UDP and over TCP at once. `direct` says some exit of the config asks its servers that way, which is what makes silence a failure.
-async fn server(at: usize, target: SocketAddr, direct: bool, wait: Duration) -> Vec<Line> {
+/// One DNS server asked from the node itself, over UDP and over TCP at once. `subject` is where the config names it. `direct` says some exit of the config asks its servers that way, which is what makes silence a failure.
+async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duration) -> Vec<Line> {
 	let (query, started) = (question(), Instant::now());
 	let (udp, tcp) = tokio::join!(
 		async {(timeout(wait, probe::ask_udp(None, target, &query)).await.ok(), started.elapsed())},
@@ -74,7 +74,7 @@ async fn server(at: usize, target: SocketAddr, direct: bool, wait: Duration) -> 
 	);
 	let (silent, advice) = if direct {(Status::Fail, "an exit that leaves directly asks this server over UDP, so its lookups fail or wait for the next server. Check the address and the firewall, or name another server")} else {(Status::Warn, "the node itself does not reach it. No exit of this config leaves directly, so what counts is whether each proxy reaches it, which the outbound lines say")};
 	let (udp, tcp) = (answered("a query from the node over UDP", &query, udp.0, udp.1, wait, silent, advice), answered("a query from the node over TCP", &query, tcp.0, tcp.1, wait, Status::Warn, "an answer too long for one datagram is asked for again over TCP, and an exit through a SOCKS5 proxy asks over TCP only. Use a server that answers over both"));
-	vec![line(udp.0, "dns", format!("servers[{at}], udp"), udp.1), line(tcp.0, "dns", format!("servers[{at}], tcp"), tcp.1)]
+	vec![line(udp.0, "dns", format!("{subject}, udp"), udp.1), line(tcp.0, "dns", format!("{subject}, tcp"), tcp.1)]
 }
 
 /// One outbound tried the way the engine uses it, towards the DNS servers of the config: a direct one from the node itself, a socks5 one step by step so that each thing a proxy may lack has its own line.
@@ -305,18 +305,20 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, api:
 		Backend::Block {} => false,
 	});
 	let (servers, limit, mut tasks): (Arc<[SocketAddr]>, _, _) = (config.dns.servers.iter().map(|server| server.0).collect(), Arc::new(Semaphore::new(AT_ONCE)), JoinSet::new());
-	for (at, target) in servers.iter().copied().enumerate() {
+	// Every server the node's resolver may ask, with where the config names it: those of `dns.servers`, then those of each set under the tag of the set. A server that two lists name is asked for each.
+	let asked: Vec<(String, SocketAddr)> = servers.iter().enumerate().map(|(at, server)| (format!("servers[{at}]"), *server)).chain(config.dns.sets.iter().flat_map(|set| set.servers.iter().enumerate().map(move |(at, server)| (format!("set {}, servers[{at}]", set.tag), server.0)))).collect();
+	for (at, (subject, target)) in asked.iter().cloned().enumerate() {
 		let limit = limit.clone();
 		tasks.spawn(async move {
 			let _slot = limit.acquire_owned().await;
-			(at, server(at, target, direct, wait).await)
+			(at, server(subject, target, direct, wait).await)
 		});
 	}
 	for at in 0..config.outbounds.len() {
-		let (config, servers, limit) = (config.clone(), servers.clone(), limit.clone());
+		let (config, servers, limit, after) = (config.clone(), servers.clone(), limit.clone(), asked.len());
 		tasks.spawn(async move {
 			let _slot = limit.acquire_owned().await;
-			(servers.len() + at, outbound(&config.outbounds[at], &servers, wait).await)
+			(after + at, outbound(&config.outbounds[at], &servers, wait).await)
 		});
 	}
 	let (began, mut tried) = (Instant::now(), Vec::new());
@@ -325,10 +327,14 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, api:
 	tasks.abort_all();
 	let ended: HashSet<usize> = tried.iter().map(|(at, _)| *at).collect();
 	let late = format!("it was not tried to its end: doctor ran out of time, which is {} s for everything on the network together. Run it again, with a smaller --timeout if little of this network answers", TOTAL.as_secs());
-	tried.extend((0..servers.len() + config.outbounds.len()).filter(|at| !ended.contains(at)).map(|at| (at, vec![match at.checked_sub(servers.len()).map(|at| &config.outbounds[at]) {
+	tried.extend((0..asked.len() + config.outbounds.len()).filter(|at| !ended.contains(at)).map(|at| (at, vec![match at.checked_sub(asked.len()).map(|at| &config.outbounds[at]) {
 		Some(config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..}) => line(Status::Skipped, "outbound", tag, late.as_str()),
-		None => line(Status::Skipped, "dns", format!("servers[{at}]"), late.as_str()),
+		None => line(Status::Skipped, "dns", asked[at].0.as_str(), late.as_str()),
 	}])));
+	// The servers of a set were asked from the node itself and through no outbound, which is said rather than left to be assumed. It is put in first with the place of the first outbound, so the sort leaves it after the last server and before that outbound.
+	if !config.dns.sets.is_empty() {
+		tried.insert(0, (asked.len(), vec![line(Status::Skipped, "dns", "sets, through the outbounds", "the servers of DNS sets were asked from the node itself only: each outbound was tried towards dns.servers and towards no server of a set. Where the queries of a set leave through a proxy, these lines do not say whether that proxy reaches the servers of the set, so look for `stopped answering` in the log of the node once its users resolve")]));
+	}
 	// They end in any order and are printed in the order of the config.
 	tried.sort_by_key(|(at, _)| *at);
 	lines.extend(tried.into_iter().flat_map(|(_, lines)| lines));

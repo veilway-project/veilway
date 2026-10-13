@@ -1307,6 +1307,30 @@ async fn rates_follow_the_traffic_and_fall_back_to_zero() {
 	node.end().await;
 }
 
+/// A user says which DNS set speaks for them: the one that names them, before the one that names a group of theirs. Null is a user who goes by the inbound a query comes through, and so is every user of a config without sets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_says_the_dns_set_that_names_them_or_their_group() {
+	let mut setup = setup().await;
+	setup.doc["groups"] = json!(["family"]);
+	setup.doc["users"][0]["groups"] = json!(["family"]);
+	setup.doc["users"][1]["groups"] = json!(["family"]);
+	setup.doc["dns"]["hijack"] = json!(true);
+	setup.doc["dns"]["sets"] = json!([{"tag": "family", "servers": ["1.1.1.3:53"], "groups": ["family"]}, {"tag": "own", "servers": ["9.9.9.9:53"], "users": ["a"]}, {"tag": "lab", "servers": ["9.9.9.10:53"], "inbounds": ["home"]}]);
+	let node = launch(setup).await;
+	let sets = async |socket: &Path| {
+		let users = get(socket, "/v1/users").await.json;
+		[0, 1, 2].map(|at| users["users"][at]["dns_set"].clone())
+	};
+	assert_eq!(sets(&node.socket).await, [json!("own"), json!("family"), Value::Null]);
+	assert_eq!(get(&node.socket, "/v1/users/b").await.json["dns_set"], json!("family"));
+	let (mut doc, revision) = node.shown().await;
+	doc["dns"].as_object_mut().unwrap().remove("sets");
+	let applied = send(&node.socket, "PUT", "/v1/config", Some(&revision), &doc).await;
+	assert_eq!((applied.status, &applied.json["diff"]["dns"]), (200, &json!(true)), "{}", applied.json);
+	assert_eq!(sets(&node.socket).await, [Value::Null, Value::Null, Value::Null]);
+	node.end().await;
+}
+
 #[test]
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
