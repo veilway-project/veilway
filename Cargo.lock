@@ -1722,7 +1722,9 @@ name = "veilway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boringtun",
  "clap",
+ "etherparse",
  "libc",
  "rcgen",
  "serde_json",

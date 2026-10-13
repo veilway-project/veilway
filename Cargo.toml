@@ -42,6 +42,6 @@ hyper={version="1", features=["http1", "server"]}
 hyper-util={version="0.1", features=["tokio", "service"]}
 
 
-# ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout. See vendor/ipstack ("veilway patch").
+# ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout, and it blocks in the Drop of a TCP stream, which kept a node with open flows from ever exiting. See vendor/ipstack ("veilway patch").
 [patch.crates-io]
 ipstack={path="vendor/ipstack"}
