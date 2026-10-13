@@ -119,8 +119,9 @@ impl Carried {
 		if document.is_empty() || !document.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte)) {return Err(LinkError::Form)}
 		Ok(Self {key, document: document.to_owned(), file})
 	}
-	/// Reads the content of a file: "`v1.<key>.<document>`", with a document of at most `BODY_MAX` bytes and nothing before or after it, a line end included.
+	/// Reads the content of a file: "`v1.<key>.<document>`", with a document of at most `BODY_MAX` bytes and nothing before or after it but one line end, LF or CRLF, which editors add when a file is saved and which is ignored.
 	pub fn file(content: &[u8]) -> Result<Self, LinkError> {
+		let content = content.strip_suffix(b"\n").map_or(content, |rest| rest.strip_suffix(b"\r").unwrap_or(rest));
 		if content.len() > BODY_MAX + KEY + 4 {return Err(LinkError::Size)}
 		Self::read(std::str::from_utf8(content).map_err(|_| LinkError::Form)?, BODY_MAX, true)
 	}
