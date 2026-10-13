@@ -238,7 +238,7 @@ Client TLS fingerprint matters as much as the server: a rustls ClientHello does 
 
 Every profile gets one of three ratings, computed by the core so panel and clients agree:
 
-- **Protected**: verified TLS or fake TLS around an encrypted protocol.
+- **Protected**: verified TLS or fake TLS around an encrypted protocol, and only for a transport that has passed the probe and fingerprint tests on that release and whose address carries no weaker listener (`THREAT_MODEL.md` invariant 7a). Until those tests are recorded, every native profile is rated Detectable.
 - **Detectable**: encrypted but easy to fingerprint (plain WireGuard UDP).
 - **Unsafe**: no encryption or broken verification (plain HTTP/SOCKS, VMess without TLS, `allowInsecure`, weak Shadowsocks ciphers).
 
