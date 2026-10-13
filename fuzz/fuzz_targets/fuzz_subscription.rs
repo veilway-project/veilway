@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::{collections::HashSet, sync::OnceLock};
-use veilway_proto::{control, proof::public_key, subscription::{client::{Held, Offer, Refreshed}, envelope::{self, SigningKey}, is_host, link::{Carried, Link}, payload::{self, Card, Payload, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, INTEGER_MAX, LIFETIME_MAX, LOGO_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX, UPDATE_INTERVAL}, BODY_MAX, LINK_URL_MAX, URL_MAX}};
+use veilway_proto::{control, proof::public_key, subscription::{client::{Held, Offer, Refreshed}, envelope::{self, SigningKey}, is_host, link::{Carried, Link}, payload::{self, Card, Payload, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, INTEGER_MAX, LIFETIME_MAX, LOGO_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX, UPDATE_INTERVAL}, Tag, Text, BODY_MAX, LINK_URL_MAX, TAG_MAX, TRANSLATIONS_MAX, URL_MAX}};
 
 // The payload of a whole document of tests/vectors.py, with a provider-issued device key, after one byte of settings. The file that carries it starts with the key it is signed under.
 const IMPORT: &[u8] = include_bytes!("../corpus/fuzz_subscription/import");
@@ -46,29 +46,51 @@ fn linked() -> Held {
 
 // What every document a client is left with keeps, whatever the provider wrote: each count within its limit, each text within its length and free of what the filter removes, each address one a document may name.
 fn sound(read: &Subscription) {
-	let shown = |text: &str, chars: usize| assert!(text.chars().count() <= chars && control::display(text, usize::MAX, usize::MAX) == text, "display text that was not filtered and cut");
+	let plain = |text: &str, chars: usize, bytes: usize| assert!(text.chars().count() <= chars && text.len() <= bytes && control::display(text, usize::MAX, usize::MAX) == text, "display text that was not filtered and cut");
+	// A text in every language it has: at most 8 translations, each under a tag that is one and no tag twice, none empty, each held to what `default` is held to.
+	let shown = |text: &Text, chars: usize, bytes: usize| {
+		plain(text.as_str(), chars, bytes);
+		assert!(text.translations().count() <= TRANSLATIONS_MAX && text.translations().all(|translation| Tag::read(translation.tag.as_str()).as_ref() == Some(translation.tag) && translation.tag.as_str().len() <= TAG_MAX && !translation.text.is_empty()) && text.translations().map(|translation| translation.tag).collect::<HashSet<_>>().len() == text.translations().count(), "a translation that is none");
+		text.translations().for_each(|translation| plain(translation.text, chars, bytes));
+		// Picking never panics and gives a text the document holds, whatever the app asks for.
+		let asked: Vec<Tag> = text.translations().map(|translation| translation.tag.clone()).chain(["und", "fa-Arab-IR", "en"].into_iter().filter_map(Tag::read)).collect();
+		assert!(asked.iter().all(|tag| text.translation(std::slice::from_ref(tag)).is_none_or(|picked| picked.tag.parts().0 == tag.parts().0 && tag.parts().0 != "und")) && text.decided(&asked).0 == text.as_str() && text.pick(&[]) == (text.as_str(), None), "a translation was picked that was not asked for");
+	};
 	assert!((1..=PROFILES_MAX).contains(&read.profiles.len()) && read.profiles.len() + read.refused.len() <= PROFILES_MAX && (1..=2).contains(&read.signing_keys.len()) && (1..=INTEGER_MAX).contains(&read.serial) && read.expires_at > read.issued_at && read.expires_at - read.issued_at <= LIFETIME_MAX && UPDATE_INTERVAL.contains(&u64::from(read.update_interval)), "a top-level value outside its range");
 	assert!(read.refresh_urls.len() <= REFRESH_URLS_MAX && read.devices.len() <= DEVICES_MAX && read.support.len() <= SUPPORT_MAX && read.cards.len() <= CARDS_MAX && read.notices.len() <= control::NOTICES_MAX && read.devices.iter().filter(|device| device.this).count() <= 1 && read.logo.as_ref().is_none_or(|logo| (1..=LOGO_MAX).contains(&logo.data.len())), "a list over its limit");
-	shown(read.provider.as_str(), 64);
-	assert!(!read.provider.is_empty() && read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= LINK_URL_MAX && !url.as_str().contains('#') && url.as_str()[8..].starts_with(url.host()) && is_host(url.host())), "a refresh URL that is none");
-	read.devices.iter().for_each(|device| shown(device.name.as_str(), 32));
+	shown(&read.provider, 64, 256);
+	assert!(read.provider.visible() &&read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= LINK_URL_MAX && !url.as_str().contains('#') && url.as_str()[8..].starts_with(url.host()) && is_host(url.host())), "a refresh URL that is none");
+	read.devices.iter().for_each(|device| {
+		plain(device.name.as_str(), 32, 128);
+		assert!(device.name.translations().count() == 0, "a device's name in several languages");
+	});
 	read.support.iter().for_each(|link| {
-		shown(link.label.as_str(), 32);
+		shown(&link.label, 32, 128);
 		assert!(link.url.as_str().starts_with("https://") && link.url.as_str().len() <= URL_MAX);
 	});
-	read.notices.iter().for_each(|notice| assert!(notice.text.as_str().len() <= control::NOTICE_MAX));
+	read.notices.iter().for_each(|notice| shown(&notice.text, usize::MAX, control::NOTICE_MAX));
 	for card in &read.cards {
 		match card {
-			Card::Stat {label, value, unit} => [(label, 32), (value, 16)].into_iter().chain(unit.as_ref().map(|unit| (unit, 8))).for_each(|(text, chars)| shown(text.as_str(), chars)),
-			Card::Progress {label, used, total} => assert!(used <= total && *total > 0 && *total <= INTEGER_MAX && label.as_str().chars().count() <= 32),
-			Card::Notice(notice) => assert!(notice.text.as_str().len() <= control::NOTICE_MAX),
-			Card::Link {label, url} => assert!(label.as_str().chars().count() <= 32 && url.as_str().starts_with("https://") && url.as_str().len() <= URL_MAX),
+			Card::Stat {label, value, unit} => [(label, 32), (value, 16)].into_iter().chain(unit.as_ref().map(|unit| (unit, 8))).for_each(|(text, chars)| shown(text, chars, 4 * chars)),
+			Card::Progress {label, used, total} => {
+				shown(label, 32, 128);
+				assert!(used <= total && *total > 0 && *total <= INTEGER_MAX);
+			}
+			Card::Notice(notice) => shown(&notice.text, usize::MAX, control::NOTICE_MAX),
+			Card::Link {label, url} => {
+				shown(label, 32, 128);
+				assert!(url.as_str().starts_with("https://") && url.as_str().len() <= URL_MAX);
+			}
 		}
 	}
 	let mut ids = HashSet::new();
 	for profile in &read.profiles {
-		shown(profile.name.as_str(), 64);
-		assert!(ids.insert(&profile.id) && !profile.name.is_empty() && (1280..=1500).contains(&profile.mtu) && (1..=4).contains(&profile.parallel) && profile.min_control_version >= 1 && (1..=TRANSPORTS_MAX).contains(&profile.transports.len()) && profile.exits.len() <= control::EXITS_MAX && profile.exits.iter().all(|exit| control::is_tag(&exit.tag) && !exit.name.is_empty()), "a profile outside its ranges");
+		shown(&profile.name, 64, 256);
+		profile.exits.iter().for_each(|exit| shown(&exit.name, 64, 256));
+		profile.notices.iter().for_each(|notice| shown(&notice.text, usize::MAX, control::NOTICE_MAX));
+		// What a node sends stands for a text of the document only when it is the bytes of its `default`: the name of another exit and a notice no list holds find nothing.
+		assert!(profile.exit_name(&control::Exit {tag: "none".into(), name: "".into(), country: None, all_protocols: false, selected: false, configured: false, working: false, load: control::Load::Low}).is_none() && read.notice_text(profile, &control::Notice {severity: control::Severity::Warning, text: "\u{0}".into()}).is_none(), "a text of the document stood for one no node sent");
+		assert!(ids.insert(&profile.id) && profile.name.visible() && (1280..=1500).contains(&profile.mtu) && (1..=4).contains(&profile.parallel) && profile.min_control_version >= 1 && (1..=TRANSPORTS_MAX).contains(&profile.transports.len()) && profile.exits.len() <= control::EXITS_MAX && profile.notices.len() <= control::NOTICES_MAX && profile.exits.iter().all(|exit| control::is_tag(&exit.tag) && exit.name.visible()), "a profile outside its ranges");
 		assert!((1..=2).contains(&profile.device.addresses.len()) && profile.gateways.len() == profile.device.addresses.len() && (1..=2).contains(&profile.device.transport_secrets.len()) && profile.device.private_key.as_ref().is_none_or(|private| public_key(private.expose()) == profile.device.public_key), "device keys that do not hold together");
 		assert!(profile.padding.keepalive.start() + 10_000 <= *profile.padding.keepalive.end() && *profile.padding.keepalive.start() >= 10_000 && *profile.padding.keepalive.end() <= 60_000 && (512..=1023).contains(&profile.padding.wide_max) && (64..=255).contains(&profile.padding.normal_max), "padding outside its ranges");
 		for transport in &profile.transports {

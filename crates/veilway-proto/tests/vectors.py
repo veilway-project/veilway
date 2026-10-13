@@ -241,13 +241,23 @@ def jws(seed, payload, header=None):
     return signed + b"." + b64(ed_sign(seed, signed))
 issued = 1_700_000_000
 # A document of one profile with one datagram and one stream transport. With `private` the provider issued the device's key, which is what a whole document in a link carries.
-def payload(serial, keys, private=False, at=issued, **more):
+def payload(serial, keys, private=False, at=issued, of_profile=None, **more):
     keys_of_device = {"public_key": key64(device_public), "addresses": ["10.7.0.2", "fd00::2"], "transport_secrets": [key64(secret)]}
     if private: keys_of_device["private_key"] = key64(device_private)
     profile = {"id": "main", "name": "Example", "type": "veilway", "inbound_public_key": key64(inbound), "device": keys_of_device, "gateways": ["10.7.0.1", "fd00::1"], "mtu": 1420, "transport_public_key": key64(node_pk), "transports": [{"type": "udp-obfs", "endpoints": ["192.0.2.10:51820", "[2001:db8::10]:51820"]}, {"type": "tls", "path": "/a-path-of-a-transport", "candidates": [{"address": "192.0.2.10:443", "sni": "node.example.com", "host": "node.example.com", "pins": [key64(hashlib.sha256(b"pin").digest())]}]}], "exits": [{"tag": "de", "name": "Berlin", "country": "DE", "full_ip": True}]}
     document = {"v": 1, "subscription_id": "example-account-0001", "serial": serial, "issued_at": at, "expires_at": at + 30 * 86400, "signing_keys": [key64(key) for key in keys], "provider": {"name": "Example Provider"}, "profiles": [profile], "devices": [{"name": "phone", "enrolled_at": at, "this": True}]}
+    profile.update(of_profile or {})
     document.update(more)
-    return json.dumps(document, separators=(",", ":")).encode()
+    return json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode()
+# Texts in several languages ("Text in several languages"): English as `default`, Persian with the zero width non-joiner (U+200C) that its spelling needs, German, and Chinese under a tag of three parts. The notice of the profile is what its node sends on the control channel, and the first exit has the name its node sends.
+def said(default, **others): return {"default": default, **{tag.replace("_", "-"): text for tag, text in others.items()}}
+languages = dict(
+    provider={"name": said("Example Provider", fa="ارائه\N{ZERO WIDTH NON-JOINER}دهنده نمونه", de="Beispielanbieter")},
+    of_profile={"name": said("Example", fa="نمونه"), "exits": [{"tag": "de", "name": said("Frankfurt", fa="فرانکفورت", de="Frankfurt am Main", zh_Hant_TW="法蘭克福"), "country": "DE", "full_ip": True}, {"tag": "nl", "name": "Amsterdam"}], "notices": [{"severity": "info", "text": said("Maintenance tonight", fa="امشب سرور به\N{ZERO WIDTH NON-JOINER}روزرسانی می\N{ZERO WIDTH NON-JOINER}شود")}]},
+    support=[{"label": said("Help", fa="راهنما"), "url": "https://example.com/help"}],
+    cards=[{"type": "stat", "label": said("Plan", fa="طرح"), "value": said("Basic", fa="پایه"), "unit": said("GB", fa="گیگابایت")}, {"type": "notice", "severity": "info", "text": said("Hello", fa="سلام")}, {"type": "link", "label": said("Site", fa="وب\N{ZERO WIDTH NON-JOINER}سایت"), "url": "https://example.com/"}],
+    notices=[{"severity": "warning", "text": said("Welcome", fa_Arab_IR="خوش آمدید", fa="خوش آمدید", en_GB="Welcome back")}],
+)
 payload_first, payload_carried = payload(1, [sub_pk1]), payload(1, [sub_pk1], private=True)
 payload_both, payload_second = payload(2, [sub_pk1, sub_pk2]), payload(3, [sub_pk2])
 payload_refusal = json.dumps({"v": 1, "subscription_id": "example-account-0001", "issued_at": issued, "refusal": "device_limit"}, separators=(",", ":")).encode()
@@ -305,6 +315,8 @@ subscription_seeds = {
     "fuzz_subscription/refusal-with-link": b"\x04" + payload_refusal,
     "fuzz_subscription/import-content": b"\x01" + payload(5, [sub_pk1], private=True, refresh_urls=["https://mirror.example.net/s"], support=[{"label": "Help", "url": "https://example.com/help"}]),
     "fuzz_subscription/content": b"\x00" + payload(5, [sub_pk1], private=True, update_interval=7200, refresh_urls=["https://mirror.example.net/s"], usage={"used_bytes": 1, "quota_bytes": 2, "period": "monthly", "period_start": issued, "expires_at": 0, "device_limit": 3}, support=[{"label": "Help", "url": "https://example.com/help"}], cards=[{"type": "stat", "label": "Plan", "value": "Basic", "unit": "GB"}, {"type": "progress", "label": "Used", "used": 1, "total": 2}, {"type": "notice", "severity": "info", "text": "Hello"}, {"type": "link", "label": "Site", "url": "https://example.com/"}], logo={"type": "png", "data": key64(b"\x89PNG")}, accent="#3366cc", notices=[{"severity": "warning", "text": "Maintenance"}]),
+    "fuzz_subscription/languages": b"\x00" + payload(6, [sub_pk1], private=True, at=issued + 60, **languages),
+    "fuzz_subscription/import-languages": b"\x01" + payload(6, [sub_pk1], private=True, **languages),
     "fuzz_deeplink/native-veilway": link_veilway,
     "fuzz_deeplink/native-https": link_https,
     "fuzz_deeplink/document": b"veilway://doc#" + link_file,

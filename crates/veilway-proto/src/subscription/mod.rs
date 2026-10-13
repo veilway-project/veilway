@@ -3,7 +3,7 @@
 //! Everything here reads what a provider or whoever answers in its place wrote, so every reader checks a limit before it uses a byte, and no error carries any of the input. There is no socket, no clock and no storage: the body of an answer, the time and the random bytes are parameters, and what a client holds is a value the caller keeps.
 //!
 //! Two properties are carried by the types and not by the caller's care. A payload is read only from an `envelope::Verified`, which nothing but `envelope::verify` makes, so no byte of a payload is parsed before its signature was checked under a key that was held. And a `fetch::Request` of a client comes only out of the steps of `client`, the first of which is the user's yes to what the link alone shows.
-use crate::control::display;
+use crate::{control::{display, Untrusted}, unicode::strong};
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 use std::fmt;
 use subtle::ConstantTimeEq;
@@ -52,17 +52,93 @@ pub type Token = Secret<16>;
 /// "Device secret: 16 bytes, 22 base64url characters."
 pub type DeviceSecret = Secret<16>;
 
+/// "Languages of one text: the default and at most 8 more."
+pub const TRANSLATIONS_MAX: usize = 8;
+/// "A language tag: at most 11 characters."
+pub const TAG_MAX: usize = 11;
+
+/// A language tag of "Text in several languages": 2 or 3 lowercase letters, then optionally `-` and a script of one uppercase and three lowercase letters, then optionally `-` and a region of two uppercase letters. One spelling only, and no registry behind it: a tag nobody has heard of is a tag that matches no language of the app.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Tag(String);
+
+impl Tag {
+	pub fn read(text: &str) -> Option<Self> {
+		let (language, rest) = text.split_once('-').map_or((text, None), |(language, rest)| (language, Some(rest)));
+		let (script, region) = match rest.map(|rest| rest.split_once('-').ok_or(rest)) {
+			None => (None, None),
+			Some(Ok((script, region))) => (Some(script), Some(region)),
+			Some(Err(one)) => if one.len() == 4 {(Some(one), None)} else {(None, Some(one))},
+		};
+		(text.len() <= TAG_MAX && (2..=3).contains(&language.len()) && language.bytes().all(|byte| byte.is_ascii_lowercase()) && script.is_none_or(|script| script.len() == 4 && script.bytes().enumerate().all(|(index, byte)| if index == 0 {byte.is_ascii_uppercase()} else {byte.is_ascii_lowercase()})) && region.is_none_or(|region| region.len() == 2 && region.bytes().all(|byte| byte.is_ascii_uppercase()))).then(|| Self(text.to_owned()))
+	}
+	/// The tag as it is written, which is what a renderer takes as the language of a text, "for shaping and the choice of font only".
+	pub fn as_str(&self) -> &str {&self.0}
+	/// The language, the script and the region.
+	pub fn parts(&self) -> (&str, Option<&str>, Option<&str>) {
+		let mut parts = self.0.split('-');
+		let (language, second, third) = (parts.next().unwrap_or_default(), parts.next(), parts.next());
+		(language, second.filter(|part| part.len() == 4), third.or(second.filter(|part| part.len() == 2)))
+	}
+}
+
+/// A translation of a text that was picked for the reader: the tag it was written under, for the "small mark of its language" and for the renderer, and the text itself.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Translation<'a> {pub tag: &'a Tag, pub text: &'a str}
+
+impl fmt::Debug for Translation<'_> {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Translation({})", self.tag.as_str())}
+}
+
+/// Which way a text is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {LeftToRight, RightToLeft}
+
+/// "The direction of a provider text is taken from the first character in it that has a strong direction. A text with none, such as one of digits only, is left to right." For a translation as for `default`, and for what a node sent once it went through `control::display`. The language tag of a text says nothing about this.
+pub fn direction(text: &str) -> Direction {if text.chars().find_map(strong) == Some(true) {Direction::RightToLeft} else {Direction::LeftToRight}}
+
+// Whether a text shows anything: it holds a character that is neither white space nor a combining mark with nothing to sit on.
+pub(crate) fn visible(text: &str) -> bool {text.chars().any(|c| !c.is_whitespace() && !matches!(c, '\u{300}'..='\u{36f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}'))}
+
 /// Display text of a provider after the filter and the cut of the control channel page: fit to show as plain text. Only this module makes one, and only through `control::display`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Text(String);
+/// It is `default` and at most `TRANSLATIONS_MAX` translations, each filtered and cut as `default` is. A legacy text and a device's name have `default` alone.
+/// It prints no text of any language. What it also holds and never gives out is `default` as the document wrote it, unfiltered and uncut, which `is` compares with what a node sent.
+#[derive(Clone, Default)]
+pub struct Text {shown: String, sent: String, translations: Vec<(Tag, String)>}
+
+// Two texts are the same text when they show the same in every language. What the filter took out of one of them makes no difference a reader could see.
+impl PartialEq for Text {
+	fn eq(&self, other: &Self) -> bool {self.shown == other.shown && self.translations == other.translations}
+}
+
+impl Eq for Text {}
+
+impl fmt::Debug for Text {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Text({} bytes, {} translations)", self.shown.len(), self.translations.len())}
+}
 
 impl Text {
-	/// Filters `sent`, then cuts it to `chars` characters and `bytes` bytes.
-	pub fn shown(sent: &str, chars: usize, bytes: usize) -> Self {Self(display(sent, chars, bytes))}
-	pub fn as_str(&self) -> &str {&self.0}
-	pub fn is_empty(&self) -> bool {self.0.is_empty()}
-	/// Whether the text shows anything: it holds a character that is neither white space nor a combining mark with nothing to sit on. What the filter removed is gone already. A name must be visible, so that no provider and no profile is shown as a blank next to a fingerprint.
-	pub fn visible(&self) -> bool {self.0.chars().any(|c| !c.is_whitespace() && !matches!(c, '\u{300}'..='\u{36f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}'))}
+	/// Filters `sent`, then cuts it to `chars` characters and `bytes` bytes. The text has no translation.
+	pub fn shown(sent: &str, chars: usize, bytes: usize) -> Self {Self {shown: display(sent, chars, bytes), sent: sent.to_owned(), translations: Vec::new()}}
+	// A text of a document: `default` as it was written, as it is shown, and the translations that were kept, each already filtered and cut.
+	pub(crate) fn translated(sent: &str, shown: String, translations: Vec<(Tag, String)>) -> Self {Self {shown, sent: sent.to_owned(), translations}}
+	/// `default`: what the provider wrote for a reader of any language.
+	pub fn as_str(&self) -> &str {&self.shown}
+	pub fn is_empty(&self) -> bool {self.shown.is_empty()}
+	/// Whether `default` shows anything. What the filter removed is gone already. A name must be visible, so that no provider and no profile is shown as a blank next to a fingerprint.
+	pub fn visible(&self) -> bool {visible(&self.shown)}
+	/// The translations that were kept, in the order of the document.
+	pub fn translations(&self) -> impl Iterator<Item = Translation<'_>> {self.translations.iter().map(|(tag, text)| Translation {tag, text})}
+	/// "How the client picks." `languages` is the app's display language and then the user's fallback languages, each with the script and the region the app fills in from its own table, such as `fa-Arab-IR`. For each in turn the text is asked for language, script and region, then language and script, then language and region, then the language alone. A step that needs a part the app's tag does not have is left out.
+	/// `None` when the text has none of them: the reader then sees `default`. Nothing is guessed, no "similar" language is taken, and `und` matches nothing, also when it is asked for.
+	pub fn translation(&self, languages: &[Tag]) -> Option<Translation<'_>> {
+		languages.iter().map(Tag::parts).filter(|(language, ..)| *language != "und").find_map(|(language, script, region)| [script.zip(region).map(|(script, region)| (Some(script), Some(region))), script.map(|script| (Some(script), None)), region.map(|region| (None, Some(region))), Some((None, None))].into_iter().flatten().find_map(|(script, region)| self.translations().find(|translation| translation.tag.parts() == (language, script, region))))
+	}
+	/// What a reader of `languages` is shown where nothing is decided: the text, and the tag it was written under when it is a translation, which is then marked as one "with a way to see `default` from there".
+	pub fn pick(&self, languages: &[Tag]) -> (&str, Option<&Tag>) {self.translation(languages).map_or((&self.shown, None), |translation| (translation.text, Some(translation.tag)))}
+	/// What a screen shows "where the user decides something (an import, a replacement, the consent to a lower class, the question about a private address)": `default` always, "with the picked translation beside it when there is one".
+	pub fn decided(&self, languages: &[Tag]) -> (&str, Option<Translation<'_>>) {(&self.shown, self.translation(languages))}
+	/// Whether `default`, exactly as the document wrote it, is byte for byte what a node sent ("Languages" on the control channel page): "before any filter or cut, with no normalisation". Only then may a translation of this text stand for the node's text.
+	pub fn is(&self, sent: &Untrusted) -> bool {self.sent == sent.as_sent()}
 }
 
 // The u coordinates of the points of small order on Curve25519, lowest byte first, with the highest bit clear as X25519 reads them: 0, 1, the two of order 8, p - 1, p and p + 1. tests/vectors.py shows that X25519 gives all zero bytes for each. `proof` holds the same list for the `enc` of a token.

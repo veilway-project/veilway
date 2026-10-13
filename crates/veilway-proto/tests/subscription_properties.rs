@@ -3,7 +3,7 @@ use proptest::{collection::vec, option, prelude::*, sample::{select, Index}};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs};
-use veilway_proto::{proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, BODY_MAX}, NoRandom};
+use veilway_proto::{control, proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, Tag, Text, BODY_MAX, TRANSLATIONS_MAX}, NoRandom};
 
 const ISSUED: u64 = 1_700_000_000;
 
@@ -73,26 +73,41 @@ fn endpoint() -> impl Strategy<Value = String> {("[a-z][a-z0-9]{0,8}(\\.[a-z][a-
 
 // A subscription as a client is left with it: every count within its limit, every text within its length and free of what the filter removes, every dial address one a document may name.
 fn sound(read: &Subscription) {
-	let shown = |text: &str, chars: usize| assert!(text.chars().count() <= chars && !text.chars().any(|c| c.is_control() || ('\u{200b}'..='\u{200f}').contains(&c) || ('\u{202a}'..='\u{202e}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)), "{text:?}");
+	let plain = |text: &str, chars: usize, bytes: usize| assert!(text.chars().count() <= chars && text.len() <= bytes && control::display(text, usize::MAX, usize::MAX) == text && !text.chars().any(|c| c.is_control() || matches!(c, '\u{200b}' | '\u{200e}' | '\u{200f}') || ('\u{202a}'..='\u{202e}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)), "{text:?}");
+	// A text in every language it has: `default` and at most 8 translations, each under a tag that is one, each filtered and cut as `default` is, none empty, and with one visible character where `filled` asks for it of `default`.
+	let said = |text: &Text, chars: usize, bytes: usize, filled: bool| {
+		plain(text.as_str(), chars, bytes);
+		assert!(text.translations().count() <= TRANSLATIONS_MAX && text.translations().all(|translation| Tag::read(translation.tag.as_str()).as_ref() == Some(translation.tag) && translation.tag.as_str().len() <= 11 && !translation.text.is_empty() && (!filled || translation.text.chars().any(|c| !c.is_whitespace()))) && text.translations().map(|translation| translation.tag).collect::<BTreeSet<_>>().len() == text.translations().count(), "a translation that is none");
+		text.translations().for_each(|translation| plain(translation.text, chars, bytes));
+	};
+	let shown = |text: &Text, chars: usize| said(text, chars, 4 * chars, false);
 	assert!((1..=PROFILES_MAX).contains(&read.profiles.len()) && read.profiles.len() + read.refused.len() <= PROFILES_MAX && (1..=2).contains(&read.signing_keys.len()) && read.serial >= 1 && read.expires_at > read.issued_at && read.expires_at - read.issued_at <= 90 * 86_400 && (900..=604_800).contains(&read.update_interval));
 	assert!(read.refresh_urls.len() <= REFRESH_URLS_MAX && read.devices.len() <= DEVICES_MAX && read.support.len() <= SUPPORT_MAX && read.cards.len() <= CARDS_MAX && read.notices.len() <= 4 && read.devices.iter().filter(|device| device.this).count() <= 1 && read.logo.as_ref().is_none_or(|logo| (1..=65_536).contains(&logo.data.len())));
-	shown(read.provider.as_str(), 64);
+	said(&read.provider, 64, 256, true);
 	assert!(!read.provider.is_empty() && read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= 256 && !url.as_str().contains('#') && !url.host().contains('@')));
-	read.devices.iter().for_each(|device| shown(device.name.as_str(), 32));
-	read.support.iter().for_each(|link| shown(link.label.as_str(), 32));
-	read.notices.iter().for_each(|notice| assert!(notice.text.as_str().len() <= 280));
+	read.devices.iter().for_each(|device| assert!(device.name.translations().count() == 0 && device.name.as_str().chars().count() <= 32, "a device's name in several languages"));
+	read.support.iter().for_each(|link| shown(&link.label, 32));
+	read.notices.iter().for_each(|notice| said(&notice.text, usize::MAX, 280, false));
 	for card in &read.cards {
 		match card {
-			Card::Stat {label, value, unit} => [(label, 32), (value, 16)].into_iter().chain(unit.as_ref().map(|unit| (unit, 8))).for_each(|(text, chars)| shown(text.as_str(), chars)),
-			Card::Progress {label, used, total} => assert!(used <= total && *total > 0 && label.as_str().chars().count() <= 32),
-			Card::Notice(notice) => assert!(notice.text.as_str().len() <= 280),
-			Card::Link {label, url} => assert!(label.as_str().chars().count() <= 32 && url.as_str().starts_with("https://") && url.as_str().len() <= 512),
+			Card::Stat {label, value, unit} => [(label, 32), (value, 16)].into_iter().chain(unit.as_ref().map(|unit| (unit, 8))).for_each(|(text, chars)| shown(text, chars)),
+			Card::Progress {label, used, total} => {
+				shown(label, 32);
+				assert!(used <= total && *total > 0);
+			}
+			Card::Notice(notice) => said(&notice.text, usize::MAX, 280, false),
+			Card::Link {label, url} => {
+				shown(label, 32);
+				assert!(url.as_str().starts_with("https://") && url.as_str().len() <= 512);
+			}
 		}
 	}
 	let mut ids = BTreeSet::new();
 	for profile in &read.profiles {
-		shown(profile.name.as_str(), 64);
-		assert!(ids.insert(&profile.id) && !profile.name.is_empty() && (1280..=1500).contains(&profile.mtu) && (1..=4).contains(&profile.parallel) && profile.min_control_version >= 1 && (1..=TRANSPORTS_MAX).contains(&profile.transports.len()) && profile.exits.len() <= 256);
+		said(&profile.name, 64, 256, true);
+		profile.exits.iter().for_each(|exit| said(&exit.name, 64, 256, true));
+		profile.notices.iter().for_each(|notice| said(&notice.text, usize::MAX, 280, false));
+		assert!(ids.insert(&profile.id) && !profile.name.is_empty() && (1280..=1500).contains(&profile.mtu) && (1..=4).contains(&profile.parallel) && profile.min_control_version >= 1 && (1..=TRANSPORTS_MAX).contains(&profile.transports.len()) && profile.exits.len() <= 256 && profile.notices.len() <= 4);
 		assert!((1..=2).contains(&profile.device.addresses.len()) && profile.gateways.len() == profile.device.addresses.len() && (1..=2).contains(&profile.device.transport_secrets.len()) && profile.device.private_key.as_ref().is_none_or(|private| public_key(private.expose()) == profile.device.public_key));
 		assert!(profile.padding.keepalive.start() + 10_000 <= *profile.padding.keepalive.end() && *profile.padding.keepalive.start() >= 10_000 && *profile.padding.keepalive.end() <= 60_000 && (512..=1023).contains(&profile.padding.wide_max) && (64..=255).contains(&profile.padding.normal_max));
 		for transport in &profile.transports {
@@ -238,6 +253,50 @@ proptest! {
 			Ok(Payload::Subscription(read)) => sound(&read),
 			Ok(Payload::Refusal(refusal)) => prop_assert!(Reason::ALL.contains(&refusal.reason)),
 			Err(_) => {}
+		}
+	}
+
+	// "Text in several languages": an object of any members in the place of a name, of an exit's name and of a notice's text. Whatever it holds, the reader does not panic, keeps at most 8 translations and none under a tag that is no tag, and keeps exactly the ones the rule names: of the members with a legal tag the first 8 as the document wrote them, and of those the ones that are a string which shows something.
+	#[test]
+	fn a_text_of_any_tags_keeps_at_most_eight_and_only_legal_ones(default in option::of(prop_oneof![3 => "[ -~]{0,12}".prop_map(Value::from), 1 => any::<String>().prop_map(Value::from), 1 => Just(json!(7))]), before in 0..6usize, members in vec((prop_oneof![6 => "[a-z]{2,3}(-[A-Z][a-z]{3})?(-[A-Z]{2})?", 2 => "[a-zA-Z_-]{0,13}", 1 => select(vec!["und", "fas", "FA", "fa-ir", "fa_IR", "fa-Arab-IR-x", "zh-Hant-TWN", "Default", "x-private", "es-419"]).prop_map(str::to_owned), 1 => any::<String>()], prop_oneof![5 => "[ -~]{0,8}".prop_map(Value::from), 2 => select(vec!["", " ", "\u{200b}", "\u{301}", "\u{202e}ab", "می\u{200c}خواهم", "می\u{200c}"]).prop_map(Value::from), 1 => vec(any::<char>(), 0..80).prop_map(|chars| Value::from(chars.into_iter().collect::<String>())), 1 => Just(json!(1)), 1 => Just(Value::Null), 1 => Just(json!(["x"])), 1 => Just(json!({"default": "x"}))]), 0..14)) {
+		// The members in the order drawn, each name once, with `default` put among them. A document written by hand, since the order of the members is what is under test.
+		let mut written: Vec<(String, Value)> = Vec::new();
+		for (name, value) in members.into_iter().filter(|(name, _)| name != "default" && !name.contains('\0')) {if !written.iter().any(|(other, _)| *other == name) {written.push((name, value))}}
+		if let Some(default) = &default {written.insert(before.min(written.len()), ("default".to_owned(), default.clone()))}
+		let object = format!("{{{}}}", written.iter().map(|(name, value)| format!("{}:{value}", Value::from(name.as_str()))).collect::<Vec<_>>().join(","));
+		// A NUL in a string refuses the document as JSON, before any text is read.
+		prop_assume!(!object.contains("\\u0000"));
+		let legal = |name: &str| {
+			let parts: Vec<&str> = name.split('-').collect();
+			let (language, script, region) = (|part: &str| (2..=3).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_lowercase()), |part: &str| part.len() == 4 && part.as_bytes()[0].is_ascii_uppercase() && part.bytes().skip(1).all(|byte| byte.is_ascii_lowercase()), |part: &str| part.len() == 2 && part.bytes().all(|byte| byte.is_ascii_uppercase()));
+			match parts[..] {
+				[one] => language(one),
+				[one, two] => language(one) && (script(two) || region(two)),
+				[one, two, three] => language(one) && script(two) && region(three),
+				_ => false,
+			}
+		};
+		for (pointer, chars, bytes, filled) in [("/provider/name", 64, 256, true), ("/profiles/0/exits/0/name", 64, 256, true), ("/notices/0/text", usize::MAX, 280, false)] {
+			let mut document: Value = serde_json::from_slice(&seed("fuzz_subscription/content")[1..]).unwrap();
+			put(&mut document, pointer, Some(json!("@@text@@")));
+			let fit = |sent: &Value| sent.as_str().map(|sent| control::display(sent, chars, bytes)).filter(|shown| !filled || shown.chars().any(|c| !c.is_whitespace() && !('\u{300}'..='\u{36f}').contains(&c) && !('\u{1ab0}'..='\u{1aff}').contains(&c) && !('\u{1dc0}'..='\u{1dff}').contains(&c) && !('\u{20d0}'..='\u{20ff}').contains(&c) && !('\u{fe20}'..='\u{fe2f}').contains(&c)));
+			let wanted = default.as_ref().and_then(fit).map(|default| (default, written.iter().filter(|(name, _)| legal(name)).take(8).filter_map(|(name, value)| fit(value).filter(|shown| !shown.is_empty()).map(|shown| (name.clone(), shown))).collect::<Vec<_>>()));
+			let got = match read(serde_json::to_string(&document).unwrap().replace("\"@@text@@\"", &object).as_bytes()) {
+				Ok(Payload::Subscription(got)) => got,
+				// Only `default` can make a text wrong, and only the provider's name is a member of the top level.
+				other => {
+					prop_assert!(wanted.is_none() && pointer == "/provider/name" && other == Err(PayloadError::Member("name")), "{pointer}: a translation refused a document");
+					continue;
+				}
+			};
+			sound(&got);
+			let text = match pointer {
+				"/provider/name" => Some(&got.provider),
+				"/notices/0/text" => got.notices.first().map(|notice| &notice.text),
+				_ => got.profiles[0].exits.first().map(|exit| &exit.name),
+			};
+			prop_assert_eq!(text.map(|text| (text.as_str().to_owned(), text.translations().map(|translation| (translation.tag.as_str().to_owned(), translation.text.to_owned())).collect::<Vec<_>>())), wanted, "{}", pointer);
+			prop_assert!(text.is_none_or(|text| text.translations().all(|translation| legal(translation.tag.as_str()))) && got.profiles.len() == 1 && got.refused.is_empty(), "{pointer}");
 		}
 	}
 

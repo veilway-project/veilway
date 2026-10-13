@@ -2,9 +2,9 @@
 //!
 //! `parse` takes an `envelope::Verified` and nothing else, so what it reads was signed by a key that was held. That makes the input a provider's and not a stranger's. It does not make it friendly: every count, length and range is checked, nothing is clamped, and three kinds of unknown value are never guessed at ("Unknown members").
 //!
-//! What refuses what ("Wrong type, out of range, missing"): a fault in a top-level member refuses the document, a fault inside a profile refuses that profile, and a faulty card, notice, support link, listed device, exit or logo is left out. Display text is the stated exception: it is filtered and cut, never refused, except where it must not be empty.
-use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, public, Secret, Text, Url, LINK_URL_MAX, STRING_MAX, URL_MAX};
-use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
+//! What refuses what ("Wrong type, out of range, missing"): a fault in a top-level member refuses the document, a fault inside a profile refuses that profile, and a faulty card, notice, support link, listed device, exit or logo is left out. Display text is the stated exception: it is filtered and cut, never refused, except where it must not be empty. A text may come in several languages ("Text in several languages"), and a translation that does not read is dropped by itself: only `default` can make a text wrong.
+use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, public, visible, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
+use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::RangeInclusive};
 
@@ -168,6 +168,9 @@ pub struct Subscription {
 }
 
 impl Subscription {
+	/// The text of this subscription for a notice the node of `profile` sent ("Languages" on the control channel page): the notice whose `default` is byte for byte the text the node sent, looked for "first in the `notices` of the profile it is connected through and then in the subscription's own `notices`". The app then shows `Text::pick` of it, and `None` means it shows `sent.shown_text()`.
+	/// The severity is not given: it "is always the one the node sent". The number is the place in `notices` of this subscription when the match is one of its own, which is then the same notice on the screen, "not two".
+	pub fn notice_text<'a>(&'a self, profile: &'a Profile, sent: &control::Notice) -> Option<(&'a Text, Option<usize>)> {profile.notices.iter().find(|notice| notice.text.is(&sent.text)).map(|notice| (&notice.text, None)).or_else(|| self.notices.iter().position(|notice| notice.text.is(&sent.text)).map(|place| (&self.notices[place].text, Some(place))))}
 	/// `Provider` when any profile carries a private key.
 	pub fn origin(&self) -> KeyOrigin {if self.profiles.iter().any(|profile| profile.device.private_key.is_some()) {KeyOrigin::Provider} else {KeyOrigin::Device}}
 	/// The addresses of every `udp` and `udp-obfs` endpoint of every profile. "A cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable": the core, which computes ratings, compares each candidate's address with this set.
@@ -217,9 +220,13 @@ pub struct Profile {
 	pub min_control_version: u8,
 	pub rating_cap: Option<RatingCap>,
 	pub exits: Vec<Exit>,
+	/// The notices of this profile's node, at most 4. "The app does not show them by themselves": they are there so that `Subscription::notice_text` finds the translations of what the node sends.
+	pub notices: Vec<Notice>,
 }
 
 impl Profile {
+	/// The name of this profile's catalogue for an exit the node sent ("Languages" on the control channel page): the exit with the same tag, when its `default` is byte for byte the name the node sent. The app then shows `Text::pick` of it. `None` in every other case, and the app shows `sent.shown_name()`: "a signed label that has gone stale must not sit on an exit whose meaning the operator has changed".
+	pub fn exit_name(&self, sent: &control::Exit) -> Option<&Text> {self.exits.iter().find(|exit| exit.tag == sent.tag).map(|exit| &exit.name).filter(|name| name.is(&sent.name))}
 	/// "The same check covers the tunnel side: when a `device` address or a gateway falls inside one of the device's own networks, the profile cannot be used on that network."
 	pub fn clashes(&self, networks: &[Network]) -> bool {self.device.addresses.iter().chain(&self.gateways).any(|address| own(*address, networks))}
 }
@@ -424,8 +431,23 @@ impl fmt::Debug for Logo {
 
 fn need<T>(name: &'static str, value: Named<Option<T>>) -> Named<T> {value?.ok_or(name)}
 
-// Display text: filtered, then cut to `chars` characters. It is refused only where it must show something (`filled`: a name of 1 to 64 characters) and shows nothing once the filter has run. A string of any length is taken, since what is over the limit is cut and the size of the document bounds the rest.
-fn text(members: Members, name: &'static str, filled: bool, chars: usize) -> Named<Option<Text>> {members.string(name, usize::MAX)?.map(|sent| Some(Text::shown(sent, chars, 4 * chars)).filter(|text| !filled || text.visible()).ok_or(name)).transpose()}
+// Display text: filtered, then cut to `chars` characters and `bytes` bytes. It is refused only where it must show something (`filled`: a name of 1 to 64 characters) and shows nothing once the filter has run. A string of any length is taken, since what is over the limit is cut and the size of the document bounds the rest.
+// "Text in several languages": a string, or an object with `default` and translations. "Only `default` can make a text wrong." Of the other members those named by a legal tag are counted in the order of the document and the first 8 are looked at. The page does not say whether a legal tag with a value that is then dropped takes one of the 8 places. Here it does, which keeps the fewest: a place is taken by the tag, whatever its value comes to.
+fn text(members: Members, name: &'static str, filled: bool, chars: usize, bytes: usize) -> Named<Option<Text>> {
+	let fit = |sent: &str| Some(display(sent, chars, bytes)).filter(|shown| !filled || visible(shown));
+	let (sent, object) = match members.get(name) {
+		None => return Ok(None),
+		Some(Json::Str(sent)) => (sent, None),
+		Some(Json::Obj(object)) => if let Some((_, Json::Str(sent))) = object.get("default") {(sent, Some(object))} else {return Err(name)},
+		Some(_) => return Err(name),
+	};
+	let mut tagged: Vec<(usize, Tag, &Json)> = object.into_iter().flatten().filter_map(|(tag, (place, value))| Some((*place, Tag::read(tag)?, value))).collect();
+	tagged.sort_by_key(|(place, ..)| *place);
+	tagged.truncate(TRANSLATIONS_MAX);
+	// "A translation that fails that requirement, or is empty after the filter, is dropped and the others stay."
+	let translations = tagged.into_iter().filter_map(|(_, tag, value)| if let Json::Str(sent) = value {fit(sent).filter(|shown| !shown.is_empty()).map(|shown| (tag, shown))} else {None}).collect();
+	Ok(Some(Text::translated(sent, fit(sent).ok_or(name)?, translations)))
+}
 
 // A key of 32 bytes. `read` is `key` for a secret one and `public` for a public key of X25519, which is refused when it is a point of small order, as an endpoint refuses it in a request.
 fn key32(members: Members, name: &'static str, read: fn(&str) -> Option<[u8; 32]>) -> Named<Option<[u8; 32]>> {members.string(name, 44)?.map(|text| read(text).ok_or(name)).transpose()}
@@ -442,12 +464,12 @@ fn severity(members: Members) -> Option<Severity> {
 }
 
 // "`severity` (`"info"` or `"warning"`) and `text` (display text, cut to 280 bytes)."
-fn notice(members: Members) -> Option<Notice> {Some(Notice {severity: severity(members)?, text: members.string("text", usize::MAX).ok().flatten().map(|sent| Text::shown(sent, usize::MAX, NOTICE_MAX))?})}
+fn notice(members: Members) -> Option<Notice> {Some(Notice {severity: severity(members)?, text: text(members, "text", false, usize::MAX, NOTICE_MAX).ok()??})}
 
 fn card(members: Members) -> Option<Card> {
-	let label = || text(members, "label", false, LABEL).ok().flatten();
+	let label = || text(members, "label", false, LABEL, 4 * LABEL).ok().flatten();
 	Some(match members.string("type", STRING_MAX).ok()?? {
-		"stat" => Card::Stat {label: label()?, value: text(members, "value", false, 16).ok()??, unit: text(members, "unit", false, 8).ok()?},
+		"stat" => Card::Stat {label: label()?, value: text(members, "value", false, 16, 64).ok()??, unit: text(members, "unit", false, 8, 32).ok()?},
 		"progress" => {
 			let (used, total) = (members.uint("used", 0..=INTEGER_MAX).ok()??, members.uint("total", 1..=INTEGER_MAX).ok()??);
 			if used > total {return None}
@@ -486,7 +508,8 @@ fn kept<T>(members: Members, name: &'static str, limit: usize, left_out: &mut us
 	Ok(good)
 }
 
-fn listed(members: Members) -> Option<Listed> {Some(Listed {name: text(members, "name", false, LABEL).ok()??, enrolled_at: members.uint("enrolled_at", 0..=INTEGER_MAX).ok()??, this: members.boolean("this").ok()??, pending: members.boolean("pending").ok()?.unwrap_or(false)})}
+// "A device's name, which the user typed", is one string and never an object of translations.
+fn listed(members: Members) -> Option<Listed> {Some(Listed {name: Text::shown(members.string("name", usize::MAX).ok()??, LABEL, 4 * LABEL), enrolled_at: members.uint("enrolled_at", 0..=INTEGER_MAX).ok()??, this: members.boolean("this").ok()??, pending: members.boolean("pending").ok()?.unwrap_or(false)})}
 
 fn exit(members: Members) -> Option<Exit> {
 	let country = match members.string("country", 2) {
@@ -494,7 +517,7 @@ fn exit(members: Members) -> Option<Exit> {
 		Ok(Some(country)) => Some(<[u8; 2]>::try_from(country.as_bytes()).ok().filter(|letters| letters.iter().all(u8::is_ascii_uppercase))?),
 		Err(_) => return None,
 	};
-	Some(Exit {tag: members.string("tag", 64).ok()?.filter(|tag| is_tag(tag))?.to_owned(), name: text(members, "name", true, NAME).ok()??, country, full_ip: members.boolean("full_ip").ok()?.unwrap_or(false)})
+	Some(Exit {tag: members.string("tag", 64).ok()?.filter(|tag| is_tag(tag))?.to_owned(), name: text(members, "name", true, NAME, 4 * NAME).ok()??, country, full_ip: members.boolean("full_ip").ok()?.unwrap_or(false)})
 }
 
 // One or two addresses of a tunnel: "at most one IPv4 and one IPv6, IPv4 first, inside the ranges the config reference allows for a pool".
@@ -580,7 +603,9 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	// An exit that does not read is left out, and so is one whose tag an earlier exit of the list has.
 	let mut tags = HashSet::new();
 	let exits = members.list("exits", 0..=EXITS_MAX)?.unwrap_or_default().iter().filter_map(|item| Members::of(item).and_then(exit).filter(|exit| tags.insert(exit.tag.clone()))).collect();
-	Ok(Profile {id: id.to_owned(), name: need("name", text(members, "name", true, NAME))?, inbound_public_key: need("inbound_public_key", key32(members, "inbound_public_key", public))?, device, gateways, mtu: need("mtu", members.uint("mtu", u64::from(MTU_MIN)..=MTU_MAX))? as u16, transport_public_key, transports, stream_first: members.boolean("stream_first")?.unwrap_or(false), parallel: members.uint("parallel", 1..=4)?.unwrap_or(1) as u8, padding, min_control_version: members.uint("min_control_version", 1..=255)?.unwrap_or(1) as u8, rating_cap, exits})
+	// A list of another type or of more than 4 is a member of the profile out of its range. A notice in it that does not read is left out, as one at the top level is.
+	let notices = members.list("notices", 0..=NOTICES_MAX)?.unwrap_or_default().iter().filter_map(|item| Members::of(item).and_then(notice)).collect();
+	Ok(Profile {id: id.to_owned(), name: need("name", text(members, "name", true, NAME, 4 * NAME))?, inbound_public_key: need("inbound_public_key", key32(members, "inbound_public_key", public))?, device, gateways, mtu: need("mtu", members.uint("mtu", u64::from(MTU_MIN)..=MTU_MAX))? as u16, transport_public_key, transports, stream_first: members.boolean("stream_first")?.unwrap_or(false), parallel: members.uint("parallel", 1..=4)?.unwrap_or(1) as u8, padding, min_control_version: members.uint("min_control_version", 1..=255)?.unwrap_or(1) as u8, rating_cap, exits, notices})
 }
 
 /// Reads the payload of a verified document: steps 4 to 6 of "What is checked, in order", without the checks that need the clock or the stored document, which are `client`'s.
@@ -600,7 +625,7 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let signing_keys = need("signing_keys", members.list("signing_keys", 1..=2))?.iter().map(|item| if let Json::Str(text) = item {key(text).and_then(SigningKey::new)} else {None}.ok_or("signing_keys")).collect::<Named<Vec<_>>>()?;
 	if signing_keys.len() == 2 && signing_keys[0] == signing_keys[1] {return Err(PayloadError::Member("signing_keys"))}
 	if !signing_keys.contains(&verified.signer()) {return Err(PayloadError::Signer)}
-	let provider = need("name", text(need("provider", members.object("provider"))?, "name", true, NAME))?;
+	let provider = need("name", text(need("provider", members.object("provider"))?, "name", true, NAME, 4 * NAME))?;
 	let update_interval = members.uint("update_interval", UPDATE_INTERVAL)?.map_or(UPDATE_DEFAULT, |seconds| seconds as u32);
 	// A refresh URL is fetched, so it is held to the limit of a subscription URL, 256 characters, and not to the 512 of a URL that is only opened.
 	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, LINK_URL_MAX, true, false)} else {None}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
@@ -624,9 +649,9 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 		devices.retain(|device| !device.this);
 		left_out += this;
 	}
-	let support = kept(members, "support", SUPPORT_MAX, &mut left_out, |members| Some(SupportLink {label: text(members, "label", false, LABEL).ok()??, url: url(members)?}))?;
+	let support = kept(members, "support", SUPPORT_MAX, &mut left_out, |members| Some(SupportLink {label: text(members, "label", false, LABEL, 4 * LABEL).ok()??, url: url(members)?}))?;
 	let (cards, notices) = (kept(members, "cards", CARDS_MAX, &mut left_out, card)?, kept(members, "notices", NOTICES_MAX, &mut left_out, notice)?);
-	let (usage, logo) = (members.0.get("usage").map(usage), members.0.get("logo").map(logo));
+	let (usage, logo) = (members.get("usage").map(usage), members.get("logo").map(logo));
 	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None));
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;

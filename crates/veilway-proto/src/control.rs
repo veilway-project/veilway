@@ -3,6 +3,7 @@
 //! Every body has a fixed layout. A decoder refuses whatever the page does not define: an unknown type, a body shorter or longer than its layout, a count above its limit, an unknown value of a field, a reserved bit that is set, a tag that is no tag. An encoder refuses to write what a decoder would refuse, and one message has one encoding.
 //!
 //! The four messages of the opening exchange are not here. `opening` reads and writes them itself, and a stream decoder for what follows exists only as the result of an exchange that opened, so a `hello` or an `auth` after the opening is an unknown type like any other.
+use crate::unicode::{joining, letter, virama, Joining};
 use std::{collections::HashSet, fmt, net::{IpAddr, Ipv4Addr, Ipv6Addr}, ops::RangeInclusive, time::Duration};
 
 /// TCP for the channel, UDP for MTU probes only, on the gateway address ("Where it is").
@@ -188,13 +189,27 @@ wire_enum!(
 pub fn is_tag(tag: &str) -> bool {(1..=TAG_MAX).contains(&tag.len()) && tag.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-') && !tag.starts_with(['_', '-']) && !RESERVED_TAGS.contains(&tag)}
 
 /// Text from a node made fit to show: control, bidirectional formatting, zero-width and other invisible characters are removed first, then the rest is cut to `chars` characters and `bytes` bytes, whichever ends it sooner ("Framing" and "What a malicious node can do"). Text is cut, never refused.
-/// The removed set is every control character and the format and filler characters that render as nothing or reorder text, the blank braille pattern, the object replacement character, the format controls of shorthand and of Egyptian hieroglyphs, the private use characters, whose look is whatever a font says, and the noncharacters. The config applies a list of the same kind to exit names (`veilway-core`, `config/validate.rs`), which is shorter than this one.
+/// The removed set is every control character and the format and filler characters that render as nothing or reorder text, the blank braille pattern, the object replacement character, the format controls of shorthand and of Egyptian hieroglyphs, the private use characters, whose look is whatever a font says, and the noncharacters. The config applies a list of the same kind to exit names (`veilway-core`, `config/validate.rs`), which is shorter than this one and keeps no joiner.
+/// The two joiners, U+200C and U+200D, are kept exactly where "The display filter" keeps them and removed everywhere else: after a virama when a letter of the script of the letter before the virama follows, and for U+200C between two joining letters of one script. They are judged in the text that is left once everything else is gone, and a kept joiner counts as a character of the limit.
 pub fn display(text: &str, chars: usize, bytes: usize) -> String {
-	let mut shown = String::new();
-	for c in text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}' | '\u{2800}' | '\u{fff0}'..='\u{fff8}' | '\u{fffc}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}' | '\u{fdd0}'..='\u{fdef}') && *c as u32 & 0xfffe != 0xfffe).take(chars) {
-		if shown.len() + c.len_utf8() > bytes {break}
+	let clean: String = text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}' | '\u{2800}' | '\u{fff0}'..='\u{fff8}' | '\u{fffc}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}' | '\u{fdd0}'..='\u{fdef}') && *c as u32 & 0xfffe != 0xfffe).collect();
+	// Whether the joiner at `at` of `text` stays. Rule 1 needs no line of its own: a joiner is no virama, no letter and no mark that joining passes through, so a joiner next to another fails both rules below, and so does the other.
+	// "The Script of the letter that the virama follows" ("The display filter", rule 2) is read as the character directly before the virama: with a nukta or any other mark between the two, the joiner goes.
+	let stays = |text: &str, at: usize| {
+		let (before, after) = (&text[..at], &text[at + 3..]);
+		let (mut back, next) = (before.chars().rev(), after.chars().next());
+		let (through, forwards, backwards) = (|c: &char| joining(*c) != Joining::Transparent, |c: &char| matches!(joining(*c), Joining::Left | Joining::Dual), |c: &char| matches!(joining(*c), Joining::Right | Joining::Dual));
+		let conjunct = back.next().is_some_and(virama) && back.next().and_then(letter).is_some_and(|script| next.and_then(letter) == Some(script));
+		conjunct || (text[at..].starts_with('\u{200c}') && before.chars().rev().find(through).filter(forwards).and_then(letter).is_some_and(|script| after.chars().find(through).filter(backwards).and_then(letter) == Some(script)))
+	};
+	let (mut shown, mut count) = (String::new(), 0);
+	for (_, c) in clean.char_indices().filter(|(at, c)| !matches!(c, '\u{200c}' | '\u{200d}') || stays(&clean, *at)) {
+		if count == chars || shown.len() + c.len_utf8() > bytes {break}
 		shown.push(c);
+		count += 1;
 	}
+	// The page cuts after it filters, and the cut can take away what a joiner was kept for: the letter after it, or the marks and the letter. Only the last joiner can lose that, and it is judged again in the text as it is shown ("The display filter", rule 4: the end of a text).
+	if let Some(at) = shown.rfind(['\u{200c}', '\u{200d}']).filter(|at| !stays(&shown, *at)) {shown.remove(at);}
 	shown
 }
 
@@ -736,6 +751,7 @@ pub fn read_probe(payload: &[u8], size: u16, v6: bool) -> Result<(Token, u8), De
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use proptest::{collection::vec, prelude::*, sample::select};
 
 	fn unhex(text: &str) -> Vec<u8> {
 		let digits: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).map(|byte| (byte as char).to_digit(16).unwrap() as u8).collect();
@@ -974,6 +990,122 @@ mod tests {
 		// Characters that show nothing, or whatever a font makes of them, in the planes above the first as well.
 		assert_eq!(display("a\u{2800}\u{fffc}\u{fff0}\u{fff8}\u{13430}\u{1343f}\u{1bca0}\u{1bca3}\u{e000}\u{f8ff}\u{f0000}\u{ffffd}\u{100000}\u{10fffd}\u{fdd0}\u{fdef}\u{fffe}\u{ffff}\u{1fffe}\u{10ffff}b\u{fffd}\u{27ff}\u{2801}\u{1342f}\u{1bc9f}", usize::MAX, usize::MAX), "ab\u{fffd}\u{27ff}\u{2801}\u{1342f}\u{1bc9f}");
 		assert!(display(&('\0'..='\u{ffff}').collect::<String>(), usize::MAX, usize::MAX).chars().all(|c| !c.is_control() && !('\u{200b}'..='\u{200f}').contains(&c) && !('\u{2028}'..='\u{202e}').contains(&c) && !('\u{2060}'..='\u{206f}').contains(&c) && c != '\u{feff}'));
+	}
+
+	// "The two joiners": real words and names, each with what a screen shows. U+200C and U+200D are written as escapes, since neither can be seen.
+	#[test]
+	fn a_joiner_stays_only_where_spelling_needs_it() {
+		for (name, sent, shown) in [
+			// Persian, U+200C between two letters that would join: "I want", "houses", "the provider", "is being updated".
+			("fa mi-khaham", "می\u{200c}خواهم", "می\u{200c}خواهم"),
+			("fa khaneh-ha", "خانه\u{200c}ها", "خانه\u{200c}ها"),
+			("fa eraeh-dahandeh", "ارائه\u{200c}دهنده نمونه", "ارائه\u{200c}دهنده نمونه"),
+			("fa two in one text", "به\u{200c}روزرسانی می\u{200c}شود", "به\u{200c}روزرسانی می\u{200c}شود"),
+			// Persian, U+200C where it changes nothing: after a letter that does not join forwards (reh, waw), before a space, and before the plural ending written apart.
+			("fa after reh", "برادر\u{200c}ها", "برادرها"),
+			("fa after waw", "گفتگو\u{200c}ها", "گفتگوها"),
+			("fa before a space", "کتاب\u{200c} ها", "کتاب ها"),
+			("fa after a space", "کتاب \u{200c}ها", "کتاب ها"),
+			// A vowel mark between the letter and the joiner, on either side, is passed over.
+			("fa mark before", "ب\u{650}\u{200c}نام", "ب\u{650}\u{200c}نام"),
+			("fa mark after", "ب\u{200c}\u{650}نام", "ب\u{200c}\u{650}نام"),
+			// Urdu: kept between lam and kaf, removed after yeh barree, which does not join forwards.
+			("ur dil-kash", "دل\u{200c}کش", "دل\u{200c}کش"),
+			("ur be-had", "بے\u{200c}حد", "بےحد"),
+			// Arabic script and U+200D: the abbreviation that writes heh in its first form, and a joiner inside a word. Neither follows a virama.
+			("fa heh with a joiner", "ه\u{200d}.ش", "ه.ش"),
+			("ar joiner in a word", "سل\u{200d}ام", "سلام"),
+			("ar between two tatweels", "س\u{640}\u{200c}\u{640}لام", "س\u{640}\u{640}لام"),
+			// Devanagari: Marathi "valleys" with the eyelash reph (virama, U+200D), Nepali with an explicit virama (U+200C).
+			("mr darya", "द\u{931}\u{94d}\u{200d}या", "द\u{931}\u{94d}\u{200d}या"),
+			("ne shriman-ko", "श्रीमान्\u{200c}को", "श्रीमान्\u{200c}को"),
+			("hi explicit virama", "क्\u{200c}ष", "क्\u{200c}ष"),
+			// A nukta between the letter and the virama: the character before the virama is no letter, and the joiner goes.
+			("hi nukta before the virama", "ज\u{93c}\u{94d}\u{200d}यादा", "ज\u{93c}\u{94d}यादा"),
+			("hi one letter with its nukta", "\u{95b}\u{94d}\u{200d}यादा", "\u{95b}\u{94d}\u{200d}यादा"),
+			// Bengali: "opening" with U+200C after the hasanta. The joiner before the hasanta, which some write for ya-phala after ra, follows no virama.
+			("bn udghatan", "উদ্\u{200c}ঘাটন", "উদ্\u{200c}ঘাটন"),
+			("bn joiner before the virama", "র\u{200d}\u{9cd}যাব", "র\u{9cd}যাব"),
+			// Sinhala: "Sri Lanka", and a conjunct with U+200D.
+			("si sri lanka", "ශ්\u{200d}රී ලංකා", "ශ්\u{200d}රී ලංකා"),
+			("si conjunct", "ක්\u{200d}ෂ", "ක්\u{200d}ෂ"),
+			// Latin next to Persian: the joiner inside the Persian word stays, one between the two scripts goes.
+			("mixed", "VPN می\u{200c}خواهم", "VPN می\u{200c}خواهم"),
+			("fa then latin", "می\u{200c}VPN", "میVPN"),
+			("latin then fa", "VPN\u{200c}می", "VPNمی"),
+			("latin", "a\u{200c}b\u{200d}c", "abc"),
+			// Two scripts whose letters both join: Arabic beh and Syriac beth. And a virama between letters of two scripts, and after a Latin letter before another.
+			("arabic and syriac", "ب\u{200c}ܒ", "بܒ"),
+			("devanagari and bengali", "क्\u{200d}ক", "क्ক"),
+			("virama after latin, another script after", "a\u{94d}\u{200d}क", "a\u{94d}क"),
+			// A joiner at each edge.
+			("at the start", "\u{200c}سلام", "سلام"),
+			("at the end", "سلام\u{200c}", "سلام"),
+			("at both, U+200D", "\u{200d}abc\u{200d}", "abc"),
+			("after a virama at the end", "क्\u{200d}", "क्"),
+			("alone", "\u{200c}", ""),
+			("two alone", "\u{200c}\u{200d}", ""),
+			// Doubled: both go, in a place where one would have stayed.
+			("doubled", "می\u{200c}\u{200c}خواهم", "میخواهم"),
+			("doubled, both kinds", "می\u{200c}\u{200d}خواهم", "میخواهم"),
+			("doubled after a virama", "ශ්\u{200d}\u{200d}රී", "ශ්රී"),
+			("three", "می\u{200c}\u{200c}\u{200c}خواهم", "میخواهم"),
+			// The rule is applied after everything else is removed: two joiners with a removed character between them are next to each other, and one behind a removed character is judged by what is left.
+			("doubled across a zero width space", "می\u{200c}\u{200b}\u{200c}خواهم", "میخواهم"),
+			("behind an override", "می\u{202e}\u{200c}\u{feff}خواهم", "می\u{200c}خواهم"),
+			// Next to digits and punctuation.
+			("before a digit", "نسخه\u{200c}۲", "نسخه۲"),
+			("after a digit", "۲\u{200c}نسخه", "۲نسخه"),
+			("before a hyphen", "می\u{200c}-خواهم", "می-خواهم"),
+			("before a full stop", "خانه\u{200c}.", "خانه."),
+			("after a bracket", "(\u{200c}خانه)", "(خانه)"),
+			("virama then a digit", "क्\u{200d}२", "क्२"),
+		] {
+			assert_eq!(display(sent, usize::MAX, usize::MAX), shown, "{name}");
+			assert_eq!(display(shown, usize::MAX, usize::MAX), shown, "{name}, shown again");
+		}
+		// The cut comes after the filter and can take away what a joiner was kept for. A joiner counts as a character of the limit.
+		assert_eq!((display("می\u{200c}خواهم", 4, usize::MAX), display("می\u{200c}خواهم", 3, usize::MAX), display("می\u{200c}خواهم", usize::MAX, 8), display("می\u{200c}خواهم", usize::MAX, 9)), ("می\u{200c}خ".to_owned(), "می".to_owned(), "می".to_owned(), "می\u{200c}خ".to_owned()));
+		assert_eq!((display("ب\u{200c}\u{650}\u{651}نام", 4, usize::MAX), display("ب\u{200c}\u{650}\u{651}نام", 5, usize::MAX), display("ශ\u{dca}\u{200d}රී", 3, usize::MAX)), ("ب\u{650}\u{651}".to_owned(), "ب\u{200c}\u{650}\u{651}ن".to_owned(), "ශ\u{dca}".to_owned()));
+	}
+
+	proptest! {
+		// The filter gives the same text when it is run again, never a longer one, and leaves a joiner only where the rule keeps one. The rule is written out a second time here, over the characters by their places.
+		#[test]
+		fn the_filter_is_idempotent_never_grows_a_text_and_leaves_no_joiner_out_of_place(parts in vec(prop_oneof![4 => select(vec!['\u{200c}', '\u{200d}']), 8 => select("میخواهدرنبلکسشے\u{640}\u{650}\u{651}\u{670}कषयजर\u{931}\u{93c}\u{94d}\u{95b}দঘয\u{9cd}ශර\u{dca}ܒܐߊߋ\u{1820}\u{1885}a b1۲.-(\u{200b}\u{202e}\u{feff}\u{ad}".chars().collect::<Vec<_>>()), 1 => any::<char>()], 0..40), chars in prop_oneof![Just(usize::MAX), 0..40usize], bytes in prop_oneof![Just(usize::MAX), 0..100usize]) {
+			let sent: String = parts.into_iter().collect();
+			let shown = display(&sent, chars, bytes);
+			prop_assert!(shown.len() <= sent.len() && shown.len() <= bytes && shown.chars().count() <= chars);
+			prop_assert_eq!(&display(&shown, chars, bytes), &shown);
+			prop_assert_eq!(&display(&shown, usize::MAX, usize::MAX), &shown);
+			let (joiner, at) = (|c: char| matches!(c, '\u{200c}' | '\u{200d}'), shown.chars().collect::<Vec<_>>());
+			for place in (0..at.len()).filter(|place| joiner(at[*place])) {
+				prop_assert!(place > 0 && place + 1 < at.len() && !joiner(at[place - 1]) && !joiner(at[place + 1]), "a joiner at an edge or next to another");
+				let (mut left, mut right) = (place - 1, place + 1);
+				while left > 0 && joining(at[left]) == Joining::Transparent {left -= 1}
+				while right + 1 < at.len() && joining(at[right]) == Joining::Transparent {right += 1}
+				let conjunct = place >= 2 && virama(at[place - 1]) && letter(at[place - 2]).is_some() && letter(at[place - 2]) == letter(at[place + 1]);
+				let cursive = at[place] == '\u{200c}' && matches!(joining(at[left]), Joining::Left | Joining::Dual) && matches!(joining(at[right]), Joining::Right | Joining::Dual) && letter(at[left]).is_some() && letter(at[left]) == letter(at[right]);
+				prop_assert!(conjunct || cursive, "a joiner the rule does not keep");
+			}
+			// Without a limit, the joiners are all the new rule decides: the rest of the text is what the list alone leaves.
+			let plain = |text: &str| text.chars().filter(|c| !joiner(*c)).collect::<String>();
+			prop_assert_eq!(plain(&display(&sent, usize::MAX, usize::MAX)), display(&plain(&sent), usize::MAX, usize::MAX));
+			prop_assert!(plain(&display(&sent, usize::MAX, usize::MAX)).starts_with(&plain(&shown)));
+		}
+	}
+
+	// The list of the filter as it was before a joiner could stay: all of it is still removed, wherever it stands, and nothing else is.
+	#[test]
+	fn everything_the_filter_removed_before_is_still_removed() {
+		let before = |c: char| c.is_control() || matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}' | '\u{2800}' | '\u{fff0}'..='\u{fff8}' | '\u{fffc}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}' | '\u{fdd0}'..='\u{fdef}') || c as u32 & 0xfffe == 0xfffe;
+		for c in '\0'..=char::MAX {
+			// Between Latin letters, where no joiner stays, and between two Persian letters, where U+200C does and nothing else of the list may.
+			for (left, right) in [('a', 'b'), ('ی', 'خ')] {
+				let gone = before(c) && !(c == '\u{200c}' && left == 'ی');
+				assert_eq!(display(&format!("{left}{c}{right}"), usize::MAX, usize::MAX), if gone {format!("{left}{right}")} else {format!("{left}{c}{right}")}, "U+{:04X}", c as u32);
+			}
+		}
 	}
 
 	#[test]
