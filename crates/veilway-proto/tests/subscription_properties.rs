@@ -159,7 +159,8 @@ proptest! {
 			}
 		}
 		for changed in neighbours(&content) {
-			if let Ok(read) = Carried::file(changed.as_bytes()) {prop_assert!(read != in_file && read.file_content() == changed, "{changed}")}
+			// The one change a file may carry and still be this document is the line end an editor adds.
+			if let Ok(read) = Carried::file(changed.as_bytes()) {prop_assert!(if changed == format!("{content}\n") {read == in_file} else {read != in_file && read.file_content() == changed.strip_suffix('\n').unwrap_or(&changed)}, "{changed}")}
 		}
 	}
 

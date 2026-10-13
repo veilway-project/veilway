@@ -152,9 +152,11 @@ fn what_is_no_link() {
 	let document = |size: usize| format!("v1.{key}.{}", "a".repeat(size));
 	assert!(Link::parse(&format!("veilway://doc#{}", document(CARRIED_MAX))).is_ok() && Carried::file(document(BODY_MAX).as_bytes()).is_ok_and(|carried| carried.veilway().is_none()));
 	assert_eq!((Link::parse(&format!("veilway://doc#{}", document(CARRIED_MAX + 1))), Carried::file(document(BODY_MAX + 1).as_bytes())), (Err(LinkError::Size), Err(LinkError::Size)));
-	for content in [document(0), format!("{}\n", document(8)), format!("{} ", document(8)), format!("{}=", document(8)), format!("{}/", document(8)), format!("v1.{key}"), format!("v1.{key}a.a.b.c"), format!("v2.{key}.a.b.c"), format!("veilway://doc#{}", document(8))] {
+	for content in [document(0), format!("{}\n\n", document(8)), format!("{}\r", document(8)), format!("{} ", document(8)), format!("{}=", document(8)), format!("{}/", document(8)), format!("v1.{key}"), format!("v1.{key}a.a.b.c"), format!("v2.{key}.a.b.c"), format!("veilway://doc#{}", document(8))] {
 		assert_eq!((Link::parse(&format!("veilway://doc#{content}")), Carried::file(content.as_bytes())), (Err(LinkError::Form), Err(LinkError::Form)), "{content}");
 	}
+	// A file may end with the one line end an editor adds. A link may not.
+	assert!(Carried::file(format!("{}\n", document(8)).as_bytes()).is_ok() && Carried::file(format!("{}\r\n", document(8)).as_bytes()).is_ok() && Link::parse(&format!("veilway://doc#{}\n", document(8))).is_err());
 	assert_eq!((Link::parse(&format!("veilway://doc/#{}", document(8))), Link::parse(&format!("veilway://doc?#{}", document(8))), Carried::file(b"v1.\xff")), (Err(LinkError::Form), Err(LinkError::Form), Err(LinkError::Form)));
 	// A legacy link "must be `https`".
 	for other in ["http://example.com/list", "ftp://example.com/list", "example.com/list", "https://user:pass@example.com/list", "https://192.0.2.1/list", "vless://example.com", ""] {assert_eq!(Link::parse(other), Err(LinkError::Form), "{other}")}
