@@ -330,8 +330,9 @@ Must have for the first release:
 3. Inbounds, outbounds, exits and routing rules, each with a guided form and a raw JSON editor that validates against the schema. Node links are made here: one panel shows a pairing code, the other takes it.
 4. Subscriptions: per-user link and QR in the `veilway` form, a subscription id per account, a reset of a user's link that makes the old one stop working and offers to remove the devices enrolled with it, device enrolment with pending places and a per-account device list with removal, native and legacy formats, provider branding and cards editor. The endpoint sits behind the operator's web server and gives that server's own unknown-path answer to everything but a valid request, answers a valid token with a signed document or a signed refusal, and limits enrolled and unseen devices apart. Signing keys rotate with an overlap, a retired key is kept for 365 days to sign refusals, and refresh mirrors can be listed. The rules are on the subscription format page in `veilway-docs`.
 5. Stats: live and historical traffic per user, inbound and exit; node health; online users.
+6. An admin API for integrations: everything the panel's own pages do (users, devices, quotas, usage reset, subscription links, inbounds, exits, DNS sets, stats) over HTTP + JSON under the panel's path prefix, with an OpenAPI document and a generated TypeScript client like the core's. The panel's own pages use this same API, so nothing can be done in the panel that an integration cannot do. Access is by API tokens made in the panel: each has a name, a scope (read only, users only, or full), an optional expiry and an optional list of allowed source addresses, is shown once, is stored hashed, can be revoked, is rate limited, and every call it makes is in the audit log. A token never gives access to another admin's login, to the signing keys or to making new tokens.
 
-Later: reseller accounts and roles, several nodes managed from one panel, ACME certificate management UI, backup/restore, API tokens and webhooks, Telegram bot, per-IP limits, WARP-style outbound presets.
+Later: reseller accounts and roles, several nodes managed from one panel, ACME certificate management UI, backup/restore, webhooks, Telegram bot, per-IP limits, WARP-style outbound presets.
 
 ## Client features
 
@@ -402,7 +403,7 @@ Gate: screenshots of the gallery in all four combinations reviewed, contrast che
 
 ### Phase 4: panel (4 to 5 sessions)
 
-Build the five "must have" items in order. Gate: a fresh server goes from install to a working user subscription using only the panel, in English and in Persian.
+Build the six "must have" items in order. Gate: a fresh server goes from install to a working user subscription using only the panel, in English and in Persian.
 
 ### Phase 5: desktop client (3 to 4 sessions)
 
