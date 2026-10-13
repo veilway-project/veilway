@@ -312,7 +312,7 @@ Must have for the first release:
 1. Admin login with Argon2id, TOTP two-factor, rate limiting, session management, audit log.
 2. Users: key generation, quota, expiry, reset cycle, device limit, groups, enable/disable, bulk actions.
 3. Inbounds, outbounds, exits and routing rules, each with a guided form and a raw JSON editor that validates against the schema.
-4. Subscriptions: per-user link and QR, native and legacy formats, provider branding and cards editor.
+4. Subscriptions: per-user link and QR, a reset of a user's link that makes the old one stop working, native and legacy formats, provider branding and cards editor.
 5. Stats: live and historical traffic per user, inbound and exit; node health; online users.
 
 Later: reseller accounts and roles, several nodes managed from one panel, ACME certificate management UI, backup/restore, API tokens and webhooks, Telegram bot, per-IP limits, WARP-style outbound presets.
@@ -321,7 +321,7 @@ Later: reseller accounts and roles, several nodes managed from one panel, ACME c
 
 Must have for the first release:
 
-1. Subscriptions and single profiles (URL, QR, clipboard, deep link), auto-refresh.
+1. Subscriptions and single profiles (URL, QR, clipboard, deep link), auto-refresh and a refresh button, with the time of the last successful refresh shown.
 2. Profile list with latency test, exit picker, one-tap connect, security rating and warnings.
 3. Live speed, session and total usage, quota and expiry from the subscription, provider cards.
 4. A real VPN interface on every platform, with kill switch, DNS pinning and IPv6 handled, and automatic transport and front fallback.
@@ -351,7 +351,7 @@ Binding for every phase.
 1. A written threat model (`THREAT_MODEL.md`) before protocol or panel code: censor with DPI and active probing, malicious provider, malicious subscription or theme file, stolen panel session, compromised node.
 2. No custom cryptographic primitives. No `unsafe` outside vetted FFI and platform layers, each use commented.
 3. Every parser of untrusted input has a fuzz target (`cargo-fuzz`): handshake, frames, config, subscription, links, theme, provider cards.
-4. Panel: binds to localhost by default, served under a path prefix that is on by default: the installer generates a long random one and prints the full panel address once, and the operator can change it (every page, asset, API route and cookie lives under it, anything outside it answers as an unknown path, and every response says `noindex`, so crawlers and scanners do not find the panel), CSRF protection, strict CSP, secrets encrypted at rest, least-privilege process separate from the core. On any address other than localhost it serves HTTPS by default, with a certificate from ACME or one the operator supplies. Plain HTTP there is allowed when the operator turns it on, and then every page carries a warning at the top that logins and keys cross the network unencrypted, and the session cookie is not marked `Secure`; behind a reverse proxy it stays on localhost. It reaches the core through the unix socket when both run on one host.
+4. Panel: binds to localhost by default, served under a path prefix that is on by default: the installer generates a long random one and prints the full panel address once, and the operator can change it (every page, asset, API route and cookie lives under it, every response says `noindex`, and `/robots.txt` disallows everything without naming the prefix, so crawlers and scanners do not find the panel). What a request outside the prefix gets is the operator's choice, so that panels do not all look alike: a plain 404 like a common web server's (the default), a closed connection, a redirect, a static page or folder, or a reverse proxy to a site the operator names, CSRF protection, strict CSP, secrets encrypted at rest, least-privilege process separate from the core. On any address other than localhost it serves HTTPS by default, with a certificate from ACME or one the operator supplies. Plain HTTP there is allowed when the operator turns it on, and then every page carries a warning at the top that logins and keys cross the network unencrypted, and the session cookie is not marked `Secure`; behind a reverse proxy it stays on localhost. It reaches the core through the unix socket when both run on one host.
 5. Supply chain: `cargo-deny` and `cargo-audit` in CI, lockfiles committed, release artifacts signed, the updater verifies signatures, add-on downloads verified against pinned hashes.
 
 Also: no telemetry, the core runs unprivileged where the OS allows it, and nothing security-relevant is claimed in docs that has not been tested.
