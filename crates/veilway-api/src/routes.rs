@@ -266,6 +266,9 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			udp: proxied.then_some(down.is_none()),
 			udp_down_secs: down.map(|down| down.as_secs()),
 			udp_flips: health.map_or(0, |health| health.udp_flips),
+			interface_up: health.and_then(|health| health.interface_down).map(|down| down.is_none()),
+			interface_down_secs: health.and_then(|health| health.interface_down).flatten().map(|down| down.as_secs()),
+			interface_flips: health.map_or(0, |health| health.interface_flips),
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
 		}
 	}).collect()})

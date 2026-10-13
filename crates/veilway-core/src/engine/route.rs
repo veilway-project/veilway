@@ -37,7 +37,7 @@ pub enum Reason {
 	/// The exit that was chosen is not in the user's `exits`.
 	Entitlement,
 	FlowTableFull,
-	/// A tunnel address no connected device holds.
+	/// A tunnel address no connected device holds, or an l3 exit whose interface is down.
 	Unreachable,
 	/// Traffic the chosen exit cannot carry.
 	Unsupported,

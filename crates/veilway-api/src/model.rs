@@ -277,6 +277,12 @@ pub struct Exit {
 	pub udp_down_secs: Option<u64>,
 	/// How often the proxy switched between relaying UDP and not.
 	pub udp_flips: u64,
+	/// Whether the interface of an l3 backend is up. While it is not, what is routed to the exit is answered as unreachable and the node tries to bring the interface up again: 2 seconds after it went down, then after twice the wait each time, once a minute at most. Null for any other backend.
+	pub interface_up: Option<bool>,
+	/// Seconds since the interface went down. Null while `interface_up` is not false.
+	pub interface_down_secs: Option<u64>,
+	/// How often the interface switched between up and down.
+	pub interface_flips: u64,
 	pub traffic: Traffic,
 }
 

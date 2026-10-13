@@ -95,6 +95,10 @@ pub struct ExitHealth {
 	/// How long ago the upstream last refused to relay UDP. The mark is tried again after a minute and goes when the upstream relays UDP again. None for an upstream that has refused nothing, which every exit without a SOCKS5 proxy is.
 	pub no_udp: Option<Duration>,
 	pub udp_flips: u64,
+	/// For an exit with an l3 backend: how long its interface has been down, None inside while it is up. None for every other exit.
+	pub interface_down: Option<Option<Duration>>,
+	/// How often the interface of an l3 exit switched between up and down.
+	pub interface_flips: u64,
 }
 
 /// What `start` needs besides the config document.
@@ -369,7 +373,11 @@ impl Engine {
 
 	/// What the engine has learnt about the upstream of each exit, in the order of the config.
 	pub fn exit_health(&self) -> Vec<ExitHealth> {
-		self.plan().exits.iter().map(|exit| ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed)}).collect()
+		let plan = self.plan();
+		plan.exits.iter().enumerate().map(|(at, exit)| {
+			let health = plan.l3.as_ref().filter(|(wired, _)| *wired == at).map(|(_, port)| &port.health);
+			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed))}
+		}).collect()
 	}
 
 	pub fn plan(&self) -> Arc<Plan> {self.shared.plan()}

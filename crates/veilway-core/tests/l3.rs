@@ -1,21 +1,24 @@
-//! The `l3` exit against a real kernel: a WireGuard client talks to the engine, which writes its packets to a TUN device, and the kernel forwards them with source NAT to a responder on the network.
-//! It needs Linux, `CAP_NET_ADMIN`, `/dev/net/tun`, `ip` and `nft`, so it only runs when `VEILWAY_TEST_L3=1` is set, with `VEILWAY_TEST_L3_PEER` naming an IPv4 host next to this one that answers ping,
-//! sends `GREETING` to whoever connects on TCP port 7000, echoes UDP datagrams on port 7001 with `echo:` in front, and has nothing on UDP port 7002. `tests/l3-responder.py` is that host.
-//! Run it in two containers on one Docker network, from the repo root:
+//! The `l3` exit against a real kernel: a WireGuard client talks to the engine, which writes its packets to a TUN device, and the kernel forwards them to a responder on the network, with source NAT or without.
+//! It needs Linux, `CAP_NET_ADMIN`, `/dev/net/tun`, `ip` and `nft`, so it only runs when `VEILWAY_TEST_L3=1` is set, with `VEILWAY_TEST_L3_PEER` and `VEILWAY_TEST_L3_PEER6` naming the IPv4 and the IPv6 address of a host next to this one
+//! that answers ping, sends `GREETING` to whoever connects on TCP port 7000, echoes UDP datagrams on port 7001 with `echo:` in front, answers on UDP port 7003 with the address a datagram came from, and has nothing on UDP port 7002.
+//! `tests/l3-responder.py` is that host. For the test without `masquerade` it needs a route to the tunnel's pools by way of this host, which is why both have fixed addresses here, and this host has to forward IPv6, which a container cannot turn on for itself.
+//! Run it in two containers on one Docker network with IPv6, from the repo root:
 //!
 //! ```text
-//! docker network create veilway-l3
-//! docker run -d --rm --name veilway-l3-peer --network veilway-l3 -v "$PWD/crates/veilway-core/tests/l3-responder.py":/responder.py:ro python:3-alpine python /responder.py
-//! docker run --rm --network veilway-l3 --cap-add NET_ADMIN --device /dev/net/tun -e VEILWAY_TEST_L3=1 -v "$PWD":/w -v veilway-target:/w/target -v veilway-cargo:/usr/local/cargo -w /w rust:1 sh -c \
-//!   "apt-get update -qq && apt-get install -y -qq iproute2 nftables && VEILWAY_TEST_L3_PEER=\$(getent hosts veilway-l3-peer | cut -d' ' -f1) cargo test -p veilway-core --test l3 --locked -- --nocapture"
+//! docker network create --ipv6 --subnet 172.30.72.0/24 --subnet fd00:72::/64 veilway-l3
+//! docker run -d --rm --name veilway-l3-peer --network veilway-l3 --ip 172.30.72.3 --ip6 fd00:72::3 --cap-add NET_ADMIN -v "$PWD/crates/veilway-core/tests/l3-responder.py":/responder.py:ro python:3-alpine sh -c \
+//!   "ip route add 10.7.0.0/24 via 172.30.72.2 && ip -6 route add fd07::/64 via fd00:72::2 && python /responder.py"
+//! docker run --rm --network veilway-l3 --ip 172.30.72.2 --ip6 fd00:72::2 --sysctl net.ipv6.conf.all.forwarding=1 --cap-add NET_ADMIN --device /dev/net/tun \
+//!   -e VEILWAY_TEST_L3=1 -e VEILWAY_TEST_L3_PEER=172.30.72.3 -e VEILWAY_TEST_L3_PEER6=fd00:72::3 -v "$PWD":/w -v veilway-target:/w/target -v veilway-cargo:/usr/local/cargo -w /w rust:1 sh -c \
+//!   "apt-get update -qq && apt-get install -y -qq iproute2 nftables && cargo test -p veilway-core --test l3 --locked -- --nocapture"
 //! docker rm -f veilway-l3-peer && docker network rm veilway-l3
 //! ```
 #![cfg(target_os = "linux")]
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use etherparse::{IpNumber, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
-use serde_json::json;
-use std::net::{Ipv4Addr, SocketAddr};
+use etherparse::{Icmpv4Type, Icmpv6Type, IpNumber, NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
+use serde_json::{json, Value};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -27,6 +30,9 @@ use veilway_core::{Options, Reason};
 const INTERFACE: &str = "vwtest0";
 const DEVICE: [u8; 4] = [10, 7, 0, 2];
 const GATEWAY: [u8; 4] = [10, 7, 0, 1];
+const DEVICE6: [u8; 16] = Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 2).octets();
+const GATEWAY6: [u8; 16] = Ipv6Addr::new(0xfd07, 0, 0, 0, 0, 0, 0, 1).octets();
+const SKIPPED: &str = "skipped: the l3 tests need a TUN device and CAP_NET_ADMIN, set VEILWAY_TEST_L3=1, VEILWAY_TEST_L3_PEER and VEILWAY_TEST_L3_PEER6 to run them";
 const GREETING: &[u8] = b"hello-from-responder";
 /// The tests share one interface name and one set of pool routes, so they take turns.
 static HOST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -77,16 +83,92 @@ impl Client {
 	}
 }
 
-fn udp(dst: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+/// The packets a device sends come from its address of the family of `dst`.
+fn udp(dst: impl Into<IpAddr>, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
 	let mut out = Vec::new();
-	PacketBuilder::ipv4(DEVICE, dst, 64).udp(sport, dport).write(&mut out, payload).unwrap();
+	match dst.into() {
+		IpAddr::V4(dst) => PacketBuilder::ipv4(DEVICE, dst.octets(), 64).udp(sport, dport).write(&mut out, payload),
+		IpAddr::V6(dst) => PacketBuilder::ipv6(DEVICE6, dst.octets(), 64).udp(sport, dport).write(&mut out, payload),
+	}.unwrap();
 	out
 }
 
-fn tcp(dst: [u8; 4], header: TcpHeader) -> Vec<u8> {
+fn tcp(dst: impl Into<IpAddr>, header: TcpHeader) -> Vec<u8> {
 	let mut out = Vec::new();
-	PacketBuilder::ipv4(DEVICE, dst, 64).tcp_header(header).write(&mut out, &[]).unwrap();
+	match dst.into() {
+		IpAddr::V4(dst) => PacketBuilder::ipv4(DEVICE, dst.octets(), 64).tcp_header(header).write(&mut out, &[]),
+		IpAddr::V6(dst) => PacketBuilder::ipv6(DEVICE6, dst.octets(), 64).tcp_header(header).write(&mut out, &[]),
+	}.unwrap();
 	out
+}
+
+fn ping(dst: impl Into<IpAddr>, seq: u16) -> Vec<u8> {
+	let mut out = Vec::new();
+	match dst.into() {
+		IpAddr::V4(dst) => PacketBuilder::ipv4(DEVICE, dst.octets(), 64).icmpv4_echo_request(77, seq).write(&mut out, b"abcdefgh"),
+		IpAddr::V6(dst) => PacketBuilder::ipv6(DEVICE6, dst.octets(), 64).icmpv6_echo_request(77, seq).write(&mut out, b"abcdefgh"),
+	}.unwrap();
+	out
+}
+
+/// The source of a packet and what it carries: the TCP or UDP header with its payload, or the ICMP header.
+fn transport(packet: &[u8]) -> Option<(IpAddr, TransportHeader, Vec<u8>)> {
+	let parsed = PacketHeaders::from_ip_slice(packet).ok()?;
+	let from = match parsed.net? {
+		NetHeaders::Ipv4(ip, _) => IpAddr::from(ip.source),
+		NetHeaders::Ipv6(ip, _) => IpAddr::from(ip.source),
+		_ => return None,
+	};
+	Some((from, parsed.transport?, match parsed.payload {PayloadSlice::Tcp(payload) | PayloadSlice::Udp(payload) => payload.to_vec(), _ => Vec::new()}))
+}
+
+/// The echo reply to the ping with `seq`, by where it came from.
+fn echoed(packet: &[u8], seq: u16) -> Option<IpAddr> {
+	match transport(packet)? {
+		(from, TransportHeader::Icmpv4(icmp), _) if matches!(icmp.icmp_type, Icmpv4Type::EchoReply(echo) if echo.id == 77 && echo.seq == seq) => Some(from),
+		(from, TransportHeader::Icmpv6(icmp), _) if matches!(icmp.icmp_type, Icmpv6Type::EchoReply(echo) if echo.id == 77 && echo.seq == seq) => Some(from),
+		_ => None,
+	}
+}
+
+/// A TCP handshake from `sport` with the responder's own stack, and the first data the responder sends on it.
+async fn greeted(a: &mut Client, dst: IpAddr, sport: u16) -> Vec<u8> {
+	let mut syn = TcpHeader::new(sport, 7000, 1000, 65535);
+	syn.syn = true;
+	a.send_ip(&tcp(dst, syn)).await;
+	let server = a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((_, TransportHeader::Tcp(tcp), _)) if tcp.syn && tcp.ack && tcp.destination_port == sport => Some(tcp.sequence_number), _ => None}).await.expect("no SYN/ACK through the l3 exit");
+	let mut ack = TcpHeader::new(sport, 7000, 1001, 65535);
+	(ack.ack, ack.acknowledgment_number) = (true, server.wrapping_add(1));
+	a.send_ip(&tcp(dst, ack)).await;
+	let greeting = a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((_, TransportHeader::Tcp(tcp), payload)) if tcp.destination_port == sport && !payload.is_empty() => Some(payload), _ => None}).await.expect("no data on the tcp flow");
+	let mut reset = TcpHeader::new(sport, 7000, 1001, 0);
+	reset.rst = true;
+	a.send_ip(&tcp(dst, reset)).await;
+	greeting
+}
+
+/// What the responder answers to one datagram from `sport` to its port `dport`.
+async fn asked(a: &mut Client, dst: IpAddr, sport: u16, dport: u16) -> Vec<u8> {
+	a.send_ip(&udp(dst, sport, dport, b"ping")).await;
+	a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((_, TransportHeader::Udp(udp), payload)) if udp.source_port == dport && udp.destination_port == sport => Some(payload), _ => None}).await.expect("no udp reply through the l3 exit")
+}
+
+/// The responder's two addresses.
+fn peers() -> (Ipv4Addr, Ipv6Addr) {
+	(std::env::var("VEILWAY_TEST_L3_PEER").expect("VEILWAY_TEST_L3_PEER names the responder").parse().expect("VEILWAY_TEST_L3_PEER is an IPv4 address"), std::env::var("VEILWAY_TEST_L3_PEER6").expect("VEILWAY_TEST_L3_PEER6 names the responder").parse().expect("VEILWAY_TEST_L3_PEER6 is an IPv6 address"))
+}
+
+/// One inbound with an IPv4 and an IPv6 pool, one device with an address in each, and the l3 exit as the default.
+fn dual(private: &[u8; 32], key: &[u8; 32], listen: SocketAddr, masquerade: bool) -> Value {
+	json!({
+		"version": 1,
+		"dns": {"servers": ["1.1.1.1:53"], "hijack": false},
+		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(private), "address": ["10.7.0.1/24", "fd07::1/64"], "mtu": 1420, "transports": [{"type": "udp", "listen": listen.to_string()}]}],
+		"outbounds": [],
+		"exits": [{"tag": "node", "backend": {"type": "l3", "interface": INTERFACE, "masquerade": masquerade}}],
+		"routing": {"default": "node", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}]},
+		"users": [{"name": "a", "exits": "all", "devices": [{"name": "device", "public_key": veilway_wg::encode_key(&veilway_wg::public_key(key)), "addresses": ["10.7.0.2", "fd07::2"]}]}]
+	})
 }
 
 /// A counter of the interface as the kernel keeps it. What the node writes to a TUN device is what the interface received.
@@ -99,7 +181,7 @@ fn output(program: &str, args: &[&str]) -> (bool, String) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_l3_exit_carries_every_protocol_through_the_kernel_and_cleans_up() {
-	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("skipped: the l3 tests need a TUN device and CAP_NET_ADMIN, set VEILWAY_TEST_L3=1 and VEILWAY_TEST_L3_PEER to run them")}
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
 	let _turn = HOST.lock().await;
 	let peer: Ipv4Addr = std::env::var("VEILWAY_TEST_L3_PEER").expect("VEILWAY_TEST_L3_PEER names the responder").parse().expect("VEILWAY_TEST_L3_PEER is an IPv4 address");
 	let (private, key, listen, peer) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21900)), peer.octets());
@@ -132,24 +214,9 @@ async fn the_l3_exit_carries_every_protocol_through_the_kernel_and_cleans_up() {
 	a.send_ip(&ping).await;
 	let reply = a.expect(Duration::from_secs(5), |packet| (packet[9] == 1 && packet[20] == 0).then(|| packet.to_vec())).await.expect("no echo reply through the l3 exit");
 	assert_eq!((&reply[12..16], &reply[16..20], &reply[24..]), (&peer[..], &DEVICE[..], &ping[24..]), "the echo reply is not the answer to the ping");
-	// TCP: a handshake with the responder's own stack, then its greeting.
-	let mut syn = TcpHeader::new(41000, 7000, 1000, 65535);
-	syn.syn = true;
-	a.send_ip(&tcp(peer, syn)).await;
-	let transport = |packet: &[u8]| PacketHeaders::from_ip_slice(packet).ok().and_then(|parsed| parsed.transport.zip(Some(match parsed.payload {PayloadSlice::Tcp(payload) | PayloadSlice::Udp(payload) => payload.to_vec(), _ => Vec::new()})));
-	let server = a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((TransportHeader::Tcp(tcp), _)) if tcp.syn && tcp.ack && tcp.destination_port == 41000 => Some(tcp.sequence_number), _ => None}).await.expect("no SYN/ACK through the l3 exit");
-	let mut ack = TcpHeader::new(41000, 7000, 1001, 65535);
-	(ack.ack, ack.acknowledgment_number) = (true, server.wrapping_add(1));
-	a.send_ip(&tcp(peer, ack)).await;
-	let greeting = a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((TransportHeader::Tcp(_), payload)) if !payload.is_empty() => Some(payload), _ => None}).await.expect("no data on the tcp flow");
-	assert_eq!(greeting, GREETING);
-	let mut reset = TcpHeader::new(41000, 7000, 1001, 0);
-	reset.rst = true;
-	a.send_ip(&tcp(peer, reset)).await;
-	// UDP both ways.
-	a.send_ip(&udp(peer, 41001, 7001, b"ping")).await;
-	let echoed = a.expect(Duration::from_secs(5), |packet| match transport(packet) {Some((TransportHeader::Udp(udp), payload)) if udp.source_port == 7001 => Some(payload), _ => None}).await.expect("no udp reply through the l3 exit");
-	assert_eq!(echoed, b"echo:ping");
+	// TCP: a handshake with the responder's own stack, then its greeting. And UDP both ways.
+	assert_eq!(greeted(&mut a, peer.into(), 41000).await, GREETING);
+	assert_eq!(asked(&mut a, peer.into(), 41001, 7001).await, b"echo:ping");
 	// An ICMP error from the network that quotes a packet of a live flow is let through to the device: nothing listens on this port of the responder.
 	let closed = udp(peer, 41002, 7002, b"ping");
 	a.send_ip(&closed).await;
@@ -191,7 +258,7 @@ async fn the_l3_exit_carries_every_protocol_through_the_kernel_and_cleans_up() {
 /// and one that changes what the interface needs (here a second pool and a smaller MTU) sets it up anew without losing the flows that leave through it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reload_adds_changes_and_removes_the_l3_exit_with_everything_it_sets_up() {
-	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("skipped: the l3 tests need a TUN device and CAP_NET_ADMIN, set VEILWAY_TEST_L3=1 and VEILWAY_TEST_L3_PEER to run them")}
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
 	let _turn = HOST.lock().await;
 	let peer: Ipv4Addr = std::env::var("VEILWAY_TEST_L3_PEER").expect("VEILWAY_TEST_L3_PEER names the responder").parse().expect("VEILWAY_TEST_L3_PEER is an IPv4 address");
 	let (private, key, listen, peer, table) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21910)), peer.octets(), format!("veilway_{INTERFACE}"));
@@ -259,7 +326,7 @@ async fn a_reload_adds_changes_and_removes_the_l3_exit_with_everything_it_sets_u
 /// here the broadcast address of the network this host is on. And an engine that is dropped without `shutdown` takes its firewall table and its interface with it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn without_masquerade_a_device_still_reaches_nothing_on_the_host_and_a_dropped_engine_cleans_up() {
-	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("skipped: the l3 tests need a TUN device and CAP_NET_ADMIN, set VEILWAY_TEST_L3=1 to run them")}
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
 	let _turn = HOST.lock().await;
 	let (private, key, listen) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21902)));
 	let broadcast: Ipv4Addr = output("ip", &["-4", "-o", "addr", "show", "scope", "global"]).1.split_whitespace().skip_while(|word| *word != "brd").nth(1).expect("this host has no network with a broadcast address").parse().unwrap();
@@ -295,4 +362,155 @@ async fn without_masquerade_a_device_still_reaches_nothing_on_the_host_and_a_dro
 		assert!(Instant::now() < deadline, "the interface outlived the engine");
 		tokio::time::sleep(Duration::from_millis(20)).await;
 	}
+}
+
+/// IPv6 through the interface, with source NAT: ping, TCP and UDP reach the responder and come back, the errors of the network and of the node come back, and what reaches the interface without belonging to a flow is not delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv6_goes_through_the_l3_exit_and_only_the_answers_to_live_flows_come_back() {
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
+	let _turn = HOST.lock().await;
+	let (private, key, listen, peer) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21920)), IpAddr::from(peers().1));
+	let config = Config::parse(dual(&private, &key, listen, true).to_string().as_bytes()).unwrap();
+	let report = config.validate(false);
+	assert!(report.errors.is_empty(), "the test config is not valid: {:#?}", report.errors);
+	let engine = veilway_core::start(&config, Options::new("")).await.expect("the l3 exit did not start");
+	assert!(output("ip", &["-6", "route", "show", "dev", INTERFACE]).1.contains("fd07::/64"), "the ipv6 pool is not routed to the interface");
+	let mut a = Client::connect(key, veilway_wg::public_key(&private), listen).await;
+	a.send_ip(&ping(peer, 1)).await;
+	assert_eq!(a.expect(Duration::from_secs(5), |packet| echoed(packet, 1)).await.expect("no ipv6 echo reply through the l3 exit"), peer);
+	assert_eq!(greeted(&mut a, peer, 41600).await, GREETING);
+	assert_eq!(asked(&mut a, peer, 41601, 7001).await, b"echo:ping");
+	// The responder saw the node's address on the network, not the device's.
+	let seen = String::from_utf8(asked(&mut a, peer, 41602, 7003).await).unwrap();
+	assert!(seen.starts_with("from:") && seen != format!("from:{}", Ipv6Addr::from(DEVICE6)), "the responder saw {seen}, which is not a source the node's NAT wrote");
+	// An ICMPv6 error from the network that quotes a packet of a live flow is let through: nothing listens on this port of the responder. Type 1 code 4 is port unreachable, and the quoted packet starts 8 bytes into the message.
+	let closed = udp(peer, 41603, 7002, b"ping");
+	a.send_ip(&closed).await;
+	let quoted = a.expect(Duration::from_secs(5), |packet| (packet[6] == 58 && packet[40] == 1 && packet[41] == 4).then(|| packet[48..].to_vec())).await.expect("the port unreachable of the responder did not come back");
+	assert_eq!((&quoted[8..40], &quoted[40..44]), (&closed[8..40], &closed[40..44]), "the error does not quote the packet the device sent");
+	// A packet that is too big for the interface is answered by the node with packet too big, type 2, and the MTU that fits.
+	a.send_ip(&udp(peer, 41604, 7001, &[7; 1400])).await;
+	let (from, mtu) = a.expect(Duration::from_secs(3), |packet| (packet[6] == 58 && packet[40] == 2).then(|| (packet[8..24].to_vec(), packet[44..48].to_vec()))).await.expect("no packet too big for a packet over the mtu of the interface");
+	assert_eq!((&from[..], &mtu[..], engine.dropped(Reason::TooBig)), (&GATEWAY6[..], &1420u32.to_be_bytes()[..], 1));
+	// A datagram from this host itself, aimed at the port the device used for its UDP flow and sent from the responder's port, belongs to no flow: that flow is with the responder's address.
+	let (stray, drops) = (UdpSocket::bind("[::]:7001").await.unwrap(), engine.dropped(Reason::NoFlow));
+	stray.send_to(b"not for you", (Ipv6Addr::from(DEVICE6), 41601)).await.unwrap();
+	assert!(a.recv_ip(Duration::from_millis(700)).await.is_none(), "an ipv6 packet that belongs to no flow was delivered");
+	assert!(engine.dropped(Reason::NoFlow) > drops, "the stray packet was not counted");
+	// The flow is still there for its own answers.
+	assert_eq!(asked(&mut a, peer, 41601, 7001).await, b"echo:ping");
+	let exit = engine.exit("node").unwrap();
+	assert!(exit.up_packets >= 7 && exit.down_packets >= 7, "the exit did not count what it carried: {exit:?}");
+	engine.shutdown().await;
+	let deadline = Instant::now() + Duration::from_secs(3);
+	while Path::new(&format!("/sys/class/net/{INTERFACE}")).exists() {
+		assert!(Instant::now() < deadline, "the interface outlived the shutdown");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	assert!(!output("ip", &["-6", "route", "show"]).1.contains("fd07::/64"), "an ipv6 pool route outlived the shutdown");
+}
+
+/// Without `masquerade` the kernel forwards a device's packets under the device's own address, IPv4 and IPv6. The responder has a route to both pools by way of this host, so its answers come back, and only into live flows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_masquerade_traffic_leaves_under_the_address_of_its_device_and_comes_back() {
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
+	let _turn = HOST.lock().await;
+	let (private, key, listen, (peer, peer6)) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21930)), peers());
+	let config = Config::parse(dual(&private, &key, listen, false).to_string().as_bytes()).unwrap();
+	let report = config.validate(false);
+	assert!(report.errors.is_empty(), "the test config is not valid: {:#?}", report.errors);
+	let engine = veilway_core::start(&config, Options::new("")).await.expect("the l3 exit did not start");
+	assert!(!output("nft", &["list", "ruleset"]).1.contains("masquerade"), "source nat was set up without masquerade");
+	let mut a = Client::connect(key, veilway_wg::public_key(&private), listen).await;
+	for (peer, device, sport) in [(IpAddr::from(peer), IpAddr::from(DEVICE), 41700), (IpAddr::from(peer6), IpAddr::from(DEVICE6), 41710)] {
+		a.send_ip(&ping(peer, 1)).await;
+		assert_eq!(a.expect(Duration::from_secs(5), |packet| echoed(packet, 1)).await.expect("no echo reply without masquerade: has the responder its route to the pools?"), peer);
+		assert_eq!(greeted(&mut a, peer, sport).await, GREETING);
+		assert_eq!(asked(&mut a, peer, sport + 1, 7001).await, b"echo:ping");
+		assert_eq!(String::from_utf8(asked(&mut a, peer, sport + 2, 7003).await).unwrap(), format!("from:{device}"), "the responder did not see the device's own address");
+	}
+	// The responder can reach the pools, and still nothing of it comes in that no flow asked for: here a datagram from this host, as in the tests with source NAT.
+	let (stray, drops) = (UdpSocket::bind("0.0.0.0:7001").await.unwrap(), engine.dropped(Reason::NoFlow));
+	stray.send_to(b"not for you", (Ipv4Addr::from(DEVICE), 41701)).await.unwrap();
+	assert!(a.recv_ip(Duration::from_millis(700)).await.is_none(), "a packet that belongs to no flow was delivered");
+	assert!(engine.dropped(Reason::NoFlow) > drops, "the stray packet was not counted");
+	engine.shutdown().await;
+}
+
+/// An exit whose interface is gone is down, says so, answers what is routed to it as unreachable, and comes back by itself: after an interface that was removed under the node, and after a reload that closed the interface and could bring up neither the new one nor the old.
+/// A reload does not wait for an exit that is down and has it try at once, and a shutdown in the middle of the tries leaves nothing behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_l3_exit_that_goes_down_is_brought_up_again() {
+	if std::env::var("VEILWAY_TEST_L3").as_deref() != Ok("1") {return eprintln!("{SKIPPED}")}
+	let _turn = HOST.lock().await;
+	let (private, key, listen, (peer, peer6), table) = (veilway_wg::generate_key(), veilway_wg::generate_key(), SocketAddr::from((Ipv4Addr::LOCALHOST, 21940)), peers(), format!("veilway_{INTERFACE}"));
+	let doc = dual(&private, &key, listen, true);
+	let config = Config::parse(doc.to_string().as_bytes()).unwrap();
+	assert!(config.validate(false).errors.is_empty());
+	let engine = veilway_core::start(&config, Options::new("")).await.expect("the l3 exit did not start");
+	let health = || engine.exit_health().into_iter().find(|health| health.exit == "node").map(|health| (health.interface_down.map(|down| down.is_some()), health.interface_flips)).unwrap();
+	let present = || (Path::new(&format!("/sys/class/net/{INTERFACE}")).exists(), output("nft", &["list", "table", "inet", &table]).0, output("ip", &["route", "show"]).1.contains("10.7.0.0/24"));
+	// Waits for the exit to say `down`, for `budget` at most.
+	let turns = async |down: bool, budget: Duration| {
+		let deadline = Instant::now() + budget;
+		while health().0 != Some(down) {
+			if Instant::now() > deadline {return false}
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		true
+	};
+	let mut a = Client::connect(key, veilway_wg::public_key(&private), listen).await;
+	a.send_ip(&ping(peer, 1)).await;
+	a.expect(Duration::from_secs(5), |packet| echoed(packet, 1)).await.expect("no echo reply through the l3 exit");
+	assert_eq!(health(), (Some(false), 0));
+	// The interface is removed under the node, and its name is taken by another before the node's first try.
+	let blocked = || assert!(output("ip", &["link", "del", INTERFACE]).0 && output("ip", &["tuntap", "add", "dev", INTERFACE, "mode", "tun"]).0, "the interface could not be replaced by one that is not the node's");
+	blocked();
+	assert!(turns(true, Duration::from_secs(2)).await, "the node did not notice that its interface was removed");
+	assert_eq!((health().1, output("nft", &["list", "table", "inet", &table]).0), (1, false), "an exit that is down keeps nothing on the host");
+	// What is routed to the exit is answered: host unreachable for a ping, address unreachable over IPv6, a reset for TCP. Nothing leaves another way.
+	let drops = engine.dropped(Reason::Unreachable);
+	a.send_ip(&ping(peer, 2)).await;
+	assert_eq!(a.expect(Duration::from_secs(2), |packet| (packet[0] >> 4 == 4 && packet[9] == 1 && packet[20] == 3 && packet[21] == 1).then(|| packet[12..16].to_vec())).await.expect("no host unreachable while the exit is down"), GATEWAY);
+	a.send_ip(&ping(peer6, 2)).await;
+	assert_eq!(a.expect(Duration::from_secs(2), |packet| (packet[0] >> 4 == 6 && packet[6] == 58 && packet[40] == 1 && packet[41] == 3).then(|| packet[8..24].to_vec())).await.expect("no address unreachable while the exit is down"), GATEWAY6);
+	let mut syn = TcpHeader::new(41800, 7000, 1000, 65535);
+	syn.syn = true;
+	a.send_ip(&tcp(peer, syn)).await;
+	a.expect(Duration::from_secs(2), |packet| matches!(transport(packet), Some((_, TransportHeader::Tcp(tcp), _)) if tcp.rst && tcp.destination_port == 41800).then_some(())).await.expect("no reset while the exit is down");
+	assert_eq!(engine.dropped(Reason::Unreachable), drops + 3);
+	// A reload that wants another interface and cannot have it stops the tries, fails, and starts them again for the exit of the config that still runs.
+	let mut other = doc.clone();
+	other["exits"][0]["backend"]["interface"] = json!("lo");
+	engine.reload(other.to_string().into_bytes(), None).await.err().expect("an l3 exit on an interface that exists came up");
+	assert_eq!((health(), engine.snapshot().generation), ((Some(true), 1), 1));
+	// A reload that leaves the exit as it is goes through while the exit is down, and has it try at once: the name is free again, and the first try by the clock is two seconds away.
+	assert!(output("ip", &["link", "del", INTERFACE]).0);
+	let mut more = doc.clone();
+	more["users"].as_array_mut().unwrap().push(json!({"name": "b", "exits": "all", "devices": [{"name": "device", "public_key": veilway_wg::encode_key(&veilway_wg::public_key(&veilway_wg::generate_key())), "addresses": ["10.7.0.3"]}]}));
+	engine.reload(more.to_string().into_bytes(), None).await.expect("a reload was refused because an exit it does not change is down");
+	assert!(turns(false, Duration::from_secs(1)).await, "the reload did not have the exit try at once");
+	assert_eq!((health().1, present(), engine.snapshot().generation), (2, (true, true, true), 2));
+	a.send_ip(&ping(peer, 3)).await;
+	a.expect(Duration::from_secs(5), |packet| echoed(packet, 3)).await.expect("no echo reply after the exit came back");
+	// A reload that changes the interface while neither `ip` nor `nft` can be run: the old interface is closed, the new one cannot be set up, and the old one cannot be brought back. The exit of the running config is down, not gone.
+	let path = std::env::var_os("PATH").unwrap();
+	std::env::set_var("PATH", "/nonexistent");
+	other["exits"][0]["backend"]["interface"] = json!("vwtest1");
+	let failed = engine.reload(other.to_string().into_bytes(), None).await.err().expect("an interface came up without ip and nft").to_string();
+	assert!(failed.contains("`node`"), "{failed}");
+	assert_eq!((health(), engine.snapshot().generation, Path::new(&format!("/sys/class/net/{INTERFACE}")).exists(), Path::new("/sys/class/net/vwtest1").exists()), ((Some(true), 3), 2, false, false));
+	std::env::set_var("PATH", path);
+	// Nobody asks for it this time: the node's own first try, two seconds after the exit went down.
+	assert!(turns(false, Duration::from_secs(4)).await, "the exit did not come back by itself");
+	assert_eq!((health().1, present()), (4, (true, true, true)));
+	a.send_ip(&ping(peer, 4)).await;
+	a.expect(Duration::from_secs(5), |packet| echoed(packet, 4)).await.expect("no echo reply after the exit came back by itself");
+	// A shutdown while the tries go on ends them: once the name is free again nothing comes up on it.
+	blocked();
+	assert!(turns(true, Duration::from_secs(2)).await, "the node did not notice that its interface was removed");
+	engine.shutdown().await;
+	assert!(output("ip", &["link", "del", INTERFACE]).0);
+	tokio::time::sleep(Duration::from_millis(2500)).await;
+	assert_eq!(present(), (false, false, false), "a try to bring the exit up outlived the shutdown");
 }

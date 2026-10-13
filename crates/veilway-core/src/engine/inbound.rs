@@ -232,6 +232,8 @@ impl Shared {
 					}
 					(By::Backend | By::Via(_), Backend::L3 {..}) => {
 						let Some((_, port)) = plan.l3.as_ref().filter(|(wired, _)| *wired == carrier) else {return self.count(Reason::Unsupported)};
+						// The flow keeps its exit while the interface is down and never moves to another: its device is told, a reset for TCP and host unreachable for the rest.
+						if port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_some() {return self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await}
 						// The sender is in a tunnel, so it can be told what does fit.
 						if raw.len() > usize::from(port.mtu) {
 							self.count(Reason::TooBig);
