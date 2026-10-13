@@ -205,9 +205,9 @@ pub async fn request(path: &Path, method: &str, uri: &str, body: Option<Vec<u8>>
 	}).await.unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
 }
 
-/// What a node that runs holds of its host: every address it listens on with whether that is over TCP, and the interface of each l3 exit.
+/// What a node that runs holds of its host: every address it listens on with whether that is over TCP, and the interface of each l3 exit. With them, what its `ws` and `fronted` listeners have counted since start: the requests they read from trusted proxies, those among them that named no source in the header the config asks for, and those that were HTTP/1.0.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Held {pub listens: Vec<(SocketAddr, bool)>, pub interfaces: Vec<String>}
+pub struct Held {pub listens: Vec<(SocketAddr, bool)>, pub interfaces: Vec<String>, pub proxy: (u64, u64, u64)}
 
 /// Asks whatever answers on the socket at `path` for its running config, and changes nothing. None when no answer came within `wait` or the answer is not the one a node gives:
 /// that something takes connections on the path says nothing of what it is.
@@ -224,10 +224,16 @@ pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
 	struct Exit {backend: Backend}
 	#[derive(Deserialize)]
 	struct Backend {r#type: String, interface: Option<String>}
+	#[derive(Deserialize)]
+	struct Stats {stream: Stream}
+	#[derive(Deserialize)]
+	struct Stream {proxy_requests: u64, proxy_unnamed: u64, #[serde(default)] proxy_http10: u64}
 	let (_, body) = request(path, "GET", "/v1/config", None, wait).await.ok().filter(|(status, _)| (200..300).contains(status))?;
 	let running = serde_json::from_slice::<Running>(&body).ok().filter(|running| !running.revision.is_empty() && running.generation > 0 && running.document.version == 1)?;
+	let counted = request(path, "GET", "/v1/stats", None, wait).await.ok().filter(|(status, _)| (200..300).contains(status)).and_then(|(_, body)| serde_json::from_slice::<Stats>(&body).ok());
 	Some(Held {
-		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, transport.r#type == "ws" || transport.r#type == "tls")).collect(),
+		proxy: counted.map_or((0, 0, 0), |stats| (stats.stream.proxy_requests, stats.stream.proxy_unnamed, stats.stream.proxy_http10)),
+		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, matches!(transport.r#type.as_str(), "ws" | "tls" | "fronted"))).collect(),
 		interfaces: running.document.exits.into_iter().filter(|exit| exit.backend.r#type == "l3").map(|exit| exit.backend.interface.unwrap_or_else(|| DEFAULT_INTERFACE.to_string())).collect(),
 	})
 }

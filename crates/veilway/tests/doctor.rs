@@ -602,6 +602,53 @@ async fn the_decoy_origin_of_a_tls_transport_is_asked_for_its_page_and_for_the_p
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Transports page, "Who ends TLS": "A native `ws` or `fronted` listener never ends TLS itself", so doctor says whether anybody but this host reaches such a listener, asks its decoy origin as it asks that of `tls`, and tells from the counts of a node that runs whether the web server in front names its visitors in the header the config says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_proxy_path_of_a_listener_is_held_to_loopback_and_to_the_header_its_proxy_sends() {
+	let (dir, server, origin) = (scratch("front"), dns(true).await, web("200 OK", Some("404 Not Found")).await);
+	config(&dir, &[server], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let (written, socket): (Value, _) = (serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap(), dir.join("veilway.sock"));
+	// What doctor says of a `ws` and a `fronted` transport on `listen` behind `trusted`, with a node on the control socket that has counted `node` when there is one: the lines of the proxy path, and how many lines of the decoy origin are good.
+	let asked = |listen: SocketAddr, trusted: Value, node: Option<(u64, u64, u64)>| {
+		let (mut document, behind) = (written.clone(), |kind: &str, path: &str| json!({"type": kind, "listen": listen.to_string(), "path": path, "decoy": {"origin": format!("http://{origin}")}, "trusted_proxies": trusted, "client_address_header": "X-Forwarded-For"}));
+		(document["inbounds"][0]["type"], document["inbounds"][0]["transport_keys"], document["inbounds"][0]["upgrade_cookie"], document["users"][0]["devices"][0]["transport_secrets"]) = (json!("veilway"), json!([veilway_wg::encode_key(&[0x51; 32])]), json!("sid"), json!([veilway_wg::encode_key(&[0xa1; 32])]));
+		document["inbounds"][0]["transports"] = json!([behind("ws", "/assets/doctor-live-1.js"), behind("fronted", "/assets/doctor-sync-1.js")]);
+		private(&dir, "config.json", &document.to_string());
+		let running = node.map(|(requests, unnamed, old)| answering(&socket, json!({"revision": "0".repeat(64), "generation": 1, "document": {"version": 1, "inbounds": [{"tag": "home", "transports": [{"type": "ws", "listen": listen.to_string()}]}], "exits": []}, "stream": {"proxy_requests": requests, "proxy_unnamed": unnamed, "proxy_http10": old}}).to_string()));
+		let (dir, socket) = (dir.clone(), socket.clone());
+		async move {
+			let (_, printed, _) = doctor(&dir, &["--json"]).await;
+			if let Some(running) = running {
+				running.abort();
+				let _ = running.await;
+				std::fs::remove_file(&socket).unwrap();
+			}
+			let document: Value = serde_json::from_str(&printed).unwrap_or_else(|e| panic!("{e}: {printed}"));
+			// The paths are secrets of the subscription: doctor sends them to the origin and prints them nowhere.
+			assert!(!printed.contains("doctor-live") && !printed.contains("doctor-sync"), "{printed}");
+			let checks = document["checks"].as_array().unwrap();
+			(checks.iter().filter(|line| line["check"] == "proxy").map(|line| (line["subject"].as_str().unwrap().rsplit('.').next().unwrap().to_string(), line["status"].as_str().unwrap().to_string())).collect::<Vec<_>>(), checks.iter().filter(|line| line["check"] == "decoy" && line["status"] == "ok").count())
+		}
+	};
+	let line = |part: &str, status: &str| (part.to_string(), status.to_string());
+	// A listener on loopback behind proxies on loopback, with no node to ask: one line for the two transports of the listener, the header left open, and the origin asked for its page and for the path of each transport.
+	assert_eq!(asked(free(), json!(["127.0.0.1", "::1"]), None).await, (vec![line("listen", "ok"), line("client_address_header", "skipped")], 4));
+	// A listener anybody may reach, and proxies that cannot reach a listener on loopback, are warnings.
+	assert_eq!(asked(SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), free().port()), json!(["127.0.0.1"]), None).await.0, [line("listen", "warn"), line("client_address_header", "skipped")]);
+	assert_eq!(asked(free(), json!(["127.0.0.1", "10.0.0.0/8"]), None).await.0, [line("trusted_proxies", "warn"), line("client_address_header", "skipped")]);
+	// A node that runs has counted: no request yet, every request with its visitor named, some without, and none with, which is a web server that does not send the header at all.
+	for (node, expected) in [((0, 0, 0), "skipped"), ((40, 0, 0), "ok"), ((40, 3, 0), "warn"), ((40, 40, 0), "fail")] {
+		let taken = std::net::TcpListener::bind(free()).unwrap();
+		assert_eq!(asked(taken.local_addr().unwrap(), json!(["127.0.0.1"]), Some(node)).await.0, [line("listen", "ok"), line("client_address_header", expected)], "{node:?}");
+	}
+	// A web server that speaks HTTP/1.0 to the node hands on no request a user could have sent: some such requests are a warning, and nothing else is a failure.
+	for (node, expected) in [((40, 0, 2), "warn"), ((40, 0, 40), "fail")] {
+		let taken = std::net::TcpListener::bind(free()).unwrap();
+		assert_eq!(asked(taken.local_addr().unwrap(), json!(["127.0.0.1"]), Some(node)).await.0, [line("listen", "ok"), line("http_version", expected), line("client_address_header", "ok")], "{node:?}");
+	}
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 fn replay(dir: &Path, floor: u64, limit: u64) {
 	let body = [&b"VWREPLAY"[..], &1u32.to_be_bytes(), &[0; 4], &floor.to_be_bytes(), &limit.to_be_bytes(), &0u32.to_be_bytes()].concat();
 	std::fs::write(dir.join("veilway-replay"), [&body[..], ring::digest::digest(&ring::digest::SHA256, &body).as_ref()].concat()).unwrap();

@@ -167,6 +167,17 @@ impl Sealer {
 		self.number += 1;
 		Ok(())
 	}
+	/// Appends a chunk around any plaintext at the next number: what only the session's client can make, and what no client makes. For the tests of what a receiver does with a chunk that opens and is invalid. No build of a node has it.
+	#[cfg(feature = "bench")]
+	#[doc(hidden)]
+	pub fn forge(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> Result<(), ChunkError> {
+		let start = out.len();
+		out.extend_from_slice(plaintext);
+		let tag = self.key.0.seal_in_place_separate_tag(Nonce::assume_unique_for_key(nonce(self.number)), Aad::empty(), &mut out[start..]).map_err(|_| ChunkError::Crypto)?;
+		out.extend_from_slice(tag.as_ref());
+		self.number += 1;
+		Ok(())
+	}
 }
 
 /// The receiving direction of a `tls` or `ws` session. A chunk opens only at the expected number, so a chunk that opens cannot be a replay ("Session activity and timers", "Activity").

@@ -226,7 +226,7 @@ async fn decoy(subject: &str, decoy: &config::Decoy, path: &str, wanted: &[Strin
 	let (started, page) = (Instant::now(), timeout(wait, asked(target, proxied, &host, "/")).await);
 	let mut lines = vec![match page.as_ref().ok().and_then(|page| page.as_ref().ok()).map(|head| read(head)) {
 		// The origin is reached over plain HTTP while a stranger arrived over TLS: the usual plain listener of a site sends everyone to `https://`, which through the node comes back to the same answer for ever.
-		Some(Some((status, sent))) if (300..400).contains(&status) && sent.iter().any(|(name, value)| name == "location" && value.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))) => line(Status::Warn, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request (`Host: {host}`) with status {status} and sends the visitor to an `https://` address. A stranger reaches the origin through the node's TLS and gets that redirect on every request, which tells the node from a web server: the origin has to be a plain listener that serves the site as its HTTPS listener does, without the redirect")),
+		Some(Some((status, sent))) if (300..400).contains(&status) && sent.iter().any(|(name, value)| name == "location" && value.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))) => line(Status::Warn, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request (`Host: {host}`) with status {status} and sends the visitor to an `https://` address. A stranger reaches the origin over TLS that ended before it, at the node or at the web server in front, and gets that redirect on every request, which tells the node from a web server: the origin has to be a plain listener that serves the site as its HTTPS listener does, without the redirect")),
 		Some(Some((status, sent))) => {
 			let absent: Vec<&str> = wanted.iter().map(String::as_str).filter(|name| !name.eq_ignore_ascii_case("date") && !sent.iter().any(|(sent, _)| sent.eq_ignore_ascii_case(name))).take(MAX_SHOWN).collect();
 			if absent.is_empty() {line(Status::Ok, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request with status {status} in {} ms and sent every field `upgrade_headers` names. The request carried `Host: {host}`, the host of `decoy.origin`: a web server with several sites may give strangers, who send their own `Host`, another one", started.elapsed().as_millis()))} else {line(Status::Warn, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request (`Host: {host}`) with status {status} and did not send {}, which `upgrade_headers` names: the upgrade answer leaves out what the origin does not send, so name the fields this origin sends", absent.join(", ")))}
@@ -309,7 +309,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	// Only a node that says so itself excuses anything, and only what it names: whatever else listens on the socket path is another program.
 	#[cfg(unix)]
 	#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-	let ((listens, interfaces), node, socket) = match api.as_deref().map(|path| (path, veilway_api::standing(path), writable(path.parent().unwrap_or(Path::new(""))))) {
+	let ((listens, interfaces, proxy), node, socket) = match api.as_deref().map(|path| (path, veilway_api::standing(path), writable(path.parent().unwrap_or(Path::new(""))))) {
 		None => (Default::default(), (Status::Skipped, NO_SOCKET.to_string(), "--no-api: no control socket is looked at, so a node that runs cannot be told from another program that holds its addresses".to_string()), (Status::Skipped, NO_SOCKET.to_string(), "--no-api: the node would run without the control API".to_string())),
 		Some((path, standing, writable)) => {
 			let (shown, replace) = (path.display().to_string(), "`veilway run` would not start: name another path with --api, or start with --no-api");
@@ -324,12 +324,12 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 				Ok(_) => (None, (Status::Ok, "no node answers on it".to_string()), (Status::Ok, "nothing is there and its directory can be written, so the node makes the socket at start".to_string())),
 				Err(e) => (None, (Status::Warn, format!("{e}: whether a node runs cannot be told, so run doctor as the user the node runs as")), (Status::Warn, format!("{e}: run doctor as the user the node runs as"))),
 			};
-			(held.map(|held| (held.listens, held.interfaces)).unwrap_or_default(), (node.0, shown.clone(), node.1), (socket.0, shown, socket.1))
+			(held.map(|held| (held.listens, held.interfaces, Some(held.proxy))).unwrap_or_default(), (node.0, shown.clone(), node.1), (socket.0, shown, socket.1))
 		}
 	};
 	#[cfg(not(unix))]
 	#[allow(unused_variables)]
-	let ((listens, interfaces), node, socket) = ((Vec::<(SocketAddr, bool)>::new(), Vec::<String>::new()), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()));
+	let ((listens, interfaces, proxy), node, socket) = ((Vec::<(SocketAddr, bool)>::new(), Vec::<String>::new(), None::<(u64, u64, u64)>), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()));
 	lines.push(line(node.0, "node", node.1, node.2));
 	let (config, mut bound, mut read, now) = (Arc::new(loaded), HashSet::new(), HashSet::new(), SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64));
 	for inbound in &config.inbounds {
@@ -363,8 +363,35 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let mut origins = HashSet::new();
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
-			let Transport::Tls {path, decoy: origin, ..} = transport else {continue};
-			if origins.insert((origin.origin.host(), path.clone())) {lines.extend(decoy(&format!("inbound {}, transports[{t}].decoy", inbound.tag), origin, path, &inbound.upgrade_headers(), wait).await)}
+			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..}) = transport else {continue};
+			// The answer to a `fronted` request is no upgrade and takes no field from the origin.
+			let wanted = if matches!(transport, Transport::Fronted {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
+			if origins.insert((origin.origin.host(), path.clone())) {lines.extend(decoy(&format!("inbound {}, transports[{t}].decoy", inbound.tag), origin, path, &wanted, wait).await)}
+		}
+	}
+	// The proxy path of every `ws` and `fronted` listener (transports page, "Who ends TLS" and "Pools and what happens when one is full"): whether anybody but this host reaches it, and whether the web server in front names the visitor in the header the config says. The second is known only to a node that runs and has read requests.
+	let mut fronts = HashSet::new();
+	for inbound in &config.inbounds {
+		for (t, transport) in inbound.transports.iter().enumerate() {
+			let (Some(proxied), addr) = (transport.proxied(), transport.listen()) else {continue};
+			if !fronts.insert(addr) {continue}
+			let (subject, outside) = (format!("inbound {}, transports[{t}]", inbound.tag), proxied.trusted.iter().filter(|proxy| !proxy.0.addr().is_loopback()).count());
+			lines.push(match (addr.ip().is_loopback(), outside) {
+				(true, 0) => line(Status::Ok, "proxy", format!("{subject}.listen"), "a loopback address, and every trusted proxy is one: only this host reaches the listener"),
+				(true, outside) => line(Status::Warn, "proxy", format!("{subject}.trusted_proxies"), format!("{outside} of them are no loopback addresses, and the listener is on one, which nothing but this host reaches: they can never connect. Leave only the addresses the web server on this host connects from")),
+				(false, _) => line(Status::Warn, "proxy", format!("{subject}.listen"), "not a loopback address, so it may be reached from outside. Whoever does so from outside trusted_proxies gets the decoy origin's answer and is never a user, but the node never ends TLS here: tokens, session ids and the decoy's pages cross the way from the web server to the node unprotected. Run the web server on this host and listen on 127.0.0.1 or [::1], and let a firewall keep everybody else from the port until then"),
+			});
+			// A request line that says HTTP/1.0 is never a user's, so a web server that speaks it to the node hands on every stranger and no user, and shows nothing else for it.
+			if let Some((requests, _, old)) = proxy.filter(|(_, _, old)| *old > 0) {lines.push(line(if old == requests {Status::Fail} else {Status::Warn}, "proxy", format!("{subject}.http_version"), format!("{old} of the {requests} requests the node read from its trusted proxies since start were HTTP/1.0, and no such request can be a user's: the web server in front has to speak HTTP/1.1 to the node (nginx: `proxy_http_version 1.1` on each location it hands to the node). The count is of every ws and fronted listener of the node together")))}
+			// What the origin is told of a request it gets through the node is as good as what the node could read of that request.
+			if proxied.decoy.proxy_protocol == Some(true) {lines.push(line(Status::Ok, "proxy", format!("{subject}.decoy.proxy_protocol"), "the origin is told the address of each visitor. A request whose head the node cannot read to its end, or that names no source, is told with the address of the web server in front: the origin must grant nothing to an address, its own host's and its proxy's included"))}
+			let Some(name) = proxied.header else {continue};
+			lines.push(match proxy {
+				None => line(Status::Skipped, "proxy", format!("{subject}.client_address_header"), format!("no node answers on the control socket, so whether the web server in front sends `{name}` cannot be told: run doctor again while the node runs and has taken requests")),
+				Some((0, _, _)) => line(Status::Skipped, "proxy", format!("{subject}.client_address_header"), "the node that runs has read no request from a trusted proxy yet: run doctor again once it has"),
+				Some((requests, 0, _)) => line(Status::Ok, "proxy", format!("{subject}.client_address_header"), format!("each of the {requests} requests the node read from its trusted proxies since start named its source in the header a listener asks for")),
+				Some((requests, unnamed, _)) => line(if unnamed == requests {Status::Fail} else {Status::Warn}, "proxy", format!("{subject}.client_address_header"), format!("{unnamed} of the {requests} requests the node read from its trusted proxies since start named no source in the header a listener asks for, which is `{name}` here: each of them counted as the proxy itself, so the limits per source were one limit for all of them, and an origin that is told addresses was told the proxy's. The web server in front has to set that header on what it hands to the node, with the address it took the request from added at the right end. The count is of every ws and fronted listener of the node together")),
+			});
 		}
 	}
 	// An exit on a direct outbound and an l3 exit with `masquerade` send the queries of the node's resolver from the node itself.

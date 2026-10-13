@@ -8,7 +8,7 @@ publish.workspace=true
 
 [features]
 # The stream listener over pipes in memory, for the fuzz target and the crate's own tests. No build of a node turns it on.
-bench=[]
+bench=["veilway-proto/bench"]
 
 [dependencies]
 veilway-wg={path="../veilway-wg"}
@@ -50,3 +50,5 @@ rcgen.workspace=true
 hyper.workspace=true
 hyper-util.workspace=true
 http-body-util.workspace=true
+# The tests of the proxy path wait five minutes for a connection to be given up, on a clock that is paused and moved for them.
+tokio={workspace=true, features=["test-util"]}

@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -290,6 +290,12 @@ text_value!(Addr, "an address and port such as 192.0.2.1:443 or [2001:db8::1]:44
 pub struct Ip(pub IpAddr);
 
 text_value!(Ip, "an IPv4 or IPv6 address without a prefix", "^[0-9A-Fa-f:.]+$", |s| ip(s).map(Ip), |ip| ip.0.to_string());
+
+/// One reverse proxy of a `ws` or `fronted` transport, or a network of them. An address alone is the network of that one address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Proxy(pub IpNet);
+
+text_value!(Proxy, "an address such as 127.0.0.1 or a network such as 10.0.0.0/8 with no host bits set", "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$", |s| if s.contains('/') {net(s, false).map(Proxy)} else {ip(s).map(|ip| Proxy(IpNet::from(ip)))}, |proxy| if proxy.0.prefix_len() == proxy.0.max_prefix_len() {proxy.0.addr().to_string()} else {proxy.0.to_string()});
 
 /// One entry of a rule's `ip` condition: a network, the name `geoip:private` for the ranges in `GEOIP_PRIVATE` outside every inbound pool, the name `tunnel:users` for every address in every inbound pool except the gateways, or `tunnel:<inbound tag>` for those of one inbound.
 /// `Tunnel` holds the tag as written. Whether an inbound has it is for `validate` to say.
@@ -644,15 +650,15 @@ pub struct Inbound {
 	/// The upper bounds of the padding the node puts on what it sends over the obfuscated transports of a `veilway` inbound.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub padding: Option<Padding>,
-	/// The node transport keys, private halves: one, or two while the key is rotated. Needed by an inbound with a `tls` transport. Profiles carry the public half of the first.
+	/// The node transport keys, private halves: one, or two while the key is rotated. Needed by an inbound with a `tls`, native `ws` or `fronted` transport. Profiles carry the public half of the first.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_TRANSPORT_KEYS))]
 	pub transport_keys: Option<Vec<TransportKey>>,
-	/// The name of the cookie on the upgrade answer of a `tls` transport. It has no default and carries no meaning: its value is random text of a random length.
+	/// The name of the cookie on the upgrade answer of a `tls` or native `ws` transport. It has no default and carries no meaning: its value is random text of a random length.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(pattern("^[A-Za-z0-9_-]{1,32}$"))]
 	pub upgrade_cookie: Option<String>,
-	/// The header fields the upgrade answer takes from the decoy origin, in this order. Defaults to `Server`, `Date` for a `tls` transport.
+	/// The header fields the upgrade answer takes from the decoy origin, in this order. Defaults to `Server`, `Date` for a `tls` transport and to none for a native `ws` transport, where the web server in front adds its own.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(max = MAX_UPGRADE_HEADERS), inner(pattern("^[A-Za-z0-9-]{1,64}$")))]
 	pub upgrade_headers: Option<Vec<String>>,
@@ -665,7 +671,10 @@ impl Inbound {
 	pub fn enveloped(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..}))}
 
 	/// Whether the inbound has a transport that takes the stream proof.
-	pub fn proved(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::Tls {..}))}
+	pub fn proved(&self) -> bool {self.transports.iter().any(|transport| transport.decoy().is_some())}
+
+	/// Whether the inbound has a transport whose proof is answered with a WebSocket upgrade, which carries the inbound's cookie: `tls` or the native `ws`.
+	pub fn upgraded(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::Tls {..} | Transport::WsNative {..}))}
 
 	/// Whether the inbound has an obfuscated transport of this build: one that takes a proof, and so needs the replay memory.
 	pub fn obfuscated(&self) -> bool {self.enveloped() || self.proved()}
@@ -673,8 +682,8 @@ impl Inbound {
 	/// The `mtu` in force (transports page, "MTU": "The proposed default `mtu` of such an inbound is 1390, and 1420 otherwise").
 	pub fn mtu(&self) -> u16 {self.mtu.unwrap_or(if self.kind == InboundType::Veilway && self.enveloped() {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})}
 
-	/// The fields the upgrade answer takes from the decoy origin: "The default list is `Server`, `Date` on a `tls` listener."
-	pub fn upgrade_headers(&self) -> Vec<String> {self.upgrade_headers.clone().unwrap_or_else(|| DEFAULT_UPGRADE_HEADERS.iter().map(|name| name.to_string()).collect())}
+	/// The fields the upgrade answer takes from the decoy origin: "The default list is `Server`, `Date` on a `tls` listener and empty on a `ws` listener, where the front web server adds its own." `tls` says which of the two the answer is for.
+	pub fn upgrade_headers(&self, tls: bool) -> Vec<String> {self.upgrade_headers.clone().unwrap_or_else(|| DEFAULT_UPGRADE_HEADERS.iter().filter(|_| tls).map(|name| name.to_string()).collect())}
 }
 
 /// Transports page, "Padding", rule 4: the bounds "may be set per profile for the client and per inbound for the node, inside the bounds in the table of numbers".
@@ -711,6 +720,18 @@ pub struct TransportLimits {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(range(min = 1, max = 65536))]
 	pub relayed: Option<u32>,
+	/// Connections from `trusted_proxies` a `ws` or `fronted` listener holds at once. Defaults to twice its `fronted_sessions`. Requests of strangers that wait for the decoy origin hold at most half of them.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 2, max = 65536))]
+	pub proxy_connections: Option<u32>,
+	/// Requests one source may have waiting for the decoy origin at once on a `ws` or `fronted` listener. Defaults to 16.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 65536))]
+	pub decoy_requests_per_source: Option<u32>,
+	/// Established `fronted` sessions the listener holds at once, each of which keeps its last response, up to 65536 bytes. Defaults to 1024, which is 64 MiB when full.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 65536))]
+	pub fronted_sessions: Option<u32>,
 }
 
 /// The decoy origin of a stream listener: the operator's own web server, which answers everyone who is not a user.
@@ -761,17 +782,68 @@ pub enum Transport {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		limits: Option<TransportLimits>,
 	},
+	/// The native WebSocket session behind the operator's own web server, for a `veilway` inbound: `ws` with a `decoy`. The node never ends TLS here. It reads plain HTTP from `trusted_proxies`, and whoever is not a user is answered by `decoy.origin`.
+	#[serde(rename = "ws")]
+	WsNative {
+		listen: Addr,
+		/// The path a proof arrives on, as the web server in front hands it on, which the origin must serve nothing at.
+		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
+		path: String,
+		decoy: Decoy,
+		/// The operator's own reverse proxies, as addresses and networks. Only a connection from one of them can carry a user, and only from them is `client_address_header` believed.
+		#[schemars(length(min = 1, max = MAX_TRUSTED_PROXIES))]
+		trusted_proxies: Vec<Proxy>,
+		/// The header field in which the proxies name the address a request came from, such as `X-Forwarded-For`. Without it every visitor counts as the proxy itself.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern("^[A-Za-z0-9-]{1,64}$"))]
+		client_address_header: Option<String>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		limits: Option<TransportLimits>,
+	},
+	/// Polling with HTTP requests through a CDN that allows nothing better, behind the operator's own web server, for a `veilway` inbound. Its keys are those of the native `ws`.
+	Fronted {
+		listen: Addr,
+		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
+		path: String,
+		decoy: Decoy,
+		#[schemars(length(min = 1, max = MAX_TRUSTED_PROXIES))]
+		trusted_proxies: Vec<Proxy>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern("^[A-Za-z0-9-]{1,64}$"))]
+		client_address_header: Option<String>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		limits: Option<TransportLimits>,
+	},
 }
+
+/// What the two transports of the proxy path have besides their listen address: the native `ws` and `fronted`.
+pub struct Proxied<'a> {pub fronted: bool, pub path: &'a str, pub decoy: &'a Decoy, pub trusted: &'a [Proxy], pub header: Option<&'a str>, pub limits: Option<TransportLimits>}
 
 impl Transport {
 	pub fn listen(&self) -> SocketAddr {
 		match self {
-			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} => listen.0,
+			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::WsNative {listen, ..} | Transport::Fronted {listen, ..} => listen.0,
 		}
 	}
 
 	/// Whether the transport has a UDP socket of its own.
 	pub fn datagram(&self) -> bool {matches!(self, Transport::Udp {..} | Transport::UdpObfs {..})}
+
+	/// The decoy origin of a transport that takes the stream proof.
+	pub fn decoy(&self) -> Option<&Decoy> {
+		match self {
+			Transport::Tls {decoy, ..} | Transport::WsNative {decoy, ..} | Transport::Fronted {decoy, ..} => Some(decoy),
+			_ => None,
+		}
+	}
+
+	/// The transport as one of the proxy path, when it is one.
+	pub fn proxied(&self) -> Option<Proxied<'_>> {
+		match self {
+			Transport::WsNative {path, decoy, trusted_proxies, client_address_header, limits, ..} | Transport::Fronted {path, decoy, trusted_proxies, client_address_header, limits, ..} => Some(Proxied {fronted: matches!(self, Transport::Fronted {..}), path, decoy, trusted: trusted_proxies, header: client_address_header.as_deref(), limits: *limits}),
+			_ => None,
+		}
+	}
 }
 
 /// A key that belongs to another `type` of the same object is refused like an unknown key.
@@ -785,20 +857,24 @@ fn only<E: de::Error>(kind: &str, others: &[(&str, bool)]) -> Result<(), E> {
 // The objects that pick their keys by `type` are read through a flat struct of every key, so a wrong value keeps its exact path. serde's own tagged enums buffer the object and lose it.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls}
+enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Tls>, decoy: Option<Decoy>, limits: Option<TransportLimits>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Tls>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
 		let keys = TransportKeys::deserialize(d)?;
+		let proxy = [("trusted_proxies", keys.trusted_proxies.is_some()), ("client_address_header", keys.client_address_header.is_some())];
 		match keys.kind {
-			TransportType::Udp => only("udp", &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())]).map(|_| Transport::Udp {listen: keys.listen}),
-			TransportType::Ws => only("ws", &[("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())]).and_then(|_| Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls})),
-			TransportType::UdpObfs => only("udp-obfs", &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())]).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
-			TransportType::Tls => Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits}),
+			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy].concat()).map(|_| Transport::Udp {listen: keys.listen}),
+			// `ws` is two formats under one name. With none of the keys of the proxy path it is the one of a `wireguard` inbound, and with any of them the native one of a `veilway` inbound, which never ends TLS itself. `validate` holds each to its kind of inbound.
+			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && proxy.iter().all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls}),
+			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
+			TransportType::Tls => only("tls", &proxy).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits})),
+			TransportType::Fronted => only("fronted", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
 		}
 	}
 }

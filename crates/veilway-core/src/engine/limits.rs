@@ -17,6 +17,8 @@ use veilway_proto::session::{FIRST_PACKET, PENDING};
 
 /// "Sessions per device: 8." A device at this limit replaces its own oldest session once the new one is established.
 pub const DEVICE_SESSIONS: usize = 8;
+/// "Sessions per device: 8, of which at most 2 `fronted`." A device at this limit replaces its own oldest `fronted` session once the new one is established, as it does at the limit of all its sessions: each `fronted` session keeps a response for its device, so they are the ones a device is held to fewer of.
+pub const DEVICE_FRONTED: usize = 2;
 /// "Accepted proofs per device: burst 16, then 1 a second."
 pub const DEVICE_PROOFS: ProofRate = ProofRate {burst: 16, rate: 1};
 /// "WireGuard handshake initiations per session: burst 3, then 1 a second."
@@ -100,6 +102,8 @@ pub struct Seat {
 	phase: AtomicU8,
 	/// The established sessions of the listener it belongs to.
 	pool: Arc<AtomicI64>,
+	/// The established `fronted` sessions of that listener, for a session of that transport and no other.
+	polled: Option<Arc<AtomicI64>>,
 	/// The counters of its transport, by `Ended`.
 	ended: Arc<[AtomicU64; ENDS]>,
 	/// "The node ends a session with no activity for" this long, in milliseconds.
@@ -113,8 +117,9 @@ pub struct Seat {
 }
 
 impl Seat {
-	/// A pending session whose proof is about to be taken to the limits. `pool` counts the established sessions of its listener and `idle` is the idle time of its transport.
-	pub fn new(device: [u8; 32], secret: Proved, key: Option<[u8; 32]>, tunnel: Arc<Tunnel>, pool: Arc<AtomicI64>, ended: Arc<[AtomicU64; ENDS]>, idle: Duration, now: i64) -> Arc<Seat> {Arc::new(Seat {device, secret, key, tunnel, phase: AtomicU8::new(WAITING), pool, ended, idle: idle.as_millis() as i64, opened: AtomicI64::new(now), active: AtomicI64::new(now), since: AtomicI64::new(now), gone: Notify::new()})}
+	/// A pending session whose proof is about to be taken to the limits. `pool` counts the established sessions of its listener, `polled` those of them that are `fronted` when this is one, and `idle` is the idle time of its transport.
+	#[allow(clippy::too_many_arguments)]
+	pub fn new(device: [u8; 32], secret: Proved, key: Option<[u8; 32]>, tunnel: Arc<Tunnel>, pool: Arc<AtomicI64>, polled: Option<Arc<AtomicI64>>, ended: Arc<[AtomicU64; ENDS]>, idle: Duration, now: i64) -> Arc<Seat> {Arc::new(Seat {device, secret, key, tunnel, phase: AtomicU8::new(WAITING), pool, polled, ended, idle: idle.as_millis() as i64, opened: AtomicI64::new(now), active: AtomicI64::new(now), since: AtomicI64::new(now), gone: Notify::new()})}
 
 	fn phase(&self) -> u8 {self.phase.load(Ordering::Acquire)}
 
@@ -135,7 +140,10 @@ impl Seat {
 	pub fn end(&self, why: Ended) {
 		let was = self.phase.swap(OVER, Ordering::AcqRel);
 		if was == OVER {return}
-		if was != WAITING {self.pool.fetch_sub(1, Ordering::Relaxed);}
+		if was != WAITING {
+			self.pool.fetch_sub(1, Ordering::Relaxed);
+			if let Some(polled) = &self.polled {polled.fetch_sub(1, Ordering::Relaxed);}
+		}
 		self.ended[why as usize].fetch_add(1, Ordering::Relaxed);
 		self.gone.notify_one();
 	}
@@ -258,15 +266,19 @@ impl State {
 	/// Makes a pending session established, the moment a WireGuard packet of its device has authenticated on it. `cap` is how many established sessions its listener holds.
 	/// "Only an established session counts against the device's session limit, and only at the moment it becomes established does it replace the device's oldest session when the limit is reached."
 	/// The device's sessions are counted, the session goes live and the oldest gives way under one hold of the limits, so two listeners never both find room for a device's eighth session.
-	pub fn establish(&self, seat: &Arc<Seat>, cap: usize, now: i64) -> Seated {
+	/// `fronted` is how many established `fronted` sessions its listener holds, which only a session of that transport is held to. A device's third `fronted` session takes the place of its oldest `fronted` one, which makes room among its eight as well.
+	pub fn establish(&self, seat: &Arc<Seat>, cap: usize, fronted: usize, now: i64) -> Seated {
 		let limits = self.limits();
 		let held: Vec<Arc<Seat>> = limits.devices.get(&seat.device).map(|account| account.seats.iter().filter_map(Weak::upgrade).filter(|held| held.established()).collect()).unwrap_or_default();
-		let oldest = held.iter().filter(|_| held.len() >= DEVICE_SESSIONS).min_by_key(|held| held.since.load(Ordering::Relaxed));
+		let polling = seat.polled.is_some() && held.iter().filter(|held| held.polled.is_some()).count() >= DEVICE_FRONTED;
+		let oldest = held.iter().filter(|one| if polling {one.polled.is_some()} else {held.len() >= DEVICE_SESSIONS}).min_by_key(|held| held.since.load(Ordering::Relaxed));
 		// A pool that filled up since the proof was accepted, or that a reload made smaller than what it holds: nothing is displaced for the session. The one place it may still take is the one its device's oldest session gives up in this same pool.
 		if seat.pool.load(Ordering::Relaxed) >= cap as i64 && !oldest.is_some_and(|oldest| Arc::ptr_eq(&oldest.pool, &seat.pool)) {return Seated::Full}
+		if seat.polled.as_ref().is_some_and(|polled| polled.load(Ordering::Relaxed) >= fronted as i64 && !oldest.and_then(|oldest| oldest.polled.as_ref()).is_some_and(|gives| Arc::ptr_eq(gives, polled))) {return Seated::Full}
 		if seat.phase.compare_exchange(WAITING, LIVE, Ordering::AcqRel, Ordering::Acquire).is_err() {return Seated::Gone}
 		if let Some(oldest) = oldest {oldest.end(Ended::Displaced)}
 		seat.pool.fetch_add(1, Ordering::Relaxed);
+		if let Some(polled) = &seat.polled {polled.fetch_add(1, Ordering::Relaxed);}
 		seat.since.store(now, Ordering::Relaxed);
 		Seated::Established
 	}

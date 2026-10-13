@@ -72,6 +72,16 @@ pub const DEFAULT_UNDECIDED_PER_SOURCE: u32 = 64;
 /// No more than this, because the listener looks at every relayed connection, with the pool held, to find the one to close for room.
 pub const MAX_RELAYED: u32 = 65536;
 pub const DEFAULT_RELAYED: u32 = 1024;
+/// The pools of the proxy path (transports page, "Node capacity numbers"): "Proxy connections: twice the `fronted` sessions", and "Decoy requests in flight per source on the proxy path: 16".
+/// The page's "`fronted` sessions: 4,096" is not the default here. A session keeps its last response for the repeat, up to `FRONTED_KEPT` bytes, so a full pool of 4,096 holds 256 MiB of them, which a host with 1 GB does not carry next to everything else. The default is 1,024, which is 64 MiB when full, and a pool above `LARGE_FRONTED_SESSIONS` is a warning that says what it holds.
+pub const MAX_PROXY_CONNECTIONS: u32 = 65536;
+pub const MAX_FRONTED_SESSIONS: u32 = 65536;
+pub const DEFAULT_FRONTED_SESSIONS: u32 = 1024;
+pub const LARGE_FRONTED_SESSIONS: u32 = 4096;
+pub const FRONTED_KEPT: u64 = 65536;
+pub const MAX_DECOY_REQUESTS: u32 = 65536;
+pub const DEFAULT_DECOY_REQUESTS: u32 = 16;
+pub const MAX_TRUSTED_PROXIES: usize = 64;
 /// "Request path: at least 12 characters."
 pub const MIN_PROOF_PATH_BYTES: usize = 12;
 pub const MAX_UPGRADE_HEADERS: usize = 16;
