@@ -18,7 +18,8 @@ use tokio::time::timeout;
 use veilway_core::config::{self, Backend, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
-use veilway_core::engine::{dns, icmp, probe};
+use veilway_core::engine::{dns, icmp, probe, replay};
+use veilway_proto::replay::{STEP, WINDOW};
 use veilway_wg::ws::{self, TlsFiles};
 use x509_parser::extensions::GeneralName;
 
@@ -220,11 +221,11 @@ fn print(lines: &[Line], config: &str, json: bool) -> i32 {
 	i32::from(fail > 0)
 }
 
-/// Runs every check of the config at `file` and prints what was found. `state` and `api` are the paths `veilway run` would use, and `api` is None for a node without the control API. `wait` is how long each step on the network may take.
+/// Runs every check of the config at `file` and prints what was found. `state`, `replay` and `api` are the paths `veilway run` would use, and `api` is None for a node without the control API. `wait` is how long each step on the network may take.
 /// `allow_readable` is the --allow-readable-config of `veilway run`: without it a config file that group or others can read is a failure here as it is there.
 /// Returns the exit status: 0 when nothing failed, 1 when a check failed, 2 when the config file could not be read at all.
 #[cfg_attr(not(unix), allow(unused_variables))]
-pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
+pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, replay: Option<PathBuf>, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
 	let ((loaded, report), name, dir, mut lines) = (config::load(file, true), file.display().to_string(), file.parent().unwrap_or(Path::new("")), Vec::new());
 	let at = |path: &str| if path.is_empty() {name.clone()} else {path.to_string()};
 	#[cfg(unix)]
@@ -415,6 +416,32 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, api:
 		Found::Good {users, ..} if open => (Status::Warn, format!("it holds {users} users and can be read by group or others, who learn every user name and its usage from it: restrict it (chmod 600)")),
 		Found::Good {users, ..} => (Status::Ok, format!("it is a state file of {users} users that only its owner can read, in a directory the node can write")),
 	};
-	lines.extend([line(status, "state", state.display().to_string(), message), line(socket.0, "socket", socket.1, socket.2)]);
+	lines.push(line(status, "state", state.display().to_string(), message));
+	// Transports page, "When the floor is ahead of the clock": "`veilway doctor` reports the floor, the limit and the clock, fails the check when the floor is ahead, and warns when the limit is more than `W` plus 20 s ahead." Only a config with an obfuscated transport has a replay file.
+	if config.inbounds.iter().any(|inbound| inbound.obfuscated()) {
+		let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
+		let (clock, folder, running) = (SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs()), writable(replay.parent().unwrap_or(Path::new(""))), replay::held(&replay) == Some(true));
+		let (status, message) = match replay::inspect(&replay, config.replay.cache()) {
+			replay::Found::Alone(why) => (Status::Fail, format!("{why}, and the node writes its replay file there, so `veilway run` would not start this config: name a free path or a replay file with --replay")),
+			_ if !folder => (Status::Fail, "its directory cannot be written by this user, and the node keeps a lock file and a temporary file next to it, so `veilway run` would not start this config: name a path the node can write with --replay".to_string()),
+			replay::Found::Bad(why) => (Status::Fail, format!("{why}: at start the node moves it aside with `.bad` behind its name and refuses every proof for {WINDOW}s. Never put a replay file back from a backup: an older one reopens replay for everything accepted since")),
+			replay::Found::Absent => (Status::Ok, format!("nothing is there yet and its directory can be written, so the node makes it at start and refuses every proof for the first {WINDOW}s. The clock of this host has to be right before that start")),
+			replay::Found::Good(found) => {
+				let (floor, limit, numbers) = (found.floor(), found.limit(), format!("floor {}, limit {}, clock {clock}", found.floor(), found.limit()));
+				// A node that did not stop cleanly takes the written limit as its floor, so for a node that is not running that is the floor its next start has.
+				let next = if found.clean() || running {floor} else {floor.max(limit)};
+				// A start or a reset puts the floor up to the window and the step ahead of the clock, which is what they cost and passes by itself. Only a floor further ahead is the fault a clock leaves, and only there is the reset the answer.
+				if floor > clock && floor - clock <= WINDOW + STEP {
+					(Status::Ok, format!("{numbers}: the node refuses proofs for {}s more, which is what a start or a reset costs and ends by itself. Do not reset for it", floor - clock))
+				} else if floor > clock {
+					(Status::Fail, format!("{numbers}: the floor is {}s ahead of the clock, so the node refuses every proof until the clock passes it. A clock that ran ahead leaves this behind. Check the clock of this host first, then `veilway replay reset` ends it at the price it names", floor - clock))
+				} else if limit > clock.saturating_add(WINDOW + STEP) {
+					(Status::Warn, format!("{numbers}: the limit is {}s ahead of the clock, which a clock that ran ahead leaves behind. {}", limit - clock, if running {"The node that runs brings it down by itself within a second or two of its clock being right"} else if next > clock {"No node holds the file, and one that starts now takes this limit as its floor and refuses every proof until the clock passes it: check the clock, and delete the file if it is right, which costs one refusal period of 60 s"} else {"A node that starts now brings it down by itself"}))
+				} else {(Status::Ok, format!("{numbers}{}", if found.clean() {format!(", written by a clean stop with {} proofs in its cache", found.len())} else if running {", held by the node that runs".to_string()} else {format!(": the node did not stop cleanly, so its next start refuses proofs with a timestamp up to {next}, which is {}s from now", next.saturating_sub(clock))}))}
+			}
+		};
+		lines.push(line(status, "replay", replay.display().to_string(), message));
+	}
+	lines.push(line(socket.0, "socket", socket.1, socket.2));
 	print(&lines, &name, json)
 }

@@ -30,6 +30,8 @@ enum Command {
 		#[arg(long)] allow_readable_config: bool,
 		/// Where every user's usage is kept across restarts [default: veilway-state.json next to the config file]
 		#[arg(long)] state: Option<PathBuf>,
+		/// Where the replay memory of the obfuscated transports is kept across restarts. Only a config with such a transport uses it, and is not started without a path the node can write. Never restore this file from a backup [default: veilway-replay next to the state file]
+		#[arg(long)] replay: Option<PathBuf>,
 		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -48,6 +50,8 @@ enum Command {
 		#[arg(long)] allow_readable_config: bool,
 		/// The state file `run` would use [default: veilway-state.json next to the config file]
 		#[arg(long)] state: Option<PathBuf>,
+		/// The replay file `run` would use [default: veilway-replay next to the state file]
+		#[arg(long)] replay: Option<PathBuf>,
 		/// The control socket `run` would use, which also says whether a node runs already [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -62,6 +66,9 @@ enum Command {
 	/// What a node that runs counts for its users, changed through its control socket
 	#[cfg(unix)]
 	Usage {#[command(subcommand)] command: Usage},
+	/// The replay memory of a node that runs obfuscated transports, changed through its control socket
+	#[cfg(unix)]
+	Replay {#[command(subcommand)] command: Replay},
 	/// Print the JSON Schema of config version 1
 	Schema,
 	/// Print a fresh private key and its public key
@@ -81,6 +88,20 @@ enum Usage {
 		#[arg(long)] user: String,
 		/// Also zero what the user sent and received in all, which a reset leaves alone otherwise
 		#[arg(long)] totals: bool,
+		/// The control socket of the node [default: veilway.sock next to the config file]
+		#[arg(long)] api: Option<PathBuf>,
+		/// The config file the node was started with, which is only looked at for where its socket is
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+	},
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum Replay {
+	/// Empty the replay cache of the node that runs and set its floor and limit to its clock plus 60 seconds. It says what that costs and does nothing without --yes. Usage and quotas are not touched. Exit status: 0 done, 2 not confirmed, 3 the node keeps no replay memory, 4 no node answers on the socket, 5 this user may not open the socket, 6 the reset is still being written and must not be run again, 1 anything else
+	Reset {
+		/// Do it. Without this the command says what a reset costs and changes nothing
+		#[arg(long)] yes: bool,
 		/// The control socket of the node [default: veilway.sock next to the config file]
 		#[arg(long)] api: Option<PathBuf>,
 		/// The config file the node was started with, which is only looked at for where its socket is
@@ -143,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+		Command::Run {config, allow_readable_config, state, replay, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -159,7 +180,10 @@ async fn main() -> anyhow::Result<()> {
 			#[cfg(unix)]
 			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);
 			let dir = config.parent().unwrap_or(Path::new(""));
-			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state.unwrap_or_else(|| dir.join("veilway-state.json"))), ..Options::new(dir)}).await?);
+			// "In a file of its own, next to the usage state file and separate from it."
+			let state = state.unwrap_or_else(|| dir.join("veilway-state.json"));
+			let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), ..Options::new(dir)}).await?);
 			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
 			#[cfg(unix)]
 			let (control, mut events) = (if no_api {None} else {
@@ -236,12 +260,58 @@ async fn main() -> anyhow::Result<()> {
 			if print(&report, &config) {std::process::exit(1)}
 			Ok(())
 		}
-		Command::Doctor {config, allow_readable_config, state, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+		Command::Doctor {config, allow_readable_config, state, replay, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
 			#[cfg(unix)]
 			let socket = (!no_api).then(|| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 			#[cfg(not(unix))]
 			let socket = None;
-			std::process::exit(doctor::run(&config, allow_readable_config, state, socket, json, Duration::from_secs(timeout)).await)
+			std::process::exit(doctor::run(&config, allow_readable_config, state, replay, socket, json, Duration::from_secs(timeout)).await)
+		}
+		#[cfg(unix)]
+		Command::Replay {command: Replay::Reset {yes, api, config}} => {
+			let socket = api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock"));
+			// "The command says so before it acts": the price of a reset, every time, whether or not it then acts.
+			eprintln!("A reset of the replay memory empties the node's cache of accepted proofs and sets its floor and its limit to the node's clock plus 60 seconds.");
+			eprintln!("It costs two things. Every client is refused for 60 seconds. And a proof that was accepted with a timestamp above the new floor is forgotten: whoever recorded it can use it once more when the clock reaches that timestamp.");
+			eprintln!("It is for a node whose floor is ahead of its clock after the clock ran ahead, which `veilway doctor` and the node's log say. Usage and quotas are not touched.");
+			if !yes {
+				eprintln!("Nothing was changed. Run it again with --yes to do it.");
+				std::process::exit(2);
+			}
+			let answer = veilway_api::request(&socket, "POST", "/v1/replay/reset", None, Duration::from_secs(30)).await;
+			let said = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+			std::process::exit(match answer {
+				Ok((200, body)) => {
+					let now = said(&body);
+					println!("replay memory reset: floor {}, limit {}, clock {}. Proofs are accepted again once the node's clock has passed the floor", now["floor"], now["limit"], now["clock"]);
+					0
+				}
+				Ok((409, body)) if said(&body)["error"]["code"] == "replay_absent" => {
+					eprintln!("error: the node on {} keeps no replay memory: it has run no obfuscated transport. Nothing was changed", socket.display());
+					3
+				}
+				Ok((500, body)) if said(&body)["error"]["code"] == "replay_writing" => {
+					eprintln!("error: the node on {} has not finished writing the reset yet. It is in force when the write ends: do not run this again. `veilway doctor` shows the floor and the limit the replay file has, and replay.resets of the node's stats grows by one when the reset has landed", socket.display());
+					6
+				}
+				Ok((status, body)) => {
+					eprintln!("error: the node on {} answered {status}: {}", socket.display(), said(&body)["error"]["message"].as_str().unwrap_or("with no message. Is it a node of this version?"));
+					1
+				}
+				// "The command refuses to run when no node answers on the socket, because editing the file under a running node would be undone by its next write."
+				Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+					eprintln!("error: no node answers on the control socket {} ({}), and this command never touches the replay file itself. Start the node, or name its socket with --api or its config file with --config. With the node stopped, deleting the replay file has the same effect as a reset", socket.display(), e.kind());
+					4
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+					eprintln!("error: the control socket {} may not be opened by this user. Run this as the user the node runs as, or as root", socket.display());
+					5
+				}
+				Err(e) => {
+					eprintln!("error: the node on {} did not answer the reset: {e}. Whether it happened is not known: `veilway doctor` shows the floor and the limit the replay file has now", socket.display());
+					1
+				}
+			})
 		}
 		#[cfg(unix)]
 		Command::Usage {command: Usage::Reset {user, totals, api, config}} => {

@@ -72,15 +72,28 @@ pub struct Wg{
 	free:Vec<usize>,
 	scratch:Vec<u8>,
 	limiter:Arc<RateLimiter>,
+	/// What every peer's own tunnel is given for a limiter: one that is never under load. The load limit of the endpoint is `limiter`, which `recv_authenticated` asks itself before a tunnel sees a handshake,
+	/// so a handshake is counted once, and one that comes in through `recv_bound` is not counted against it at all.
+	quiet:Arc<RateLimiter>,
 	last_reset:Instant,
+}
+
+/// What a datagram did that came in on a session bound to one peer, see [`Wg::recv_bound`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bound{
+	pub peer:usize,
+	/// Whether the datagram proved the peer's key: a handshake initiation the tunnel answered, or a data packet or keepalive under one of its sessions.
+	pub proven:bool,
+	/// A data packet that authenticated and carried no IP packet.
+	pub keepalive:bool,
 }
 
 impl Wg{
 	pub fn new(private_key:[u8;32])->Wg{
 		let private=StaticSecret::from(private_key);
 		let public=PublicKey::from(&private);
-		let limiter=Arc::new(RateLimiter::new(&public, HANDSHAKE_RATE_LIMIT));
-		Wg{private, public, peers:Vec::new(), by_key:HashMap::new(), free:Vec::new(), scratch:vec![0u8;MAX_PACKET], limiter, last_reset:Instant::now()}
+		let (limiter, quiet)=(Arc::new(RateLimiter::new(&public, HANDSHAKE_RATE_LIMIT)), Arc::new(RateLimiter::new(&public, u64::MAX)));
+		Wg{private, public, peers:Vec::new(), by_key:HashMap::new(), free:Vec::new(), scratch:vec![0u8;MAX_PACKET], limiter, quiet, last_reset:Instant::now()}
 	}
 
 	pub fn public_key(&self)->[u8;32]{self.public.to_bytes()}
@@ -91,7 +104,7 @@ impl Wg{
 		if self.by_key.contains_key(&public_key){bail!("duplicate peer public key")}
 		let idx=self.free.last().copied().unwrap_or(self.peers.len());
 		if idx>=MAX_PEERS{bail!("too many peers")}
-		let tunn=Tunn::new(self.private.clone(), PublicKey::from(public_key), preshared_key, keepalive, idx as u32, Some(self.limiter.clone()));
+		let tunn=Tunn::new(self.private.clone(), PublicKey::from(public_key), preshared_key, keepalive, idx as u32, Some(self.quiet.clone()));
 		let peer=Some(Peer{public_key, endpoint:None, preshared_key, keepalive, tunn});
 		if self.free.pop().is_some(){self.peers[idx]=peer}else{self.peers.push(peer)}
 		self.by_key.insert(public_key, idx);
@@ -109,7 +122,7 @@ impl Wg{
 	/// Drops every session key of a peer and forgets where it was heard from. It stays a peer and has to shake hands again. False when there is no such peer.
 	pub fn drop_sessions(&mut self, public_key:&[u8;32])->bool{
 		let Some((idx, peer))=self.by_key.get(public_key).and_then(|idx| Some((*idx, self.peers.get_mut(*idx)?.as_mut()?))) else{return false};
-		peer.tunn=Tunn::new(self.private.clone(), PublicKey::from(peer.public_key), peer.preshared_key, peer.keepalive, idx as u32, Some(self.limiter.clone()));
+		peer.tunn=Tunn::new(self.private.clone(), PublicKey::from(peer.public_key), peer.preshared_key, peer.keepalive, idx as u32, Some(self.quiet.clone()));
 		peer.endpoint=None;
 		true
 	}
@@ -169,6 +182,40 @@ impl Wg{
 		let proven=decrypted|| kind==4|| (kind!=3 && answered);
 		if proven{peer.endpoint=Some(from)}
 		Some((idx, proven))
+	}
+
+	/// Feeds one datagram that came in on a session which belongs to the peer with `public_key` and to nobody else (transports page, "WireGuard on an obfuscated transport", rule 1).
+	/// A handshake initiation is read only when the static key in it is that key, and any other message only when it is addressed to a session of that peer. Everything else is dropped with no reply, and so is a cookie reply.
+	/// Nothing here asks the endpoint's handshake load limiter and no cookie reply is ever made (rule 5): whoever calls this has limits of its own.
+	pub fn recv_bound(&mut self, public_key:&[u8;32], from:SocketAddr, datagram:&[u8], net_out:&mut Vec<Vec<u8>>, ip_out:&mut Vec<Vec<u8>>)->Option<Bound>{
+		let idx=*self.by_key.get(public_key)?;
+		let kind=match Tunn::parse_incoming_packet(datagram).ok()?{
+			Packet::HandshakeInit(p)=>{
+				if parse_handshake_anon(&self.private, &self.public, &p).ok()?.peer_static_public!=*public_key{return None}
+				1u8
+			}
+			Packet::HandshakeResponse(p) if (p.receiver_idx>>8) as usize==idx=>2,
+			Packet::PacketData(p) if (p.receiver_idx>>8) as usize==idx=>4,
+			_=>return None,
+		};
+		let (before, carried)=(net_out.len(), ip_out.len());
+		let Wg{peers, scratch, ..}=self;
+		let peer=peers.get_mut(idx)?.as_mut()?;
+		let mut input:&[u8]=datagram;
+		loop{
+			match peer.tunn.decapsulate(None, input, scratch){
+				TunnResult::Done=>break,
+				TunnResult::Err(e)=>{tracing::debug!("peer {idx} decapsulate on a bound session: {e:?}"); return None}
+				TunnResult::WriteToNetwork(b)=>{net_out.push(b.to_vec()); input=&[]}
+				TunnResult::WriteToTunnelV4(b, _)|TunnResult::WriteToTunnelV6(b, _)=>{ip_out.push(b.to_vec()); break}
+			}
+		}
+		// The tunnel's own limiter is never under load, so it makes no cookie reply. Should one ever stand here, it is not sent.
+		let mut at=before;
+		while at<net_out.len(){if net_out[at].first()==Some(&3){net_out.remove(at);}else{at+=1}}
+		let proven=kind==4|| net_out.len()>before;
+		if proven{peer.endpoint=Some(from)}
+		Some(Bound{peer:idx, proven, keepalive:kind==4&& ip_out.len()==carried})
 	}
 
 	/// Encrypts one IP packet for `idx`. With no live session it emits a handshake initiation and queues the packet.
@@ -336,6 +383,85 @@ mod tests{
 		assert_eq!(wg.recv_from_network(from, &data(&mut client), &mut net, &mut ip), None);
 		assert!(ip.is_empty() && wg.endpoint(idx).is_none() && wg.time_since_last_handshake(idx).is_none());
 		assert_eq!(connected(&mut wg, &srv, a, from).1, idx, "the peer could not shake hands again");
+	}
+
+	// Transports page, "WireGuard on an obfuscated transport", rule 1: "device A's proof followed by device B's initiation yields no handshake response".
+	#[test]
+	fn a_bound_session_takes_only_its_own_peer(){
+		let (srv, a, b)=(generate_key(), generate_key(), generate_key());
+		let mut wg=Wg::new(srv);
+		let (ia, ib)=(wg.add_peer(public_key(&a), None, None).unwrap(), wg.add_peer(public_key(&b), None, None).unwrap());
+		let from:SocketAddr="127.0.0.1:1234".parse().unwrap();
+		let initiation=|key:[u8;32]|{
+			let mut client=Tunn::new(StaticSecret::from(key), PublicKey::from(public_key(&srv)), None, None, 0, None);
+			let mut buf=vec![0u8;MAX_PACKET];
+			let TunnResult::WriteToNetwork(init)=client.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+			let init=init.to_vec();
+			(client, init)
+		};
+		let (mut net, mut ip)=(Vec::new(), Vec::new());
+		let (_, from_b)=initiation(b);
+		assert_eq!(wg.recv_bound(&public_key(&a), from, &from_b, &mut net, &mut ip), None);
+		assert!(net.is_empty()&& wg.endpoint(ia).is_none()&& wg.endpoint(ib).is_none(), "another peer's initiation was answered on a bound session");
+		let (mut client, from_a)=initiation(a);
+		assert_eq!(wg.recv_bound(&public_key(&a), from, &from_a, &mut net, &mut ip), Some(Bound{peer:ia, proven:true, keepalive:false}));
+		assert_eq!((net.len(), net[0].first(), wg.endpoint(ia)), (1, Some(&2), Some(from)));
+		// The same initiation again is one the tunnel drops as a repeat: it proves nothing.
+		assert_eq!(wg.recv_bound(&public_key(&a), from, &from_a, &mut net, &mut ip), None);
+		assert_eq!(net.len(), 1);
+		// The keepalive that follows the response is a data packet with nothing in it, and data of that peer is refused on a session bound to the other.
+		let mut out=vec![0u8;MAX_PACKET];
+		let TunnResult::WriteToNetwork(keepalive)=client.decapsulate(None, &net[0], &mut out) else{panic!("no keepalive after the response")};
+		let keepalive=keepalive.to_vec();
+		assert_eq!(wg.recv_bound(&public_key(&b), from, &keepalive, &mut net, &mut ip), None);
+		assert_eq!(wg.recv_bound(&public_key(&a), from, &keepalive, &mut net, &mut ip), Some(Bound{peer:ia, proven:true, keepalive:true}));
+		let sent=data(&mut client);
+		assert_eq!(wg.recv_bound(&public_key(&b), from, &sent, &mut net, &mut ip), None);
+		assert_eq!(wg.recv_bound(&public_key(&a), from, &sent, &mut net, &mut ip), Some(Bound{peer:ia, proven:true, keepalive:false}));
+		assert_eq!((ip.len(), wg.recv_bound(&public_key(&a), from, &sent, &mut net, &mut ip)), (1, None), "a replayed data packet authenticated");
+	}
+
+	// A flood on the plain socket puts the endpoint under load. A handshake on a bound session is neither counted against that load nor answered with a cookie.
+	#[test]
+	fn a_bound_session_is_not_held_to_the_load_limit_and_gets_no_cookie(){
+		let (srv, a, b)=(generate_key(), generate_key(), generate_key());
+		let mut wg=Wg::new(srv);
+		wg.add_peer(public_key(&a), None, None).unwrap();
+		wg.add_peer(public_key(&b), None, None).unwrap();
+		let from:SocketAddr="127.0.0.1:1234".parse().unwrap();
+		let mut flood=Tunn::new(StaticSecret::from(b), PublicKey::from(public_key(&srv)), None, None, 0, None);
+		let mut buf=vec![0u8;MAX_PACKET];
+		let TunnResult::WriteToNetwork(init)=flood.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+		let init=init.to_vec();
+		let (mut net, mut ip)=(Vec::new(), Vec::new());
+		for _ in 0..(HANDSHAKE_RATE_LIMIT as usize)*2{wg.recv_from_network(from, &init, &mut net, &mut ip);}
+		assert!(net.iter().any(|d| d.first()==Some(&3)), "the limiter never engaged");
+		net.clear();
+		let mut client=Tunn::new(StaticSecret::from(a), PublicKey::from(public_key(&srv)), None, None, 0, None);
+		let mut buf=vec![0u8;MAX_PACKET];
+		let TunnResult::WriteToNetwork(init)=client.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+		assert!(wg.recv_bound(&public_key(&a), from, init, &mut net, &mut ip).is_some_and(|bound| bound.proven));
+		assert_eq!((net.len(), net[0].first()), (1, Some(&2)));
+	}
+
+	// A handshake is counted once against the load limit: by `recv_authenticated`, and not a second time by the peer's own tunnel. So cookie replies begin above `HANDSHAKE_RATE_LIMIT` handshake messages a second, as the constant says.
+	#[test]
+	fn cookie_replies_begin_above_the_handshake_limit_and_not_at_half_of_it(){
+		let (srv, a)=(generate_key(), generate_key());
+		let mut wg=Wg::new(srv);
+		wg.add_peer(public_key(&a), None, None).unwrap();
+		let from:SocketAddr="127.0.0.1:1234".parse().unwrap();
+		let mut client=Tunn::new(StaticSecret::from(a), PublicKey::from(public_key(&srv)), None, None, 0, None);
+		let mut buf=vec![0u8;MAX_PACKET];
+		let TunnResult::WriteToNetwork(init)=client.format_handshake_initiation(&mut buf, false) else{panic!("no initiation")};
+		let init=init.to_vec();
+		let (mut net, mut ip, mut first)=(Vec::new(), Vec::new(), None);
+		for n in 0..300{
+			net.clear();
+			wg.recv_from_network(from, &init, &mut net, &mut ip);
+			if first.is_none()&& net.iter().any(|d| d.first()==Some(&3)){first=Some(n)}
+		}
+		assert_eq!(first, Some(HANDSHAKE_RATE_LIMIT as usize));
 	}
 
 	#[test]

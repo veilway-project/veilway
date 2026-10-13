@@ -1,6 +1,6 @@
 //! Reloading: the running config behind a watch channel, the diff between two configs and the two-phase apply.
 //! Nothing here holds or logs a value from a document except tags, user names and device public keys.
-use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, User, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
+use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, User, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, HashSet};
@@ -128,6 +128,8 @@ pub struct Diff {
 	/// The rules present in both configs are in a different order, which can change what they decide.
 	pub rules_reordered: bool,
 	pub notices: bool,
+	/// `replay` changed. The per-source rate is in force at once, the cache size at the next start.
+	pub replay: bool,
 	/// One entry per tag in `inbounds.changed`.
 	pub inbound_changes: Vec<InboundChange>,
 	/// One entry per name in `users.changed`.
@@ -153,12 +155,12 @@ impl Diff {
 			let change = InboundChange {
 				tag: tag.clone(),
 				// The same networks in another order, or an absent mtu and the default written out, are the same tunnel, and a restart drops every session.
-				restart: was.private_key != is.private_key || was.address.len() != is.address.len() || was.address.iter().any(|net| !is.address.contains(net)) || was.mtu.unwrap_or(DEFAULT_MTU) != is.mtu.unwrap_or(DEFAULT_MTU),
+				restart: was.private_key != is.private_key || was.address.len() != is.address.len() || was.address.iter().any(|net| !is.address.contains(net)) || was.mtu() != is.mtu(),
 				transports_stopped: (0..was.transports.len()).filter(|i| !is.transports.contains(&was.transports[*i])).collect(),
 				transports_started: (0..is.transports.len()).filter(|i| !was.transports.contains(&is.transports[*i])).collect(),
 			};
 			// A changed `type` restarts nothing: the tunnel is the same, and what its gateway answers goes by the config in force.
-			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind).then_some(change)
+			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.padding != is.padding).then_some(change)
 		}).collect();
 		inbounds.changed.retain(|tag| inbound_changes.iter().any(|change| change.tag == *tag));
 		// Objects that differ as written are compared again with their defaults filled in.
@@ -215,6 +217,7 @@ impl Diff {
 			log: old.log != new.log,
 			routing_default: old.routing.default != new.routing.default,
 			notices: old.notices != new.notices,
+			replay: old.replay.cache() != new.replay.cache() || old.replay.per_source() != new.replay.per_source(),
 			rules_reordered: !old.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| new_rules.contains(tag)).eq(new.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| old_rules.contains(tag))),
 			inbound_changes,
 			user_changes,

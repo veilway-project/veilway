@@ -22,13 +22,14 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
-use veilway_core::{Denied, Over, Reason};
+use veilway_core::{Denied, Over, Reason, Reset};
 
 pub(crate) const EVENTS: &str = "/v1/events";
 const CONFIG: &str = "/v1/config";
 /// What the path of a usage reset begins and ends with, around the name of its user.
 const USERS: &str = "/v1/users/";
 const RESET: &str = "/usage/reset";
+const REPLAY_RESET: &str = "/v1/replay/reset";
 /// How many times the body limit a request may send before the node stops taking its body off the connection.
 const DRAIN: usize = 4;
 
@@ -257,6 +258,17 @@ async fn reset_usage(State(api): State<Arc<Api>>, name: Result<Path<String>, Pat
 	users_of(&api, Some(&name)).pop().map_or_else(missing, |user| json(StatusCode::OK, &user))
 }
 
+/// `veilway replay reset`, see `Engine::reset_replay`. Like a usage reset the answer waits for the node once it has been asked: the node gives up on the write by itself and says so.
+async fn reset_replay(State(api): State<Arc<Api>>) -> Response {
+	match api.engine.reset_replay().await {
+		None => Failure::new(StatusCode::CONFLICT, "replay_absent", "The node has run no obfuscated transport, so it keeps no replay memory and there is nothing to reset. Nothing was changed.").into_response(),
+		Some(Reset::Busy) => Failure::new(StatusCode::CONFLICT, "replay_busy", "An earlier reset is not known to be on disk yet, or the node is stopping. Until then the node accepts no proof. Ask again in a moment.").into_response(),
+		Some(Reset::Unwritten) => Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "replay_unwritten", "The replay file could not be written, so the reset may or may not be on disk. The node accepts no proof until it has written the floor and the limit it had back, and then they are in force again. Make the replay file writable and ask again.").into_response(),
+		Some(Reset::Writing) => Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "replay_writing", "The write of the reset has not ended yet. The reset is in force when it does: do not ask for it again. GET /v1/stats shows it: replay.resets grows by one when the reset has landed, and replay.ready is false while the node accepts no proof.").into_response(),
+		Some(Reset::Done(_)) => api.engine.replay().map_or_else(|| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "The replay memory was reset and could not be read back.").into_response(), |status| json(StatusCode::OK, &model::Replay::from(status))),
+	}
+}
+
 async fn stats(State(api): State<Arc<Api>>) -> Response {json(StatusCode::OK, &api.stats())}
 
 async fn sessions(State(api): State<Arc<Api>>) -> Response {
@@ -269,6 +281,7 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 		transport: peer.over.map(|over| match over {
 			Over::Udp => model::Transport::Udp,
 			Over::Ws => model::Transport::Ws,
+			Over::UdpObfs => model::Transport::UdpObfs,
 		}),
 		flows: peer.flows,
 		selected_exit: peer.exit,
@@ -335,10 +348,10 @@ pub(crate) async fn unknown() -> Response {Failure::new(StatusCode::NOT_FOUND, "
 pub(crate) async fn not_allowed() -> Response {Failure::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "The route does not take this method. GET /v1/openapi.json lists what it takes.").into_response()}
 
 /// Ends a request that has not been answered in time. The event stream is no such request: it is held to how fast its reader takes what it is sent, see `Stalled`.
-/// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force. So does a usage reset, see `reset_usage`.
+/// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force. So does a usage reset, see `reset_usage`, and a reset of the replay memory, which the node gives up on by itself.
 pub(crate) async fn deadline(State(api): State<Arc<Api>>, request: Request, next: Next) -> Response {
 	let path = request.uri().path();
-	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET))) {return next.run(request).await}
+	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && (path == REPLAY_RESET || path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET)))) {return next.run(request).await}
 	tokio::time::timeout(api.limits.request, next.run(request)).await.unwrap_or_else(|_| Failure::late(&api).into_response())
 }
 
@@ -400,6 +413,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::Users, _, _>(schemas, Method::GET, "/v1/users", "listUsers", "Every user of the running config with their usage, counters and devices.", users, false, &[]),
 		route::<model::User, _, _>(schemas, Method::GET, "/v1/users/{name}", "getUser", "One user.", user, false, &[(StatusCode::NOT_FOUND, "The running config has no user of that name.")]),
 		reset,
+		route::<model::Replay, _, _>(schemas, Method::POST, REPLAY_RESET, "resetReplay", "Resets the replay memory of the obfuscated transports: the cache of accepted proofs is emptied, and the floor and the limit become the node's clock plus 60 seconds, written to the replay file before the next proof is accepted. It ends the state in which the floor is ahead of the clock. It costs two things: every client is refused for 60 seconds, and a proof that was accepted with a timestamp above the new floor is forgotten, so whoever recorded it can use it once more when the clock reaches that timestamp. Nothing else of the node is touched, usage and quotas included. The answer is the replay memory after the reset.", reset_replay, false, &[(StatusCode::CONFLICT, "The node keeps no replay memory because it has run no obfuscated transport, or an earlier reset is not known to be on disk yet. Nothing was changed."), (StatusCode::INTERNAL_SERVER_ERROR, "replay_unwritten: the replay file could not be written, so the reset may or may not be on disk. The node accepts no proof until it has written the floor and the limit it had back, and the reset has to be asked for again. replay_writing: the write has not ended within 10 seconds and the reset is in force when it does, so it must not be asked for again: replay.resets of GET /v1/stats grows by one when it has landed.")]),
 		route::<model::Stats, _, _>(schemas, Method::GET, "/v1/stats", "stats", "Every counter at one moment, with rates in bytes per second over the last 5 seconds.", stats, false, &[]),
 		route::<model::Sessions, _, _>(schemas, Method::GET, "/v1/sessions", "listSessions", "The devices with a live session.", sessions, false, &[]),
 		route::<model::Exits, _, _>(schemas, Method::GET, "/v1/exits", "listExits", "Every exit with what the node knows of its upstream, and its counters.", exits, false, &[]),
@@ -429,7 +443,7 @@ impl Api {
 			let (up, down) = rates.get(&(kind, name)).copied().unwrap_or_default();
 			model::Rated {name: name.to_string(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down}
 		};
-		let (dns, control) = (self.engine.dns(), self.engine.control());
+		let (dns, control, obfs) = (self.engine.dns(), self.engine.control(), self.engine.obfs());
 		model::Stats {
 			window_secs: window,
 			users: counters.users.iter().map(|usage| rated(crate::USER, &usage.name, usage.traffic)).collect(),
@@ -441,7 +455,14 @@ impl Api {
 			ws_stalled: self.engine.ws_stalled(),
 			ws_refused: self.engine.ws_refused(),
 			state_write_failures: self.engine.state_write_failures(),
+			send_failed: self.engine.send_failures(),
 			control: model::Control {accepted: control.accepted, authenticated: control.authenticated, auth_failed: control.auth_failed, malformed: control.malformed, timed_out: control.timed_out, replaced: control.replaced, rate_limited: control.rate_limited, exits_selected: control.exits_selected, exits_refused: control.exits_refused, exits_dropped: control.exits_dropped, probe_runs: control.probe_runs, probes_confirmed: control.probes_confirmed, probes_sent: control.probes_sent, probes_refused: control.probes_refused, mtus_set: control.mtus_set, byes: control.byes, open: control.open},
+			udp_obfs: model::UdpObfs {
+				pending: obfs.pending, sessions: obfs.sessions, tags: obfs.tags, opened: obfs.opened, established: obfs.established, sent: obfs.sent, waited: obfs.waited, spent: obfs.spent, short: obfs.short, unknown: obfs.unknown, open_failed: obfs.open_failed, window: obfs.window, floor: obfs.floor, seen: obfs.seen, cache_full: obfs.cache_full, limit: obfs.limit, no_replay: obfs.no_replay,
+				source_devices: obfs.source_devices, pool: obfs.pool, pending_full: obfs.pending_full, device_rate: obfs.device_rate, source_rate: obfs.source_rate, handshakes: obfs.handshakes, tunnel: obfs.tunnel, unsendable: obfs.unsendable,
+				ended_deadline: obfs.ended_deadline, ended_idle: obfs.ended_idle, ended_packets: obfs.ended_packets, ended_replaced: obfs.ended_replaced, ended_displaced: obfs.ended_displaced, ended_revoked: obfs.ended_revoked, table_rebuilds: obfs.table_rebuilds, table_rebuilds_late: obfs.table_rebuilds_late, table_build_failures: obfs.table_build_failures, tag_collisions: obfs.tag_collisions,
+			},
+			replay: self.engine.replay().map(model::Replay::from),
 		}
 	}
 }

@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_SECRETS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_SECRETS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -457,6 +457,39 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_NOTICES))]
 	pub notices: Vec<Notice>,
+	/// The replay memory of the obfuscated transports. Only a node with such a transport keeps one.
+	#[serde(default, skip_serializing_if = "Replay::is_default")]
+	pub replay: Replay,
+}
+
+/// Accepted proofs one source may bring: `burst` at once, then `rate` a second. A source is an IPv4 address or an IPv6 /64.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProofRate {
+	#[schemars(range(min = 1, max = 65536))]
+	pub burst: u32,
+	#[schemars(range(min = 1, max = 65536))]
+	pub rate: u32,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Replay {
+	/// How many accepted proofs the node remembers at once. Defaults to 262144. It is read at start: a reload that changes it changes nothing until the node starts again.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1024, max = 1048576))]
+	pub cache: Option<u32>,
+	/// Defaults to a burst of 256 and 32 a second.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub per_source: Option<ProofRate>,
+}
+
+impl Replay {
+	fn is_default(&self) -> bool {*self == Replay::default()}
+
+	pub fn cache(&self) -> usize {self.cache.unwrap_or(DEFAULT_REPLAY_CACHE) as usize}
+
+	pub fn per_source(&self) -> ProofRate {self.per_source.unwrap_or(DEFAULT_PROOFS_PER_SOURCE)}
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -551,12 +584,47 @@ pub struct Inbound {
 	pub private_key: Secret<Key>,
 	#[schemars(length(min = 1, max = 2))]
 	pub address: Vec<GatewayNet>,
-	/// Defaults to 1420.
+	/// Defaults to 1420, and to 1390 for a `veilway` inbound with a `udp-obfs` transport.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(range(min = 1280, max = 1500))]
 	pub mtu: Option<u16>,
+	/// The upper bounds of the padding the node puts on what it sends over the obfuscated transports of a `veilway` inbound.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub padding: Option<Padding>,
 	#[schemars(length(min = 1, max = 8))]
 	pub transports: Vec<Transport>,
+}
+
+impl Inbound {
+	/// Whether the inbound has a transport of this build that wraps its datagrams in `udp-obfs`.
+	pub fn obfuscated(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..}))}
+
+	/// The `mtu` in force (transports page, "MTU": "The proposed default `mtu` of such an inbound is 1390, and 1420 otherwise").
+	pub fn mtu(&self) -> u16 {self.mtu.unwrap_or(if self.kind == InboundType::Veilway && self.obfuscated() {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})}
+}
+
+/// Transports page, "Padding", rule 4: the bounds "may be set per profile for the client and per inbound for the node, inside the bounds in the table of numbers".
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Padding {
+	/// The most bytes of wide padding. Defaults to 1023.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 512, max = 1023))]
+	pub wide: Option<u16>,
+	/// The most bytes of normal padding. Defaults to 255.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 64, max = 255))]
+	pub normal: Option<u16>,
+}
+
+/// Node capacity numbers of one listener (transports page, "Numbers that are judgement calls").
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransportLimits {
+	/// Established sessions the listener holds at once. Defaults to 16384.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 1048576))]
+	pub sessions: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
@@ -579,14 +647,24 @@ pub enum Transport {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		tls: Option<Tls>,
 	},
+	/// WireGuard datagrams inside the `udp-obfs` envelope, for a `veilway` inbound.
+	#[serde(rename = "udp-obfs")]
+	UdpObfs {
+		listen: Addr,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		limits: Option<TransportLimits>,
+	},
 }
 
 impl Transport {
 	pub fn listen(&self) -> SocketAddr {
 		match self {
-			Transport::Udp {listen} | Transport::Ws {listen, ..} => listen.0,
+			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} => listen.0,
 		}
 	}
+
+	/// Whether the transport has a UDP socket of its own.
+	pub fn datagram(&self) -> bool {!matches!(self, Transport::Ws {..})}
 }
 
 /// A key that belongs to another `type` of the same object is refused like an unknown key.
@@ -600,18 +678,19 @@ fn only<E: de::Error>(kind: &str, others: &[(&str, bool)]) -> Result<(), E> {
 // The objects that pick their keys by `type` are read through a flat struct of every key, so a wrong value keeps its exact path. serde's own tagged enums buffer the object and lose it.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum TransportType {Udp, Ws}
+enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Tls>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Tls>, limits: Option<TransportLimits>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
 		let keys = TransportKeys::deserialize(d)?;
 		match keys.kind {
-			TransportType::Udp => only("udp", &[("path", keys.path.is_some()), ("tls", keys.tls.is_some())]).map(|_| Transport::Udp {listen: keys.listen}),
-			TransportType::Ws => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls}),
+			TransportType::Udp => only("udp", &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("limits", keys.limits.is_some())]).map(|_| Transport::Udp {listen: keys.listen}),
+			TransportType::Ws => only("ws", &[("limits", keys.limits.is_some())]).and_then(|_| Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls})),
+			TransportType::UdpObfs => only("udp-obfs", &[("path", keys.path.is_some()), ("tls", keys.tls.is_some())]).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
 		}
 	}
 }

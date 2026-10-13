@@ -5,12 +5,14 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{control, l3, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{Config, Protocol, Tls, Transport, DEFAULT_MTU, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::{control, l3, obfs, replay, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{Config, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
 use ipstack::{IpStack, IpStackConfig, TcpConfig};
+#[cfg(target_os = "linux")]
+use rustix::net::sockopt;
 use socket2::{Domain, Socket, Type};
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -40,6 +42,20 @@ impl Drop for Task {
 	fn drop(&mut self) {self.0.abort()}
 }
 
+/// What a UDP socket is read for: the tunnel of a `udp` transport, which takes WireGuard datagrams as they are, or the listener of a `udp-obfs` transport with its sessions.
+enum Reader {Plain(Arc<Tunnel>), Obfs(Arc<obfs::Listener>)}
+
+/// Transports page, "MTU", "No outer fragmentation": "On a `veilway` inbound, the client and the node send every outer packet of a datagram transport with fragmentation prohibited. A packet that does not fit the path is lost, not fragmented."
+/// With `whole` the socket sets "do not fragment" on everything it sends and never fragments by a path MTU it has learnt, so neither the host nor a router cuts a packet. Without it the socket is put back to what the system does by itself.
+/// Only Linux has this here: no dependency of the tree sets the option of another system without `unsafe`. There a `veilway` inbound is told at start that its packets may be fragmented.
+#[cfg(target_os = "linux")]
+fn fragmenting(socket: &UdpSocket, v6: bool, whole: bool) -> io::Result<()> {
+	Ok(if v6 {sockopt::set_ipv6_mtu_discover(socket, if whole {sockopt::Ipv6PathMtuDiscovery::PROBE} else {sockopt::Ipv6PathMtuDiscovery::WANT})?} else {sockopt::set_ip_mtu_discover(socket, if whole {sockopt::Ipv4PathMtuDiscovery::PROBE} else {sockopt::Ipv4PathMtuDiscovery::WANT})?})
+}
+
+#[cfg(not(target_os = "linux"))]
+fn fragmenting(_: &UdpSocket, _: bool, whole: bool) -> io::Result<()> {if whole {Err(io::ErrorKind::Unsupported.into())} else {Ok(())}}
+
 /// A tunnel as it runs: its tasks, and the loopback socket every `ws` transport of the inbound relays to, with its address and the task that reads it. An inbound without a `ws` transport has none.
 struct Running {tunnel: Arc<Tunnel>, _tasks: Vec<Task>, loopback: Option<(SocketAddr, Arc<UdpSocket>, Task)>}
 
@@ -54,9 +70,9 @@ pub struct Host {
 	dir: PathBuf,
 	/// The config the plan in force was compiled from.
 	config: Option<Arc<Config>>,
-	/// Every `udp` transport by its listen address: its socket, and the task that reads it with the tunnel it reads it for.
-	/// An address the next config uses again is never bound a second time. Its socket goes to whichever tunnel has it then.
-	udp: HashMap<SocketAddr, (Arc<UdpSocket>, Option<(Task, Arc<Tunnel>)>)>,
+	/// Every `udp` and `udp-obfs` transport by its listen address: its socket, and the task that reads it with what it reads it for.
+	/// An address the next config uses again is never bound a second time. Its socket goes to whichever tunnel and transport has it then.
+	udp: HashMap<SocketAddr, (Arc<UdpSocket>, Option<(Task, Reader)>)>,
 	ws: HashMap<SocketAddr, Relay>,
 	/// By the tag of the inbound.
 	tunnels: HashMap<String, Running>,
@@ -140,8 +156,8 @@ impl Host {
 				let (mut stack, mut tcp) = (IpStackConfig::default(), TcpConfig::default());
 				// A tunnel outlives the exits of the config it started under, so its stack waits longer than any exit may ask and each flow's handler keeps the time of its own exit.
 				tcp.timeout = Duration::from_secs(u64::from(MAX_TCP_IDLE_SECS) + STACK_MARGIN);
-				stack.mtu_unchecked(inbound.mtu.unwrap_or(DEFAULT_MTU)).packet_information(false).udp_timeout(Duration::from_secs(u64::from(MAX_UDP_IDLE_SECS) + STACK_MARGIN)).with_tcp_config(tcp);
-				let tunnel = Arc::new(Tunnel {tag: inbound.tag.clone(), peers: Mutex::new(Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}), to_stack});
+				stack.mtu_unchecked(inbound.mtu()).packet_information(false).udp_timeout(Duration::from_secs(u64::from(MAX_UDP_IDLE_SECS) + STACK_MARGIN)).with_tcp_config(tcp);
+				let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
 				fresh.push((tunnel.clone(), IpStack::new(stack, PacketDev::new(from_wg, to_wg)), from_stack));
 				tunnel
 			}
@@ -151,12 +167,19 @@ impl Host {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
 			for device in plan.devices.iter().filter(|device| device.inbounds.contains(&at)) {peers.add(device.public_key, device.preshared_key)}
 		}
+		// "`veilway run` refuses to start a config that has an obfuscated transport" without a replay file it can write and lock. The memory is taken once, by the first config that needs it, and kept for as long as the process runs.
+		if let (Some(i), None) = (plan.inbounds.iter().position(|inbound| inbound.native.is_some()), shared.replay.get()) {
+			let path = shared.replay_path.clone().ok_or_else(|| anyhow!("inbounds[{i}].transports: inbound `{}` has a udp-obfs transport, which needs a replay file, and the node was started without a path for one", plan.inbounds[i].tag))?;
+			let (capacity, now) = (config.replay.cache(), replay::seconds((shared.now)()));
+			let guard = Arc::new(tokio::task::spawn_blocking(move || replay::Guard::open(&path, capacity, now)).await.map_err(|e| anyhow!("the replay file could not be opened: {e}"))??);
+			if shared.replay.set(guard.clone()).is_ok() {tokio::spawn(guard.run(shared.now));}
+		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate() {
 				match transport {
-					Transport::Udp {listen} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
-					Transport::Udp {..} => {}
+					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
+					Transport::Udp {..} | Transport::UdpObfs {..} => {}
 					Transport::Ws {listen, tls, ..} => {
 						if !self.ws.contains_key(&listen.0) && !relays.iter().any(|(addr, _)| *addr == listen.0) {
 							relays.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
@@ -255,11 +278,13 @@ impl Host {
 		for (tunnel, addr, socket) in loopbacks {
 			if let Some(running) = self.tunnels.get_mut(&tunnel.tag) {running.loopback = Some((addr, socket.clone(), Task(inbound::read(shared, tunnel, socket, Over::Ws))))}
 		}
-		let (mut wanted, mut routes): (HashMap<SocketAddr, &Arc<Tunnel>>, HashMap<SocketAddr, Vec<(String, Option<Tls>, Arc<Tunnel>, u64)>>) = Default::default();
+		// For each UDP address: its tunnel, the session pool of a `udp-obfs` transport, and whether what leaves it must never be fragmented, with the inbound to say so of.
+		let (mut wanted, mut routes): (HashMap<SocketAddr, (&Arc<Tunnel>, Option<usize>, bool, &str)>, HashMap<SocketAddr, Vec<(String, Option<Tls>, Arc<Tunnel>, u64)>>) = Default::default();
 		for inbound in &plan.inbounds {
 			for transport in &inbound.transports {
 				match transport {
-					Transport::Udp {listen} => drop(wanted.insert(listen.0, &inbound.tunnel)),
+					Transport::Udp {listen} => drop(wanted.insert(listen.0, (&inbound.tunnel, None, inbound.veilway, inbound.tag.as_str()))),
+					Transport::UdpObfs {listen, limits} => drop(wanted.insert(listen.0, (&inbound.tunnel, Some(limits.and_then(|limits| limits.sessions).unwrap_or(DEFAULT_SESSIONS) as usize), true, inbound.tag.as_str()))),
 					Transport::Ws {listen, path, tls} => {
 						// A transport that is as it was keeps its number, and with the number the connections it has. Any other is a new route.
 						let id = self.ws.get(&listen.0).and_then(|relay| relay.routes.iter().find(|(was, files, tunnel, _)| was == path && files == tls && Arc::ptr_eq(tunnel, &inbound.tunnel))).map(|(.., id)| *id).unwrap_or_else(|| {
@@ -273,14 +298,29 @@ impl Host {
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).copied().collect();
 		for (addr, socket) in udp {self.udp.insert(addr, (socket, None));}
-		// A socket is read for the tunnel that has its address now. One whose address nobody has any more is closed, and so is its reader.
+		// A socket is read for the tunnel and the transport that have its address now. One whose address nobody has any more is closed, and so is its reader. A `udp-obfs` listener that keeps its tunnel keeps its sessions.
 		self.udp.retain(|addr, (socket, reader)| match wanted.get(addr) {
-			Some(tunnel) => {
-				if !reader.as_ref().is_some_and(|(_, of)| Arc::ptr_eq(of, tunnel)) {*reader = Some((Task(inbound::read(shared, (*tunnel).clone(), socket.clone(), Over::Udp)), (*tunnel).clone()))}
+			Some((tunnel, pool, whole, tag)) => {
+				let fresh = reader.is_none();
+				match (pool, reader.as_ref().map(|(_, reader)| reader)) {
+					(None, Some(Reader::Plain(of))) if Arc::ptr_eq(of, tunnel) => {}
+					(Some(pool), Some(Reader::Obfs(listener))) if Arc::ptr_eq(&listener.tunnel, tunnel) => listener.resize(*pool),
+					(None, _) => *reader = Some((Task(inbound::read(shared, (*tunnel).clone(), socket.clone(), Over::Udp)), Reader::Plain((*tunnel).clone()))),
+					(Some(pool), _) => {
+						let listener = shared.obfs.listen((*tunnel).clone(), *pool);
+						tracing::info!("inbound {tag}: udp-obfs on {addr}, at most {pool} established sessions");
+						*reader = Some((Task(obfs::read(shared, listener.clone(), socket.clone())), Reader::Obfs(listener)));
+					}
+				}
+				if let Err(e) = fragmenting(socket, addr.is_ipv6(), *whole) {
+					if fresh {tracing::warn!("inbound {tag}: fragmentation of what leaves {addr} could not be prohibited ({}), so a packet that does not fit the path may be fragmented and an MTU probe may be confirmed over a path that fragments it", e.kind())}
+				}
 				true
 			}
 			None => false,
 		});
+		if let Some(config) = &self.config {shared.obfs.per_source(config.replay.per_source())}
+		if let Some((replay, config)) = shared.replay.get().zip(self.config.as_ref()).filter(|(replay, config)| replay.capacity() != config.replay.cache()) {tracing::warn!("replay.cache: the replay memory was started with room for {} proofs and the config now says {}. It keeps what it was started with until the node starts again", replay.capacity(), config.replay.cache())}
 		for running in self.tunnels.values_mut() {
 			if !routes.values().flatten().any(|(.., tunnel, _)| Arc::ptr_eq(tunnel, &running.tunnel)) {running.loopback = None}
 		}
@@ -396,13 +436,13 @@ impl Host {
 				let packet = bye.clone().or_else(|| farewell(&old, flow).map(|(_, packet)| packet));
 				let (Some(packet), mut peers, mut datagrams) = (packet, inbound.tunnel.lock(), Vec::new()) else {continue};
 				let Some(peer) = peers.wg.index(&flow.device).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {continue};
-				let Some((endpoint, socket)) = peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade())) else {continue};
+				let Some(route) = peers.route(peer) else {continue};
 				peers.wg.encapsulate(peer, &packet, &mut datagrams);
 				// Counted where it is written into the tunnel of a device that has a session, and nowhere before.
 				if bye.is_some() {shared.control.counters.byes.fetch_add(1, Ordering::Relaxed);}
 				shared.spend(&old.users[old.devices[from.device].user], false, packet.len());
 				inbound.traffic.down(packet.len());
-				out.extend(datagrams.into_iter().map(|datagram| (socket.clone(), endpoint, datagram)));
+				out.extend(datagrams.into_iter().map(|datagram| (inbound.tunnel.clone(), route.clone(), datagram, bye.is_some())));
 			}
 			for was in old.devices.iter().filter(|was| cut.contains_key(&was.public_key)) {
 				let is = plan.by_key.get(&was.public_key).map(|at| &plan.devices[*at]);
@@ -434,7 +474,7 @@ impl Host {
 		shared.control.counters.exits_dropped.fetch_add(gone.len() as u64, Ordering::Relaxed);
 		for (user, device, tag) in gone.iter().take(MAX_NAMES_LOGGED) {tracing::info!("user {user} device {device}: its exit selection {tag} is dropped: that is no exit of the user's `exits` any more, so the device leaves through the user's exit");}
 		if gone.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices had their exit selection dropped", gone.len() - MAX_NAMES_LOGGED)}
-		// A control connection proved one transport secret. When the config no longer has that secret for the device, the connection ends, like the session of a transport that was opened with it will (protocol overview, "Rotation").
+		// A control connection proved one transport secret. When the config no longer has that secret for the device, the connection ends, like the `udp-obfs` session that was opened with it does below (protocol overview, "Rotation").
 		// The WireGuard session of a `udp` transport was opened with no secret, so it stays.
 		for (was, is) in old.devices.iter().filter(|was| !cut.contains_key(&was.public_key)).filter_map(|was| plan.by_key.get(&was.public_key).map(|at| (was, &plan.devices[*at]))).filter(|(was, is)| was.secrets != is.secrets) {
 			let ended = is.control.revoke(&is.secrets);
@@ -444,8 +484,15 @@ impl Host {
 		if reloaded {shared.control.plans.send_replace(plan.generation);}
 		// Every packet of every user waits while the flow table is locked, so how long that was is always said.
 		tracing::info!("a plan was put in force: the flow table was locked for {:?} while every live flow was decided again", started.elapsed());
-		// Never waited for: a socket that cannot take a reset right now loses it, like any packet on a full queue.
-		for (socket, endpoint, datagram) in &out {let _ = socket.try_send_to(datagram, *endpoint);}
+		// Never waited for: a socket that cannot take a reset right now loses it, like any packet on a full queue. They leave before the sessions of a native transport end below, which is the only way they could reach a device that came over one.
+		for (tunnel, route, datagram, control) in &out {route.try_send(tunnel, datagram, *control)}
+		// One cut-off path for the native transports too: every `udp-obfs` session of a device that was cut off above ends here, whatever the reason was, and so does one whose device is no longer in its inbound or whose transport secret the plan no longer has.
+		// A device that was cut off lost its WireGuard sessions, and with them the tunnel's memory of the handshakes it has seen. A session that lived on would take a recorded initiation for a new one (threat model G18), so none does.
+		// The plan is in force by now, and with it a tag table that no longer holds a removed secret, so no opening packet under it is accepted from here on.
+		let revoked = shared.obfs.cut(&plan, |device| cut.contains_key(device));
+		if revoked > 0 {tracing::info!("{revoked} udp-obfs session(s) ended: their device was cut off, or the config no longer has the transport secret they were opened with")}
+		// "Validation refuses a config in which two tags of one inbound are equal" is kept here, where the tags are: a tag that another secret had is left out of the table and said at once.
+		for (tag, collisions) in plan.inbounds.iter().filter_map(|inbound| inbound.native.as_ref().map(|native| (&inbound.tag, native.tags().collisions))).filter(|(_, collisions)| *collisions > 0) {shared.obfs.collided(tag, collisions)}
 		// The flows went first and the memory goes after them, which is the order `resolver::answer` counts on.
 		for was in old.devices.iter().filter(|was| cut.contains_key(&was.public_key)) {old.users[was.user].state.names().clear()}
 		// A user whose queries go to other servers from here on forgets what the servers before told them, so no `domain` rule goes on matching by the word of a resolver that is no longer theirs.
@@ -490,5 +537,25 @@ impl Host {
 		}
 		if old.users.iter().any(|was| users.get(was.name.as_str()).is_none_or(|is| is.denied == Some(Denied::Quota) && was.denied != is.denied)) {shared.save.notify_one()}
 		(old, plan)
+	}
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+	use super::*;
+
+	// Transports page, "MTU", "No outer fragmentation": what the node sets on the socket of a datagram transport of a `veilway` inbound, and takes back when the address goes to another kind of inbound.
+	#[tokio::test]
+	async fn the_sockets_of_a_veilway_inbound_never_fragment() {
+		let (v4, v6) = (UdpSocket::bind("127.0.0.1:0").await.unwrap(), UdpSocket::from_std(bind("[::1]:0".parse().unwrap(), Type::DGRAM, false).await.unwrap().into()).unwrap());
+		fragmenting(&v4, false, true).unwrap();
+		fragmenting(&v6, true, true).unwrap();
+		assert_eq!((sockopt::ip_mtu_discover(&v4).unwrap(), sockopt::ipv6_mtu_discover(&v6).unwrap()), (sockopt::Ipv4PathMtuDiscovery::PROBE, sockopt::Ipv6PathMtuDiscovery::PROBE));
+		// A datagram of the largest size still leaves on loopback, whose MTU is above it: the option forbids fragmenting, not sending.
+		let to = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		assert_eq!(v4.send_to(&[0; 1452], to.local_addr().unwrap()).await.unwrap(), 1452);
+		fragmenting(&v4, false, false).unwrap();
+		fragmenting(&v6, true, false).unwrap();
+		assert_eq!((sockopt::ip_mtu_discover(&v4).unwrap(), sockopt::ipv6_mtu_discover(&v6).unwrap()), (sockopt::Ipv4PathMtuDiscovery::WANT, sockopt::Ipv6PathMtuDiscovery::WANT));
 	}
 }

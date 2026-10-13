@@ -3,11 +3,14 @@ use super::icmp::{self, Kind};
 use super::netstack::{self, Packet};
 use super::netstack::Fit;
 use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
+use super::obfs::{self, Room};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
 use super::{control, flows, gate, l3, resolver, Over, Shared};
 use crate::config::Protocol;
 use ipstack::{IpStack, IpStackStream};
+use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -17,14 +20,43 @@ use veilway_proto::control::PORT;
 use veilway_wg::{Wg, MAX_PACKET};
 
 const TIMER_EVERY: Duration = Duration::from_millis(250);
+/// How far apart the log lines of sends that fail are.
+const UNSENT_EVERY: Duration = Duration::from_secs(60);
 /// The FIN and RST bits in the flags byte of a TCP header, which is its 14th.
 const TCP_FLAGS: usize = 13;
 const FIN_OR_RST: u8 = 0x05;
 
+/// How a peer's last authenticated datagram reached its tunnel, which is the way replies leave: a socket that carries WireGuard as it is, or a `udp-obfs` session on a socket. Nothing leaves once the transport, or the session, is gone.
+#[derive(Clone)]
+pub enum Via {None, Socket(Weak<UdpSocket>, Over), Obfs(Weak<UdpSocket>, Weak<obfs::Session>)}
+
+/// A way to a peer that is there right now.
+#[derive(Clone)]
+pub enum Route {Socket(Arc<UdpSocket>, SocketAddr), Obfs(Arc<UdpSocket>, Arc<obfs::Session>)}
+
+impl Route {
+	/// Sends one WireGuard datagram. `control` says it holds a control channel packet, which a `udp-obfs` session pads wide like a handshake message (transports page, "Padding", rule 2), and `room` how large the session may make its packet.
+	/// `tunnel` is the peer's, which counts a datagram no socket took.
+	pub async fn send(&self, tunnel: &Arc<Tunnel>, datagram: &[u8], control: bool, room: Room) {
+		match self {
+			Route::Socket(socket, to) => tunnel.sent(socket.send_to(datagram, *to).await),
+			Route::Obfs(socket, session) => session.send(tunnel, socket, datagram, control, room).await,
+		}
+	}
+
+	/// `send` that never waits: a socket that cannot take the datagram right now loses it, like any packet on a full queue, and it is counted like any that was not sent.
+	pub fn try_send(&self, tunnel: &Tunnel, datagram: &[u8], control: bool) {
+		match self {
+			Route::Socket(socket, to) => tunnel.sent(socket.try_send_to(datagram, *to)),
+			Route::Obfs(socket, session) => if let Some(sealed) = session.seal(Some(datagram), control, Room::Inbound) {tunnel.sent(socket.try_send_to(&sealed, session.source))},
+		}
+	}
+}
+
 pub struct Peers {
 	pub wg: Wg,
-	/// For each peer index, the socket its last authenticated datagram came in on, and what kind of transport that socket belongs to. Replies leave through that one, and nowhere once its transport is gone.
-	pub via: Vec<(Weak<UdpSocket>, Over)>,
+	/// For each peer index, how its last authenticated datagram came in.
+	pub via: Vec<Via>,
 }
 
 impl Peers {
@@ -32,10 +64,32 @@ impl Peers {
 	pub fn add(&mut self, public_key: [u8; 32], preshared_key: Option<[u8; 32]>) {
 		match self.wg.add_peer(public_key, preshared_key, None) {
 			Ok(peer) => {
-				if self.via.len() <= peer {self.via.resize(peer + 1, (Weak::new(), Over::Udp))}
-				self.via[peer] = (Weak::new(), Over::Udp);
+				if self.via.len() <= peer {self.via.resize(peer + 1, Via::None)}
+				self.via[peer] = Via::None;
 			}
 			Err(e) => tracing::error!("a device could not be made a peer of its tunnel: {e}"),
+		}
+	}
+
+	pub fn heard(&mut self, peer: usize, via: Via) {
+		if let Some(slot) = self.via.get_mut(peer) {*slot = via}
+	}
+
+	/// Where a datagram for the peer goes right now. None for a peer that was never heard, or whose transport or session is gone.
+	pub fn route(&self, peer: usize) -> Option<Route> {
+		match self.via.get(peer)? {
+			Via::None => None,
+			Via::Socket(socket, _) => socket.upgrade().zip(self.wg.endpoint(peer)).map(|(socket, to)| Route::Socket(socket, to)),
+			Via::Obfs(socket, session) => socket.upgrade().zip(session.upgrade().filter(|session| session.live())).map(|(socket, session)| Route::Obfs(socket, session)),
+		}
+	}
+
+	/// The kind of transport the peer was last heard over, while that is still there.
+	pub fn over(&self, peer: usize) -> Option<Over> {
+		match self.via.get(peer)? {
+			Via::None => None,
+			Via::Socket(socket, over) => (socket.strong_count() > 0).then_some(*over),
+			Via::Obfs(socket, session) => (socket.strong_count() > 0 && session.upgrade().is_some_and(|session| session.live())).then_some(Over::UdpObfs),
 		}
 	}
 }
@@ -45,10 +99,23 @@ pub struct Tunnel {
 	pub tag: String,
 	pub peers: Mutex<Peers>,
 	pub to_stack: Sender<Vec<u8>>,
+	/// Datagrams the node made for a device of the tunnel and could not hand to a socket, and when that was last logged.
+	pub unsent: AtomicU64,
+	pub said: Mutex<Option<Instant>>,
 }
 
 impl Tunnel {
+	pub fn new(tag: String, peers: Peers, to_stack: Sender<Vec<u8>>) -> Tunnel {Tunnel {tag, peers: Mutex::new(peers), to_stack, unsent: AtomicU64::new(0), said: Mutex::default()}}
+
 	pub fn lock(&self) -> MutexGuard<'_, Peers> {self.peers.lock().unwrap_or_else(|e| e.into_inner())}
+
+	/// Takes what a socket said to a datagram of the node: a send that failed is counted, and logged at info when it is the first, or the first in a minute. A socket of a `veilway` inbound never fragments, so a packet above what the host's interface carries fails here and nowhere else.
+	pub fn sent(&self, result: io::Result<usize>) {
+		let Err(e) = result else {return};
+		let failed = self.unsent.fetch_add(1, Ordering::Relaxed) + 1;
+		let said = self.said.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now());
+		if said.is_none_or(|said| said.elapsed() >= UNSENT_EVERY) {tracing::info!("inbound {}: a packet for a device could not be sent ({}), {failed} since start. A packet larger than the host's interface carries is refused by the system on a veilway inbound, which never fragments: lower the inbound's mtu if this goes on", self.tag, e.kind())}
+	}
 }
 
 impl Shared {
@@ -66,19 +133,26 @@ impl Shared {
 		sent
 	}
 
-	/// `send` for a packet that goes out whole whatever MTU the device set: an MTU probe, and what `send` has cut to fit.
-	pub(super) async fn transmit(&self, plan: &Plan, to: Holder, packet: &[u8]) -> usize {
+	/// `send` for a packet that goes out whole whatever MTU the device set: what `send` has cut to fit, and what was forwarded by the device's MTU already.
+	pub(super) async fn transmit(&self, plan: &Plan, to: Holder, packet: &[u8]) -> usize {self.emit(plan, to, packet, Room::Mtu(plan.mtu_of(to))).await}
+
+	/// An MTU probe: it goes out whole and at exactly its own size on every datagram transport, so what arrives says what the path carries.
+	pub(super) async fn probe(&self, plan: &Plan, to: Holder, packet: &[u8]) -> usize {self.emit(plan, to, packet, Room::Exact).await}
+
+	async fn emit(&self, plan: &Plan, to: Holder, packet: &[u8], room: Room) -> usize {
 		let (inbound, device, mut out) = (&plan.inbounds[to.inbound], &plan.devices[to.device], Vec::new());
 		let route = {
 			let mut peers = inbound.tunnel.lock();
 			let Some(peer) = peers.wg.index(&device.public_key).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {return 0};
 			peers.wg.encapsulate(peer, packet, &mut out);
-			peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade()))
+			peers.route(peer)
 		};
-		let Some((endpoint, socket)) = route else {return 0};
+		let Some(route) = route else {return 0};
 		self.spend(&plan.users[device.user], false, packet.len());
 		inbound.traffic.down(packet.len());
-		for datagram in &out {let _ = socket.send_to(datagram, endpoint).await;}
+		// What the control channel sends is a TCP segment from the gateway's control port.
+		let control = matches!(route, Route::Obfs(..)) && netstack::parse(packet).is_some_and(|parsed| parsed.protocol == Protocol::TCP && parsed.sport == PORT && plan.control(to.inbound, parsed.src));
+		for datagram in &out {route.send(&inbound.tunnel, datagram, control, room).await}
 		packet.len()
 	}
 
@@ -159,7 +233,7 @@ impl Shared {
 	}
 
 	/// One decrypted packet from the device with the public key `peer`, which came in on inbound `at`, in the order the checks must happen: parse, source, destination, route.
-	async fn ingress(self: &Arc<Self>, plan: &Arc<Plan>, at: usize, peer: [u8; 32], mut raw: Vec<u8>) {
+	pub(super) async fn ingress(self: &Arc<Self>, plan: &Arc<Plan>, at: usize, peer: [u8; 32], mut raw: Vec<u8>) {
 		// A device this plan does not know was cut off between its packet being decrypted and now.
 		let Some(&device) = plan.by_key.get(&peer) else {return self.count(Reason::Stale)};
 		let (from, user) = (Holder {device, inbound: at}, plan.devices[device].user);
@@ -344,12 +418,10 @@ pub fn read(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, socket: Arc<UdpSocket>, o
 			let peer = {
 				let mut peers = tunnel.lock();
 				let received = peers.wg.recv_authenticated(from, &buf[..n], &mut net_out, &mut ip_out);
-				if let Some((peer, true)) = received {
-					if let Some(via) = peers.via.get_mut(peer) {*via = (Arc::downgrade(&socket), over)}
-				}
+				if let Some((peer, true)) = received {peers.heard(peer, Via::Socket(Arc::downgrade(&socket), over))}
 				received.and_then(|(peer, _)| peers.wg.key(peer))
 			};
-			for datagram in &net_out {let _ = socket.send_to(datagram, from).await;}
+			for datagram in &net_out {tunnel.sent(socket.send_to(datagram, from).await)}
 			let Some(peer) = peer else {continue};
 			let plan = shared.plan();
 			let Some(at) = plan.inbound_of(&tunnel) else {continue};
@@ -389,13 +461,14 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 			loop {
 				tick.tick().await;
 				out.clear();
-				let targets: Vec<Option<(SocketAddr, Arc<UdpSocket>)>> = {
+				let targets: Vec<Option<Route>> = {
 					let mut peers = tunnel.lock();
 					peers.wg.update_timers(&mut out);
-					out.iter().map(|(peer, _)| peers.wg.endpoint(*peer).zip(peers.via.get(*peer).and_then(|(socket, _)| socket.upgrade()))).collect()
+					out.iter().map(|(peer, _)| peers.route(*peer)).collect()
 				};
+				// What WireGuard's own timers send: a keepalive or a handshake message, never a packet of the control channel.
 				for ((_, datagram), target) in out.iter().zip(targets) {
-					if let Some((endpoint, socket)) = target {let _ = socket.send_to(datagram, endpoint).await;}
+					if let Some(route) = target {route.send(&tunnel, datagram, false, Room::Inbound).await}
 				}
 			}
 		}

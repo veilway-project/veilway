@@ -9,14 +9,18 @@ pub mod icmp;
 mod inbound;
 pub mod l3;
 pub mod netstack;
+pub mod obfs;
 pub mod plan;
 pub mod probe;
+pub mod replay;
 pub mod resolver;
 pub mod route;
 pub mod usage;
 
 pub use control::ControlTotals;
+pub use obfs::ObfsTotals;
 pub use plan::{Denied, Plan};
+pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
 
 use crate::config::{Applied, ApplyError, Config, Diff, Revision, Snapshot, Store};
@@ -29,7 +33,7 @@ use std::net::IpAddr;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
@@ -77,7 +81,7 @@ pub enum Event {
 
 /// How a device's last authenticated datagram reached its inbound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Over {Udp, Ws}
+pub enum Over {Udp, Ws, UdpObfs}
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.
 #[derive(Clone, Debug)]
@@ -127,12 +131,14 @@ pub struct Options {
 	pub allow_readable: bool,
 	/// The state file, which carries every user's usage across restarts, see `usage`. It is not relative to `dir`. Without one usage is kept in memory and gone with the process.
 	pub state: Option<PathBuf>,
+	/// The replay file, which carries the replay memory of the obfuscated transports across restarts, see `replay`. It is not relative to `dir`. A config with an obfuscated transport is not started, and not reloaded into, without one that the node can write.
+	pub replay: Option<PathBuf>,
 	/// The range, in milliseconds, the control channel draws the shortest time between two `usage` pushes of one connection from. It is `veilway_proto::control::USAGE_PUSH`, 30 to 90 s, and tests replace it so as not to wait that long.
 	pub usage_push: RangeInclusive<u32>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, usage_push: veilway_proto::control::USAGE_PUSH}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -266,6 +272,12 @@ pub struct Shared {
 	unwritten: AtomicU64,
 	events: broadcast::Sender<Event>,
 	control: control::Channel,
+	/// What the `udp-obfs` listeners share.
+	obfs: obfs::State,
+	/// The replay memory, from the first config with an obfuscated transport on. It belongs to the process: no reload empties it or gives it back.
+	replay: OnceLock<Arc<replay::Guard>>,
+	/// Where the replay file is. None for a node that was given no path, which starts no obfuscated transport.
+	replay_path: Option<PathBuf>,
 }
 
 impl Shared {
@@ -312,8 +324,12 @@ async fn persist(file: PathBuf, bytes: Vec<u8>, generation: u64, written: Arc<Mu
 	})).await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?.unwrap_or_else(|e| Err(io::Error::other(e)))
 }
 
+// The replay memory of an engine that is dropped without `shutdown` is left as a kill leaves it: nothing more is accepted or written, and the lock of the file is given back.
 impl Drop for Engine {
-	fn drop(&mut self) {self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();}
+	fn drop(&mut self) {
+		self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
+		if let Some(replay) = self.shared.replay.get() {replay.abandon()}
+	}
 }
 
 impl Engine {
@@ -324,7 +340,11 @@ impl Engine {
 		if self.shared.dismiss() > 0 {tokio::time::sleep(control::BYE_WAIT).await}
 		let wired = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 		if let Some(wired) = wired {wired.running.close().await}
-		if tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, true)).await.is_err() {tracing::error!("the state file was not written within {}s of the shutdown, so usage since its last write is lost", usage::LAST_WRITE.as_secs())}
+		// A clean stop of the replay memory: no proof is taken from here on, and its cache goes to the replay file. It waits no longer than `replay::LAST_WRITE` itself, next to the state file's last write and not after it.
+		let replay = async {
+			if let Some(replay) = self.shared.replay.get() {replay.stop().await}
+		};
+		if tokio::join!(tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, true)), replay).0.is_err() {tracing::error!("the state file was not written within {}s of the shutdown, so usage since its last write is lost", usage::LAST_WRITE.as_secs())}
 	}
 
 	/// The first step of `shutdown` as something to call from any thread, without the runtime and without the engine: it takes back at once what the l3 exit set up on the host, and does nothing when a `shutdown` has done so or is doing so.
@@ -399,7 +419,7 @@ impl Engine {
 				asked.iter().map(|at| {
 					let peer = peers.wg.index(&plan.devices[*at].public_key);
 					let handshake = peer.and_then(|peer| peers.wg.time_since_last_handshake(peer));
-					(handshake, peer.filter(|_| handshake.is_some()).and_then(|peer| peers.via.get(peer)).filter(|(socket, _)| socket.strong_count() > 0).map(|(_, over)| *over))
+					(handshake, peer.filter(|_| handshake.is_some()).and_then(|peer| peers.over(peer)))
 				}).collect()
 			};
 			out.extend(asked.iter().zip(seen).map(|(at, (handshake, over))| {
@@ -490,6 +510,22 @@ impl Engine {
 	/// What the control channel of the `veilway` inbounds did since start.
 	pub fn control(&self) -> ControlTotals {self.shared.control.totals()}
 
+	/// Datagrams the node made for a device and no socket took, over every transport of every inbound of the config that runs. A socket of a `veilway` inbound never fragments, so a packet larger than the host's interface carries is counted here and not sent.
+	pub fn send_failures(&self) -> u64 {self.plan().inbounds.iter().map(|inbound| inbound.tunnel.unsent.load(Ordering::Relaxed)).sum()}
+
+	/// What the `udp-obfs` transports did since start, and the sessions and tags they hold right now.
+	pub fn obfs(&self) -> ObfsTotals {self.shared.obfs.totals(&self.plan())}
+
+	/// The replay memory of the obfuscated transports right now. None for a node that never ran one, which keeps no replay memory.
+	pub fn replay(&self) -> Option<ReplayStatus> {self.shared.replay.get().map(|replay| replay.status(replay::seconds((self.shared.now)())))}
+
+	/// `veilway replay reset`: empties the replay cache and sets the floor and the limit to the node's clock plus the proof window, written before the next proof is accepted. Nothing else of the node is touched, usage and quotas included.
+	/// It costs every client one refusal period of the window, and a proof that was accepted with a timestamp above the new floor can be used once more. None for a node without a replay memory.
+	pub async fn reset_replay(&self) -> Option<Reset> {
+		let replay = self.shared.replay.get()?.clone();
+		Some(replay.reset().await)
+	}
+
 	/// Names the node remembers for a user right now: those the user resolved through it whose answer has not expired.
 	pub fn dns_names(&self, user: &str) -> Option<usize> {self.plan().users.iter().find(|u| u.name == user).map(|user| user.state.names().names(Instant::now()))}
 
@@ -522,11 +558,18 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		(users, devices, writable.then_some(path))
 	});
 	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
-	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(options.usage_push)});
-	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind.
+	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(options.usage_push), obfs: obfs::State::default(), replay: OnceLock::new(), replay_path: options.replay});
+	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let mut host = Host::new(options.dir);
-	let staged = host.prepare(&shared, &store.current().config, &[]).await?;
+	let staged = match host.prepare(&shared, &store.current().config, &[]).await {
+		Ok(staged) => staged,
+		Err(e) => {
+			if let Some(replay) = shared.replay.get() {replay.abandon()}
+			return Err(e);
+		}
+	};
 	host.commit(&shared, staged);
+	tokio::spawn(obfs::tables(shared.clone()));
 	let (l3, host) = (host.l3.clone(), Arc::new(tokio::sync::Mutex::new(host)));
 	tokio::spawn({
 		let (shared, host) = (shared.clone(), host.clone());
@@ -539,6 +582,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 						if ticks % SWEEP_EVERY == 0 {
 							shared.flows.sweep();
 							shared.tend();
+							shared.obfs.sweep(obfs::Clock::of((shared.now)()));
 						}
 					}
 					_ = shared.over.notified() => {}

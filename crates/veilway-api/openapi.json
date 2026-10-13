@@ -305,6 +305,10 @@
           "outbounds": {
             "$ref": "#/components/schemas/Changes"
           },
+          "replay": {
+            "description": "`replay` changed. The rate per source is in force at once, the cache size from the next start of the node.",
+            "type": "boolean"
+          },
           "routing_default": {
             "type": "boolean"
           },
@@ -335,6 +339,7 @@
           "routing_default",
           "rules_reordered",
           "notices",
+          "replay",
           "inbound_changes",
           "user_changes"
         ],
@@ -669,6 +674,109 @@
         ],
         "type": "string"
       },
+      "Replay": {
+        "description": "The replay memory of the node. Times are Unix seconds on the node's clock.",
+        "properties": {
+          "capacity": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "clock": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "disk_limit": {
+            "description": "The highest limit that may be on disk, which a start after a kill takes as its floor.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entries": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "floor": {
+            "description": "A proof with a timestamp at or below the floor is refused.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "floor_ahead": {
+            "description": "The floor is ahead of the clock in a way no start explains: more than 80 seconds, or risen while the node ran. Every proof of a client with a right clock is refused until the clock passes the floor or the replay memory is reset. After a start or a reset the floor is up to 80 seconds ahead, which is what they cost and is false here.",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "A proof with a timestamp above the limit is not accepted before a higher limit is written.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit_lowered": {
+            "description": "How often the node brought its own limit down after a clock that had run ahead.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ready": {
+            "description": "False while no proof is accepted at all: a reset whose file is not known to be on disk.",
+            "type": "boolean"
+          },
+          "refused_floor_ahead": {
+            "description": "Proofs refused at the floor while `floor_ahead` was true.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refusing_secs": {
+            "description": "How many seconds the floor is ahead of the clock, whatever the cause: for that long proofs with a right clock are refused. 0 on a node that takes them.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "slow_writes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "write_failures": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "writes": {
+            "description": "Writes of the replay file that went through, that failed, and that took more than 2 seconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ready",
+          "clock",
+          "floor",
+          "limit",
+          "disk_limit",
+          "entries",
+          "capacity",
+          "floor_ahead",
+          "refusing_secs",
+          "refused_floor_ahead",
+          "writes",
+          "write_failures",
+          "slow_writes",
+          "limit_lowered",
+          "resets"
+        ],
+        "type": "object"
+      },
       "Report": {
         "properties": {
           "errors": {
@@ -871,11 +979,31 @@
             },
             "type": "array"
           },
+          "replay": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Replay"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory."
+          },
+          "send_failed": {
+            "description": "Datagrams the node made for a device and no socket took, over every transport of every inbound. A socket of a `veilway` inbound never fragments, so a packet larger than the host's interface carries is counted here and not sent: lower the inbound's `mtu` when this grows.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "state_write_failures": {
             "description": "Writes of the usage state file that failed since start.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "udp_obfs": {
+            "$ref": "#/components/schemas/UdpObfs"
           },
           "users": {
             "items": {
@@ -912,7 +1040,10 @@
           "ws_stalled",
           "ws_refused",
           "state_write_failures",
-          "control"
+          "send_failed",
+          "control",
+          "udp_obfs",
+          "replay"
         ],
         "type": "object"
       },
@@ -1005,9 +1136,241 @@
       "Transport": {
         "enum": [
           "udp",
-          "ws"
+          "ws",
+          "udp-obfs"
         ],
         "type": "string"
+      },
+      "UdpObfs": {
+        "description": "What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key.",
+        "properties": {
+          "cache_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_rate": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_deadline": {
+            "description": "Sessions that ended, by reason: no WireGuard packet within 10 seconds of the opening packet, no activity for 180 seconds, 2^31 packets sent, a newer session of the same source and device, the device's ninth session, and a device or transport secret the config no longer has.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_displaced": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_idle": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_replaced": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ended_revoked": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "established": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "floor": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshakes": {
+            "description": "Handshake initiations above a session's allowance, datagrams inside a session that WireGuard did not take as a packet of the session's device, and packets the node could not make.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "description": "Opening packets with a timestamp above the written limit that were dropped: the listener already kept 64 others, or no write ended within 2 seconds. And those that came while the node took no proof at all.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "no_replay": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "open_failed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "opened": {
+            "description": "Opening packets that were accepted, and sessions that became established.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending": {
+            "description": "Sessions whose opening packet was accepted and on which WireGuard has not authenticated yet, right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pool": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seen": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sent": {
+            "description": "Packets the listeners made for a socket. Every one is a data packet of an established session, so a node that only strangers talk to has 0 here.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessions": {
+            "description": "Established sessions right now, with those that a newer session of the same source replaced and that are still readable for 10 seconds.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "short": {
+            "description": "Datagrams dropped, by reason: shorter than a data packet, `short`. No data packet of a session at its source and a tag that is not in the tag table, `unknown`, which is where every datagram of a stranger is counted. A tag that is in the table on a packet that does not open, `open_failed`: its sender holds a tag of this epoch without the device's secret, or the packet was changed on its way.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_devices": {
+            "description": "Opening packets refused by a limit: the source has sessions of 4 other devices, the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_rate": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "spent": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "table_build_failures": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "table_rebuilds": {
+            "description": "How often a tag table was built for a new epoch, how often that was late, how often a build did not end, and tags that were left out because another secret had the same.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "table_rebuilds_late": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tag_collisions": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Epoch tags in the tag tables right now: three for each transport secret of each device that may connect.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tunnel": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unknown": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unsendable": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "waited": {
+            "description": "Opening packets that were kept for the write of a higher limit and taken to the replay rule again when it had ended, and opening packets a limit refused whose salt was recorded as spent, so that nobody who saw one can use it later.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "window": {
+            "description": "Opening packets of a device that the replay rule refused: a timestamp outside the window of 60 seconds, at or below the floor, a packet that was accepted before, and any while the cache is full.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pending",
+          "sessions",
+          "tags",
+          "opened",
+          "established",
+          "sent",
+          "waited",
+          "spent",
+          "short",
+          "unknown",
+          "open_failed",
+          "window",
+          "floor",
+          "seen",
+          "cache_full",
+          "limit",
+          "no_replay",
+          "source_devices",
+          "pool",
+          "pending_full",
+          "device_rate",
+          "source_rate",
+          "handshakes",
+          "tunnel",
+          "unsendable",
+          "ended_deadline",
+          "ended_idle",
+          "ended_packets",
+          "ended_replaced",
+          "ended_displaced",
+          "ended_revoked",
+          "table_rebuilds",
+          "table_rebuilds_late",
+          "table_build_failures",
+          "tag_collisions"
+        ],
+        "type": "object"
       },
       "UsageReset": {
         "description": "The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it.",
@@ -1660,6 +2023,65 @@
           }
         },
         "summary": "This document."
+      }
+    },
+    "/v1/replay/reset": {
+      "post": {
+        "operationId": "resetReplay",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Replay"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node keeps no replay memory because it has run no obfuscated transport, or an earlier reset is not known to be on disk yet. Nothing was changed."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "replay_unwritten: the replay file could not be written, so the reset may or may not be on disk. The node accepts no proof until it has written the floor and the limit it had back, and the reset has to be asked for again. replay_writing: the write has not ended within 10 seconds and the reset is in force when it does, so it must not be asked for again: replay.resets of GET /v1/stats grows by one when it has landed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Resets the replay memory of the obfuscated transports: the cache of accepted proofs is emptied, and the floor and the limit become the node's clock plus 60 seconds, written to the replay file before the next proof is accepted. It ends the state in which the floor is ahead of the clock. It costs two things: every client is refused for 60 seconds, and a proof that was accepted with a timestamp above the new floor is forgotten, so whoever recorded it can use it once more when the clock reaches that timestamp. Nothing else of the node is touched, usage and quotas included. The answer is the replay memory after the reset."
       }
     },
     "/v1/sessions": {

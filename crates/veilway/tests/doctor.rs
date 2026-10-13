@@ -528,6 +528,66 @@ async fn the_servers_of_every_dns_set_have_their_own_lines() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Writes the replay file a node leaves that was killed with this floor and this limit.
+fn replay(dir: &Path, floor: u64, limit: u64) {
+	let body = [&b"VWREPLAY"[..], &1u32.to_be_bytes(), &[0; 4], &floor.to_be_bytes(), &limit.to_be_bytes(), &0u32.to_be_bytes()].concat();
+	std::fs::write(dir.join("veilway-replay"), [&body[..], ring::digest::digest(&ring::digest::SHA256, &body).as_ref()].concat()).unwrap();
+	std::fs::set_permissions(dir.join("veilway-replay"), std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// Transports page, "When the floor is ahead of the clock": "`veilway doctor` reports the floor, the limit and the clock, fails the check when the floor is ahead, and warns when the limit is more than `W` plus 20 s ahead."
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_replay_file_of_a_config_with_an_obfuscated_transport_is_held_against_the_clock() {
+	let (dir, server) = (scratch("replay"), dns(true).await);
+	// A config without such a transport has no replay file, and doctor has no line for one.
+	config(&dir, &[server], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let (_, document, _) = doctor(&dir, &["--json"]).await;
+	assert!(serde_json::from_str::<Value>(&document).unwrap()["checks"].as_array().unwrap().iter().all(|line| line["check"] != "replay"), "{document}");
+	let mut document: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+	(document["inbounds"][0]["type"], document["inbounds"][0]["transports"], document["users"][0]["devices"][0]["transport_secrets"]) = (json!("veilway"), json!([{"type": "udp-obfs", "listen": free().to_string()}]), json!([veilway_wg::encode_key(&[0xa1; 32])]));
+	private(&dir, "config.json", &document.to_string());
+	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+	let subject = dir.join("veilway-replay").display().to_string();
+	let checked = |document: &str| -> (String, String) {
+		let document: Value = serde_json::from_str(document).unwrap_or_else(|e| panic!("{e}: {document}"));
+		let line = document["checks"].as_array().unwrap().iter().find(|line| line["check"] == "replay" && line["subject"] == subject.as_str()).unwrap_or_else(|| panic!("no replay line in {document:#}")).clone();
+		(line["status"].as_str().unwrap().to_string(), line["message"].as_str().unwrap().to_string())
+	};
+	// Nothing there yet: the node makes it, and says what its first minute is like.
+	let (_, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(status == "ok" && message.contains("refuses every proof for the first 60s"), "{status}: {message}");
+	// A file as a node writes it while it runs, and one whose limit a clock that ran ahead left behind.
+	replay(&dir, now - 100, now + 10);
+	let (_, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(status == "ok" && message.contains(&format!("floor {}, limit {}, clock ", now - 100, now + 10)), "{status}: {message}");
+	// What a start or a reset leaves: a floor up to 80 seconds ahead. It ends by itself, and the line does not send anybody to the reset.
+	replay(&dir, now + 50, now + 50);
+	let (_, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(status == "ok" && message.contains("what a start or a reset costs") && message.contains("Do not reset"), "{status}: {message}");
+	replay(&dir, now - 100, now + 3600);
+	let (_, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(status == "warn" && message.contains("the limit is") && message.contains("takes this limit as its floor"), "{status}: {message}");
+	// The floor ahead of the clock is an outage, and the line says what ends it.
+	replay(&dir, now + 3600, now + 3620);
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(code == 1 && status == "fail" && message.contains(&format!("floor {}, limit {}", now + 3600, now + 3620)) && message.contains("ahead of the clock") && message.contains("veilway replay reset"), "{code} {status}: {message}");
+	let (code, plain, _) = doctor(&dir, &[]).await;
+	assert!(code == 1 && plain.lines().any(|line| line.starts_with("fail    replay ") && line.contains("veilway replay reset")), "{code}: {plain}");
+	// A file no node wrote. Doctor moves nothing and makes nothing, whatever it finds.
+	private(&dir, "veilway-replay", "VWREPLAY and nothing else of a replay file, though long enough to be one as far as its length goes");
+	let before = listing(&dir);
+	let (code, document, _) = doctor(&dir, &["--json"]).await;
+	let (status, message) = checked(&document);
+	assert!(code == 1 && status == "fail" && message.contains(".bad") && message.contains("Never put a replay file back from a backup"), "{code} {status}: {message}");
+	assert_eq!(listing(&dir), before);
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[tokio::test]
 async fn a_config_that_cannot_be_read_ends_with_status_two_and_one_that_is_wrong_with_one() {
 	let dir = scratch("unreadable");

@@ -8,6 +8,7 @@ export type Difference = Schemas["Difference"];
 export type Validation = Schemas["Validation"];
 export type User = Schemas["User"];
 export type Stats = Schemas["Stats"];
+export type Replay = Schemas["Replay"];
 export type Session = Schemas["Session"];
 export type Exit = Schemas["Exit"];
 export type Problem = Schemas["Problem"];
@@ -84,6 +85,9 @@ export class Client {
 
 	/** Starts the user's quota count over, which lets a user who was out of quota connect again at once. With `totals` the user's `traffic` goes back to zero as well. The answer is the user as `getUser` gives them, and the same call again changes nothing more. */
 	resetUsage(name: string, options: {totals?: boolean} = {}): Promise<User> {return this.json("POST", "/v1/users/" + encodeURIComponent(name) + "/usage/reset", {}, {totals: options.totals === true})}
+
+	/** Empties the replay memory of the obfuscated transports and sets its floor and limit to the node's clock plus 60 seconds. Every client is refused for those 60 seconds, and a proof that was accepted with a timestamp above the new floor can be used once more. A node that has run no obfuscated transport throws `replay_absent`. The answer is the replay memory after the reset. */
+	resetReplay(): Promise<Replay> {return this.json("POST", "/v1/replay/reset")}
 
 	stats(): Promise<Stats> {return this.json("GET", "/v1/stats")}
 

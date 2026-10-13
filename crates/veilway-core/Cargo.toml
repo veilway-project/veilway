@@ -28,5 +28,11 @@ socket2.workspace=true
 [target.'cfg(unix)'.dependencies]
 libc.workspace=true
 
+# The socket option that prohibits fragmentation of what a datagram transport of a `veilway` inbound sends: `socket2` has no setter for it, and this one needs no `unsafe` of ours.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace=true
+
 [dev-dependencies]
 boringtun.workspace=true
+# The tests of `udp-obfs` read the node's log: a state in which honest clients are refused has to be said.
+tracing-subscriber.workspace=true

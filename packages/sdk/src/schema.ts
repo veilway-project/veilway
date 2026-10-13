@@ -107,6 +107,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/replay/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resets the replay memory of the obfuscated transports: the cache of accepted proofs is emptied, and the floor and the limit become the node's clock plus 60 seconds, written to the replay file before the next proof is accepted. It ends the state in which the floor is ahead of the clock. It costs two things: every client is refused for 60 seconds, and a proof that was accepted with a timestamp above the new floor is forgotten, so whoever recorded it can use it once more when the clock reaches that timestamp. Nothing else of the node is touched, usage and quotas included. The answer is the replay memory after the reset. */
+        post: operations["resetReplay"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/sessions": {
         parameters: {
             query?: never;
@@ -340,6 +357,8 @@ export interface components {
             log: boolean;
             notices: boolean;
             outbounds: components["schemas"]["Changes"];
+            /** @description `replay` changed. The rate per source is in force at once, the cache size from the next start of the node. */
+            replay: boolean;
             routing_default: boolean;
             rules: components["schemas"]["Changes"];
             rules_reordered: boolean;
@@ -452,6 +471,60 @@ export interface components {
         };
         /** @enum {string} */
         Reason: "disabled" | "expired" | "quota" | "removed";
+        /** @description The replay memory of the node. Times are Unix seconds on the node's clock. */
+        Replay: {
+            /** Format: uint */
+            capacity: number;
+            /** Format: uint64 */
+            clock: number;
+            /**
+             * Format: uint64
+             * @description The highest limit that may be on disk, which a start after a kill takes as its floor.
+             */
+            disk_limit: number;
+            /** Format: uint */
+            entries: number;
+            /**
+             * Format: uint64
+             * @description A proof with a timestamp at or below the floor is refused.
+             */
+            floor: number;
+            /** @description The floor is ahead of the clock in a way no start explains: more than 80 seconds, or risen while the node ran. Every proof of a client with a right clock is refused until the clock passes the floor or the replay memory is reset. After a start or a reset the floor is up to 80 seconds ahead, which is what they cost and is false here. */
+            floor_ahead: boolean;
+            /**
+             * Format: uint64
+             * @description A proof with a timestamp above the limit is not accepted before a higher limit is written.
+             */
+            limit: number;
+            /**
+             * Format: uint64
+             * @description How often the node brought its own limit down after a clock that had run ahead.
+             */
+            limit_lowered: number;
+            /** @description False while no proof is accepted at all: a reset whose file is not known to be on disk. */
+            ready: boolean;
+            /**
+             * Format: uint64
+             * @description Proofs refused at the floor while `floor_ahead` was true.
+             */
+            refused_floor_ahead: number;
+            /**
+             * Format: uint64
+             * @description How many seconds the floor is ahead of the clock, whatever the cause: for that long proofs with a right clock are refused. 0 on a node that takes them.
+             */
+            refusing_secs: number;
+            /** Format: uint64 */
+            resets: number;
+            /** Format: uint64 */
+            slow_writes: number;
+            /** Format: uint64 */
+            write_failures: number;
+            /**
+             * Format: uint64
+             * @description Writes of the replay file that went through, that failed, and that took more than 2 seconds.
+             */
+            writes: number;
+        };
         Report: {
             errors: components["schemas"]["Problem"][];
             /**
@@ -523,11 +596,19 @@ export interface components {
             /** Format: uint */
             flows: number;
             inbounds: components["schemas"]["Rated"][];
+            /** @description The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory. */
+            replay: components["schemas"]["Replay"] | null;
+            /**
+             * Format: uint64
+             * @description Datagrams the node made for a device and no socket took, over every transport of every inbound. A socket of a `veilway` inbound never fragments, so a packet larger than the host's interface carries is counted here and not sent: lower the inbound's `mtu` when this grows.
+             */
+            send_failed: number;
             /**
              * Format: uint64
              * @description Writes of the usage state file that failed since start.
              */
             state_write_failures: number;
+            udp_obfs: components["schemas"]["UdpObfs"];
             users: components["schemas"]["Rated"][];
             /**
              * Format: uint64
@@ -577,7 +658,119 @@ export interface components {
             up_packets: number;
         };
         /** @enum {string} */
-        Transport: "udp" | "ws";
+        Transport: "udp" | "ws" | "udp-obfs";
+        /** @description What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key. */
+        UdpObfs: {
+            /** Format: uint64 */
+            cache_full: number;
+            /** Format: uint64 */
+            device_rate: number;
+            /**
+             * Format: uint64
+             * @description Sessions that ended, by reason: no WireGuard packet within 10 seconds of the opening packet, no activity for 180 seconds, 2^31 packets sent, a newer session of the same source and device, the device's ninth session, and a device or transport secret the config no longer has.
+             */
+            ended_deadline: number;
+            /** Format: uint64 */
+            ended_displaced: number;
+            /** Format: uint64 */
+            ended_idle: number;
+            /** Format: uint64 */
+            ended_packets: number;
+            /** Format: uint64 */
+            ended_replaced: number;
+            /** Format: uint64 */
+            ended_revoked: number;
+            /** Format: uint64 */
+            established: number;
+            /** Format: uint64 */
+            floor: number;
+            /**
+             * Format: uint64
+             * @description Handshake initiations above a session's allowance, datagrams inside a session that WireGuard did not take as a packet of the session's device, and packets the node could not make.
+             */
+            handshakes: number;
+            /**
+             * Format: uint64
+             * @description Opening packets with a timestamp above the written limit that were dropped: the listener already kept 64 others, or no write ended within 2 seconds. And those that came while the node took no proof at all.
+             */
+            limit: number;
+            /** Format: uint64 */
+            no_replay: number;
+            /** Format: uint64 */
+            open_failed: number;
+            /**
+             * Format: uint64
+             * @description Opening packets that were accepted, and sessions that became established.
+             */
+            opened: number;
+            /**
+             * Format: uint
+             * @description Sessions whose opening packet was accepted and on which WireGuard has not authenticated yet, right now.
+             */
+            pending: number;
+            /** Format: uint64 */
+            pending_full: number;
+            /** Format: uint64 */
+            pool: number;
+            /** Format: uint64 */
+            seen: number;
+            /**
+             * Format: uint64
+             * @description Packets the listeners made for a socket. Every one is a data packet of an established session, so a node that only strangers talk to has 0 here.
+             */
+            sent: number;
+            /**
+             * Format: uint
+             * @description Established sessions right now, with those that a newer session of the same source replaced and that are still readable for 10 seconds.
+             */
+            sessions: number;
+            /**
+             * Format: uint64
+             * @description Datagrams dropped, by reason: shorter than a data packet, `short`. No data packet of a session at its source and a tag that is not in the tag table, `unknown`, which is where every datagram of a stranger is counted. A tag that is in the table on a packet that does not open, `open_failed`: its sender holds a tag of this epoch without the device's secret, or the packet was changed on its way.
+             */
+            short: number;
+            /**
+             * Format: uint64
+             * @description Opening packets refused by a limit: the source has sessions of 4 other devices, the listener's session pool is full, the device has 2 pending sessions, or the device's or the source's allowance of accepted proofs is spent.
+             */
+            source_devices: number;
+            /** Format: uint64 */
+            source_rate: number;
+            /** Format: uint64 */
+            spent: number;
+            /** Format: uint64 */
+            table_build_failures: number;
+            /**
+             * Format: uint64
+             * @description How often a tag table was built for a new epoch, how often that was late, how often a build did not end, and tags that were left out because another secret had the same.
+             */
+            table_rebuilds: number;
+            /** Format: uint64 */
+            table_rebuilds_late: number;
+            /** Format: uint64 */
+            tag_collisions: number;
+            /**
+             * Format: uint
+             * @description Epoch tags in the tag tables right now: three for each transport secret of each device that may connect.
+             */
+            tags: number;
+            /** Format: uint64 */
+            tunnel: number;
+            /** Format: uint64 */
+            unknown: number;
+            /** Format: uint64 */
+            unsendable: number;
+            /**
+             * Format: uint64
+             * @description Opening packets that were kept for the write of a higher limit and taken to the replay rule again when it had ended, and opening packets a limit refused whose salt was recorded as spent, so that nobody who saw one can use it later.
+             */
+            waited: number;
+            /**
+             * Format: uint64
+             * @description Opening packets of a device that the replay rule refused: a timestamp outside the window of 60 seconds, at or below the floor, a packet that was accepted before, and any while the cache is full.
+             */
+            window: number;
+        };
         /** @description The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it. */
         UsageReset: {
             totals: boolean;
@@ -1017,6 +1210,62 @@ export interface operations {
             };
             /** @description The request was not finished within 30 seconds. */
             408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resetReplay: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Replay"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node keeps no replay memory because it has run no obfuscated transport, or an earlier reset is not known to be on disk yet. Nothing was changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description replay_unwritten: the replay file could not be written, so the reset may or may not be on disk. The node accepts no proof until it has written the floor and the limit it had back, and the reset has to be asked for again. replay_writing: the write has not ended within 10 seconds and the reset is in force when it does, so it must not be asked for again: replay.resets of GET /v1/stats grows by one when it has landed. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
