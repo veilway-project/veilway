@@ -6,6 +6,10 @@ license.workspace=true
 repository.workspace=true
 publish.workspace=true
 
+[features]
+# The stream listener over pipes in memory, for the fuzz target and the crate's own tests. No build of a node turns it on.
+bench=[]
+
 [dependencies]
 veilway-wg={path="../veilway-wg"}
 veilway-proto={path="../veilway-proto"}
@@ -23,6 +27,9 @@ schemars.workspace=true
 time.workspace=true
 ring.workspace=true
 socket2.workspace=true
+# The `tls` transport: the node ends TLS itself, with the library the built `ws` already ends it with.
+tokio-rustls.workspace=true
+rustls.workspace=true
 
 # The one ioctl that makes the TUN device of an l3 exit on Linux, and the flags the state file is opened with.
 [target.'cfg(unix)'.dependencies]
@@ -33,6 +40,13 @@ libc.workspace=true
 rustix.workspace=true
 
 [dev-dependencies]
+# The crate's own tests are built with the listener over pipes in memory.
+veilway-core={path=".", features=["bench"]}
 boringtun.workspace=true
 # The tests of `udp-obfs` read the node's log: a state in which honest clients are refused has to be said.
 tracing-subscriber.workspace=true
+# The tests of `tls`: a certificate made for each test, and a real HTTP/1.1 server as the decoy origin that the node is held against.
+rcgen.workspace=true
+hyper.workspace=true
+hyper-util.workspace=true
+http-body-util.workspace=true

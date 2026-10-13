@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -62,6 +63,24 @@ pub const MAX_PROOF_RATE: u32 = 65536;
 pub const DEFAULT_PROOFS_PER_SOURCE: ProofRate = ProofRate {burst: 256, rate: 32};
 pub const MAX_SESSIONS: u32 = 1 << 20;
 pub const DEFAULT_SESSIONS: u32 = 16384;
+/// An inbound has two node transport keys only while one is rotated out (protocol overview, "Rotation").
+pub const MAX_TRANSPORT_KEYS: usize = 2;
+/// The pools of a stream listener (transports page, "Node capacity numbers"): "Undecided connections: 512, and 64 per source. Relayed connections: 1,024."
+pub const MAX_UNDECIDED: u32 = 65536;
+pub const DEFAULT_UNDECIDED: u32 = 512;
+pub const DEFAULT_UNDECIDED_PER_SOURCE: u32 = 64;
+/// No more than this, because the listener looks at every relayed connection, with the pool held, to find the one to close for room.
+pub const MAX_RELAYED: u32 = 65536;
+pub const DEFAULT_RELAYED: u32 = 1024;
+/// "Request path: at least 12 characters."
+pub const MIN_PROOF_PATH_BYTES: usize = 12;
+pub const MAX_UPGRADE_HEADERS: usize = 16;
+pub const MAX_HEADER_NAME_BYTES: usize = 64;
+pub const MAX_COOKIE_NAME_BYTES: usize = 32;
+/// "The default list is `Server`, `Date` on a `tls` listener."
+pub const DEFAULT_UPGRADE_HEADERS: [&str; 2] = ["Server", "Date"];
+/// "Validation refuses a list that names" one of these: the fields the node writes itself, and those that would change how the answer is read.
+pub const UPGRADE_HEADERS_REFUSED: [&str; 10] = ["upgrade", "connection", "sec-websocket-accept", "set-cookie", "content-length", "transfer-encoding", "content-type", "content-encoding", "trailer", "keep-alive"];
 pub const MIN_TCP_IDLE_SECS: u32 = 10;
 pub const MAX_TCP_IDLE_SECS: u32 = 86400;
 pub const MIN_UDP_IDLE_SECS: u32 = 5;
@@ -184,6 +203,21 @@ pub fn transport_secret() -> io::Result<String> {
 	let mut secret = [0u8; 32];
 	SystemRandom::new().fill(&mut secret).map_err(|_| io::Error::other("the system gave no random bytes"))?;
 	Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret))
+}
+
+/// A new node transport key as a config writes it, and its public half as a profile carries it: an X25519 key from the system's secure random source, in base64. The private half goes into `transport_keys` of one inbound of one node, and nowhere else.
+pub fn transport_key() -> io::Result<(String, String)> {
+	let mut key = [0u8; 32];
+	SystemRandom::new().fill(&mut key).map_err(|_| io::Error::other("the system gave no random bytes"))?;
+	let encode = |bytes: &[u8; 32]| base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+	Ok((encode(&key), encode(&veilway_proto::proof::public_key(&key))))
+}
+
+/// Whether a connection to a decoy origin at `origin` arrives at a stream listener of the node at `listen`: the same address and port, or one of them the wildcard and the other an address of this host for certain (loopback, or the wildcard, which a connect takes for this host). An address written as IPv4 inside IPv6 is the IPv4 one, and the IPv6 wildcard listens for IPv4 too where the host says so.
+/// A wildcard listener does not refuse an origin on another host with the same port: whether an address is this host's is not known here, and such a loop only fails a TLS handshake.
+pub fn loops(listen: SocketAddr, origin: SocketAddr) -> bool {
+	let ((here, there), local) = ((listen.ip().to_canonical(), origin.ip().to_canonical()), |ip: IpAddr| ip.is_loopback() || ip.is_unspecified());
+	listen.port() == origin.port() && (here == there || (here.is_unspecified() && local(there) || there.is_unspecified() && local(here)) && (here.is_ipv4() == there.is_ipv4() || here == IpAddr::V6(Ipv6Addr::UNSPECIFIED)))
 }
 
 /// The JSON Schema of config version 1, as committed in `schema/config.v1.json`.

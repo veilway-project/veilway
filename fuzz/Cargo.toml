@@ -10,12 +10,15 @@ cargo-fuzz=true
 [dependencies]
 libfuzzer-sys="0.4"
 serde_json="1"
-veilway-core={path="../crates/veilway-core"}
+veilway-core={path="../crates/veilway-core", features=["bench"]}
 veilway-proto={path="../crates/veilway-proto"}
 # The obfs_listener target drives real WireGuard peers against the node's listener.
 veilway-wg={path="../crates/veilway-wg"}
 # The chunk target seals plaintexts itself, with the library the crate opens them with, and the subscription targets sign documents with it.
 ring="0.17"
+# The tls_listener target runs the node's own connection tasks over pipes in memory, and gives the node a clock of its own.
+tokio={version="1", features=["rt", "io-util", "time"]}
+time="0.3"
 
 [[bin]]
 name="config"
@@ -146,6 +149,13 @@ bench=false
 [[bin]]
 name="obfs_listener"
 path="fuzz_targets/obfs_listener.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="tls_listener"
+path="fuzz_targets/tls_listener.rs"
 test=false
 doc=false
 bench=false

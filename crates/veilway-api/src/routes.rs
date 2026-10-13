@@ -282,6 +282,7 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 			Over::Udp => model::Transport::Udp,
 			Over::Ws => model::Transport::Ws,
 			Over::UdpObfs => model::Transport::UdpObfs,
+			Over::Tls => model::Transport::Tls,
 		}),
 		flows: peer.flows,
 		selected_exit: peer.exit,
@@ -462,6 +463,7 @@ impl Api {
 				source_devices: obfs.source_devices, pool: obfs.pool, pending_full: obfs.pending_full, device_rate: obfs.device_rate, source_rate: obfs.source_rate, handshakes: obfs.handshakes, tunnel: obfs.tunnel, unsendable: obfs.unsendable,
 				ended_deadline: obfs.ended_deadline, ended_idle: obfs.ended_idle, ended_packets: obfs.ended_packets, ended_replaced: obfs.ended_replaced, ended_displaced: obfs.ended_displaced, ended_revoked: obfs.ended_revoked, table_rebuilds: obfs.table_rebuilds, table_rebuilds_late: obfs.table_rebuilds_late, table_build_failures: obfs.table_build_failures, tag_collisions: obfs.tag_collisions,
 			},
+			stream: self.engine.stream().into(),
 			replay: self.engine.replay().map(model::Replay::from),
 		}
 	}

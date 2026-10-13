@@ -1,7 +1,8 @@
 //! `veilway doctor`: everything a config needs of this host and of the network, tried once and reported line by line. It needs no running node and changes nothing: no file, no interface, no firewall rule, no sysctl.
 //! A line names tags, user-chosen names, field paths and listen addresses, and never another value of the config: no key, no password, no address of a proxy or a DNS server.
-//! What is tried goes through `veilway_core::engine::probe` and the other code the node itself runs. Only two things are done here because the engine has no code for them that could be called without a node:
-//! the DNS query that is sent (the engine only ever forwards the queries of its users), and the reading of a certificate's dates and names (the node serves a certificate and never looks inside it).
+//! What is tried goes through `veilway_core::engine::probe` and the other code the node itself runs. Only three things are done here because the engine has no code for them that could be called without a node:
+//! the DNS query that is sent (the engine only ever forwards the queries of its users), the reading of a certificate's dates and names (the node serves a certificate and never looks inside it),
+//! and the two requests to a decoy origin (the node asks it for its page from inside a listener, and never for the path of a transport).
 use serde_json::json;
 use std::collections::hash_map::RandomState;
 use std::collections::HashSet;
@@ -11,6 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -18,7 +20,7 @@ use tokio::time::timeout;
 use veilway_core::config::{self, Backend, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
-use veilway_core::engine::{dns, icmp, probe, replay};
+use veilway_core::engine::{dns, icmp, probe, replay, stream};
 use veilway_proto::replay::{STEP, WINDOW};
 use veilway_wg::ws::{self, TlsFiles};
 use x509_parser::extensions::GeneralName;
@@ -190,6 +192,64 @@ fn certificate(cert: &Path, key: &Path, now: i64) -> (Status, String) {
 	(status, format!("the chain and the key load and belong together, {covers}, and {dates}"))
 }
 
+/// One request to a decoy origin as the node makes its own: the PROXY protocol header with the node's address first when the config asks for one, `Host` as the config writes the origin, and the answer's head, 16 kB of it at the most.
+async fn asked(target: SocketAddr, proxied: bool, host: &str, path: &str) -> io::Result<Vec<u8>> {
+	let (mut origin, mut head, mut filled) = (TcpStream::connect(target).await?, vec![0u8; 16384], 0);
+	if proxied {origin.write_all(&stream::proxy_header(origin.local_addr()?, target)).await?}
+	origin.write_all(format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+	while filled < head.len() && !head[..filled].windows(4).any(|window| window == b"\r\n\r\n") {
+		match origin.read(&mut head[filled..]).await? {
+			0 => break,
+			read => filled += read,
+		}
+	}
+	head.truncate(filled);
+	Ok(head)
+}
+
+/// The decoy origin of one `tls` transport (transports page, "What the decoy origin must be"): whether it is reached and answers as a web server, which fields of `upgrade_headers` it sends, and whether it answers the transport's own path itself.
+/// "The origin must also not send the transport path back to the node by a rule of its own. `veilway doctor` checks this by a request", and "the origin must not serve anything at a transport path". The path is sent to the origin, whose access log keeps that request, and doctor itself writes it nowhere.
+async fn decoy(subject: &str, decoy: &config::Decoy, path: &str, wanted: &[String], wait: Duration) -> Vec<Line> {
+	let (host, proxied, down) = (decoy.origin.host(), decoy.proxy_protocol == Some(true), "while it is so, whoever is not a user is closed with no answer, which tells the node from its decoy, and the upgrade answer carries only Date. Users are not affected");
+	let target = match &decoy.origin.0.host {
+		config::Host::Ip(ip) => Some(SocketAddr::new(*ip, decoy.origin.0.port)),
+		config::Host::Name(name) => timeout(wait, tokio::net::lookup_host((name.as_str(), decoy.origin.0.port))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()),
+	};
+	let Some(target) = target else {return vec![line(Status::Fail, "decoy", format!("{subject}, origin"), "the name of the origin does not resolve, so `veilway run` would not start: write an address, or a name this host resolves")]};
+	// The status of an answer's head, and its header fields with their names in lowercase.
+	let read = |head: &[u8]| -> Option<(u16, Vec<(String, String)>)> {
+		let text = String::from_utf8_lossy(head);
+		let mut lines = text.split("\r\n");
+		let status = lines.next()?.strip_prefix("HTTP/1.")?.get(2..5)?.parse().ok()?;
+		Some((status, lines.filter_map(|field| field.split_once(':')).map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string())).collect()))
+	};
+	let (started, page) = (Instant::now(), timeout(wait, asked(target, proxied, &host, "/")).await);
+	let mut lines = vec![match page.as_ref().ok().and_then(|page| page.as_ref().ok()).map(|head| read(head)) {
+		// The origin is reached over plain HTTP while a stranger arrived over TLS: the usual plain listener of a site sends everyone to `https://`, which through the node comes back to the same answer for ever.
+		Some(Some((status, sent))) if (300..400).contains(&status) && sent.iter().any(|(name, value)| name == "location" && value.get(..8).is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))) => line(Status::Warn, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request (`Host: {host}`) with status {status} and sends the visitor to an `https://` address. A stranger reaches the origin through the node's TLS and gets that redirect on every request, which tells the node from a web server: the origin has to be a plain listener that serves the site as its HTTPS listener does, without the redirect")),
+		Some(Some((status, sent))) => {
+			let absent: Vec<&str> = wanted.iter().map(String::as_str).filter(|name| !name.eq_ignore_ascii_case("date") && !sent.iter().any(|(sent, _)| sent.eq_ignore_ascii_case(name))).take(MAX_SHOWN).collect();
+			if absent.is_empty() {line(Status::Ok, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request with status {status} in {} ms and sent every field `upgrade_headers` names. The request carried `Host: {host}`, the host of `decoy.origin`: a web server with several sites may give strangers, who send their own `Host`, another one", started.elapsed().as_millis()))} else {line(Status::Warn, "decoy", format!("{subject}, origin"), format!("the origin answered the node's own request (`Host: {host}`) with status {status} and did not send {}, which `upgrade_headers` names: the upgrade answer leaves out what the origin does not send, so name the fields this origin sends", absent.join(", ")))}
+		}
+		Some(None) => line(Status::Fail, "decoy", format!("{subject}, origin"), format!("what listens there did not answer as a web server{}: {down}", if proxied {". With `proxy_protocol` the origin has to expect the PROXY protocol header, version 2, on that listener"} else {""})),
+		None => line(Status::Fail, "decoy", format!("{subject}, origin"), format!("the origin is not reached ({}): {down}", if let Ok(Err(e)) = &page {e.kind().to_string()} else {format!("no answer within {} s", wait.as_secs())})),
+	}];
+	if lines[0].status == Status::Fail {
+		lines.push(line(Status::Skipped, "decoy", format!("{subject}, path"), "the origin did not answer, so its answer for the path of the transport was not asked for"));
+		return lines;
+	}
+	// A query of the size of a token that is none: with a node running, a request the origin handed on to it would be a stranger's.
+	let probe = timeout(wait, asked(target, proxied, &host, &format!("{path}?{}", "A".repeat(144)))).await;
+	let looped = "if a rule of the web server hands that path on to the node, every request of a stranger for it goes round between the two until a pool is full. The origin has to be a listener of the web server that serves the site without that rule";
+	lines.push(match probe.as_ref().ok().and_then(|probe| probe.as_ref().ok()).and_then(|head| read(head)) {
+		Some((status, _)) if (400..500).contains(&status) => line(Status::Ok, "decoy", format!("{subject}, path"), format!("the origin answers the path of the transport itself, with status {status}, as it answers a path it does not have. This check left one request for that path, with a query of 144 letters, in the origin's access log")),
+		Some((status, _)) if status < 400 => line(Status::Warn, "decoy", format!("{subject}, path"), format!("the origin serves something at the path of the transport (status {status}). It must serve nothing there, so that a request for the path without a valid proof gets its own not-found answer: choose a path the site does not have")),
+		Some((status, _)) => line(Status::Fail, "decoy", format!("{subject}, path"), format!("the origin did not answer the path of the transport itself (status {status}): {looped}")),
+		None => line(Status::Fail, "decoy", format!("{subject}, path"), format!("the origin gave no answer for the path of the transport within {} s, where it answered for its page: {looped}", wait.as_secs())),
+	});
+	lines
+}
+
 /// Whether this user may make and replace files in `dir`. The system is asked, which knows of read-only mounts and ACLs where the mode bits do not.
 #[cfg(unix)]
 fn writable(dir: &Path) -> bool {
@@ -275,7 +335,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
 			// Transports that share an address share one listener, as they do in the node.
-			let (addr, stream) = (transport.listen(), matches!(transport, Transport::Ws {..}));
+			let (addr, stream) = (transport.listen(), !transport.datagram());
 			if !bound.insert((addr, stream)) {continue}
 			let subject = format!("inbound {}, transports[{t}], {} {addr}", inbound.tag, if stream {"tcp"} else {"udp"});
 			lines.push(match probe::listen(addr, stream).await {
@@ -292,11 +352,19 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
-			let Transport::Ws {tls: Some(tls), ..} = transport else {continue};
+			let (Transport::Ws {tls: Some(tls), ..} | Transport::Tls {tls, ..}) = transport else {continue};
 			let (cert, key) = (dir.join(&tls.cert), dir.join(&tls.key));
 			if !read.insert((cert.clone(), key.clone())) {continue}
 			let (status, message) = certificate(&cert, &key, now);
 			lines.push(line(status, "certificate", format!("inbound {}, transports[{t}].tls", inbound.tag), message));
+		}
+	}
+	// The decoy origin of every `tls` transport, once for each origin and path. It is asked directly, with or without a node that runs.
+	let mut origins = HashSet::new();
+	for inbound in &config.inbounds {
+		for (t, transport) in inbound.transports.iter().enumerate() {
+			let Transport::Tls {path, decoy: origin, ..} = transport else {continue};
+			if origins.insert((origin.origin.host(), path.clone())) {lines.extend(decoy(&format!("inbound {}, transports[{t}].decoy", inbound.tag), origin, path, &inbound.upgrade_headers(), wait).await)}
 		}
 	}
 	// An exit on a direct outbound and an l3 exit with `masquerade` send the queries of the node's resolver from the node itself.

@@ -8,6 +8,7 @@ mod host;
 pub mod icmp;
 mod inbound;
 pub mod l3;
+pub mod limits;
 pub mod netstack;
 pub mod obfs;
 pub mod plan;
@@ -15,10 +16,12 @@ pub mod probe;
 pub mod replay;
 pub mod resolver;
 pub mod route;
+pub mod stream;
 pub mod usage;
 
 pub use control::ControlTotals;
 pub use obfs::ObfsTotals;
+pub use stream::StreamTotals;
 pub use plan::{Denied, Plan};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
@@ -81,7 +84,7 @@ pub enum Event {
 
 /// How a device's last authenticated datagram reached its inbound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Over {Udp, Ws, UdpObfs}
+pub enum Over {Udp, Ws, UdpObfs, Tls}
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.
 #[derive(Clone, Debug)]
@@ -274,6 +277,10 @@ pub struct Shared {
 	control: control::Channel,
 	/// What the `udp-obfs` listeners share.
 	obfs: obfs::State,
+	/// The limits per device and per source, which every native transport is held to together.
+	limits: limits::State,
+	/// What the stream listeners share.
+	stream: stream::State,
 	/// The replay memory, from the first config with an obfuscated transport on. It belongs to the process: no reload empties it or gives it back.
 	replay: OnceLock<Arc<replay::Guard>>,
 	/// Where the replay file is. None for a node that was given no path, which starts no obfuscated transport.
@@ -281,6 +288,11 @@ pub struct Shared {
 }
 
 impl Shared {
+	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
+	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>) -> Shared {
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay}
+	}
+
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
 	fn publish(&self, event: Event) {let _ = self.events.send(event);}
 
@@ -516,6 +528,9 @@ impl Engine {
 	/// What the `udp-obfs` transports did since start, and the sessions and tags they hold right now.
 	pub fn obfs(&self) -> ObfsTotals {self.shared.obfs.totals(&self.plan())}
 
+	/// What the stream listeners did since start, and the connections and sessions they hold right now.
+	pub fn stream(&self) -> StreamTotals {self.shared.stream.totals()}
+
 	/// The replay memory of the obfuscated transports right now. None for a node that never ran one, which keeps no replay memory.
 	pub fn replay(&self) -> Option<ReplayStatus> {self.shared.replay.get().map(|replay| replay.status(replay::seconds((self.shared.now)())))}
 
@@ -558,7 +573,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		(users, devices, writable.then_some(path))
 	});
 	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
-	let shared = Arc::new(Shared {plan: RwLock::new(Arc::new(remembered)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local: options.is_local, now: options.now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state.clone(), written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(options.usage_push), obfs: obfs::State::default(), replay: OnceLock::new(), replay_path: options.replay});
+	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push));
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let mut host = Host::new(options.dir);
 	let staged = match host.prepare(&shared, &store.current().config, &[]).await {
@@ -582,7 +597,9 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 						if ticks % SWEEP_EVERY == 0 {
 							shared.flows.sweep();
 							shared.tend();
-							shared.obfs.sweep(obfs::Clock::of((shared.now)()));
+							let clock = limits::Clock::of((shared.now)());
+							shared.limits.sweep(clock);
+							shared.obfs.sweep(clock);
 						}
 					}
 					_ = shared.over.notified() => {}

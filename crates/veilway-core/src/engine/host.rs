@@ -5,8 +5,8 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{control, l3, obfs, replay, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{Config, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::{control, l3, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{loops, Config, Host as Named, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{lookup_host, TcpListener, UdpSocket};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
@@ -34,6 +34,8 @@ const STACK_MARGIN: u64 = 60;
 /// How often and how far apart `bind` tries an address again that the node has only just given back.
 const REBIND_TRIES: u32 = 50;
 const REBIND_EVERY: Duration = Duration::from_millis(20);
+/// How long the name of a decoy origin may take to resolve, at start and at a reload.
+const RESOLVE: Duration = Duration::from_secs(5);
 
 /// A task that ends when this is dropped.
 struct Task(AbortHandle);
@@ -74,6 +76,8 @@ pub struct Host {
 	/// An address the next config uses again is never bound a second time. Its socket goes to whichever tunnel and transport has it then.
 	udp: HashMap<SocketAddr, (Arc<UdpSocket>, Option<(Task, Reader)>)>,
 	ws: HashMap<SocketAddr, Relay>,
+	/// Every stream listener by its listen address, with the tasks that accept on it and learn the header fields of its upgrade answer. It lives for as long as a config has a `tls` transport on the address, and its sessions with it.
+	tls: HashMap<SocketAddr, (Arc<stream::Listener>, [Task; 2])>,
 	/// By the tag of the inbound.
 	tunnels: HashMap<String, Running>,
 	/// Shared with the `Engine`, which takes it out when it shuts down or is dropped: the interface, its routes and its firewall table go with the engine, while everything else here serves on.
@@ -92,6 +96,9 @@ pub struct Staged {
 	ws: Vec<(SocketAddr, TcpListener)>,
 	/// For every address `ws` transports listen on, what its certificate files hold now.
 	acceptors: HashMap<SocketAddr, Option<ws::Acceptor>>,
+	/// The stream listeners the node does not have yet, and for every address stream transports listen on, what its certificate files hold now and where its decoy origin is now.
+	tls: Vec<(SocketAddr, TcpListener)>,
+	streams: HashMap<SocketAddr, (ws::Acceptor, SocketAddr)>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
 	tunnels: Vec<(Arc<Tunnel>, IpStack, Receiver<Vec<u8>>)>,
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
@@ -142,7 +149,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new()}}
 
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
@@ -169,17 +176,39 @@ impl Host {
 		}
 		// "`veilway run` refuses to start a config that has an obfuscated transport" without a replay file it can write and lock. The memory is taken once, by the first config that needs it, and kept for as long as the process runs.
 		if let (Some(i), None) = (plan.inbounds.iter().position(|inbound| inbound.native.is_some()), shared.replay.get()) {
-			let path = shared.replay_path.clone().ok_or_else(|| anyhow!("inbounds[{i}].transports: inbound `{}` has a udp-obfs transport, which needs a replay file, and the node was started without a path for one", plan.inbounds[i].tag))?;
+			let path = shared.replay_path.clone().ok_or_else(|| anyhow!("inbounds[{i}].transports: inbound `{}` has an obfuscated transport, which needs a replay file, and the node was started without a path for one", plan.inbounds[i].tag))?;
 			let (capacity, now) = (config.replay.cache(), replay::seconds((shared.now)()));
 			let guard = Arc::new(tokio::task::spawn_blocking(move || replay::Guard::open(&path, capacity, now)).await.map_err(|e| anyhow!("the replay file could not be opened: {e}"))??);
 			if shared.replay.set(guard.clone()).is_ok() {tokio::spawn(guard.run(shared.now));}
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
+		let (mut listeners, mut streams) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (ws::Acceptor, SocketAddr)>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate() {
 				match transport {
 					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
 					Transport::Udp {..} | Transport::UdpObfs {..} => {}
+					Transport::Tls {listen, tls, decoy, ..} => {
+						if !self.tls.contains_key(&listen.0) && !listeners.iter().any(|(addr, _)| *addr == listen.0) {
+							listeners.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
+								socket.listen(1024)?;
+								TcpListener::from_std(socket.into())
+							}).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over tcp: {}", inbound.tag, e.kind()))?));
+						}
+						// Once for each address, on every reload: the certificate is read again, and the name of the decoy origin is resolved again ("resolved once per reload"). Transports that share an address have the same files and the same origin.
+						if streams.contains_key(&listen.0) {continue}
+						let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
+						let acceptor = ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?;
+						#[cfg(unix)]
+						if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
+						let origin = match &decoy.origin.0.host {
+							Named::Ip(ip) => SocketAddr::new(*ip, decoy.origin.0.port),
+							Named::Name(name) => tokio::time::timeout(RESOLVE, lookup_host((name.as_str(), decoy.origin.0.port))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].decoy.origin: the name of the decoy origin of inbound `{}` does not resolve", inbound.tag))?,
+						};
+						// "Validation refuses an origin whose address and port equal a listen address of the node, since requests would loop", and this is where a name is held to it.
+						if plan.inbounds.iter().flat_map(|inbound| &inbound.transports).any(|other| !other.datagram() && loops(other.listen(), origin)) {anyhow::bail!("inbounds[{i}].transports[{t}].decoy.origin: the decoy origin of inbound `{}` resolves to an address and port the node itself listens on, so every request of a stranger would come back to the node", inbound.tag)}
+						streams.insert(listen.0, (acceptor, origin));
+					}
 					Transport::Ws {listen, tls, ..} => {
 						if !self.ws.contains_key(&listen.0) && !relays.iter().any(|(addr, _)| *addr == listen.0) {
 							relays.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
@@ -252,12 +281,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tunnels: fresh, loopbacks, l3: staged})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, tunnels: fresh, loopbacks, l3: staged})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tunnels, loopbacks, l3} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, tunnels, loopbacks, l3} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -293,10 +322,37 @@ impl Host {
 						});
 						routes.entry(listen.0).or_default().push((path.clone(), tls.clone(), inbound.tunnel.clone(), id));
 					}
+					Transport::Tls {..} => {}
 				}
 			}
 		}
-		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).copied().collect();
+		// What each stream listener serves from here on: the certificate and the origin as `prepare` found them, and one route for each `tls` transport on its address.
+		let mut serving: HashMap<SocketAddr, stream::Served> = HashMap::new();
+		for (inbound, written) in plan.inbounds.iter().zip(self.config.iter().flat_map(|config| &config.inbounds)) {
+			for transport in &inbound.transports {
+				let Transport::Tls {listen, path, decoy, limits, ..} = transport else {continue};
+				let Some((acceptor, origin)) = streams.get(&listen.0) else {continue};
+				serving.entry(listen.0).or_insert_with(|| stream::Served {acceptor: Some(acceptor.clone()), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(*limits)}).routes.push(stream::Route::tls(path.clone(), inbound.tunnel.clone(), written.upgrade_cookie.clone().unwrap_or_default(), written.upgrade_headers()));
+			}
+		}
+		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();
+		// A listener whose address the config still has is told what it serves now, and keeps every session whose transport is as it was. One whose address nobody has any more closes with everything it holds.
+		self.tls.retain(|addr, (listener, _)| match serving.remove(addr) {
+			Some(served) => {
+				listener.serve(served);
+				true
+			}
+			None => {
+				listener.close();
+				false
+			}
+		});
+		for (addr, socket) in listeners {
+			let Some(served) = serving.remove(&addr) else {continue};
+			tracing::info!("stream listener {addr}: tls, {} path(s), at most {} established sessions, {} undecided connections and {} relayed to the decoy origin at {}", served.routes.len(), served.pools.sessions, served.pools.undecided, served.pools.relayed, served.host);
+			let listener = shared.stream.listen(addr, served);
+			self.tls.insert(addr, (listener.clone(), [Task(stream::accept(shared, listener.clone(), socket)), Task(stream::learn(&listener))]));
+		}
 		for (addr, socket) in udp {self.udp.insert(addr, (socket, None));}
 		// A socket is read for the tunnel and the transport that have its address now. One whose address nobody has any more is closed, and so is its reader. A `udp-obfs` listener that keeps its tunnel keeps its sessions.
 		self.udp.retain(|addr, (socket, reader)| match wanted.get(addr) {
@@ -319,7 +375,7 @@ impl Host {
 			}
 			None => false,
 		});
-		if let Some(config) = &self.config {shared.obfs.per_source(config.replay.per_source())}
+		if let Some(config) = &self.config {shared.limits.per_source(config.replay.per_source())}
 		if let Some((replay, config)) = shared.replay.get().zip(self.config.as_ref()).filter(|(replay, config)| replay.capacity() != config.replay.cache()) {tracing::warn!("replay.cache: the replay memory was started with room for {} proofs and the config now says {}. It keeps what it was started with until the node starts again", replay.capacity(), config.replay.cache())}
 		for running in self.tunnels.values_mut() {
 			if !routes.values().flatten().any(|(.., tunnel, _)| Arc::ptr_eq(tunnel, &running.tunnel)) {running.loopback = None}
@@ -486,11 +542,11 @@ impl Host {
 		tracing::info!("a plan was put in force: the flow table was locked for {:?} while every live flow was decided again", started.elapsed());
 		// Never waited for: a socket that cannot take a reset right now loses it, like any packet on a full queue. They leave before the sessions of a native transport end below, which is the only way they could reach a device that came over one.
 		for (tunnel, route, datagram, control) in &out {route.try_send(tunnel, datagram, *control)}
-		// One cut-off path for the native transports too: every `udp-obfs` session of a device that was cut off above ends here, whatever the reason was, and so does one whose device is no longer in its inbound or whose transport secret the plan no longer has.
+		// One cut-off path for the native transports too: every `udp-obfs` and every stream session of a device that was cut off above ends here, whatever the reason was, and so does one whose device is no longer in its inbound or whose transport secret the plan no longer has.
 		// A device that was cut off lost its WireGuard sessions, and with them the tunnel's memory of the handshakes it has seen. A session that lived on would take a recorded initiation for a new one (threat model G18), so none does.
 		// The plan is in force by now, and with it a tag table that no longer holds a removed secret, so no opening packet under it is accepted from here on.
-		let revoked = shared.obfs.cut(&plan, |device| cut.contains_key(device));
-		if revoked > 0 {tracing::info!("{revoked} udp-obfs session(s) ended: their device was cut off, or the config no longer has the transport secret they were opened with")}
+		let revoked = shared.limits.cut(&plan, |device| cut.contains_key(device));
+		if revoked > 0 {tracing::info!("{revoked} session(s) of the obfuscated transports ended: their device was cut off, or the config no longer has the transport secret or the transport key they were opened with")}
 		// "Validation refuses a config in which two tags of one inbound are equal" is kept here, where the tags are: a tag that another secret had is left out of the table and said at once.
 		for (tag, collisions) in plan.inbounds.iter().filter_map(|inbound| inbound.native.as_ref().map(|native| (&inbound.tag, native.tags().collisions))).filter(|(_, collisions)| *collisions > 0) {shared.obfs.collided(tag, collisions)}
 		// The flows went first and the memory goes after them, which is the order `resolver::answer` counts on.

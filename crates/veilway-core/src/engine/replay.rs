@@ -275,6 +275,7 @@ impl Guard {
 			memory.expire(clock);
 			if (wanted > 0).then(|| memory.raise(wanted)).flatten().or_else(|| memory.timer(clock)).is_some() {memory.written()}
 		});
+		self.ended.send_modify(|ended| *ended += 1);
 	}
 
 	/// A memory without a file, as one that started without a file `ahead` seconds ago and wrote every limit it wanted since. For the harness of a fuzz target and for tests that need no disk: a node never has one.
