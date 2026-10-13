@@ -1,0 +1,1680 @@
+{
+  "components": {
+    "schemas": {
+      "Applied": {
+        "properties": {
+          "diff": {
+            "$ref": "#/components/schemas/Diff"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "report": {
+            "$ref": "#/components/schemas/Report",
+            "description": "The warnings of the config that is now in force."
+          },
+          "revision": {
+            "type": "string"
+          },
+          "save_error": {
+            "description": "Why the write failed, as the system names it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "saved": {
+            "description": "False when the config is in force and could not be written to the config file: a restart would come back with the config before. Sending the same document again tries the write again.\nA write that was given up on after 10 seconds is not stopped, so the file may still come to hold this config. It never goes back to an older one.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "revision",
+          "generation",
+          "saved",
+          "save_error",
+          "diff",
+          "report"
+        ],
+        "type": "object"
+      },
+      "Backend": {
+        "enum": [
+          "netstack",
+          "l3",
+          "block"
+        ],
+        "type": "string"
+      },
+      "Changes": {
+        "description": "Tags or names of one kind.",
+        "properties": {
+          "added": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "changed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "added",
+          "changed",
+          "removed"
+        ],
+        "type": "object"
+      },
+      "ConfigApplied": {
+        "description": "The data of a `config_applied` event.",
+        "properties": {
+          "diff": {
+            "$ref": "#/components/schemas/Diff"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "revision",
+          "diff"
+        ],
+        "type": "object"
+      },
+      "ConfigRefused": {
+        "description": "The data of a `config_refused` event: a reload or an apply that left the running config in force.",
+        "properties": {
+          "errors": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stage": {
+            "$ref": "#/components/schemas/Stage"
+          }
+        },
+        "required": [
+          "stage",
+          "errors"
+        ],
+        "type": "object"
+      },
+      "Denied": {
+        "enum": [
+          "disabled",
+          "expired",
+          "quota"
+        ],
+        "type": "string"
+      },
+      "Device": {
+        "properties": {
+          "addresses": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "handshake_age_secs": {
+            "description": "Seconds since the session the device has was made. Null without a session.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "public_key",
+          "addresses",
+          "handshake_age_secs"
+        ],
+        "type": "object"
+      },
+      "Diff": {
+        "description": "What an apply adds, changes and removes, by tag and name.",
+        "properties": {
+          "dns": {
+            "type": "boolean"
+          },
+          "exits": {
+            "$ref": "#/components/schemas/Changes"
+          },
+          "inbound_changes": {
+            "items": {
+              "$ref": "#/components/schemas/InboundChange"
+            },
+            "type": "array"
+          },
+          "inbounds": {
+            "$ref": "#/components/schemas/Changes"
+          },
+          "log": {
+            "type": "boolean"
+          },
+          "outbounds": {
+            "$ref": "#/components/schemas/Changes"
+          },
+          "routing_default": {
+            "type": "boolean"
+          },
+          "rules": {
+            "$ref": "#/components/schemas/Changes"
+          },
+          "rules_reordered": {
+            "type": "boolean"
+          },
+          "user_changes": {
+            "items": {
+              "$ref": "#/components/schemas/UserChange"
+            },
+            "type": "array"
+          },
+          "users": {
+            "$ref": "#/components/schemas/Changes"
+          }
+        },
+        "required": [
+          "inbounds",
+          "outbounds",
+          "exits",
+          "rules",
+          "users",
+          "dns",
+          "log",
+          "routing_default",
+          "rules_reordered",
+          "inbound_changes",
+          "user_changes"
+        ],
+        "type": "object"
+      },
+      "Difference": {
+        "properties": {
+          "diff": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Diff"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Against the running config. Null for a document that is not valid."
+          },
+          "report": {
+            "$ref": "#/components/schemas/Report"
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "valid",
+          "report",
+          "diff"
+        ],
+        "type": "object"
+      },
+      "Dns": {
+        "description": "What the node's resolver did with the DNS queries of its tunnels since start.",
+        "properties": {
+          "answered": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "malformed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "throttled": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "answered",
+          "refused",
+          "failed",
+          "malformed",
+          "throttled"
+        ],
+        "type": "object"
+      },
+      "Document": {
+        "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\". In a request the marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. An outbound whose server is new or has changed needs its username and password written out.",
+        "type": "object"
+      },
+      "ErrorBody": {
+        "description": "The one shape of every answer that is not a success.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Failure"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Exit": {
+        "properties": {
+          "backend": {
+            "$ref": "#/components/schemas/Backend"
+          },
+          "name": {
+            "type": "string"
+          },
+          "outbound": {
+            "description": "The tag of the outbound of a netstack backend.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tag": {
+            "type": "string"
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/Traffic"
+          },
+          "udp": {
+            "description": "Whether the SOCKS5 proxy of the exit relays UDP as far as the node knows. Null for an exit without one.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "udp_down_secs": {
+            "description": "Seconds since the proxy last refused to relay UDP. The node tries again once a minute. Null while `udp` is not false.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "udp_flips": {
+            "description": "How often the proxy switched between relaying UDP and not.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tag",
+          "name",
+          "backend",
+          "outbound",
+          "udp",
+          "udp_down_secs",
+          "udp_flips",
+          "traffic"
+        ],
+        "type": "object"
+      },
+      "ExitUdpChanged": {
+        "description": "The data of an `exit_udp_changed` event.",
+        "properties": {
+          "exit": {
+            "type": "string"
+          },
+          "udp": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "exit",
+          "udp"
+        ],
+        "type": "object"
+      },
+      "Exits": {
+        "properties": {
+          "exits": {
+            "items": {
+              "$ref": "#/components/schemas/Exit"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "exits"
+        ],
+        "type": "object"
+      },
+      "Failure": {
+        "properties": {
+          "code": {
+            "description": "Stable, for programs.",
+            "type": "string"
+          },
+          "details": {
+            "description": "For a config that was refused, every error with the path of its field. For a stale revision, one entry with the path `revision` and the revision that runs.",
+            "items": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "type": "array"
+          },
+          "message": {
+            "description": "One plain sentence, for people.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "details"
+        ],
+        "type": "object"
+      },
+      "InboundChange": {
+        "properties": {
+          "restart": {
+            "description": "The tunnel restarts and every session of it drops.",
+            "type": "boolean"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "transports_started": {
+            "description": "Indexes into the transports of the new inbound.",
+            "items": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "transports_stopped": {
+            "description": "Indexes into the transports of the running inbound.",
+            "items": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tag",
+          "restart",
+          "transports_stopped",
+          "transports_started"
+        ],
+        "type": "object"
+      },
+      "Lagged": {
+        "description": "The data of a `lagged` event: this many events, the ones whose ids are missing before the next event, never reached the reader. It was too slow for them, or the node made them faster than it keeps them for anybody. It has no id.",
+        "properties": {
+          "missed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "missed"
+        ],
+        "type": "object"
+      },
+      "Problem": {
+        "description": "One problem of a config document: where it is and what was expected there. It never holds a value from the document.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "message"
+        ],
+        "type": "object"
+      },
+      "QuotaPeriod": {
+        "enum": [
+          "daily",
+          "weekly",
+          "monthly"
+        ],
+        "type": "string"
+      },
+      "Rated": {
+        "description": "The counters of one user, inbound or exit, with how fast they grew over the last seconds.",
+        "properties": {
+          "down_bytes_per_sec": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The user's name, or the tag of the inbound or exit.",
+            "type": "string"
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/Traffic"
+          },
+          "up_bytes_per_sec": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "traffic",
+          "up_bytes_per_sec",
+          "down_bytes_per_sec"
+        ],
+        "type": "object"
+      },
+      "Reason": {
+        "enum": [
+          "disabled",
+          "expired",
+          "quota",
+          "removed"
+        ],
+        "type": "string"
+      },
+      "Report": {
+        "properties": {
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "type": "array"
+          },
+          "more_errors": {
+            "description": "Errors beyond the first hundred, which are only counted.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "more_warnings": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shadow_cut_short": {
+            "description": "The check for rules covered by an earlier rule stopped at its budget.",
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "$ref": "#/components/schemas/Problem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "errors",
+          "warnings",
+          "more_errors",
+          "more_warnings",
+          "shadow_cut_short"
+        ],
+        "type": "object"
+      },
+      "Running": {
+        "properties": {
+          "document": {
+            "$ref": "#/components/schemas/Document"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revision": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "generation",
+          "document"
+        ],
+        "type": "object"
+      },
+      "Session": {
+        "description": "A device with a live session on one inbound. The address the device connects from is not part of it.",
+        "properties": {
+          "device": {
+            "type": "string"
+          },
+          "flows": {
+            "description": "The flows of the device, through all its inbounds together.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshake_age_secs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inbound": {
+            "type": "string"
+          },
+          "public_key": {
+            "type": "string"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Transport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null when the transport the device came over is gone."
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "device",
+          "public_key",
+          "inbound",
+          "transport",
+          "handshake_age_secs",
+          "flows"
+        ],
+        "type": "object"
+      },
+      "Sessions": {
+        "properties": {
+          "sessions": {
+            "items": {
+              "$ref": "#/components/schemas/Session"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
+      "Stage": {
+        "enum": [
+          "validate",
+          "prepare"
+        ],
+        "type": "string"
+      },
+      "Stats": {
+        "properties": {
+          "dns": {
+            "$ref": "#/components/schemas/Dns"
+          },
+          "drops": {
+            "additionalProperties": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "Packets that were not carried since start, by reason.",
+            "type": "object"
+          },
+          "exits": {
+            "items": {
+              "$ref": "#/components/schemas/Rated"
+            },
+            "type": "array"
+          },
+          "flows": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inbounds": {
+            "items": {
+              "$ref": "#/components/schemas/Rated"
+            },
+            "type": "array"
+          },
+          "state_write_failures": {
+            "description": "Writes of the usage state file that failed since start.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/Rated"
+            },
+            "type": "array"
+          },
+          "window_secs": {
+            "description": "The seconds the rates were taken over: 5 once the node has run that long, 0 before its second sample.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ws_refused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ws_stalled": {
+            "description": "WebSocket connections dropped because they never finished the upgrade, and refused at accept.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "window_secs",
+          "users",
+          "inbounds",
+          "exits",
+          "drops",
+          "dns",
+          "flows",
+          "ws_stalled",
+          "ws_refused",
+          "state_write_failures"
+        ],
+        "type": "object"
+      },
+      "Status": {
+        "properties": {
+          "exits": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "flows": {
+            "description": "Flows in the flow table right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "description": "Starts at 1 and grows by one with every config that is put in force.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inbounds": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "revision": {
+            "description": "What `If-Match` takes: 64 hex digits that name the bytes of the running config. Only this run of the node gives them this name: nobody else can work it out from a document, and after a restart the same config has another one.",
+            "type": "string"
+          },
+          "uptime_secs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "users": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "generation",
+          "revision",
+          "uptime_secs",
+          "inbounds",
+          "exits",
+          "users",
+          "flows"
+        ],
+        "type": "object"
+      },
+      "Traffic": {
+        "description": "Inner IP packets and their bytes since the node first knew the name. Up is from the device into the node.",
+        "properties": {
+          "down_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "down_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "up_bytes",
+          "up_packets",
+          "down_bytes",
+          "down_packets"
+        ],
+        "type": "object"
+      },
+      "Transport": {
+        "enum": [
+          "udp",
+          "ws"
+        ],
+        "type": "string"
+      },
+      "User": {
+        "properties": {
+          "denied": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Denied"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the user cannot connect right now. Null for a user who can."
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/Device"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "period_start": {
+            "description": "When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "quota_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "quota_period": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuotaPeriod"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/Traffic"
+          },
+          "used_bytes": {
+            "description": "Bytes in both directions since `period_start`, which is what `quota_bytes` is held against.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "enabled",
+          "denied",
+          "expires_at",
+          "quota_bytes",
+          "quota_period",
+          "used_bytes",
+          "period_start",
+          "traffic",
+          "devices"
+        ],
+        "type": "object"
+      },
+      "UserChange": {
+        "description": "Devices are named by their public key.",
+        "properties": {
+          "devices_added": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "devices_readdressed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "devices_rekeyed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "devices_removed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "lost_access": {
+            "description": "The user could connect and no longer can.",
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "devices_added",
+          "devices_removed",
+          "devices_readdressed",
+          "devices_rekeyed",
+          "lost_access"
+        ],
+        "type": "object"
+      },
+      "UserCutOff": {
+        "description": "The data of a `user_cut_off` event.",
+        "properties": {
+          "reason": {
+            "$ref": "#/components/schemas/Reason"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "UserRestored": {
+        "description": "The data of a `user_restored` event.",
+        "properties": {
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user"
+        ],
+        "type": "object"
+      },
+      "Users": {
+        "properties": {
+          "users": {
+            "items": {
+              "$ref": "#/components/schemas/User"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "users"
+        ],
+        "type": "object"
+      },
+      "Validation": {
+        "properties": {
+          "report": {
+            "$ref": "#/components/schemas/Report"
+          },
+          "valid": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "valid",
+          "report"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "HTTP/1.1 and JSON on the unix socket of a node. Whoever can open the socket is the administrator: there is no other authentication. Every answer that is not a success has the shape of ErrorBody. No answer and no event holds a secret.",
+    "title": "Veilway control API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/config": {
+      "get": {
+        "operationId": "getConfig",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Running"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "The running config with every secret replaced by the marker \"<redacted>\", and its revision, which is also the ETag."
+      },
+      "put": {
+        "operationId": "applyConfig",
+        "parameters": [
+          {
+            "description": "The revision of the config the change was made on, as GET /v1/config gave it, with or without quotes.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Applied"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The document was not read and checked within 30 seconds. Nothing was changed: once the node has begun to put a config in force, the answer waits for it however long that takes, and is never this one."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config is not the one If-Match names. The details and the ETag hold the revision that runs."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The document is not a valid config, or the node could not prepare it. Nothing was changed."
+          },
+          "428": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The header If-Match is missing."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Puts a config in force, the way a reload on SIGHUP does, and writes it to the config file. If-Match must name the revision the change was made on. A document that is refused changes nothing. An outbound keeps its username and password for a marker only while its server is the same."
+      }
+    },
+    "/v1/config/diff": {
+      "post": {
+        "operationId": "diffConfig",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Difference"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "What an apply of the document would add, change and remove, by tag and name. Nothing changes. An outbound whose username or password is written out, and not left as the marker, is listed as changed whatever they are."
+      }
+    },
+    "/v1/config/validate": {
+      "post": {
+        "operationId": "validateConfig",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Validation"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Validates a document and changes nothing. Errors and warnings name the path of a field and never its value."
+      }
+    },
+    "/v1/events": {
+      "get": {
+        "operationId": "events",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The stream. The data of each event is one JSON document, see x-events."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive."
+      }
+    },
+    "/v1/exits": {
+      "get": {
+        "operationId": "listExits",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Exits"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every exit with what the node knows of its upstream, and its counters."
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "operationId": "openapi",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "This document."
+      }
+    },
+    "/v1/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Sessions"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "The devices with a live session."
+      }
+    },
+    "/v1/stats": {
+      "get": {
+        "operationId": "stats",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every counter at one moment, with rates in bytes per second over the last 5 seconds."
+      }
+    },
+    "/v1/status": {
+      "get": {
+        "operationId": "status",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "What runs: the version, the config in force and how much of everything there is."
+      }
+    },
+    "/v1/users": {
+      "get": {
+        "operationId": "listUsers",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Users"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every user of the running config with their usage, counters and devices."
+      }
+    },
+    "/v1/users/{name}": {
+      "get": {
+        "operationId": "getUser",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no user of that name."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "One user."
+      }
+    }
+  },
+  "x-events": {
+    "config_applied": {
+      "$ref": "#/components/schemas/ConfigApplied"
+    },
+    "config_refused": {
+      "$ref": "#/components/schemas/ConfigRefused"
+    },
+    "exit_udp_changed": {
+      "$ref": "#/components/schemas/ExitUdpChanged"
+    },
+    "lagged": {
+      "$ref": "#/components/schemas/Lagged"
+    },
+    "stats": {
+      "$ref": "#/components/schemas/Stats"
+    },
+    "user_cut_off": {
+      "$ref": "#/components/schemas/UserCutOff"
+    },
+    "user_restored": {
+      "$ref": "#/components/schemas/UserRestored"
+    }
+  }
+}

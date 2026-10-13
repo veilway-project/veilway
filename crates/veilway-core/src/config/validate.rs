@@ -141,6 +141,8 @@ impl Config {
 					if username.is_some() != password.is_some() {r.error(format!("outbounds[{i}]"), "expected username and password together, or neither")}
 					for (key, secret) in [("username", username), ("password", password)] {
 						if secret.as_ref().is_some_and(|s| !(1..=MAX_CREDENTIAL_BYTES).contains(&s.expose().len())) {r.error(format!("outbounds[{i}].{key}"), format!("expected 1 to {MAX_CREDENTIAL_BYTES} bytes"))}
+						// The marker is text like any user name, so it parses. A key that holds it does not: it is no base64. It gets here in a document the control API showed that was saved as the config file.
+						if secret.as_ref().is_some_and(|s| s.expose() == REDACTED) {r.error(format!("outbounds[{i}].{key}"), format!("expected a {key}, found the marker the control API shows in the place of one: write the {key} itself"))}
 					}
 				}
 				_ => {}

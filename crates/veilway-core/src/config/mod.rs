@@ -7,13 +7,14 @@ mod validate;
 pub use model::*;
 pub(crate) use model::domain;
 pub use reload::*;
+use ring::rand::{SecureRandom, SystemRandom};
 use schemars::generate::SchemaSettings;
 use schemars::transform::{RecursiveTransform, Transform};
 use schemars::Schema;
 use serde_json::{json, Value};
 use std::fmt;
-use std::fs::File;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -133,6 +134,34 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 	(report.readable, report.revision) = (readable, revision);
 	if readable {report.warning("", "the config file can be read by group or others; `veilway run` refuses that unless started with --allow-readable-config")}
 	(config, report)
+}
+
+/// Puts a config document in the place of the config file: a temporary file next to it with mode 600, synced, then renamed over it, and the directory synced after that,
+/// so a node that is killed halfway starts with the old file or the new one, and a rename that was answered for is still there after a power loss.
+/// A path that is a link is followed first: the link stays and the file it names is replaced. The bytes hold keys and passwords.
+/// The temporary file has a name of this one write, so two writes never meet in it, and no file is ever removed that this write did not make: a name that is taken is an error. A write that is killed halfway leaves its temporary file behind.
+pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
+	let target = match fs::canonicalize(path) {
+		Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
+		target => target?,
+	};
+	let (mut name, mut tmp) = ([0u8; 8], target.clone().into_os_string());
+	SystemRandom::new().fill(&mut name).map_err(|_| io::Error::other("the system gave no random name for the temporary file"))?;
+	tmp.push(format!(".{}.tmp", name.iter().map(|byte| format!("{byte:02x}")).collect::<String>()));
+	let mut options = fs::OpenOptions::new();
+	// `create_new` never follows a link and never opens what is already there.
+	options.write(true).create_new(true);
+	#[cfg(unix)]
+	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+	let mut file = options.open(&tmp)?;
+	let written = file.write_all(bytes).and_then(|_| file.sync_all()).and_then(|_| fs::rename(&tmp, &target));
+	if written.is_err() {
+		let _ = fs::remove_file(&tmp);
+		return written;
+	}
+	#[cfg(unix)]
+	File::open(target.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new(".")))?.sync_all()?;
+	Ok(())
 }
 
 /// The JSON Schema of config version 1, as committed in `schema/config.v1.json`.

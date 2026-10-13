@@ -2,7 +2,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Instant;
-use veilway_core::config::{load, schema, Config, Diagnostic, Report, MAX_DIAGNOSTICS, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_RULES, MAX_USERS};
+use veilway_core::config::{load, save, schema, Config, Diagnostic, Report, MAX_DIAGNOSTICS, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_RULES, MAX_USERS, REDACTED};
 
 /// An obviously fake key: one byte repeated.
 fn key(byte: u8) -> String {veilway_wg::encode_key(&[byte; 32])}
@@ -103,6 +103,102 @@ fn shipped_example_is_clean_and_survives_a_round_trip() {
 	let config = Config::parse(&bytes).unwrap();
 	assert_eq!(config.validate(true), Report::default());
 	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);
+}
+
+#[test]
+fn a_redacted_document_shows_no_secret_and_comes_back_with_every_one_of_them() {
+	let bytes = std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config.example.json")).unwrap();
+	let config = Config::parse(&bytes).unwrap();
+	let (shown, saved) = (config.redacted().to_string(), serde_json::to_string(&config).unwrap());
+	for secret in ["ERERERERERERERERERERERERERERERERERERERERERE=", "EhISEhISEhISEhISEhISEhISEhISEhISEhISEhISEhI=", "ExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExM=", "MTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTE=", "example-user", "example-password"] {
+		assert!(!shown.contains(secret) && saved.contains(secret), "a secret is in the redacted document, or missing from the one that is saved");
+	}
+	assert_eq!(shown.matches(REDACTED).count(), 6);
+	// Showing a document must not change how the next one is saved on the same thread.
+	assert_eq!(serde_json::to_string(&config).unwrap(), saved);
+	assert!(Config::parse(shown.as_bytes()).is_err(), "a marker was taken for a secret without a running config to take it from");
+	assert!(Config::parse_keeping(shown.as_bytes(), &config).ok() == Some((config.clone(), Vec::new())), "the secrets of the running config did not come back for their markers");
+	// A user name or a password that is written out is said to be, whatever it holds: the control API lists such an outbound as changed without saying whether it is.
+	assert_eq!(Config::parse_keeping(saved.as_bytes(), &config).ok().map(|(_, spelled)| spelled), Some(vec!["proxy".to_string()]));
+	// Each marker belongs to an object of the running config. Under another tag or key there is nothing to keep, and the error names the field and no value.
+	let mut moved: Value = serde_json::from_str(&shown).unwrap();
+	(moved["inbounds"][0]["tag"], moved["outbounds"][0]["tag"], moved["users"][0]["devices"][1]["public_key"]) = (json!("elsewhere"), json!("other"), json!(key(99)));
+	let report = Config::parse_keeping(moved.to_string().as_bytes(), &config).err().expect("markers with nothing to keep were taken");
+	assert_eq!(report.errors.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["inbounds[0].private_key", "outbounds[0].username", "outbounds[0].password", "users[0].devices[1].preshared_key"]);
+	assert!(report.errors.iter().all(|e| !e.message.contains('=') && !e.message.contains("example-")), "{report:?}");
+	// A marker where no secret belongs is a wrong value like any other.
+	let mut misplaced: Value = serde_json::from_str(&saved).unwrap();
+	misplaced["users"][0]["devices"][0]["public_key"] = json!(REDACTED);
+	assert_eq!(Config::parse_keeping(misplaced.to_string().as_bytes(), &config).err().map(|report| report.errors[0].path.clone()).as_deref(), Some("users[0].devices[0].public_key"));
+}
+
+/// A document the control API showed, saved as the config file with real keys pasted in, must not start a node that logs in to its proxy as the marker.
+#[test]
+fn the_marker_is_no_user_name_and_no_password_of_a_config_that_runs() {
+	cases!(error_at:
+		"outbounds[0].username": |doc| doc["outbounds"][0]["username"] = json!(REDACTED);
+		"outbounds[0].password": |doc| doc["outbounds"][0]["password"] = json!(REDACTED);
+	);
+	let report = check(&with(|doc| (doc["outbounds"][0]["username"], doc["outbounds"][0]["password"]) = (json!(REDACTED), json!(REDACTED))));
+	assert_eq!(report.errors.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(), ["outbounds[0].username", "outbounds[0].password"]);
+}
+
+/// A marker keeps a user name and a password for the proxy they were shown for and no other: kept under another server, the node would hand them to whoever the document names.
+#[test]
+fn a_marker_keeps_the_secrets_of_an_outbound_only_while_it_is_the_same_proxy() {
+	let config = parse(&with(|doc| push(doc, "/outbounds", json!({"tag": "second", "type": "socks5", "server": "proxy.example.com:1080", "username": "second-user", "password": "second-password"})))).unwrap();
+	let shown = config.redacted();
+	let kept = |edit: &dyn Fn(&mut Value)| {
+		let mut doc = shown.clone();
+		edit(&mut doc);
+		Config::parse_keeping(doc.to_string().as_bytes(), &config).map_err(|report| report.errors.iter().map(|e| e.path.clone()).collect::<Vec<_>>())
+	};
+	assert!(kept(&|_| {}).is_ok());
+	assert_eq!(kept(&|doc| doc["outbounds"][0]["server"] = json!("127.0.0.1:9")).err(), Some(vec!["outbounds[0].username".to_string(), "outbounds[0].password".to_string()]));
+	assert_eq!(kept(&|doc| doc["outbounds"][2]["server"] = json!("other.example.com:1080")).err(), Some(vec!["outbounds[2].username".to_string(), "outbounds[2].password".to_string()]));
+	assert_eq!(kept(&|doc| (doc["outbounds"][0]["tag"], doc["outbounds"][2]["tag"]) = (json!("second"), json!("proxy"))).err().map(|paths| paths.len()), Some(4));
+	// A server that changes with its secrets sent along is a new proxy like any other.
+	assert!(kept(&|doc| doc["outbounds"][0] = json!({"tag": "proxy", "type": "socks5", "server": "127.0.0.1:9", "username": "fresh-user", "password": "fresh-password"})).is_ok());
+}
+
+/// Two writes at once, each of its own megabyte, next to a file the node never made that has the name a temporary file used to have.
+#[test]
+fn writes_of_the_config_file_share_no_temporary_file_and_remove_nobody_elses() {
+	let dir = std::env::temp_dir().join(format!("veilway-config-save-{}", std::process::id()));
+	let _ = std::fs::remove_dir_all(&dir);
+	std::fs::create_dir_all(&dir).unwrap();
+	let (path, theirs) = (&dir.join("config.json"), dir.join("config.json.tmp"));
+	std::fs::write(&theirs, "somebody's").unwrap();
+	let contents: Vec<Vec<u8>> = (0..4u8).map(|i| vec![b'a' + i; 1 << 20]).collect();
+	std::thread::scope(|scope| {
+		for content in &contents {
+			scope.spawn(move || {
+				for _ in 0..25 {save(path, content).expect("a write of the config file failed next to another one")}
+			});
+		}
+	});
+	assert!(contents.contains(&std::fs::read(path).unwrap()), "the config file holds what no single write put there");
+	assert_eq!(std::fs::read_to_string(&theirs).unwrap(), "somebody's", "a file the node did not make was touched");
+	let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect();
+	left.sort();
+	assert_eq!(left, ["config.json", "config.json.tmp"], "a temporary file was left behind");
+	#[cfg(unix)]
+	assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777, 0o600);
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A list of short values costs many times its text once it is a tree, so a root that is no object is refused for what it is, however many values it holds.
+#[test]
+fn a_document_that_is_no_object_is_refused_before_it_is_held_in_memory() {
+	let refused = Config::parse(format!("[{}0]", "0,".repeat(MAX_JSON_NODES)).as_bytes()).unwrap_err();
+	assert_eq!((refused.path.as_str(), refused.message.as_str()), ("", "expected an object, found a list"));
+	for (text, found) in [("[]", "a list"), (" \r\n\t\"text\"", "a string"), ("7", "a number"), ("-1.5", "a number"), ("true", "true or false"), ("null", "null")] {
+		assert_eq!(Config::parse(text.as_bytes()).unwrap_err().message, format!("expected an object, found {found}"), "{text}");
+	}
+	for broken in ["[1,", "nothing", "", "[] []"] {
+		let refused = Config::parse(broken.as_bytes()).unwrap_err();
+		assert!(refused.path.is_empty() && refused.message.starts_with("expected one JSON document"), "{broken:?}: {}", refused.message);
+	}
 }
 
 #[test]
@@ -1027,13 +1123,14 @@ fn load_reads_a_file() {
 	assert!(config.is_none() && report.errors.len() == 1 && report.errors[0].message.contains("cannot read"));
 }
 
-/// The list itself is one value, so `MAX_JSON_NODES` zeros are one too many.
+/// The object and the list in it are one value each, so `MAX_JSON_NODES` - 1 zeros are one too many.
 #[test]
 fn a_document_of_too_many_values_is_refused_before_it_is_held_in_memory() {
 	let zeros = |n: usize| format!("[{}0]", "0,".repeat(n - 1));
-	let over = Config::parse(zeros(MAX_JSON_NODES).as_bytes()).unwrap_err();
+	// The object around the list is one more value, and so is the list.
+	let over = Config::parse(format!("{{\"version\":{}}}", zeros(MAX_JSON_NODES - 1)).as_bytes()).unwrap_err();
 	assert!(over.path.is_empty() && over.message.contains(&format!("more than {MAX_JSON_NODES} values")), "{}", over.message);
-	assert!(!Config::parse(zeros(MAX_JSON_NODES - 1).as_bytes()).unwrap_err().message.contains("values"));
+	assert!(!Config::parse(format!("{{\"version\":{}}}", zeros(MAX_JSON_NODES - 2)).as_bytes()).unwrap_err().message.contains("values"));
 	// Values inside objects count the same. That many keys of one object would not fit the file size limit, so each key holds a list.
 	let lists: String = (0..1000).map(|i| format!("\"{i}\":{},", zeros(MAX_JSON_NODES / 1000))).collect();
 	assert!(Config::parse(format!("{{{lists}\"z\":0}}").as_bytes()).unwrap_err().message.contains("values"));

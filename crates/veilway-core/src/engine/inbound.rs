@@ -3,7 +3,7 @@ use super::icmp::{self, Kind};
 use super::netstack::{self, Packet};
 use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
-use super::{flows, gate, l3, resolver, Shared};
+use super::{flows, gate, l3, resolver, Over, Shared};
 use crate::config::Protocol;
 use ipstack::{IpStack, IpStackStream};
 use std::net::SocketAddr;
@@ -21,8 +21,8 @@ const FIN_OR_RST: u8 = 0x05;
 
 pub struct Peers {
 	pub wg: Wg,
-	/// For each peer index, the socket its last authenticated datagram came in on. Replies leave through that one, and nowhere once its transport is gone.
-	pub via: Vec<Weak<UdpSocket>>,
+	/// For each peer index, the socket its last authenticated datagram came in on, and what kind of transport that socket belongs to. Replies leave through that one, and nowhere once its transport is gone.
+	pub via: Vec<(Weak<UdpSocket>, Over)>,
 }
 
 impl Peers {
@@ -30,8 +30,8 @@ impl Peers {
 	pub fn add(&mut self, public_key: [u8; 32], preshared_key: Option<[u8; 32]>) {
 		match self.wg.add_peer(public_key, preshared_key, None) {
 			Ok(peer) => {
-				if self.via.len() <= peer {self.via.resize(peer + 1, Weak::new())}
-				self.via[peer] = Weak::new();
+				if self.via.len() <= peer {self.via.resize(peer + 1, (Weak::new(), Over::Udp))}
+				self.via[peer] = (Weak::new(), Over::Udp);
 			}
 			Err(e) => tracing::error!("a device could not be made a peer of its tunnel: {e}"),
 		}
@@ -59,7 +59,7 @@ impl Shared {
 			let mut peers = inbound.tunnel.lock();
 			let Some(peer) = peers.wg.index(&device.public_key).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {return};
 			peers.wg.encapsulate(peer, packet, &mut out);
-			peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(Weak::upgrade))
+			peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade()))
 		};
 		let Some((endpoint, socket)) = route else {return};
 		self.spend(&plan.users[device.user], false, packet.len());
@@ -280,8 +280,8 @@ impl Shared {
 	}
 }
 
-/// Reads one socket for one tunnel until the handle it returns is aborted: a `udp` transport's own socket, or the loopback socket the `ws` transports of the inbound relay to.
-pub fn read(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, socket: Arc<UdpSocket>) -> AbortHandle {
+/// Reads one socket for one tunnel until the handle it returns is aborted: a `udp` transport's own socket, or the loopback socket the `ws` transports of the inbound relay to. `over` says which of the two it is.
+pub fn read(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, socket: Arc<UdpSocket>, over: Over) -> AbortHandle {
 	let shared = shared.clone();
 	tokio::spawn(async move {
 		let mut buf = vec![0u8; MAX_PACKET];
@@ -295,7 +295,7 @@ pub fn read(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, socket: Arc<UdpSocket>) -
 				let mut peers = tunnel.lock();
 				let received = peers.wg.recv_authenticated(from, &buf[..n], &mut net_out, &mut ip_out);
 				if let Some((peer, true)) = received {
-					if let Some(via) = peers.via.get_mut(peer) {*via = Arc::downgrade(&socket)}
+					if let Some(via) = peers.via.get_mut(peer) {*via = (Arc::downgrade(&socket), over)}
 				}
 				received.and_then(|(peer, _)| peers.wg.key(peer))
 			};
@@ -340,7 +340,7 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 				let targets: Vec<Option<(SocketAddr, Arc<UdpSocket>)>> = {
 					let mut peers = tunnel.lock();
 					peers.wg.update_timers(&mut out);
-					out.iter().map(|(peer, _)| peers.wg.endpoint(*peer).zip(peers.via.get(*peer).and_then(Weak::upgrade))).collect()
+					out.iter().map(|(peer, _)| peers.wg.endpoint(*peer).zip(peers.via.get(*peer).and_then(|(socket, _)| socket.upgrade()))).collect()
 				};
 				for ((_, datagram), target) in out.iter().zip(targets) {
 					if let Some((endpoint, socket)) = target {let _ = socket.send_to(datagram, endpoint).await;}

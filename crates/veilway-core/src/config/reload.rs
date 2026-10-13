@@ -1,14 +1,16 @@
 //! Reloading: the running config behind a watch channel, the diff between two configs and the two-phase apply.
 //! Nothing here holds or logs a value from a document except tags, user names and device public keys.
 use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, User, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
-use ring::digest::{digest, SHA256};
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{BuildHasher, RandomState};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use time::OffsetDateTime;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -19,14 +21,26 @@ use tracing::{info, warn};
 /// Tags or names of one kind that a log line lists before it only counts the rest.
 pub const MAX_NAMES_LOGGED: usize = 32;
 
-/// The SHA-256 of the exact bytes a config was loaded from.
+/// The key of every revision of this process, made when the first one is asked for and never shown.
+static KEY: LazyLock<hmac::Key> = LazyLock::new(|| {
+	let mut key = [0u8; 32];
+	// The system's generator does not fail on a system the node runs on. Should it, the seed std gives the hash maps of the process is what is left, which is still nothing anybody outside it knows.
+	if SystemRandom::new().fill(&mut key).is_err() {
+		for (i, chunk) in key.chunks_mut(8).enumerate() {chunk.copy_from_slice(&RandomState::new().hash_one(i).to_le_bytes())}
+	}
+	hmac::Key::new(hmac::HMAC_SHA256, &key)
+});
+
+/// Names the exact bytes a config was loaded from, for this process alone: their HMAC-SHA-256 under `KEY`.
+/// The bytes hold keys and passwords, and a revision is shown to whoever may see the config without them. A plain hash would let them try a guess of a password against it, so it is keyed,
+/// and a revision means nothing to another process: a node that starts again on the same file calls it something else.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Revision([u8; 32]);
 
 impl Revision {
 	pub fn of(bytes: &[u8]) -> Revision {
 		let mut hash = [0; 32];
-		hash.copy_from_slice(digest(&SHA256, bytes).as_ref());
+		hash.copy_from_slice(hmac::sign(&KEY, bytes).as_ref());
 		Revision(hash)
 	}
 }
