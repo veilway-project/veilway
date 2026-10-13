@@ -16,4 +16,5 @@ veilway-wg={path="../veilway-wg"}
 tokio.workspace=true
 anyhow.workspace=true
 clap.workspace=true
+tracing.workspace=true
 tracing-subscriber.workspace=true

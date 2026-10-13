@@ -10,7 +10,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -76,30 +76,56 @@ pub async fn serve_limited(listener:TcpListener, tls:Option<TlsFiles>, path:Stri
 	Ok(())
 }
 
+pub type Acceptor=tokio_rustls::TlsAcceptor;
+
+/// A request path, the UDP endpoint its frames are forwarded to, and a number that tells this route from an earlier one with the same path and endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route{pub path:String, pub target:SocketAddr, pub id:u64}
+
+/// What a relay listener serves at one moment: plain ws without an acceptor.
+pub struct Served{pub acceptor:Option<Acceptor>, pub routes:Vec<Route>}
+
+/// Reads a certificate chain and its key. What it says when it fails names neither file.
+pub fn acceptor(tls:&TlsFiles)->anyhow::Result<Acceptor>{
+	let _=rustls::crypto::ring::default_provider().install_default();
+	let certs=CertificateDer::pem_file_iter(&tls.cert).and_then(|certs| certs.collect::<Result<Vec<_>, _>>()).map_err(|e| anyhow::anyhow!("the certificate file: {e}"))?;
+	anyhow::ensure!(!certs.is_empty(), "the certificate file holds no certificate");
+	let key=PrivateKeyDer::from_pem_file(&tls.key).map_err(|e| anyhow::anyhow!("the key file: {e}"))?;
+	let mut cfg=rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
+	cfg.alpn_protocols=vec![b"http/1.1".to_vec()];
+	Ok(Acceptor::from(Arc::new(cfg)))
+}
+
 /// One listener for several tunnels: `routes` maps each request path to the UDP endpoint its frames are forwarded to.
 /// The certificate is loaded before this returns, so a bad file fails the caller instead of a background task.
 pub fn relay(listener:TcpListener, tls:Option<TlsFiles>, routes:Vec<(String, SocketAddr)>, max_conns:usize, stats:Arc<Stats>)->anyhow::Result<impl std::future::Future<Output=()>+Send+'static>{
+	let acceptor=tls.as_ref().map(|files| acceptor(files).map_err(|e| e.context(format!("tls files {} and {}", files.cert.display(), files.key.display())))).transpose()?;
+	info!(listen=%listener.local_addr()?, paths=?routes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), tls=acceptor.is_some(), max_conns, "relay listening");
+	let (keep, served)=watch::channel(Arc::new(Served{acceptor, routes:routes.into_iter().map(|(path, target)| Route{path, target, id:0}).collect()}));
+	let serving=relay_served(listener, served, max_conns, stats);
+	Ok(async move{
+		serving.await;
+		drop(keep);
+	})
+}
+
+/// The same listener for whatever `served` holds, which may change while it runs: every new connection gets the certificate and the routes of that moment,
+/// and a connection ends when its route is no longer served. When the other end of `served` is dropped the listener closes and every connection ends.
+pub fn relay_served(listener:TcpListener, mut served:watch::Receiver<Arc<Served>>, max_conns:usize, stats:Arc<Stats>)->impl std::future::Future<Output=()>+Send+'static{
 	let _=rustls::crypto::ring::default_provider().install_default();
 	let limit=Arc::new(tokio::sync::Semaphore::new(max_conns));
 	let by_source=Arc::new(Mutex::new(HashMap::<IpAddr, usize>::new()));
-	let acceptor=match &tls{
-		Some(f)=>{
-			let certs=CertificateDer::pem_file_iter(&f.cert)?.collect::<Result<Vec<_>, _>>()?;
-			anyhow::ensure!(!certs.is_empty(), "no certificates in {}", f.cert.display());
-			let key=PrivateKeyDer::from_pem_file(&f.key).map_err(|e| anyhow::anyhow!("private key in {}: {e}", f.key.display()))?;
-			let mut cfg=rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key)?;
-			cfg.alpn_protocols=vec![b"http/1.1".to_vec()];
-			Some(tokio_rustls::TlsAcceptor::from(Arc::new(cfg)))
-		}
-		None=>None,
-	};
-	let routes=Arc::new(routes);
-	info!(listen=%listener.local_addr()?, paths=?routes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), tls=acceptor.is_some(), max_conns, "relay listening");
-	Ok(async move{
+	async move{
 		loop{
-			let (stream, peer)=match listener.accept().await{
-				Ok(v)=>v,
-				Err(e)=>{warn!(error=%e, "accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue}
+			let (stream, peer)=tokio::select!{
+				accepted=listener.accept()=>match accepted{
+					Ok(v)=>v,
+					Err(e)=>{warn!(error=%e, "accept failed"); tokio::time::sleep(Duration::from_millis(50)).await; continue}
+				},
+				changed=served.changed()=>{
+					if changed.is_err(){return}
+					continue
+				}
 			};
 			let Ok(permit)=limit.clone().try_acquire_owned() else{
 				stats.refused.fetch_add(1, Ordering::Relaxed);
@@ -124,19 +150,21 @@ pub fn relay(listener:TcpListener, tls:Option<TlsFiles>, routes:Vec<(String, Soc
 				continue
 			}
 			let pending=Pending{by_source:by_source.clone(), source};
-			let (acceptor, routes, stats)=(acceptor.clone(), routes.clone(), stats.clone());
+			// The watcher is cloned before it is read, so a change that comes after this read is one the connection still hears of.
+			let (mut watching, stats)=(served.clone(), stats.clone());
+			let now=watching.borrow_and_update().clone();
 			tokio::spawn(async move{
 				let _permit=permit;
 				// One deadline for TLS and the upgrade together: until both are done the peer has proven nothing, and without it
 				// a connection that never speaks would hold its place for good.
 				let deadline=Instant::now()+UPGRADE_TIMEOUT;
-				let r=match acceptor{
+				let r=match &now.acceptor{
 					Some(a)=>match tokio::time::timeout_at(deadline, a.accept(stream)).await{
-						Ok(Ok(s))=>relay_conn(s, peer, &routes, deadline, pending).await,
+						Ok(Ok(s))=>relay_conn(s, peer, &now.routes, watching, deadline, pending).await,
 						Ok(Err(e))=>Err(anyhow::anyhow!("tls handshake: {e}")),
 						Err(e)=>Err(e.into()),
 					},
-					None=>relay_conn(stream, peer, &routes, deadline, pending).await,
+					None=>relay_conn(stream, peer, &now.routes, watching, deadline, pending).await,
 				};
 				match r{
 					Err(e) if e.is::<tokio::time::error::Elapsed>()=>{
@@ -148,19 +176,20 @@ pub fn relay(listener:TcpListener, tls:Option<TlsFiles>, routes:Vec<(String, Soc
 				}
 			});
 		}
-	})
+	}
 }
 
-/// One accepted transport: handshake on a known path before `deadline`, then pump a private UDP socket against the WS.
-async fn relay_conn<S>(stream:S, peer:SocketAddr, routes:&[(String, SocketAddr)], deadline:Instant, pending:Pending)->anyhow::Result<()>
+/// One accepted transport: handshake on a known path before `deadline`, then pump a private UDP socket against the WS for as long as `served` still holds the route it came in on.
+async fn relay_conn<S>(stream:S, peer:SocketAddr, routes:&[Route], mut served:watch::Receiver<Arc<Served>>, deadline:Instant, pending:Pending)->anyhow::Result<()>
 where S:AsyncRead+AsyncWrite+Unpin{
 	let mut chosen=None;
 	let ws=tokio::time::timeout_at(deadline, tokio_tungstenite::accept_hdr_async_with_config(stream, |req:&Request, resp:Response|->Result<Response, ErrorResponse>{
-		chosen=routes.iter().find(|(path, _)| req.uri().path()==path).map(|(_, target)| *target);
+		chosen=routes.iter().find(|route| req.uri().path()==route.path);
 		if chosen.is_some(){Ok(resp)}else{Err(Response::builder().status(404).body(Some("not found".to_string())).unwrap())}
 	}, Some(ws_config()))).await??;
 	drop(pending);
-	let target=chosen.ok_or_else(|| anyhow::anyhow!("handshake finished without a route"))?;
+	let route=chosen.ok_or_else(|| anyhow::anyhow!("handshake finished without a route"))?;
+	let target=route.target;
 	let udp=UdpSocket::bind(if target.is_ipv4(){SocketAddr::from((Ipv4Addr::LOCALHOST, 0))}else{SocketAddr::from((Ipv6Addr::LOCALHOST, 0))}).await?;
 	udp.connect(target).await?;
 	info!(%peer, %target, "ws connected");
@@ -191,6 +220,7 @@ where S:AsyncRead+AsyncWrite+Unpin{
 			}
 			_=ping.tick()=>tx.send(Message::Ping(Bytes::new())).await?,
 			_=tokio::time::sleep_until(deadline)=>break "idle",
+			changed=served.changed()=>if changed.is_err()|| !served.borrow_and_update().routes.contains(route){break "route removed"},
 		}
 	};
 	info!(%peer, reason, "ws disconnected");

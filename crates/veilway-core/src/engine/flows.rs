@@ -142,8 +142,8 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 		_ => (outbound, exit, true),
 	};
 	// A lookup is one round trip, so a port 53 flow must not pin an association and its control connection for long.
-	// The stack resets an idle TCP flow itself after the longest tcp_idle of any exit, so this timer is one second behind it and only ends flows of exits with a shorter one.
-	let idle = if key.protocol == 6 {*tcp_idle + Duration::from_secs(1)} else if key.dport == 53 {(*udp_idle).min(DNS_IDLE)} else {*udp_idle};
+	// The stack's own idle times are longer than any exit may set, because a tunnel outlives the exits of the config it started under. This timer is the one that ends an idle flow.
+	let idle = if key.protocol == 6 {*tcp_idle} else if key.dport == 53 {(*udp_idle).min(DNS_IDLE)} else {*udp_idle};
 	shared.flows.hold(&key, id, idle + HOLD_MARGIN);
 	let relay = async {
 		match (stream, outbound) {
@@ -222,7 +222,8 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 					Fallback::Drop => refused(Reason::Unsupported, false),
 					_ => refused(Reason::Unsupported, true),
 				};
-				shared.flows.decide(&key, id, decision);
+				// A reload came in between: the flow ends here, and its next packet is decided under the config that runs now.
+				if !shared.flows.decide(&key, id, decision, plan.generation) {return}
 				tracing::debug!("exit {tag}: udp to {}: the upstream relays no udp, so the flow is now {decision:?}", plan.show(target));
 				if let Some(next) = onward {
 					(outbound, carrier, own) = (next.0, next.1, false);
@@ -251,7 +252,11 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 	};
 	tokio::select! {
 		_ = relay => {}
-		_ = shared.flows.quiet(key, id, idle) => tracing::debug!("exit {tag}: a flow to {} was idle for {idle:?}", plan.show(target)),
+		_ = shared.flows.quiet(key, id, idle) => {
+			// Idle, or ended by a reload. The stack says nothing when its stream is dropped, so an idle TCP flow is reset from here. One a reload ended has had its reset from there, and its entry is gone.
+			tracing::debug!("exit {tag}: a flow to {} was idle for {idle:?} or was ended", plan.show(target));
+			if let Some(reset) = shared.flows.reset(&key, id) {shared.send(&plan, from, &reset).await}
+		}
 	}
 	shared.flows.hold(&key, id, CLOSED_IDLE);
 }
@@ -260,7 +265,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 /// An association ties the flow `id` to the proxy before its first datagram goes out.
 #[allow(clippy::too_many_arguments)]
 async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackUdpStream, up: &Upstream, dst: SocketAddr, mtu: u16, plan: &Plan, key: &Key, id: u64) -> Option<IpStackUdpStream> {
-	let state = &shared.exits[exit];
+	let state = &plan.exits[exit].state;
 	if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|since| since.elapsed() < UDP_RETRY) {return Some(stream)}
 	let (mut control, relay) = match tokio::time::timeout(ASSOCIATE_TIMEOUT, associate(up)).await {
 		Ok(Ok(v)) => {
@@ -283,7 +288,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 			return Some(stream);
 		}
 	};
-	shared.flows.pin(key, id);
+	if !shared.flows.pin(key, id, plan.generation) {return None}
 	tracing::debug!("exit {tag}: udp to {} associated", plan.show(dst));
 	let (header, cap) = (udp_header(dst), usize::from(mtu).saturating_sub(UDP_OVERHEAD));
 	let (mut from_peer, mut from_relay, mut sink) = (vec![0u8; MAX_DATAGRAM], vec![0u8; MAX_DATAGRAM], [0u8; 1]);

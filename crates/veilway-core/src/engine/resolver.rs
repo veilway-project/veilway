@@ -1,19 +1,17 @@
 //! The node's own resolver: every DNS query from a tunnel is answered here, one query at a time, by asking the configured servers through the exit the rules choose for that query.
 //! What it learns is kept per user, so a rule with a `domain` condition can match the flows that follow.
 use super::flows::{self, HOLD_MARGIN, UDP_OVERHEAD, UDP_OVERHEAD_V6};
-use super::plan::{Action, Backend, Outbound, Pattern, Plan};
+use super::plan::{Action, Backend, Outbound, Pattern};
 use super::route::{self, Key, Reason, CLOSED_IDLE};
 use super::{dns, gate, Shared};
-use crate::config::Protocol;
 use ipnet::IpNet;
 use ipstack::IpStackStream;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 /// Name to address entries one user's memory holds.
@@ -78,6 +76,9 @@ impl Names {
 		self.by_address.get(&address).is_some_and(|slots| slots.iter().any(|slot| slot.expires > now && patterns.iter().any(|pattern| pattern.matches(&slot.name))))
 	}
 
+	/// The names the user resolved to `address` whose answer has not expired: what a flow to that address is known by for as long as it lives.
+	pub fn of(&self, address: IpAddr, now: Instant) -> Vec<Arc<str>> {self.by_address.get(&address).map_or_else(Vec::new, |slots| slots.iter().filter(|slot| slot.expires > now).map(|slot| slot.name.clone()).collect())}
+
 	/// Names with at least one address that has not expired.
 	pub fn names(&self, now: Instant) -> usize {self.by_address.values().flatten().filter(|slot| slot.expires > now).map(|slot| &*slot.name).collect::<HashSet<&str>>().len()}
 
@@ -89,12 +90,9 @@ impl Names {
 	pub fn clear(&mut self) {*self = Names::default()}
 }
 
-/// What the resolver keeps while the engine runs. Users are indexed like the users of the plan.
+/// What the resolver did since the node started. A user's name memory and their share of waiting queries belong to the user, see `UserState`.
+#[derive(Default)]
 pub struct Resolver {
-	names: Vec<Mutex<Names>>,
-	in_flight: Vec<Semaphore>,
-	/// Failures in a row for each server through each exit, server by server.
-	failures: Vec<AtomicU32>,
 	pub answered: AtomicU64,
 	pub refused: AtomicU64,
 	pub failed: AtomicU64,
@@ -102,30 +100,19 @@ pub struct Resolver {
 	pub throttled: AtomicU64,
 }
 
-impl Resolver {
-	pub fn new(plan: &Plan) -> Resolver {
-		Resolver {
-			names: plan.users.iter().map(|_| Mutex::default()).collect(),
-			in_flight: plan.users.iter().map(|_| Semaphore::new(MAX_IN_FLIGHT)).collect(),
-			failures: (0..plan.dns.len() * plan.exits.len()).map(|_| AtomicU32::new(0)).collect(),
-			answered: AtomicU64::new(0), refused: AtomicU64::new(0), failed: AtomicU64::new(0), malformed: AtomicU64::new(0), throttled: AtomicU64::new(0),
-		}
-	}
-
-	/// The memory of one user. Nothing in it is ever read for another.
-	pub fn names(&self, user: usize) -> MutexGuard<'_, Names> {self.names[user].lock().unwrap_or_else(|e| e.into_inner())}
-}
-
-/// Answers one message from a tunnel. None when it is not a query, which gets no answer at all.
+/// Answers one message of the DNS flow `flow` (its key and the id of its entry), which the device with the public key `device` opened. None when it is not a query, which gets no answer at all, and when that device no longer holds the address the flow came from.
 /// The query is a flow from the user to each server in turn on port 53: the rules see the server's address and the name that was asked, and the exit they choose must be one the user may use and one that carries the server's address.
-async fn answer(shared: Arc<Shared>, plan: Arc<Plan>, inbound: usize, user: usize, protocol: u8, message: Vec<u8>) -> Option<Vec<u8>> {
-	let resolver = &shared.resolver;
+/// The plan is taken anew for each query, so a flow that outlives a reload is answered by the config that runs.
+async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message: Vec<u8>) -> Option<Vec<u8>> {
+	let (resolver, plan, protocol) = (&shared.resolver, shared.plan(), flow.0.protocol);
+	let from = plan.by_address.get(&flow.0.src).copied().filter(|from| plan.devices[from.device].public_key == device)?;
+	let (inbound, user) = (from.inbound, plan.devices[from.device].user);
 	let Some(query) = dns::query(&message) else {
 		resolver.malformed.fetch_add(1, Ordering::Relaxed);
 		return None;
 	};
 	let (tag, who, asked) = (plan.inbounds[inbound].tag.as_str(), plan.users[user].name.as_str(), query.question.name.as_deref());
-	let Ok(_permit) = resolver.in_flight[user].try_acquire() else {
+	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {
 		resolver.throttled.fetch_add(1, Ordering::Relaxed);
 		tracing::debug!("inbound {tag}: user {who}: more than {MAX_IN_FLIGHT} dns queries at once");
 		return Some(query.reply(dns::SERVFAIL));
@@ -142,7 +129,7 @@ async fn answer(shared: Arc<Shared>, plan: Arc<Plan>, inbound: usize, user: usiz
 			_ => None,
 		};
 		if let Some(reason) = refusal {
-			shared.counters.count(reason);
+			shared.count(reason);
 			resolver.refused.fetch_add(1, Ordering::Relaxed);
 			tracing::debug!("inbound {tag}: user {who}: dns query for {} refused: {reason:?}", plan.show(asked.unwrap_or("<no domain>")));
 			return Some(query.reply(dns::REFUSED));
@@ -154,19 +141,23 @@ async fn answer(shared: Arc<Shared>, plan: Arc<Plan>, inbound: usize, user: usiz
 			Backend::L3 {masquerade: true, ..} => &flows::AROUND,
 			_ => continue,
 		};
-		let Some(failures) = resolver.failures.get(at * plan.exits.len() + exit) else {continue};
+		let Some(failures) = plan.exits[exit].failures.get(at) else {continue};
 		// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
 		if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != server.is_ipv4()) {continue}
-		shared.counters.exits[exit].up(message.len());
+		plan.exits[exit].traffic.up(message.len());
 		let Some(answer) = flows::lookup(outbound, *server, &message).await else {
 			if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {} ({}) stopped answering through exit {}", at + 1, plan.dns.len(), plan.show(server), plan.exits[exit].tag)}
 			continue;
 		};
 		if failures.swap(0, Ordering::Relaxed) >= DOWN_AFTER {tracing::info!("dns: server {} of {} ({}) answers again through exit {}", at + 1, plan.dns.len(), plan.show(server), plan.exits[exit].tag)}
-		shared.counters.exits[exit].down(answer.len());
+		plan.exits[exit].traffic.down(answer.len());
 		resolver.answered.fetch_add(1, Ordering::Relaxed);
 		// Only an answer to the question that was asked is remembered, and only under a name a rule could name.
-		let remembered = asked.zip(dns::response(&answer)).is_some_and(|(name, response)| response.rcode == 0 && response.question.as_ref() == Some(&query.question) && resolver.names(user).record(name, &response.addresses, &plan.pools, Instant::now()));
+		let remembered = asked.zip(dns::response(&answer)).is_some_and(|(name, response)| response.rcode == 0 && response.question.as_ref() == Some(&query.question) && {
+			// A user who was cut off while this query was out gets nothing written into a memory that was just cleared. The cut-off ends the flow first and clears the memory after, so the flow is looked at with the memory locked.
+			let mut names = plan.users[user].state.names();
+			shared.flows.holds(&flow.0, flow.1) && names.record(name, &response.addresses, &plan.pools, Instant::now())
+		});
 		tracing::debug!("inbound {tag}: user {who}: dns query for {} answered through exit {}{}", plan.show(asked.unwrap_or("<no domain>")), plan.exits[exit].tag, if remembered {", remembered"} else {""});
 		return Some(answer);
 	}
@@ -175,9 +166,8 @@ async fn answer(shared: Arc<Shared>, plan: Arc<Plan>, inbound: usize, user: usiz
 	Some(query.reply(dns::SERVFAIL))
 }
 
-/// Runs one DNS flow the stack accepted to its end. Over UDP every datagram is a query and they are answered side by side; over TCP queries carry a 2 byte length and are answered in the order they came.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, inbound: usize, user: usize, stream: IpStackStream, mtu: u16) {
+/// Runs one DNS flow the stack accepted to its end, for the device with the public key `device`. Over UDP every datagram is a query and they are answered side by side; over TCP queries carry a 2 byte length and are answered in the order they came.
+pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], stream: IpStackStream, mtu: u16) {
 	shared.flows.hold(&key, id, FLOW_IDLE + HOLD_MARGIN);
 	let queries = async {
 		let mut message = vec![0u8; MAX_QUERY];
@@ -193,7 +183,7 @@ pub async fn serve(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, inbo
 								shared.resolver.throttled.fetch_add(1, Ordering::Relaxed);
 								continue;
 							}
-							pending.spawn(answer(shared.clone(), plan.clone(), inbound, user, Protocol::UDP, message[..n].to_vec()));
+							pending.spawn(answer(shared.clone(), (key, id), device, message[..n].to_vec()));
 						}
 						Some(done) = pending.join_next() => {
 							let Ok(Some(mut answer)) = done else {continue};
@@ -218,7 +208,7 @@ pub async fn serve(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, inbo
 					}
 					if stream.read_exact(&mut message[..len]).await.is_err() {break}
 					// What is not a query ends the connection.
-					let Some(answer) = answer(shared.clone(), plan.clone(), inbound, user, Protocol::TCP, message[..len].to_vec()).await else {break};
+					let Some(answer) = answer(shared.clone(), (key, id), device, message[..len].to_vec()).await else {break};
 					let mut framed = (answer.len() as u16).to_be_bytes().to_vec();
 					framed.extend_from_slice(&answer);
 					if stream.write_all(&framed).await.is_err() {break}

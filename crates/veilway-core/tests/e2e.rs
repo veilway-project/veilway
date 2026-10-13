@@ -5,13 +5,15 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use etherparse::{Icmpv4Type, IpNumber, NetHeaders, PacketBuilder, PacketHeaders, PayloadSlice, TcpHeader, TransportHeader};
 use serde_json::{json, Value};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
-use veilway_core::config::Config;
+use veilway_core::config::{Applied, ApplyError, Config, Revision};
 use veilway_core::engine::dns::response;
 use veilway_core::engine::icmp::{MAX_PINGS_PER_DEVICE, MAX_PINGS_PER_USER};
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
@@ -2141,4 +2143,503 @@ async fn a_second_l3_exit_is_refused_at_start(){
 	let error=veilway_core::start(&config, Options::new("")).await.err().expect("two l3 exits started").to_string();
 	assert!(error.contains("`first-l3`") && error.contains("`second-l3`") && error.contains("one l3 exit"), "{error}");
 	assert!(!std::path::Path::new("/sys/class/net/vwfirst0").exists());
+}
+
+/// Sends the greeting, then echoes whatever comes, on every connection. The counter is the connections that have ended.
+async fn echo_responder()->(SocketAddr, Arc<AtomicUsize>){
+	let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr=listener.local_addr().unwrap();
+	let closed=Arc::new(AtomicUsize::new(0));
+	let counter=closed.clone();
+	tokio::spawn(async move{
+		loop{
+			let Ok((mut s, _))=listener.accept().await else{return};
+			let counter=counter.clone();
+			tokio::spawn(async move{
+				let _=s.write_all(GREETING).await;
+				let mut buf=[0u8;256];
+				while let Ok(n)=s.read(&mut buf).await{
+					if n==0|| s.write_all(&buf[..n]).await.is_err(){break}
+				}
+				counter.fetch_add(1, Ordering::SeqCst);
+			});
+		}
+	});
+	(addr, closed)
+}
+
+/// The test's side of one open TCP flow to an echoing responder: enough of TCP to send data in order, acknowledge what comes back and tell an echo from a reset.
+struct Flow{src:[u8;4], dst:[u8;4], sport:u16, dport:u16, seq:u32, ack:u32}
+
+impl Flow{
+	/// Opens the flow, takes the greeting and acknowledges it, as a device's own stack would.
+	async fn open(client:&mut Client, src:[u8;4], dst:[u8;4], sport:u16, dport:u16)->Flow{
+		let isn=open(client, src, dst, sport, dport).await;
+		assert_eq!(greeting(client).await, GREETING, "no greeting on a new flow");
+		let flow=Flow{src, dst, sport, dport, seq:1001, ack:isn.wrapping_add(1+GREETING.len() as u32)};
+		client.send_ip(&flow.segment(&[])).await;
+		flow
+	}
+
+	fn segment(&self, data:&[u8])->Vec<u8>{
+		let mut header=TcpHeader::new(self.sport, self.dport, self.seq, 65535);
+		(header.ack, header.psh, header.acknowledgment_number)=(true, !data.is_empty(), self.ack);
+		ip_tcp(self.src, self.dst, header, data)
+	}
+
+	/// Sends `data` and says what came back for it within two seconds: `Accepted` is its echo.
+	async fn say(&mut self, client:&mut Client, data:&[u8])->Answer{
+		client.send_ip(&self.segment(data)).await;
+		self.seq=self.seq.wrapping_add(data.len() as u32);
+		let deadline=Instant::now()+Duration::from_secs(2);
+		while let Some(left)=deadline.checked_duration_since(Instant::now()){
+			let Some(packet)=client.recv_ip(left).await else{break};
+			let Some((tcp, payload))=parse_tcp(&packet) else{continue};
+			if (tcp.source_port, tcp.destination_port)!=(self.dport, self.sport){continue}
+			if tcp.rst{return Answer::Reset}
+			if payload==data && tcp.sequence_number==self.ack{
+				self.ack=self.ack.wrapping_add(payload.len() as u32);
+				client.send_ip(&self.segment(&[])).await;
+				return Answer::Accepted;
+			}
+		}
+		Answer::Silence
+	}
+
+	/// Whether the node resets the flow within `budget` without the device sending anything, with a reset the device's stack takes: one that starts where the device expects the next byte.
+	async fn reset(&self, client:&mut Client, budget:Duration)->bool{
+		let deadline=Instant::now()+budget;
+		while let Some(left)=deadline.checked_duration_since(Instant::now()){
+			let Some(packet)=client.recv_ip(left).await else{break};
+			if parse_tcp(&packet).is_some_and(|(tcp, _)| tcp.rst && (tcp.source_port, tcp.destination_port, tcp.sequence_number)==(self.dport, self.sport, self.ack)){return true}
+		}
+		false
+	}
+}
+
+/// A running node whose TCP flows reach an echoing responder, and the document it runs, for a test to change and reload. `closed` counts the upstream connections that have ended.
+struct Live{node:Node, doc:Value, closed:Arc<AtomicUsize>}
+
+/// `edit` changes the document of `setup` before the node starts. With `second`, there is a second exit of that tag through the same proxy.
+async fn live(second:bool, options:Options, edit:impl FnOnce(&mut Setup))->Live{
+	let (backend, closed)=echo_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (dns, _, _)=dns_server(Ipv4Addr::LOCALHOST, ZONE, false).await;
+	let (proxy, _)=socks5_proxy(dns, backend, echo, false).await;
+	let mut setup=setup(proxy);
+	if second{add_exit(&mut setup.doc, "second", proxy)}
+	edit(&mut setup);
+	let doc=setup.doc.clone();
+	Live{node:launch_with(setup, options).await, doc, closed}
+}
+
+/// Puts `doc` in force on a running node, or says why it was not.
+async fn reload(node:&Node, doc:&Value)->Result<Applied, ApplyError<anyhow::Error>>{node.engine.reload(doc.to_string().into_bytes(), None).await}
+
+/// What a prepare step that failed says.
+fn refusal(result:Result<Applied, ApplyError<anyhow::Error>>)->String{
+	match result{
+		Err(ApplyError::Prepare(e))=>format!("{e:#}"),
+		Err(other)=>panic!("the reload failed before its prepare step: {other}"),
+		Ok(_)=>panic!("the reload went through"),
+	}
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_adds_a_user_without_disturbing_an_open_flow(){
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 42000, 80).await;
+	let key=veilway_wg::generate_key();
+	assert!(Client::try_connect(key, node.public, node.addr, Duration::from_millis(500)).await.is_none(), "a key no user has completed a handshake");
+	doc["users"].as_array_mut().unwrap().push(user("c", &key, "10.7.0.9"));
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!((applied.diff.users.added.as_slice(), applied.snapshot.generation, node.engine.snapshot().generation), (&["c".to_string()][..], 2, 2));
+	let mut c=Client::connect(key, node.public, node.addr).await;
+	let mut theirs=Flow::open(&mut c, [10, 7, 0, 9], OTHER, 42001, 80).await;
+	assert_eq!(theirs.say(&mut c, b"new here").await, Answer::Accepted);
+	assert_eq!(flow.say(&mut a, b"still here").await, Answer::Accepted, "a reload that only added a user disturbed another user's flow");
+	assert_eq!((closed.load(Ordering::SeqCst), node.engine.flows(), node.engine.user("c").map(|totals| totals.up_packets>0)), (0, 2, Some(true)));
+	// The same bytes again change nothing and count as no new config.
+	assert_eq!(reload(&node, &doc).await.unwrap().snapshot.generation, 2);
+	assert_eq!(flow.say(&mut a, b"and still").await, Answer::Accepted);
+}
+
+/// User `b` has an open flow and a name in the node's memory when `change` takes them away. Within a second the flow is reset and its upstream connection closed,
+/// after that the device hears nothing more and cannot shake hands, and user `a` notices none of it. Returns what the node remembers of `b`'s names afterwards.
+async fn cut_off(change:fn(&mut Value), sport:u16)->Option<usize>{
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |setup| setup.doc["dns"]["hijack"]=json!(true)).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, sport, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, sport+1, 80).await;
+	let answer=ask(&mut b, PEER_B, [1, 1, 1, 1], sport+2, &dns_query(7, "example.com", 1), Duration::from_secs(3)).await.expect("no answer to a dns query");
+	assert_eq!((resolved(&answer, 7), node.engine.dns_names("b")), (vec![IpAddr::from(PUBLIC)], Some(1)));
+	change(&mut doc);
+	let started=Instant::now();
+	reload(&node, &doc).await.unwrap();
+	assert!(theirs.reset(&mut b, Duration::from_secs(1)).await, "the flow of a user who was cut off was not reset within a second");
+	eventually("the upstream connection of a user who was cut off stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert!(started.elapsed()<Duration::from_secs(1), "cutting a user off took {:?}", started.elapsed());
+	// One reset, then silence: the session keys are gone, so nothing the device sends is read and nothing more is sent to it.
+	assert_eq!(theirs.say(&mut b, b"anyone").await, Answer::Silence, "a device that was cut off was still answered");
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_secs(1)).await.is_none(), "a user who was cut off completed a handshake");
+	assert_eq!(ours.say(&mut a, b"still here").await, Answer::Accepted, "cutting off one user disturbed another");
+	assert_eq!((node.engine.flows(), closed.load(Ordering::SeqCst)), (1, 1), "only the other user's flow is left");
+	node.engine.dns_names("b")
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_disabled_user_is_cut_off_within_a_second(){
+	assert_eq!(cut_off(|doc| doc["users"][1]["enabled"]=json!(false), 42010).await, Some(0), "the names of a user who was cut off are still remembered");
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_removed_user_is_cut_off_within_a_second(){
+	assert_eq!(cut_off(|doc| drop(doc["users"].as_array_mut().unwrap().remove(1)), 42020).await, None);
+}
+
+/// A device whose addresses change is the same device with other addresses: its sessions, flows and its user's name memory go, and it comes back under the new address only.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_device_whose_addresses_change_starts_over(){
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |setup| setup.doc["dns"]["hijack"]=json!(true)).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut b, PEER_B, PUBLIC, 42030, 80).await;
+	ask(&mut b, PEER_B, [1, 1, 1, 1], 42031, &dns_query(7, "example.com", 1), Duration::from_secs(3)).await.expect("no answer to a dns query");
+	let before=node.engine.user("b").unwrap();
+	doc["users"][1]["devices"][0]["addresses"]=json!(["10.7.0.30"]);
+	reload(&node, &doc).await.unwrap();
+	assert!(flow.reset(&mut b, Duration::from_secs(1)).await, "the flow of a device whose address changed was not reset");
+	eventually("the upstream connection of that flow stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert_eq!((flow.say(&mut b, b"anyone").await, node.engine.dns_names("b"), node.engine.flows()), (Answer::Silence, Some(0), 0));
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let spoofed=node.engine.dropped(Reason::SpoofedSource);
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 42032, 9999, b"old address")).await;
+	eventually("the address the device no longer has was still taken from it", || node.engine.dropped(Reason::SpoofedSource)==spoofed+1).await;
+	let mut again=Flow::open(&mut b, [10, 7, 0, 30], PUBLIC, 42033, 80).await;
+	assert_eq!(again.say(&mut b, b"new address").await, Answer::Accepted);
+	// The user is who they were, so what they used is still counted for them.
+	assert!(node.engine.user("b").unwrap().up_packets>before.up_packets);
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_user_whose_time_passes_while_connected_is_cut_off_without_a_reload(){
+	let at=(OffsetDateTime::now_utc()+time::Duration::seconds(3)).replace_nanosecond(0).unwrap();
+	let Live{node, closed, ..}=live(false, Options::new(""), |setup| setup.doc["users"][1]["expires_at"]=json!(at.format(&Rfc3339).unwrap())).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, 42040, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, 42041, 80).await;
+	assert_eq!(theirs.say(&mut b, b"in time").await, Answer::Accepted);
+	assert!(theirs.reset(&mut b, Duration::from_secs(5)).await, "a user whose expires_at passed kept their flow");
+	let late=OffsetDateTime::now_utc()-at;
+	assert!(late>=time::Duration::ZERO && late<time::Duration::seconds(1), "the user was cut off {late} after expires_at");
+	eventually("the upstream connection of an expired user stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_secs(1)).await.is_none(), "an expired user completed a handshake");
+	assert_eq!((ours.say(&mut a, b"still here").await, node.engine.flows(), node.engine.snapshot().generation), (Answer::Accepted, 1, 1));
+}
+
+/// The node's clock is the test's here. It jumps past a user's `expires_at`, which cuts the user off at once, and then back before it, which must not let them in again:
+/// not by itself, and not through a reload that still gives the user the same `expires_at`. A later `expires_at` is the operator's word and does.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_clock_that_steps_back_does_not_bring_an_expired_user_back(){
+	static SKEW:AtomicI64=AtomicI64::new(0);
+	fn clock()->OffsetDateTime{OffsetDateTime::now_utc()+time::Duration::seconds(SKEW.load(Ordering::SeqCst))}
+	let stamp=|hours:i64| json!((OffsetDateTime::now_utc()+time::Duration::hours(hours)).replace_nanosecond(0).unwrap().format(&Rfc3339).unwrap());
+	let Live{node, mut doc, ..}=live(false, Options{now:clock, ..Options::new("")}, |setup| setup.doc["users"][1]["expires_at"]=stamp(1)).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let flow=Flow::open(&mut b, PEER_B, PUBLIC, 42050, 80).await;
+	SKEW.store(7200, Ordering::SeqCst);
+	assert!(flow.reset(&mut b, Duration::from_secs(1)).await, "a clock that jumped past expires_at did not cut the user off within a second");
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "an expired user completed a handshake");
+	SKEW.store(0, Ordering::SeqCst);
+	tokio::time::sleep(Duration::from_millis(700)).await;
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "a clock that stepped back let an expired user in again");
+	let key=veilway_wg::generate_key();
+	doc["users"].as_array_mut().unwrap().push(user("c", &key, "10.7.0.9"));
+	reload(&node, &doc).await.unwrap();
+	Client::connect(key, node.public, node.addr).await;
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "a reload under a clock that stepped back let an expired user in again");
+	doc["users"][1]["expires_at"]=stamp(2);
+	reload(&node, &doc).await.unwrap();
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	Flow::open(&mut b, PEER_B, PUBLIC, 42051, 80).await;
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_rule_change_resets_exactly_the_flows_it_decides_differently(){
+	let Live{node, mut doc, closed}=live(true, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let mut stays=Flow::open(&mut a, PEER_A, PUBLIC, 42060, 80).await;
+	let moves=Flow::open(&mut a, PEER_A, OTHER, 42061, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, OTHER, 42062, 80).await;
+	assert_eq!(node.engine.exit("second"), Some(Totals::default()));
+	// From now on user a reaches this one address through the other exit. Nothing else is decided differently.
+	add_rule(&mut doc, json!({"tag":"a-other", "user":["a"], "ip":["93.184.216.35/32"], "action":{"exit":"second"}}));
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!(applied.diff.rules.added, ["a-other"]);
+	assert!(moves.reset(&mut a, Duration::from_secs(1)).await, "a flow the rules now send elsewhere was not reset");
+	eventually("its upstream connection stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert_eq!((stays.say(&mut a, b"same exit").await, theirs.say(&mut b, b"other user").await), (Answer::Accepted, Answer::Accepted), "a flow the rules decide as before was disturbed");
+	assert_eq!((node.engine.flows(), closed.load(Ordering::SeqCst)), (2, 1));
+	let mut moved=Flow::open(&mut a, PEER_A, OTHER, 42063, 80).await;
+	assert_eq!(moved.say(&mut a, b"new exit").await, Answer::Accepted);
+	assert!(node.engine.exit("second").unwrap().up_packets>0, "the new flow did not leave through the exit the new rule names");
+	// A rule that now refuses a destination ends the flows to it as well.
+	add_rule(&mut doc, json!({"tag":"no-public", "ip":["93.184.216.34/32"], "action":"reject"}));
+	reload(&node, &doc).await.unwrap();
+	assert!(stays.reset(&mut a, Duration::from_secs(1)).await, "a flow the rules now reject was not reset");
+	assert_eq!((moved.say(&mut a, b"untouched").await, theirs.say(&mut b, b"untouched").await), (Answer::Accepted, Answer::Accepted));
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn changing_an_exits_outbound_resets_the_flows_through_it(){
+	let Live{node, mut doc, closed}=live(true, Options::new(""), |setup| add_rule(&mut setup.doc, json!({"tag":"other-second", "ip":["93.184.216.35/32"], "action":{"exit":"second"}}))).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let through=Flow::open(&mut a, PEER_A, PUBLIC, 42070, 80).await;
+	let mut beside=Flow::open(&mut a, PEER_A, OTHER, 42071, 80).await;
+	// A display name is not the backend: changing it ends nothing.
+	doc["exits"][0]["name"]=json!("Renamed");
+	assert_eq!(reload(&node, &doc).await.unwrap().diff.exits.changed, ["main"]);
+	assert!(!through.reset(&mut a, Duration::from_millis(500)).await && closed.load(Ordering::SeqCst)==0, "a flow was reset for a change of its exit's display name");
+	let spare=doc["outbounds"][0]["server"].clone();
+	doc["outbounds"].as_array_mut().unwrap().push(json!({"tag":"spare", "type":"socks5", "server":spare}));
+	doc["exits"][0]["backend"]["outbound"]=json!("spare");
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!((applied.diff.exits.changed.as_slice(), applied.diff.outbounds.added.as_slice()), (&["main".to_string()][..], &["spare".to_string()][..]));
+	assert!(through.reset(&mut a, Duration::from_secs(1)).await, "a flow through an exit whose outbound changed was not reset");
+	eventually("its upstream connection stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert_eq!((beside.say(&mut a, b"other exit").await, node.engine.flows()), (Answer::Accepted, 1), "a flow through another exit was disturbed");
+	let mut again=Flow::open(&mut a, PEER_A, PUBLIC, 42072, 80).await;
+	assert_eq!(again.say(&mut a, b"new outbound").await, Answer::Accepted);
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_user_who_loses_an_exit_loses_the_flows_through_it(){
+	let Live{node, mut doc, closed}=live(true, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	let ours=Flow::open(&mut a, PEER_A, PUBLIC, 42080, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, 42081, 80).await;
+	(doc["users"][0]["exits"], doc["users"][0]["exit"])=(json!(["second"]), json!("second"));
+	reload(&node, &doc).await.unwrap();
+	assert!(ours.reset(&mut a, Duration::from_secs(1)).await, "a flow through an exit its user may no longer use was not reset");
+	eventually("its upstream connection stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert_eq!((theirs.say(&mut b, b"still entitled").await, node.engine.flows()), (Answer::Accepted, 1));
+	// The user is still connected, and their next flow leaves through the exit they have.
+	let mut next=Flow::open(&mut a, PEER_A, PUBLIC, 42082, 80).await;
+	assert_eq!(next.say(&mut a, b"own exit").await, Answer::Accepted);
+	assert!(node.engine.exit("second").unwrap().up_packets>0);
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_transport_added_by_a_reload_serves_and_a_removed_one_stops(){
+	let Live{node, mut doc, ..}=live(false, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut first=Flow::open(&mut a, PEER_A, PUBLIC, 42090, 80).await;
+	let (second, relay)=(listen(), listen());
+	doc["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":node.addr.to_string()}, {"type":"udp", "listen":second.to_string()}, {"type":"ws", "listen":relay.to_string(), "path":"/wg"}]);
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!((applied.diff.inbounds.changed.as_slice(), applied.diff.inbound_changes[0].restart), (&["home".to_string()][..], false));
+	// The new transports serve, and the session over the one that was there is as it was.
+	let mut b=Client::connect(node.keys[1], node.public, second).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, 42091, 80).await;
+	assert_eq!(first.say(&mut a, b"same session").await, Answer::Accepted, "adding a transport disturbed a session over another");
+	let bridge=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let bridged=bridge.local_addr().unwrap();
+	tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{relay}/wg"), false));
+	let mut over_ws=Client::connect(node.keys[0], node.public, bridged).await;
+	let mut third=Flow::open(&mut over_ws, PEER_A, OTHER, 42092, 80).await;
+	assert_eq!(third.say(&mut over_ws, b"over ws").await, Answer::Accepted);
+	// Now only the second udp transport is left.
+	doc["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":second.to_string()}]);
+	reload(&node, &doc).await.unwrap();
+	assert_eq!(theirs.say(&mut b, b"same session").await, Answer::Accepted, "removing two transports disturbed a session over the third");
+	assert_eq!(third.say(&mut over_ws, b"gone").await, Answer::Silence, "a removed ws transport still carried a session");
+	assert!(Client::try_connect(node.keys[0], node.public, bridged, Duration::from_millis(700)).await.is_none(), "a removed ws transport answered a handshake");
+	// Nobody listens on the removed udp transport's port any more: it can be bound again.
+	eventually("the port of a removed udp transport is still taken", || std::net::UdpSocket::bind(node.addr).is_ok()).await;
+	eventually("the port of a removed ws transport is still taken", || std::net::TcpListener::bind(relay).is_ok()).await;
+	// The device is still a peer, and reaches the node again over the transport that is left.
+	let mut a=Client::connect(node.keys[0], node.public, second).await;
+	Flow::open(&mut a, PEER_A, PUBLIC, 42093, 80).await;
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn changing_an_inbounds_key_drops_its_sessions_and_leaves_the_other_inbound_alone(){
+	let (office, key_c, office_listen, fresh)=(veilway_wg::generate_key(), veilway_wg::generate_key(), listen(), veilway_wg::generate_key());
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |setup| {
+		setup.doc["inbounds"].as_array_mut().unwrap().push(inbound("office", &office, "10.8.0.1/24", udp(office_listen)));
+		setup.doc["users"].as_array_mut().unwrap().push(user("c", &key_c, "10.8.0.2"));
+	}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut c=Client::connect(key_c, veilway_wg::public_key(&office), office_listen).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, 42100, 80).await;
+	let mut theirs=Flow::open(&mut c, PEER_C, PUBLIC, 42101, 80).await;
+	let before=node.engine.inbound("home").unwrap();
+	doc["inbounds"][0]["private_key"]=json!(veilway_wg::encode_key(&fresh));
+	let applied=reload(&node, &doc).await.unwrap();
+	assert!(applied.diff.inbound_changes.len()==1 && applied.diff.inbound_changes[0].restart);
+	// The tunnel started over. The flows that came through it are reset, which is the last thing its old sessions carry.
+	assert!(ours.reset(&mut a, Duration::from_secs(1)).await, "a flow through a tunnel that restarted was not reset");
+	assert_eq!(ours.say(&mut a, b"old session").await, Answer::Silence, "a session survived a new key of its inbound");
+	eventually("the upstream connection of a flow through a tunnel that restarted stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert!(Client::try_connect(node.keys[0], node.public, node.addr, Duration::from_millis(700)).await.is_none(), "the old key of the inbound still answered");
+	assert_eq!((theirs.say(&mut c, b"other inbound").await, node.engine.flows()), (Answer::Accepted, 1), "a new key for one inbound disturbed another");
+	let mut a=Client::connect(node.keys[0], veilway_wg::public_key(&fresh), node.addr).await;
+	let mut again=Flow::open(&mut a, PEER_A, PUBLIC, 42102, 80).await;
+	assert_eq!(again.say(&mut a, b"new key").await, Answer::Accepted);
+	// The inbound is the one it was by its tag, so its counters went on.
+	assert!(node.engine.inbound("home").unwrap().up_packets>before.up_packets);
+}
+
+/// Each reload here would cut user `a` off if any part of it took effect. None may: not the listener it bound before it failed, not the user it removes.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_that_fails_leaves_the_running_config_whole(){
+	let Live{node, doc, closed}=live(false, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 42110, 80).await;
+	let mut without_a=doc.clone();
+	without_a["users"].as_array_mut().unwrap().remove(0);
+	assert!(matches!(node.engine.reload(b"{\"version\":1".to_vec(), None).await, Err(ApplyError::Invalid(_))), "a document that does not parse was taken");
+	let mut invalid=without_a.clone();
+	invalid["routing"]["default"]=json!("nowhere");
+	match reload(&node, &invalid).await{
+		Err(ApplyError::Invalid(report))=>assert!(report.errors.iter().any(|e| e.path.starts_with("routing")), "{:?}", report.errors),
+		_=>panic!("a document that does not validate was taken"),
+	}
+	assert!(matches!(node.engine.reload(without_a.to_string().into_bytes(), Some(Revision::of(b"another config"))).await, Err(ApplyError::Stale{..})), "a reload based on a config that does not run was taken");
+	// A port that somebody else has. The transport before it is one the reload binds and has to give back.
+	let (free, taken)=(listen(), listen());
+	let holder=std::net::UdpSocket::bind(taken).unwrap();
+	let mut busy=without_a.clone();
+	busy["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":node.addr.to_string()}, {"type":"udp", "listen":free.to_string()}, {"type":"udp", "listen":taken.to_string()}]);
+	let said=refusal(reload(&node, &busy).await);
+	assert!(said.contains("inbounds[0].transports[2].listen") && said.contains("`home`") && !said.contains(&taken.port().to_string()), "{said}");
+	std::net::UdpSocket::bind(free).expect("a reload that failed left a listener behind");
+	drop(holder);
+	// A certificate that cannot be read, for a listener the reload binds first.
+	let relay=listen();
+	let mut uncertain=without_a.clone();
+	uncertain["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type":"ws", "listen":relay.to_string(), "path":"/wg", "tls":{"cert":"absent/fullchain.pem", "key":"absent/privkey.pem"}}));
+	let said=refusal(reload(&node, &uncertain).await);
+	assert!(said.contains("inbounds[0].transports[1].tls") && !said.contains("absent") && !said.contains(&relay.port().to_string()), "{said}");
+	std::net::TcpListener::bind(relay).expect("a reload that failed left a listener behind");
+	// The config that ran still runs, all of it.
+	assert_eq!((node.engine.snapshot().generation, flow.say(&mut a, b"still here").await, closed.load(Ordering::SeqCst), node.engine.flows()), (1, Answer::Accepted, 0, 1));
+	let mut again=Client::connect(node.keys[0], node.public, node.addr).await;
+	Flow::open(&mut again, PEER_A, OTHER, 42111, 80).await;
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	Flow::open(&mut b, PEER_B, PUBLIC, 42112, 80).await;
+	// And the next good document goes through as if nothing had happened.
+	assert_eq!(reload(&node, &without_a).await.unwrap().snapshot.generation, 2);
+}
+
+/// Users, exits, outbounds and rules all change places, and a user and an exit are added in front. Everything the node keeps by position has to follow the names:
+/// the counters, and the open flow, whose exit has another index now.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn counters_and_flows_follow_their_names_when_a_reload_reorders_everything(){
+	let Live{node, mut doc, closed}=live(true, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 42120, 80).await;
+	assert_eq!(flow.say(&mut a, b"before").await, Answer::Accepted);
+	// The acknowledgement of the echo is still on its way to the node's counters.
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let before=(node.engine.user("a").unwrap(), node.engine.inbound("home").unwrap(), node.engine.exit("main").unwrap());
+	assert!(before.0.up_packets>=4 && before.2.up_packets>=4 && node.engine.exit("second")==Some(Totals::default()));
+	for list in ["users", "exits", "outbounds"]{doc[list].as_array_mut().unwrap().reverse()}
+	doc["routing"]["rules"].as_array_mut().unwrap().reverse();
+	doc["users"].as_array_mut().unwrap().insert(0, user("c", &veilway_wg::generate_key(), "10.7.0.9"));
+	doc["exits"].as_array_mut().unwrap().insert(0, json!({"tag":"sink", "backend":{"type":"block"}}));
+	let applied=reload(&node, &doc).await.unwrap();
+	assert!(applied.diff.users.changed.is_empty() && applied.diff.exits.changed.is_empty() && applied.diff.rules_reordered);
+	let after=(node.engine.user("a").unwrap(), node.engine.inbound("home").unwrap(), node.engine.exit("main").unwrap());
+	assert_eq!(((after.0.up_packets, after.0.up_bytes), (after.1.up_packets, after.1.up_bytes), (after.2.up_packets, after.2.up_bytes)), ((before.0.up_packets, before.0.up_bytes), (before.1.up_packets, before.1.up_bytes), (before.2.up_packets, before.2.up_bytes)), "a counter did not keep its total across the reload");
+	assert!(after.0.down_bytes>=before.0.down_bytes && after.2.down_bytes>=before.2.down_bytes);
+	assert_eq!(flow.say(&mut a, b"after").await, Answer::Accepted, "a flow did not survive a reload that only changed the order of things");
+	// What the flow carries is counted for its exit under the exit's new index, and for nobody who has the old one.
+	let (user, main)=(node.engine.user("a").unwrap(), node.engine.exit("main").unwrap());
+	assert!(user.up_packets>after.0.up_packets && main.up_packets>after.2.up_packets && main.down_bytes>after.2.down_bytes, "the flow's traffic was not counted for its exit: {main:?}");
+	assert_eq!((node.engine.exit("second"), node.engine.exit("sink"), node.engine.user("b"), node.engine.user("c")), (Some(Totals::default()), Some(Totals::default()), Some(Totals::default()), Some(Totals::default())), "traffic was counted for whoever took an index");
+	assert_eq!((closed.load(Ordering::SeqCst), node.engine.flows()), (0, 1));
+}
+
+/// Fifty reloads between two configs that differ in an inbound, a ws transport, a user, an exit and a rule. Afterwards the node runs as many tasks as after the first round,
+/// holds none of the listeners of the larger config, and has the one flow it had, which is still open.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_storm_of_reloads_leaks_no_tasks_sockets_or_flows(){
+	let Live{node, doc, closed}=live(false, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 42130, 80).await;
+	let (office_listen, relay, key_c, mut busy)=(listen(), listen(), veilway_wg::generate_key(), doc.clone());
+	busy["inbounds"].as_array_mut().unwrap().push(inbound("office", &veilway_wg::generate_key(), "10.8.0.1/24", udp(office_listen)));
+	busy["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type":"ws", "listen":relay.to_string(), "path":"/wg"}));
+	busy["users"].as_array_mut().unwrap().push(user("c", &key_c, "10.8.0.2"));
+	busy["exits"].as_array_mut().unwrap().push(json!({"tag":"sink", "backend":{"type":"block"}}));
+	add_rule(&mut busy, json!({"tag":"c-sink", "user":["c"], "action":{"exit":"sink"}}));
+	let tasks=|| tokio::runtime::Handle::current().metrics().num_alive_tasks();
+	// One round first, so what is started once and kept is there when the tasks are counted. Tasks that were told to end take a moment to do so.
+	for doc in [&busy, &doc]{reload(&node, doc).await.unwrap();}
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let settled=tasks();
+	for _ in 0..25{
+		for doc in [&busy, &doc]{reload(&node, doc).await.unwrap();}
+	}
+	eventually("the node runs more tasks after a storm of reloads than before it", || tasks()<=settled).await;
+	assert_eq!((node.engine.snapshot().generation, node.engine.flows(), closed.load(Ordering::SeqCst)), (53, 1, 0));
+	assert_eq!(flow.say(&mut a, b"after the storm").await, Answer::Accepted);
+	eventually("the listener of a removed inbound is still held", || std::net::UdpSocket::bind(office_listen).is_ok()).await;
+	eventually("the listener of a removed ws transport is still held", || std::net::TcpListener::bind(relay).is_ok()).await;
+	assert_eq!((node.engine.inbound("office"), node.engine.user("c"), node.engine.exit("sink")), (None, None, None));
+	// The larger config still works after all that.
+	reload(&node, &busy).await.unwrap();
+	let mut c=Client::connect(key_c, veilway_wg::public_key(&veilway_wg::decode_key(busy["inbounds"][1]["private_key"].as_str().unwrap()).unwrap()), office_listen).await;
+	assert_eq!(knock(&mut c, PEER_C, PUBLIC, 42131, 80).await, Answer::Silence, "a flow to a block exit was answered");
+	assert_eq!(flow.say(&mut a, b"and still").await, Answer::Accepted);
+}
+
+/// One reload takes user `a` away and gives their address to a new user `c` while the answers to a flow of `a` are still on their way through the node.
+/// A flow belongs to a user and a device, not to an address: none of those answers may reach `c`, not at once and not after `c` has shaken hands.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn the_answers_to_a_flow_never_reach_whoever_takes_its_address(){
+	let Live{node, mut doc, ..}=live(false, Options::new(""), |_| {}).await;
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let key=veilway_wg::generate_key();
+	doc["users"][0]=user("c", &key, "10.7.0.2");
+	a.send_ip(&ip_udp(PEER_A, PUBLIC, 42140, 9999, b"secret-of-a")).await;
+	a.recv_ip(Duration::from_secs(5)).await.expect("no udp reply");
+	let sending=tokio::spawn(async move{
+		for _ in 0..1500{a.send_ip(&ip_udp(PEER_A, PUBLIC, 42140, 9999, b"secret-of-a")).await}
+	});
+	tokio::time::sleep(Duration::from_millis(15)).await;
+	reload(&node, &doc).await.unwrap();
+	let mut c=Client::connect(key, node.public, node.addr).await;
+	let (deadline, mut leaked)=(Instant::now()+Duration::from_millis(1500), 0);
+	while let Some(packet)=c.recv_ip(deadline.saturating_duration_since(Instant::now())).await{
+		if packet.windows(11).any(|window| window==b"secret-of-a"){leaked+=1}
+	}
+	sending.await.unwrap();
+	assert_eq!(leaked, 0, "the device that took an address was sent the answers to a flow of the device that had it");
+}
+
+/// A reload of the file whose bytes already run reads the certificates again and decides nothing anew: the plan in force stays the very plan it was,
+/// so no flow is judged again and no packet on its way through the node meets a config that replaced its own.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_reload_of_the_file_that_runs_leaves_the_plan_in_force(){
+	let Live{node, doc, closed}=live(false, Options{allow_readable:true, ..Options::new("")}, |_| {}).await;
+	let path=std::env::temp_dir().join(format!("veilway-e2e-same-file-{}.json", std::process::id()));
+	std::fs::write(&path, doc.to_string()).unwrap();
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut flow=Flow::open(&mut a, PEER_A, PUBLIC, 42150, 80).await;
+	// The node was started without the revision of these bytes, so the first reload of the file counts as a new config.
+	assert_eq!(node.engine.reload_from(&path).await.unwrap().snapshot.generation, 2);
+	let (plan, stale)=(node.engine.plan(), node.engine.dropped(Reason::Stale));
+	for _ in 0..3{
+		let applied=node.engine.reload_from(&path).await.unwrap();
+		assert!(applied.diff.is_empty() && applied.snapshot.generation==2);
+	}
+	std::fs::remove_file(&path).unwrap();
+	assert!(Arc::ptr_eq(&plan, &node.engine.plan()), "a reload of the bytes that already run put another plan in force");
+	assert_eq!((flow.say(&mut a, b"still here").await, node.engine.flows(), closed.load(Ordering::SeqCst), node.engine.dropped(Reason::Stale)), (Answer::Accepted, 1, 0, stale));
 }

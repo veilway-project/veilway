@@ -97,6 +97,8 @@ pub struct Report {
 	pub shadow_cut_short: bool,
 	/// The file can be read by group or others. Only `load` sets it, next to the warning that says so.
 	pub readable: bool,
+	/// The revision of the bytes `load` read, for a file that could be read.
+	pub revision: Option<Revision>,
 }
 
 impl Report {
@@ -119,7 +121,7 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 		let readable = false;
 		file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).map(|_| readable)
 	});
-	let readable = read.as_ref().is_ok_and(|readable| *readable);
+	let (readable, revision) = (read.as_ref().is_ok_and(|readable| *readable), read.is_ok().then(|| Revision::of(&bytes)));
 	let parsed = read.map_err(|e| Diagnostic {path: String::new(), message: format!("cannot read the config file: {}", e.kind())}).and_then(|_| Config::parse(&bytes));
 	let (config, mut report) = match parsed {
 		Ok(config) => {
@@ -128,7 +130,7 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 		}
 		Err(e) => (None, Report {errors: vec![e], ..Report::default()}),
 	};
-	report.readable = readable;
+	(report.readable, report.revision) = (readable, revision);
 	if readable {report.warning("", "the config file can be read by group or others; `veilway run` refuses that unless started with --allow-readable-config")}
 	(config, report)
 }

@@ -1,16 +1,23 @@
-//! Everything the engine derives from a config, built once and never changed. Tasks read it through `Shared::plan`, so a reload can later swap in a new one in a single step.
-use crate::config::{self, Config, Exits, IpEntry, Policy, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE};
+//! Everything the engine derives from a config, built once and never changed. Tasks read it through `Shared::plan`, and a reload or an expiry swaps in a new one in a single step.
+//! What the node learns while it runs (counters, name memory, tunnels) hangs off the plan and is handed from one plan to the next by tag, user name or public key, so a change of order or membership loses nothing that survives it.
+use super::inbound::Tunnel;
+use super::{icmp, l3, ExitState, Traffic, UserState};
+use crate::config::{self, Config, Exits, IpEntry, Policy, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::net::{IpAddr, SocketAddr};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
+#[derive(PartialEq, Eq)]
 pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>}
 
+#[derive(PartialEq, Eq)]
 pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
 
 /// What a netstack exit does with one class of traffic its outbound cannot carry: a policy of `unsupported`, with a `via` resolved to its exit.
@@ -24,7 +31,16 @@ pub enum Backend {
 	Block,
 }
 
-pub struct Exit {pub tag: String, pub backend: Backend}
+pub struct Exit {
+	pub tag: String,
+	pub backend: Backend,
+	/// The tag of the outbound of a netstack backend. An exit that is given another outbound has changed, even when that one leads to the same place.
+	pub outbound: Option<String>,
+	pub traffic: Arc<Traffic>,
+	pub state: Arc<ExitState>,
+	/// Failures in a row of each DNS server through this exit, server by server. They start over when the list of servers changes.
+	pub failures: Arc<[AtomicU32; MAX_DNS_SERVERS]>,
+}
 
 pub struct Inbound {
 	pub tag: String,
@@ -33,9 +49,15 @@ pub struct Inbound {
 	pub pools: Vec<IpNet>,
 	pub mtu: u16,
 	pub transports: Vec<Transport>,
-	/// The device behind each WireGuard peer index of this tunnel.
-	pub peers: Vec<usize>,
+	pub traffic: Arc<Traffic>,
+	/// The tunnel as it runs. A reload that leaves the key, the pools and the MTU alone hands the same one on, with its sessions.
+	pub tunnel: Arc<Tunnel>,
 }
+
+/// Why a user has no peer and holds no address. Whatever puts a user here cuts them off the same way, see `Host::switch`.
+/// Out of quota is the next reason: `Plan::new` decides it where it decides `Expired`, from the user's byte count, and nothing after that has to know about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Denied {Disabled, Expired}
 
 pub struct User {
 	pub name: String,
@@ -43,13 +65,26 @@ pub struct User {
 	/// None is every exit.
 	pub entitled: Option<Vec<usize>>,
 	pub exit: Option<usize>,
+	pub denied: Option<Denied>,
+	pub state: Arc<UserState>,
 }
 
-pub struct Device {pub user: usize, pub name: String, pub public_key: [u8; 32], pub preshared_key: Option<[u8; 32]>}
+pub struct Device {
+	pub user: usize,
+	pub name: String,
+	pub public_key: [u8; 32],
+	pub preshared_key: Option<[u8; 32]>,
+	/// In ascending order, so two devices with the same addresses compare equal.
+	pub addresses: Vec<IpAddr>,
+	/// The inbounds it has an address in. It is a peer of each of their tunnels, once, however many addresses that is.
+	pub inbounds: Vec<usize>,
+	/// The ICMP errors the device may still be sent.
+	pub limit: Arc<Mutex<icmp::Limit>>,
+}
 
-/// Where a tunnel address lives: the device, its inbound and its peer index in that inbound's tunnel.
+/// Where a tunnel address lives: the device and its inbound.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Holder {pub device: usize, pub inbound: usize, pub peer: usize}
+pub struct Holder {pub device: usize, pub inbound: usize}
 
 pub enum IpMatch {Net(IpNet), Private, Users, Tunnel(usize)}
 
@@ -87,8 +122,13 @@ pub struct Rule {
 	pub action: Action,
 }
 
+#[derive(Default)]
 pub struct Plan {
+	/// Counts the plans the engine has put in force. The flow table holds decisions in the indexes of one plan and turns away whoever comes with another.
+	pub generation: u64,
 	pub log_destinations: bool,
+	/// What `show` goes by: `log_destinations` of the plan in force, shared by every plan so that a flow that began under an earlier one stops showing destinations with everybody else.
+	pub shown: Arc<AtomicBool>,
 	/// The servers the node's resolver asks, in the order it tries them.
 	pub dns: Vec<SocketAddr>,
 	pub hijack: bool,
@@ -104,12 +144,24 @@ pub struct Plan {
 	pub pools: Vec<(IpNet, usize)>,
 	pub private: Vec<IpNet>,
 	pub by_address: HashMap<IpAddr, Holder>,
+	/// The device of each public key.
+	pub by_key: HashMap<[u8; 32], usize>,
+	/// Users whose `expires_at` has passed, with that time. A user stays here for as long as the config gives them the same `expires_at`, wherever the node's clock goes afterwards.
+	pub expired: HashMap<String, OffsetDateTime>,
+	/// The earliest `expires_at` still to come among the users that are not denied.
+	pub next_expiry: Option<OffsetDateTime>,
+	/// The exit with an l3 backend and the way into its interface. The engine sets it once the interface is up.
+	pub l3: Option<(usize, l3::Port)>,
 }
 
 impl Plan {
-	/// Compiles a validated config. `now` decides which users have expired.
-	pub fn new(config: &Config, now: OffsetDateTime) -> anyhow::Result<Plan> {
+	/// Compiles a validated config. `now` decides which users have expired, `tunnels` holds the tunnel of each inbound in the order of the config,
+	/// and `previous` is the plan in force, whose counters, name memory and other state go to whatever keeps its tag, user name or public key.
+	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>) -> anyhow::Result<Plan> {
 		let stale = || anyhow!("the config names something it does not define; it was not validated");
+		anyhow::ensure!(tunnels.len() == config.inbounds.len(), "one tunnel for each inbound");
+		let dns: Vec<SocketAddr> = config.dns.servers.iter().map(|server| server.0).collect();
+		let (was_exit, was_inbound, was_user): (HashMap<&str, &Exit>, HashMap<&str, &Inbound>, HashMap<&str, &User>) = (previous.exits.iter().map(|exit| (exit.tag.as_str(), exit)).collect(), previous.inbounds.iter().map(|inbound| (inbound.tag.as_str(), inbound)).collect(), previous.users.iter().map(|user| (user.name.as_str(), user)).collect());
 		let index = |names: Vec<&str>| names.into_iter().enumerate().map(|(i, name)| (name.to_string(), i)).collect::<HashMap<String, usize>>();
 		let find = |map: &HashMap<String, usize>, name: &str| map.get(name).copied().ok_or_else(stale);
 		let find_all = |map: &HashMap<String, usize>, names: &Option<Vec<String>>| names.as_ref().map(|names| names.iter().map(|name| find(map, name)).collect::<anyhow::Result<Vec<usize>>>()).transpose();
@@ -150,19 +202,32 @@ impl Plan {
 				config::Backend::L3(l3) => Backend::L3 {interface: l3.interface.clone().unwrap_or_else(|| DEFAULT_INTERFACE.to_string()), masquerade: l3.masquerade != Some(false)},
 				config::Backend::Block {} => Backend::Block,
 			};
-			exits.push(Exit {tag: exit.tag.clone(), backend});
+			let was = was_exit.get(exit.tag.as_str());
+			exits.push(Exit {
+				tag: exit.tag.clone(),
+				backend,
+				outbound: if let config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None},
+				traffic: was.map(|was| was.traffic.clone()).unwrap_or_default(),
+				state: was.map(|was| was.state.clone()).unwrap_or_default(),
+				failures: was.filter(|_| previous.dns == dns).map(|was| was.failures.clone()).unwrap_or_default(),
+			});
 		}
-		let mut inbounds: Vec<Inbound> = config.inbounds.iter().map(|inbound| Inbound {
+		let inbounds: Vec<Inbound> = config.inbounds.iter().zip(tunnels).map(|(inbound, tunnel)| Inbound {
 			tag: inbound.tag.clone(),
 			private_key: inbound.private_key.expose().0,
 			pools: inbound.address.iter().map(|net| net.0).collect(),
 			mtu: inbound.mtu.unwrap_or(DEFAULT_MTU),
 			transports: inbound.transports.clone(),
-			peers: Vec::new(),
+			traffic: was_inbound.get(inbound.tag.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(),
+			tunnel,
 		}).collect();
 		let pools: Vec<(IpNet, usize)> = inbounds.iter().enumerate().flat_map(|(i, inbound)| inbound.pools.iter().map(move |pool| (*pool, i))).collect();
-		let (mut users, mut devices, mut by_address) = (Vec::with_capacity(config.users.len()), Vec::new(), HashMap::new());
+		let (mut users, mut devices, mut by_address, mut by_key, mut expired, mut next_expiry) = (Vec::with_capacity(config.users.len()), Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), None::<OffsetDateTime>);
 		for (u, user) in config.users.iter().enumerate() {
+			// Once the time has passed while the node ran, it stays passed: a clock that steps back must not let the user in again.
+			let lapsed = user.expires_at.map(|at| at.0).filter(|at| *at <= now || previous.expired.get(&user.name) == Some(at));
+			if let Some(at) = lapsed {expired.insert(user.name.clone(), at);}
+			let denied = if user.enabled == Some(false) {Some(Denied::Disabled)} else if lapsed.is_some() {Some(Denied::Expired)} else {None};
 			users.push(User {
 				name: user.name.clone(),
 				groups: user.groups.iter().map(|group| find(&group_names, group)).collect::<anyhow::Result<_>>()?,
@@ -171,20 +236,30 @@ impl Plan {
 					Exits::List(list) => Some(list.iter().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?),
 				},
 				exit: user.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?,
+				denied,
+				state: was_user.get(user.name.as_str()).map(|was| was.state.clone()).unwrap_or_default(),
 			});
-			if user.enabled == Some(false) || user.expires_at.is_some_and(|at| at.0 <= now) {continue}
+			if denied.is_some() {continue}
+			if let Some(at) = user.expires_at {next_expiry = Some(next_expiry.map_or(at.0, |next| next.min(at.0)))}
 			for device in &user.devices {
-				let d = devices.len();
-				devices.push(Device {user: u, name: device.name.clone(), public_key: device.public_key.0, preshared_key: device.preshared_key.as_ref().map(|key| key.expose().0)});
+				let (d, mut addresses, mut within) = (devices.len(), Vec::with_capacity(device.addresses.len()), Vec::new());
 				for config::Ip(ip) in &device.addresses {
 					let inbound = pools.iter().find(|(pool, _)| pool.contains(ip)).map(|(_, i)| *i).ok_or_else(stale)?;
-					// A device is one peer of each tunnel it has an address in, however many addresses that is.
-					let peer = inbounds[inbound].peers.iter().position(|other| *other == d).unwrap_or_else(|| {
-						inbounds[inbound].peers.push(d);
-						inbounds[inbound].peers.len() - 1
-					});
-					by_address.insert(*ip, Holder {device: d, inbound, peer});
+					if !within.contains(&inbound) {within.push(inbound)}
+					addresses.push(*ip);
+					by_address.insert(*ip, Holder {device: d, inbound});
 				}
+				addresses.sort();
+				by_key.insert(device.public_key.0, d);
+				devices.push(Device {
+					user: u,
+					name: device.name.clone(),
+					public_key: device.public_key.0,
+					preshared_key: device.preshared_key.as_ref().map(|key| key.expose().0),
+					addresses,
+					inbounds: within,
+					limit: previous.by_key.get(&device.public_key.0).map_or_else(|| Arc::new(Mutex::new(icmp::Limit::new(Instant::now()))), |was| previous.devices[*was].limit.clone()),
+				});
 			}
 		}
 		let mut rules = Vec::new();
@@ -214,12 +289,14 @@ impl Plan {
 			});
 		}
 		Ok(Plan {
+			generation: previous.generation + 1,
 			log_destinations: config.log.destinations,
-			dns: config.dns.servers.iter().map(|server| server.0).collect(),
+			shown: previous.shown.clone(),
 			hijack: config.dns.hijack != Some(false),
 			default_exit: find(&exit_tags, &config.routing.default)?,
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),
-			inbounds, users, devices, exits, rules, pools, by_address,
+			l3: None,
+			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry,
 		})
 	}
 
@@ -228,6 +305,9 @@ impl Plan {
 
 	pub fn is_gateway(&self, ip: IpAddr) -> bool {self.pools.iter().any(|(pool, _)| pool.addr() == ip)}
 
+	/// The inbound a tunnel belongs to under this plan. None for a tunnel the plan no longer has.
+	pub fn inbound_of(&self, tunnel: &Arc<Tunnel>) -> Option<usize> {self.inbounds.iter().position(|inbound| Arc::ptr_eq(&inbound.tunnel, tunnel))}
+
 	/// A destination or DNS name for a log line: shown only when the config's `log.destinations` allows it.
-	pub fn show(&self, destination: impl Display) -> String {if self.log_destinations {destination.to_string()} else {"<hidden>".to_string()}}
+	pub fn show(&self, destination: impl Display) -> String {if self.shown.load(Ordering::Relaxed) {destination.to_string()} else {"<hidden>".to_string()}}
 }
