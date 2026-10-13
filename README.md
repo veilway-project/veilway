@@ -1,3 +1,7 @@
+<p align="center">
+<img src="apps/desktop/src-tauri/icons/icon.svg" width="96" height="96" alt="Veilway">
+</p>
+
 <h1 align="center">Veilway</h1>
 
 <p align="center">
@@ -52,7 +56,7 @@ The full plan with the gate for each phase is in [PLAN.md](PLAN.md).
 | Phase | Delivers |
 |---|---|
 | 0, done | Repository layout, licence and community files, CI, threat model |
-| 1 | Core engine: versioned config with hot reload, several inbounds, flow table and router, exits (userspace stack, and TUN with NAT on Linux for every IP protocol), users, quotas, stats, control API |
+| 1, done | Core engine: versioned config with hot reload, several inbounds, flow table and router, exits (userspace stack, and TUN with NAT on Linux for every IP protocol), users, quotas, stats, control API |
 | 2 | Native protocol: a control channel inside the tunnel, transports (TLS, obfuscated UDP, fronted HTTP, a fake TLS spike), client engine on Windows, macOS and Linux with IPv6 |
 | 3 | Shared design system for panel and clients, themes |
 | 4 | Web panel: users, inbounds, exits, routing, subscriptions, stats |
