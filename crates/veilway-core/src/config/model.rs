@@ -9,6 +9,7 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Unexpected, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize, Serializer};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use time::format_description::well_known::Rfc3339;
@@ -137,15 +138,41 @@ fn port(s: &str) -> Result<u16, &'static str> {
 	s.parse().map_err(|_| "a port from 1 to 65535")
 }
 
+/// What stands in the place of every secret in a document the control API shows. In a document it is sent, it stands for the value the same object has in the running config, see `Config::parse_keeping`.
+pub const REDACTED: &str = "<redacted>";
+
+thread_local! {
+	/// Set while `Config::redacted` serializes on this thread.
+	static REDACTING: Cell<bool> = const {Cell::new(false)};
+}
+
 /// A secret. No diagnostic, log line or `Debug` output shows it.
-// `Serialize` writes the real value, because that is how the document is saved: an API response must redact it first.
-#[derive(Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+// `Serialize` writes the real value, because that is how the document is saved. `Config::redacted` is the one way to a document without them, and it covers every `Secret` there is or will be, because the marker is written here.
+#[derive(Deserialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(transparent)]
 #[schemars(inline)]
 pub struct Secret<T>(T);
 
 impl<T> Secret<T> {
 	pub fn expose(&self) -> &T {&self.0}
+}
+
+impl<T: Serialize> Serialize for Secret<T> {
+	fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {if REDACTING.get() {s.serialize_str(REDACTED)} else {self.0.serialize(s)}}
+}
+
+impl Config {
+	/// The document with `REDACTED` in the place of every secret, for whoever may see the config and not its keys and passwords.
+	pub fn redacted(&self) -> serde_json::Value {
+		// Switched off again however this ends: a flag left on would write the marker into the next config file that is saved.
+		struct Off;
+		impl Drop for Off {
+			fn drop(&mut self) {REDACTING.set(false)}
+		}
+		let _off = Off;
+		REDACTING.set(true);
+		serde_json::to_value(self).unwrap_or_default()
+	}
 }
 
 impl<T> fmt::Debug for Secret<T> {

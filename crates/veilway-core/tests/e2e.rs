@@ -18,7 +18,7 @@ use veilway_core::config::{Applied, ApplyError, Config, Revision};
 use veilway_core::engine::dns::response;
 use veilway_core::engine::icmp::{MAX_PINGS_PER_DEVICE, MAX_PINGS_PER_USER};
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
-use veilway_core::{Denied, DnsTotals, Engine, Options, Reason, Totals, Usage};
+use veilway_core::{Denied, DnsTotals, Engine, Options, Over, Reason, Totals, Usage};
 
 const GATEWAY:[u8;4]=[10, 7, 0, 1];
 const PEER_A:[u8;4]=[10, 7, 0, 2];
@@ -2455,6 +2455,15 @@ async fn a_transport_added_by_a_reload_serves_and_a_removed_one_stops(){
 	let mut over_ws=Client::connect(node.keys[0], node.public, bridged).await;
 	let mut third=Flow::open(&mut over_ws, PEER_A, OTHER, 42092, 80).await;
 	assert_eq!(third.say(&mut over_ws, b"over ws").await, Answer::Accepted);
+	// A session is known by the kind of transport its device was last heard over, and whoever asks for one user is told of that user's devices and no other.
+	let all=node.engine.peers(None);
+	let over=|key:&[u8;32]| all.iter().find(|peer| peer.public_key==veilway_wg::public_key(key)).and_then(|peer| peer.over);
+	assert_eq!((over(&node.keys[0]), over(&node.keys[1])), (Some(Over::Ws), Some(Over::Udp)));
+	for peer in &all{
+		let own=node.engine.peers(Some(&peer.user));
+		assert!(own.iter().all(|own| own.user==peer.user) && own.iter().any(|own| own.public_key==peer.public_key && own.over==peer.over && own.flows==peer.flows), "{own:?}");
+	}
+	assert!(node.engine.peers(Some("nobody")).is_empty());
 	// Now only the second udp transport is left.
 	doc["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":second.to_string()}]);
 	reload(&node, &doc).await.unwrap();

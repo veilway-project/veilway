@@ -1,4 +1,5 @@
 target/
+node_modules/
 *.pem
 config.json
 veilway-state.json*

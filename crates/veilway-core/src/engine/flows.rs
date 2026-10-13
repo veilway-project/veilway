@@ -1,7 +1,7 @@
 //! What happens to a TCP or UDP flow once the userspace stack has accepted it: it is re-dialled through the outbound of the exit its routing decision named.
 use super::plan::{Backend, Fallback, Holder, Outbound, Plan, Upstream};
 use super::route::{By, Decision, Key, Reason, CLOSED_IDLE};
-use super::{dns, netstack, Shared};
+use super::{dns, netstack, Event, Shared};
 use etherparse::PacketBuilder;
 use ipstack::{IpStackStream, IpStackUdpStream};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -277,6 +277,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 		Ok(Ok(v)) => {
 			if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).take().is_some() {
 				state.udp_flips.fetch_add(1, Ordering::Relaxed);
+				shared.publish(Event::ExitUdpChanged {exit: tag.to_string(), udp: true});
 				tracing::info!("exit {tag}: the upstream relays udp again");
 			}
 			v
@@ -285,6 +286,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 			// Never latched: the mark expires after UDP_RETRY and the next flow tries again.
 			if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).replace(Instant::now()).is_none() {
 				state.udp_flips.fetch_add(1, Ordering::Relaxed);
+				shared.publish(Event::ExitUdpChanged {exit: tag.to_string(), udp: false});
 				tracing::info!("exit {tag}: the upstream cannot relay udp, so dns falls back to tcp and other udp follows the exit's `unsupported.udp` policy; trying again every {}s: {e}", UDP_RETRY.as_secs());
 			} else {tracing::debug!("exit {tag}: udp associate failed again: {e}")}
 			return Some(stream);

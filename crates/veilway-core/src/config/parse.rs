@@ -1,12 +1,14 @@
 //! Strict JSON reading. serde's own error texts quote the offending value, so nothing here passes one through:
 //! the document is first read into a small tree, then deserialized by a deserializer whose error type only
 //! ever says where the problem is and what was expected.
-use super::{Config, Diagnostic, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN};
-use serde::de::{self, DeserializeSeed, Deserializer, Expected, IntoDeserializer, MapAccess, SeqAccess, Unexpected, Visitor};
+use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
+use serde::de::{self, DeserializeSeed, Deserializer, Expected, IgnoredAny, IntoDeserializer, MapAccess, SeqAccess, Unexpected, Visitor};
 use serde::Deserialize;
 use std::cell::Cell;
 use std::collections::btree_map;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 /// `Negative` and `Fraction` keep no value: no key of the format takes one.
@@ -243,19 +245,99 @@ impl<'de> MapAccess<'de> for Entries<'_> {
 	}
 }
 
+/// The tree of one document under the strict JSON rules.
+fn tree(bytes: &[u8]) -> Result<Json, Diagnostic> {
+	let fail = |message: String| Diagnostic {path: String::new(), message};
+	if bytes.len() as u64 > MAX_FILE_BYTES {return Err(fail(format!("expected a document of at most {} MiB", MAX_FILE_BYTES >> 20)))}
+	if bytes.starts_with(b"\xef\xbb\xbf") {return Err(fail("expected a document without a byte order mark".to_string()))}
+	let text = std::str::from_utf8(bytes).map_err(|e| fail(format!("expected UTF-8, found an invalid sequence at byte {}", e.valid_up_to())))?;
+	// A config is an object. Anything else is refused for what it is before a tree of it is built: a list of short values takes many times the memory of its text, and whoever sends one gets nothing for it but this.
+	let first = text.trim_start_matches([' ', '\t', '\n', '\r']).bytes().next();
+	if first != Some(b'{') {
+		return Err(fail(match (serde_json::from_str::<IgnoredAny>(text), first) {
+			(Err(e), _) => format!("expected one JSON document, found a syntax error at line {} column {}", e.line(), e.column()),
+			(Ok(_), Some(b'[')) => "expected an object, found a list".to_string(),
+			(Ok(_), Some(b'"')) => "expected an object, found a string".to_string(),
+			(Ok(_), Some(b't' | b'f')) => "expected an object, found true or false".to_string(),
+			(Ok(_), Some(b'n')) => "expected an object, found null".to_string(),
+			(Ok(_), _) => "expected an object, found a number".to_string(),
+		}));
+	}
+	let (broken, nodes) = (Cell::new(""), Cell::new(0));
+	let mut reader = serde_json::Deserializer::from_str(text);
+	let json = Build(&broken, &nodes).deserialize(&mut reader).map_err(|e| {
+		fail(format!("expected one JSON document, found {} at line {} column {}", if broken.get().is_empty() {"a syntax error"} else {broken.get()}, e.line(), e.column()))
+	})?;
+	reader.end().map_err(|e| fail(format!("expected one JSON document, found data after it at line {} column {}", e.line(), e.column())))?;
+	Ok(json)
+}
+
 impl Config {
 	/// Reads one document under the strict JSON rules. The result is not validated yet: call `validate`.
 	pub fn parse(bytes: &[u8]) -> Result<Config, Diagnostic> {
-		let fail = |message: String| Diagnostic {path: String::new(), message};
-		if bytes.len() as u64 > MAX_FILE_BYTES {return Err(fail(format!("expected a document of at most {} MiB", MAX_FILE_BYTES >> 20)))}
-		if bytes.starts_with(b"\xef\xbb\xbf") {return Err(fail("expected a document without a byte order mark".to_string()))}
-		let text = std::str::from_utf8(bytes).map_err(|e| fail(format!("expected UTF-8, found an invalid sequence at byte {}", e.valid_up_to())))?;
-		let (broken, nodes) = (Cell::new(""), Cell::new(0));
-		let mut reader = serde_json::Deserializer::from_str(text);
-		let json = Build(&broken, &nodes).deserialize(&mut reader).map_err(|e| {
-			fail(format!("expected one JSON document, found {} at line {} column {}", if broken.get().is_empty() {"a syntax error"} else {broken.get()}, e.line(), e.column()))
-		})?;
-		reader.end().map_err(|e| fail(format!("expected one JSON document, found data after it at line {} column {}", e.line(), e.column())))?;
+		let json = tree(bytes)?;
 		Config::deserialize(De {json: &json, path: &Path::Root}).map_err(|e| Diagnostic {path: e.path.unwrap_or_default(), message: e.message})
+	}
+
+	/// `parse` for a document in which a secret may hold `REDACTED` in the place of its value, which is how the control API shows a config and takes it back.
+	/// The marker stands for the value of the same object in `running`: the `private_key` of the inbound with that tag, the `preshared_key` of the device with that `public_key`,
+	/// and the `username` and `password` of the socks5 outbound with that tag and that `server`. The server is part of it because that is who the node sends them to: kept for another one, they would go to whoever the document names.
+	/// A marker `running` has no value for is an error at the path of its field, and so is the marker anywhere else, where it is no valid value. The result holds the real secrets.
+	/// Next to it come the tags of the outbounds whose `username` or `password` the document spells out, which is what lets a caller say "changed" for them without saying whether they are what runs.
+	pub fn parse_keeping(bytes: &[u8], running: &Config) -> Result<(Config, Vec<String>), Report> {
+		let (mut json, mut report, mut spelled) = (tree(bytes).map_err(|e| Report {errors: vec![e], ..Report::default()})?, Report::default(), Vec::new());
+		let marked = |object: &BTreeMap<String, Json>, key: &str| matches!(object.get(key), Some(Json::Str(value)) if value == REDACTED);
+		let named = |object: &BTreeMap<String, Json>, key: &str| match object.get(key) {
+			Some(Json::Str(name)) => Some(name.clone()),
+			_ => None,
+		};
+		// A document that is no object has no secret to keep, and `deserialize` says what is wrong with it.
+		let mut nothing = BTreeMap::new();
+		let root = if let Json::Obj(root) = &mut json {root} else {&mut nothing};
+		if let Some(Json::Arr(inbounds)) = root.get_mut("inbounds") {
+			for (i, inbound) in inbounds.iter_mut().enumerate() {
+				let Json::Obj(inbound) = inbound else {continue};
+				if !marked(inbound, "private_key") {continue}
+				match named(inbound, "tag").and_then(|tag| running.inbounds.iter().find(|was| was.tag == tag)) {
+					Some(was) => drop(inbound.insert("private_key".to_string(), Json::Str(STANDARD.encode(was.private_key.expose().0)))),
+					None => report.error(format!("inbounds[{i}].private_key"), "expected a key: the marker stands for the key of the running inbound with this tag, and no inbound runs under it"),
+				}
+			}
+		}
+		if let Some(Json::Arr(outbounds)) = root.get_mut("outbounds") {
+			for (i, outbound) in outbounds.iter_mut().enumerate() {
+				let Json::Obj(outbound) = outbound else {continue};
+				let (tag, server) = (named(outbound, "tag"), outbound.get("server").and_then(|json| HostPort::deserialize(De {json, path: &Path::Root}).ok()));
+				if ["username", "password"].iter().any(|key| outbound.contains_key(*key) && !marked(outbound, *key)) {spelled.extend(tag.clone())}
+				for key in ["username", "password"] {
+					if !marked(outbound, key) {continue}
+					let kept = tag.as_ref().zip(server.as_ref()).and_then(|(tag, server)| running.outbounds.iter().find_map(|was| match was {
+						Outbound::Socks5 {tag: of, server: at, username, password} if of == tag && at == server => if key == "username" {username.as_ref()} else {password.as_ref()},
+						_ => None,
+					}));
+					match kept {
+						Some(kept) => drop(outbound.insert(key.to_string(), Json::Str(kept.expose().clone()))),
+						None => report.error(format!("outbounds[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running socks5 outbound with this tag and this server, and no such outbound runs with one. For a server that is new or has changed, the {key} has to be sent itself")),
+					}
+				}
+			}
+		}
+		if let Some(Json::Arr(users)) = root.get_mut("users") {
+			let shared: HashMap<[u8; 32], &Secret<Key>> = running.users.iter().flat_map(|user| &user.devices).filter_map(|device| device.preshared_key.as_ref().map(|key| (device.public_key.0, key))).collect();
+			for (u, user) in users.iter_mut().enumerate() {
+				let Json::Obj(user) = user else {continue};
+				let Some(Json::Arr(devices)) = user.get_mut("devices") else {continue};
+				for (d, device) in devices.iter_mut().enumerate() {
+					let Json::Obj(device) = device else {continue};
+					if !marked(device, "preshared_key") {continue}
+					match named(device, "public_key").and_then(|key| <[u8; 32]>::try_from(STANDARD.decode(key).ok()?).ok()).and_then(|key| shared.get(&key)) {
+						Some(kept) => drop(device.insert("preshared_key".to_string(), Json::Str(STANDARD.encode(kept.expose().0)))),
+						None => report.error(format!("users[{u}].devices[{d}].preshared_key"), "expected a key: the marker stands for the preshared key of the running device with this public_key, and no device runs under it with one"),
+					}
+				}
+			}
+		}
+		if !report.errors.is_empty() {return Err(report)}
+		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| (config, spelled)).map_err(|e| Report {errors: vec![Diagnostic {path: e.path.unwrap_or_default(), message: e.message}], ..Report::default()})
 	}
 }

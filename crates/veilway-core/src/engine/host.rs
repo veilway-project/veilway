@@ -5,7 +5,7 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{Backend, Denied, Fallback, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{l3, Shared, QUEUE};
+use super::{l3, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{Config, Protocol, Tls, Transport, DEFAULT_MTU, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
@@ -17,7 +17,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::mpsc::{self, Receiver};
@@ -226,7 +226,7 @@ impl Host {
 		}
 		self.tunnels.retain(|tag, _| plan.inbounds.iter().any(|inbound| inbound.tag == *tag));
 		for (tunnel, addr, socket) in loopbacks {
-			if let Some(running) = self.tunnels.get_mut(&tunnel.tag) {running.loopback = Some((addr, socket.clone(), Task(inbound::read(shared, tunnel, socket))))}
+			if let Some(running) = self.tunnels.get_mut(&tunnel.tag) {running.loopback = Some((addr, socket.clone(), Task(inbound::read(shared, tunnel, socket, Over::Ws))))}
 		}
 		let (mut wanted, mut routes): (HashMap<SocketAddr, &Arc<Tunnel>>, HashMap<SocketAddr, Vec<(String, Option<Tls>, Arc<Tunnel>, u64)>>) = Default::default();
 		for inbound in &plan.inbounds {
@@ -249,7 +249,7 @@ impl Host {
 		// A socket is read for the tunnel that has its address now. One whose address nobody has any more is closed, and so is its reader.
 		self.udp.retain(|addr, (socket, reader)| match wanted.get(addr) {
 			Some(tunnel) => {
-				if !reader.as_ref().is_some_and(|(_, of)| Arc::ptr_eq(of, tunnel)) {*reader = Some((Task(inbound::read(shared, (*tunnel).clone(), socket.clone())), (*tunnel).clone()))}
+				if !reader.as_ref().is_some_and(|(_, of)| Arc::ptr_eq(of, tunnel)) {*reader = Some((Task(inbound::read(shared, (*tunnel).clone(), socket.clone(), Over::Udp)), (*tunnel).clone()))}
 				true
 			}
 			None => false,
@@ -369,7 +369,7 @@ impl Host {
 				};
 				let (Some(packet), mut peers, mut datagrams) = (packet, inbound.tunnel.lock(), Vec::new()) else {continue};
 				let Some(peer) = peers.wg.index(&flow.device).filter(|peer| peers.wg.time_since_last_handshake(*peer).is_some()) else {continue};
-				let Some((endpoint, socket)) = peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(Weak::upgrade)) else {continue};
+				let Some((endpoint, socket)) = peers.wg.endpoint(peer).zip(peers.via.get(peer).and_then(|(socket, _)| socket.upgrade())) else {continue};
 				peers.wg.encapsulate(peer, &packet, &mut datagrams);
 				shared.spend(&old.users[old.devices[from.device].user], false, packet.len());
 				inbound.traffic.down(packet.len());
@@ -408,13 +408,26 @@ impl Host {
 		shared.pings.lock().unwrap_or_else(|e| e.into_inner()).retain(|(src, dst, _), (device, ..)| !cut.contains_key(device) && !pings.contains(&(*src, *dst)));
 		// An exit that is not what it was has an upstream nothing is known about.
 		for (was, at) in old.exits.iter().zip(&exits) {
-			if at.is_none() {*was.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()) = None}
+			if at.is_none() && was.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() && tags.contains_key(was.tag.as_str()) {shared.publish(Event::ExitUdpChanged {exit: was.tag.clone(), udp: true})}
 		}
 		for (was, reason) in old.devices.iter().filter_map(|was| cut.get(&was.public_key).map(|reason| (was, reason))).take(MAX_NAMES_LOGGED) {
 			tracing::info!("user {} device {}: cut off, {reason}: its session keys and its flows are gone and the user's dns memory is cleared", old.users[was.user].name, was.name);
 		}
 		if cut.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices were cut off", cut.len() - MAX_NAMES_LOGGED)}
 		if ended > 0 {tracing::info!("{ended} flow(s) ended with the config they were routed by")}
+		// A user is an event when what `denied` says of them turns, not when one of their devices changes. The plan before the first one holds what the state file remembered and nobody was connected under it.
+		for was in old.users.iter().filter(|_| old.generation > 0) {
+			match (was.denied, users.get(was.name.as_str()).map(|is| is.denied)) {
+				(None, None) => shared.publish(Event::UserCutOff {user: was.name.clone(), reason: CutOff::Removed}),
+				(None, Some(Some(denied))) => shared.publish(Event::UserCutOff {user: was.name.clone(), reason: match denied {
+					Denied::Disabled => CutOff::Disabled,
+					Denied::Expired => CutOff::Expired,
+					Denied::Quota => CutOff::Quota,
+				}}),
+				(Some(_), Some(None)) => shared.publish(Event::UserRestored {user: was.name.clone()}),
+				_ => {}
+			}
+		}
 		if old.users.iter().any(|was| users.get(was.name.as_str()).is_none_or(|is| is.denied == Some(Denied::Quota) && was.denied != is.denied)) {shared.save.notify_one()}
 		(old, plan)
 	}

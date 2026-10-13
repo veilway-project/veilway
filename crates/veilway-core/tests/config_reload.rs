@@ -78,6 +78,16 @@ fn config(doc: &Value) -> Config {
 	config
 }
 
+/// The bytes of a config hold keys and passwords. Whoever is shown the document without them must not be able to try a guess of one against the revision.
+#[test]
+fn a_revision_is_no_hash_that_somebody_else_can_work_out() {
+	let doc = bytes(&good());
+	assert!(Revision::of(&doc) == Revision::of(&doc) && Revision::of(&doc) != Revision::of(&bytes(&with(|doc| doc["outbounds"][0]["password"] = json!("another-password")))));
+	let plain: String = ring::digest::digest(&ring::digest::SHA256, &doc).as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+	assert_eq!(Revision::of(&doc).to_string().len(), plain.len());
+	assert_ne!(Revision::of(&doc).to_string(), plain, "a revision is the plain hash of bytes that hold secrets");
+}
+
 #[track_caller]
 fn between(old: &Value, new: &Value) -> Diff {Diff::between(&config(old), &config(new), OffsetDateTime::parse(NOW, &Rfc3339).unwrap())}
 

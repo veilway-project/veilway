@@ -57,6 +57,29 @@ pub enum Reason {
 
 impl Reason {
 	pub const COUNT: usize = 15;
+	/// Every reason, in the order of their counters.
+	pub const ALL: [Reason; Reason::COUNT] = [Reason::Unparsable, Reason::Fragment, Reason::SpoofedSource, Reason::Gate, Reason::Rule, Reason::Entitlement, Reason::FlowTableFull, Reason::Unreachable, Reason::Unsupported, Reason::BlockExit, Reason::QueueFull, Reason::NoFlow, Reason::TooBig, Reason::IcmpLimited, Reason::Stale];
+
+	/// The name the control API gives the counter. It is part of that API and does not change.
+	pub fn name(self) -> &'static str {
+		match self {
+			Reason::Unparsable => "unparsable",
+			Reason::Fragment => "fragment",
+			Reason::SpoofedSource => "spoofed_source",
+			Reason::Gate => "gate",
+			Reason::Rule => "rule",
+			Reason::Entitlement => "entitlement",
+			Reason::FlowTableFull => "flow_table_full",
+			Reason::Unreachable => "unreachable",
+			Reason::Unsupported => "unsupported",
+			Reason::BlockExit => "block_exit",
+			Reason::QueueFull => "queue_full",
+			Reason::NoFlow => "no_flow",
+			Reason::TooBig => "too_big",
+			Reason::IcmpLimited => "icmp_limited",
+			Reason::Stale => "stale",
+		}
+	}
 }
 
 /// How a flow leaves through its exit.
@@ -332,6 +355,12 @@ impl Flows {
 	}
 
 	pub fn len(&self) -> usize {self.lock().flows.len()}
+
+	/// The carried flows each device has right now, by its public key. A device without one is not in it.
+	pub fn per_device(&self) -> HashMap<[u8; 32], usize> {self.lock().per_device.clone()}
+
+	/// The carried flows one device has right now.
+	pub fn of_device(&self, device: &[u8; 32]) -> usize {self.lock().per_device.get(device).copied().unwrap_or(0)}
 
 	pub fn is_empty(&self) -> bool {self.len() == 0}
 }

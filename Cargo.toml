@@ -36,6 +36,9 @@ time={version="0.3.36", default-features=false, features=["std", "parsing", "for
 ring="0.17"
 socket2="0.6"
 libc="0.2.150"
+axum={version="0.8", default-features=false, features=["http1", "tokio"]}
+hyper={version="1", features=["http1", "server"]}
+hyper-util={version="0.1", features=["tokio", "service"]}
 
 
 # ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout. See vendor/ipstack ("veilway patch").

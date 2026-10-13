@@ -1,10 +1,15 @@
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+#[cfg(unix)]
+use tokio::sync::broadcast::error::RecvError;
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use veilway_core::config::{Log, LogLevel, Report};
+#[cfg(unix)]
+use veilway_core::Event;
 use veilway_core::Options;
 use veilway_wg::ws::{self, TlsFiles};
 
@@ -21,6 +26,12 @@ enum Command {
 		#[arg(long)] allow_readable_config: bool,
 		/// Where every user's usage is kept across restarts [default: veilway-state.json next to the config file]
 		#[arg(long)] state: Option<PathBuf>,
+		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
+		#[cfg(unix)]
+		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
+		/// Run without the control API
+		#[cfg(unix)]
+		#[arg(long)] no_api: bool,
 	},
 	/// Validate a version 1 config and print every error and warning
 	Check {
@@ -82,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("public_key:  {}", veilway_wg::encode_key(&veilway_wg::public_key(&private)));
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state} => {
+		Command::Run {config, allow_readable_config, state, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -98,16 +109,28 @@ async fn main() -> anyhow::Result<()> {
 			#[cfg(unix)]
 			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);
 			let dir = config.parent().unwrap_or(Path::new(""));
-			let engine = veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state.unwrap_or_else(|| dir.join("veilway-state.json"))), ..Options::new(dir)}).await?;
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state.unwrap_or_else(|| dir.join("veilway-state.json"))), ..Options::new(dir)}).await?);
+			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
+			#[cfg(unix)]
+			let (control, mut events) = (if no_api {None} else {
+				match veilway_api::serve(engine.clone(), veilway_api::Options {socket: api.unwrap_or_else(|| dir.join("veilway.sock")), config: config.clone(), limits: veilway_api::Limits::default()}) {
+					Ok(control) => Some(control),
+					Err(e) => {
+						if let Ok(engine) = Arc::try_unwrap(engine) {engine.shutdown().await}
+						return Err(e.into());
+					}
+				}
+			}, engine.events());
 			#[cfg(unix)]
 			let stopped = loop {
 				tokio::select! {
 					stopped = tokio::signal::ctrl_c() => break stopped,
 					_ = terminate.recv() => break Ok(()),
+					// However a config came into force, on SIGHUP or through the control API, its `log` is what is written from here on. A listener that fell behind looks at what runs now.
+					event = events.recv() => if matches!(event, Ok(Event::ConfigApplied {..}) | Err(RecvError::Lagged(_))) && relog.reload(filter(&engine.snapshot().config.log)).is_err() {tracing::warn!("the log filter could not be changed")},
 					// The reload runs to its end before the next signal is looked at. What the store refused it has logged itself, once, with the paths of the fields.
 					_ = hangup.recv() => match engine.reload_from(&config).await {
 						Ok(applied) => {
-							if relog.reload(filter(&applied.snapshot.config.log)).is_err() {tracing::warn!("the log filter could not be changed")}
 							// A reload has no terminal to print to, and a warning can be the only sign that a rule which kept users apart is gone.
 							for w in &applied.report.warnings {tracing::warn!("config: {w}")}
 							tracing::info!("config generation {} is in force, {} warnings", applied.snapshot.generation, applied.report.warnings.len() + applied.report.more_warnings);
@@ -119,7 +142,12 @@ async fn main() -> anyhow::Result<()> {
 			};
 			#[cfg(not(unix))]
 			let stopped = tokio::signal::ctrl_c().await;
-			engine.shutdown().await;
+			#[cfg(unix)]
+			if let Some(control) = control {control.shutdown().await}
+			match Arc::try_unwrap(engine) {
+				Ok(engine) => engine.shutdown().await,
+				Err(_) => tracing::error!("the engine is still in use and was not shut down in order: usage since the last write of the state file is lost"),
+			}
 			Ok(stopped?)
 		}
 		Command::Check {config} => {

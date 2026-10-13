@@ -2,4 +2,4 @@
 pub mod config;
 pub mod engine;
 
-pub use engine::{start, Counters, Denied, DnsTotals, Engine, Options, Reason, Totals, Usage};
+pub use engine::{start, Counters, CutOff, Denied, DnsTotals, Engine, Event, ExitHealth, Options, Over, Peer, Reason, Stage, Totals, Usage};
