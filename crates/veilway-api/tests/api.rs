@@ -512,6 +512,9 @@ async fn every_route_answers() {
 		let none = get(&node.socket, missing).await;
 		assert_eq!((none.status, none.code()), (404, "user_not_found"), "{missing}");
 	}
+	let reset = call(&node.socket, "POST", "/v1/users/a/usage/reset", &[], None).await;
+	ask("POST", "/v1/users/a/usage/reset");
+	assert_eq!((reset.status, &reset.json["name"], &reset.json["traffic"]["up_bytes"]), (200, &json!("a"), &a["traffic"]["up_bytes"]), "{}", reset.json);
 	let stats = get(&node.socket, "/v1/stats").await;
 	ask("GET", "/v1/stats");
 	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(15)), "{}", stats.json);
@@ -924,6 +927,81 @@ async fn the_event_stream_says_what_the_node_does() {
 	node.end().await;
 }
 
+/// A usage reset through the API. User `b` runs out of quota, and the reset lets them in again at once, says so on the event stream, and is in the state file when it is answered: the second node here starts on the file as it was at that moment, which is what a node that is killed right then leaves.
+/// `traffic` stays until the body asks for it, a body that is no reset is refused before anything changes, and a user the config does not have is a 404.
+/// The second node also finds a quota period for `b` that begins years after its clock, which it puts back and says so once.
+#[test]
+fn a_usage_reset_starts_the_count_over_lets_the_user_in_and_survives_a_restart() {
+	let runtime = || tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
+	let (first, far) = (runtime(), 4102444800i64 + i64::from(std::process::id()));
+	let (limits, kept, traffic, dir) = first.block_on(async {
+		let mut setup = setup().await;
+		setup.doc["users"][1]["quota_bytes"] = json!(1200);
+		setup.limits.body = 64 << 10;
+		let node = launch(setup).await;
+		let (mut events, reset, state) = (Events::open(&node.socket).await, "/v1/users/b/usage/reset", node.dir.join("state.json"));
+		let mut b = Client::connect(node.keys[1], None, node.public, node.addr).await;
+		for _ in 0..2 {b.send_ip(&ip_udp(PEER_B, [10, 7, 0, 1], 44010, 9, &[b'x'; 1000])).await}
+		events.until("user_cut_off", |_| true).await;
+		// Whatever was on its way to the device when it was cut off has been counted by now.
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		let spent = get(&node.socket, "/v1/users/b").await.json;
+		assert!(spent["denied"] == "quota" && spent["used_bytes"].as_u64().unwrap() >= 1200 && spent["traffic"]["up_bytes"].as_u64().unwrap() >= 1028, "{spent}");
+		for (typed, body, status, code) in [(true, "{\"totals\":\"yes\"}", 422, "body_invalid"), (true, "{\"totals\":true,\"more\":1}", 422, "body_invalid"), (true, "[]", 422, "body_invalid"), (true, "true", 422, "body_invalid"), (true, "{\"totals\":true", 400, "bad_json"), (false, "{\"totals\":true}", 415, "unsupported_media_type")] {
+			let refused = call(&node.socket, "POST", reset, if typed {&[JSON][..]} else {&[]}, Some(Body::from(body))).await;
+			assert_eq!((refused.status, refused.code()), (status, code), "{body}");
+		}
+		let large = call(&node.socket, "POST", reset, &[JSON], Some(Body::from(format!("{{\"totals\":true{}}}", " ".repeat(128 << 10))))).await;
+		assert_eq!((large.status, large.code()), (413, "body_too_large"));
+		for missing in ["/v1/users/nobody/usage/reset", "/v1/users/%ff/usage/reset", "/v1/users/A%20B/usage/reset"] {
+			let none = call(&node.socket, "POST", missing, &[JSON], Some(Body::from("{\"totals\":true}"))).await;
+			assert_eq!((none.status, none.code()), (404, "user_not_found"), "{missing}");
+		}
+		let wrong = get(&node.socket, reset).await;
+		assert_eq!((wrong.status, wrong.code()), (405, "method_not_allowed"));
+		assert_eq!(get(&node.socket, "/v1/users/b").await.json, spent, "a reset that was refused changed something");
+		assert!(Client::try_connect(node.keys[1], None, node.public, node.addr, Duration::from_millis(500)).await.is_none(), "a user who ran out of quota completed a handshake");
+		// The reset, with no body at all.
+		let fresh = call(&node.socket, "POST", reset, &[], None).await;
+		assert_eq!((fresh.status, &fresh.json["name"], &fresh.json["used_bytes"], &fresh.json["period_start"], &fresh.json["denied"], &fresh.json["quota_bytes"], &fresh.json["traffic"]), (200, &json!("b"), &json!(0), &json!(0), &Value::Null, &json!(1200), &spent["traffic"]), "{}", fresh.json);
+		let kept = std::fs::read(&state).unwrap();
+		let saved: Value = serde_json::from_slice(&kept).unwrap();
+		assert_eq!((&saved["users"]["b"]["used_bytes"], &saved["users"]["b"]["up_bytes"]), (&json!(0), &spent["traffic"]["up_bytes"]), "the reset was not in the state file when it was answered: {saved}");
+		assert_eq!(events.until("usage_reset", |_| true).await.data, json!({"user": "b", "totals": false}));
+		assert_eq!(events.until("user_restored", |_| true).await.data, json!({"user": "b"}));
+		let mut b = Client::connect(node.keys[1], None, node.public, node.addr).await;
+		b.send_ip(&ip_udp(PEER_B, [10, 7, 0, 1], 44011, 9, &[b'x'; 100])).await;
+		eventually("a user who was let in again is not counted", async || get(&node.socket, "/v1/users/b").await.json["used_bytes"].as_u64().unwrap() >= 128).await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+		// The same request again starts the count over again and that is all: the totals go on from where they were.
+		let again = call(&node.socket, "POST", reset, &[JSON], Some(Body::from("{}"))).await;
+		assert!(again.status == 200 && again.json["used_bytes"] == 0 && again.json["denied"].is_null() && again.json["traffic"]["up_bytes"].as_u64() > spent["traffic"]["up_bytes"].as_u64(), "{}", again.json);
+		let zeroed = call(&node.socket, "POST", reset, &[("content-type", "application/json; charset=utf-8")], Some(Body::from("{\"totals\": true}"))).await;
+		assert_eq!((zeroed.status, &zeroed.json["traffic"], &zeroed.json["used_bytes"]), (200, &json!({"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}), &json!(0)), "{}", zeroed.json);
+		assert_eq!(events.until("usage_reset", |data| data["totals"] == true).await.data, json!({"user": "b", "totals": true}));
+		assert_eq!(get(&node.socket, "/v1/users/a").await.json["denied"], Value::Null);
+		assert!(String::from_utf8_lossy(&LOGS.lock().unwrap()).contains("user b: usage reset: "), "a usage reset was not logged");
+		no_secret_logged();
+		drop(events);
+		(node.limits.clone(), kept, spent["traffic"].clone(), node.stop().await)
+	});
+	drop(first);
+	let mut left: Value = serde_json::from_slice(&kept).unwrap();
+	(left["users"]["b"]["period_start"], left["users"]["a"]["period_start"]) = (json!(far), json!(far));
+	std::fs::write(dir.join("state.json"), left.to_string()).unwrap();
+	runtime().block_on(async {
+		let (engine, server) = start(&dir, &limits).await;
+		let b = get(&dir.join("veilway.sock"), "/v1/users/b").await;
+		assert_eq!((b.status, &b.json["used_bytes"], &b.json["period_start"], &b.json["denied"], &b.json["traffic"]), (200, &json!(0), &json!(0), &Value::Null, &traffic), "{}", b.json);
+		// Several looks at the clock later it has still been said once for each of the two users, and no more.
+		tokio::time::sleep(Duration::from_secs(1)).await;
+		assert_eq!(String::from_utf8_lossy(&LOGS.lock().unwrap()).matches(&format!("was said to have begun at {far}, ")).count(), 2, "a quota period after the clock was not said once for each user it was found for");
+		server.shutdown().await;
+		Arc::try_unwrap(engine).ok().expect("the API still holds the engine after its shutdown").shutdown().await;
+	});
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// `count` more users on top of the three, which is what makes a snapshot of the counters too large for the buffers between the node and a reader.
 fn crowd(doc: &mut Value, count: usize) {
 	let users = doc["users"].as_array_mut().unwrap();
@@ -1233,7 +1311,7 @@ async fn rates_follow_the_traffic_and_fall_back_to_zero() {
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();
@@ -1252,8 +1330,11 @@ fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	}
 	for status in ["409", "422", "428", "400", "413", "415"] {assert!(OPENAPI["paths"]["/v1/config"]["put"]["responses"].get(status).is_some(), "an apply has no {status}")}
 	assert!(OPENAPI["paths"]["/v1/users/{name}"]["get"]["responses"].get("404").is_some());
+	let reset = &OPENAPI["paths"]["/v1/users/{name}/usage/reset"]["post"];
+	for status in ["404", "422", "400", "413", "415"] {assert!(reset["responses"].get(status).is_some(), "a usage reset has no {status}")}
+	assert_eq!((&reset["requestBody"]["required"], &reset["requestBody"]["content"]["application/json"]["schema"], &OPENAPI["components"]["schemas"]["ResetUsage"]["required"]), (&json!(false), &json!({"$ref": "#/components/schemas/ResetUsage"}), &Value::Null));
 	assert_eq!(OPENAPI["paths"]["/v1/events"]["get"]["responses"]["200"]["content"].as_object().unwrap().keys().collect::<Vec<_>>(), ["text/event-stream"]);
-	assert_eq!(OPENAPI["x-events"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["config_applied", "config_refused", "exit_udp_changed", "lagged", "stats", "user_cut_off", "user_restored"]);
+	assert_eq!(OPENAPI["x-events"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["config_applied", "config_refused", "exit_udp_changed", "lagged", "stats", "usage_reset", "user_cut_off", "user_restored"]);
 	// Every reference leads to a schema, and no schema has a place for a secret.
 	let text = OPENAPI.to_string();
 	for reference in text.split("\"$ref\":\"").skip(1).map(|rest| &rest[..rest.find('"').unwrap()]) {

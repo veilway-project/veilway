@@ -14,4 +14,6 @@ printf '{"version": 1, "dns": {"servers": ["1.1.1.1:53"], "hijack": true}, "inbo
 pid=$!
 for _ in $(seq 50); do [ -S "$dir/api.sock" ] && break; sleep 0.2; done
 [ -S "$dir/api.sock" ] || { cat "$dir/node.log"; exit 1; }
+# The command line talks to the same socket.
+"$bin" usage reset --api "$dir/api.sock" --user alice --totals
 VEILWAY_API_SOCKET="$dir/api.sock" npm test

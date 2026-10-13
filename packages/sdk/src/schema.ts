@@ -63,7 +63,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive. */
+        /** Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, usage_reset, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive. */
         get: operations["events"];
         put?: never;
         post?: never;
@@ -186,6 +186,23 @@ export interface paths {
         get: operations["getUser"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/users/{name}/usage/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Starts a user's quota count over: used_bytes is 0 and period_start is the start of the quota period the node's clock is in, or 0 for a user without a quota_period. A user who was out of quota may connect again at once, with no reload. traffic stays as it is unless the body says {"totals": true}, and the body may be left out. The state file is written before the answer. The same request again changes nothing more. The answer is the user as GET /v1/users/{name} gives them. */
+        post: operations["resetUsage"];
         delete?: never;
         options?: never;
         head?: never;
@@ -377,6 +394,14 @@ export interface components {
             shadow_cut_short: boolean;
             warnings: components["schemas"]["Problem"][];
         };
+        /** @description What a usage reset zeroes besides the quota count. The body may be left out altogether. */
+        ResetUsage: {
+            /**
+             * @description Whether traffic, what the user sent and received in all, goes back to zero as well. Left out or false, only used_bytes and period_start start over.
+             * @default false
+             */
+            totals: boolean;
+        };
         Running: {
             document: components["schemas"]["Document"];
             /** Format: uint64 */
@@ -469,6 +494,11 @@ export interface components {
         };
         /** @enum {string} */
         Transport: "udp" | "ws";
+        /** @description The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it. */
+        UsageReset: {
+            totals: boolean;
+            user: string;
+        };
         User: {
             /** @description Why the user cannot connect right now. Null for a user who can. */
             denied: components["schemas"]["Denied"] | null;
@@ -478,7 +508,7 @@ export interface components {
             name: string;
             /**
              * Format: int64
-             * @description When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.
+             * @description When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`, or who had none when their usage was last reset.
              */
             period_start: number;
             /** Format: uint64 */
@@ -1100,6 +1130,95 @@ export interface operations {
             };
             /** @description The request was not finished within 30 seconds. */
             408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resetUsage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ResetUsage"];
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["User"];
+                };
+            };
+            /** @description The body is not one JSON document, or could not be read to its end. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The running config has no user of that name. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not read within 30 seconds. Nothing was changed: once the node has begun the reset, the answer waits for it and is never this one. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is larger than 4 MiB. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not sent as application/json. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is JSON and not what a usage reset takes. Nothing was changed. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

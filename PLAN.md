@@ -309,7 +309,7 @@ Load the `frontend-preferences` skill before any UI work. Where it conflicts wit
 Must have for the first release:
 
 1. Admin login with Argon2id, TOTP two-factor, rate limiting, session management, audit log.
-2. Users: key generation, quota, expiry, reset cycle, device limit, groups, enable/disable, bulk actions.
+2. Users: key generation, quota, expiry, reset cycle, usage reset, device limit, groups, enable/disable, bulk actions.
 3. Inbounds, outbounds, exits and routing rules, each with a guided form and a raw JSON editor that validates against the schema.
 4. Subscriptions: per-user link and QR, a reset of a user's link that makes the old one stop working, native and legacy formats, provider branding and cards editor.
 5. Stats: live and historical traffic per user, inbound and exit; node health; online users.

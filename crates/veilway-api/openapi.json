@@ -583,6 +583,18 @@
         ],
         "type": "object"
       },
+      "ResetUsage": {
+        "additionalProperties": false,
+        "description": "What a usage reset zeroes besides the quota count. The body may be left out altogether.",
+        "properties": {
+          "totals": {
+            "default": false,
+            "description": "Whether traffic, what the user sent and received in all, goes back to zero as well. Left out or false, only used_bytes and period_start start over.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "Running": {
         "properties": {
           "document": {
@@ -842,6 +854,22 @@
         ],
         "type": "string"
       },
+      "UsageReset": {
+        "description": "The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it.",
+        "properties": {
+          "totals": {
+            "type": "boolean"
+          },
+          "user": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "user",
+          "totals"
+        ],
+        "type": "object"
+      },
       "User": {
         "properties": {
           "denied": {
@@ -874,7 +902,7 @@
             "type": "string"
           },
           "period_start": {
-            "description": "When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.",
+            "description": "When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`, or who had none when their usage was last reset.",
             "format": "int64",
             "type": "integer"
           },
@@ -1381,7 +1409,7 @@
             "description": "The node already serves as many connections, or as many event streams, as it takes at once."
           }
         },
-        "summary": "Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive."
+        "summary": "Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, usage_reset, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive."
       }
     },
     "/v1/exits": {
@@ -1677,6 +1705,115 @@
         },
         "summary": "One user."
       }
+    },
+    "/v1/users/{name}/usage/reset": {
+      "post": {
+        "operationId": "resetUsage",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResetUsage"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no user of that name. Nothing was changed."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not read within 30 seconds. Nothing was changed: once the node has begun the reset, the answer waits for it and is never this one."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is JSON and not what a usage reset takes. Nothing was changed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Starts a user's quota count over: used_bytes is 0 and period_start is the start of the quota period the node's clock is in, or 0 for a user without a quota_period. A user who was out of quota may connect again at once, with no reload. traffic stays as it is unless the body says {\"totals\": true}, and the body may be left out. The state file is written before the answer. The same request again changes nothing more. The answer is the user as GET /v1/users/{name} gives them."
+      }
     }
   },
   "x-events": {
@@ -1694,6 +1831,9 @@
     },
     "stats": {
       "$ref": "#/components/schemas/Stats"
+    },
+    "usage_reset": {
+      "$ref": "#/components/schemas/UsageReset"
     },
     "user_cut_off": {
       "$ref": "#/components/schemas/UserCutOff"

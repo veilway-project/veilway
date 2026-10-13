@@ -67,6 +67,9 @@ pub enum Event {
 	UserRestored {user: String},
 	/// The upstream of an exit stopped relaying UDP (`udp` false) or relays it again.
 	ExitUdpChanged {exit: String, udp: bool},
+	/// The operator started a user's quota count over, see `Engine::reset_usage`. With `totals` what the user sent and received in all went back to zero as well.
+	/// A user who was out of quota is let in by it, which is a `UserRestored` right behind this.
+	UsageReset {user: String, totals: bool},
 }
 
 /// How a device's last authenticated datagram reached its inbound.
@@ -176,7 +179,7 @@ pub struct Usage {
 	pub traffic: Totals,
 	/// Bytes in both directions since `period_start`, which is what `quota_bytes` is held against.
 	pub used_bytes: u64,
-	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.
+	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`, or who had none when their usage was last reset.
 	pub period_start: i64,
 	pub quota_bytes: Option<u64>,
 	pub denied: Option<Denied>,
@@ -195,7 +198,7 @@ pub struct UserState {
 	pub traffic: Traffic,
 	/// Bytes of inner IP traffic in both directions since `since`. It counts whether or not the user has a quota, so a quota that is given later is held against what was used.
 	used: AtomicU64,
-	/// The start of the quota period `used` belongs to, in Unix seconds. It only ever moves forward, so a clock that steps back starts no count over.
+	/// The start of the quota period `used` belongs to, in Unix seconds. It moves back in two cases only: when it lies more than one whole period after the node's clock (or after it at all, for a user without a `quota_period`), see `roll`, and when the operator resets the user's usage.
 	since: AtomicI64,
 	/// What the user resolved through the node. Nothing in it is ever read for another user.
 	names: Mutex<Names>,
@@ -212,8 +215,21 @@ impl UserState {
 
 	pub fn used(&self) -> u64 {self.used.load(Ordering::Relaxed)}
 
-	/// Starts the count over when `start`, the start of the quota period the clock is in, lies after the period the count belongs to. Whoever sees the new period first does it, once.
-	pub fn roll(&self, start: i64) {if self.since.fetch_max(start, Ordering::Relaxed) < start {self.used.store(0, Ordering::Relaxed)}}
+	/// Holds the count of the user called `name` against the clock, which stands at `now`. `period` is the start of the quota period the clock is in and the longest such a period lasts, see `usage::SPANS`, None for a user without a `quota_period`. All of it is in Unix seconds.
+	/// A period that began more than one whole period after `now` is one no clock of this node can have started and then stepped back from by less than a period: a state file said so, or the clock was wrong by more than a period. It is not trusted, and a count that waited for it to end would wait for as long as the clock was wrong by.
+	/// So the count is given the period the clock is in and keeps what it holds, which is said once, in a warning. The price is a clock that steps back by more than a period and comes forward again: the count then starts over with the period it comes forward into.
+	/// A period that began after `now` by one period or less is left as it is. It ends within one period at the latest, and so a clock that steps back by less than a period and comes forward again starts no count over and gives nobody their quota again.
+	/// Without a `quota_period` nothing ever starts over, so there is no such price: any start after `now` goes to 0.
+	/// Otherwise the count starts over when the start of the period the clock is in lies after the period it belongs to. Whoever sees the new period first does it, once.
+	pub fn roll(&self, name: &str, period: Option<(i64, i64)>, now: i64) {
+		let since = self.since.load(Ordering::Relaxed);
+		if since > period.map_or(now, |(_, span)| now.saturating_add(span)) {
+			let start = period.map_or(0, |(start, _)| start);
+			if self.since.compare_exchange(since, start, Ordering::Relaxed, Ordering::Relaxed).is_ok() {tracing::warn!("user {name}: their quota period was said to have begun at {since}, which is {}s after the node's clock{}, so it is not trusted: the period is the one the clock is in, from {start}, and the {} bytes counted so far stay counted", since.saturating_sub(now), if period.is_some() {" and more than one whole period"} else {""}, self.used())}
+		} else if let Some((start, _)) = period {
+			if self.since.fetch_max(start, Ordering::Relaxed) < start {self.used.store(0, Ordering::Relaxed)}
+		}
+	}
 }
 
 /// Everything the engine's tasks share. What belongs to one user, device, inbound or exit hangs off the plan instead, see `plan`.
@@ -404,6 +420,30 @@ impl Engine {
 	/// The counters of one user of the config that runs, as `counters` has them, without those of anybody else.
 	pub fn usage(&self, name: &str) -> Option<Usage> {self.plan().users.iter().find(|user| user.name == name).map(Usage::of)}
 
+	/// Starts the quota count of the user called `name` over at the operator's word: `used_bytes` is 0 and `period_start` is the start of the quota period the clock is in, or 0 for a user without a `quota_period`.
+	/// What the user sent and received in all is a record of the node and not of the quota, so it stays unless `totals` is set, which zeroes those four counters as well. Nothing else of the user is touched: sessions, flows and DNS memory stay.
+	/// A user who was out of quota is let in before this returns, through the same path as a quota period that starts over, with no reload. The state file is written before this returns as well,
+	/// for at most `usage::LAST_WRITE`: a write that fails or hangs is counted and logged like any other and tried again at the next one, and the reset is in force all the same.
+	/// It is the same call however often it is made. None when the config that runs has no such user, and then nothing was changed.
+	pub async fn reset_usage(&self, name: &str, totals: bool) -> Option<Usage> {
+		// Held so that no reload puts another plan in force halfway. Nothing between here and the switch waits, so whoever stops waiting for this leaves no reset half done.
+		let mut host = self.host.lock().await;
+		let plan = self.shared.plan();
+		let user = plan.users.iter().find(|user| user.name == name)?;
+		let (state, start) = (&user.state, user.period.map_or(0, |period| usage::starts((self.shared.now)())[period as usize]));
+		let used = state.used.swap(0, Ordering::Relaxed);
+		state.since.store(start, Ordering::Relaxed);
+		if totals {
+			for counter in [&state.traffic.up_packets, &state.traffic.up_bytes, &state.traffic.down_packets, &state.traffic.down_bytes] {counter.store(0, Ordering::Relaxed)}
+		}
+		tracing::info!("user {name}: usage reset: the quota count went from {used} bytes to 0 and its period starts at {start}, the totals of what the user sent and received were {}{}", if totals {"zeroed"} else {"kept"}, if user.denied == Some(Denied::Quota) {", and the user was out of quota and may connect again"} else {""});
+		self.shared.publish(Event::UsageReset {user: name.to_string(), totals});
+		if user.denied == Some(Denied::Quota) {host.expire(&self.shared)}
+		drop(host);
+		if tokio::time::timeout(usage::LAST_WRITE, usage::save(&self.shared, false)).await.is_err() {tracing::error!("user {name}: the state file was not written within {}s of the usage reset. The reset is in force and the write is tried again", usage::LAST_WRITE.as_secs())}
+		self.usage(name)
+	}
+
 	/// Writes of the state file that failed since start. While it grows, a node that stops loses what its users have used since the last write that went through.
 	pub fn state_write_failures(&self) -> u64 {self.shared.unwritten.load(Ordering::Relaxed)}
 
@@ -476,13 +516,13 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 				}
 				// Held against the clock again at every tick, never slept towards, so a clock that jumps ahead cuts a user off as promptly as time that passes.
 				let (plan, now) = (shared.plan(), (shared.now)());
-				let starts = usage::starts(now);
-				// A count whose period is over starts over here, for the plan in force, which is what brings it below the quota.
+				let (starts, clock) = (usage::starts(now), now.unix_timestamp());
+				// A count whose period is over starts over here, for the plan in force, which is what brings it below the quota. Every user is looked at, with or without a quota: a period that lies too far after the clock is put right for all of them.
 				// A user's count has turned when the quota is spent and the user is not denied for it, or the user is denied for it and the count is below the quota again.
-				let turned = plan.users.iter().any(|user| user.quota.is_some_and(|quota| {
-					if let Some(period) = user.period {user.state.roll(starts[period as usize])}
-					matches!((user.denied, user.state.used() >= quota), (None, true) | (Some(Denied::Quota), false))
-				}));
+				let turned = plan.users.iter().fold(false, |turned, user| {
+					user.state.roll(&user.name, user.period.map(|period| (starts[period as usize], usage::SPANS[period as usize])), clock);
+					turned | user.quota.is_some_and(|quota| matches!((user.denied, user.state.used() >= quota), (None, true) | (Some(Denied::Quota), false)))
+				});
 				if turned || plan.next_expiry.is_some_and(|at| at <= now) {host.lock().await.expire(&shared)}
 			}
 		}

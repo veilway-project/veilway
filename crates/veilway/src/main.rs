@@ -58,12 +58,31 @@ enum Command {
 		/// Seconds each step on the network may take, which is 10 at most because the node waits no longer either. All of them together have 45
 		#[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=10))] timeout: u64,
 	},
+	/// What a node that runs counts for its users, changed through its control socket
+	#[cfg(unix)]
+	Usage {#[command(subcommand)] command: Usage},
 	/// Print the JSON Schema of config version 1
 	Schema,
 	/// Print a fresh private key and its public key
 	Genkey,
 	/// WireGuard over WebSocket bridge
 	Bridge {#[command(subcommand)] command: Bridge},
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum Usage {
+	/// Start a user's quota count over on the node that runs. A user who was out of quota may connect again at once. Exit status: 0 done, 3 no such user, 4 no node answers on the socket, 5 this user may not open the socket, 1 anything else
+	Reset {
+		/// The name of the user, as the config has it
+		#[arg(long)] user: String,
+		/// Also zero what the user sent and received in all, which a reset leaves alone otherwise
+		#[arg(long)] totals: bool,
+		/// The control socket of the node [default: veilway.sock next to the config file]
+		#[arg(long)] api: Option<PathBuf>,
+		/// The config file the node was started with, which is only looked at for where its socket is
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+	},
 }
 
 #[derive(Subcommand)]
@@ -182,6 +201,41 @@ async fn main() -> anyhow::Result<()> {
 			#[cfg(not(unix))]
 			let socket = None;
 			std::process::exit(doctor::run(&config, allow_readable_config, state, socket, json, Duration::from_secs(timeout)).await)
+		}
+		#[cfg(unix)]
+		Command::Usage {command: Usage::Reset {user, totals, api, config}} => {
+			let socket = api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock"));
+			// The name is one segment of the path whatever was typed: a name no config can have is then a user the node does not have, and never another route.
+			let segment: String = user.bytes().map(|byte| if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {char::from(byte).to_string()} else {format!("%{byte:02X}")}).collect();
+			let answer = veilway_api::request(&socket, "POST", &format!("/v1/users/{segment}/usage/reset"), Some(serde_json::json!({"totals": totals}).to_string().into_bytes()), Duration::from_secs(30)).await;
+			let said = |body: &[u8]| serde_json::from_slice::<serde_json::Value>(body).unwrap_or_default();
+			std::process::exit(match answer {
+				Ok((200, body)) => {
+					let now = said(&body);
+					println!("user {user}: usage reset. used_bytes {}, period_start {}, traffic {}{}", now["used_bytes"], now["period_start"], if totals {"zeroed"} else {"kept"}, if now["denied"].is_null() {String::new()} else {format!(". The user still cannot connect: {}", now["denied"].as_str().unwrap_or("denied"))});
+					0
+				}
+				Ok((404, body)) if said(&body)["error"]["code"] == "user_not_found" => {
+					eprintln!("error: the node on {} has no user named {user}. Nothing was changed", socket.display());
+					3
+				}
+				Ok((status, body)) => {
+					eprintln!("error: the node on {} answered {status}: {}", socket.display(), said(&body)["error"]["message"].as_str().unwrap_or("with no message. Is it a node of this version?"));
+					1
+				}
+				Err(e) if matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {
+					eprintln!("error: no node answers on the control socket {} ({}). Start the node, or name its socket with --api or its config file with --config", socket.display(), e.kind());
+					4
+				}
+				Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+					eprintln!("error: the control socket {} may not be opened by this user. Run this as the user the node runs as, or as root", socket.display());
+					5
+				}
+				Err(e) => {
+					eprintln!("error: the node on {} did not answer the reset: {e}. Whether it happened is not known. Sending it again is safe: a reset that already happened changes nothing more", socket.display());
+					1
+				}
+			})
 		}
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());

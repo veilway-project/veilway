@@ -240,7 +240,7 @@ impl Plan {
 			let lapsed = user.expires_at.map(|at| at.0).filter(|at| *at <= now || previous.expired.get(&user.name) == Some(at));
 			if let Some(at) = lapsed {expired.insert(user.name.clone(), at);}
 			let state = was_user.get(user.name.as_str()).map(|was| was.state.clone()).unwrap_or_default();
-			// The count is held against the quota this config gives, in the period this config gives. A count only starts over when a later period begins, so a clock that steps back gives nobody their quota again.
+			// The count is held against the quota this config gives, in the period this config gives. A count only starts over when a later period begins, so a clock that steps back by less than a period gives nobody their quota again. A period that lies more than one whole period after the clock is not trusted and is put back with its count kept, see `UserState::roll`.
 			// It is taken here for what it will be once this plan is in force and is not touched: a plan that is compiled and never put in force, as in a reload that fails, has changed nobody's count. `Host::switch` starts it over.
 			let used = if user.quota_period.is_some_and(|period| state.since.load(Ordering::Relaxed) < starts[period as usize]) {0} else {state.used()};
 			let denied = if user.enabled == Some(false) {Some(Denied::Disabled)} else if lapsed.is_some() {Some(Denied::Expired)} else if user.quota_bytes.is_some_and(|quota| used >= quota) {Some(Denied::Quota)} else {None};

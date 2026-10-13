@@ -34,6 +34,9 @@ pub fn starts(now: OffsetDateTime) -> [i64; 3] {
 	[day, day - weekday * DAY, day - (monthday - 1) * DAY]
 }
 
+/// The longest a day, a week and a month last, in seconds and in the order of `QuotaPeriod`. A quota period that is said to have begun further after the node's clock than this is not trusted, see `UserState::roll`.
+pub const SPANS: [i64; 3] = [DAY, 7 * DAY, 31 * DAY];
+
 /// A count as the file holds it. Any number that stands there is taken for a count and none is trusted: one below zero is zero, and one above `MAX_COUNT` is `MAX_COUNT`.
 #[derive(Clone, Copy, Serialize)]
 #[serde(transparent)]

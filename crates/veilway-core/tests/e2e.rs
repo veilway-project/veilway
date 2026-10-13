@@ -18,7 +18,7 @@ use veilway_core::config::{Applied, ApplyError, Config, Revision};
 use veilway_core::engine::dns::response;
 use veilway_core::engine::icmp::{MAX_PINGS_PER_DEVICE, MAX_PINGS_PER_USER};
 use veilway_core::engine::route::MAX_FLOWS_PER_USER;
-use veilway_core::{Denied, DnsTotals, Engine, Options, Over, Reason, Totals, Usage};
+use veilway_core::{CutOff, Denied, DnsTotals, Engine, Event, Options, Over, Reason, Totals, Usage};
 
 const GATEWAY:[u8;4]=[10, 7, 0, 1];
 const PEER_A:[u8;4]=[10, 7, 0, 2];
@@ -2739,7 +2739,7 @@ async fn traffic_that_is_refused_or_answered_by_the_node_counts_against_the_quot
 }
 
 /// The node's clock is the test's: it stands at noon on Wednesday 14 January 2026 and moves only when the test moves it. User `b` spends their quota and is let in again when the next period starts,
-/// at 00:00 UTC of the next day, of the next Monday or of the 1st of the next month, and not one second before. A clock that steps back starts no count over and lets nobody in.
+/// at 00:00 UTC of the next day, of the next Monday or of the 1st of the next month, and not one second before. A clock that steps back by less than a period starts no count over and lets nobody in, then or when it comes forward again.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn a_quota_period_that_starts_over_lets_the_user_in_again_and_a_clock_that_steps_back_does_not(){
 	const NOON:i64=1768392000;
@@ -2762,8 +2762,8 @@ async fn a_quota_period_that_starts_over_lets_the_user_in_again_and_a_clock_that
 		tokio::time::sleep(Duration::from_millis(200)).await;
 		let spent=usage(&node, "b");
 		assert!(spent.used_bytes>=728, "{period}: {spent:?}");
-		// Forty days back, which is before the period began, and then one second before the next period begins.
-		for skew in [-40*86400, next-1-NOON]{
+		// One hour before the period began, which is a step back by less than a period, and then one second before the next period begins.
+		for skew in [began-3600-NOON, next-1-NOON]{
 			SKEW.store(skew, Ordering::SeqCst);
 			tokio::time::sleep(Duration::from_millis(700)).await;
 			assert_eq!(usage(&node, "b"), spent, "{period}: the clock moved by {skew}s and the count or the user's standing changed");
@@ -2783,6 +2783,113 @@ async fn a_quota_period_that_starts_over_lets_the_user_in_again_and_a_clock_that
 		let back=usage(&node, "b");
 		assert_eq!((back.used_bytes, back.period_start, back.denied), (71, next, None), "{period}: a clock that stepped back changed the count");
 	}
+}
+
+/// A usage reset starts the quota count of one user over at the operator's word. User `b` spends their quota and is cut off, and the reset alone lets them in again, in the same period and with no reload:
+/// the count is 0, the period is the one the clock is in, and what the user sent and received in all stays until a reset asks for the totals as well. Nobody else's count moves, and a name the config does not have changes nothing.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_usage_reset_lets_a_user_who_ran_out_of_quota_in_again_and_keeps_the_totals_unless_asked(){
+	let Live{node, ..}=live(false, Options::new(""), |setup|{
+		setup.doc["users"][1]["quota_bytes"]=json!(600);
+		setup.doc["users"][1]["quota_period"]=json!("monthly");
+	}).await;
+	let mut events=node.engine.events();
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44130, 80).await, Answer::Reset);
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44131, 9999, &[b'x';700])).await;
+	eventually("a user who spent their quota was not cut off", || usage(&node, "b").denied==Some(Denied::Quota)).await;
+	// Whatever was on its way to the device when it was cut off has been counted by now.
+	tokio::time::sleep(Duration::from_millis(200)).await;
+	let (spent, other)=(usage(&node, "b"), usage(&node, "a"));
+	assert!(spent.used_bytes>=728 && spent.period_start>0 && other.used_bytes==80 && other.period_start==0, "{spent:?} {other:?}");
+	assert!(Client::try_connect(node.keys[1], node.public, node.addr, Duration::from_millis(500)).await.is_none(), "a user who ran out of quota completed a handshake");
+	assert_eq!((node.engine.reset_usage("nobody", true).await, usage(&node, "b"), usage(&node, "a")), (None, spent.clone(), other.clone()), "a reset for a name the config does not have changed something");
+	assert_eq!(node.engine.reset_usage("b", false).await, Some(Usage{used_bytes:0, denied:None, ..spent.clone()}));
+	// At once: the handshake is the next thing that happens.
+	let mut b=Client::connect(node.keys[1], node.public, node.addr).await;
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44132, 9999, b"again")).await;
+	assert_eq!(datagram(&mut b, 44132).await.as_deref(), Some(&b"echo:again"[..]));
+	let mut said=Vec::new();
+	while let Ok(event)=events.try_recv(){said.push(event)}
+	assert!(matches!(&said[..], [Event::UserCutOff{user:cut, reason:CutOff::Quota}, Event::UsageReset{user:reset, totals:false}, Event::UserRestored{user:restored}] if cut=="b" && reset=="b" && restored=="b"), "{said:?}");
+	// 33 bytes up and 38 down since the reset. The same reset again starts the count over again and that is all it does.
+	let again=node.engine.reset_usage("b", false).await.unwrap();
+	assert_eq!((again.used_bytes, again.period_start, again.denied, again.traffic.up_bytes+again.traffic.down_bytes), (0, spent.period_start, None, spent.traffic.up_bytes+spent.traffic.down_bytes+71));
+	assert_eq!(node.engine.reset_usage("b", true).await, Some(Usage{traffic:Totals::default(), ..again}));
+	// A user without a quota period, and without a quota: the count starts over, the period stays 0, and nobody else was touched by any of it.
+	assert_eq!(usage(&node, "a"), other);
+	assert_eq!(node.engine.reset_usage("a", false).await, Some(Usage{used_bytes:0, ..other}));
+	while let Ok(event)=events.try_recv(){said.push(event)}
+	assert!(matches!(&said[3..], [Event::UsageReset{totals:false, ..}, Event::UsageReset{user:b, totals:true}, Event::UsageReset{user:a, totals:false}] if b=="b" && a=="a"), "{said:?}");
+}
+
+/// A reset is in the state file when it returns, not at the next write ten seconds on: a node that is killed right after it comes back with the count the reset left. The file is put back here as it was at that moment, which is what a kill leaves.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_usage_reset_is_in_the_state_file_at_once_and_a_restart_comes_back_with_it(){
+	let path=state_file("reset");
+	std::fs::write(&path, r#"{"version":1,"users":{"a":{"used_bytes":5000,"period_start":0,"up_bytes":4000,"up_packets":3,"down_bytes":1000,"down_packets":2},"b":{"used_bytes":9,"period_start":0,"up_bytes":9,"up_packets":1,"down_bytes":0,"down_packets":0}}}"#).unwrap();
+	let Live{node, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |setup| setup.doc["users"][0]["quota_bytes"]=json!(1000)).await;
+	assert_eq!(usage(&node, "a").denied, Some(Denied::Quota));
+	let fresh=node.engine.reset_usage("a", false).await.unwrap();
+	assert_eq!((saved(&path, "a"), saved(&path, "b"), fresh.denied), (Some(json!({"used_bytes":0, "period_start":0, "up_bytes":4000, "up_packets":3, "down_bytes":1000, "down_packets":2})), Some(json!({"used_bytes":9, "period_start":0, "up_bytes":9, "up_packets":1, "down_bytes":0, "down_packets":0})), None), "the reset was not in the state file when it returned");
+	let kept=std::fs::read(&path).unwrap();
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut a, PEER_A, PEER_B, 44140, 80).await, Answer::Reset);
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	std::fs::write(&path, kept).unwrap();
+	let Live{node, ..}=live(false, Options{state:Some(path.clone()), ..Options::new("")}, |setup| setup.doc["users"][0]["quota_bytes"]=json!(1000)).await;
+	assert_eq!(usage(&node, "a"), fresh);
+	Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!((node.engine.reset_usage("a", true).await.map(|zeroed| zeroed.traffic), saved(&path, "a")), (Some(Totals::default()), Some(json!({"used_bytes":0, "period_start":0, "up_bytes":0, "up_packets":0, "down_bytes":0, "down_packets":0}))));
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+/// A quota period that begins more than one whole period after the node's clock is one that clock cannot have started: a state file says so here at start, and a clock that was ahead by more than a period and is set right says so while the node runs.
+/// Either way the count would wait for as long as the clock was wrong by, so the period is not trusted: it becomes the one the clock is in and the count is kept. From there it ends when any period ends.
+/// A period that begins one period after the clock or less is left alone, to the second. For a user without a quota period any start after the clock goes to 0.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_quota_period_that_begins_more_than_a_period_after_the_clock_is_put_back_and_its_count_is_kept(){
+	const NOON:i64=1768392000;
+	const DAY:i64=86400;
+	static SKEW:AtomicI64=AtomicI64::new(0);
+	fn clock()->OffsetDateTime{OffsetDateTime::from_unix_timestamp(NOON+SKEW.load(Ordering::SeqCst)).unwrap()}
+	let (path, began, far)=(state_file("future"), NOON-NOON%DAY, NOON+3650*DAY);
+	std::fs::write(&path, json!({"version":1, "users":{"a":{"used_bytes":5000, "period_start":far, "up_bytes":5000, "up_packets":3, "down_bytes":0, "down_packets":0}, "b":{"used_bytes":700, "period_start":far, "up_bytes":700, "up_packets":1, "down_bytes":0, "down_packets":0}}}).to_string()).unwrap();
+	let Live{node, ..}=live(false, Options{state:Some(path.clone()), now:clock, ..Options::new("")}, |setup|{
+		setup.doc["users"][0]["quota_bytes"]=json!(1000);
+		setup.doc["users"][0]["quota_period"]=json!("daily");
+	}).await;
+	// At start, before anybody could ask: the period is today's, the count is the file's and the user is out of quota for it.
+	let (a, b)=(usage(&node, "a"), usage(&node, "b"));
+	assert_eq!((a.used_bytes, a.period_start, a.denied, b.used_bytes, b.period_start, b.denied), (5000, began, Some(Denied::Quota), 700, 0, None));
+	eventually("the period that was put back did not reach the state file", || saved(&path, "a").is_some_and(|a| a["period_start"]==began) && saved(&path, "b").is_some_and(|b| b["period_start"]==0 && b["used_bytes"]==700)).await;
+	// The period ends like any other, at the next midnight and not in ten years.
+	SKEW.store(DAY, Ordering::SeqCst);
+	eventually("a user was not let in again when the period that was put back was over", || usage(&node, "a").denied.is_none()).await;
+	assert_eq!((usage(&node, "a").used_bytes, usage(&node, "a").period_start), (0, began+DAY));
+	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut client, PEER_A, PEER_B, 44150, 80).await, Answer::Reset);
+	// While the node runs. The period began at `began+DAY` and a day lasts `DAY`: with the clock one second into the day before, the period lies one second less than a whole period after it, and exactly a whole period with the clock at that midnight. Both are left alone.
+	let fresh=usage(&node, "a");
+	assert_eq!((fresh.used_bytes, fresh.period_start), (80, began+DAY));
+	for skew in [began+1-NOON, began-NOON]{
+		SKEW.store(skew, Ordering::SeqCst);
+		tokio::time::sleep(Duration::from_millis(700)).await;
+		assert_eq!(usage(&node, "a"), fresh, "the clock moved by {skew}s, which is no more than a period before the period began, and the period or the count changed");
+	}
+	// One second further back it is more than a whole period: the count of 80 bytes stays, in the period the clock stands in now.
+	SKEW.store(began-1-NOON, Ordering::SeqCst);
+	eventually("a quota period that lies more than a period after the clock was kept", || usage(&node, "a").period_start==began-DAY).await;
+	tokio::time::sleep(Duration::from_millis(700)).await;
+	let back=usage(&node, "a");
+	assert_eq!((back.used_bytes, back.period_start, back.denied, usage(&node, "b").period_start), (80, began-DAY, None, 0));
+	let Node{engine, ..}=node;
+	engine.shutdown().await;
+	std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
 }
 
 /// A user who is out of quota stays out until the operator gives them more. A reload that raises the quota above what they used lets them in with the count they had,
