@@ -177,6 +177,18 @@ An **exit** is a named egress: a tag, a display name, a country code and a backe
 - `wireguard` inbound: an exit is bound per peer, since stock WireGuard has no way to ask.
 - The catalogue (name, country, load, whether it is up, full IP or not) reaches clients through the subscription and the control channel, so a provider sells "one address, 12 locations" and the user picks from a list.
 
+### Node links: an entry node and an exit node on two servers
+
+Two nodes can be joined so that users connect to one (the entry) and their traffic leaves from the other (the exit). This is the `chain` backend, and it carries whole IP packets over the same native transports the clients use, so the link between the two servers is disguised the same way.
+
+- The link can be opened from either side. In a **forward** link the entry node dials the exit node. In a **reverse** link the exit node dials the entry node and the entry node then sends its users' packets back down that connection. A reverse link is for an entry node that cannot open connections outwards, or whose outward connections are filtered, while connections into it pass.
+- A link is a pairing of two nodes, each with its own panel and its own config, and neither panel controls the other. One side creates the link and gets a short pairing code (the peer's address, the keys of the link and its transport). The other side pastes it. Either side can end the link, and a link has its own key, never a user's.
+- To the entry node the link is one exit like any other: rules can send users, groups or domains to it, and it shows in the exit catalogue with its country. To the exit node the link is one inbound with one peer, and what arrives through it is routed by that node's own rules, gate and limits. The exit node never trusts the entry node's word about who a user is, and the entry node keeps counting usage per user.
+- A link reconnects by itself, with backoff, and reports its state like an `l3` exit does. While it is down, traffic routed to it is answered as unreachable and never leaves another way.
+- Several links may run in parallel between two nodes, and an entry node may have links to several exit nodes.
+
+This is built after the native transports exist (Phase 2 step 3), since it uses them. The pairing screens belong to the panel (Phase 4).
+
 ### Routing
 
 The engine keeps a flow table (5-tuple for TCP and UDP, address pair and protocol for everything else). The first packet of a flow is matched against ordered rules, first match wins, and the whole flow sticks to that decision.
@@ -315,7 +327,7 @@ Must have for the first release:
 
 1. Admin login with Argon2id, TOTP two-factor, rate limiting, session management, audit log.
 2. Users: key generation, quota, expiry, reset cycle, usage reset, device limit, groups, enable/disable, bulk actions.
-3. Inbounds, outbounds, exits and routing rules, each with a guided form and a raw JSON editor that validates against the schema.
+3. Inbounds, outbounds, exits and routing rules, each with a guided form and a raw JSON editor that validates against the schema. Node links are made here: one panel shows a pairing code, the other takes it.
 4. Subscriptions: per-user link and QR, a reset of a user's link that makes the old one stop working, native and legacy formats, provider branding and cards editor.
 5. Stats: live and historical traffic per user, inbound and exit; node health; online users.
 
@@ -388,7 +400,7 @@ Gate: one process serves two inbounds on two ports with two exits, a routing rul
 
 1. Spec for transport framing, fronting options and the control channel in `veilway-docs`, reviewed by `brutal-critic`, revised.
 2. Control channel (exits, a report of addresses and DNS that is never applied, MTU, usage, notices) and transport framing with padding, with fuzz targets and property tests.
-3. Transports `tls`, `ws`, `udp-obfs` and `fronted`, with decoy fallback for unauthenticated peers and the front-candidate prober.
+3. Transports `tls`, `ws`, `udp-obfs` and `fronted`, with decoy fallback for unauthenticated peers and the front-candidate prober. Then node links (the `chain` backend) over those transports, forward and reverse, see "Node links".
 4. Client engine: TUN on Windows, macOS and Linux, IPv4 and IPv6, automatic transport fallback.
 5. `faketls` and browser-like client fingerprint spike, with a written result.
 
