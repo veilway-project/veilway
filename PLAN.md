@@ -351,7 +351,7 @@ Binding for every phase.
 1. A written threat model (`THREAT_MODEL.md`) before protocol or panel code: censor with DPI and active probing, malicious provider, malicious subscription or theme file, stolen panel session, compromised node.
 2. No custom cryptographic primitives. No `unsafe` outside vetted FFI and platform layers, each use commented.
 3. Every parser of untrusted input has a fuzz target (`cargo-fuzz`): handshake, frames, config, subscription, links, theme, provider cards.
-4. Panel: binds to localhost by default, random base path on install, CSRF protection, strict CSP, secrets encrypted at rest, least-privilege process separate from the core.
+4. Panel: binds to localhost by default, random base path on install, CSRF protection, strict CSP, secrets encrypted at rest, least-privilege process separate from the core. On any address other than localhost it serves HTTPS only, with a certificate from ACME or one the operator supplies, and refuses to start on plain HTTP there; behind a reverse proxy it stays on localhost. It reaches the core through the unix socket when both run on one host.
 5. Supply chain: `cargo-deny` and `cargo-audit` in CI, lockfiles committed, release artifacts signed, the updater verifies signatures, add-on downloads verified against pinned hashes.
 
 Also: no telemetry, the core runs unprivileged where the OS allows it, and nothing security-relevant is claimed in docs that has not been tested.
