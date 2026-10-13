@@ -1,6 +1,6 @@
 //! The seed corpus of the fuzz targets in `fuzz/corpus` stays what its file names say: seeds that no longer read would leave the fuzzers starting from nothing. The seeds of `fuzz_control_server` and `fuzz_control_client` are settings for exchanges those targets run themselves, and each run of a target checks them.
 use std::{fs, time::Duration};
-use veilway_proto::{chunk::{parse, ChunkError, Opener}, control::{ClientMessages, NodeMessages}, keys::{ChunkKey, ControlKey}, opening::{ClientOpening, NodeOpening}, NoRandom};
+use veilway_proto::{chunk::{parse, ChunkError, Opener}, control::{ClientMessages, NodeMessages}, fronted::later, keys::{ChunkKey, ControlKey}, opening::{ClientOpening, NodeOpening}, replay::{File, MARKER}, request::{Line, Method, Scan, Scanner}, NoRandom};
 
 fn seed(name: &str) -> Vec<u8> {fs::read(format!("{}/../../fuzz/corpus/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()}
 
@@ -37,6 +37,36 @@ fn control_stream_seeds() {
 		while if bytes[0] & 1 == 1 {pushes.read(&mut input).unwrap().is_some()} else {requests.read(&mut input).unwrap().is_some()} {seen += 1}
 		assert_eq!((seen, input.len()), (count, 0), "{name}");
 	}
+}
+
+// The seeds of the transports' targets that spell out more than settings: the bytes after the settings are what their names say.
+#[test]
+fn transport_seeds() {
+	for (name, clean, entries) in [("clean", true, 2), ("running", false, 0)] {assert_eq!(File::decode(&seed(&format!("replay_file/{name}"))[1..], 64).map(|file| (file.clean(), file.len())), Ok((clean, entries)), "{name}")}
+	for (name, rule) in [("body-clean", 2), ("body-running", 0), ("body-version-2", 0), ("body-entries-without-mark", 2), ("body-count-too-high", 3)] {
+		let body = seed(&format!("replay_file/{name}"));
+		assert_eq!((&body[1..9], body[36], body.len()), (&MARKER[..], rule, if rule == 3 {119} else {37 + 41 * usize::from(rule)}), "{name}");
+	}
+	for (name, method, query) in [("get-token", Method::Get, 151), ("post-opening", Method::Post, 151), ("post-later", Method::Post, 24)] {
+		let bytes = seed(&format!("request_line/{name}"));
+		let Scan::Line(size) = Scanner::new().feed(&bytes[1..]) else {panic!("{name} is no line")};
+		let line = Line::parse(&bytes[1..1 + size]).unwrap();
+		assert_eq!((line.method, line.path, line.query.map(<[u8]>::len)), (method, &b"/a-path-of-a-transport"[..], Some(query)), "{name}");
+		assert_eq!(later(line.query.unwrap()).map(|(_, number)| number), (query == 24).then_some(7), "{name}");
+	}
+	assert_eq!(Scanner::new().feed(&seed("request_line/no-query")[1..]), Scan::Line(16));
+	for name in ["http-1-0", "head", "bare-newline", "space-in-target", "tls-hello"] {assert_eq!(Scanner::new().feed(&seed(&format!("request_line/{name}"))[1..]), Scan::Forward, "{name}")}
+	for (name, count) in [("forged-good", 1), ("forged-no-datagram", 0), ("forged-two-datagrams", 2), ("data-one", 1), ("data-padding-only", 0), ("data-two", 2)] {assert_eq!(parse(&seed(&format!("udp_obfs/{name}"))[20..]).unwrap().count(), count, "{name}")}
+	for (name, valid) in [("two-chunks", [true, true]), ("invalid-item", [true, false])] {
+		let (bytes, mut at, mut read) = (seed(&format!("fronted_body/{name}")), 4, Vec::new());
+		while at < bytes.len() {
+			let end = at + 2 + usize::from(u16::from_be_bytes([bytes[at], bytes[at + 1]]));
+			read.push(parse(&bytes[at + 2..end]).is_ok());
+			at = end;
+		}
+		assert_eq!(read, valid, "{name}");
+	}
+	for (name, size) in [("forged-good", 8 + 28 + 9), ("forged-binder", 8 + 28 + 32 + 4), ("raw-token", 8 + 151)] {assert_eq!(seed(&format!("stream_proof/{name}")).len(), size, "{name}")}
 }
 
 // The requests and the messages that follow the settings in the seeds of the two exchange targets.

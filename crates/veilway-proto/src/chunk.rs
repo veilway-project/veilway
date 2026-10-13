@@ -2,7 +2,7 @@
 //!
 //! A chunk is one ChaCha20-Poly1305 message whose plaintext is a list of items, each a 2 byte length and one WireGuard datagram, followed by padding. `write` and `parse` are the plaintext alone. `Sealer` and `Opener` are one direction of a `tls` or `ws` session, with the counter nonce and empty associated data.
 //!
-//! Not built here: `udp-obfs` seals with random nonces, and `fronted` advances its chunk numbers only when a whole request is accepted and must leave the session exactly as it was when any chunk of a body fails. `Opener` advances per chunk and ends for good on its first failure, so `fronted` needs an opener of its own, one that opens the chunks of a body at tentative numbers and commits them together. Both can use `write`, `parse` and `nonce` as they are.
+//! Two transports do not use `Opener`. `udp-obfs` seals with random nonces (`udp_obfs`). `fronted` advances its chunk numbers only when a whole request is accepted and must leave the session exactly as it was when any chunk of a body fails, while `Opener` advances per chunk and ends for good on its first failure: `fronted::Opener` opens the chunks of a body at tentative numbers and commits them together. Both use `write`, `parse` and `nonce` as they are, and `fronted` seals with `Sealer`.
 use crate::{keys::ChunkKey, uniform, NoRandom, Random};
 use ring::aead::{Aad, Nonce};
 use std::{fmt, ops::RangeInclusive};

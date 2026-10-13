@@ -35,7 +35,7 @@ impl Transport {
 	/// Whether the transport has the client's idle keepalive and the node's echo. `fronted` has neither: its polling is the activity.
 	pub fn keepalive(self) -> bool {self != Self::Fronted}
 	/// "A session is active at a moment when the receiver accepts from it a chunk that cannot be a replay."
-	/// `opened` says a chunk opened at the expected number on `tls` and `ws`. On `fronted` it says a request was accepted, which this crate cannot tell yet: `chunk::Opener` does not do what a `fronted` body needs. `wireguard` says the chunk held a WireGuard packet that authenticated, which is the only thing that counts on `udp-obfs`, where a recorded chunk opens again.
+	/// `opened` says a chunk opened at the expected number on `tls` and `ws`. On `fronted` it says a request was accepted, which is the moment its body is committed (`fronted::Opened::commit`). `wireguard` says the chunk held a WireGuard packet that authenticated, which is the only thing that counts on `udp-obfs`, where a recorded chunk opens again.
 	pub fn activity(self, opened: bool, wireguard: bool) -> bool {opened && (wireguard || self != Self::UdpObfs)}
 }
 

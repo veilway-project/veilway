@@ -1,13 +1,28 @@
 //! Wire formats of the Veilway protocol, as pure code: no sockets, no clocks and no randomness of its own. Time and random bytes are parameters.
 //!
-//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the control key (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), and the timer table (`session`). The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
+//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the keys (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), the timer table (`session`), the stream proof (`proof`), the packets of `udp-obfs` (`udp_obfs`), the replay rule and the replay file (`replay`), the request line of a stream listener (`request`) and the bodies of `fronted` (`fronted`). There is no listener, no socket and no file here. The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
 #![forbid(unsafe_code)]
 
 pub mod chunk;
 pub mod control;
+pub mod fronted;
 pub mod keys;
 pub mod opening;
+pub mod proof;
+pub mod replay;
+pub mod request;
 pub mod session;
+pub mod udp_obfs;
+
+/// The one answer to everything that is not a valid proof, opening packet or data packet for this node. It says nothing about the cause, and a caller must not try to learn one: a refused stream request takes the unauthenticated path and a refused datagram is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Refused;
+
+impl std::fmt::Display for Refused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {f.write_str("refused")}
+}
+
+impl std::error::Error for Refused {}
 
 /// The caller's random source failed, or kept giving values that no uniform draw could use, or a draw was asked from a range that holds no number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +51,18 @@ pub fn uniform(low: u32, high: u32, random: &mut Random) -> Result<u32, NoRandom
 		if value < limit {return Ok(low + (value % span) as u32)}
 	}
 	Err(NoRandom)
+}
+
+// The cryptographic operations of the node-side openers, in the order they ran on this thread. A timing test is not possible in unit tests, so the tests of `proof` and `udp_obfs` compare these sequences instead: every refusal must show the same one as an accepted input.
+#[cfg(test)]
+pub(crate) mod trace {
+	use std::cell::RefCell;
+
+	thread_local! {static OPS: RefCell<Vec<&'static str>> = const {RefCell::new(Vec::new())};}
+
+	pub(crate) fn op(name: &'static str) {OPS.with_borrow_mut(|ops| ops.push(name))}
+
+	pub(crate) fn take() -> Vec<&'static str> {OPS.take()}
 }
 
 #[cfg(test)]
