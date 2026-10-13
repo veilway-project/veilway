@@ -71,6 +71,41 @@ test=false
 doc=false
 bench=false
 
+[[bin]]
+name="stream_proof"
+path="fuzz_targets/stream_proof.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="udp_obfs"
+path="fuzz_targets/udp_obfs.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="replay_file"
+path="fuzz_targets/replay_file.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="request_line"
+path="fuzz_targets/request_line.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fronted_body"
+path="fuzz_targets/fronted_body.rs"
+test=false
+doc=false
+bench=false
+
 # Not part of the main workspace.
 [workspace]
 
