@@ -8,8 +8,9 @@ Update this block at the end of every work session.
 - Step 2b is done too: every tunnel DNS query is answered by the node's own resolver (UDP and TCP port 53, servers tried in order, REFUSED when the rules refuse), names are remembered per user, and `domain` rules match on them. Fuzz targets: `config`, `packet`, `dns`.
 - Step 2c is done too: rejected traffic gets the matching ICMP error, every `unsupported` policy of a `netstack` exit works (`local`, `reject`, `drop`, `direct`, `via`), and the `l3` exit runs on Linux (one TUN device, kernel forwarding and source NAT through `ip` and `nft`, return traffic only for live flows). Only one `l3` exit per node for now.
 - Step 2d is done too: `veilway run` reloads its config on SIGHUP (`Engine::reload`), a refused or failing file leaves the running config in force, every live flow is decided again under the new config, and a user who is disabled, removed or expired (or a device that is removed or re-keyed) loses sessions, flows and DNS memory within a second. `THREAT_MODEL.md` now describes the engine as built.
-- Last finished step: Phase 1, step 2d
-- Next action: Phase 1, step 3 (quotas and counters with a state file; out of quota plugs into the cut-off path, `Denied` in `engine/plan.rs`).
+- Step 3 is done: `quota_bytes` and `quota_period` are enforced (a user over quota is cut off within a second and comes back when the period rolls over or a reload raises the quota), every user, inbound and exit has counters (`Engine::counters`), and usage lives in a state file (`veilway run --state`, default `veilway-state.json` next to the config) that survives reloads and restarts.
+- Last finished step: Phase 1, step 3
+- Next action: Phase 1, step 4 (control API on a unix socket with OpenAPI, SSE events and the generated TypeScript SDK in `packages/sdk`).
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 

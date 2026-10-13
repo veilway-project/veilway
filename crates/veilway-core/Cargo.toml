@@ -11,7 +11,7 @@ veilway-wg={path="../veilway-wg"}
 tokio.workspace=true
 anyhow.workspace=true
 serde.workspace=true
-serde_json.workspace=true
+serde_json={workspace=true, features=["raw_value"]}
 tracing.workspace=true
 ipstack.workspace=true
 tokio-socks.workspace=true
@@ -23,8 +23,8 @@ time.workspace=true
 ring.workspace=true
 socket2.workspace=true
 
-# The one ioctl that makes the TUN device of an l3 exit.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The one ioctl that makes the TUN device of an l3 exit on Linux, and the flags the state file is opened with.
+[target.'cfg(unix)'.dependencies]
 libc.workspace=true
 
 [dev-dependencies]

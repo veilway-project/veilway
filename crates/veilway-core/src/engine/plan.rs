@@ -1,8 +1,8 @@
 //! Everything the engine derives from a config, built once and never changed. Tasks read it through `Shared::plan`, and a reload or an expiry swaps in a new one in a single step.
 //! What the node learns while it runs (counters, name memory, tunnels) hangs off the plan and is handed from one plan to the next by tag, user name or public key, so a change of order or membership loses nothing that survives it.
 use super::inbound::Tunnel;
-use super::{icmp, l3, ExitState, Traffic, UserState};
-use crate::config::{self, Config, Exits, IpEntry, Policy, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
+use super::{icmp, l3, usage, ExitState, Traffic, UserState};
+use crate::config::{self, Config, Exits, IpEntry, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_MTU, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
 use std::collections::HashMap;
@@ -55,9 +55,9 @@ pub struct Inbound {
 }
 
 /// Why a user has no peer and holds no address. Whatever puts a user here cuts them off the same way, see `Host::switch`.
-/// Out of quota is the next reason: `Plan::new` decides it where it decides `Expired`, from the user's byte count, and nothing after that has to know about it.
+/// `Plan::new` decides `Quota` where it decides `Expired`, from the user's byte count, and nothing after that has to know about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Denied {Disabled, Expired}
+pub enum Denied {Disabled, Expired, Quota}
 
 pub struct User {
 	pub name: String,
@@ -65,6 +65,9 @@ pub struct User {
 	/// None is every exit.
 	pub entitled: Option<Vec<usize>>,
 	pub exit: Option<usize>,
+	/// `quota_bytes`, which the count in `state` is held against.
+	pub quota: Option<u64>,
+	pub period: Option<QuotaPeriod>,
 	pub denied: Option<Denied>,
 	pub state: Arc<UserState>,
 }
@@ -135,7 +138,7 @@ pub struct Plan {
 	pub inbounds: Vec<Inbound>,
 	/// Every user of the config, enabled or not, so counters and rules keep their indexes.
 	pub users: Vec<User>,
-	/// Devices of users that are enabled and not expired. Nobody else has a peer or holds an address.
+	/// Devices of users that are enabled, not expired and within their quota. Nobody else has a peer or holds an address.
 	pub devices: Vec<Device>,
 	pub exits: Vec<Exit>,
 	pub default_exit: usize,
@@ -150,6 +153,8 @@ pub struct Plan {
 	pub expired: HashMap<String, OffsetDateTime>,
 	/// The earliest `expires_at` still to come among the users that are not denied.
 	pub next_expiry: Option<OffsetDateTime>,
+	/// `usage::starts` of the time the plan was compiled at. The counts of its users start over by these when the plan is put in force, see `Host::switch`.
+	pub starts: [i64; 3],
 	/// The exit with an l3 backend and the way into its interface. The engine sets it once the interface is up.
 	pub l3: Option<(usize, l3::Port)>,
 }
@@ -222,12 +227,16 @@ impl Plan {
 			tunnel,
 		}).collect();
 		let pools: Vec<(IpNet, usize)> = inbounds.iter().enumerate().flat_map(|(i, inbound)| inbound.pools.iter().map(move |pool| (*pool, i))).collect();
-		let (mut users, mut devices, mut by_address, mut by_key, mut expired, mut next_expiry) = (Vec::with_capacity(config.users.len()), Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), None::<OffsetDateTime>);
+		let (mut users, mut devices, mut by_address, mut by_key, mut expired, mut next_expiry, starts) = (Vec::with_capacity(config.users.len()), Vec::new(), HashMap::new(), HashMap::new(), HashMap::new(), None::<OffsetDateTime>, usage::starts(now));
 		for (u, user) in config.users.iter().enumerate() {
 			// Once the time has passed while the node ran, it stays passed: a clock that steps back must not let the user in again.
 			let lapsed = user.expires_at.map(|at| at.0).filter(|at| *at <= now || previous.expired.get(&user.name) == Some(at));
 			if let Some(at) = lapsed {expired.insert(user.name.clone(), at);}
-			let denied = if user.enabled == Some(false) {Some(Denied::Disabled)} else if lapsed.is_some() {Some(Denied::Expired)} else {None};
+			let state = was_user.get(user.name.as_str()).map(|was| was.state.clone()).unwrap_or_default();
+			// The count is held against the quota this config gives, in the period this config gives. A count only starts over when a later period begins, so a clock that steps back gives nobody their quota again.
+			// It is taken here for what it will be once this plan is in force and is not touched: a plan that is compiled and never put in force, as in a reload that fails, has changed nobody's count. `Host::switch` starts it over.
+			let used = if user.quota_period.is_some_and(|period| state.since.load(Ordering::Relaxed) < starts[period as usize]) {0} else {state.used()};
+			let denied = if user.enabled == Some(false) {Some(Denied::Disabled)} else if lapsed.is_some() {Some(Denied::Expired)} else if user.quota_bytes.is_some_and(|quota| used >= quota) {Some(Denied::Quota)} else {None};
 			users.push(User {
 				name: user.name.clone(),
 				groups: user.groups.iter().map(|group| find(&group_names, group)).collect::<anyhow::Result<_>>()?,
@@ -236,8 +245,10 @@ impl Plan {
 					Exits::List(list) => Some(list.iter().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?),
 				},
 				exit: user.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?,
+				quota: user.quota_bytes,
+				period: user.quota_period,
 				denied,
-				state: was_user.get(user.name.as_str()).map(|was| was.state.clone()).unwrap_or_default(),
+				state,
 			});
 			if denied.is_some() {continue}
 			if let Some(at) = user.expires_at {next_expiry = Some(next_expiry.map_or(at.0, |next| next.min(at.0)))}
@@ -296,7 +307,7 @@ impl Plan {
 			default_exit: find(&exit_tags, &config.routing.default)?,
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),
 			l3: None,
-			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry,
+			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry, starts,
 		})
 	}
 

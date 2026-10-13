@@ -145,6 +145,8 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 	// The stack's own idle times are longer than any exit may set, because a tunnel outlives the exits of the config it started under. This timer is the one that ends an idle flow.
 	let idle = if key.protocol == 6 {*tcp_idle} else if key.dport == 53 {(*udp_idle).min(DNS_IDLE)} else {*udp_idle};
 	shared.flows.hold(&key, id, idle + HOLD_MARGIN);
+	// An exit counts inner IP packets, and a datagram here is one without its headers. It counts for the exit whose outbound takes it or gives it, at that moment and not before.
+	let overhead = if key.src.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6};
 	let relay = async {
 		match (stream, outbound) {
 			(IpStackStream::Tcp(mut stream), outbound) => {
@@ -184,7 +186,10 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 								r = stream.read(&mut from_peer) => {
 									let Ok(n) = r else {return};
 									if n == 0 {return}
-									if let Err(e) = socket.send(&from_peer[..n]).await {tracing::debug!("exit {tag}: udp to {}: send: {}", plan.show(target), e.kind())}
+									match socket.send(&from_peer[..n]).await {
+										Ok(_) => plan.exits[carrier].traffic.up(n + overhead),
+										Err(e) => tracing::debug!("exit {tag}: udp to {}: send: {}", plan.show(target), e.kind()),
+									}
 								}
 								r = socket.recv(&mut from_remote) => {
 									// A connected socket reports an ICMP error for an earlier datagram here. The flow outlives it.
@@ -193,6 +198,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 										tracing::debug!("exit {tag}: udp from {}: dropping a {n} byte reply, over the {cap} byte mtu", plan.show(target));
 										continue;
 									}
+									plan.exits[carrier].traffic.down(n + overhead);
 									if stream.write(&from_remote[..n]).await.is_err() {return}
 								}
 							}
@@ -204,7 +210,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 					Some(stream) => stream,
 					None => return,
 				};
-				if own && target.port() == 53 {return dns_over_tcp(stream, up, target, mtu, &plan).await}
+				if own && target.port() == 53 {return dns_over_tcp(stream, up, target, mtu, &plan, exit, overhead).await}
 				// The proxy has no UDP at this flow's first packet, so the policy decides, and only the policy of the exit the rules chose: what a `via` target cannot carry is rejected.
 				// A flow the proxy has carried before is past that choice. It is refused, without an answer where the policy is `drop`.
 				// `direct` and `via` need no second look at the destination gate. It is one list for every exit and the flow passed it before it came here.
@@ -290,7 +296,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 	};
 	if !shared.flows.pin(key, id, plan.generation) {return None}
 	tracing::debug!("exit {tag}: udp to {} associated", plan.show(dst));
-	let (header, cap) = (udp_header(dst), usize::from(mtu).saturating_sub(UDP_OVERHEAD));
+	let (header, cap, traffic, overhead) = (udp_header(dst), usize::from(mtu).saturating_sub(UDP_OVERHEAD), &plan.exits[exit].traffic, if key.src.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6});
 	let (mut from_peer, mut from_relay, mut sink) = (vec![0u8; MAX_DATAGRAM], vec![0u8; MAX_DATAGRAM], [0u8; 1]);
 	let mut wrapped = Vec::with_capacity(MAX_DATAGRAM);
 	loop {
@@ -305,6 +311,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 					tracing::debug!("exit {tag}: udp to {}: relay send: {}", plan.show(dst), e.kind());
 					return None;
 				}
+				traffic.up(n + overhead);
 			}
 			r = relay.recv(&mut from_relay) => {
 				let Ok(n) = r else {return None};
@@ -313,6 +320,7 @@ async fn udp_relay(shared: &Shared, exit: usize, tag: &str, mut stream: IpStackU
 					tracing::debug!("exit {tag}: udp from {}: dropping a {} byte reply, over the {cap} byte mtu", plan.show(dst), payload.len());
 					continue;
 				}
+				traffic.down(payload.len() + overhead);
 				if stream.write(payload).await.is_err() {return None}
 			}
 			// The association dies with its control connection, so anything on it ends the flow.
@@ -375,8 +383,8 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 	Some(answer)
 }
 
-/// DNS with a 2 byte big endian length prefix, so the query rides an ordinary SOCKS5 CONNECT.
-async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: SocketAddr, mtu: u16, plan: &Plan) {
+/// DNS with a 2 byte big endian length prefix, so the query rides an ordinary SOCKS5 CONNECT. `exit` counts each query the proxy takes and each answer it gives as the datagram it was or becomes, `overhead` bytes of headers included.
+async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: SocketAddr, mtu: u16, plan: &Plan, exit: usize, overhead: usize) {
 	let cap = usize::from(mtu).saturating_sub(UDP_OVERHEAD);
 	let mut query = vec![0u8; 1500];
 	loop {
@@ -391,6 +399,7 @@ async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: Socke
 				continue;
 			}
 		};
+		plan.exits[exit].traffic.up(n + overhead);
 		let mut answer = match tokio::time::timeout(DNS_TIMEOUT, framed(&mut remote, &query[..n])).await {
 			Ok(Ok(a)) => a,
 			_ => {
@@ -400,6 +409,7 @@ async fn dns_over_tcp(mut stream: IpStackUdpStream, up: &Upstream, target: Socke
 		};
 		// ipstack would clip the tail without saying so.
 		dns::clip(&mut answer, cap);
+		plan.exits[exit].traffic.down(answer.len() + overhead);
 		// One write is one datagram here, and a short write would duplicate rather than continue.
 		if stream.write(&answer).await.is_err() {return}
 	}
