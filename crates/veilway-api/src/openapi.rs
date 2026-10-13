@@ -1,6 +1,5 @@
 //! The OpenAPI 3.1 document of the control API, generated from the route table and the types of the answers, so it cannot say anything else than what the router serves.
 //! It is committed as `openapi.json` next to this crate's manifest, which is what the TypeScript SDK is generated from, and a test fails when that file is not what this produces.
-use crate::model::Document;
 use crate::routes::{event_schemas, parameter, routes};
 use axum::http::StatusCode;
 use schemars::generate::SchemaSettings;
@@ -19,7 +18,7 @@ pub fn openapi() -> String {
 		// A route that can answer that the precondition is missing is a route that takes one.
 		if route.responses.iter().any(|(status, ..)| *status == StatusCode::PRECONDITION_REQUIRED) {parameters.push(json!({"name": "If-Match", "in": "header", "required": true, "description": "The revision of the config the change was made on, as GET /v1/config gave it, with or without quotes.", "schema": {"type": "string"}}))}
 		let mut operation = json!({"operationId": route.operation, "summary": route.summary, "parameters": parameters, "responses": responses});
-		if route.document {operation["requestBody"] = json!({"required": true, "content": {"application/json": {"schema": schemas.subschema_for::<Document>()}}})}
+		if let Some((schema, required)) = &route.body {operation["requestBody"] = json!({"required": required, "content": {"application/json": {"schema": schema}}})}
 		paths.entry(route.path).or_insert_with(|| json!({}))[route.method.as_str().to_lowercase()] = operation;
 	}
 	let events: Map<String, Value> = event_schemas(&mut schemas).into_iter().map(|(name, schema)| (name.to_string(), json!(schema))).collect();

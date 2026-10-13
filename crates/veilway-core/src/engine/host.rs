@@ -396,10 +396,10 @@ impl Host {
 					if peers.wg.index(&device.public_key).is_none() {peers.add(device.public_key, device.preshared_key)}
 				}
 			}
-			// `Plan::new` held each count against the period the plan was compiled in without touching it. The plan is in force from here, so this is where a count whose period is over starts over.
-			for user in &plan.users {
-				if let Some(period) = user.period {user.state.roll(plan.starts[period as usize])}
-			}
+			// `Plan::new` held each count against the period the plan was compiled in without touching it. The plan is in force from here, so this is where a count whose period is over starts over,
+			// and where a period the state file has more than one whole period after the node's clock is put right at start.
+			let now = (shared.now)().unix_timestamp();
+			for user in &plan.users {user.state.roll(&user.name, user.period.map(|period| (plan.starts[period as usize], super::usage::SPANS[period as usize])), now)}
 			plan.shown.store(plan.log_destinations, Ordering::Relaxed);
 			*shared.plan.write().unwrap_or_else(|e| e.into_inner()) = plan.clone();
 			(out, pings, ended.len())

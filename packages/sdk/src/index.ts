@@ -20,6 +20,7 @@ export interface EventData {
 	config_refused: Schemas["ConfigRefused"];
 	user_cut_off: Schemas["UserCutOff"];
 	user_restored: Schemas["UserRestored"];
+	usage_reset: Schemas["UsageReset"];
 	exit_udp_changed: Schemas["ExitUdpChanged"];
 	stats: Schemas["Stats"];
 	lagged: Schemas["Lagged"];
@@ -36,7 +37,7 @@ export interface FetchResponse {
 export type Fetch = (url: string, init: {method: string, headers: Record<string, string>, body?: string, signal?: AbortSignal}) => Promise<FetchResponse>;
 /** The most one line of the event stream may hold before the client gives up on it. */
 const MAX_LINE = 1 << 20;
-const EVENTS = new Set<string>(["config_applied", "config_refused", "user_cut_off", "user_restored", "exit_udp_changed", "stats", "lagged"]);
+const EVENTS = new Set<string>(["config_applied", "config_refused", "user_cut_off", "user_restored", "usage_reset", "exit_udp_changed", "stats", "lagged"]);
 
 /** Every answer that is not a success, and an answer the client could not read. */
 export class VeilwayError extends Error {
@@ -80,6 +81,9 @@ export class Client {
 	async listUsers(): Promise<User[]> {return (await this.json<{users: User[]}>("GET", "/v1/users")).users}
 
 	getUser(name: string): Promise<User> {return this.json("GET", "/v1/users/" + encodeURIComponent(name))}
+
+	/** Starts the user's quota count over, which lets a user who was out of quota connect again at once. With `totals` the user's `traffic` goes back to zero as well. The answer is the user as `getUser` gives them, and the same call again changes nothing more. */
+	resetUsage(name: string, options: {totals?: boolean} = {}): Promise<User> {return this.json("POST", "/v1/users/" + encodeURIComponent(name) + "/usage/reset", {}, {totals: options.totals === true})}
 
 	stats(): Promise<Stats> {return this.json("GET", "/v1/stats")}
 

@@ -26,6 +26,9 @@ use veilway_core::{Denied, Over, Reason};
 
 pub(crate) const EVENTS: &str = "/v1/events";
 const CONFIG: &str = "/v1/config";
+/// What the path of a usage reset begins and ends with, around the name of its user.
+const USERS: &str = "/v1/users/";
+const RESET: &str = "/usage/reset";
 /// How many times the body limit a request may send before the node stops taking its body off the connection.
 const DRAIN: usize = 4;
 
@@ -36,8 +39,8 @@ pub(crate) struct Route {
 	pub operation: &'static str,
 	pub summary: &'static str,
 	pub handler: MethodRouter<Arc<Api>>,
-	/// Whether the request carries a config document.
-	pub document: bool,
+	/// The schema of the body the request carries, and whether it has to carry one. None for a request without a body.
+	pub body: Option<(Schema, bool)>,
 	/// Every status the route answers with, each with what it means. Without a schema the body is no JSON document: the event stream.
 	pub responses: Vec<(StatusCode, &'static str, Option<Schema>)>,
 }
@@ -74,8 +77,8 @@ fn json<T: Serialize>(status: StatusCode, body: &T) -> Response {
 	}
 }
 
-/// The body of a request that carries a config document, read up to the limit and no further.
-async fn document(api: &Api, request: Request) -> Result<Vec<u8>, Failure> {
+/// The body of a request that carries a JSON document, read up to the limit and no further. With `optional` a request without a body is taken too, as no bytes, whatever it says its type is.
+async fn document(api: &Api, request: Request, optional: bool) -> Result<Vec<u8>, Failure> {
 	let typed = request.headers().get(CONTENT_TYPE).and_then(|kind| kind.to_str().ok()).is_some_and(|kind| kind.split(';').next().is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json")));
 	let mut large = request.headers().get(CONTENT_LENGTH).and_then(|length| length.to_str().ok()).and_then(|length| length.parse::<usize>().ok()).is_some_and(|length| length > api.limits.body);
 	// A body that is not wanted is still taken off the connection, and thrown away, up to a few times the limit: a client that is still sending when its connection closes may never see why it was refused. Past that the connection is cut.
@@ -87,6 +90,7 @@ async fn document(api: &Api, request: Request) -> Result<Vec<u8>, Failure> {
 		if read > api.limits.body.saturating_mul(DRAIN) {break}
 		if typed && !large {bytes.extend_from_slice(&chunk)}
 	}
+	if optional && read == 0 {return Ok(bytes)}
 	if !typed {return Err(Failure::new(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_media_type", "The body must be sent as application/json."))}
 	if large {return Err(Failure::new(StatusCode::PAYLOAD_TOO_LARGE, "body_too_large", format!("The body is larger than {} bytes.", api.limits.body)))}
 	// A body that is no JSON at all is a request that went wrong. One that is JSON and no valid config is a document to report on.
@@ -133,7 +137,7 @@ async fn running(State(api): State<Arc<Api>>) -> Response {
 }
 
 async fn validate(State(api): State<Arc<Api>>, request: Request) -> Response {
-	let bytes = match document(&api, request).await {
+	let bytes = match document(&api, request, false).await {
 		Ok(bytes) => bytes,
 		Err(failure) => return failure.into_response(),
 	};
@@ -144,7 +148,7 @@ async fn validate(State(api): State<Arc<Api>>, request: Request) -> Response {
 }
 
 async fn difference(State(api): State<Arc<Api>>, request: Request) -> Response {
-	let bytes = match document(&api, request).await {
+	let bytes = match document(&api, request, false).await {
 		Ok(bytes) => bytes,
 		Err(failure) => return failure.into_response(),
 	};
@@ -161,7 +165,7 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 	// From that moment the answer waits for the engine however long it takes, see `deadline`: the engine finishes what it has begun whether or not anybody waits, so "too slow" would be said of a config that then goes into force.
 	let checked = tokio::time::timeout(api.limits.request, async {
 		// The body is read before anything is answered, see `document`.
-		let bytes = document(&api, request).await?;
+		let bytes = document(&api, request, false).await?;
 		let given = given.ok_or_else(|| Failure::new(StatusCode::PRECONDITION_REQUIRED, "precondition_required", "An apply needs the header If-Match with the revision of the config the change was made on."))?;
 		let snapshot = api.engine.snapshot();
 		if given != snapshot.revision.to_string() {return Err(Failure::stale(snapshot.revision.to_string()))}
@@ -228,6 +232,23 @@ async fn user(State(api): State<Arc<Api>>, name: Result<Path<String>, PathReject
 		Some(user) => json(StatusCode::OK, &user),
 		None => Failure::new(StatusCode::NOT_FOUND, "user_not_found", "The running config has no user of that name.").into_response(),
 	}
+}
+
+/// Starts a user's quota count over, see `Engine::reset_usage`. Like an apply it keeps the time itself: the body has the time a request gets, and once the engine has been asked the answer waits for it,
+/// so "too slow" is never said of a reset that then happens. The engine waits for a reload that is under way and for one write of the state file, which it gives up on by itself.
+async fn reset_usage(State(api): State<Arc<Api>>, name: Result<Path<String>, PathRejection>, request: Request) -> Response {
+	let missing = || Failure::new(StatusCode::NOT_FOUND, "user_not_found", "The running config has no user of that name.").into_response();
+	// The body is read before anything is answered, see `document`.
+	let bytes = match tokio::time::timeout(api.limits.request, document(&api, request, true)).await {
+		Ok(Ok(bytes)) => bytes,
+		Ok(Err(failure)) => return failure.into_response(),
+		Err(_) => return Failure::late(&api).into_response(),
+	};
+	// Only an object is a body: left to itself the type would also be read from a list.
+	let Some(asked) = (if bytes.is_empty() {Some(model::ResetUsage::default())} else {serde_json::from_slice::<serde_json::Value>(&bytes).ok().filter(serde_json::Value::is_object).and_then(|body| serde_json::from_value::<model::ResetUsage>(body).ok())}) else {return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "body_invalid", "The body of a usage reset is an object with at most the field totals, which is true or false. Nothing was changed.").into_response()};
+	let Ok(Path(name)) = name else {return missing()};
+	if api.engine.reset_usage(&name, asked.totals).await.is_none() {return missing()}
+	users_of(&api, Some(&name)).pop().map_or_else(missing, |user| json(StatusCode::OK, &user))
 }
 
 async fn stats(State(api): State<Arc<Api>>) -> Response {json(StatusCode::OK, &api.stats())}
@@ -305,9 +326,10 @@ pub(crate) async fn unknown() -> Response {Failure::new(StatusCode::NOT_FOUND, "
 pub(crate) async fn not_allowed() -> Response {Failure::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "The route does not take this method. GET /v1/openapi.json lists what it takes.").into_response()}
 
 /// Ends a request that has not been answered in time. The event stream is no such request: it is held to how fast its reader takes what it is sent, see `Stalled`.
-/// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force.
+/// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force. So does a usage reset, see `reset_usage`.
 pub(crate) async fn deadline(State(api): State<Arc<Api>>, request: Request, next: Next) -> Response {
-	if request.uri().path() == EVENTS || (request.uri().path() == CONFIG && request.method() == Method::PUT) {return next.run(request).await}
+	let path = request.uri().path();
+	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET))) {return next.run(request).await}
 	tokio::time::timeout(api.limits.request, next.run(request)).await.unwrap_or_else(|_| Failure::late(&api).into_response())
 }
 
@@ -322,6 +344,7 @@ pub(crate) fn frame(id: u64, event: veilway_core::Event) -> Frame {
 		veilway_core::Event::UserCutOff {user, reason} => ("user_cut_off", serde_json::to_string(&model::UserCutOff {user, reason: reason.into()})),
 		veilway_core::Event::UserRestored {user} => ("user_restored", serde_json::to_string(&model::UserRestored {user})),
 		veilway_core::Event::ExitUdpChanged {exit, udp} => ("exit_udp_changed", serde_json::to_string(&model::ExitUdpChanged {exit, udp})),
+		veilway_core::Event::UsageReset {user, totals} => ("usage_reset", serde_json::to_string(&model::UsageReset {user, totals})),
 	};
 	Frame {id, kind, data: Some(data.unwrap_or_default().into())}
 }
@@ -334,27 +357,31 @@ pub(crate) fn event_schemas(schemas: &mut SchemaGenerator) -> Vec<(&'static str,
 		("user_cut_off", schemas.subschema_for::<model::UserCutOff>()),
 		("user_restored", schemas.subschema_for::<model::UserRestored>()),
 		("exit_udp_changed", schemas.subschema_for::<model::ExitUdpChanged>()),
+		("usage_reset", schemas.subschema_for::<model::UsageReset>()),
 		("stats", schemas.subschema_for::<model::Stats>()),
 		("lagged", schemas.subschema_for::<model::Lagged>()),
 	]
 }
 
-/// One row of the table. `T` is what the route answers a request that went well with, and every route may also answer that a request took too long or that the node is full.
+/// One row of the table. `T` is what the route answers a request that went well with, `document` says the request carries a config document, and every route may also answer that a request took too long or that the node is full.
 fn route<T: JsonSchema, H: Handler<X, Arc<Api>>, X: 'static>(schemas: &mut SchemaGenerator, method: Method, path: &'static str, operation: &'static str, summary: &'static str, handler: H, document: bool, failures: &[(StatusCode, &'static str)]) -> Route {
 	let failure = schemas.subschema_for::<model::ErrorBody>();
 	let mut responses = vec![(StatusCode::OK, "The answer.", Some(schemas.subschema_for::<T>()))];
 	if document {responses.extend([(StatusCode::BAD_REQUEST, "The body is not one JSON document, or could not be read to its end."), (StatusCode::PAYLOAD_TOO_LARGE, "The body is larger than 4 MiB."), (StatusCode::UNSUPPORTED_MEDIA_TYPE, "The body was not sent as application/json.")].map(|(status, meaning)| (status, meaning, Some(failure.clone()))))}
 	responses.extend(failures.iter().map(|(status, meaning)| (*status, *meaning, Some(failure.clone()))));
 	responses.extend([(StatusCode::REQUEST_TIMEOUT, "The request was not finished within 30 seconds."), (StatusCode::SERVICE_UNAVAILABLE, "The node already serves as many connections, or as many event streams, as it takes at once.")].map(|(status, meaning)| (status, meaning, Some(failure.clone()))));
-	Route {handler: on(MethodFilter::try_from(method.clone()).unwrap_or(MethodFilter::GET), handler), method, path, operation, summary, document, responses}
+	Route {handler: on(MethodFilter::try_from(method.clone()).unwrap_or(MethodFilter::GET), handler), method, path, operation, summary, body: document.then(|| (schemas.subschema_for::<model::Document>(), true)), responses}
 }
 
 /// Every route of the API. The router serves exactly these and the OpenAPI document describes exactly these.
 pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
-	let mut stream = route::<model::Stats, _, _>(schemas, Method::GET, EVENTS, "events", "Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive.", events, false, &[]);
+	let mut stream = route::<model::Stats, _, _>(schemas, Method::GET, EVENTS, "events", "Server-Sent Events: config_applied, config_refused, user_cut_off, user_restored, usage_reset, exit_udp_changed, and stats once a second. Each has an increasing id. A reader that is too slow loses events and gets a lagged event, which has no id, saying how many. A comment line every 15 seconds keeps the stream alive.", events, false, &[]);
 	stream.responses[0] = (StatusCode::OK, "The stream. The data of each event is one JSON document, see x-events.", None);
 	let mut put = route::<model::Applied, _, _>(schemas, Method::PUT, CONFIG, "applyConfig", "Puts a config in force, the way a reload on SIGHUP does, and writes it to the config file. If-Match must name the revision the change was made on. A document that is refused changes nothing. An outbound keeps its username and password for a marker only while its server is the same.", apply, true, &[(StatusCode::CONFLICT, "The running config is not the one If-Match names. The details and the ETag hold the revision that runs."), (StatusCode::UNPROCESSABLE_ENTITY, "The document is not a valid config, or the node could not prepare it. Nothing was changed."), (StatusCode::PRECONDITION_REQUIRED, "The header If-Match is missing.")]);
 	for response in put.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The document was not read and checked within 30 seconds. Nothing was changed: once the node has begun to put a config in force, the answer waits for it however long that takes, and is never this one."}
+	let mut reset = route::<model::User, _, _>(schemas, Method::POST, "/v1/users/{name}/usage/reset", "resetUsage", "Starts a user's quota count over: used_bytes is 0 and period_start is the start of the quota period the node's clock is in, or 0 for a user without a quota_period. A user who was out of quota may connect again at once, with no reload. traffic stays as it is unless the body says {\"totals\": true}, and the body may be left out. The state file is written before the answer. The same request again changes nothing more. The answer is the user as GET /v1/users/{name} gives them.", reset_usage, true, &[(StatusCode::NOT_FOUND, "The running config has no user of that name. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a usage reset takes. Nothing was changed.")]);
+	reset.body = Some((schemas.subschema_for::<model::ResetUsage>(), false));
+	for response in reset.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was changed: once the node has begun the reset, the answer waits for it and is never this one."}
 	vec![
 		route::<model::Status, _, _>(schemas, Method::GET, "/v1/status", "status", "What runs: the version, the config in force and how much of everything there is.", status, false, &[]),
 		route::<model::Running, _, _>(schemas, Method::GET, "/v1/config", "getConfig", "The running config with every secret replaced by the marker \"<redacted>\", and its revision, which is also the ETag.", running, false, &[]),
@@ -363,6 +390,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::Difference, _, _>(schemas, Method::POST, "/v1/config/diff", "diffConfig", "What an apply of the document would add, change and remove, by tag and name. Nothing changes. An outbound whose username or password is written out, and not left as the marker, is listed as changed whatever they are.", difference, true, &[]),
 		route::<model::Users, _, _>(schemas, Method::GET, "/v1/users", "listUsers", "Every user of the running config with their usage, counters and devices.", users, false, &[]),
 		route::<model::User, _, _>(schemas, Method::GET, "/v1/users/{name}", "getUser", "One user.", user, false, &[(StatusCode::NOT_FOUND, "The running config has no user of that name.")]),
+		reset,
 		route::<model::Stats, _, _>(schemas, Method::GET, "/v1/stats", "stats", "Every counter at one moment, with rates in bytes per second over the last 5 seconds.", stats, false, &[]),
 		route::<model::Sessions, _, _>(schemas, Method::GET, "/v1/sessions", "listSessions", "The devices with a live session.", sessions, false, &[]),
 		route::<model::Exits, _, _>(schemas, Method::GET, "/v1/exits", "listExits", "Every exit with what the node knows of its upstream, and its counters.", exits, false, &[]),

@@ -188,6 +188,22 @@ pub fn standing(path: &Path) -> io::Result<Standing> {
 	}
 }
 
+/// One request to whatever answers on the socket at `path`, on a connection of its own, with `body` sent as JSON: the status of the answer and its body. This is what the command line talks to a node that runs with.
+/// An error is the one of the connect (nothing at the path, nobody answers there, this user may not open it), `TimedOut` when the answer was not whole within `wait`, and anything else when what answered does not speak HTTP.
+/// An answer is read up to the size of the largest there is, a running config, which is no longer than a config file: its secrets are markers that are shorter than they were.
+pub async fn request(path: &Path, method: &str, uri: &str, body: Option<Vec<u8>>, wait: Duration) -> io::Result<(u16, Vec<u8>)> {
+	tokio::time::timeout(wait, async {
+		let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(UnixStream::connect(path).await?)).await.map_err(io::Error::other)?;
+		let asked = if body.is_some() {hyper::Request::builder().header("content-type", "application/json")} else {hyper::Request::builder()};
+		let asked = asked.method(method).uri(uri).header("host", "veilway").body(body.map_or_else(Body::empty, Body::from)).map_err(io::Error::other)?;
+		// The connection ends once the request, which holds the sender, is through.
+		tokio::join!(connection, async move {
+			let response = sender.send_request(asked).await.map_err(io::Error::other)?;
+			Ok((response.status().as_u16(), to_bytes(Body::new(response.into_body()), MAX_FILE_BYTES as usize).await.map_err(io::Error::other)?.to_vec()))
+		}).1
+	}).await.unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()))
+}
+
 /// What a node that runs holds of its host: every address it listens on with whether that is over TCP, and the interface of each l3 exit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Held {pub listens: Vec<(SocketAddr, bool)>, pub interfaces: Vec<String>}
@@ -207,15 +223,7 @@ pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
 	struct Exit {backend: Backend}
 	#[derive(Deserialize)]
 	struct Backend {r#type: String, interface: Option<String>}
-	let body = tokio::time::timeout(wait, async {
-		let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(UnixStream::connect(path).await.ok()?)).await.ok()?;
-		// The connection ends once the request, which holds the sender, is through.
-		tokio::join!(connection, async move {
-			let response = sender.send_request(hyper::Request::builder().uri("/v1/config").header("host", "veilway").body(Body::empty()).ok()?).await.ok()?;
-			// A running config is no longer than a config file, and its secrets are markers that are shorter than they were.
-			if response.status().is_success() {to_bytes(Body::new(response.into_body()), MAX_FILE_BYTES as usize).await.ok()} else {None}
-		}).1
-	}).await.ok()??;
+	let (_, body) = request(path, "GET", "/v1/config", None, wait).await.ok().filter(|(status, _)| (200..300).contains(status))?;
 	let running = serde_json::from_slice::<Running>(&body).ok().filter(|running| !running.revision.is_empty() && running.generation > 0 && running.document.version == 1)?;
 	Some(Held {
 		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, transport.r#type == "ws")).collect(),

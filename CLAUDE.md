@@ -21,7 +21,7 @@ A WireGuard peer connects over UDP or over WebSocket (one WireGuard datagram is 
 | `crates/veilway-api` | The control API (Unix only): HTTP + JSON on a unix socket with axum. One route table builds both the router and `openapi.json` (`routes.rs`, `openapi.rs`), response and event types in `model.rs` |
 | `packages/sdk` | TypeScript client for the control API. `src/schema.ts` is generated from `crates/veilway-api/openapi.json`, `src/index.ts` is written by hand |
 | `fuzz/` | cargo-fuzz targets, outside the workspace. See `fuzz/README.md` |
-| `crates/veilway` | The `veilway` binary: `run`, `check`, `schema`, `genkey`, `doctor` (`doctor.rs`, read-only diagnosis of ports, certificates, DNS, outbounds, l3), `bridge client`, `bridge relay` |
+| `crates/veilway` | The `veilway` binary: `run`, `check`, `schema`, `genkey`, `doctor` (`doctor.rs`, read-only diagnosis of ports, certificates, DNS, outbounds, l3), `usage reset` (asks the running node through its control socket), `bridge client`, `bridge relay` |
 | `scripts/gate-phase1.sh` | The Phase 1 gate: the release binary, two kernel WireGuard clients and a responder in Docker containers |
 | `crates/veilway-client` | Single-peer client engine plus the Windows Wintun, route, DNS (NRPT) layer |
 | `apps/desktop` | Tauri 2 desktop app. Outside the cargo workspace, own `Cargo.lock`, UI in `ui/` |
@@ -36,6 +36,7 @@ cargo zigbuild --release --locked --target x86_64-unknown-linux-musl -p veilway 
 cargo deny check && cargo audit
 veilway check --config config.example.json
 veilway doctor --config config.json
+veilway usage reset --user <name> [--totals]   # on a node that runs, through its control socket
 sh scripts/gate-phase1.sh   # needs the release binary in the Docker volume, see its header
 VEILWAY_TEST_L3=1 cargo test -p veilway-core --test l3   # needs NET_ADMIN and a responder, see the file header
 cd packages/sdk && npm ci && npm run generate && npm run check   # after any change to the API's shape; test/live.sh runs the client against a real node

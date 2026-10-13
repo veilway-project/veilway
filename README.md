@@ -124,7 +124,7 @@ It takes `--allow-readable-config`, `--state`, `--api` and `--no-api` like `run`
 
 The server logs its public key on startup. `RUST_LOG=debug` gives more detail.
 
-What each user has used is kept in `veilway-state.json` next to the config file, so quotas hold across restarts. `--state <file>` puts it somewhere else.
+What each user has used is kept in `veilway-state.json` next to the config file, so quotas hold across restarts. `--state <file>` puts it somewhere else. `veilway usage reset --user <name>` starts a user's quota count over on the running node, which lets a user in again who was out of quota, and `--totals` zeroes their lifetime counters as well.
 
 ### 5. Connect a peer
 

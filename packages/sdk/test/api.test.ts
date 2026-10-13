@@ -67,6 +67,14 @@ test("an unknown user is a user_not_found error", live, async () => {
 	await assert.rejects(client.getUser("no.such.user"), (e: unknown) => e instanceof VeilwayError && e.status === 404 && e.code === "user_not_found");
 });
 
+test("a usage reset answers with the user, zeroes the totals when asked and knows no unknown user", live, async () => {
+	const user = await client.resetUsage("alice");
+	assert.equal(user.name, "alice");
+	assert.equal(user.used_bytes, 0);
+	assert.deepEqual((await client.resetUsage("alice", {totals: true})).traffic, {up_bytes: 0, up_packets: 0, down_bytes: 0, down_packets: 0});
+	await assert.rejects(client.resetUsage("no.such.user"), (e: unknown) => e instanceof VeilwayError && e.status === 404 && e.code === "user_not_found");
+});
+
 test("the event stream parser reads ids, comments, CRLF and lagged", async () => {
 	const body = ": keepalive\r\nid: 7\r\nevent: user_restored\r\ndata: {\"user\":\r\ndata: \"a\"}\r\n\r\nevent: lagged\ndata: {\"missed\":3}\n\nevent: other\ndata: 1\n\n";
 	const bytes = new TextEncoder().encode(body);

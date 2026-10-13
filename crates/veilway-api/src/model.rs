@@ -1,7 +1,7 @@
-//! What the API says, as types: every response body and every event payload. The OpenAPI document is generated from these, so a field that is added here is in the document.
+//! What the API says, as types: every response body and every event payload, and the one request body that is no config document. The OpenAPI document is generated from these, so a field that is added here is in the document.
 //! None of them has a field for a secret, a destination or a DNS name.
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -198,7 +198,7 @@ pub struct User {
 	pub quota_period: Option<QuotaPeriod>,
 	/// Bytes in both directions since `period_start`, which is what `quota_bytes` is held against.
 	pub used_bytes: u64,
-	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`.
+	/// When the count last started over, in Unix seconds. 0 for a user who never had a `quota_period`, or who had none when their usage was last reset.
 	pub period_start: i64,
 	pub traffic: Traffic,
 	pub devices: Vec<Device>,
@@ -206,6 +206,17 @@ pub struct User {
 
 #[derive(Serialize, JsonSchema)]
 pub struct Users {pub users: Vec<User>}
+
+/// The body of a usage reset. A request without a body is one with every field left out.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResetUsage {#[serde(default)] pub totals: bool}
+
+// Written out by hand: the generator describes what the node writes, where a field is always there, and this is something the node reads, where it may be left out.
+impl JsonSchema for ResetUsage {
+	fn schema_name() -> Cow<'static, str> {"ResetUsage".into()}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "What a usage reset zeroes besides the quota count. The body may be left out altogether.", "properties": {"totals": {"type": "boolean", "default": false, "description": "Whether traffic, what the user sent and received in all, goes back to zero as well. Left out or false, only used_bytes and period_start start over."}}, "additionalProperties": false})}
+}
 
 /// The counters of one user, inbound or exit, with how fast they grew over the last seconds.
 #[derive(Serialize, JsonSchema)]
@@ -323,6 +334,10 @@ pub struct UserCutOff {pub user: String, pub reason: Reason}
 /// The data of a `user_restored` event.
 #[derive(Serialize, JsonSchema)]
 pub struct UserRestored {pub user: String}
+
+/// The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it.
+#[derive(Serialize, JsonSchema)]
+pub struct UsageReset {pub user: String, pub totals: bool}
 
 /// The data of an `exit_udp_changed` event.
 #[derive(Serialize, JsonSchema)]
