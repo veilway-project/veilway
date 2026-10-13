@@ -42,8 +42,7 @@ const MAX_HEAD: usize = 16 << 10;
 const MAX_HEADERS: usize = 64;
 /// How long a connection the node has no place for is kept after it was told so.
 const LINGER: Duration = Duration::from_secs(1);
-/// How often the counters are sampled for the rates, and how many samples back a rate looks.
-const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+/// How many samples back a rate looks, see `Limits::sample`.
 const WINDOW: usize = 5;
 /// Documents that are checked at once. A document is read into a tree that takes many times the memory of its text, tens of megabytes for one at the body limit, and a check that its request no longer waits for still runs to its end.
 /// So the memory of all checks together is bounded here and not by the number of connections: a third document waits for its turn within the time its request has.
@@ -68,10 +67,12 @@ pub struct Limits {
 	pub keep_alive: Duration,
 	/// Events kept for a reader of the event stream that has not taken them yet. One that falls further behind loses the oldest.
 	pub events: usize,
+	/// How far apart the counters are sampled, which is how often a `stats` event is made. The rates of a snapshot are taken over the last `WINDOW` of these.
+	pub sample: Duration,
 }
 
 impl Default for Limits {
-	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256}}
+	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256, sample: Duration::from_secs(1)}}
 }
 
 pub struct Options {
@@ -314,7 +315,7 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 	});
 	// One task gives every event its id: those of the engine as they come, and a `stats` event each time the counters are sampled.
 	let hub = tokio::spawn(async move {
-		let (mut events, mut tick, mut id) = (api.engine.events(), tokio::time::interval(SAMPLE_EVERY), 0u64);
+		let (mut events, mut tick, mut id) = (api.engine.events(), tokio::time::interval(api.limits.sample.max(Duration::from_millis(1))), 0u64);
 		tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 		loop {
 			let frame = tokio::select! {
@@ -347,6 +348,9 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 			// Before the frame goes out: a reader that starts between the two counts from an id it may still be sent, never from one it has missed.
 			api.sent.store(id, Ordering::Relaxed);
 			let _ = api.events.send(Arc::new(frame));
+			// The readers this woke run before the next frame is made. A snapshot that takes longer to put together than the time between two leaves the tick due at once, so without this the task would go from one snapshot to the next
+			// and never give its thread back, and a reader that waits for the frame it was just sent, on that same thread, would not be run until the buffer had long gone over it.
+			tokio::task::yield_now().await;
 		}
 	});
 	tracing::info!("control api: serving on the unix socket {}, mode 600: whoever can open it is the administrator of this node", path.display());

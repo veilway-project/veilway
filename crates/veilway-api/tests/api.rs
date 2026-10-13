@@ -1023,25 +1023,47 @@ async fn a_reader_that_is_too_slow_loses_events_and_is_told_how_many() {
 	let mut setup = setup().await;
 	crowd(&mut setup.doc, 3000);
 	setup.limits.events = 8;
+	// The slow reader of this test is one that lags, not one that is dropped for taking nothing, however long a starved machine needs for the applies.
+	setup.limits.request = Duration::from_secs(600);
 	let node = launch(setup).await;
-	// A reader that asks for the stream and then takes nothing: the snapshots fill what lies between the node and it within a few seconds, and from then on the node has nowhere to put its events.
+	// A reader that asks for the stream and then takes nothing: the snapshots fill what lies between the node and it, and from then on the node has nowhere to put its events.
 	let mut slow = UnixStream::connect(&node.socket).await.unwrap();
 	slow.write_all(b"GET /v1/events HTTP/1.1\r\nhost: veilway\r\n\r\n").await.unwrap();
-	// 20 applies are 40 events, each config with the user it turned. A reader that keeps up gets every one of them.
+	// 20 applies are 40 events, each config with the user it turned. A reader that keeps up gets every one of them, and that it keeps up is made true here, not hoped for.
+	// A snapshot is an event like any other in the node's buffer, one a second, so a reader that needs longer than that for each falls behind on snapshots alone and is rightly told so.
+	// Reading every snapshot against its schema is what took `Events::next` that long on a starved machine. This reader passes over a snapshot, and every apply waits for the events of the one before to be read.
 	let mut quick = Events::open(&node.socket).await;
+	let (taken, mut seen) = tokio::sync::watch::channel((0, 0));
 	let kept_up = tokio::spawn(async move {
-		let mut got = 0;
+		let (mut text, mut from, mut last, mut got, mut snapshots) = (Vec::new(), 0, 0u64, 0, 0);
 		while got < 40 {
-			let event = quick.next(Duration::from_secs(30)).await.expect("a reader that kept up did not get every event");
-			assert_ne!(event.kind, "lagged", "a reader that kept up was told it had not");
-			if event.kind != "stats" {got += 1}
+			let frame = timeout(Duration::from_secs(30), poll_fn(|cx| Pin::new(&mut quick.body).poll_frame(cx))).await.expect("a reader that kept up did not get every event").expect("the event stream ended").expect("the event stream broke");
+			let Ok(chunk) = frame.into_data() else {continue};
+			text.extend_from_slice(&chunk);
+			while let Some(end) = text[from..].windows(2).position(|pair| pair == b"\n\n").map(|at| from + at) {
+				let block = String::from_utf8(text.drain(..end + 2).collect()).expect("an event that is not UTF-8");
+				from = 0;
+				let Some(kind) = block.lines().find_map(|line| line.strip_prefix("event: ")) else {continue};
+				assert_ne!(kind, "lagged", "a reader that kept up was told it had not: {}", &block[..block.len().min(200)]);
+				let id = block.lines().find_map(|line| line.strip_prefix("id: ")).and_then(|id| id.parse::<u64>().ok()).expect("an event without an id");
+				assert!(last == 0 || id == last + 1, "nothing was lost and the {kind} event after {last} has id {id}");
+				last = id;
+				if kind == "stats" {snapshots += 1} else {
+					valid(&OPENAPI["x-events"][kind], &serde_json::from_str(block.lines().find_map(|line| line.strip_prefix("data: ")).expect("an event without data")).unwrap(), kind).unwrap();
+					got += 1;
+				}
+				taken.send_replace((got, snapshots));
+			}
+			from = text.len().saturating_sub(1);
 		}
 	});
-	tokio::time::sleep(Duration::from_secs(4)).await;
+	// Four snapshots are more than a megabyte, which nothing between the node and a reader holds.
+	let _ = timeout(Duration::from_secs(60), seen.wait_for(|(_, snapshots)| *snapshots >= 4)).await.expect("no snapshots came").expect("the reader that kept up ended early");
 	let mut doc = node.doc.clone();
 	for round in 0..20 {
 		doc["users"][1]["enabled"] = json!(round % 2 == 1);
 		node.engine.reload(doc.to_string().into_bytes(), None).await.unwrap();
+		let _ = timeout(Duration::from_secs(30), seen.wait_for(|(got, _)| *got >= 2 * (round + 1))).await.expect("a reader that kept up did not get the events of an apply").expect("the reader that kept up ended early");
 	}
 	kept_up.await.unwrap();
 	// The slow one now reads what was waiting for it. The node kept 8 events for it and no more, so of the 40 it gets a few, and a count of the rest.
@@ -1070,6 +1092,34 @@ async fn a_reader_that_is_too_slow_loses_events_and_is_told_how_many() {
 	let ids: Vec<u64> = text[text.find("event: lagged").unwrap()..].split("\nid: ").skip(1).filter_map(|rest| rest.lines().next()?.trim().parse().ok()).collect();
 	assert!(ids.windows(2).all(|pair| pair[0] < pair[1]) && ids.len() >= 3, "{ids:?}");
 	drop(slow);
+	node.end().await;
+}
+
+/// A node whose snapshots take longer to put together than the time between two has the next one due the moment one is done. The readers it wakes with a frame must still be run before the next frame is made:
+/// a reader that waits for its first event would otherwise not be looked at again for well over a hundred snapshots, by when the buffer has gone over it, and it would be told it had lagged before it was sent anything.
+/// No machine is slow enough to make a snapshot take a second here, so the time between two is brought down to less than one takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_snapshot_that_takes_longer_than_the_time_between_two_holds_no_reader_up() {
+	let mut setup = setup().await;
+	crowd(&mut setup.doc, 3000);
+	(setup.limits.sample, setup.limits.events, setup.limits.request) = (Duration::from_millis(1), 16, Duration::from_secs(600));
+	let node = launch(setup).await;
+	// The runtime only learns that the next snapshot is already due when something else makes it look at the clock, which the timers of a node with traffic do all the time.
+	let clock = tokio::spawn(async {
+		loop {tokio::time::sleep(Duration::from_millis(1)).await}
+	});
+	for round in 0..10 {
+		let (mut reader, mut text, mut buf) = (UnixStream::connect(&node.socket).await.unwrap(), String::new(), vec![0u8; 4096]);
+		reader.write_all(b"GET /v1/events HTTP/1.1\r\nhost: veilway\r\n\r\n").await.unwrap();
+		let kind = loop {
+			if let Some((kind, _)) = text.split_once("event: ").and_then(|(_, rest)| rest.split_once('\n')) {break kind.to_string()}
+			let n = timeout(Duration::from_secs(120), reader.read(&mut buf)).await.expect("no event came").unwrap();
+			assert!(n > 0, "the node closed an event stream");
+			text.push_str(&String::from_utf8_lossy(&buf[..n]));
+		};
+		assert_eq!(kind, "stats", "reader {round} had asked for the stream and was waiting, and the first thing it was sent was not the next event");
+	}
+	clock.abort();
 	node.end().await;
 }
 
