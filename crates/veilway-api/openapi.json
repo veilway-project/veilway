@@ -301,6 +301,28 @@
           "backend": {
             "$ref": "#/components/schemas/Backend"
           },
+          "interface_down_secs": {
+            "description": "Seconds since the interface went down. Null while `interface_up` is not false.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "interface_flips": {
+            "description": "How often the interface switched between up and down.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "interface_up": {
+            "description": "Whether the interface of an l3 backend is up. While it is not, what is routed to the exit is answered as unreachable and the node tries to bring the interface up again: 2 seconds after it went down, then after twice the wait each time, once a minute at most. Null for any other backend.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -348,6 +370,9 @@
           "udp",
           "udp_down_secs",
           "udp_flips",
+          "interface_up",
+          "interface_down_secs",
+          "interface_flips",
           "traffic"
         ],
         "type": "object"

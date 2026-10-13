@@ -285,6 +285,18 @@ export interface components {
         };
         Exit: {
             backend: components["schemas"]["Backend"];
+            /**
+             * Format: uint64
+             * @description Seconds since the interface went down. Null while `interface_up` is not false.
+             */
+            interface_down_secs: number | null;
+            /**
+             * Format: uint64
+             * @description How often the interface switched between up and down.
+             */
+            interface_flips: number;
+            /** @description Whether the interface of an l3 backend is up. While it is not, what is routed to the exit is answered as unreachable and the node tries to bring the interface up again: 2 seconds after it went down, then after twice the wait each time, once a minute at most. Null for any other backend. */
+            interface_up: boolean | null;
             name: string;
             /** @description The tag of the outbound of a netstack backend. */
             outbound: string | null;

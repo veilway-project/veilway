@@ -373,7 +373,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, api:
 				});
 			}
 			lines.push(match (found.taken, interfaces.iter().any(|held| held == interface)) {
-				(false, _) => line(Status::Ok, "l3", subject("interface"), "no interface has the name this exit asks for"),
+				(false, true) => line(Status::Warn, "l3", subject("interface"), "the node on the control socket has this exit and its interface is not there, so the exit is down: the node tries to bring it up again by itself, once a minute at least, and GET /v1/exits and the node's log say since when and why"),
+				(false, false) => line(Status::Ok, "l3", subject("interface"), "no interface has the name this exit asks for"),
 				(true, true) => line(Status::Ok, "l3", subject("interface"), "an interface of its name exists, and the node on the control socket says it is the one that made it"),
 				(true, false) => line(Status::Fail, "l3", subject("interface"), "an interface of the name this exit asks for exists already, so `veilway run` would not start: remove it, or give the exit another `interface`"),
 			});

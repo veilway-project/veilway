@@ -171,10 +171,14 @@ impl Host {
 		}
 		let mut staged = None;
 		if let Some((at, wanted)) = wanted {
-			let runs = self.l3.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|wired| wired.wanted == wanted).map(|wired| wired.port.clone());
+			// An exit that is down and wanted as it is does not stand in the way of the reload, which may be the one that cuts a user off: it stays down and tries now, whatever wait it was in.
+			let runs = self.l3.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|wired| wired.wanted == wanted).map(|wired| {
+				if wired.port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_some() {wired.running.retry_now()}
+				wired.port.clone()
+			});
 			if let Some(port) = runs {plan.l3 = Some((at, port))} else {
-				// The pools can be routed to one interface only, so an interface that runs and is not the one wanted goes first. This is the last thing that can fail,
-				// and when it does that interface is brought back on the queue the running config still writes to.
+				// The pools can be routed to one interface only, so an interface that runs and is not the one wanted goes first, and with it whatever try to bring it up was waiting. This is the last thing that can fail,
+				// and when it does that interface is brought back on the queue the running config still writes to. Should that fail as well, the exit of the running config is down and tried again until it is up, see `l3::Running::start`.
 				let previous = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 				let previous = match previous {
 					Some(Wired {wanted, port, queue, running}) => {
@@ -184,17 +188,18 @@ impl Host {
 					None => None,
 				};
 				let (to, from) = mpsc::channel(QUEUE);
-				let (port, queue) = (l3::Port {to, mtu: wanted.mtu}, Arc::new(tokio::sync::Mutex::new(from)));
-				match l3::Running::start(shared, &wanted, queue.clone()) {
+				let (port, queue) = (l3::Port {to, mtu: wanted.mtu, health: Arc::default()}, Arc::new(tokio::sync::Mutex::new(from)));
+				match l3::Running::start(shared, &wanted, queue.clone(), port.health.clone(), false) {
 					Ok(running) => {
 						plan.l3 = Some((at, port.clone()));
 						staged = Some(Wired {wanted, port, queue, running});
 					}
 					Err(e) => {
 						if let Some((wanted, port, queue)) = previous {
-							match l3::Running::start(shared, &wanted, queue.clone()) {
+							match l3::Running::start(shared, &wanted, queue.clone(), port.health.clone(), true) {
 								Ok(running) => *self.l3.lock().unwrap_or_else(|e| e.into_inner()) = Some(Wired {wanted, port, queue, running}),
-								Err(again) => tracing::error!("exit {}: its interface was closed for a reload that then failed and could not be brought back, so the exit carries nothing until a reload succeeds: {again:#}", wanted.tag),
+								// Only where no l3 exit can run at all, and there none was running.
+								Err(again) => tracing::error!("exit {}: its interface was closed for a reload that then failed and cannot be brought back: {again:#}", wanted.tag),
 							}
 						}
 						return Err(e);

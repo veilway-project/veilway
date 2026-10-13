@@ -529,6 +529,7 @@ async fn every_route_answers() {
 	assert_eq!(exits.json["exits"].as_array().map(Vec::len), Some(2));
 	let (main, sink) = (&exits.json["exits"][0], &exits.json["exits"][1]);
 	assert_eq!((&main["tag"], &main["name"], &main["backend"], &main["outbound"], &main["udp"], &main["udp_down_secs"], &main["udp_flips"]), (&json!("main"), &json!("Main"), &json!("netstack"), &json!("proxy"), &json!(true), &Value::Null, &json!(0)), "{main}");
+	assert_eq!((&main["interface_up"], &main["interface_down_secs"], &main["interface_flips"]), (&Value::Null, &Value::Null, &json!(0)), "only an l3 exit has an interface: {main}");
 	assert_eq!((&sink["tag"], &sink["name"], &sink["backend"], &sink["outbound"], &sink["udp"]), (&json!("sink"), &json!("sink"), &json!("block"), &Value::Null, &Value::Null), "{sink}");
 	assert!(main["traffic"]["up_bytes"].as_u64().unwrap() > 0, "{main}");
 	let document = get(&node.socket, "/v1/openapi.json").await;
