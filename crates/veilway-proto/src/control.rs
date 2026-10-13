@@ -188,10 +188,10 @@ wire_enum!(
 pub fn is_tag(tag: &str) -> bool {(1..=TAG_MAX).contains(&tag.len()) && tag.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-') && !tag.starts_with(['_', '-']) && !RESERVED_TAGS.contains(&tag)}
 
 /// Text from a node made fit to show: control, bidirectional formatting, zero-width and other invisible characters are removed first, then the rest is cut to `chars` characters and `bytes` bytes, whichever ends it sooner ("Framing" and "What a malicious node can do"). Text is cut, never refused.
-/// The removed set is every control character and the format and filler characters that render as nothing or reorder text. The config applies a list of the same kind to exit names (`veilway-core`, `config/validate.rs`), which is shorter than this one.
+/// The removed set is every control character and the format and filler characters that render as nothing or reorder text, the blank braille pattern, the object replacement character, the format controls of shorthand and of Egyptian hieroglyphs, the private use characters, whose look is whatever a font says, and the noncharacters. The config applies a list of the same kind to exit names (`veilway-core`, `config/validate.rs`), which is shorter than this one.
 pub fn display(text: &str, chars: usize, bytes: usize) -> String {
 	let mut shown = String::new();
-	for c in text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}')).take(chars) {
+	for c in text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}' | '\u{2800}' | '\u{fff0}'..='\u{fff8}' | '\u{fffc}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}' | '\u{fdd0}'..='\u{fdef}') && *c as u32 & 0xfffe != 0xfffe).take(chars) {
 		if shown.len() + c.len_utf8() > bytes {break}
 		shown.push(c);
 	}
@@ -971,6 +971,8 @@ mod tests {
 		// Bytes that are not UTF-8 are a malformed body, in a name as in a notice or a tag.
 		assert_eq!(NodeMessage::decode(&framed("91 01 01 02 6465 0002 c328 4445 0b 02")), Err(DecodeError::Text));
 		assert_eq!(display("abc", 0, 9), "");
+		// Characters that show nothing, or whatever a font makes of them, in the planes above the first as well.
+		assert_eq!(display("a\u{2800}\u{fffc}\u{fff0}\u{fff8}\u{13430}\u{1343f}\u{1bca0}\u{1bca3}\u{e000}\u{f8ff}\u{f0000}\u{ffffd}\u{100000}\u{10fffd}\u{fdd0}\u{fdef}\u{fffe}\u{ffff}\u{1fffe}\u{10ffff}b\u{fffd}\u{27ff}\u{2801}\u{1342f}\u{1bc9f}", usize::MAX, usize::MAX), "ab\u{fffd}\u{27ff}\u{2801}\u{1342f}\u{1bc9f}");
 		assert!(display(&('\0'..='\u{ffff}').collect::<String>(), usize::MAX, usize::MAX).chars().all(|c| !c.is_control() && !('\u{200b}'..='\u{200f}').contains(&c) && !('\u{2028}'..='\u{202e}').contains(&c) && !('\u{2060}'..='\u{206f}').contains(&c) && c != '\u{feff}'));
 	}
 

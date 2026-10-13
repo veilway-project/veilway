@@ -12,7 +12,7 @@ libfuzzer-sys="0.4"
 serde_json="1"
 veilway-core={path="../crates/veilway-core"}
 veilway-proto={path="../crates/veilway-proto"}
-# The chunk target seals plaintexts itself, with the library the crate opens them with.
+# The chunk target seals plaintexts itself, with the library the crate opens them with, and the subscription targets sign documents with it.
 ring="0.17"
 
 [[bin]]
@@ -102,6 +102,41 @@ bench=false
 [[bin]]
 name="fronted_body"
 path="fuzz_targets/fronted_body.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_deeplink"
+path="fuzz_targets/fuzz_deeplink.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_sub_envelope"
+path="fuzz_targets/fuzz_sub_envelope.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_subscription"
+path="fuzz_targets/fuzz_subscription.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_links"
+path="fuzz_targets/fuzz_links.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_sub_request"
+path="fuzz_targets/fuzz_sub_request.rs"
 test=false
 doc=false
 bench=false
