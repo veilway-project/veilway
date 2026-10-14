@@ -8,6 +8,7 @@ use ring::digest::{digest, SHA256};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::json;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +17,7 @@ use veilway_wg::{encode_key, generate_key, public_key};
 
 fn write(path: &Path, text: &str) {
 	fs::write(path, text).unwrap();
+	#[cfg(unix)]
 	fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
 }
 
