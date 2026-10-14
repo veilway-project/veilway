@@ -1375,6 +1375,53 @@ async fn rates_follow_the_traffic_and_fall_back_to_zero() {
 	node.end().await;
 }
 
+/// An outbound counts nothing itself. Exits `main` and `second` leave through the proxy, user `a` by the first and user `b` by the second, and `outbounds` of the stats has their sum: totals, rates, and what the two know of the proxy's UDP.
+/// The outbound `spare` is one no exit uses, and the exit `sink` has no outbound and is counted under none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outbound_is_the_sum_of_the_exits_that_leave_through_it() {
+	let mut setup = setup().await;
+	setup.doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "spare", "type": "direct"}));
+	setup.doc["exits"].as_array_mut().unwrap().push(json!({"tag": "second", "backend": {"type": "netstack", "outbound": "proxy"}}));
+	setup.doc["routing"]["rules"].as_array_mut().unwrap().push(json!({"tag": "b-second", "user": ["b"], "action": {"exit": "second"}}));
+	let node = launch(setup).await;
+	let (mut a, mut b) = (Client::connect(node.keys[0], None, node.public, node.addr).await, Client::connect(node.keys[1], None, node.public, node.addr).await);
+	// The exits are main, sink and second in the order of the config. What comes back is the proxy, the spare outbound, and whether every number of the proxy is the sum of the two exits in the same snapshot.
+	let read = async |socket: &Path| {
+		let stats = get(socket, "/v1/stats").await.json;
+		let (main, second, proxy) = (&stats["exits"][0], &stats["exits"][2], &stats["outbounds"][0]);
+		assert_eq!((stats["outbounds"].as_array().map(Vec::len), &stats["exits"][1]["name"], &proxy["name"]), (Some(2), &json!("sink"), &json!("proxy")), "{stats}");
+		let sum = ["up_bytes", "up_packets", "down_bytes", "down_packets"].iter().all(|field| proxy["traffic"][field].as_u64().unwrap() == main["traffic"][field].as_u64().unwrap() + second["traffic"][field].as_u64().unwrap()) && ["up_bytes_per_sec", "down_bytes_per_sec"].iter().all(|field| proxy[field].as_u64().unwrap() == main[field].as_u64().unwrap() + second[field].as_u64().unwrap());
+		assert!(sum, "{stats}");
+		(proxy.clone(), stats["outbounds"][1].clone(), [main.clone(), second.clone()])
+	};
+	let unused = json!({"name": "spare", "traffic": {"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}, "up_bytes_per_sec": 0, "down_bytes_per_sec": 0, "udp": null, "udp_down_secs": null, "udp_flips": 0});
+	let (proxy, spare, _) = read(&node.socket).await;
+	assert_eq!((&proxy["traffic"]["up_bytes"], &proxy["udp"], &proxy["udp_down_secs"], &proxy["udp_flips"], &spare), (&json!(0), &json!(true), &Value::Null, &json!(0), &unused), "{proxy}");
+	// A new TCP flow through each exit every 200 ms for three seconds.
+	let (started, mut port) = (Instant::now(), 41000);
+	while started.elapsed() < Duration::from_secs(3) {
+		assert_eq!((a.greeted(PEER_A, port).await, b.greeted(PEER_B, port).await), (GREETING.to_vec(), GREETING.to_vec()));
+		port += 1;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	let (proxy, spare, exits) = read(&node.socket).await;
+	assert!(exits.iter().all(|exit| exit["traffic"]["up_bytes"].as_u64().unwrap() > 0 && exit["traffic"]["down_bytes"].as_u64().unwrap() > 0 && exit["up_bytes_per_sec"].as_u64().unwrap() > 0) && proxy["down_bytes_per_sec"].as_u64().unwrap() > 0, "{exits:?}");
+	assert_eq!(spare, unused);
+	// The proxy relays no UDP, and the node learns that for each exit from the flows of that exit: first for `second` alone, which is enough for the outbound to say so, then for `main` as well.
+	b.send_ip(&ip_udp(PEER_B, PUBLIC, 44003, 9999, b"datagram")).await;
+	eventually("the outbound never said that its proxy relays no udp", async || read(&node.socket).await.0["udp"] == json!(false)).await;
+	let (proxy, spare, listed) = (read(&node.socket).await.0, read(&node.socket).await.1, get(&node.socket, "/v1/exits").await.json);
+	assert_eq!((&proxy["udp_flips"], proxy["udp_down_secs"].is_u64(), &listed["exits"][0]["udp"], &listed["exits"][2]["udp"], &spare), (&json!(1), true, &json!(true), &json!(false), &unused), "{proxy} {listed}");
+	a.send_ip(&ip_udp(PEER_A, PUBLIC, 44004, 9999, b"datagram")).await;
+	eventually("the outbound never counted the change of its other exit", async || read(&node.socket).await.0["udp_flips"] == json!(2)).await;
+	// With the traffic gone the window empties, and the totals stay.
+	let before = read(&node.socket).await.0["traffic"].clone();
+	tokio::time::sleep(Duration::from_secs(7)).await;
+	let (proxy, spare, _) = read(&node.socket).await;
+	assert_eq!((&proxy["up_bytes_per_sec"], &proxy["down_bytes_per_sec"], &proxy["traffic"], &proxy["udp"], &spare), (&json!(0), &json!(0), &before, &json!(false), &unused), "{proxy}");
+	node.end().await;
+}
+
 /// A user says which DNS set speaks for them: the one that names them, before the one that names a group of theirs. Null is a user who goes by the inbound a query comes through, and so is every user of a config without sets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_user_says_the_dns_set_that_names_them_or_their_group() {

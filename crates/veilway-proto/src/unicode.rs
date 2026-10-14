@@ -1,4 +1,4 @@
-//! Four facts about a character, from the Unicode Character Database 17.0.0: the script of a letter, how it joins, whether it is a virama, and whether it has a strong direction.
+//! Four facts about a character, from the Unicode Character Database 17.0.0: the script of a letter, how it joins, whether it is a virama and of which script, and whether it has a strong direction.
 //! This file is written by `scripts/unicode-tables.py` and is never edited by hand. Every table is sorted, and a row is the first character of a range, the number of characters that follow it in the range, and the value.
 
 /// How a character joins its neighbours in cursive writing (Joining_Type), as far as the display filter asks.
@@ -263,8 +263,9 @@ const WEAK: [(u32, u16, u8); 696] = [
 	(0x9fffe, 1, 1), (0xafffe, 1, 1), (0xbfffe, 1, 1), (0xcfffe, 1, 1), (0xdfffe, 4097, 1), (0xefffe, 1, 1), (0xffffe, 1, 1), (0x10fffe, 1, 1),
 ];
 
-// Canonical_Combining_Class 9.
+// Canonical_Combining_Class 9, and the Script of each in the same order, numbered as in LETTERS. 0 is a virama whose Script is Common or Inherited.
 const VIRAMAS: [u32; 69] = [0x94d, 0x9cd, 0xa4d, 0xacd, 0xb4d, 0xbcd, 0xc4d, 0xccd, 0xd3b, 0xd3c, 0xd4d, 0xdca, 0xe3a, 0xeba, 0xf84, 0x1039, 0x103a, 0x1714, 0x1715, 0x1734, 0x17d2, 0x1a60, 0x1b44, 0x1baa, 0x1bab, 0x1bf2, 0x1bf3, 0x2d7f, 0xa806, 0xa82c, 0xa8c4, 0xa953, 0xa9c0, 0xaaf6, 0xabed, 0x10a3f, 0x11046, 0x11070, 0x1107f, 0x110b9, 0x11133, 0x11134, 0x111c0, 0x11235, 0x112ea, 0x1134d, 0x113ce, 0x113cf, 0x113d0, 0x11442, 0x114c2, 0x115bf, 0x1163f, 0x116b6, 0x1172b, 0x11839, 0x1193d, 0x1193e, 0x119e0, 0x11a34, 0x11a47, 0x11a99, 0x11c3f, 0x11d44, 0x11d45, 0x11d97, 0x11f41, 0x11f42, 0x1612f];
+const VIRAMA_SCRIPTS: [u8; 69] = [32, 11, 48, 46, 119, 152, 155, 62, 83, 83, 83, 137, 157, 72, 158, 98, 98, 145, 145, 53, 68, 148, 7, 141, 141, 10, 10, 159, 143, 143, 131, 128, 60, 89, 89, 66, 15, 15, 15, 61, 22, 22, 132, 69, 70, 44, 164, 164, 164, 103, 160, 134, 94, 151, 2, 34, 33, 33, 101, 172, 172, 140, 13, 87, 87, 47, 64, 64, 49];
 
 fn find(table: &[(u32, u16, u8)], c: char) -> u8 {
 	let at = table.partition_point(|row| row.0 <= c as u32);
@@ -276,8 +277,8 @@ pub(crate) fn letter(c: char) -> Option<u8> {Some(find(&LETTERS, c)).filter(|scr
 
 pub(crate) fn joining(c: char) -> Joining {[Joining::Other, Joining::Transparent, Joining::Left, Joining::Dual, Joining::Right][usize::from(find(&JOINING, c)).min(4)]}
 
-/// Whether the character has Canonical_Combining_Class 9.
-pub(crate) fn virama(c: char) -> bool {VIRAMAS.binary_search(&(c as u32)).is_ok()}
+/// The script of a virama (Canonical_Combining_Class 9), numbered as `letter` numbers it. `None` for every other character, and for a virama of no script of its own (Common and Inherited), which is the virama of no letter.
+pub(crate) fn virama(c: char) -> Option<u8> {VIRAMAS.binary_search(&(c as u32)).ok().map(|at| VIRAMA_SCRIPTS[at]).filter(|script| *script != 0)}
 
 /// `Some(true)` for a strong right-to-left character (Bidi_Class R and AL), `Some(false)` for a strong left-to-right one (L), `None` for every other.
 pub(crate) fn strong(c: char) -> Option<bool> {[Some(false), None, Some(true)][usize::from(find(&WEAK, c)).min(2)]}

@@ -452,6 +452,35 @@ export interface components {
             /** Format: uint64 */
             missed: number;
         };
+        /**
+         * @description The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.
+         *     The node learns whether a proxy relays UDP once for each exit, from the flows of that exit, so two exits through one proxy can know different things for a while. This is what they know together.
+         */
+        OutboundStats: {
+            /** Format: uint64 */
+            down_bytes_per_sec: number;
+            /** @description The tag of the outbound. */
+            name: string;
+            /** @description The sum of `traffic` over the exits whose backend names this outbound, all zero for an outbound no exit uses. It holds everything those exits count, which includes what their `unsupported` policy sent around the proxy with `"direct"`. */
+            traffic: components["schemas"]["Traffic"];
+            /** @description Whether the SOCKS5 proxy relays UDP as far as the node knows: false while any exit through it was last refused. Null for an outbound that is no SOCKS5 proxy. */
+            udp: boolean | null;
+            /**
+             * Format: uint64
+             * @description Seconds since the proxy last refused to relay UDP for any of its exits. Null while `udp` is not false.
+             */
+            udp_down_secs: number | null;
+            /**
+             * Format: uint64
+             * @description How often the proxy switched between relaying UDP and not, added up over its exits. Exits that learn of one change each count it.
+             */
+            udp_flips: number;
+            /**
+             * Format: uint64
+             * @description The sums of the rates of those exits.
+             */
+            up_bytes_per_sec: number;
+        };
         /** @description One problem of a config document: where it is and what was expected there. It never holds a value from the document. */
         Problem: {
             message: string;
@@ -596,6 +625,8 @@ export interface components {
             /** Format: uint */
             flows: number;
             inbounds: components["schemas"]["Rated"][];
+            /** @description Every outbound of the running config, in its order. An exit with an `l3` or `block` backend has no outbound and is in none of them. */
+            outbounds: components["schemas"]["OutboundStats"][];
             /** @description The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory. */
             replay: components["schemas"]["Replay"] | null;
             /**

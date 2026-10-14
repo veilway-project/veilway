@@ -237,6 +237,25 @@ pub struct Rated {
 	pub down_bytes_per_sec: u64,
 }
 
+/// The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.
+/// The node learns whether a proxy relays UDP once for each exit, from the flows of that exit, so two exits through one proxy can know different things for a while. This is what they know together.
+#[derive(Serialize, JsonSchema)]
+pub struct OutboundStats {
+	/// The tag of the outbound.
+	pub name: String,
+	/// The sum of `traffic` over the exits whose backend names this outbound, all zero for an outbound no exit uses. It holds everything those exits count, which includes what their `unsupported` policy sent around the proxy with `"direct"`.
+	pub traffic: Traffic,
+	/// The sums of the rates of those exits.
+	pub up_bytes_per_sec: u64,
+	pub down_bytes_per_sec: u64,
+	/// Whether the SOCKS5 proxy relays UDP as far as the node knows: false while any exit through it was last refused. Null for an outbound that is no SOCKS5 proxy.
+	pub udp: Option<bool>,
+	/// Seconds since the proxy last refused to relay UDP for any of its exits. Null while `udp` is not false.
+	pub udp_down_secs: Option<u64>,
+	/// How often the proxy switched between relaying UDP and not, added up over its exits. Exits that learn of one change each count it.
+	pub udp_flips: u64,
+}
+
 /// What the node's resolver did with the DNS queries of its tunnels since start.
 #[derive(Serialize, JsonSchema)]
 pub struct Dns {pub answered: u64, pub refused: u64, pub failed: u64, pub malformed: u64, pub throttled: u64}
@@ -281,6 +300,8 @@ pub struct Stats {
 	pub users: Vec<Rated>,
 	pub inbounds: Vec<Rated>,
 	pub exits: Vec<Rated>,
+	/// Every outbound of the running config, in its order. An exit with an `l3` or `block` backend has no outbound and is in none of them.
+	pub outbounds: Vec<OutboundStats>,
 	/// Packets that were not carried since start, by reason.
 	pub drops: BTreeMap<String, u64>,
 	pub dns: Dns,
