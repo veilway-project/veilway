@@ -1,6 +1,6 @@
 # Veilway
 
-Veilway is a proxy/VPN platform meant to replace the Xray core + 3x-ui + v2ray-client stack: a Rust core and SDK, a web panel, and first-party clients. Keep the name in one place per package so a rename stays cheap.
+Veilway is a proxy/VPN platform: a Rust core and SDK, a web panel, and first-party clients. Keep the name in one place per package so a rename stays cheap.
 
 Read `PLAN.md` before any work. Its status block at the top says which phase is active. Update that block when a phase or a numbered step is finished.
 
