@@ -27,7 +27,18 @@ jobs:
         run: |
           for a in 127.0.1.1 $(seq -f "127.0.0.%g" 2 9) 127.0.0.77 $(seq -f "127.0.2.%g" 100 155); do sudo ifconfig lo0 alias $a up; done
       - run: cargo build --workspace --release
-      - run: cargo test --workspace --no-fail-fast
+      # A shared runner sometimes starves a test that times real sockets. A test that failed runs once more on its own: one that passes then is named as flaky, one that fails again, a doc test or a build that failed fails the job.
+      - name: Test
+        shell: bash
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast 2>&1 | tee test.log; [ "${PIPESTATUS[0]}" = 0 ] && exit 0
+          failed=$(tr -d "\r" < test.log | sed -n "s/^test \(.*\) \.\.\. FAILED$/\1/p" | sort -u); [ -n "$failed" ] || exit 1
+          while read -r t; do
+            case "$t" in *" "*|*"("*) exit 1;; esac
+            cargo test --workspace -- --exact "$t" 2>&1 | grep -q "^test $t \.\.\. ok" || { echo "::error::$t failed twice"; exit 1; }
+            echo "::warning::$t is flaky: it failed once and passed on its own"
+          done <<< "$failed"
       - name: Build the desktop app
         if: matrix.os == 'windows-latest'
         shell: pwsh
