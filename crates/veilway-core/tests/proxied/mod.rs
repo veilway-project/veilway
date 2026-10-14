@@ -80,6 +80,9 @@ impl Write for Sink {
 
 pub fn logged(text: &str) -> bool {String::from_utf8_lossy(&LOGS.lock().unwrap()).contains(text)}
 
+/// The lines of the log that hold `text`, newest last.
+pub fn lines(text: &str) -> Vec<String> {String::from_utf8_lossy(&LOGS.lock().unwrap()).lines().filter(|line| line.contains(text)).map(str::to_owned).collect()}
+
 pub fn listen() -> SocketAddr {SocketAddr::from((Ipv4Addr::LOCALHOST, NEXT_PORT.fetch_add(1, Ordering::SeqCst)))}
 
 pub fn text(key: &[u8; 32]) -> String {veilway_wg::encode_key(key)}
@@ -534,9 +537,12 @@ pub fn parsed(doc: &Value) -> Config {
 /// A node with its origin behind it and two reverse proxies: `front` with the node for its upstream, and `bare` with the origin itself, which is what the node is held against.
 pub struct Node {pub engine: Engine, pub addr: SocketAddr, pub doc: Value, pub dir: PathBuf, pub time: Time, pub site: Site, pub front: Front, pub bare: Front}
 
+/// Starts the log of the process, once: every line at info goes to `logged`. A test that starts its node by itself calls it first.
+pub fn logging() {LOGGING.call_once(|| tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_ansi(false).with_writer(|| Sink).init());}
+
 /// Starts an engine on `doc` with its files in `dir` and the clock of `time`.
 pub async fn start(doc: &Value, dir: &Path, time: Time) -> anyhow::Result<Engine> {
-	LOGGING.call_once(|| tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_ansi(false).with_writer(|| Sink).init());
+	logging();
 	veilway_core::start(&parsed(doc), Options {now: time.now, replay: Some(dir.join("replay")), ..Options::new(dir)}).await
 }
 

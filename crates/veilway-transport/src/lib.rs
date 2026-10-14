@@ -23,6 +23,7 @@ pub mod http;
 mod parallel;
 pub mod stream;
 mod tls;
+pub use tls::pin_only;
 pub mod udp;
 
 use ring::rand::{SecureRandom, SystemRandom};

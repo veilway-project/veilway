@@ -11,6 +11,8 @@ cargo-fuzz=true
 libfuzzer-sys="0.4"
 serde_json="1"
 veilway-core={path="../crates/veilway-core", features=["bench"]}
+# The engine_* targets drive what the client engine reads from a file and from the node.
+veilway-engine={path="../crates/veilway-engine", features=["fuzz"]}
 veilway-proto={path="../crates/veilway-proto"}
 # The client_* targets drive what the client's side of the transports reads from the network.
 veilway-transport={path="../crates/veilway-transport"}
@@ -214,6 +216,27 @@ bench=false
 [[bin]]
 name="client_choice"
 path="fuzz_targets/client_choice.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="engine_store"
+path="fuzz_targets/engine_store.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="engine_channel"
+path="fuzz_targets/engine_channel.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="engine_tcp"
+path="fuzz_targets/engine_tcp.rs"
 test=false
 doc=false
 bench=false
