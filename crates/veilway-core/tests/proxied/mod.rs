@@ -18,7 +18,7 @@ use std::convert::Infallible;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -381,7 +381,7 @@ async fn line(from: &mut OwnedReadHalf, to: &mut (impl AsyncWrite + Unpin), buf:
 
 pub async fn front(upstream: SocketAddr) -> Front {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let (addr, upstreams) = (listener.local_addr().unwrap(), Arc::new(AtomicUsize::new(0)));
+	let (addr, upstreams, base) = (listener.local_addr().unwrap(), Arc::new(AtomicUsize::new(0)), tokio::time::Instant::now());
 	let task = tokio::spawn({
 		let upstreams = upstreams.clone();
 		async move {
@@ -392,6 +392,8 @@ pub async fn front(upstream: SocketAddr) -> Front {
 					let _ = client.set_nodelay(true);
 					let (mut from_client, write) = client.into_split();
 					let (from_client, mut buf, mut to_client, mut to_upstream, mut relay) = (&mut from_client, Vec::new(), Some(write), None::<OwnedWriteHalf>, None::<JoinHandle<()>>);
+					// When the answer last moved, in milliseconds after `base`: a client that is still being handed an answer is not a client that left the next request unsent.
+					let moved = Arc::new(AtomicU64::new(0));
 					loop {
 						// A whole head, within its time, before anybody is asked. What ends the wait otherwise: the upstream closed, the client closed its side, or the client gave up or took too long.
 						let deadline = tokio::time::Instant::now() + FRONT_HEAD;
@@ -405,7 +407,14 @@ pub async fn front(upstream: SocketAddr) -> Front {
 										None => std::future::pending().await,
 									}
 								} => break Err(None),
-								got = tokio::time::timeout_at(deadline, from_client.read(&mut read)) => got,
+								got = async {
+									loop {
+										let at = || deadline.max(base + Duration::from_millis(moved.load(Ordering::Relaxed)) + FRONT_HEAD);
+										let got = tokio::time::timeout_at(at(), from_client.read(&mut read)).await;
+										if got.is_err() && tokio::time::Instant::now() < at() {continue}
+										break got;
+									}
+								} => got,
 							};
 							match got {
 								Ok(Ok(size)) if size > 0 && buf.len() + size <= 262_144 => buf.extend_from_slice(&read[..size]),
@@ -436,11 +445,15 @@ pub async fn front(upstream: SocketAddr) -> Front {
 							upstreams.fetch_add(1, Ordering::SeqCst);
 							let ((mut from_upstream, write), Some(mut to_client)) = (dialed.into_split(), to_client.take()) else {return};
 							to_upstream = Some(write);
+							let moved = moved.clone();
 							relay = Some(tokio::spawn(async move {
 								let mut answer = vec![0u8; 16384];
 								loop {
 									match from_upstream.read(&mut answer).await {
-										Ok(size) if size > 0 => if to_client.write_all(&answer[..size]).await.is_err() {return},
+										Ok(size) if size > 0 => {
+											if to_client.write_all(&answer[..size]).await.is_err() {return}
+											moved.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
+										}
 										Ok(_) => return drop(to_client.shutdown().await),
 										Err(_) => return drop(SockRef::from(to_client.as_ref()).set_linger(Some(Duration::ZERO))),
 									}
