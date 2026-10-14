@@ -273,12 +273,14 @@ pub struct Candidate {
 	/// `None` for an empty `sni`: no server name is sent.
 	pub sni: Option<String>,
 	pub host: String,
-	/// Present exactly when `sni` is `None`.
+	/// Present exactly when `sni` is `None`, except on a self-signed candidate, which never has one.
 	pub verify_name: Option<String>,
 	/// An Encrypted Client Hello configuration of 1 to 1,024 bytes, as it is handed to the TLS library. It is not read here.
 	pub ech: Option<Vec<u8>>,
 	/// The SHA-256 of a certificate's SubjectPublicKeyInfo, 1 to 4 of them, or none: a candidate with pins is a "pinned candidate".
 	pub pins: Vec<[u8; 32]>,
+	/// `self_signed` of a `tls` candidate: the certificate is trusted through `pins` alone, and no chain, name or date of it is checked. Never true on another transport.
+	pub self_signed: bool,
 }
 
 /// An address "a client may be told to connect" to: an IP address and a port that passed the refusals made "when the document is parsed". The ones made at each connect are `Dial::own` and `Dial::private`.
@@ -418,7 +420,7 @@ impl fmt::Debug for Stream {
 }
 
 impl fmt::Debug for Candidate {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Candidate({} pins)", self.pins.len())}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Candidate({} pins{})", self.pins.len(), if self.self_signed {", self-signed"} else {""})}
 }
 
 impl fmt::Debug for Dial {
@@ -535,16 +537,20 @@ fn host<'a>(members: Members<'a>, name: &'static str) -> Named<Option<&'a str>> 
 fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
 	let members = Members::of(value).ok_or("candidates")?;
 	let address = Dial::parse(need("address", members.string("address", STRING_MAX))?).ok_or("address")?;
+	// "`self_signed` on a candidate of any other transport, or a value that is not a boolean, refuses that candidate." Only `tls` requires pins.
+	let self_signed = members.boolean("self_signed")?;
+	if self_signed.is_some() && rule != Pins::Required {return Err("self_signed")}
+	let self_signed = self_signed.unwrap_or(false);
 	// `sni` is "a host name, or empty for none", so it is a member that is always there. Only an empty one is read as none.
 	let sni = Some(need("sni", members.string("sni", 253))?).filter(|sni| !sni.is_empty());
 	if sni.is_some_and(|sni| !is_host(sni)) {return Err("sni")}
 	let verify_name = host(members, "verify_name")?;
-	// "Required when `sni` is empty and not allowed otherwise."
-	if verify_name.is_some() == sni.is_some() {return Err("verify_name")}
+	// "Required when `sni` is empty and not allowed otherwise." A self-signed candidate "has no `verify_name`, since no name is checked", and its `sni` may be empty.
+	if (self_signed && verify_name.is_some()) || (!self_signed && verify_name.is_some() == sni.is_some()) {return Err("verify_name")}
 	let ech = members.string("ech", 1_368)?.map(|text| STANDARD.decode(text).ok().filter(|ech| (1..=1_024).contains(&ech.len())).ok_or("ech")).transpose()?;
 	let pins = members.list("pins", 1..=PINS_MAX)?.map(|pins| pins.iter().map(|pin| if let Json::Str(text) = pin {hash(text)} else {None}.ok_or("pins")).collect::<Named<Vec<_>>>()).transpose()?;
 	if (rule == Pins::Required && pins.is_none()) || (rule == Pins::Forbidden && pins.is_some()) {return Err("pins")}
-	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default()})
+	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default(), self_signed})
 }
 
 pub(crate) fn transport(value: &Json) -> Result<Transport, Fault> {

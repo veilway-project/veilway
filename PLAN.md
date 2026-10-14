@@ -23,7 +23,8 @@ Update this block at the end of every work session.
 - Last finished step: Phase 2, step 3. Of step 4: the subscription reader and the transport library
 - The proxy path has had one adversarial review and its findings are built: nothing the origin says or does between two requests reaches the proxy, nothing behind a complete answer does, a long head still names its visitor, a `fronted` session keeps a digest of its last request and not the request, and `probe_start` is answered on `udp` and `udp-obfs` alone. `sh scripts/gate-front.sh` holds the path against nginx in front and nginx and HAProxy behind, in Docker, and passes. It is run by hand.
 - The second look is in `veilway-ui`, and `veilway-ui` was split out of this repository ahead of the Phase 2 gate, with its history, because nothing in flight touched it.
-- Next action: self-signed certificates for `tls` (see "Self-signed certificates"), then Phase 2 step 4: the client engine around the transport library, with the client's side of the control channel and the tests G39 names.
+- Self-signed certificates for `tls` are built: a candidate the signed profile marks `self_signed` is trusted by its pin alone with the handshake signature still checked, and the node makes, keeps and renews its own key and certificate (`engine/certificate.rs`, config `tls.self_signed` and `tls.name`), reporting the pin in `doctor`, the log and `/v1/status`. Reviewed once, findings built. The subscription endpoint may be self-signed too (a pin in the link) and the panel stores tokens as a keyed hash plus a sealed copy: designed in the subscription page, not built.
+- Next action: Phase 2 step 4: the client engine around the transport library, with the client's side of the control channel and the tests G39 names.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 

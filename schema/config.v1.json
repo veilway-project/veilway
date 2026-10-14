@@ -170,6 +170,17 @@
         }
       ]
     },
+    "Certificate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Tls"
+        },
+        {
+          "$ref": "#/$defs/SelfSigned"
+        }
+      ],
+      "description": "The certificate of a native `tls` transport: files the operator obtains with their own tooling, or one the node makes itself."
+    },
     "Decoy": {
       "additionalProperties": false,
       "description": "The decoy origin of a stream listener: the operator's own web server, which answers everyone who is not a user.",
@@ -1450,6 +1461,26 @@
       ],
       "type": "object"
     },
+    "SelfSigned": {
+      "additionalProperties": false,
+      "description": "`{\"self_signed\": true}`: the node makes an ECDSA P-256 key and a self-signed certificate on its first start, keeps them next to the config file with mode 600, makes the certificate anew with the same key before it runs out, and reports the pin, the SHA-256 of the SubjectPublicKeyInfo, that profiles carry with `self_signed`.",
+      "properties": {
+        "name": {
+          "description": "The operator's own host name, which the certificate carries as its subject and its alternative name. Without it the node draws a name per node and keeps it.",
+          "maxLength": 64,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "type": "string"
+        },
+        "self_signed": {
+          "const": true,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "self_signed"
+      ],
+      "type": "object"
+    },
     "Timestamp": {
       "description": "an RFC 3339 timestamp with an offset such as 2027-01-31T00:00:00Z",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
@@ -1557,7 +1588,7 @@
               "type": "string"
             },
             "tls": {
-              "$ref": "#/$defs/Tls"
+              "$ref": "#/$defs/Certificate"
             },
             "type": {
               "const": "tls",

@@ -474,7 +474,7 @@ async fn every_route_answers() {
 	let status = get(&node.socket, "/v1/status").await;
 	ask("GET", "/v1/status");
 	assert_eq!((status.status, &status.json["version"], &status.json["generation"], &status.json["inbounds"], &status.json["exits"], &status.json["users"]), (200, &json!(env!("CARGO_PKG_VERSION")), &json!(1), &json!(1), &json!(2), &json!(3)), "{}", status.json);
-	assert!(status.json["flows"].as_u64().unwrap() >= 1 && status.json["uptime_secs"].is_u64() && status.json["revision"].as_str().unwrap().len() == 64, "{}", status.json);
+	assert!(status.json["flows"].as_u64().unwrap() >= 1 && status.json["uptime_secs"].is_u64() && status.json["revision"].as_str().unwrap().len() == 64 && status.json["certificates"] == json!([]), "{}", status.json);
 	let config = get(&node.socket, "/v1/config").await;
 	ask("GET", "/v1/config");
 	assert_eq!((config.status, &config.json["revision"], config.etag.as_deref()), (200, &status.json["revision"], Some(format!("\"{}\"", status.json["revision"].as_str().unwrap()).as_str())));

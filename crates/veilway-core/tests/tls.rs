@@ -1601,6 +1601,16 @@ fn the_new_keys_are_validated_shown_and_compared() {
 		("no path", &|doc| drop(doc["inbounds"][0]["transports"][0].as_object_mut().unwrap().remove("path")), transport.to_string()),
 		("no certificate", &|doc| drop(doc["inbounds"][0]["transports"][0].as_object_mut().unwrap().remove("tls")), transport.to_string()),
 		("a certificate outside the config's directory", &|doc| doc["inbounds"][0]["transports"][0]["tls"]["key"] = json!("../key.pem"), format!("{transport}.tls.key")),
+		// "`self_signed: true` may stand instead of `cert` and `key`", and nothing else does.
+		("self_signed beside the files", &|doc| doc["inbounds"][0]["transports"][0]["tls"]["self_signed"] = json!(true), format!("{transport}.tls")),
+		("self_signed with a key alone", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": true, "key": "key.pem"}), format!("{transport}.tls")),
+		("self_signed false", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": false}), format!("{transport}.tls")),
+		("a name beside the files", &|doc| doc["inbounds"][0]["transports"][0]["tls"]["name"] = json!("www.example.org"), format!("{transport}.tls")),
+		("a name that is no host name", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": true, "name": "not a name"}), format!("{transport}.tls.name")),
+		("a name that is an address", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": true, "name": "192.0.2.1"}), format!("{transport}.tls.name")),
+		("a name of 65 characters", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": true, "name": format!("{}.org", "a".repeat(61))}), format!("{transport}.tls.name")),
+		("a name that is no string", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": true, "name": 7}), format!("{transport}.tls.name")),
+		("self_signed that is no boolean", &|doc| doc["inbounds"][0]["transports"][0]["tls"] = json!({"self_signed": "true"}), format!("{transport}.tls.self_signed")),
 		("no decoy", &|doc| drop(doc["inbounds"][0]["transports"][0].as_object_mut().unwrap().remove("decoy")), transport.to_string()),
 		("a decoy with no origin", &|doc| doc["inbounds"][0]["transports"][0]["decoy"] = json!({}), format!("{transport}.decoy")),
 		("an origin over https", &|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("https://127.0.0.1:8443"), format!("{transport}.decoy.origin")),
@@ -1641,6 +1651,15 @@ fn the_new_keys_are_validated_shown_and_compared() {
 	assert_eq!((warned(&|_| {}), warned(&|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("http://[::1]:8080")), warned(&|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("http://10.1.2.3"))), (Vec::<String>::new(), Vec::new(), Vec::new()));
 	assert_eq!(warned(&|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("http://198.51.100.7:8080")).len() + warned(&|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("http://8.8.8.8")).len(), 1);
 	assert_eq!(warned(&|doc| doc["inbounds"][0]["transports"][0]["decoy"]["origin"] = json!("http://site.example.com:8080")), [format!("{transport}.decoy.origin")]);
+	// A certificate the node makes itself is valid, and on an address others reach a warning: a prober sees it, and ordinary sites rarely have one.
+	let own = |listen: &'static str| move |doc: &mut Value| (doc["inbounds"][0]["transports"][0]["tls"], doc["inbounds"][0]["transports"][0]["listen"]) = (json!({"self_signed": true}), json!(listen));
+	assert_eq!((errors(&own("127.0.0.1:443")), warned(&own("127.0.0.1:443")), errors(&own("0.0.0.0:443")), warned(&own("0.0.0.0:443"))), (Vec::<String>::new(), Vec::new(), Vec::new(), vec![format!("{transport}.tls.self_signed")]));
+	let mut written = doc.clone();
+	own("127.0.0.1:443")(&mut written);
+	assert_eq!(serde_json::to_value(parsed(&written)).unwrap()["inbounds"][0]["transports"][0]["tls"], json!({"self_signed": true}));
+	// The operator's own name is a valid setting and is kept as written.
+	written["inbounds"][0]["transports"][0]["tls"]["name"] = json!("www.example.org");
+	assert_eq!((errors(&|doc| *doc = written.clone()), serde_json::to_value(parsed(&written)).unwrap()["inbounds"][0]["transports"][0]["tls"].clone()), (Vec::<String>::new(), json!({"self_signed": true, "name": "www.example.org"})));
 	// What is set and never used is a warning, and the `mtu` of an inbound with `tls` alone is the plain default: no datagram of it has an envelope to make room for.
 	let plain = |doc: &mut Value| doc["inbounds"][0]["transports"] = json!([{"type": "udp", "listen": "127.0.0.1:51820"}]);
 	assert_eq!((warned(&plain), parsed(&doc).inbounds[0].mtu()), (vec!["inbounds[0].transport_keys".to_string(), "inbounds[0].upgrade_cookie".to_string()], 1420));

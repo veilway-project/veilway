@@ -4,6 +4,8 @@ use ring::digest::{digest, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
 use rcgen::{date_time_ymd, BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, PublicKeyData};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::version::{TLS12, TLS13};
 use rustls::{RootCertStore, ServerConfig, SupportedProtocolVersion};
 use socket2::SockRef;
@@ -148,7 +150,7 @@ fn source() -> Source {
 	})))
 }
 
-fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false}}
+fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false, self_signed: false}}
 
 fn ws(candidate: Front) -> Target {Target::Ws {path: PATH.into(), candidate}}
 
@@ -199,6 +201,50 @@ async fn a_certificate_is_held_against_the_roots_the_name_the_clock_and_the_pins
 	assert_eq!(tried(&root.roots, ws(front(at(5), "node.test", &[older_pin]))).await, Ended::Unreachable(Unreachable::Tls));
 	// Every server was met once for each attempt and no more: nothing was tried again with fewer checks.
 	assert_eq!(servers.iter().map(|(_, met)| met.load(Ordering::SeqCst)).collect::<Vec<_>>(), [5, 3, 3, 3, 3, 2]);
+}
+
+// What a server answers with whatever it is asked: a certificate, and a key that may not be its own.
+#[derive(Debug)]
+struct Shown(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for Shown {
+	fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {Some(self.0.clone())}
+}
+
+// The `tls` client step 1, second path: "only on a candidate whose `self_signed` member is `true`: the chain, the name and the validity dates are not checked. The leaf's public key must match a pin of that candidate. The TLS 1.3 handshake's signature is always verified against that pinned key."
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn a_self_signed_candidate_is_held_to_its_pins_and_to_the_key_that_signs_the_handshake() {
+	let (root, provider) = (root(), Arc::new(rustls::crypto::ring::default_provider()));
+	let ((alone, pin, own), (renamed, renamed_pin, _), (expired, expired_pin, _)) = (certified(None, "node.test", None, &[], &[&TLS13]), certified(None, "other.test", None, &[], &[&TLS13]), certified(None, "node.test", Some((date_time_ymd(2020, 1, 1), date_time_ymd(2020, 12, 31))), &[], &[&TLS13]));
+	let (older, older_pin) = served(None, "node.test", false, &[&TLS12]);
+	// The pinned certificate, shown by a server that signs with another key.
+	let forged = ServerConfig::builder_with_provider(provider.clone()).with_protocol_versions(&[&TLS13]).unwrap().with_no_client_auth().with_cert_resolver(Arc::new(Shown(Arc::new(CertifiedKey::new(vec![own], provider.key_provider.load_private_key(PrivateKeyDer::try_from(KeyPair::generate().unwrap().serialize_der()).unwrap()).unwrap())))));
+	let mut servers = Vec::new();
+	for config in [alone, renamed, expired, Arc::new(forged), older] {servers.push(answering(config, MISS, false).await)}
+	let at = |server: usize| servers[server].0;
+	let alone = |server: usize, sni: Option<&str>, pins: &[[u8; 32]]| Target::Tls {path: PATH.into(), candidate: Front {sni: sni.map(str::to_owned), self_signed: true, ..front(at(server), "", pins)}};
+	// The pin is the whole check: with a server name or none, for a name the certificate does not have, and long after it ran out. The root store plays no part, an empty one included. The pin matched, so the `Date` of the refusal is read.
+	for (server, sni, pins) in [(0, Some("node.test"), vec![pin]), (0, None, vec![older_pin, pin]), (1, Some("node.test"), vec![renamed_pin]), (2, None, vec![expired_pin])] {
+		assert_eq!(tried(&root.roots, alone(server, sni, &pins)).await, DATED, "server {server}");
+		assert_eq!(tried(&Arc::new(RootCertStore::empty()), alone(server, sni, &pins)).await, DATED, "server {server} with no roots");
+	}
+	// A pin that does not match ends it at once, and so does the pinned certificate from a server that does not hold its key: a certificate is public, the key is what is proven.
+	for (server, pins) in [(0, vec![renamed_pin, expired_pin]), (3, vec![pin])] {
+		let started = Instant::now();
+		assert_eq!(tried(&root.roots, alone(server, None, &pins)).await, NO_CERTIFICATE, "server {server}");
+		assert!(started.elapsed() < 2 * SECOND, "server {server} took {:?}", started.elapsed());
+	}
+	// TLS 1.3 or nothing.
+	assert_eq!(tried(&root.roots, alone(4, None, &[older_pin])).await, Ended::Unreachable(Unreachable::Tls));
+	// The server cannot put a candidate on this path: one from an authority is refused the self-signed certificate it pinned, and the forged one.
+	for server in [0, 3] {assert_eq!(tried(&root.roots, Target::Tls {path: PATH.into(), candidate: front(at(server), "node.test", &[pin])}).await, NO_CERTIFICATE, "server {server}")}
+	// What a profile can never hold is not dialled: `self_signed` on another transport, with a `verify_name`, or without a pin.
+	let open = |target: Target| Session::open(&link(20_000), target, env(&root.roots), source()).map(|_| ()).unwrap_err();
+	assert_eq!(open(ws(Front {self_signed: true, ..front(at(0), "node.test", &[pin])})), Refuse::SelfSigned);
+	assert_eq!(open(Target::Fronted {path: PATH.into(), candidate: Front {self_signed: true, ..front(at(0), "node.test", &[])}}), Refuse::SelfSigned);
+	assert_eq!(open(Target::Tls {path: PATH.into(), candidate: Front {sni: None, verify_name: Some("node.test".into()), self_signed: true, ..front(at(0), "", &[pin])}}), Refuse::SelfSigned);
+	assert_eq!(open(alone(0, None, &[])), Refuse::Pins);
+	assert_eq!(servers.iter().map(|(_, met)| met.load(Ordering::SeqCst)).collect::<Vec<_>>(), [6, 2, 2, 2, 1]);
 }
 
 // "A candidate says where to connect and which names to show": the address, the server name and the `Host` are three fields.

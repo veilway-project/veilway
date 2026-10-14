@@ -1,5 +1,6 @@
 //! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to.
 //! Only an `l3` exit uses a TUN device and kernel routing, and only for the flows that were routed to it.
+pub mod certificate;
 mod chain;
 pub mod control;
 pub mod dns;
@@ -332,12 +333,14 @@ pub struct Shared {
 	roots: Arc<RootCertStore>,
 	/// Held once more by every dialler task of a node link while it runs, so that its count says how many still dial: a link a reload removed must stop within a second.
 	dialling: Arc<()>,
+	/// The self-signed certificates the node made for the `tls` listeners of the config in force, by listen address.
+	certificates: Mutex<Vec<certificate::Made>>,
 }
 
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default()}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -605,6 +608,9 @@ impl Engine {
 	/// What the stream listeners did since start, and the connections and sessions they hold right now.
 	pub fn stream(&self) -> StreamTotals {self.shared.stream.totals()}
 
+	/// The self-signed certificates the node made for its `tls` listeners, each with the pin a profile carries for it.
+	pub fn certificates(&self) -> Vec<certificate::Made> {self.shared.certificates.lock().unwrap_or_else(|e| e.into_inner()).clone()}
+
 	/// The replay memory of the obfuscated transports right now. None for a node that never ran one, which keeps no replay memory.
 	pub fn replay(&self) -> Option<ReplayStatus> {self.shared.replay.get().map(|replay| replay.status(replay::seconds((self.shared.now)())))}
 
@@ -678,6 +684,8 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 							shared.stream.sweep();
 							shared.nat.sweep(&shared.flows);
 							shared.check_links();
+							// A reload that holds the host does not hold up this task: the renewal waits for the next sweep.
+							if shared.certificates.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|made| made.due((shared.now)().unix_timestamp())) {if let Ok(host) = host.try_lock() {host.renew(&shared)}}
 						}
 					}
 					_ = shared.over.notified() => {}

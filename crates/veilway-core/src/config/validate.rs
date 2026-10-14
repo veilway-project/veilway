@@ -179,11 +179,16 @@ impl Config {
 						Host::Ip(_) => {}
 					}
 				}
-				if let Transport::Tls {tls, ..} = transport {
+				if let Transport::Tls {tls: Certificate::Files(tls), ..} = transport {
 					for (key, file) in [("cert", &tls.cert), ("key", &tls.key)] {
 						if file.is_empty() || file.starts_with(['/', '\\']) || file.as_bytes().get(1) == Some(&b':') || file.split(['/', '\\']).any(|part| part == "..") {r.error(format!("{at}.tls.{key}"), PATH_RULE)}
 					}
 				}
+				if let Transport::Tls {tls: Certificate::SelfSigned(SelfSigned {name: Some(name), ..}), ..} = transport {
+					if name.len() > 64 || !domain(name, false) {r.error(format!("{at}.tls.name"), "expected a lowercase DNS name of at most 64 characters, such as www.example.com: the certificate carries it as its subject")}
+				}
+				// Transports page, "What self-signed certificates cost."
+				if matches!(transport, Transport::Tls {tls: Certificate::SelfSigned(_), ..}) && !transport.listen().ip().is_loopback() {r.warning(format!("{at}.tls.self_signed"), "a self-signed certificate on an address others reach: any prober that completes the handshake sees it, ordinary sites rarely have one, and a censor can look for that")}
 				if let Some(proxied) = transport.proxied() {
 					let limits = proxied.limits.unwrap_or_default();
 					if limits.proxy_connections.is_some_and(|connections| !(2..=MAX_PROXY_CONNECTIONS).contains(&connections)) {r.error(format!("{at}.limits.proxy_connections"), format!("expected an integer from 2 to {MAX_PROXY_CONNECTIONS}: requests of strangers may hold half of them, and the other half is for users"))}

@@ -2013,6 +2013,7 @@ dependencies = [
  "veilway-transport",
  "veilway-wg",
  "webpki-roots 1.0.9",
+ "x509-parser",
 ]
 
 [[package]]

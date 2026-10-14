@@ -757,6 +757,42 @@ pub struct Tls {
 	pub key: String,
 }
 
+/// The certificate of a native `tls` transport: files the operator obtains with their own tooling, or one the node makes itself.
+#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Certificate {
+	Files(Tls),
+	SelfSigned(SelfSigned),
+}
+
+/// `{"self_signed": true}`: the node makes an ECDSA P-256 key and a self-signed certificate on its first start, keeps them next to the config file with mode 600, makes the certificate anew with the same key before it runs out, and reports the pin, the SHA-256 of the SubjectPublicKeyInfo, that profiles carry with `self_signed`.
+#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SelfSigned {
+	#[schemars(extend("const" = true))]
+	pub self_signed: bool,
+	/// The operator's own host name, which the certificate carries as its subject and its alternative name. Without it the node draws a name per node and keeps it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(max = 64), pattern("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"))]
+	pub name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CertificateKeys {cert: Option<String>, key: Option<String>, self_signed: Option<bool>, name: Option<String>}
+
+impl<'de> Deserialize<'de> for Certificate {
+	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Certificate, D::Error> {
+		match CertificateKeys::deserialize(d)? {
+			CertificateKeys {self_signed: Some(true), cert: None, key: None, name} => Ok(Certificate::SelfSigned(SelfSigned {self_signed: true, name})),
+			CertificateKeys {self_signed: Some(true), ..} => Err(de::Error::custom("no `cert` or `key` with `self_signed`: the node makes the key and the certificate itself")),
+			CertificateKeys {self_signed: Some(false), ..} => Err(de::Error::invalid_value(Unexpected::Bool(false), &"true, or no `self_signed` and a `cert` and a `key`")),
+			CertificateKeys {name: Some(_), ..} => Err(de::Error::custom("`name` only with `self_signed`: a certificate from files has the name it was issued for")),
+			CertificateKeys {cert, key, self_signed: None, name: None} => Ok(Certificate::Files(Tls {cert: cert.ok_or_else(|| de::Error::missing_field("cert"))?, key: key.ok_or_else(|| de::Error::missing_field("key"))?})),
+		}
+	}
+}
+
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transport {
@@ -781,7 +817,7 @@ pub enum Transport {
 		/// The path a proof arrives on, which the origin must serve nothing at.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
-		tls: Tls,
+		tls: Certificate,
 		decoy: Decoy,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		limits: Option<TransportLimits>,
@@ -865,7 +901,7 @@ enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Tls>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
@@ -874,7 +910,7 @@ impl<'de> Deserialize<'de> for Transport {
 		match keys.kind {
 			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy].concat()).map(|_| Transport::Udp {listen: keys.listen}),
 			// `ws` is two formats under one name. With none of the keys of the proxy path it is the one of a `wireguard` inbound, and with any of them the native one of a `veilway` inbound, which never ends TLS itself. `validate` holds each to its kind of inbound.
-			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && proxy.iter().all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls}),
+			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && proxy.iter().all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
 			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
 			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
 			TransportType::Tls => only("tls", &proxy).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits})),

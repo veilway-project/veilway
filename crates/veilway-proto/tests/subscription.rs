@@ -379,6 +379,8 @@ fn a_hostile_document_for_every_limit_and_rule() {
 		("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_024]))), Fine), ("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_025]))), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("")), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("AAA")), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!([0])), fault("ech")),
 		// Pins per candidate, with the rule of each transport: `tls` at index 1, `ws` at 2, `fronted` at 3.
 		("/profiles/0/transports/1/candidates/0/pins", None, fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 4)), Fine), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 5)), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([&small[..43]])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([1])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(pin.clone()), fault("pins")), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([pin])), Fine), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([])), fault("pins")), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([pin])), fault("pins")), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([])), fault("pins")),
+		// `self_signed`: a boolean, and on a `tls` candidate alone.
+		("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(true)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(false)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!("true")), fault("self_signed")), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(1)), fault("self_signed")), ("/profiles/0/transports/1/candidates/0/self_signed", Some(Value::Null), fault("self_signed")), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(true)), fault("self_signed")), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(false)), fault("self_signed")), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(true)), fault("self_signed")), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(false)), fault("self_signed")),
 		// The optional members of a profile.
 		("/profiles/0/stream_first", Some(json!(true)), Fine), ("/profiles/0/stream_first", Some(json!("true")), fault("stream_first")), ("/profiles/0/stream_first", Some(json!(1)), fault("stream_first")), ("/profiles/0/stream_first", Some(Value::Null), fault("stream_first")), ("/profiles/0/parallel", Some(json!(0)), fault("parallel")), ("/profiles/0/parallel", Some(json!(4)), Fine), ("/profiles/0/parallel", Some(json!(5)), fault("parallel")), ("/profiles/0/min_control_version", Some(json!(0)), fault("min_control_version")), ("/profiles/0/min_control_version", Some(json!(255)), Fine), ("/profiles/0/min_control_version", Some(json!(256)), fault("min_control_version")),
 		("/profiles/0/padding", Some(json!({})), Fine), ("/profiles/0/padding", Some(json!([])), fault("padding")), ("/profiles/0/padding", Some(json!({"wide_max": 511})), fault("wide_max")), ("/profiles/0/padding", Some(json!({"wide_max": 512, "normal_max": 64})), Fine), ("/profiles/0/padding", Some(json!({"wide_max": 1024})), fault("wide_max")), ("/profiles/0/padding", Some(json!({"normal_max": 63})), fault("normal_max")), ("/profiles/0/padding", Some(json!({"normal_max": 256})), fault("normal_max")),
@@ -420,6 +422,37 @@ fn a_hostile_document_for_every_limit_and_rule() {
 	for (reason, word) in Reason::ALL.iter().map(|reason| (*reason, reason.word())) {assert_eq!(read(&json!({"v": 1, "subscription_id": "example-account-0001", "issued_at": 5, "refusal": word, "serial": "not read", "profiles": 7})).map(|payload| matches!(payload, Payload::Refusal(refusal) if refusal.reason == reason && refusal.issued_at == 5)), Ok(true), "{word}")}
 	assert_eq!((Reason::ALL.len(), RatingCap::ALL.len(), LogoKind::ALL.len()), (8, 2, 2));
 	for (document, error) in [(json!({"v": 1, "issued_at": 5, "refusal": "disabled"}), E::Member("subscription_id")), (json!({"v": 1, "subscription_id": "example-account-0001", "refusal": "disabled"}), E::Member("issued_at")), (json!({"subscription_id": "example-account-0001", "issued_at": 5, "refusal": "disabled"}), E::Member("v")), (json!({"v": 2, "subscription_id": "example-account-0001", "issued_at": 5, "refusal": "disabled"}), E::Version), (json!({"v": 1, "critical": ["x"], "subscription_id": "example-account-0001", "issued_at": 5, "refusal": "disabled"}), E::Critical), (json!({"v": 1, "subscription_id": "example-account-0001", "issued_at": 5, "refusal": "Disabled"}), E::Refusal)] {assert_eq!(read(&document).err(), Some(error), "{document}")}
+}
+
+// "A candidate with `self_signed` set still needs 1 to 4 `pins`. Its `sni` may be a host name, which is sent, or empty. It has no `verify_name`, since no name is checked, and a `verify_name` on it refuses the candidate."
+#[test]
+fn a_self_signed_candidate_is_a_tls_candidate_with_pins_and_no_name_to_check() {
+	let document = subscription(&payload("self-signed"));
+	let Transport::Tls(stream) = &document.profiles[0].transports[0] else {panic!("a tls transport")};
+	assert_eq!(stream.candidates.iter().map(|candidate| (candidate.self_signed, candidate.sni.as_deref(), candidate.verify_name.as_deref(), candidate.pins.len())).collect::<Vec<_>>(), [(true, None, None, 1), (true, Some("node.example.com"), None, 2)]);
+	assert_eq!(format!("{:?}", stream.candidates), "[Candidate(1 pins, self-signed), Candidate(2 pins, self-signed)]");
+	// Every other candidate of the vectors is checked as it always was.
+	assert!(subscription(&payload("content")).profiles.iter().flat_map(|profile| &profile.transports).all(|transport| !matches!(transport, Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) if stream.candidates.iter().any(|candidate| candidate.self_signed))));
+	let at = "/profiles/0/transports/1/candidates/0";
+	let changed = |changes: &[(&str, Option<Value>)]| {
+		let mut document = rich();
+		for (member, value) in changes {put(&mut document, &format!("{at}/{member}"), value.clone())}
+		document
+	};
+	use Want::{Fine, Profile};
+	for (name, changes, want) in [
+		("an empty sni and no verify_name", vec![("self_signed", Some(json!(true))), ("sni", Some(json!("")))], Fine),
+		("an empty sni and a verify_name", vec![("self_signed", Some(json!(true))), ("sni", Some(json!(""))), ("verify_name", Some(json!("node.example.com")))], Profile(Fault::Member("verify_name"))),
+		("a sni and a verify_name", vec![("self_signed", Some(json!(true))), ("verify_name", Some(json!("node.example.com")))], Profile(Fault::Member("verify_name"))),
+		("no pins", vec![("self_signed", Some(json!(true))), ("pins", None)], Profile(Fault::Member("pins"))),
+		("five pins", vec![("self_signed", Some(json!(true))), ("pins", Some(Value::Array(vec![rich()["profiles"][0]["transports"][1]["candidates"][0]["pins"][0].clone(); 5])))], Profile(Fault::Member("pins"))),
+		("false with an empty sni and no verify_name", vec![("self_signed", Some(json!(false))), ("sni", Some(json!("")))], Profile(Fault::Member("verify_name"))),
+	] {judge(name, &changed(&changes), want)}
+	// What is read is what the page means: `true` alone makes a candidate self-signed.
+	let read = subscription(&changed(&[("self_signed", Some(json!(true))), ("sni", Some(json!("")))]));
+	let Transport::Tls(stream) = &read.profiles[0].transports[1] else {panic!("a tls transport")};
+	assert!(stream.candidates[0].self_signed && stream.candidates[0].sni.is_none() && stream.candidates[0].verify_name.is_none());
+	assert!(matches!(&subscription(&rich()).profiles[0].transports[1], Transport::Tls(stream) if !stream.candidates[0].self_signed));
 }
 
 fn std_base64(bytes: &[u8]) -> String {

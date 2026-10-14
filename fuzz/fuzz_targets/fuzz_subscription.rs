@@ -98,7 +98,7 @@ fn sound(read: &Subscription) {
 				Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
 				Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => {
 					assert!(stream.path.len() >= 12 && stream.path.starts_with('/') && profile.transport_public_key.is_some(), "a stream transport without its path or key");
-					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && candidate.sni.is_some() != candidate.verify_name.is_some() && (matches!(transport, Transport::Ws(_)) || candidate.pins.is_empty() != matches!(transport, Transport::Tls(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len())), "a candidate that breaks the rule of its transport"));
+					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && (if candidate.self_signed {candidate.verify_name.is_none() && matches!(transport, Transport::Tls(_))} else {candidate.sni.is_some() != candidate.verify_name.is_some()}) && (matches!(transport, Transport::Ws(_)) || candidate.pins.is_empty() != matches!(transport, Transport::Tls(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len())), "a candidate that breaks the rule of its transport"));
 					stream.candidates.iter().map(|candidate| candidate.address).collect()
 				}
 			};

@@ -115,7 +115,7 @@ fn sound(read: &Subscription) {
 				Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
 				Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => {
 					assert!(stream.path.len() >= 12 && profile.transport_public_key.is_some());
-					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && candidate.sni.is_some() != candidate.verify_name.is_some() && (candidate.pins.is_empty() != matches!(transport, Transport::Tls(_)) || matches!(transport, Transport::Ws(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len()))));
+					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && (if candidate.self_signed {candidate.verify_name.is_none() && matches!(transport, Transport::Tls(_))} else {candidate.sni.is_some() != candidate.verify_name.is_some()}) && (candidate.pins.is_empty() != matches!(transport, Transport::Tls(_)) || matches!(transport, Transport::Ws(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len()))));
 					stream.candidates.iter().map(|candidate| candidate.address).collect()
 				}
 			};
@@ -241,8 +241,8 @@ proptest! {
 	}
 
 	#[test]
-	fn a_good_document_with_one_member_changed_reads_soundly_or_not_at_all(at in any::<Index>(), value in option::of(replacement()), extra in "[a-z_]{1,12}") {
-		let mut document: Value = serde_json::from_slice(&seed("fuzz_subscription/content")[1..]).unwrap();
+	fn a_good_document_with_one_member_changed_reads_soundly_or_not_at_all(at in any::<Index>(), value in option::of(replacement()), extra in "[a-z_]{1,12}", name in select(vec!["content", "self-signed"])) {
+		let mut document: Value = serde_json::from_slice(&seed(&format!("fuzz_subscription/{name}"))[1..]).unwrap();
 		let mut all = Vec::new();
 		pointers(&document, String::new(), &mut all);
 		let pointer = at.get(&all).clone();

@@ -657,6 +657,23 @@ export interface components {
             generation: number;
             revision: string;
         };
+        /** @description A certificate the node made for a `tls` listener, with the key it keeps. */
+        SelfSigned: {
+            /** @description The listen address, as the config writes it. */
+            listen: string;
+            /**
+             * Format: int64
+             * @description Unix seconds, 80 to 100 days after `not_before`, drawn per certificate. Clients do not check it.
+             */
+            not_after: number;
+            /**
+             * Format: int64
+             * @description Unix seconds. The node makes the certificate anew with the same key 20 days before `not_after`.
+             */
+            not_before: number;
+            /** @description The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's candidate carries with `self_signed`. It stays the same when the certificate is made anew. */
+            pin: string;
+        };
         /** @description A device with a live session on one inbound. The address the device connects from is not part of it. */
         Session: {
             /**
@@ -732,6 +749,8 @@ export interface components {
             ws_stalled: number;
         };
         Status: {
+            /** @description The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none. */
+            certificates: components["schemas"]["SelfSigned"][];
             /** Format: uint */
             exits: number;
             /**
