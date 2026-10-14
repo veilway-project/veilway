@@ -1,0 +1,16 @@
+# Weekly version updates, grouped so one pull request covers each ecosystem. Security updates come on their own as soon as an advisory is published.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/apps/desktop/src-tauri", "/fuzz"]
+    schedule: {interval: weekly}
+    groups: {cargo: {patterns: ["*"]}}
+    open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /packages/sdk
+    schedule: {interval: weekly}
+    groups: {npm: {patterns: ["*"]}}
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    groups: {actions: {patterns: ["*"]}}
