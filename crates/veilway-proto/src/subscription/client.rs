@@ -11,9 +11,9 @@
 //! What stays the caller's: asking the user, choosing how a request travels ("When a fetch happens"), sending a request to nothing but `Held::endpoints`, never following a redirect, and keeping a `Stored` where the platform keeps secrets.
 //!
 //! **What is stored is trusted as the link is.** A `Stored` holds the keys a subscription is verified under, so whoever can write the client's storage chooses the keys, the document and where the token goes. `Held::restore` checks that a stored value holds together. It cannot check that it is the one that was stored.
-use super::{envelope::{self, EnvelopeError, Fingerprint, SigningKey}, fetch::{DeviceName, Op, Request}, is_host, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, payload::{self, Fault, Id, KeyOrigin, Payload, PayloadError, Reason, Refusal, Subscription}, DeviceSecret, Secret, Url, BODY_MAX, CARRIED_MAX};
+use super::{envelope::{self, EnvelopeError, Fingerprint, SigningKey}, fetch::{DeviceName, Op, Request}, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, payload::{self, Fault, Id, KeyOrigin, Payload, PayloadError, Reason, Refresh, Refusal, Subscription}, DeviceSecret, Secret, Url, BODY_MAX, CARRIED_MAX};
 use crate::{proof, uniform, NoRandom, Random};
-use std::{fmt, time::Duration};
+use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 
 /// "Clock tolerance for `issued_at`: 300 s into the future."
 pub const CLOCK_TOLERANCE: u64 = 300;
@@ -60,6 +60,12 @@ pub enum Failure {
 	NotNewer,
 	/// A whole document for a stored subscription that has a link. It has no endpoint, so taking it would leave the stored subscription unable to refresh and its device place with nobody to free it. The user removes the stored subscription first.
 	HasLink,
+	/// An entry of `refresh_urls` with the host and port of the link's endpoint that is of the other kind: "a document cannot move an entry from one kind to the other". The link alone decides whether its endpoint is pinned.
+	EndpointKind,
+	/// An import accepted on a screen that said the endpoint is checked the way the stored one is (or another way), when what is stored moved while the screen was up and that is no longer true. Nothing is stored; the import is shown again.
+	Changed,
+	/// `endpoint_pins` in a document whose link's endpoint is not pinned, or a list of pins, of the endpoint or of a pinned refresh entry the user has confirmed, that holds none of the pins the client holds for it: "a pin set cannot jump to keys the client has no tie to".
+	Pins,
 }
 
 impl fmt::Display for Failure {
@@ -111,6 +117,8 @@ pub struct NativeOffer(Native);
 impl NativeOffer {
 	/// The endpoint, whose host the screen shows "with its registrable domain marked".
 	pub fn endpoint(&self) -> &Url {self.0.endpoint()}
+	/// The pin the link names, for the first screen: "this server uses its own certificate, which this link names", and for a host that is an address, "this server has an address and no name".
+	pub fn pin(&self) -> Option<&[u8; 32]> {self.0.pin()}
 	pub fn fingerprint(&self) -> Fingerprint {self.0.key().fingerprint()}
 	/// The user continues. "What will be sent if the user continues: the link's token and a new key for this device, to that host."
 	/// `device` is `None` for a new device, whose key and secret are drawn here and not before. It is the stored device when the user imports a link again for a subscription the app holds, so that the import takes no new place. The page does not say how a client knows that before the fetch, when the id is in the document: the caller decides, by the key and the endpoint of the link and by asking the user.
@@ -124,22 +132,24 @@ impl NativeOffer {
 				Device::restore(Secret::new(private), Secret::new(secret))
 			}
 		};
-		Ok(Fetching {keys: vec![self.0.key()], link: self.0, device})
+		Ok(Fetching {keys: vec![self.0.key()], pins: self.0.pin().copied().into_iter().collect(), link: self.0, device})
 	}
 }
 
 /// Step 2 of a native import: the one request with `op` `"fetch"` is out, or about to be. The keys an answer is verified under are the key of the link, or the keys a stored subscription held when its document could not be read again (`Damaged::Unread`).
 #[derive(Debug)]
-pub struct Fetching {link: Native, device: Device, keys: Vec<SigningKey>}
+pub struct Fetching {link: Native, device: Device, keys: Vec<SigningKey>, pins: Vec<[u8; 32]>}
 
 impl Fetching {
 	pub fn endpoint(&self) -> &Url {self.link.endpoint()}
+	/// The pins the endpoint is checked by, for the TLS layer: the link's pin on an import, the pins held on a recovery from `Damaged::Unread`. Empty for an endpoint whose certificate is validated by its chain.
+	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
 	fn ask(&self, op: Op) -> Request {Request::new(self.link.token().clone(), self.keys.iter().map(SigningKey::kid).collect(), self.device.public, self.device.secret.clone(), op)}
 	/// "One request with `op` `"fetch"`", naming the keys held: on a first import, "the id of the key in the link".
 	pub fn request(&self) -> Request {self.ask(Op::Fetch)}
 	/// The body of the answer. "A native link expects a signed document under the link's key, and anything else is a failure": it "is never read as a legacy list".
 	/// `stored` is every subscription the app holds, so that the review can say whether this one replaces one of them. A failure leaves this step as it was, to try again or to `abandon`.
-	pub fn answer(&self, body: &[u8], now: u64, stored: &[&Held]) -> Result<Review, Failure> {review(Some((self.link.clone(), self.device.clone())), &self.keys, body, BODY_MAX, now, stored)}
+	pub fn answer(&self, body: &[u8], now: u64, stored: &[&Held]) -> Result<Review, Failure> {review(Some((self.link.clone(), self.device.clone())), &self.pins, &self.keys, body, BODY_MAX, now, stored)}
 	/// The import is given up after the request went out and before an answer could be reviewed: the `release` request, which frees the pending place if one was taken.
 	pub fn abandon(self) -> Request {self.ask(Op::Release)}
 }
@@ -152,7 +162,7 @@ impl CarriedOffer {
 	pub fn fingerprint(&self) -> Fingerprint {self.0.key().fingerprint()}
 	pub fn in_file(&self) -> bool {self.0.in_file()}
 	/// The user continues. "A whole document needs no fetch": it is verified under the key it came with, by the same rules. "It carries a provider-issued device key, since there is nothing to enrol with", so a profile without a private key refuses it.
-	pub fn proceed(self, now: u64, stored: &[&Held]) -> Result<Review, Failure> {review(None, &[self.0.key()], self.0.document(), if self.0.in_file() {BODY_MAX} else {CARRIED_MAX}, now, stored)}
+	pub fn proceed(self, now: u64, stored: &[&Held]) -> Result<Review, Failure> {review(None, &[], &[self.0.key()], self.0.document(), if self.0.in_file() {BODY_MAX} else {CARRIED_MAX}, now, stored)}
 }
 
 /// A legacy link on the first screen, which says "this link cannot be verified" and "this link has no key part. If your provider gave you a Veilway link, part of it was lost on the way."
@@ -207,8 +217,24 @@ fn replaced<'a>(subscription: &Subscription, document: &str, key: &SigningKey, l
 	Ok(Some(held))
 }
 
-// The document of an import: verified under the keys held for it, which on a first import is the one key that came with the link, read, and judged by the clock, the device's key and the rule of a fresh import.
-fn review(origin: Option<(Native, Device)>, keys: &[SigningKey], document: &[u8], limit: usize, now: u64, stored: &[&Held]) -> Result<Review, Failure> {
+// The pin rules of a document that has a link, against the pins held for the link's endpoint: "the same rule as for the link, said per entry", so an entry with the link's host and port is of the link's kind, and "a document that has `endpoint_pins` when the link's endpoint is not pinned is refused", as is a list "that holds none of the pins the client holds".
+fn endpoint_ok(subscription: &Subscription, link: &Native, held: &[[u8; 32]]) -> Result<(), Failure> {
+	if subscription.refresh_urls.iter().any(|entry| entry.authority() == link.endpoint().authority() && entry.pinned() != link.pin().is_some()) {return Err(Failure::EndpointKind)}
+	// A pinned entry on the link's host and port is confirmed with the link, so it is trusted by the pins held for the endpoint and by none it names itself.
+	if subscription.refresh_urls.iter().any(|entry| entry.pinned() && entry.authority() == link.endpoint().authority() && !entry.pins().iter().any(|pin| held.contains(pin))) {return Err(Failure::Pins)}
+	if !subscription.endpoint_pins.is_empty() && (link.pin().is_none() || !subscription.endpoint_pins.iter().any(|pin| held.contains(pin))) {return Err(Failure::Pins)}
+	Ok(())
+}
+
+// "A pinned endpoint whose host is an IP literal, the link's or a refresh entry's, counts as a `udp` endpoint at that address", on top of the `udp` and `udp-obfs` endpoints of the profiles. A whole document has no endpoints, whatever its `refresh_urls` say.
+fn addresses(subscription: &Subscription, link: Option<&Native>) -> HashSet<IpAddr> {
+	let mut addresses = subscription.profile_datagram_addresses();
+	if let Some(link) = link {addresses.extend(link.endpoint().literal().into_iter().chain(subscription.refresh_urls.iter().filter_map(|entry| entry.literal())))}
+	addresses
+}
+
+// The document of an import: verified under the keys held for it, which on a first import is the one key that came with the link, read, and judged by the clock, the device's key and the rule of a fresh import. `held` is the pins the link's endpoint is checked by: the link's, or the ones stored for a recovery.
+fn review(origin: Option<(Native, Device)>, held: &[[u8; 32]], keys: &[SigningKey], document: &[u8], limit: usize, now: u64, stored: &[&Held]) -> Result<Review, Failure> {
 	let verified = envelope::verify(document, keys, limit).map_err(Failure::Envelope)?;
 	let subscription = match payload::parse(&verified).map_err(Failure::Payload)? {
 		Payload::Refusal(refusal) => return Err(recent(&refusal, now)),
@@ -216,13 +242,17 @@ fn review(origin: Option<(Native, Device)>, keys: &[SigningKey], document: &[u8]
 	};
 	timely(&subscription, now)?;
 	keyed(&subscription, origin.as_ref().map(|(_, device)| device), None)?;
+	if let Some((link, _)) = &origin {endpoint_ok(&subscription, link, held)?}
 	let document = String::from_utf8(document.to_vec()).map_err(|_| Failure::Envelope(EnvelopeError::Encoding))?;
-	let replaces = replaced(&subscription, &document, &verified.signer(), origin.is_some(), stored)?.is_some();
-	Ok(Review {origin, key: verified.signer(), document, subscription, replaces})
+	let replaces = replaced(&subscription, &document, &verified.signer(), origin.is_some(), stored)?;
+	let rechecked = replaces.zip(origin.as_ref()).is_some_and(|(held, (link, _))| held.rechecked(link));
+	// What the client holds for the endpoint is the document's list when it has one, and otherwise what it held.
+	let pins = if origin.is_none() {Vec::new()} else if subscription.endpoint_pins.is_empty() {held.to_vec()} else {subscription.endpoint_pins.clone()};
+	Ok(Review {origin, pins, key: verified.signer(), document, subscription, replaces: replaces.is_some(), rechecked})
 }
 
 /// Step 3 of an import: a document that passed every check, for the user to confirm. Nothing of it is stored yet.
-pub struct Review {origin: Option<(Native, Device)>, key: SigningKey, document: String, subscription: Subscription, replaces: bool}
+pub struct Review {origin: Option<(Native, Device)>, pins: Vec<[u8; 32]>, key: SigningKey, document: String, subscription: Subscription, replaces: bool, rechecked: bool}
 
 impl fmt::Debug for Review {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Review({:?}, {:?}, {} bytes)", self.subscription, self.key, self.document.len())}
@@ -241,6 +271,8 @@ pub struct Accepted {
 	pub replaces: Option<Replaced>,
 	/// The `confirm` request, which makes the device's place permanent. `None` for a whole document, which has no endpoint.
 	pub confirm: Option<Request>,
+	/// Whether the replaced subscription's endpoint was checked another way, as it stood when the user accepted: see `Review::endpoint_changed`.
+	pub endpoint_changed: bool,
 }
 
 /// An import the user accepted and the rules no longer allow, because what is stored changed while the confirmation was on the screen. Nothing is stored, and the pending place is given back.
@@ -258,6 +290,12 @@ impl Review {
 	pub fn fingerprint(&self) -> Fingerprint {self.key.fingerprint()}
 	/// "Whether this adds a new subscription or replaces a stored one", as it stood when the review was made. Which one is the one `Held::is` says yes to, for `subscription().id` and the key of `fingerprint`.
 	pub fn replaces(&self) -> bool {self.replaces}
+	/// "When the link replaces a stored link whose endpoint was checked another way (pinned or not, or by another pin), that it changes": the import replaces the pins held with the link's.
+	pub fn endpoint_changed(&self) -> bool {self.rechecked}
+	/// The pins to check the link's endpoint by once this is accepted: the document's list when it has one, otherwise the link's pin.
+	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
+	/// The addresses of the `udp` and `udp-obfs` endpoints of the profiles, and of the pinned endpoints that are IP literals, which "count as a `udp` endpoint at that address" for the cap of a cover transport.
+	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {addresses(&self.subscription, self.origin.as_ref().map(|(link, _)| link))}
 	/// "Whether the device's key was made on this device or issued by the provider."
 	pub fn origin(&self) -> KeyOrigin {self.subscription.origin()}
 	/// Whether the subscription can refresh. A whole document cannot, "and the app says so".
@@ -265,21 +303,25 @@ impl Review {
 	fn release(origin: Option<(Native, Device)>, key: SigningKey) -> Option<Request> {origin.map(|(link, device)| Request::new(link.token().clone(), vec![key.kid()], device.public, device.secret, Op::Release))}
 	/// The user accepts. `stored` is every subscription the app holds now: the rule of a fresh import is asked again, because the confirmation may have been on the screen while a refresh ran. "The client stores the subscription and sends `"confirm"`, with the name if one was typed." The hosts of `refresh_urls` were on the screen, so they are confirmed with it, unless the subscription has no link to refresh by.
 	pub fn accept(self, name: Option<DeviceName>, stored: &[&Held]) -> Result<Accepted, Box<Declined>> {
-		let replaces = match replaced(&self.subscription, &self.document, &self.key, self.origin.is_some(), stored) {
-			Ok(replaces) => replaces.map(|_| Replaced {id: self.subscription.id.clone(), key: self.key}),
+		let before = match replaced(&self.subscription, &self.document, &self.key, self.origin.is_some(), stored) {
+			Ok(before) => before,
 			Err(failure) => return Err(Box::new(Declined {failure, release: Self::release(self.origin, self.key)})),
 		};
-		let hosts = if self.origin.is_some() {self.subscription.refresh_urls.iter().map(Url::authority).collect()} else {Vec::new()};
-		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts};
-		Ok(Accepted {confirm: held.request(Op::Confirm(name)), held, replaces})
+		let endpoint_changed = before.zip(self.origin.as_ref()).is_some_and(|(held, (link, _))| held.rechecked(link));
+		// The screen said whether the endpoint is checked another way. If what is stored moved since, the user's yes was to something else, and the import must be shown again.
+		if endpoint_changed != self.rechecked {return Err(Box::new(Declined {failure: Failure::Changed, release: Self::release(self.origin, self.key)}))}
+		let replaces = before.map(|_| Replaced {id: self.subscription.id.clone(), key: self.key});
+		let hosts = if self.origin.is_some() {self.subscription.refresh_urls.iter().map(Refresh::key).collect()} else {Vec::new()};
+		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, pins: self.pins};
+		Ok(Accepted {confirm: held.request(Op::Confirm(name)), held, replaces, endpoint_changed})
 	}
 	/// The user declines. "The client sends `"release"`, so that the device place is freed, and keeps nothing: not the document, not the link, not the key it made." `None` for a whole document, which took no place.
 	pub fn decline(self) -> Option<Request> {Self::release(self.origin, self.key)}
 }
 
-/// What a client holds for one subscription: the link it came by and the device made for it, unless it came as a whole document, the last good document as it was delivered, and the refresh hosts the user has confirmed, each with its port. The keys held, the id, the serial and the times are those of the last good document, so they cannot disagree with it.
+/// What a client holds for one subscription: the link it came by and the device made for it, unless it came as a whole document, the last good document as it was delivered, the pins the link's endpoint is checked by, and the refresh hosts the user has confirmed, each with its port and whether it is pinned. The keys held, the id, the serial and the times are those of the last good document, so they cannot disagree with it.
 #[derive(Clone, PartialEq)]
-pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>}
+pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>, pins: Vec<[u8; 32]>}
 
 // The document holds transport secrets, and with a provider-issued key the device's private key. None of it is printed, and neither is the link.
 impl fmt::Debug for Held {
@@ -291,7 +333,9 @@ impl fmt::Debug for Held {
 pub struct Changes {
 	/// The keys held are others than before: "the provider renewed its signing key". Noted with the date. "It does not ask the user anything."
 	pub rotated: bool,
-	/// Refresh hosts, as `host:port`, the user has not confirmed: "the provider added a refresh host". They are not in `Held::endpoints` until `Held::confirm_hosts`.
+	/// The pins of the link's endpoint changed: "the provider renewed the certificate of its subscription server", noted with the date. The user is asked nothing.
+	pub renewed: bool,
+	/// Refresh hosts, as `host:port` and for a pinned entry `host:port#pinned`, the user has not confirmed: "the provider added a refresh host". They are not in `Held::endpoints` until `Held::confirm_hosts`.
 	pub hosts: Vec<String>,
 	/// Profiles the client had that the new document leaves out, or holds in a form that was refused, by `id` and with the fault if there is one.
 	pub dropped: Vec<(String, Option<Fault>)>,
@@ -347,8 +391,10 @@ pub struct Stored {
 	pub keys: Vec<[u8; 32]>,
 	/// The last good document.
 	pub document: String,
-	/// The confirmed refresh hosts, each as `host:port`.
+	/// The confirmed refresh hosts, each as `host:port`, or `host:port#pinned`.
 	pub hosts: Vec<String>,
+	/// The pins the link's endpoint is checked by: empty for a link with no pin, otherwise 1 or 2.
+	pub pins: Vec<[u8; 32]>,
 }
 
 impl fmt::Debug for Stored {
@@ -392,16 +438,23 @@ impl Held {
 	/// A `confirm` with another name, which "replaces it".
 	pub fn rename(&self, name: Option<DeviceName>) -> Option<Request> {self.request(Op::Confirm(name))}
 	// The refresh URLs of the last good document with whether the user has confirmed the host and port of each. The endpoint of the link needs no confirmation. A subscription with no link has none: it cannot refresh, whatever its document lists.
-	fn listed(&self) -> impl Iterator<Item = (&Url, bool)> {self.origin.iter().flat_map(move |(link, _)| self.subscription.refresh_urls.iter().map(move |url| (url, url.authority() == link.endpoint().authority() || self.hosts.contains(&url.authority()))))}
+	// A host is confirmed as host, port and whether it is pinned (`Refresh::key`), so that one listed pinned that was confirmed unpinned, or the reverse, waits again, and a change of its pins does not.
+	fn listed(&self) -> impl Iterator<Item = (&Refresh, bool)> {self.origin.iter().flat_map(move |(link, _)| self.subscription.refresh_urls.iter().map(move |entry| (entry, entry.authority() == link.endpoint().authority() || self.hosts.contains(&entry.key()))))}
 	/// Where a request of this subscription may go, in the order to try: the endpoint of the link, then the `refresh_urls` of the last good document whose host and port the user has confirmed. The token goes nowhere else. Empty for a subscription that came as a whole document.
-	pub fn endpoints(&self) -> Vec<&Url> {self.origin.iter().map(|(link, _)| link.endpoint()).chain(self.listed().filter(|(_, confirmed)| *confirmed).map(|(url, _)| url)).collect()}
-	/// The refresh hosts of the last good document that wait for the user, each as `host:port`: the app "asks at the next refresh the user starts. Until then the client uses the hosts it already had."
+	pub fn endpoints(&self) -> Vec<&Url> {self.targets().into_iter().map(|(url, _)| url).collect()}
+	/// `endpoints` with the pins each is checked by, which is what the TLS layer needs: "the pins held" for the link's endpoint and the pins of the entry for a refresh URL. Empty pins mean the certificate is validated by its chain; any pins mean it is not, and "there is no fallback to chain validation".
+	pub fn targets(&self) -> Vec<(&Url, &[[u8; 32]])> {self.origin.iter().map(|(link, _)| (link.endpoint(), &self.pins[..])).chain(self.listed().filter(|(_, confirmed)| *confirmed).map(|(entry, _)| (entry.url(), entry.pins()))).collect()}
+	/// The addresses of the `udp` and `udp-obfs` endpoints of the profiles, and of the pinned endpoints that are IP literals, the link's and the refresh entries', which "count as a `udp` endpoint at that address": a cover transport at one of them is capped at Detectable.
+	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {addresses(&self.subscription, self.origin.as_ref().map(|(link, _)| link))}
+	// Whether a link that replaces this one checks its endpoint another way: pinned or not, or by a pin this does not hold.
+	fn rechecked(&self, link: &Native) -> bool {self.origin.is_some() && link.pin().map_or(!self.pins.is_empty(), |pin| !self.pins.contains(pin))}
+	/// The refresh hosts of the last good document that wait for the user, each as `host:port`, or `host:port#pinned` for a pinned entry: the app "asks at the next refresh the user starts. Until then the client uses the hosts it already had."
 	pub fn unconfirmed(&self) -> Vec<String> {
 		let mut hosts = Vec::new();
-		for host in self.listed().filter(|(_, confirmed)| !confirmed).map(|(url, _)| url.authority()) {if !hosts.contains(&host) {hosts.push(host)}}
+		for host in self.listed().filter(|(_, confirmed)| !confirmed).map(|(entry, _)| entry.key()) {if !hosts.contains(&host) {hosts.push(host)}}
 		hosts
 	}
-	/// The user confirmed the hosts in `seen`, each as `host:port` as `unconfirmed` gave it: what the screen showed. Only hosts that wait are taken, so a host that a refresh added while the screen was up is not confirmed with it.
+	/// The user confirmed the hosts in `seen`, each as `unconfirmed` gave it: what the screen showed. Only hosts that wait are taken, so a host that a refresh added while the screen was up is not confirmed with it.
 	pub fn confirm_hosts(&mut self, seen: &[&str]) {
 		let confirmed: Vec<String> = self.unconfirmed().into_iter().filter(|host| seen.contains(&host.as_str())).collect();
 		self.hosts.extend(confirmed);
@@ -420,11 +473,20 @@ impl Held {
 		if new.serial == self.subscription.serial {return if body == self.document.as_bytes() {Ok(Refreshed::Unchanged)} else {Err(Failure::Fork)}}
 		if new.issued_at < self.subscription.issued_at {return Err(Failure::Backdated)}
 		keyed(&new, self.device(), Some(&self.subscription))?;
-		let mut changes = Changes {rotated: new.signing_keys != self.subscription.signing_keys, hosts: Vec::new(), dropped: self.subscription.profiles.iter().filter(|old| !new.profiles.iter().any(|profile| profile.id == old.id)).map(|old| (old.id.clone(), new.refused.iter().find(|refused| refused.id.as_deref() == Some(&old.id)).map(|refused| refused.fault))).collect(), devices_grew: new.devices.iter().any(|device| !self.subscription.devices.iter().any(|old| old.name == device.name && old.enrolled_at == device.enrolled_at))};
-		(self.document, self.subscription) = (String::from_utf8(body.to_vec()).map_err(|_| Failure::Envelope(EnvelopeError::Encoding))?, new);
+		if let Some((link, _)) = &self.origin {
+			endpoint_ok(&new, link, &self.pins)?;
+			// A pinned entry the user confirmed follows the same rule with the list in its `pins` (one on the link's host and port was held to the endpoint's pins by `endpoint_ok`). An entry that is new, or was listed the other way, has no pins held and is taken on the signed document's word and the user's confirmation of the host.
+			for entry in new.refresh_urls.iter().filter(|entry| entry.pinned() && self.hosts.contains(&entry.key())) {
+				let held: Vec<&[u8; 32]> = self.subscription.refresh_urls.iter().filter(|old| old.key() == entry.key()).flat_map(Refresh::pins).collect();
+				if !entry.pins().iter().any(|pin| held.contains(&pin)) {return Err(Failure::Pins)}
+			}
+		}
+		let pins = if self.origin.is_some() && !new.endpoint_pins.is_empty() {new.endpoint_pins.clone()} else {self.pins.clone()};
+		let mut changes = Changes {rotated: new.signing_keys != self.subscription.signing_keys, renewed: pins.len() != self.pins.len() || pins.iter().any(|pin| !self.pins.contains(pin)), hosts: Vec::new(), dropped: self.subscription.profiles.iter().filter(|old| !new.profiles.iter().any(|profile| profile.id == old.id)).map(|old| (old.id.clone(), new.refused.iter().find(|refused| refused.id.as_deref() == Some(&old.id)).map(|refused| refused.fault))).collect(), devices_grew: new.devices.iter().any(|device| !self.subscription.devices.iter().any(|old| old.name == device.name && old.enrolled_at == device.enrolled_at))};
+		(self.document, self.subscription, self.pins) = (String::from_utf8(body.to_vec()).map_err(|_| Failure::Envelope(EnvelopeError::Encoding))?, new, pins);
 		// A host stays confirmed only while documents list it. One that a document dropped and a later one lists again is a host "a later document adds", and is asked about again.
 		let listed = &self.subscription.refresh_urls;
-		self.hosts.retain(|host| listed.iter().any(|url| url.authority() == *host));
+		self.hosts.retain(|host| listed.iter().any(|entry| entry.key() == *host));
 		changes.hosts = self.unconfirmed();
 		Ok(Refreshed::Updated(changes))
 	}
@@ -435,7 +497,7 @@ impl Held {
 		if self.standing(now) == Standing::Stale {Err(Stale(permit))} else {Ok(permit)}
 	}
 	/// The value to put in storage.
-	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone()}}
+	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone(), pins: self.pins.clone()}}
 	/// A `Held` out of storage. The document is verified again under the stored keys and read again, so a `Held` never holds a document that would not pass today's reader. The clock is not asked: an old document is still the last good one. A confirmed host that is no `host:port`, or that the document does not list, is not kept, and the user is asked about it again.
 	/// The stored device is not compared with the keys in the document, and the stored keys are not compared with anything: what is stored is trusted.
 	pub fn restore(stored: Stored) -> Result<Self, Damaged> {
@@ -444,10 +506,15 @@ impl Held {
 			Some((Ok(Link::Native(link)), device)) => Ok(Some((link, device))),
 			Some(_) => Err(()),
 		}) else {return Err(Damaged::Broken(stored.origin.map(Box::new)))};
-		let Ok(verified) = envelope::verify(stored.document.as_bytes(), &keys, BODY_MAX) else {return Err(Damaged::Broken(stored.origin.map(Box::new)))};
+		// The pins held are the link's endpoint's: none for a link with no pin or for a whole document, otherwise 1 or 2.
+		let fits = stored.pins.len() <= 2 && stored.pins.windows(2).all(|pair| pair[0] != pair[1]) && origin.as_ref().is_some_and(|(link, _)| link.pin().is_some()) == !stored.pins.is_empty();
+		let verified = envelope::verify(stored.document.as_bytes(), &keys, BODY_MAX).ok().filter(|_| fits);
+		let Some(verified) = verified else {return Err(Damaged::Broken(stored.origin.map(Box::new)))};
 		match payload::parse(&verified) {
-			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys => Ok(Self {hosts: stored.hosts.into_iter().filter(|host| host.rsplit_once(':').is_some_and(|(name, port)| is_host(name) && port.parse::<u16>().is_ok()) && subscription.refresh_urls.iter().any(|url| url.authority() == *host)).collect(), origin, document: stored.document, subscription: *subscription}),
-			_ => Err(Damaged::Unread(origin.map(|(link, device)| Box::new(Fetching {link, device, keys})))),
+			// Every step that stores pins stores exactly the list of the document when it has one, so pins that differ from it are storage that does not hold together, and are not trusted for a recovery fetch.
+			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.is_some() && !subscription.endpoint_pins.is_empty() && stored.pins != subscription.endpoint_pins => Err(Damaged::Broken(stored.origin.map(Box::new))),
+			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.as_ref().is_none_or(|(link, _)| endpoint_ok(&subscription, link, &stored.pins).is_ok()) => Ok(Self {hosts: stored.hosts.into_iter().filter(|host| subscription.refresh_urls.iter().any(|entry| entry.key() == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins}),
+			_ => Err(Damaged::Unread(origin.map(|(link, device)| Box::new(Fetching {link, device, keys, pins: stored.pins})))),
 		}
 	}
 }

@@ -9,6 +9,10 @@ const IMPORT: &[u8] = include_bytes!("../corpus/fuzz_subscription/import");
 const FILE: &str = include_str!("../corpus/fuzz_deeplink/file");
 // The native link of the seeds, and the first document its endpoint answers with: one profile whose device made its own key. Its first byte is the settings byte of the seed.
 const LINK: &str = include_str!("../corpus/fuzz_deeplink/native-veilway");
+// The same endpoint with the pin of its own certificate in the link, held for the document as for the one above.
+const PINNED_LINK: &str = include_str!("../corpus/fuzz_deeplink/native-pinned");
+// A first document for the pinned link that already lists pinned refresh entries, so the client holds them confirmed, one of them on the link's own host and port.
+const PINNED_DOCUMENT: &[u8] = include_bytes!("../corpus/fuzz_subscription/refresh-with-pinned-link");
 const DOCUMENT: &[u8] = include_bytes!("../corpus/fuzz_sub_envelope/document");
 // The clock: 100 s after the documents of the seeds were issued.
 const NOW: u64 = 1_700_000_100;
@@ -34,14 +38,14 @@ fn import(document: &str) -> Option<Held> {
 }
 
 // The subscription of the seeds as a client holds it after an import by its link: a device that made its own key (33..33, with the secret 44..44), and an endpoint to refresh by.
-fn linked() -> Held {
-	let Ok(Link::Native(link)) = Link::parse(LINK) else {panic!("the seed is a native link")};
+fn linked(link: &str, document: &[u8]) -> Held {
+	let Ok(Link::Native(link)) = Link::parse(link) else {panic!("the seed is a native link")};
 	let Offer::Native(offer) = Offer::open(Link::Native(link)) else {panic!("a native link is offered as one")};
 	let fetching = offer.proceed(None, &mut |bytes: &mut [u8]| {
 		bytes.fill(if bytes.len() == 32 {0x33} else {0x44});
 		Ok(())
 	}).expect("the random source works");
-	fetching.answer(&DOCUMENT[1..], NOW, &[]).expect("the seed is the document of the link").accept(None, &[]).expect("nothing is stored").held
+	fetching.answer(document, NOW, &[]).expect("the seed is the document of the link").accept(None, &[]).expect("nothing is stored").held
 }
 
 // What every document a client is left with keeps, whatever the provider wrote: each count within its limit, each text within its length and free of what the filter removes, each address one a document may name.
@@ -59,7 +63,8 @@ fn sound(read: &Subscription) {
 	assert!((1..=PROFILES_MAX).contains(&read.profiles.len()) && read.profiles.len() + read.refused.len() <= PROFILES_MAX && (1..=2).contains(&read.signing_keys.len()) && (1..=INTEGER_MAX).contains(&read.serial) && read.expires_at > read.issued_at && read.expires_at - read.issued_at <= LIFETIME_MAX && UPDATE_INTERVAL.contains(&u64::from(read.update_interval)), "a top-level value outside its range");
 	assert!(read.refresh_urls.len() <= REFRESH_URLS_MAX && read.devices.len() <= DEVICES_MAX && read.support.len() <= SUPPORT_MAX && read.cards.len() <= CARDS_MAX && read.notices.len() <= control::NOTICES_MAX && read.devices.iter().filter(|device| device.this).count() <= 1 && read.logo.as_ref().is_none_or(|logo| (1..=LOGO_MAX).contains(&logo.data.len())), "a list over its limit");
 	shown(&read.provider, 64, 256);
-	assert!(read.provider.visible() &&read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= LINK_URL_MAX && !url.as_str().contains('#') && url.as_str()[8..].starts_with(url.host()) && is_host(url.host())), "a refresh URL that is none");
+	assert!(read.provider.visible() &&read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= LINK_URL_MAX && !url.as_str().contains('#') && url.as_str()[8..].starts_with(url.host()) && if let Some(address) = url.literal() {url.pinned() && payload::dialable(address) && !is_host(url.host()) && url.host() == match address {std::net::IpAddr::V4(ip) => ip.to_string(), std::net::IpAddr::V6(ip) => format!("[{ip}]")}} else {is_host(url.host())}), "a refresh URL that is none");
+	assert!(read.refresh_urls.iter().all(|entry| entry.pins().len() <= 2 && entry.pins().windows(2).all(|pair| pair[0] != pair[1])) && read.refresh_urls.iter().enumerate().all(|(place, entry)| read.refresh_urls[..place].iter().all(|earlier| earlier.authority() != entry.authority() || earlier.pinned() == entry.pinned())) && read.endpoint_pins.len() <= 2 && read.endpoint_pins.windows(2).all(|pair| pair[0] != pair[1]), "pins that are none, or entries of one host and port of two kinds");
 	read.devices.iter().for_each(|device| {
 		plain(device.name.as_str(), 32, 128);
 		assert!(device.name.translations().count() == 0, "a device's name in several languages");
@@ -111,6 +116,8 @@ fn sound(read: &Subscription) {
 // The payload reader behind a good signature, and what a client then decides. The first byte is settings and the rest is the payload, which is sealed here under a key the client holds, so every byte of it reaches the reader.
 //   bit 0  clear: the document is the answer to a refresh. Set: it is a whole document in a file, imported.
 //   bit 1  the document is signed by the second key, which the client does not hold.
+//   bit 3  the client imported the pinned link of the seeds, which is the link above with the pin of its endpoint's own certificate. It implies bit 2.
+//   bit 4  the same, from a first document that lists pinned refresh entries, which the import confirmed. It implies bits 2 and 3.
 //   bit 2  who refreshes. Clear: a client that holds the whole document of the seeds, with a key the provider issued and no link. Set: a client that imported the link of the seeds, with a key its device made and an endpoint.
 // A payload that reads must be sound. A refresh that fails must leave what is held exactly as it was. One that is taken must be signed by a held key, of the same subscription, of a higher serial and not issued earlier, and must bring no device key the client did not have. A request may go only to the endpoint of the link and to hosts the user confirmed, and nowhere at all for a whole document. What is held must go to storage and come back the same.
 fuzz_target!(|data: &[u8]| {
@@ -127,17 +134,25 @@ fuzz_target!(|data: &[u8]| {
 		assert!(!format!("{imported:?}").contains(&document), "what is held printed its document");
 		return;
 	}
-	static BASES: OnceLock<[Held; 2]> = OnceLock::new();
-	let (with_link, bases) = (mode & 4 != 0, BASES.get_or_init(|| [import(&sealed(0, &IMPORT[1..])).expect("the seed is a whole document"), linked()]));
-	let mut client = bases[usize::from(with_link)].clone();
+	static BASES: OnceLock<[Held; 4]> = OnceLock::new();
+	let (pinned, bases) = (mode & 24 != 0, BASES.get_or_init(|| [import(&sealed(0, &IMPORT[1..])).expect("the seed is a whole document"), linked(LINK, &DOCUMENT[1..]), linked(PINNED_LINK, &DOCUMENT[1..]), linked(PINNED_LINK, sealed(0, &PINNED_DOCUMENT[1..]).as_bytes())]));
+	let with_link = pinned || mode & 4 != 0;
+	let mut client = bases[if mode & 16 != 0 {3} else if pinned {2} else {usize::from(with_link)}].clone();
 	let before = client.clone();
 	match client.refresh(document.as_bytes(), NOW) {
 		Ok(Refreshed::Updated(changes)) => {
 			assert!(signer == 0 && client.subscription().serial > before.subscription().serial && client.subscription().issued_at >= before.subscription().issued_at && client.id() == before.id() && client.document() == document && client.subscription().expires_at > NOW && client.keys().contains(&held[0]), "a refresh was taken that the rules refuse");
 			assert!(client.subscription().profiles.iter().all(|profile| profile.device.private_key.is_some() != with_link && before.subscription().profiles.iter().any(|old| old.device.public_key == profile.device.public_key) && client.device().is_none_or(|device| *device.public() == profile.device.public_key)), "a refresh changed a device key");
-			// Nothing was confirmed, so the token goes to the host and port of the link and nowhere else, and every other host the document lists waits for the user.
-			assert!(client.endpoints().iter().all(|url| url.authority() == "sub.example.com:443") && (with_link || client.endpoints().is_empty()) && client.unconfirmed() == changes.hosts && (with_link || changes.hosts.is_empty()), "a request may go somewhere the user has not confirmed");
-			assert!(client.subscription().refresh_urls.iter().all(|url| url.authority() == "sub.example.com:443" || changes.hosts.contains(&url.authority()) || !with_link), "a refresh host is neither the link's nor waiting");
+			// Only a base with bit 4 has confirmed hosts, and only the ones the document before also listed stay confirmed. Otherwise nothing was confirmed, so the token goes to the host and port of the link and nowhere else, and every other host the document lists waits for the user.
+			assert!(client.endpoints().iter().all(|url| url.authority() == "sub.example.com:443" || client.subscription().refresh_urls.iter().any(|entry| entry.url() == *url && !changes.hosts.contains(&entry.key()) && before.subscription().refresh_urls.iter().any(|old| old.key() == entry.key()))) && (with_link || client.endpoints().is_empty()) && client.unconfirmed() == changes.hosts && (with_link || changes.hosts.is_empty()), "a request may go somewhere the user has not confirmed");
+			assert!(client.subscription().refresh_urls.iter().all(|url| url.authority() == "sub.example.com:443" || changes.hosts.contains(&url.key()) || !with_link || before.subscription().refresh_urls.iter().any(|old| old.key() == url.key())), "a refresh host is neither the link's nor waiting");
+			// The pins of an entry follow the pins held: a pinned entry on the link's host and port holds a pin held for the endpoint, and a pinned entry that was confirmed and is listed again holds one of the pins it had. Without this rule a document could hand a host to a key the client has no tie to.
+			assert!(client.subscription().refresh_urls.iter().all(|entry| !with_link || !entry.pinned() || if entry.authority() == "sub.example.com:443" {entry.pins().iter().any(|pin| before.stored().pins.contains(pin))} else {!before.subscription().refresh_urls.iter().any(|old| old.key() == entry.key()) || entry.pins().iter().any(|pin| before.subscription().refresh_urls.iter().any(|old| old.key() == entry.key() && old.pins().contains(pin)))}), "a pinned entry that holds no pin that was held");
+			// The link alone decides whether the endpoint is pinned. Every entry of the link's host and port is of its kind, a list of pins is for a pinned endpoint only and holds a pin that was held, and the client holds exactly the list. Nothing is pinned for a whole document.
+			let (list, held_before) = (&client.subscription().endpoint_pins, before.stored().pins);
+			assert!(client.stored().pins.len() <= 2 && client.stored().pins.is_empty() != pinned && client.targets().iter().take(1).all(|(_, pins)| *pins == &client.stored().pins[..]), "a pin set that is not the link's kind");
+			assert!(client.targets().iter().all(|(_, pins)| pins.len() <= 2) && client.subscription().refresh_urls.iter().all(|url| !with_link || url.authority() != "sub.example.com:443" || url.pinned() == pinned), "an entry of the link's host and port moved to the other kind");
+			assert!(list.is_empty() || !with_link || (pinned && client.stored().pins == *list && list.iter().any(|pin| held_before.contains(pin))), "a list of pins that does not hold a pin that was held");
 			// The user confirms what waits: from then on those URLs are endpoints, and no other.
 			let waiting: Vec<&str> = changes.hosts.iter().map(String::as_str).collect();
 			client.confirm_hosts(&waiting);

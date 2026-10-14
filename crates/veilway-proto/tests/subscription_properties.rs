@@ -71,6 +71,9 @@ fn signing_key() -> impl Strategy<Value = [u8; 32]> {any::<[u8; 32]>().prop_filt
 
 fn endpoint() -> impl Strategy<Value = String> {("[a-z][a-z0-9]{0,8}(\\.[a-z][a-z0-9-]{0,6}[a-z0-9]){0,3}", option::of(1..=65_535u16), "(/[A-Za-z0-9_~-][A-Za-z0-9._~-]{0,8}){0,3}/?").prop_map(|(host, port, path)| format!("{host}{}{}", port.map_or(String::new(), |port| format!(":{port}")), if path.is_empty() {"/".to_owned()} else {path}))}
 
+// The endpoint of a pinned link: a host name, or an address in its one spelling, with a port and a path.
+fn pinned_endpoint() -> impl Strategy<Value = String> {(prop_oneof![2 => "[a-z][a-z0-9]{0,8}(\\.[a-z][a-z0-9-]{0,6}[a-z0-9]){0,3}", 1 => (1..=254u8).prop_map(|last| format!("198.51.100.{last}")), 1 => (1..=0xffffu32).prop_map(|last| format!("[2001:db8::{last:x}]"))], option::of(1..=65_535u16), "(/[A-Za-z0-9_~-][A-Za-z0-9._~-]{0,8}){0,3}/?").prop_map(|(host, port, path)| format!("{host}{}{}", port.map_or(String::new(), |port| format!(":{port}")), if path.is_empty() {"/".to_owned()} else {path}))}
+
 // A subscription as a client is left with it: every count within its limit, every text within its length and free of what the filter removes, every dial address one a document may name.
 fn sound(read: &Subscription) {
 	let plain = |text: &str, chars: usize, bytes: usize| assert!(text.chars().count() <= chars && text.len() <= bytes && control::display(text, usize::MAX, usize::MAX) == text && !text.chars().any(|c| c.is_control() || matches!(c, '\u{200b}' | '\u{200e}' | '\u{200f}') || ('\u{202a}'..='\u{202e}').contains(&c) || ('\u{2066}'..='\u{2069}').contains(&c)), "{text:?}");
@@ -83,6 +86,9 @@ fn sound(read: &Subscription) {
 	let shown = |text: &Text, chars: usize| said(text, chars, 4 * chars, false);
 	assert!((1..=PROFILES_MAX).contains(&read.profiles.len()) && read.profiles.len() + read.refused.len() <= PROFILES_MAX && (1..=2).contains(&read.signing_keys.len()) && read.serial >= 1 && read.expires_at > read.issued_at && read.expires_at - read.issued_at <= 90 * 86_400 && (900..=604_800).contains(&read.update_interval));
 	assert!(read.refresh_urls.len() <= REFRESH_URLS_MAX && read.devices.len() <= DEVICES_MAX && read.support.len() <= SUPPORT_MAX && read.cards.len() <= CARDS_MAX && read.notices.len() <= 4 && read.devices.iter().filter(|device| device.this).count() <= 1 && read.logo.as_ref().is_none_or(|logo| (1..=65_536).contains(&logo.data.len())));
+	// A pinned entry holds 1 or 2 pins that differ, and only a pinned entry has an address for a host, which a client may dial. Entries of one host and port are of one kind. The pins of the endpoint are 1 or 2 that differ, or none.
+	assert!(read.refresh_urls.iter().all(|entry| entry.pins().len() <= 2 && entry.pins().windows(2).all(|pair| pair[0] != pair[1]) && entry.pinned() == !entry.pins().is_empty() && entry.literal().is_none_or(|ip| entry.pinned() && payload::dialable(ip) && entry.host() == match ip {std::net::IpAddr::V4(ip) => ip.to_string(), std::net::IpAddr::V6(ip) => format!("[{ip}]")})) && read.refresh_urls.iter().enumerate().all(|(place, entry)| read.refresh_urls[..place].iter().all(|earlier| earlier.authority() != entry.authority() || earlier.pinned() == entry.pinned())));
+	assert!(read.endpoint_pins.len() <= 2 && read.endpoint_pins.windows(2).all(|pair| pair[0] != pair[1]));
 	said(&read.provider, 64, 256, true);
 	assert!(!read.provider.is_empty() && read.refresh_urls.iter().all(|url| url.as_str().starts_with("https://") && url.as_str().len() <= 256 && !url.as_str().contains('#') && !url.host().contains('@')));
 	read.devices.iter().for_each(|device| assert!(device.name.translations().count() == 0 && device.name.as_str().chars().count() <= 32, "a device's name in several languages"));
@@ -131,7 +137,7 @@ fn replacement() -> impl Strategy<Value = Value> {
 		Just(Value::Null), any::<bool>().prop_map(Value::from), any::<u64>().prop_map(Value::from), any::<i64>().prop_map(Value::from), any::<f64>().prop_map(|number| json!(number)),
 		select(vec![0u64, 1, 2, 4, 5, 9, 10, 16, 17, 60, 61, 64, 65, 255, 256, 257, 899, 900, 1279, 1280, 1500, 1501, 65_535, 65_536, 604_800, 604_801, ISSUED, 9_007_199_254_740_991, 9_007_199_254_740_992]).prop_map(Value::from),
 		any::<String>().prop_map(Value::from), "[ -~]{0,40}".prop_map(Value::from), vec(any::<char>(), 0..300).prop_map(|chars| Value::from(chars.into_iter().collect::<String>())),
-		select(vec!["", "veilway", "later", "tls", "ws", "fronted", "udp", "udp-obfs", "info", "warning", "none", "unsafe", "main", "direct", "127.0.0.1:443", "[::1]:443", "192.0.2.1:0", "[::ffff:192.0.2.1]:443", "10.0.0.1:1", "192.0.2.1:443", "10.7.0.1", "fd00::1", "node.example.com", "https://example.com/", "http://example.com/", "https://user@example.com/", "/a-path-of-a-transport", "#000000", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="]).prop_map(Value::from),
+		select(vec!["", "veilway", "later", "tls", "ws", "fronted", "udp", "udp-obfs", "info", "warning", "none", "unsafe", "main", "direct", "127.0.0.1:443", "[::1]:443", "192.0.2.1:0", "[::ffff:192.0.2.1]:443", "10.0.0.1:1", "192.0.2.1:443", "10.7.0.1", "fd00::1", "node.example.com", "https://example.com/", "https://203.0.113.7/s", "https://[2001:db8::1]:444/s", "http://example.com/", "https://user@example.com/", "/a-path-of-a-transport", "#000000", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="]).prop_map(Value::from),
 		any::<[u8; 32]>().prop_map(|bytes| Value::from(std_base64(&bytes))),
 	];
 	leaf.prop_recursive(3, 24, 6, |inner| prop_oneof![vec(inner.clone(), 0..6).prop_map(Value::from), vec(("[a-z_]{1,8}", inner), 0..4).prop_map(|members| Value::Object(members.into_iter().collect()))])
@@ -160,6 +166,43 @@ proptest! {
 		}
 	}
 
+	// "The link alone decides whether the endpoint is pinned": a pinned link reads back with its pin, no changed character makes it a link without one, and no changed character makes a link without a pin a pinned one.
+	#[test]
+	fn a_pinned_link_reads_back_and_no_changed_character_moves_it_between_the_two_kinds(endpoint in pinned_endpoint(), key in signing_key(), token in any::<[u8; 16]>(), pin in any::<[u8; 32]>()) {
+		let (bare, with) = (format!("#v1.{}.{}", url_base64(&key), url_base64(&token)), format!("#v1.{}.{}.{}", url_base64(&key), url_base64(&token), url_base64(&pin)));
+		let (veilway, https) = (format!("veilway://sub/{endpoint}{with}"), format!("https://{endpoint}{with}"));
+		let (Ok(Link::Native(native)), Ok(Link::Native(other))) = (Link::parse(&veilway), Link::parse(&https)) else {panic!("{veilway}")};
+		prop_assert_eq!((native.veilway(), native.https(), native.pin().copied(), &other), (veilway.clone(), https.clone(), Some(pin), &native));
+		let printed = format!("{native:?}");
+		prop_assert!(!printed.contains(&url_base64(&pin)) && !printed.contains(&url_base64(&token)));
+		for (text, form) in [(&veilway, true), (&https, false)] {
+			for changed in neighbours(text) {
+				match Link::parse(&changed) {
+					Err(_) => {}
+					// A pinned link has 113 characters of fragment and an unpinned one 69: one changed character cannot be the other.
+					Ok(Link::Native(read)) => prop_assert!(read.pin().is_some() && read != native && changed == if form {read.veilway()} else {read.https()}, "{changed}"),
+					Ok(Link::Legacy(read)) => prop_assert!(!form && changed.starts_with(read.url().as_str()) && !read.url().as_str().contains(&url_base64(&token)) && !read.url().as_str().contains(&url_base64(&pin)) && read.url().literal().is_none(), "{changed}"),
+					Ok(Link::Carried(_)) => prop_assert!(false, "{changed}"),
+				}
+			}
+		}
+		// The same link without its pin is a link when its host is a name, and then it holds none. A pin never appears out of one changed character.
+		let (veilway, https) = (format!("veilway://sub/{endpoint}{bare}"), format!("https://{endpoint}{bare}"));
+		for (text, form) in [(&veilway, true), (&https, false)] {
+			let literal = endpoint.starts_with(|c: char| c.is_ascii_digit() || c == '[');
+			prop_assert_eq!(Link::parse(text).is_ok(), !literal);
+			if literal {continue}
+			for changed in neighbours(text) {
+				match Link::parse(&changed) {
+					Err(_) => {}
+					Ok(Link::Native(read)) => prop_assert!(read.pin().is_none() && changed == if form {read.veilway()} else {read.https()}, "{changed}"),
+					Ok(Link::Legacy(read)) => prop_assert!(!form && read.url().literal().is_none() && !read.url().as_str().contains(&url_base64(&token)), "{changed}"),
+					Ok(Link::Carried(_)) => prop_assert!(false, "{changed}"),
+				}
+			}
+		}
+	}
+
 	#[test]
 	fn a_document_in_a_link_reads_back_and_no_changed_character_passes_for_it(key in signing_key(), document in "[A-Za-z0-9_-]{1,40}\\.[A-Za-z0-9_-]{0,60}\\.[A-Za-z0-9_-]{86}") {
 		let content = format!("v1.{}.{document}", url_base64(&key));
@@ -180,7 +223,7 @@ proptest! {
 	}
 
 	#[test]
-	fn a_link_reader_takes_any_text(text in prop_oneof![any::<String>(), "(veilway://|https://|veilway://sub/|veilway://doc#)[ -~]{0,200}", "https://[a-z.]{1,20}/[ -~]{0,40}#v1\\.[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{22}"], bytes in vec(any::<u8>(), 0..200)) {
+	fn a_link_reader_takes_any_text(text in prop_oneof![any::<String>(), "(veilway://|https://|veilway://sub/|veilway://doc#)[ -~]{0,200}", "https://[a-z.]{1,20}/[ -~]{0,40}#v1\\.[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{22}", "(veilway://sub/|https://)[0-9a-f.:\\[\\]]{1,30}/[ -~]{0,20}#v1\\.[A-Za-z0-9_-]{43}\\.[A-Za-z0-9_-]{22}(\\.[A-Za-z0-9_-]{43})?"], bytes in vec(any::<u8>(), 0..200)) {
 		match Link::parse(&text) {
 			Err(_) => {}
 			Ok(Link::Native(native)) => prop_assert!(Link::parse(&native.veilway()) == Ok(Link::Native(native.clone())) && (text == native.veilway() || text == native.https())),
@@ -241,7 +284,7 @@ proptest! {
 	}
 
 	#[test]
-	fn a_good_document_with_one_member_changed_reads_soundly_or_not_at_all(at in any::<Index>(), value in option::of(replacement()), extra in "[a-z_]{1,12}", name in select(vec!["content", "self-signed"])) {
+	fn a_good_document_with_one_member_changed_reads_soundly_or_not_at_all(at in any::<Index>(), value in option::of(replacement()), extra in "[a-z_]{1,12}", name in select(vec!["content", "self-signed", "pinned"])) {
 		let mut document: Value = serde_json::from_slice(&seed(&format!("fuzz_subscription/{name}"))[1..]).unwrap();
 		let mut all = Vec::new();
 		pointers(&document, String::new(), &mut all);

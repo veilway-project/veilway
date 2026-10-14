@@ -6,7 +6,7 @@
 use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, public, visible, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
 use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::RangeInclusive};
+use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::{Deref, RangeInclusive}};
 
 pub use super::json::{JsonError, DEPTH_MAX, VALUES_MAX};
 
@@ -113,6 +113,24 @@ impl Id {
 	pub fn as_str(&self) -> &str {&self.0}
 }
 
+/// An entry of `refresh_urls`: "a URL string, for an endpoint whose certificate is validated by its chain, or an object with exactly `url` and `pins`" for a pinned one. It derefs to its `Url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refresh {url: Url, pins: Vec<[u8; 32]>}
+
+impl Refresh {
+	pub fn url(&self) -> &Url {&self.url}
+	/// The 1 or 2 pins a pinned entry is trusted by, none twice. Empty for an entry whose certificate is validated by its chain.
+	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
+	pub fn pinned(&self) -> bool {!self.pins.is_empty()}
+	/// What a user confirms, as `host:port`, and for a pinned entry `host:port#pinned`: "a host and port together, with whether it is pinned".
+	pub fn key(&self) -> String {if self.pinned() {format!("{}#pinned", self.url.authority())} else {self.url.authority()}}
+}
+
+impl Deref for Refresh {
+	type Target = Url;
+	fn deref(&self) -> &Url {&self.url}
+}
+
 /// What a verified payload is.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Payload {
@@ -149,7 +167,9 @@ pub struct Subscription {
 	pub provider: Text,
 	/// Seconds between automatic refreshes.
 	pub update_interval: u32,
-	pub refresh_urls: Vec<Url>,
+	pub refresh_urls: Vec<Refresh>,
+	/// "The pins of the link's endpoint", 1 or 2, none twice, or empty when the document has none. Whether it is allowed, and whether it holds a pin the client has, is for `client`: this document alone cannot say.
+	pub endpoint_pins: Vec<[u8; 32]>,
 	/// The profiles that read, in the provider's order.
 	pub profiles: Vec<Profile>,
 	/// The profiles that did not, for the app to tell the user "which profile was dropped and why".
@@ -174,7 +194,8 @@ impl Subscription {
 	/// `Provider` when any profile carries a private key.
 	pub fn origin(&self) -> KeyOrigin {if self.profiles.iter().any(|profile| profile.device.private_key.is_some()) {KeyOrigin::Provider} else {KeyOrigin::Device}}
 	/// The addresses of every `udp` and `udp-obfs` endpoint of every profile. "A cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable": the core, which computes ratings, compares each candidate's address with this set.
-	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {self.profiles.iter().flat_map(|profile| &profile.transports).flat_map(|transport| if let Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) = transport {&endpoints[..]} else {&[]}).map(|dial| dial.address().ip()).collect()}
+	/// Only the profiles' addresses, which is not the set a cap is computed from: the pinned endpoints of the link and of `refresh_urls` that are IP literals count too, and only the client knows the link. A cap uses `Held::datagram_addresses` or `Review::datagram_addresses`.
+	pub fn profile_datagram_addresses(&self) -> HashSet<IpAddr> {self.profiles.iter().flat_map(|profile| &profile.transports).flat_map(|transport| if let Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) = transport {&endpoints[..]} else {&[]}).map(|dial| dial.address().ip()).collect()}
 }
 
 /// Why a profile was refused while its document was kept.
@@ -457,6 +478,12 @@ fn key32(members: Members, name: &'static str, read: fn(&str) -> Option<[u8; 32]
 // Every `url` but a refresh URL: "an `https` URL with a host name, no user or password part, at most 512 characters".
 fn url(members: Members) -> Option<Url> {members.string("url", URL_MAX).ok().flatten().and_then(|text| Url::parse(text, URL_MAX, true, true))}
 
+// The pins of an endpoint: 1 or 2 hashes in standard base64, and not the same one twice, which would pass for a standby that is not there.
+fn pin_list(pins: &[Json]) -> Option<Vec<[u8; 32]>> {
+	let pins = pins.iter().map(|pin| if let Json::Str(text) = pin {hash(text)} else {None}).collect::<Option<Vec<_>>>()?;
+	(!pins.is_empty() && pins.len() <= 2 && (pins.len() == 1 || pins[0] != pins[1])).then_some(pins)
+}
+
 fn severity(members: Members) -> Option<Severity> {
 	match members.string("severity", STRING_MAX) {
 		Ok(Some("info")) => Some(Severity::Information),
@@ -634,7 +661,10 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let provider = need("name", text(need("provider", members.object("provider"))?, "name", true, NAME, 4 * NAME))?;
 	let update_interval = members.uint("update_interval", UPDATE_INTERVAL)?.map_or(UPDATE_DEFAULT, |seconds| seconds as u32);
 	// A refresh URL is fetched, so it is held to the limit of a subscription URL, 256 characters, and not to the 512 of a URL that is only opened.
-	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, LINK_URL_MAX, true, false)} else {None}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
+	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, LINK_URL_MAX, true, false).map(|url| Refresh {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Refresh {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
+	// "A document cannot move an entry from one kind to the other": entries with one host and port are of one kind. The link's endpoint is held to the same rule by `client`.
+	if refresh_urls.iter().enumerate().any(|(place, entry)| refresh_urls[..place].iter().any(|earlier| earlier.url.authority() == entry.url.authority() && earlier.pinned() != entry.pinned())) {return Err(PayloadError::Member("refresh_urls"))}
+	let endpoint_pins = members.list("endpoint_pins", 1..=2)?.map(|pins| pin_list(pins).ok_or("endpoint_pins")).transpose()?.unwrap_or_default();
 	let (mut profiles, mut refused) = (Vec::new(), Vec::new());
 	for (position, item) in need("profiles", members.list("profiles", 1..=PROFILES_MAX))?.iter().enumerate() {
 		match Members::of(item).ok_or(Fault::Member("profiles")).and_then(profile) {
@@ -661,5 +691,5 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None));
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;
-	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
+	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
 }
