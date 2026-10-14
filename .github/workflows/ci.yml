@@ -21,6 +21,11 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # macOS has only 127.0.0.1 on loopback; the tests dial from these as the addresses of separate visitors.
+      - name: Alias the loopback addresses the tests use
+        if: matrix.os == 'macos-latest'
+        run: |
+          for a in 127.0.1.1 $(seq -f "127.0.0.%g" 2 9) 127.0.0.77 $(seq -f "127.0.2.%g" 100 155); do sudo ifconfig lo0 alias $a up; done
       - run: cargo build --workspace --release
       - run: cargo test --workspace
       - name: Build the desktop app

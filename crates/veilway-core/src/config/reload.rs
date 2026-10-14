@@ -263,12 +263,13 @@ impl<E: fmt::Debug + fmt::Display> std::error::Error for ApplyError<E> {}
 
 /// Why `reload_from` did not get as far as the document.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Unread {Io(io::ErrorKind), Readable}
+enum Unread {Io(io::ErrorKind), #[cfg(unix)] Readable}
 
 impl fmt::Display for Unread {
 	fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 		match self {
 			Unread::Io(kind) => write!(f, "cannot read the config file: {kind}"),
+			#[cfg(unix)]
 			Unread::Readable => f.write_str("the config file can be read by group or others and holds keys and passwords; restrict it (chmod 600) or start with --allow-readable-config"),
 		}
 	}
