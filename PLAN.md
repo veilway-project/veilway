@@ -174,7 +174,7 @@ An inbound is one WireGuard tunnel (one key, one address pool) reached over one 
 
 | Kind | Types at v1 | Later |
 |---|---|---|
-| Inbound | `veilway` (WireGuard tunnel + any Veilway transport + control channel), `wireguard` (plain, for stock clients over UDP or WebSocket) | `xray:*` through the add-on (proxy protocols, TCP and UDP only) |
+| Inbound | `veilway` (WireGuard tunnel + any Veilway transport + control channel), `wireguard` (plain, for stock clients over UDP or WebSocket), `socks5` and `http` (proxy inbounds, see "Proxy inbounds") | `xray:*` through the add-on (proxy protocols, TCP and UDP only) |
 | Exit backend | `l3` (TUN + NAT on the host: every IP protocol), `chain` (forward the packets into another Veilway or WireGuard node: every IP protocol), `netstack` (userspace TCP/IP re-dialed through `direct` or `socks5`: TCP and UDP, plus ping answered by the server where it can), `block` | `xray:*` outbounds through the add-on, behind `netstack` |
 
 Many inbounds, each with its own key, address pool, transports and ports. A device belongs to the inbound whose pool holds its address, and keeps that address on every transport of the inbound. This is what "multi-inbound ports with different configs" means in the panel.
@@ -446,6 +446,13 @@ Gate: with the client connected over port 443 next to a decoy site, `ping`, DNS,
 4. Theme schema, validator, editor, import/export.
 
 Gate: screenshots of the gallery in all four combinations reviewed, contrast checks pass, a hand-written hostile theme file is rejected.
+
+### Proxy inbounds and the local proxy
+
+Decided on 2026-10-14. Two separate things:
+
+- **`socks5` and `http` inbounds on a node**, so other software can use a Veilway server as a plain proxy: a SOCKS5 inbound (CONNECT and UDP ASSOCIATE) and an HTTP proxy inbound (CONNECT for TLS, and plain requests). What comes in goes through the same router, rules, gate, exits, quotas and per-user counters as tunnel traffic, so the panel can turn a server into a SOCKS5 or HTTP proxy for one user or a group. Rules: every connection authenticates as a user (username and password per user, never shared, refused without them); the listener binds to loopback or a private address by default, and a public address needs the operator's explicit confirmation with a warning, since SOCKS5 and HTTP are plaintext and rated Unsafe; no UDP ASSOCIATE relay address that is not the node's own; per-source limits on attempts. Built after the client engine, before the panel needs it (Phase 4 shows them as inbound types).
+- **A local SOCKS5 and HTTP proxy in the apps**, for programs that do not follow the VPN (or a browser you want to send through it alone): the desktop app (and later Android) can listen on `127.0.0.1` on a port the user picks, off by default, never on another interface without a confirmation, with an optional username and password. Its traffic enters the same tunnel and the same exit as everything else. Built with the desktop app (Phase 5).
 
 ### Phase 4: panel (4 to 5 sessions)
 
