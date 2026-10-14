@@ -228,6 +228,7 @@ async fn fetched(node: &Node, request: String, stall: Duration, pace: Duration) 
 }
 
 // "An answer larger than a socket buffer read by a peer that reads slowly", pipelined requests whose answers are large, an answer that takes its time, an upgrade of the origin's own, a reset in the middle of an answer and an origin that says `100 Continue`: against an origin written by hand, which keeps every connection.
+#[cfg_attr(not(target_os = "linux"), ignore = "a slow reader on a shared Windows or macOS runner stalls past any fixed wait, see G59")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_an_origin_does_to_a_connection_is_what_the_visitor_gets() {
 	let time = time!();
