@@ -144,6 +144,9 @@ pub async fn ping(shared: Arc<Shared>, plan: Arc<Plan>, exit: usize, to: Holder,
 					// Some systems hand back the IPv4 header in front of the message.
 					let message = if dst.is_ipv4() && reply[0] >> 4 == 4 {reply[..n].get(usize::from(reply[0] & 0x0f) * 4..)} else {Some(&reply[..n])};
 					let Some(message) = message.filter(|message| message.len() >= 8 && message[0] == if dst.is_ipv4() {ECHO_REPLY_V4} else {ECHO_REPLY_V6}) else {continue};
+					// macOS hands every ping socket of this host the replies to all the others, and keeps the identifier the request was sent with, so a reply is this ping's only when it carries the device's identifier.
+					#[cfg(target_os = "macos")]
+					if message[4..6] != ident.to_be_bytes() {continue}
 					let (seq, mut out) = (u16::from_be_bytes([message[6], message[7]]), Vec::with_capacity(message.len() + 40));
 					let built = match (dst, src) {
 						(IpAddr::V4(dst), IpAddr::V4(src)) => PacketBuilder::ipv4(dst.octets(), src.octets(), 64).icmpv4_echo_reply(ident, seq).write(&mut out, &message[8..]),

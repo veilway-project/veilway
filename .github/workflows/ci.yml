@@ -27,7 +27,7 @@ jobs:
         run: |
           for a in 127.0.1.1 $(seq -f "127.0.0.%g" 2 9) 127.0.0.77 $(seq -f "127.0.2.%g" 100 155); do sudo ifconfig lo0 alias $a up; done
       - run: cargo build --workspace --release
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
       - name: Build the desktop app
         if: matrix.os == 'windows-latest'
         shell: pwsh
