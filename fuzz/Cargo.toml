@@ -16,6 +16,8 @@ veilway-engine={path="../crates/veilway-engine", features=["fuzz"]}
 veilway-proto={path="../crates/veilway-proto"}
 # The client_* targets drive what the client's side of the transports reads from the network.
 veilway-transport={path="../crates/veilway-transport"}
+# The linux_netlink target drives what the Linux layer reads from the kernel.
+veilway-linux={path="../crates/veilway-linux"}
 # The obfs_listener target drives real WireGuard peers against the node's listener.
 veilway-wg={path="../crates/veilway-wg"}
 # The chunk target seals plaintexts itself, with the library the crate opens them with, and the subscription targets sign documents with it.
@@ -237,6 +239,13 @@ bench=false
 [[bin]]
 name="engine_tcp"
 path="fuzz_targets/engine_tcp.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="linux_netlink"
+path="fuzz_targets/linux_netlink.rs"
 test=false
 doc=false
 bench=false

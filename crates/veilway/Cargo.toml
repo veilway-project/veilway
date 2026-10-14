@@ -29,6 +29,14 @@ veilway-api={path="../veilway-api"}
 # The one `access` call `doctor` asks the system with whether a directory can be written.
 libc.workspace=true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# `connect`, `disconnect` and `status`: the client engine and its Linux layer.
+veilway-engine={path="../veilway-engine"}
+veilway-linux={path="../veilway-linux"}
+ipnet.workspace=true
+# Whether the client runs as root, which decides where it keeps its files.
+rustix={workspace=true, features=["process"]}
+
 [dev-dependencies]
 rcgen.workspace=true
 # The hash at the end of a replay file that a test writes by hand.

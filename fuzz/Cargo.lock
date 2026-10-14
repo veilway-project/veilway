@@ -1563,9 +1563,29 @@ dependencies = [
  "tokio",
  "veilway-core",
  "veilway-engine",
+ "veilway-linux",
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",
+]
+
+[[package]]
+name = "veilway-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "libc",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+ "veilway-engine",
+ "veilway-proto",
+ "veilway-transport",
 ]
 
 [[package]]

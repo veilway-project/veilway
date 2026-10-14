@@ -68,4 +68,6 @@ One check of `veilway-proto` is neither a fuzz target nor part of an ordinary te
 docker run --rm -v "$PWD":/w -v veilway-target:/w/target -v veilway-cargo:/usr/local/cargo -w /w rust:1 cargo test -p veilway-proto --release --locked --test timing -- --ignored --nocapture
 ```
 
+`linux_netlink` feeds bytes to what the Linux layer of the client reads from the kernel (`veilway_linux::netlink`): a packet cut into messages (`split`), and the links, addresses and routes of a dump. The payloads cut out of a packet must fit in it and must come out the same when put back into messages and cut again, and every route that is read must be of the family and table asked for, with a prefix no longer than its address. The kernel is not hostile, so this holds a reader that must not panic the client or turn into a route it later tries to remove, and not a security boundary. It needs no seeds or dictionary: replace `config` with `linux_netlink` in the command above, drop the `fuzz/corpus/config` and `-dict` arguments and use `-max_len=4096`.
+
 New inputs go to the first corpus directory (`/tmp/corpus`, lost with the container), so the tracked seeds in `fuzz/corpus/config/` stay as written. To keep a good new input, copy it into the seed directory by hand. A crash is saved under `fuzz/artifacts/config/`; shrink it with `cargo fuzz tmin config <file>`.
