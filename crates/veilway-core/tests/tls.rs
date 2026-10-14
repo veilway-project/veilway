@@ -1464,13 +1464,13 @@ async fn the_end_of_an_answer_never_stays_in_the_node() {
 	node.engine.shutdown().await;
 }
 
-// "When the origin closes, the peer is closed only after all of it has been handed on": the origin closes behind each answer, and the peers read eight seconds later. Only the pool's own rule ends a relayed connection before its peer has taken everything.
+// "When the origin closes, the peer is closed only after all of it has been handed on": the origin closes behind each answer, and the peers read eight seconds later. A peer is given up on after 15 s of nothing, since a BSD kernel (macOS) can leave a reader waiting for its persist timer for longer than three. Only the pool's own rule ends a relayed connection before its peer has taken everything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_answer_the_origin_closed_behind_reaches_a_peer_that_reads_late() {
 	let time = time!();
 	let node = launch_at("closed-behind", time, raw().await, |_| {}).await;
 	let sizes: Vec<usize> = (1..=60).map(|step| step * 96 * 1024).collect();
-	let cut = short(&node, &sizes, false, Duration::from_secs(8), Duration::from_secs(3), Duration::ZERO).await;
+	let cut = short(&node, &sizes, false, Duration::from_secs(8), Duration::from_secs(15), Duration::ZERO).await;
 	assert!(cut.is_empty(), "answers that were cut, as (size, missing): {cut:?}, and what the node logged of relayed connections: {:?}", LOGS.lock().unwrap().split(|byte| *byte == b'\n').filter(|line| String::from_utf8_lossy(line).contains("a relayed connection ended")).map(|line| String::from_utf8_lossy(line).into_owned()).take(8).collect::<Vec<_>>());
 	eventually("a relayed connection outlived its end", || node.totals().relayed == 0).await;
 	node.engine.shutdown().await;
