@@ -29,7 +29,8 @@ scripts = sorted(set(script.values()) - {"Common", "Inherited"})
 # A letter with a script of its own, by the number of that script. Common and Inherited are left out: two letters of no script do not share one.
 letters = {point: scripts.index(script[point]) + 1 for point, value in category.items() if value[0] == "L" and script.get(point) in scripts}
 joins = {point: " TLDR".index(value) for point, value in joining.items() if value in ("T", "L", "D", "R")}
-viramas = sorted(point for point, value in combining.items() if value == "9")
+# A virama by the number of its script, as LETTERS numbers it. 0 is one whose Script is Common or Inherited, which is the script of no letter.
+viramas = {point: scripts.index(script[point]) + 1 if script.get(point) in scripts else 0 for point, value in combining.items() if value == "9"}
 # Every character that is not strong left to right, which is the class of whatever the file does not list: 2 for a strong right-to-left one (R and AL), 1 for the rest.
 weak = {point: 2 if value in ("R", "AL") else 1 for point, value in bidi.items() if value != "L"}
 
@@ -42,9 +43,9 @@ def table(name, values, about):
     lines = "\n".join("\t" + " ".join(f"({first:#x}, {extent}, {value})," for first, extent, value in rows[at:at + 8]) for at in range(0, len(rows), 8))
     return f"// {about}\nconst {name}: [(u32, u16, u8); {len(rows)}] = [\n{lines}\n];\n"
 
-print("VIRAMAS", len(viramas), "characters,", 4 * len(viramas), "bytes")
+print("VIRAMAS and VIRAMA_SCRIPTS", len(viramas), "characters,", 5 * len(viramas), "bytes, in", len(set(viramas.values()) - {0}), "scripts, of no script of their own:", [f"{point:#x}" for point in sorted(viramas) if viramas[point] == 0])
 print("scripts", len(scripts), "joining letters outside LETTERS", sum(1 for point, value in joins.items() if value > 1 and point not in letters))
-out = f"""//! Four facts about a character, from the Unicode Character Database {VERSION}: the script of a letter, how it joins, whether it is a virama, and whether it has a strong direction.
+out = f"""//! Four facts about a character, from the Unicode Character Database {VERSION}: the script of a letter, how it joins, whether it is a virama and of which script, and whether it has a strong direction.
 //! This file is written by `scripts/unicode-tables.py` and is never edited by hand. Every table is sorted, and a row is the first character of a range, the number of characters that follow it in the range, and the value.
 
 /// How a character joins its neighbours in cursive writing (Joining_Type), as far as the display filter asks.
@@ -62,8 +63,9 @@ pub(crate) enum Joining {{
 {table("LETTERS", letters, f"General_Category L with a Script other than Common and Inherited. The value is the number of the script among the {len(scripts)} of this version, in the order of their names, from 1.")}
 {table("JOINING", joins, "Joining_Type T, L, D and R, as 1, 2, 3 and 4.")}
 {table("WEAK", weak, "Bidi_Class other than L, which is the class of every character that is not here: 2 for R and AL, 1 for all the others.")}
-// Canonical_Combining_Class 9.
-const VIRAMAS: [u32; {len(viramas)}] = [{", ".join(f"{point:#x}" for point in viramas)}];
+// Canonical_Combining_Class 9, and the Script of each in the same order, numbered as in LETTERS. 0 is a virama whose Script is Common or Inherited.
+const VIRAMAS: [u32; {len(viramas)}] = [{", ".join(f"{point:#x}" for point in sorted(viramas))}];
+const VIRAMA_SCRIPTS: [u8; {len(viramas)}] = [{", ".join(str(viramas[point]) for point in sorted(viramas))}];
 
 fn find(table: &[(u32, u16, u8)], c: char) -> u8 {{
 	let at = table.partition_point(|row| row.0 <= c as u32);
@@ -75,8 +77,8 @@ pub(crate) fn letter(c: char) -> Option<u8> {{Some(find(&LETTERS, c)).filter(|sc
 
 pub(crate) fn joining(c: char) -> Joining {{[Joining::Other, Joining::Transparent, Joining::Left, Joining::Dual, Joining::Right][usize::from(find(&JOINING, c)).min(4)]}}
 
-/// Whether the character has Canonical_Combining_Class 9.
-pub(crate) fn virama(c: char) -> bool {{VIRAMAS.binary_search(&(c as u32)).is_ok()}}
+/// The script of a virama (Canonical_Combining_Class 9), numbered as `letter` numbers it. `None` for every other character, and for a virama of no script of its own (Common and Inherited), which is the virama of no letter.
+pub(crate) fn virama(c: char) -> Option<u8> {{VIRAMAS.binary_search(&(c as u32)).ok().map(|at| VIRAMA_SCRIPTS[at]).filter(|script| *script != 0)}}
 
 /// `Some(true)` for a strong right-to-left character (Bidi_Class R and AL), `Some(false)` for a strong left-to-right one (L), `None` for every other.
 pub(crate) fn strong(c: char) -> Option<bool> {{[Some(false), None, Some(true)][usize::from(find(&WEAK, c)).min(2)]}}

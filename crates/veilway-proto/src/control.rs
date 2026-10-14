@@ -190,7 +190,7 @@ pub fn is_tag(tag: &str) -> bool {(1..=TAG_MAX).contains(&tag.len()) && tag.byte
 
 /// Text from a node made fit to show: control, bidirectional formatting, zero-width and other invisible characters are removed first, then the rest is cut to `chars` characters and `bytes` bytes, whichever ends it sooner ("Framing" and "What a malicious node can do"). Text is cut, never refused.
 /// The removed set is every control character and the format and filler characters that render as nothing or reorder text, the blank braille pattern, the object replacement character, the format controls of shorthand and of Egyptian hieroglyphs, the private use characters, whose look is whatever a font says, and the noncharacters. The config applies a list of the same kind to exit names (`veilway-core`, `config/validate.rs`), which is shorter than this one and keeps no joiner.
-/// The two joiners, U+200C and U+200D, are kept exactly where "The display filter" keeps them and removed everywhere else: after a virama when a letter of the script of the letter before the virama follows, and for U+200C between two joining letters of one script. They are judged in the text that is left once everything else is gone, and a kept joiner counts as a character of the limit.
+/// The two joiners, U+200C and U+200D, are kept exactly where "The display filter" keeps them and removed everywhere else: after a virama when a letter of the script of the letter before the virama follows and the virama is of that script too, and for U+200C between two joining letters of one script. They are judged in the text that is left once everything else is gone, and a kept joiner counts as a character of the limit.
 pub fn display(text: &str, chars: usize, bytes: usize) -> String {
 	let clean: String = text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{ad}' | '\u{34f}' | '\u{61c}' | '\u{115f}' | '\u{1160}' | '\u{17b4}' | '\u{17b5}' | '\u{180b}'..='\u{180f}' | '\u{200b}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{3164}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}' | '\u{ffa0}' | '\u{fff9}'..='\u{fffb}' | '\u{1d173}'..='\u{1d17a}' | '\u{e0000}'..='\u{e0fff}' | '\u{2800}' | '\u{fff0}'..='\u{fff8}' | '\u{fffc}' | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{e000}'..='\u{f8ff}' | '\u{f0000}'..='\u{ffffd}' | '\u{100000}'..='\u{10fffd}' | '\u{fdd0}'..='\u{fdef}') && *c as u32 & 0xfffe != 0xfffe).collect();
 	// Whether the joiner at `at` of `text` stays. Rule 1 needs no line of its own: a joiner is no virama, no letter and no mark that joining passes through, so a joiner next to another fails both rules below, and so does the other.
@@ -199,7 +199,7 @@ pub fn display(text: &str, chars: usize, bytes: usize) -> String {
 		let (before, after) = (&text[..at], &text[at + 3..]);
 		let (mut back, next) = (before.chars().rev(), after.chars().next());
 		let (through, forwards, backwards) = (|c: &char| joining(*c) != Joining::Transparent, |c: &char| matches!(joining(*c), Joining::Left | Joining::Dual), |c: &char| matches!(joining(*c), Joining::Right | Joining::Dual));
-		let conjunct = back.next().is_some_and(virama) && back.next().and_then(letter).is_some_and(|script| next.and_then(letter) == Some(script));
+		let conjunct = back.next().and_then(virama).is_some_and(|script| back.next().and_then(letter) == Some(script) && next.and_then(letter) == Some(script));
 		conjunct || (text[at..].starts_with('\u{200c}') && before.chars().rev().find(through).filter(forwards).and_then(letter).is_some_and(|script| after.chars().find(through).filter(backwards).and_then(letter) == Some(script)))
 	};
 	let (mut shown, mut count) = (String::new(), 0);
@@ -1038,6 +1038,12 @@ mod tests {
 			("arabic and syriac", "ب\u{200c}ܒ", "بܒ"),
 			("devanagari and bengali", "क्\u{200d}ক", "क्ক"),
 			("virama after latin, another script after", "a\u{94d}\u{200d}क", "a\u{94d}क"),
+			// The virama is of the script of the letters around it as well: a Devanagari one between two Latin letters keeps no joiner, and neither does a Bengali one between two Devanagari letters or a Devanagari one between two Sinhala letters.
+			("latin around a devanagari virama", "a\u{94d}\u{200d}b", "a\u{94d}b"),
+			("latin around a devanagari virama, U+200C", "a\u{94d}\u{200c}b", "a\u{94d}b"),
+			("devanagari around a bengali virama", "क\u{9cd}\u{200d}ष", "क\u{9cd}ष"),
+			("devanagari around a bengali virama, U+200C", "क\u{9cd}\u{200c}ष", "क\u{9cd}ष"),
+			("sinhala around a devanagari virama", "ශ\u{94d}\u{200d}රී", "ශ\u{94d}රී"),
 			// A joiner at each edge.
 			("at the start", "\u{200c}سلام", "سلام"),
 			("at the end", "سلام\u{200c}", "سلام"),
@@ -1084,7 +1090,7 @@ mod tests {
 				let (mut left, mut right) = (place - 1, place + 1);
 				while left > 0 && joining(at[left]) == Joining::Transparent {left -= 1}
 				while right + 1 < at.len() && joining(at[right]) == Joining::Transparent {right += 1}
-				let conjunct = place >= 2 && virama(at[place - 1]) && letter(at[place - 2]).is_some() && letter(at[place - 2]) == letter(at[place + 1]);
+				let conjunct = place >= 2 && virama(at[place - 1]).is_some() && virama(at[place - 1]) == letter(at[place - 2]) && letter(at[place - 2]) == letter(at[place + 1]);
 				let cursive = at[place] == '\u{200c}' && matches!(joining(at[left]), Joining::Left | Joining::Dual) && matches!(joining(at[right]), Joining::Right | Joining::Dual) && letter(at[left]).is_some() && letter(at[left]) == letter(at[right]);
 				prop_assert!(conjunct || cursive, "a joiner the rule does not keep");
 			}

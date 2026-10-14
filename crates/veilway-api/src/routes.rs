@@ -445,12 +445,35 @@ impl Api {
 			let (up, down) = rates.get(&(kind, name)).copied().unwrap_or_default();
 			model::Rated {name: name.to_string(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down}
 		};
+		// An outbound counts nothing itself: its numbers are those of its exits, added up here. Exits are matched by tag, because the document and the counters are read one after the other and a reload may come in between.
+		let (snapshot, health) = (self.engine.snapshot(), self.engine.exit_health());
+		let through: HashMap<&str, &str> = snapshot.config.exits.iter().filter_map(|exit| if let veilway_core::config::Backend::Netstack(netstack) = &exit.backend {Some((exit.tag.as_str(), netstack.outbound.as_str()))} else {None}).collect();
+		let mut sums: HashMap<&str, (veilway_core::Totals, (u64, u64), Option<Duration>, u64)> = HashMap::new();
+		for (tag, totals) in &counters.exits {
+			let Some(sum) = through.get(tag.as_str()).map(|outbound| sums.entry(*outbound).or_default()) else {continue};
+			let (up, down) = rates.get(&(crate::EXIT, tag.as_str())).copied().unwrap_or_default();
+			(sum.0, sum.1) = (veilway_core::Totals {up_packets: sum.0.up_packets + totals.up_packets, up_bytes: sum.0.up_bytes + totals.up_bytes, down_packets: sum.0.down_packets + totals.down_packets, down_bytes: sum.0.down_bytes + totals.down_bytes}, (sum.1.0 + up, sum.1.1 + down));
+		}
+		for health in &health {
+			let Some(sum) = through.get(health.exit.as_str()).map(|outbound| sums.entry(*outbound).or_default()) else {continue};
+			(sum.2, sum.3) = ([sum.2, health.no_udp].into_iter().flatten().min(), sum.3 + health.udp_flips);
+		}
 		let (dns, control, obfs) = (self.engine.dns(), self.engine.control(), self.engine.obfs());
 		model::Stats {
 			window_secs: window,
 			users: counters.users.iter().map(|usage| rated(crate::USER, &usage.name, usage.traffic)).collect(),
 			inbounds: counters.inbounds.iter().map(|(tag, totals)| rated(crate::INBOUND, tag, *totals)).collect(),
 			exits: counters.exits.iter().map(|(tag, totals)| rated(crate::EXIT, tag, *totals)).collect(),
+			outbounds: snapshot.config.outbounds.iter().map(|outbound| {
+				let (tag, proxied) = match outbound {
+					Outbound::Direct {tag, ..} => (tag, false),
+					Outbound::Socks5 {tag, ..} => (tag, true),
+				};
+				let (totals, (up, down), refused, flips) = sums.get(tag.as_str()).copied().unwrap_or_default();
+				// Only a SOCKS5 proxy can refuse to relay UDP, as in `exits`.
+				let refused = refused.filter(|_| proxied);
+				model::OutboundStats {name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}}
+			}).collect(),
 			drops: Reason::ALL.iter().map(|reason| (reason.name().to_string(), self.engine.dropped(*reason))).collect(),
 			dns: model::Dns {answered: dns.answered, refused: dns.refused, failed: dns.failed, malformed: dns.malformed, throttled: dns.throttled},
 			flows: self.engine.flows(),
