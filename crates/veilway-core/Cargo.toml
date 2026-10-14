@@ -30,6 +30,9 @@ socket2.workspace=true
 # The `tls` transport: the node ends TLS itself, with the library the built `ws` already ends it with.
 tokio-rustls.workspace=true
 rustls.workspace=true
+# The client side of the native transports, which a node link this node dials is opened with, and the root certificates its TLS is validated against when no other roots are given.
+veilway-transport={path="../veilway-transport"}
+webpki-roots.workspace=true
 
 # The one ioctl that makes the TUN device of an l3 exit on Linux, and the flags the state file is opened with.
 [target.'cfg(unix)'.dependencies]
@@ -50,7 +53,5 @@ rcgen.workspace=true
 hyper.workspace=true
 hyper-util.workspace=true
 http-body-util.workspace=true
-# The tests of the client library against this node (`tests/client.rs`). The library does not depend on this crate, so there is no cycle.
-veilway-transport={path="../veilway-transport"}
 # The tests of the proxy path wait five minutes for a connection to be given up, on a clock that is paused and moved for them.
 tokio={workspace=true, features=["test-util"]}

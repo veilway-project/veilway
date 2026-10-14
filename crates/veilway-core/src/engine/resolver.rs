@@ -141,16 +141,23 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 		}
 		// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
 		// Without `masquerade` the operator decides where that traffic goes, which the node cannot know, so such an exit carries no query of the node's resolver rather than one that takes another way out.
+		// A `chain` exit carries the query into its link like any other packet, see `chain`.
 		let outbound = match &plan.exits[exit].backend {
-			Backend::Netstack {outbound, ..} => outbound,
-			Backend::L3 {masquerade: true, ..} => &flows::AROUND,
+			Backend::Netstack {outbound, ..} => Some(outbound),
+			Backend::L3 {masquerade: true, ..} => Some(&flows::AROUND),
+			Backend::Chain {..} => None,
 			_ => continue,
 		};
 		let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {continue};
 		// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
-		if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != server.is_ipv4()) {continue}
-		plan.exits[exit].traffic.up(message.len());
-		let Some(answer) = flows::lookup(outbound, *server, &message).await else {
+		if matches!(outbound, Some(Outbound::Direct {bind: Some(bind)}) if bind.is_ipv4() != server.is_ipv4()) {continue}
+		// A `chain` exit counts the query once it went into a link, which it does not while no link is up.
+		if outbound.is_some() {plan.exits[exit].traffic.up(message.len())}
+		let found = match outbound {
+			Some(outbound) => flows::lookup(outbound, *server, &message).await,
+			None => shared.lookup_through(&plan, exit, *server, &message).await,
+		};
+		let Some(answer) = found else {
 			if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) stopped answering through exit {}", at + 1, set.servers.len(), listed(), plan.show(server), plan.exits[exit].tag)}
 			continue;
 		};

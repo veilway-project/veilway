@@ -11,7 +11,7 @@ use subtle::ConstantTimeEq;
 pub mod client;
 pub mod envelope;
 pub mod fetch;
-mod json;
+pub(crate) mod json;
 pub mod legacy;
 pub mod link;
 pub mod payload;

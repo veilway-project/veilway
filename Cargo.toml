@@ -47,6 +47,10 @@ proptest={version="1", default-features=false, features=["std"]}
 # HPKE (RFC 9180) for the stream proof, from a library so that nothing of it is written here. Pinned to the exact version whose output is checked against the RFC's vectors in veilway-proto: 0.14 is the maintained line, and a new version is a decision, not an update. It has had no paid audit, and it brings a second curve25519 and a second ChaCha20-Poly1305 next to the ones boringtun and ring already bring.
 hpke={version="=0.14.1", default-features=false, features=["x25519", "chacha"]}
 subtle={version="2.6", default-features=false}
+# X25519 for the one key agreement of node link pairing, as a plain function over bytes the caller drew. It is the version `hpke` brings already, and no feature of it is on.
+x25519-dalek={version="3", default-features=false}
+# The Mozilla root certificates, which the TLS of a node link's dialler is validated against. `tokio-tungstenite` brings the same crate already.
+webpki-roots="1"
 
 
 # ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout, and it blocks in the Drop of a TCP stream, which kept a node with open flows from ever exiting. See vendor/ipstack ("veilway patch").

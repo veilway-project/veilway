@@ -229,7 +229,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 						Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind)}, ..} if bind.is_ipv4() != target.is_ipv4() => refused(Reason::Unsupported, true),
 						Backend::Netstack {outbound, ..} => (Decision::Exit {exit, by: By::Via(next)}, Some((outbound, next))),
 						Backend::L3 {..} => (Decision::Exit {exit, by: By::Via(next)}, None),
-						Backend::Block => refused(Reason::Unsupported, true),
+						Backend::Block | Backend::Chain {..} => refused(Reason::Unsupported, true),
 					},
 					Fallback::Drop => refused(Reason::Unsupported, false),
 					_ => refused(Reason::Unsupported, true),

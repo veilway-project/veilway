@@ -19,6 +19,10 @@ pub const QUOTE_V6: usize = 1280 - 40 - 8;
 /// ICMP errors one device is sent at once, and how many more it earns each second.
 pub const BURST: u32 = 20;
 pub const PER_SECOND: u32 = 10;
+/// The same for a node link at its exit, and the direct pings one link may have in flight (node links page, "Numbers that are judgement calls").
+pub const LINK_BURST: u32 = 200;
+pub const LINK_PER_SECOND: u32 = 100;
+pub const LINK_PINGS: usize = 256;
 /// ICMP messages that ask something: echo and its reply, router advertisement and solicitation, timestamp, information and address mask. Every other type is treated as an error.
 const QUERIES_V4: [u8; 10] = [0, 8, 9, 10, 13, 14, 15, 16, 17, 18];
 const REDIRECT_V6: u8 = 137;
@@ -91,15 +95,18 @@ pub fn error(raw: &[u8], packet: &Packet, kind: Kind, from: IpAddr, pools: &[(Ip
 }
 
 /// The share of ICMP errors one device is sent: `BURST` at once, then `PER_SECOND` a second. Without it a device could make the node write an error for every packet it throws at a closed door.
-pub struct Limit {left: u32, since: Instant}
+pub struct Limit {left: u32, since: Instant, burst: u32, rate: u32}
 
 impl Limit {
-	pub fn new(now: Instant) -> Limit {Limit {left: BURST, since: now}}
+	pub fn new(now: Instant) -> Limit {Limit {left: BURST, since: now, burst: BURST, rate: PER_SECOND}}
+
+	/// The share of a node link at its exit, which covers resets as well: "ICMP errors and resets the exit sends a link: 200 at once, then 100 a second."
+	pub fn link(now: Instant) -> Limit {Limit {left: LINK_BURST, since: now, burst: LINK_BURST, rate: LINK_PER_SECOND}}
 
 	/// Whether one more error may be sent at `now`.
 	pub fn take(&mut self, now: Instant) -> bool {
-		let earned = (now.saturating_duration_since(self.since).as_millis().saturating_mul(u128::from(PER_SECOND)) / 1000).min(u128::from(BURST)) as u32;
-		if earned > 0 {(self.left, self.since) = ((self.left + earned).min(BURST), now)}
+		let earned = (now.saturating_duration_since(self.since).as_millis().saturating_mul(u128::from(self.rate)) / 1000).min(u128::from(self.burst)) as u32;
+		if earned > 0 {(self.left, self.since) = ((self.left + earned).min(self.burst), now)}
 		if self.left == 0 {return false}
 		self.left -= 1;
 		true

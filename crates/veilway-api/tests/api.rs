@@ -535,6 +535,9 @@ async fn every_route_answers() {
 	assert!(!String::from_utf8_lossy(&sessions.body).contains("127.0.0.1"), "a session shows where its device connects from");
 	let exits = get(&node.socket, "/v1/exits").await;
 	ask("GET", "/v1/exits");
+	// A node without links lists none.
+	assert_eq!(get(&node.socket, "/v1/links").await.json, json!({"links": []}));
+	ask("GET", "/v1/links");
 	assert_eq!(exits.json["exits"].as_array().map(Vec::len), Some(2));
 	let (main, sink) = (&exits.json["exits"][0], &exits.json["exits"][1]);
 	assert_eq!((&main["tag"], &main["name"], &main["backend"], &main["outbound"], &main["udp"], &main["udp_down_secs"], &main["udp_flips"]), (&json!("main"), &json!("Main"), &json!("netstack"), &json!("proxy"), &json!(true), &Value::Null, &json!(0)), "{main}");
@@ -1474,7 +1477,7 @@ async fn a_replay_reset_is_written_before_it_is_answered_and_touches_no_usage() 
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/links"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();

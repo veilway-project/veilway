@@ -521,7 +521,7 @@ fn exit(members: Members) -> Option<Exit> {
 }
 
 // One or two addresses of a tunnel: "at most one IPv4 and one IPv6, IPv4 first, inside the ranges the config reference allows for a pool".
-fn addresses(members: Members, name: &'static str) -> Named<Vec<IpAddr>> {
+pub(crate) fn addresses(members: Members, name: &'static str) -> Named<Vec<IpAddr>> {
 	let read = need(name, members.list(name, 1..=2))?.iter().map(|item| if let Json::Str(text) = item {text.parse().ok().filter(|address| pool(*address))} else {None}.ok_or(name)).collect::<Named<Vec<IpAddr>>>()?;
 	if read.len() == 2 && !(read[0].is_ipv4() && read[1].is_ipv6()) {return Err(name)}
 	Ok(read)
@@ -547,7 +547,7 @@ fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
 	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default()})
 }
 
-fn transport(value: &Json) -> Result<Transport, Fault> {
+pub(crate) fn transport(value: &Json) -> Result<Transport, Fault> {
 	let members = Members::of(value).ok_or("transports")?;
 	let endpoints = || need("endpoints", members.list("endpoints", 1..=CANDIDATES_MAX))?.iter().map(|item| if let Json::Str(text) = item {Dial::parse(text)} else {None}.ok_or("endpoints")).collect::<Named<Vec<_>>>();
 	let stream = |rule: Pins| -> Named<Stream> {

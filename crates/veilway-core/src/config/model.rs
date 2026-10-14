@@ -1,6 +1,6 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
-use base64::engine::general_purpose::STANDARD;
+use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
@@ -519,6 +519,10 @@ pub struct Config {
 	/// The replay memory of the obfuscated transports. Only a node with such a transport keeps one.
 	#[serde(default, skip_serializing_if = "Replay::is_default")]
 	pub replay: Replay,
+	/// The node links of this node: each joins it to one other node, so that users connect to one of the two and their traffic leaves from the other.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_LINKS))]
+	pub links: Vec<Link>,
 }
 
 /// Accepted proofs one source may bring: `burst` at once, then `rate` a second. A source is an IPv4 address or an IPv6 /64.
@@ -991,13 +995,22 @@ pub struct L3 {
 	pub masquerade: Option<bool>,
 }
 
+/// The entry half of node links: what is routed to the exit leaves from another node, through one of these links.
+#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Chain {
+	/// The tags of 1 to 4 links that lead to the same exit node. Each is a link whose entry half this node is.
+	#[schemars(length(min = 1, max = MAX_CHAIN_LINKS), inner(pattern(TAG_PATTERN)))]
+	pub links: Vec<String>,
+}
+
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Backend {Netstack(Netstack), L3(L3), Block {}}
+pub enum Backend {Netstack(Netstack), L3(L3), Block {}, Chain(Chain)}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BackendType {Netstack, L3, Block}
+enum BackendType {Netstack, L3, Block, Chain}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1011,6 +1024,7 @@ struct BackendKeys {
 	unsupported: Option<Unsupported>,
 	interface: Option<String>,
 	masquerade: Option<bool>,
+	links: Option<Vec<String>>,
 }
 
 impl<'de> Deserialize<'de> for Backend {
@@ -1018,6 +1032,13 @@ impl<'de> Deserialize<'de> for Backend {
 		let keys = BackendKeys::deserialize(d)?;
 		let netstack = [("outbound", keys.outbound.is_some()), ("proxy_only", keys.proxy_only.is_some()), ("tcp_idle_secs", keys.tcp_idle_secs.is_some()), ("udp_idle_secs", keys.udp_idle_secs.is_some()), ("unsupported", keys.unsupported.is_some())];
 		let l3 = [("interface", keys.interface.is_some()), ("masquerade", keys.masquerade.is_some())];
+		// "A `chain` exit carries whole packets of every IP protocol, so the per-exit `unsupported` policies of the config reference do not exist for it."
+		if let BackendType::Chain = keys.kind {return only("chain", &netstack).and_then(|_| only("chain", &l3)).and_then(|_| Ok(Backend::Chain(Chain {links: keys.links.ok_or_else(|| de::Error::missing_field("links"))?})))}
+		only(match keys.kind {
+			BackendType::Netstack => "netstack",
+			BackendType::L3 => "l3",
+			_ => "block",
+		}, &[("links", keys.links.is_some())])?;
 		match keys.kind {
 			BackendType::Netstack => {
 				only("netstack", &l3)?;
@@ -1030,7 +1051,7 @@ impl<'de> Deserialize<'de> for Backend {
 				}))
 			}
 			BackendType::L3 => only("l3", &netstack).map(|_| Backend::L3(L3 {interface: keys.interface, masquerade: keys.masquerade})),
-			BackendType::Block => only("block", &netstack).and_then(|_| only("block", &l3)).map(|_| Backend::Block {}),
+			_ => only("block", &netstack).and_then(|_| only("block", &l3)).map(|_| Backend::Block {}),
 		}
 	}
 }
@@ -1049,7 +1070,7 @@ pub struct Routing {
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend(
-	"anyOf" = [{"required": ["inbound"]}, {"required": ["user"]}, {"required": ["group"]}, {"required": ["ip"]}, {"required": ["domain"]}, {"required": ["protocol"]}, {"required": ["port"]}, {"required": ["icmp_type"]}, {"required": ["icmp_code"]}],
+	"anyOf" = [{"required": ["inbound"]}, {"required": ["user"]}, {"required": ["group"]}, {"required": ["link"]}, {"required": ["ip"]}, {"required": ["domain"]}, {"required": ["protocol"]}, {"required": ["port"]}, {"required": ["icmp_type"]}, {"required": ["icmp_code"]}],
 	"dependentRequired" = {"port": ["protocol"], "icmp_type": ["protocol"], "icmp_code": ["icmp_type"]},
 ))]
 pub struct Rule {
@@ -1067,6 +1088,10 @@ pub struct Rule {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_RULE_ENTRIES), inner(pattern(NAME_PATTERN)))]
 	pub group: Option<Vec<String>>,
+	/// The tags of node links whose exit half this node is: the rule matches what arrives from one of them. A link has no user and no group.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_LINKS), inner(pattern(TAG_PATTERN)))]
+	pub link: Option<Vec<String>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_RULE_ENTRIES))]
 	pub ip: Option<Vec<IpEntry>>,
@@ -1133,4 +1158,182 @@ pub struct Device {
 	pub transport_secrets: Option<Vec<TransportSecret>>,
 	#[schemars(length(min = 1, max = MAX_DEVICE_ADDRESSES))]
 	pub addresses: Vec<Ip>,
+}
+
+/// The id of a node link as its pairing made it: 16 bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkId(pub [u8; 16]);
+
+text_value!(LinkId, "the id of a link: 22 characters of base64url without padding", "^[A-Za-z0-9_-]{21}[AQgw]$", |s| {
+	let mut bytes = [0u8; 18];
+	if s.len() == 22 && URL_SAFE_NO_PAD.decode_slice(s, &mut bytes) == Ok(16) {Ok(LinkId(std::array::from_fn(|at| bytes[at])))} else {Err("the id of a link: 22 characters of base64url without padding")}
+}, |id| URL_SAFE_NO_PAD.encode(id.0));
+
+/// The SHA-256 of a certificate's SubjectPublicKeyInfo, written like a key. It is no key and no secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pin(pub [u8; 32]);
+
+text_value!(Pin, "a certificate pin: 44 characters of standard base64 with padding", "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", |s| {
+	match STANDARD.decode(s).ok().and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+		Some(pin) if s.len() == KEY_CHARS => Ok(Pin(pin)),
+		_ => Err("a certificate pin: 44 characters of standard base64 with padding"),
+	}
+}, |pin| STANDARD.encode(pin.0));
+
+/// Who dials. In a forward link the entry dials the exit, in a reverse link the exit dials the entry.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkDirection {Forward, Reverse}
+
+/// The addresses pairing fixed for a link, all from the inbound pool of the node the link connects to.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkAddresses {
+	/// The address of the node that dials: at most one IPv4 and one IPv6.
+	#[schemars(length(min = 1, max = 2))]
+	pub dialler: Vec<Ip>,
+	/// The link address of the node that is dialled, in a reverse link and in no other: one for each family of `dialler`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = 2))]
+	pub listener: Option<Vec<Ip>>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkTransportType {
+	#[serde(rename = "udp")] Udp,
+	#[serde(rename = "udp-obfs")] UdpObfs,
+	#[serde(rename = "tls")] Tls,
+	#[serde(rename = "ws")] Ws,
+	/// Read so that validation can say why a link has none.
+	#[serde(rename = "fronted")] Fronted,
+}
+
+/// One way to reach the other node of a link through its web server or directly, as a profile of a subscription writes a candidate.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkCandidate {
+	pub address: Addr,
+	/// The server name that is shown, or empty for none.
+	#[schemars(length(max = 253))]
+	pub sni: String,
+	/// The `Host` of the request.
+	#[schemars(length(min = 1, max = 253))]
+	pub host: String,
+	/// The name the certificate is held against when `sni` is empty, and only then.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = 253))]
+	pub verify_name: Option<String>,
+	/// Needed by a `tls` candidate. The certificate chain is always validated, and a pin is a second condition.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_LINK_PINS))]
+	pub pins: Option<Vec<Pin>>,
+}
+
+/// One transport of the node a link dials, in the shape a profile of a subscription has: `endpoints` for `udp` and `udp-obfs`, `path` and `candidates` for `tls` and `ws`.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkTransport {
+	#[serde(rename = "type")]
+	pub kind: LinkTransportType,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_LINK_CANDIDATES))]
+	pub endpoints: Option<Vec<Addr>>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
+	pub path: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_LINK_CANDIDATES))]
+	pub candidates: Option<Vec<LinkCandidate>>,
+}
+
+/// What the node that dials a link holds of the node it dials, "as the offer gave them".
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LinkPeer {
+	/// The WireGuard public key of the inbound the link connects to.
+	pub inbound_public_key: Key,
+	/// The node transport public key of that inbound. Needed when a `tls` or `ws` transport is listed.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub transport_public_key: Option<Key>,
+	/// In the other node's order of preference.
+	#[schemars(length(min = 1, max = MAX_TRANSPORTS))]
+	pub transports: Vec<LinkTransport>,
+}
+
+/// One node link, as its pairing left it on this node. A link with `inbound` and `public_key` is one this node is dialled for, and a link with `peer` and `private_key` one it dials.
+/// With `direction`, that says which half the node is: the exit half when it is dialled in a forward link or dials a reverse one, and the entry half otherwise. The entry half is used through an exit with a `chain` backend.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[schemars(extend("dependentRequired" = {"inbound": ["public_key"], "public_key": ["inbound"], "peer": ["private_key"], "private_key": ["peer"], "quota_period": ["quota_bytes"]}))]
+pub struct Link {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	pub id: LinkId,
+	pub direction: LinkDirection,
+	/// Defaults to true. A link that is not enabled is validated like any other and neither dialled nor answered.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub enabled: Option<bool>,
+	pub addresses: LinkAddresses,
+	/// Defaults to 1390 when the link lists `udp-obfs`, and to 1420 otherwise.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1280, max = 1500))]
+	pub mtu: Option<u16>,
+	/// The secret the two nodes agreed on when they were paired. It never travels.
+	pub transport_secret: TransportSecret,
+	/// On the node that is dialled: the tag of the `veilway` inbound the link connects to. That inbound carries no users' devices.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub inbound: Option<String>,
+	/// On the node that is dialled: the WireGuard public key the other node made for this link.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub public_key: Option<Key>,
+	/// On the node that dials: the WireGuard private key it made for this link.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub private_key: Option<Secret<Key>>,
+	/// On the node that dials: the other node's keys and transports.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub peer: Option<LinkPeer>,
+	/// On the exit half: the exit the link leaves through when no rule names one. Without it that is `routing.default`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub exit: Option<String>,
+	/// On the exit half, where it is needed: the exits the link may leave through. None of them is a `chain` exit.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(max = MAX_EXITS), inner(pattern(TAG_PATTERN)))]
+	pub exits: Option<Vec<String>>,
+	/// On the exit half: whether private networks are decided by the rules for this link. Defaults to false, which refuses them whatever the rules say.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub allow_private: Option<bool>,
+	/// On the exit half: the flows the link may have at once. Defaults to 16384.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 65536))]
+	pub max_flows: Option<u32>,
+	/// On the exit half. The quota and its period mean what they mean for a user.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 9007199254740991_u64))]
+	pub quota_bytes: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub quota_period: Option<QuotaPeriod>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub expires_at: Option<Timestamp>,
+}
+
+impl Link {
+	/// Whether this node is the one the link connects to. A link that validates is that or is one this node dials.
+	pub fn listener(&self) -> bool {self.inbound.is_some()}
+
+	/// Whether this node is the entry half: it has the users, and sends their packets into the link.
+	pub fn entry(&self) -> bool {self.listener() != (self.direction == LinkDirection::Forward)}
+
+	/// The entry's link address: "the dialler's address in a forward link and the listener's link address in a reverse link".
+	pub fn entry_addresses(&self) -> &[Ip] {if self.direction == LinkDirection::Forward {&self.addresses.dialler} else {self.addresses.listener.as_deref().unwrap_or(&[])}}
+
+	/// The WireGuard public key the dialling node has for the link, which is what names a link on both nodes.
+	pub fn identity(&self) -> Option<[u8; 32]> {self.public_key.map(|key| key.0).or_else(|| self.private_key.as_ref().map(|key| veilway_wg::public_key(&key.expose().0)))}
+
+	/// The `mtu` in force. `inbounds` are those of the config the link is in: a link that is dialled lists the transports of its inbound.
+	pub fn mtu(&self, inbounds: &[Inbound]) -> u16 {
+		let obfs = self.peer.as_ref().is_some_and(|peer| peer.transports.iter().any(|transport| transport.kind == LinkTransportType::UdpObfs)) || self.inbound.as_ref().is_some_and(|tag| inbounds.iter().any(|inbound| inbound.tag == *tag && inbound.enveloped()));
+		self.mtu.unwrap_or(if obfs {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})
+	}
 }

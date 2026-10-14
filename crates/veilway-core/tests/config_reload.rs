@@ -147,6 +147,7 @@ fn every_category_is_reported() {
 		doc["users"][1] = json!({"name": "carol", "exits": "all", "devices": [{"name": "tablet", "public_key": key(0x23), "addresses": ["10.9.0.2"]}]});
 	});
 	assert_eq!(d, Diff {
+		links: Changes::default(),
 		inbounds: Changes {added: names(&["lab"]), changed: names(&["home"]), removed: names(&["office"])},
 		outbounds: Changes {added: names(&["spare"]), changed: names(&["proxy"]), removed: names(&["plain"])},
 		exits: Changes {added: names(&["extra"]), changed: names(&["open"]), removed: names(&["sink"])},

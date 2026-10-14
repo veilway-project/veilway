@@ -229,6 +229,13 @@ impl Wg{
 		}
 	}
 
+	/// A fresh handshake initiation for `idx`, whatever the tunnel has under way: what the client side of a native transport opens a session with while the tunnel has none ("a fresh WireGuard datagram of the same kind" for every opening packet).
+	pub fn initiate(&mut self, idx:usize, net_out:&mut Vec<Vec<u8>>){
+		let Wg{peers, scratch, ..}=self;
+		let Some(peer)=peers.get_mut(idx).and_then(|peer| peer.as_mut()) else{return};
+		if let TunnResult::WriteToNetwork(b)=peer.tunn.format_handshake_initiation(scratch, true){net_out.push(b.to_vec())}
+	}
+
 	/// Time since that peer's last completed handshake, None while it has no live session.
 	pub fn time_since_last_handshake(&self, idx:usize)->Option<std::time::Duration>{self.peers.get(idx)?.as_ref()?.tunn.time_since_last_handshake()}
 

@@ -1,6 +1,6 @@
 //! Reloading: the running config behind a watch channel, the diff between two configs and the two-phase apply.
 //! Nothing here holds or logs a value from a document except tags, user names and device public keys.
-use super::{Backend, Config, Diagnostic, Exit, Key, Outbound, Policy, Report, Rule, Transport, User, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
+use super::{Backend, Config, Diagnostic, Exit, Key, Link, Outbound, Policy, Report, Rule, Transport, User, DEFAULT_INTERFACE, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, MAX_FILE_BYTES};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::{HashMap, HashSet};
@@ -122,6 +122,8 @@ pub struct Diff {
 	pub exits: Changes,
 	pub rules: Changes,
 	pub users: Changes,
+	/// Node links, by tag. A link whose `enabled` is left out and one that writes true are the same link.
+	pub links: Changes,
 	pub dns: bool,
 	pub log: bool,
 	pub routing_default: bool,
@@ -199,7 +201,7 @@ impl Diff {
 					l3.interface.get_or_insert_with(|| DEFAULT_INTERFACE.to_string());
 					l3.masquerade.get_or_insert(true);
 				}
-				Backend::Block {} => {}
+				Backend::Block {} | Backend::Chain(_) => {}
 			}
 			exit
 		};
@@ -212,6 +214,7 @@ impl Diff {
 			exits: changes(&old.exits, &new.exits, |exit| exit.tag.as_str(), |was, is| was == is || effective(old, was) == effective(new, is)),
 			rules: changes(&old.routing.rules, &new.routing.rules, |rule| rule.tag.as_str(), |was, is| was == is || Rule {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Rule {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
 			users,
+			links: changes(&old.links, &new.links, |link| link.tag.as_str(), |was, is| was == is || Link {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Link {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
 			dns: old.dns.servers != new.dns.servers || old.dns.hijack.unwrap_or(true) != new.dns.hijack.unwrap_or(true) || old.dns.sets != new.dns.sets,
 			// `level` and `destinations` are read with their defaults, so `Log` already holds effective values.
 			log: old.log != new.log,
@@ -329,7 +332,7 @@ impl Store {
 		let snapshot = Snapshot {config: Arc::new(config), revision, generation: running.generation + 1, report: Arc::new(report.clone())};
 		prepare(&snapshot, &diff).await.map_err(ApplyError::Prepare)?;
 		self.current.send_replace(snapshot.clone());
-		info!(generation = snapshot.generation, inbounds = %diff.inbounds, outbounds = %diff.outbounds, exits = %diff.exits, rules = %diff.rules, users = %diff.users, dns = diff.dns, log = diff.log, routing_default = diff.routing_default, rules_reordered = diff.rules_reordered, "config applied");
+		info!(generation = snapshot.generation, inbounds = %diff.inbounds, outbounds = %diff.outbounds, exits = %diff.exits, rules = %diff.rules, users = %diff.users, links = %diff.links, dns = diff.dns, log = diff.log, routing_default = diff.routing_default, rules_reordered = diff.rules_reordered, "config applied");
 		Ok(Applied {snapshot, diff, report})
 	}
 

@@ -1,6 +1,7 @@
 //! Keys, and every label of the protocol (transports page, "Keys derived from the device transport secret", "The stream proof" and the keys of `udp-obfs`).
 //!
 //! A key lives inside the opaque key type of `ring` from the moment it is made, so the types here cannot print a key, cannot be copied and cannot be compared. The one exception is `ObfsKey`: `k_obfs` is the input keying material of an HKDF, which `ring` takes as bytes, so that type keeps the 32 bytes itself. Nothing is zeroed on drop: `ring` does not zero its key types, and doing it from outside would need `unsafe` or a dependency.
+use ring::digest::{digest, SHA256};
 use ring::{aead, hkdf, hmac};
 use std::{borrow::Borrow, collections::HashMap, fmt};
 
@@ -26,6 +27,12 @@ pub(crate) const BINDER: &[u8] = b"veilway v1 binder\0";
 pub(crate) const C2S: &[u8] = b"veilway v1 c2s\0";
 pub(crate) const S2C: &[u8] = b"veilway v1 s2c\0";
 pub(crate) const SID: &[u8] = b"veilway v1 sid\0";
+// Node links: the label the pairing hash begins with, and the salt of the link's transport secret.
+pub(crate) const LINK_PAIRING: &[u8] = b"veilway v1 link pairing\0";
+const LINK_SECRET: &[u8] = b"veilway v1 link secret\0";
+// The two values of a pairing's fingerprint: the one the listener's panel shows and the dialler's accepts, and the other way round.
+const LINK_LISTENER: &[u8] = b"veilway v1 link listener\0";
+const LINK_DIALLER: &[u8] = b"veilway v1 link dialler\0";
 
 // `prk` = HKDF-Extract(salt `"veilway v1 device secret"`, ikm `S`): "Deriving the four keys below, nothing else".
 fn prk(secret: &[u8; 32]) -> hkdf::Prk {hkdf::Salt::new(hkdf::HKDF_SHA256, DEVICE_SECRET).extract(secret)}
@@ -37,6 +44,21 @@ fn truncated(key: &hmac::Key, parts: &[&[u8]]) -> [u8; 16] {
 	let mut tag = [0; 16];
 	tag.copy_from_slice(&context.sign().as_ref()[..16]);
 	tag
+}
+
+/// The transport secret of a node link (node links page, "The link's transport secret"): `S` = HKDF(salt `"veilway v1 link secret"`, ikm `shared`, info the pairing hash, 32). `shared` is what X25519 gave for the two pairing keys, and the caller has refused one that is all zero.
+/// From here on it is a device transport secret, and goes through `prk` like any other. Its label is its own, so nothing else of the protocol can be made to derive it.
+pub fn link_secret(shared: &[u8; 32], pairing_hash: &[u8; 32]) -> [u8; 32] {
+	let mut secret = [0; 32];
+	hkdf::Salt::new(hkdf::HKDF_SHA256, LINK_SECRET).extract(shared).expand(&[pairing_hash], hkdf::HKDF_SHA256).and_then(|okm| okm.fill(&mut secret)).expect("32 bytes are within the output limit of HKDF-SHA-256");
+	secret
+}
+
+/// The value of a pairing's fingerprint that the panel of the listener (`listener`) or of the dialler shows: the first 16 bytes of SHA-256(label, pairing hash). Each panel accepts only the other's, so no operator can confirm by typing what their own screen says.
+pub fn link_fingerprint(pairing_hash: &[u8; 32], listener: bool) -> [u8; 16] {
+	let mut value = [0; 16];
+	value.copy_from_slice(&digest(&SHA256, &[if listener {LINK_LISTENER} else {LINK_DIALLER}, &pairing_hash[..]].concat()).as_ref()[..16]);
+	value
 }
 
 /// `k_ctl`, the key of the control channel credential, for one device transport secret on one inbound.

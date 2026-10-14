@@ -2012,6 +2012,7 @@ dependencies = [
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -2029,6 +2030,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]

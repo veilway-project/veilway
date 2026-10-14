@@ -548,7 +548,7 @@ pub struct Sessions {pub sessions: Vec<Session>}
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Backend {Netstack, L3, Block}
+pub enum Backend {Netstack, L3, Block, Chain}
 
 #[derive(Serialize, JsonSchema)]
 pub struct Exit {
@@ -569,11 +569,83 @@ pub struct Exit {
 	pub interface_down_secs: Option<u64>,
 	/// How often the interface switched between up and down.
 	pub interface_flips: u64,
+	/// The node links of a chain backend, by tag, which `/v1/links` reports on. Empty for every other backend.
+	pub links: Vec<String>,
+	/// Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend.
+	pub link_up: Option<bool>,
 	pub traffic: Traffic,
 }
 
 #[derive(Serialize, JsonSchema)]
 pub struct Exits {pub exits: Vec<Exit>}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkState {
+	/// A WireGuard handshake completed within the last 180 seconds.
+	Up,
+	/// The node dials and has no session yet, or it is dialled and has heard no handshake yet.
+	Connecting,
+	/// The node dials and no candidate of the other node answers.
+	Unreachable,
+	/// The node dials and the other node answers and does not take the proof.
+	Refused,
+	/// No handshake for 24 hours, so the other node has ended the link or one of the two is misconfigured, or this node cut the link off for its quota or its expiry (`denied`). A node that dials tries once a day from here on.
+	Ended,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkHalf {
+	/// This node has the users and sends their packets into the link, through an exit with a chain backend.
+	Entry,
+	/// What arrives from the link leaves from this node, under its own gate, rules and limits.
+	Exit,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkRole {
+	/// The link connects to an inbound of this node.
+	Listener,
+	/// This node dials the other one.
+	Dialler,
+}
+
+/// One node link. It holds no key and no secret.
+#[derive(Serialize, JsonSchema)]
+pub struct Link {
+	pub tag: String,
+	pub id: veilway_core::config::LinkId,
+	pub half: LinkHalf,
+	pub role: LinkRole,
+	pub state: LinkState,
+	/// Seconds the link has been in `state`.
+	pub state_secs: u64,
+	/// Seconds since the link's tunnel last completed a handshake. Null without a session.
+	pub handshake_secs: Option<u64>,
+	/// On the node that dials: the transport it is at, and the places of that transport and of its candidate or endpoint in the other node's list, from 0. Null on the node that is dialled.
+	pub transport: Option<Transport>,
+	pub transport_index: Option<usize>,
+	pub candidate_index: Option<usize>,
+	/// The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns.
+	pub size_warning: bool,
+	/// On the exit half: why this node cut the link off. Null for a link that may run.
+	pub denied: Option<Denied>,
+	/// On the entry half: the exit with a chain backend the link is behind.
+	pub exit: Option<String>,
+	/// The flows the link carries: the translations of the entry half, or the flows of the exit half in the flow table.
+	pub flows: usize,
+	/// Packets that came out of the link and were not carried: on the entry half what answers no flow, on the exit half what the gate, the source check or a limit refused.
+	pub dropped: u64,
+	/// How often `state` changed.
+	pub state_flips: u64,
+	/// Inner packets. Up is what this node sent into the link, down what it took out of it.
+	pub traffic: Traffic,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct Links {pub links: Vec<Link>}
 
 /// The data of a `config_applied` event.
 #[derive(Serialize, JsonSchema)]
