@@ -173,7 +173,8 @@ fn writes_of_the_config_file_share_no_temporary_file_and_remove_nobody_elses() {
 	std::thread::scope(|scope| {
 		for content in &contents {
 			scope.spawn(move || {
-				for _ in 0..25 {save(path, content).expect("a write of the config file failed next to another one")}
+				// Windows refuses a file for as long as a scanner or another write holds it, and a write that gave up says so; what must hold is checked below: the file is one whole write, nobody else's file was touched, nothing was left behind.
+				for _ in 0..25 {if let Err(e) = save(path, content) {assert!(cfg!(windows) && e.kind() == std::io::ErrorKind::PermissionDenied, "a write of the config file failed next to another one: {e:?}")}}
 			});
 		}
 	});

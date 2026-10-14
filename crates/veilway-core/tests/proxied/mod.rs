@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicI64, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
@@ -51,6 +51,8 @@ pub const POLL_PATH: &str = "/assets/sync-90be44f1.js";
 pub const SECOND: Duration = Duration::from_secs(1);
 /// What a quiet connection is given to stay quiet in.
 pub const QUIET: Duration = Duration::from_millis(500);
+/// What a connection to a port nobody listens at is given to be refused in: Windows retries the SYN for about two seconds before it reports the refusal, where Linux and macOS refuse at once. The node's own limit is 5 s.
+pub const REFUSED: Duration = Duration::from_secs(4);
 /// What the test origin gives a peer to send its request head in, and after which it closes a connection it kept for another request.
 pub const HEAD: Duration = Duration::from_secs(2);
 /// What the reverse proxy gives a client to send a request head in, from the connection's first moment and from the end of the request before. It is above `HEAD`, so a connection the origin gives up is seen to be given up by the origin.
@@ -346,6 +348,7 @@ fn field(head: &[u8], name: &str) -> Option<String> {String::from_utf8_lossy(hea
 async fn pass(from: &mut OwnedReadHalf, to: &mut (impl AsyncWrite + Unpin), buf: &mut Vec<u8>, mut count: usize) -> bool {
 	while count > 0 {
 		if buf.is_empty() {
+			if to.flush().await.is_err() {return false}
 			let mut read = vec![0u8; 16384];
 			match from.read(&mut read).await {
 				Ok(size) if size > 0 => buf.extend_from_slice(&read[..size]),
@@ -367,6 +370,7 @@ async fn line(from: &mut OwnedReadHalf, to: &mut (impl AsyncWrite + Unpin), buf:
 			let line: Vec<u8> = buf.drain(..=end).collect();
 			return to.write_all(&line).await.is_ok().then_some(line);
 		}
+		if to.flush().await.is_err() {return None}
 		let mut read = vec![0u8; 16384];
 		match from.read(&mut read).await {
 			Ok(size) if size > 0 => buf.extend_from_slice(&read[..size]),
@@ -443,36 +447,39 @@ pub async fn front(upstream: SocketAddr) -> Front {
 								}
 							}));
 						}
-						let Some(to) = to_upstream.as_mut() else {return};
+						// What the client sent in one piece goes to the upstream in one piece, as a reverse proxy does it: an origin that answers before its request is whole in what it read does not read the rest, and the proxy's two writes would otherwise make that depend on whether it read between them.
+						let Some(upstream) = to_upstream.as_mut() else {return};
+						let mut to = BufWriter::with_capacity(1 << 20, upstream);
 						if to.write_all(&[&head[..head.len() - 2], format!("X-Forwarded-For: {}\r\n\r\n", peer.ip()).as_bytes()].concat()).await.is_err() {break}
 						let (chunked, length) = (field(&head, "transfer-encoding").is_some_and(|coding| coding.to_ascii_lowercase().contains("chunked")), field(&head, "content-length").and_then(|length| length.parse::<usize>().ok()));
 						let followed = if field(&head, "upgrade").is_some() {false} else if chunked {
 							loop {
-								let Some(size) = line(from_client, to, &mut buf).await else {break false};
+								let Some(size) = line(from_client, &mut to, &mut buf).await else {break false};
 								let digits: String = String::from_utf8_lossy(&size).chars().take_while(char::is_ascii_hexdigit).collect();
 								let Ok(size) = usize::from_str_radix(&digits, 16) else {break false};
 								if size > 0 {
-									if !pass(from_client, to, &mut buf, size).await || line(from_client, to, &mut buf).await.is_none() {break false}
+									if !pass(from_client, &mut to, &mut buf, size).await || line(from_client, &mut to, &mut buf).await.is_none() {break false}
 									continue;
 								}
 								// The trailer, to its empty line.
 								break loop {
-									match line(from_client, to, &mut buf).await {
+									match line(from_client, &mut to, &mut buf).await {
 										Some(trailer) if trailer.len() <= 2 => break true,
 										Some(_) => {}
 										None => break false,
 									}
 								};
 							}
-						} else {pass(from_client, to, &mut buf, length.unwrap_or(0)).await};
+						} else {pass(from_client, &mut to, &mut buf, length.unwrap_or(0)).await};
+						if followed && to.flush().await.is_err() {break}
 						if !followed {
 							// A pipe from here on, until either side closes.
 							let piped = async {
-								if to.write_all(&buf).await.is_err() {return}
+								if to.write_all(&buf).await.is_err() || to.flush().await.is_err() {return}
 								let mut read = vec![0u8; 16384];
 								loop {
 									match from_client.read(&mut read).await {
-										Ok(size) if size > 0 => if to.write_all(&read[..size]).await.is_err() {return},
+										Ok(size) if size > 0 => if to.write_all(&read[..size]).await.is_err() || to.flush().await.is_err() {return},
 										Ok(_) => return drop(to.shutdown().await),
 										Err(_) => return,
 									}

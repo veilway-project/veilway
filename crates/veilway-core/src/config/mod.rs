@@ -19,6 +19,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Duration;
 
 pub const VERSION: u64 = 1;
@@ -189,19 +190,23 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 	(config, report)
 }
 
+static REPLACING: Mutex<()> = Mutex::new(());
+
 /// Puts a config document in the place of the config file: a temporary file next to it with mode 600, synced, then renamed over it, and the directory synced after that,
 /// so a node that is killed halfway starts with the old file or the new one, and a rename that was answered for is still there after a power loss.
 /// A path that is a link is followed first: the link stays and the file it names is replaced. The bytes hold keys and passwords.
 /// The temporary file has a name of this one write, so two writes never meet in it, and no file is ever removed that this write did not make: a name that is taken is an error. A write that is killed halfway leaves its temporary file behind.
 pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	// Windows refuses with "access denied" or a sharing violation for as long as another write of this file, a reader or a scanner holds it, so what it refuses is tried again for a moment.
-	let busy = |e: &io::Error, tries: u32| cfg!(windows) && tries < 200 && e.kind() == io::ErrorKind::PermissionDenied;
+	let busy = |e: &io::Error, tries: u32| cfg!(windows) && tries < 400 && (e.kind() == io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(32));
+	// Which step refused is in the error: Windows says no more than "access denied".
+	let at = |step: &'static str| move |e: io::Error| io::Error::new(e.kind(), format!("{step}: {e}"));
 	let mut tries = 0;
 	let target = loop {
 		match fs::canonicalize(path) {
 			Err(e) if e.kind() == io::ErrorKind::NotFound => break path.to_path_buf(),
 			Err(e) if busy(&e, tries) => {tries += 1; std::thread::sleep(Duration::from_millis(10))}
-			target => break target?,
+			target => break target.map_err(at("resolving the config path"))?,
 		}
 	};
 	let (mut name, mut tmp) = ([0u8; 8], target.clone().into_os_string());
@@ -212,14 +217,22 @@ pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	options.write(true).create_new(true);
 	#[cfg(unix)]
 	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-	let mut file = options.open(&tmp)?;
-	let written = file.write_all(bytes).and_then(|_| file.sync_all()).and_then(|_| {
+	let mut tries = 0;
+	let mut file = loop {
+		match options.open(&tmp) {
+			Err(e) if busy(&e, tries) => {tries += 1; std::thread::sleep(Duration::from_millis(10))}
+			opened => break opened.map_err(at("creating the temporary file"))?,
+		}
+	};
+	let written = file.write_all(bytes).map_err(at("writing the temporary file")).and_then(|_| file.sync_all().map_err(at("syncing the temporary file"))).and_then(|_| {
 		drop(file);
+		// Windows can refuse a rename over a file that another rename is replacing, so the writes of this process take turns here and only the writing of their bytes overlaps. A write of another process can still meet this one, and then the retry is what gets through.
+		let _turn = REPLACING.lock().unwrap_or_else(|e| e.into_inner());
 		let mut tries = 0;
 		loop {
 			match fs::rename(&tmp, &target) {
 				Err(e) if busy(&e, tries) => {tries += 1; std::thread::sleep(Duration::from_millis(10))}
-				done => break done,
+				done => break done.map_err(at("replacing the config file")),
 			}
 		}
 	});

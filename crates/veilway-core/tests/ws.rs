@@ -102,7 +102,8 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 		("two requests on one connection", vec![send("GET / HTTP/1.1\r\nHost: node.test\r\n\r\n"), Step::Wait(300), send("GET /second HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("two requests in one write", vec![send("GET / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /other HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("three requests in one write, with a body in the middle", vec![send("GET / HTTP/1.1\r\nHost: node.test\r\n\r\nPOST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\n\r\nhelloGET /third HTTP/1.1\r\nHost: node.test\r\n\r\n")], late),
-		("four requests, each in two writes that end inside the next", vec![send("GET / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /a HT"), Step::Wait(100), send("TP/1.1\r\nHost: node.test\r\n\r\nPOST /b HTTP/1.1\r\nHost: node.test\r\nContent-Length: 6\r\n\r\nab"), Step::Wait(100), send("cdefGET /c HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
+		// The origin (hyper) answers a POST without reading its body, and if the body is not whole by the next time it looks at the connection, which on Windows is at once, it stops reading that connection and drops the requests behind. So no write ends inside a body here; a body in pieces is the case "a body that comes in pieces".
+		("four requests, each in two writes that end inside the next", vec![send("GET / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /a HT"), Step::Wait(100), send("TP/1.1\r\nHost: node.test\r\n\r\nPOST /b HTTP/1.1\r\nHost: node.test\r\nContent-Length: 6\r\n\r\nabcdefGET /c HT"), Step::Wait(100), send("TP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("another method", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("a head request and one behind it", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /after HTTP/1.1\r\nHost: node.test\r\n\r\n")], late),
 		("a body", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")], late),
@@ -118,7 +119,8 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 		("a body the client announces and waits with", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n"), Step::Wait(300), send("hello")], late),
 		("a body in chunks", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n there\r\n0\r\n\r\n")], late),
 		("a body in chunks with a trailer, and a request behind it", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nX-Sum: 1\r\n\r\nGET /behind HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
-		("a body in chunks that come one by one", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhel"), Step::Wait(200), send("lo\r\n"), Step::Wait(200), send("0\r\n\r\n")], late),
+		// No `Connection: close` here: the origin answers before the body is whole and would close at once with a body unread, which is a reset behind its answer, and Windows throws away an answer that was not yet read when the reset came. Whether the reverse proxy or the node read it first is not what is compared.
+		("a body in chunks that come one by one", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"), Step::Wait(200), send("lo\r\n"), Step::Wait(200), send("0\r\n\r\n")], late),
 		("a chunk with an extension", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5;name=value\r\nhello\r\n0\r\n\r\n")], late),
 		("a chunk size that is none", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nzz\r\nhello\r\n0\r\n\r\n")], late),
 		("a length and a coding at once", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n")], late),
@@ -691,7 +693,8 @@ async fn a_decoy_that_is_down_closes_the_proxys_connection_and_never_touches_a_u
 	let gone = site.addr;
 	drop(site);
 	let node = launch("down", time, |doc| for transport in doc["inbounds"][0]["transports"].as_array_mut().unwrap() {transport["decoy"]["origin"] = json!(format!("http://{gone}"))}).await;
-	assert_eq!(node.hand(b"GET / HTTP/1.1\r\nHost: node.test\r\n\r\n", "198.51.100.7").await, (String::new(), true));
+	let (answer, closed, _) = play(dial(node.addr, PROXY).await, &[Step::Send(forwarded(b"GET / HTTP/1.1\r\nHost: node.test\r\n\r\n", "198.51.100.7"))], REFUSED).await;
+	assert_eq!((answer.as_slice(), closed), (&[][..], true));
 	eventually("the connection of a proxy whose request found no origin stayed", || node.totals().decoy_down == 1 && node.totals().proxies == 0).await;
 	assert!(logged("its decoy origin cannot be reached"));
 	let mut a = node.device(0);

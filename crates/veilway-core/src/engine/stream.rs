@@ -1253,6 +1253,8 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 /// When the origin has closed, the peer is closed once all of that was handed on, however long the peer takes to read it: only the pool's own rule ends a relayed connection early, and one that is closed for room is closed at once, with no wait. An origin that reset its connection resets the peer's.
 async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[u8], first: &[u8], open: Result<bool, io::ErrorKind>, slot: &Relayed) {
 	let ((mut from_peer, mut to_peer), (mut from_origin, mut to_origin)) = (tokio::io::split(io), tokio::io::split(origin));
+	// What a peer or an origin does to its connection is theirs to say; anything else, such as a system out of buffers, is logged.
+	let odd = |e: &io::Error| !matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof);
 	let (evicted, reset) = {
 		// Up ends with whether the origin's answer is still to be waited for: it is unless the peer's connection broke. An origin that has closed is sent nothing.
 		let up = async {
@@ -1264,7 +1266,10 @@ async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[
 						slot.last.store(Clock::of(now()).ms, Ordering::Relaxed);
 						if to_origin.write_all(&buf[..read]).await.is_err() {return true}
 					}
-					Err(e) if e.kind() != io::ErrorKind::UnexpectedEof => return false,
+					Err(e) if e.kind() != io::ErrorKind::UnexpectedEof => {
+						if odd(&e) {tracing::info!("a relayed connection ended because reading from the peer failed with {e:?}")}
+						return false;
+					}
 					// The peer closed its side, with the closing message of TLS or without it. The origin is told so, and may still answer.
 					_ => {
 						let _ = to_origin.shutdown().await;
@@ -1285,11 +1290,17 @@ async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[
 			loop {
 				match from_origin.read(&mut buf).await {
 					Ok(read) if read > 0 => {
-						if to_peer.write_all(&buf[..read]).await.is_err() || to_peer.flush().await.is_err() {return false}
+						if let Err(e) = async {to_peer.write_all(&buf[..read]).await?; to_peer.flush().await}.await {
+							if odd(&e) {tracing::info!("a relayed connection ended because writing to the peer failed with {e:?}, with the origin's answer not yet all handed on")}
+							return false;
+						}
 						slot.last.store(Clock::of(now()).ms, Ordering::Relaxed);
 					}
 					Ok(_) => return false,
-					Err(e) => return e.kind() == io::ErrorKind::ConnectionReset,
+					Err(e) => {
+						if odd(&e) {tracing::info!("a relayed connection ended because reading from the origin failed with {e:?}")}
+						return e.kind() == io::ErrorKind::ConnectionReset;
+					}
 				}
 			}
 		};
