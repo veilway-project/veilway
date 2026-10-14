@@ -252,8 +252,8 @@ struct Mark {carried: u64, used: u64, quota: u64, period: Period, start: u64, ex
 impl Mark {
 	fn of(user: &User, told: &control::Usage) -> Mark {Mark {carried: told.up_bytes.saturating_add(told.down_bytes).saturating_sub(user.state.control.load(Ordering::Relaxed)), used: told.used_bytes, quota: told.quota_bytes, period: told.period, start: told.period_start, expires: told.expires_at}}
 
-	/// Whether the numbers are others than at `last`: the user carried something, their count was started over, or the config gave them another quota, period or expiry.
-	fn moved(&self, last: &Mark) -> bool {self.carried != last.carried || self.used < last.used || (self.quota, self.period, self.start, self.expires) != (last.quota, last.period, last.start, last.expires)}
+	/// Whether the numbers are others than at `last`: the user carried something (a count that is lower is a packet of the channel that was not yet counted as its own when `last` was taken, never traffic that undid itself), their count was started over, or the config gave them another quota, period or expiry.
+	fn moved(&self, last: &Mark) -> bool {self.carried > last.carried || self.used < last.used || (self.quota, self.period, self.start, self.expires) != (last.quota, last.period, last.start, last.expires)}
 }
 
 impl Shared {

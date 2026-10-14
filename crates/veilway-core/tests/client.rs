@@ -285,7 +285,8 @@ async fn a_device_reaches_its_tunnel_over_each_of_the_four_transports() {
 	let net = net("client-four", time, |_| {}).await;
 	for (n, (kind, over, user)) in [("udp-obfs", Over::UdpObfs, "a"), ("tls", Over::Tls, "b"), ("ws", Over::WsNative, "c"), ("fronted", Over::Fronted, "d")].into_iter().enumerate() {
 		let mut peer = net.peer(n, &link(n), net.target(kind));
-		assert_eq!((peer.session.state(), peer.session.numbers().datagram), (State::Opening, 1422));
+		// `open` returns at once and the session goes on by itself, so on a busy machine it can be established before this line: what it must not be is ended.
+		assert_eq!((matches!(peer.session.state(), State::Opening | State::Established), peer.session.numbers().datagram), (true, 1422));
 		peer.connect().await.unwrap_or_else(|ended| panic!("{kind}: {ended:?}"));
 		// A real WireGuard handshake went through the session, and traffic passes both ways: a TCP connection through the exit, and an echo the node answers.
 		assert_eq!(peer.leaves(40000 + n as u16).await.as_deref(), Some("main"), "{kind}");

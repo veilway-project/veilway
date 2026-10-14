@@ -55,6 +55,8 @@ const PATH: &str = "/assets/app-3f9c2e71.js";
 const SECOND: Duration = Duration::from_secs(1);
 /// What a quiet connection is given to stay quiet in.
 const QUIET: Duration = Duration::from_millis(500);
+/// What a connection to a port nobody listens at is given to be refused in: Windows retries the SYN for about two seconds before it reports the refusal, where Linux and macOS refuse at once. The node's own limit is 5 s.
+const REFUSED: Duration = Duration::from_secs(4);
 /// What the test origin gives a peer to send its request head in, which is below the 10 s the node gives a request line.
 const HEAD: Duration = Duration::from_secs(2);
 /// The key of the upgrade request of every test client, and the page and the miss of the test origin.
@@ -250,7 +252,10 @@ async fn fetch<S: AsyncRead + AsyncWrite + Unpin>(mut io: S, body: usize, keep: 
 	while got < BULK_HEAD + body {
 		match timeout(quiet, io.read(&mut buf)).await {
 			Ok(Ok(read)) if read > 0 => got += read,
-			_ => break,
+			ended => {
+				eprintln!("a read of {body} bytes stopped at {got}: {}", match ended {Ok(Ok(_)) => "the connection ended".to_string(), Ok(Err(e)) => e.to_string(), Err(_) => format!("nothing came for {quiet:?}")});
+				break;
+			}
 		}
 		if !pace.is_zero() {tokio::time::sleep(pace).await}
 	}
@@ -1194,8 +1199,8 @@ async fn a_decoy_that_is_down_closes_strangers_and_never_touches_a_user() {
 	let node = launch_at("down", time, gone, |_| {}).await;
 	node.site.task.abort();
 	eventually("the origin did not go away", || std::net::TcpStream::connect(addr).is_err()).await;
-	let (answer, closed) = node.ask(b"GET / HTTP/1.1\r\nHost: node.test\r\n\r\n").await;
-	assert_eq!((answer.as_str(), closed), ("", true));
+	let (answer, closed) = play(node.dial(Ipv4Addr::LOCALHOST.into()).await, &[Step::Send(b"GET / HTTP/1.1\r\nHost: node.test\r\n\r\n".to_vec())], REFUSED).await;
+	assert_eq!((answer.as_slice(), closed), (&[][..], true));
 	assert!(node.totals().decoy_down == 1 && logged("its decoy origin cannot be reached"));
 	// A user connects as ever. Its upgrade answer carries only `Date` of the list while the origin's fields are not known: "If that request fails, the node sends only `Date` from the list."
 	let mut a = node.device(0);
@@ -1452,10 +1457,10 @@ async fn the_end_of_an_answer_never_stays_in_the_node() {
 	drop(hold);
 	eprintln!("an answer blocks at {blocked} bytes when the peer reads nothing");
 	assert!(blocked > 0 && blocked < 128 << 20, "the origin wrote {blocked} bytes to a peer that reads nothing");
-	// Sizes in steps of 8 kB from well below that to above it, to peers that wait and then read slowly.
+	// Sizes in steps of 8 kB from well below that to above it, to peers that wait and then read slowly. A peer is given up on after 15 s of nothing: a BSD kernel (macOS) can leave a slow reader waiting for its persist timer, 5 s and then more, where an answer held back by the node would never come while the origin keeps the connection for 60 s.
 	let sizes: Vec<usize> = (0..88).map(|step| (blocked.saturating_sub(640 * 1024) / 8192 + step) * 8192).filter(|size| *size > 0).collect();
-	let cut = short(&node, &sizes, true, Duration::from_secs(2), Duration::from_secs(6), Duration::from_millis(3)).await;
-	assert!(cut.is_empty(), "answers to a slow reader whose end never came, as (size, missing): {cut:?}");
+	let cut = short(&node, &sizes, true, Duration::from_secs(2), Duration::from_secs(15), Duration::from_millis(3)).await;
+	assert!(cut.is_empty(), "answers to a slow reader whose end never came, as (size, missing): {cut:?}, and what the node logged of relayed connections: {:?}", LOGS.lock().unwrap().split(|byte| *byte == b'\n').filter(|line| String::from_utf8_lossy(line).contains("a relayed connection ended")).map(|line| String::from_utf8_lossy(line).into_owned()).take(8).collect::<Vec<_>>());
 	node.engine.shutdown().await;
 }
 
@@ -1466,7 +1471,7 @@ async fn an_answer_the_origin_closed_behind_reaches_a_peer_that_reads_late() {
 	let node = launch_at("closed-behind", time, raw().await, |_| {}).await;
 	let sizes: Vec<usize> = (1..=60).map(|step| step * 96 * 1024).collect();
 	let cut = short(&node, &sizes, false, Duration::from_secs(8), Duration::from_secs(3), Duration::ZERO).await;
-	assert!(cut.is_empty(), "answers that were cut, as (size, missing): {cut:?}");
+	assert!(cut.is_empty(), "answers that were cut, as (size, missing): {cut:?}, and what the node logged of relayed connections: {:?}", LOGS.lock().unwrap().split(|byte| *byte == b'\n').filter(|line| String::from_utf8_lossy(line).contains("a relayed connection ended")).map(|line| String::from_utf8_lossy(line).into_owned()).take(8).collect::<Vec<_>>());
 	eventually("a relayed connection outlived its end", || node.totals().relayed == 0).await;
 	node.engine.shutdown().await;
 }

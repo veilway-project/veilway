@@ -24,6 +24,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use veilway_core::{Engine, Options};
 use veilway_engine::import::{self, Fetcher, FileVault, Library};
+use veilway_transport::udp::DONT_FRAGMENT;
 use veilway_engine::{Agree, Class, Event, Pause, Redirect, Retry, Say, Settings, StartError, State, Status, Stop, Store, Tunnel};
 use veilway_proto::control::ExitStatus;
 use veilway_proto::subscription::client::Offer;
@@ -299,9 +300,10 @@ async fn a_tunnel_connects_over_each_transport_carries_packets_and_runs_the_cont
 		plain_words(&status);
 		let counters = status.counters;
 		assert!(counters.opened == 1 && counters.attempts >= 1 && counters.packets_sent >= 4 && counters.packets_received >= 3 && counters.control_opened == 1 && counters.dropped_offline == 0, "{kind}: {counters:?}");
-		// The probe settles at the profile's size where the path carries it, on the transports that are probed.
-		let mtu = if kind == "tls" {status.mtu} else {run.until("the MTU was not probed", Duration::from_secs(20), |status| status.counters.probes >= 1).await.mtu};
-		assert_eq!((mtu, run.tunnel.status().counters.probes > 0), (1390, kind != "tls"), "{kind}");
+		// The probe settles at the profile's size where the path carries it, on the transports that are probed: the datagram ones where the system can prohibit fragmentation, since a probe that is fragmented is not lost and says nothing.
+		let probed = kind != "tls" && DONT_FRAGMENT;
+		let mtu = if probed {run.until("the MTU was not probed", Duration::from_secs(20), |status| status.counters.probes >= 1).await.mtu} else {status.mtu};
+		assert_eq!((mtu, run.tunnel.status().counters.probes > 0), (1390, probed), "{kind}");
 		let last = run.tunnel.stop().await;
 		assert_eq!(last.state, State::Off);
 	}
@@ -450,6 +452,8 @@ async fn an_unreachable_candidate_is_set_aside_for_an_hour_and_the_last_transpor
 	assert!(logged("a candidate is unreachable and set aside"));
 }
 
+// Windows reports a refused connection to a closed port after about 2 s, so the dead candidate cannot end inside the 250 ms stagger, which is what this test is about.
+#[cfg_attr(windows, ignore = "a closed port is refused after about 2 s on Windows")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blocked_candidate_costs_a_mark_and_the_one_that_worked_is_tried_first_and_alone_next_time() {
 	let time = time!();
@@ -647,8 +651,8 @@ async fn a_node_that_drops_the_device_on_a_reload_ends_the_session_and_the_engin
 	let mut events = stopped.tunnel.events();
 	stopped.connected().await;
 	stopped.until("the channel did not open", Duration::from_secs(20), |status| status.control).await;
-	Arc::try_unwrap(net.engine).ok().expect("the engine is held by nobody else").shutdown().await;
-	let status = stopped.until("no stop", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})).await;
+	// Watched while the node shuts down: the stop is a state of a second or two, and a shutdown that takes long (it does on Windows) is over after the engine has gone on.
+	let (_, status) = tokio::join!(async {Arc::try_unwrap(net.engine).ok().expect("the engine is held by nobody else").shutdown().await}, stopped.until("no stop", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})));
 	let State::Stopped {reason, retry: Retry::At(at)} = status.state else {panic!("{:?}", status.state)};
 	assert_eq!(reason, Stop::NodeStopping);
 	assert!(at <= time.secs() + 3, "the ordinary reconnect wait is a second or two: {} s", at.saturating_sub(time.secs()));
@@ -669,13 +673,13 @@ async fn the_mtu_is_lowered_to_what_the_node_and_the_probes_allow_and_never_rais
 	let mut run = Run::new(start(&net, net.settings("mtu"), &library, PRIVATE).unwrap(), 0);
 	let mut events = run.tunnel.events();
 	run.connected().await;
-	let status = run.until("the MTU was not lowered", Duration::from_secs(20), |status| status.control && status.mtu == 1300 && status.counters.probes >= 1).await;
+	let status = run.until("the MTU was not lowered", Duration::from_secs(20), |status| status.control && status.mtu == 1300 && (status.counters.probes >= 1 || !DONT_FRAGMENT)).await;
 	assert_eq!(status.mtu, 1300);
 	let mut told = Vec::new();
 	while let Ok(Ok(event)) = timeout(Duration::from_millis(300), events.recv()).await {told.push(event)}
 	assert!(told.contains(&Event::Mtu(1300)) && !told.iter().any(|event| matches!(event, Event::Mtu(mtu) if *mtu > 1300)), "{told:?}");
-	// The node took the size the device set, and a packet that fits it passes.
-	eventually("the node did not take the device's MTU", || net.engine.peers(Some("a")).first().is_some_and(|peer| peer.mtu == Some(1300))).await;
+	// The node took the size the device set, and a packet that fits it passes. Where fragmentation cannot be prohibited the device walks nothing and sets nothing, and the node's size is the inbound's, which is the same.
+	if DONT_FRAGMENT {eventually("the node did not take the device's MTU", || net.engine.peers(Some("a")).first().is_some_and(|peer| peer.mtu == Some(1300))).await}
 	assert!(run.ping(1300, 1).await);
 	run.tunnel.stop().await;
 }
@@ -1146,17 +1150,19 @@ async fn a_reconnect_starts_at_the_size_found_for_the_network_and_does_not_raise
 	let run = Run::new(start(&net, net.settings("remembered"), &library, PRIVATE).unwrap(), 0);
 	let mut events = run.tunnel.events();
 	run.connected().await;
-	run.until("the size was not found", Duration::from_secs(20), |status| status.mtu == 1300 && status.counters.probes >= 1).await;
+	run.until("the size was not found", Duration::from_secs(20), |status| status.mtu == 1300 && (status.counters.probes >= 1 || !DONT_FRAGMENT)).await;
 	// The node ends the tunnel for a moment, and the engine starts a new session after the asking.
 	net.reload(|doc| doc["users"][0]["enabled"] = json!(false)).await;
 	run.until("no stop", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})).await;
 	net.reload(|doc| doc["users"][0]["enabled"] = json!(true)).await;
 	run.tunnel.connect_again();
 	let status = run.until("no second session", Duration::from_secs(20), |status| status.counters.opened == 2 && matches!(status.state, State::Connected {..})).await;
+	// Where fragmentation cannot be prohibited nothing was found, so the session starts at the profile's size and the node's comes with its first word.
+	let status = if DONT_FRAGMENT {status} else {run.until("the node's size was not taken", Duration::from_secs(10), |status| status.mtu == 1300).await};
 	assert_eq!(status.mtu, 1300, "the new session started above the size found");
 	let mut told = Vec::new();
 	while let Ok(Ok(event)) = timeout(Duration::from_millis(300), events.recv()).await {told.push(event)}
-	assert!(told.contains(&Event::Mtu(1300)) && !told.iter().any(|event| matches!(event, Event::Mtu(mtu) if *mtu > 1300)), "{told:?}");
+	assert!(told.contains(&Event::Mtu(1300)) && (!DONT_FRAGMENT || !told.iter().any(|event| matches!(event, Event::Mtu(mtu) if *mtu > 1300))), "{told:?}");
 	run.tunnel.stop().await;
 }
 
@@ -1170,7 +1176,7 @@ async fn a_node_that_says_a_higher_mtu_than_the_one_in_force_does_not_raise_the_
 	let run = Run::new(start(&net, net.settings("hostile-mtu"), &library, PRIVATE).unwrap(), 0);
 	let mut events = run.tunnel.events();
 	run.connected().await;
-	run.until("the size was not found", Duration::from_secs(20), |status| status.mtu == 1300 && status.counters.probes >= 1).await;
+	run.until("the size was not found", Duration::from_secs(20), |status| status.mtu == 1300 && (status.counters.probes >= 1 || !DONT_FRAGMENT)).await;
 	let session = |mtu| NodeMessage::Session(Session {node_time: time.secs(), mtu, v4: Some(Addresses {device: [10, 7, 0, 2].into(), gateway: [10, 7, 0, 1].into()}), v6: None});
 	for message in [NodeMessage::MtuResult {mtu: 1390}, NodeMessage::MtuResult {mtu: 1300}, session(1390), session(1500), NodeMessage::MtuResult {mtu: 1279}, NodeMessage::MtuResult {mtu: 0}] {run.tunnel.inject(message)}
 	tokio::time::sleep(Duration::from_secs(1)).await;
