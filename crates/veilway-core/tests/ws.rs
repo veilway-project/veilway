@@ -207,7 +207,8 @@ async fn fetched(node: &Node, request: String, stall: Duration, pace: Duration) 
 			io.write_all(request.as_bytes()).await.unwrap();
 			tokio::time::sleep(stall).await;
 			loop {
-				match tokio::time::timeout(SECOND, io.read(&mut buf)).await {
+				// The end of an answer the origin keeps open is three seconds with nothing; a shared runner can stall a transfer for one.
+				match tokio::time::timeout(3 * SECOND, io.read(&mut buf)).await {
 					Ok(Ok(read)) if read > 0 => {
 						times.first.get_or_insert(started.elapsed().as_millis() as u64);
 						got += read;
