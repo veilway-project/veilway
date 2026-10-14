@@ -12,3 +12,6 @@ PROMPT.md
 fuzz/target
 fuzz/artifacts
 fuzz/coverage
+# Left behind by the move to veilway-ui
+packages/ui/
+packages/i18n/
