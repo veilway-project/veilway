@@ -143,6 +143,21 @@ pub struct Status {
 	pub users: usize,
 	/// Flows in the flow table right now.
 	pub flows: usize,
+	/// The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none.
+	pub certificates: Vec<SelfSigned>,
+}
+
+/// A certificate the node made for a `tls` listener, with the key it keeps.
+#[derive(Serialize, JsonSchema)]
+pub struct SelfSigned {
+	/// The listen address, as the config writes it.
+	pub listen: String,
+	/// The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's candidate carries with `self_signed`. It stays the same when the certificate is made anew.
+	pub pin: String,
+	/// Unix seconds. The node makes the certificate anew with the same key 20 days before `not_after`.
+	pub not_before: i64,
+	/// Unix seconds, 80 to 100 days after `not_before`, drawn per certificate. Clients do not check it.
+	pub not_after: i64,
 }
 
 #[derive(Serialize, JsonSchema)]

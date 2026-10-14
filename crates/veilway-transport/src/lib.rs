@@ -3,7 +3,7 @@
 //! A session carries WireGuard datagrams between a device and a node and nothing else. There is no WireGuard here, no TUN device, no routing, no DNS and no control channel: the caller hands datagrams in with `Session::send` and takes them out with `Session::recv`.
 //! Two things only the WireGuard layer can make are asked of it through `Source`: the datagram a session opens with ("a handshake initiation, or a keepalive of a tunnel that is already up") and the idle keepalive. The rekey point of the transports page is the WireGuard layer's own business and is not here.
 //!
-//! Everything fails closed. An error ends the session and `recv` gives it as an `Ended`: nothing is sent outside a session, there is no retry without a proof, and no check is loosened after a failure. A certificate that does not validate, or does not match a pin where the candidate has one, ends the attempt, and there is no switch that turns a check off. A certificate that signed itself is refused with its pin: an operator with an authority of their own gives the client its root.
+//! Everything fails closed. An error ends the session and `recv` gives it as an `Ended`: nothing is sent outside a session, there is no retry without a proof, and no check is loosened after a failure. A certificate that does not validate, or does not match a pin where the candidate has one, ends the attempt, and there is no switch that turns a check off. A certificate that signed itself is refused with its pin, unless the signed profile marks the candidate `self_signed`: then the pin alone is the check and the handshake must be signed with the pinned key (see `tls`). Nothing the server sends puts a candidate on that path.
 //!
 //! How an attempt ended is what the caller's next step hangs on, so it is told by who could have caused it. A refusal is what the TLS session vouches for: an answer that is no session, or a close in order. A connection that is reset or ends without one is unreachable, since anyone on the path can do that. A fault of the device itself (no route, no socket, a socket hook that failed, a clock outside the certificate's validity) is told apart from both and held against no candidate. A proof that was taken and followed by silence, on a session that opened with a keepalive, is a node that no longer knows the tunnel: `End::Unanswered`, after which the caller's `Source` must give a handshake initiation.
 //! Every socket is the crate's own, and the caller has each one before it is connected (`Env::socket`), to keep it out of its tunnel and to let its firewall know it.
@@ -116,14 +116,16 @@ pub struct Front {
 	pub pins: Vec<[u8; 32]>,
 	/// The candidate carries an Encrypted Client Hello configuration. Such a candidate is refused here.
 	pub ech: bool,
+	/// `self_signed` of the signed profile: the certificate is trusted through `pins` alone, with no chain, name or date checked. Only a `tls` candidate with pins and no `verify_name` may have it.
+	pub self_signed: bool,
 }
 
 impl Front {
-	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some()}}
+	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some(), self_signed: candidate.self_signed}}
 }
 
 impl fmt::Debug for Front {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Front({} pins)", self.pins.len())}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Front({} pins{})", self.pins.len(), if self.self_signed {", self-signed"} else {""})}
 }
 
 /// Where one session goes: one endpoint of a `udp-obfs` transport, or one candidate of a stream transport with the transport's path.
@@ -214,7 +216,7 @@ pub enum Unreachable {
 	Connect,
 	/// The TLS handshake failed for something that is no verdict on the certificate.
 	Tls,
-	/// The certificate did not validate for the name, or matched no pin of the candidate.
+	/// The certificate did not pass its candidate's check: it did not validate for the name, matched no pin of the candidate, or on a self-signed candidate the handshake was not signed with the pinned key. It is never the node refusing the device, since nothing of the answer was authenticated: the app says "the server's certificate does not match this profile; the network may be interfering".
 	Certificate,
 	/// The certificate is not valid at the time the device's clock shows: it ran out, or is not valid yet. The attempt ends as for any certificate that is not accepted. It marks nothing, since the first thing to check is the device's clock.
 	CertificateTime,
@@ -285,6 +287,8 @@ pub enum Refuse {
 	Ech,
 	/// A `tls` candidate without a pin.
 	Pins,
+	/// A self-signed candidate on another transport than `tls`, or with a `verify_name`: a profile never has one, and the pin-only check is for nothing else.
+	SelfSigned,
 	/// A stream transport on a link without a node transport key.
 	NodeKey,
 	/// Padding bounds or a keepalive range outside what a profile may set.
@@ -404,9 +408,11 @@ fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 	if chunk::Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random).is_err() || session::keepalive(link.padding.keepalive.clone()).is_none() {return Err(Refuse::Padding)}
 	let (Target::Tls {path, candidate} | Target::Ws {path, candidate} | Target::Fronted {path, candidate}) = target else {return Ok(())};
 	if link.node.is_none() {return Err(Refuse::NodeKey)}
-	if env.roots.is_empty() {return Err(Refuse::Roots)}
+	if candidate.self_signed && (!matches!(target, Target::Tls {..}) || candidate.verify_name.is_some()) {return Err(Refuse::SelfSigned)}
+	// A self-signed candidate's check reads no root.
+	if env.roots.is_empty() && !candidate.self_signed {return Err(Refuse::Roots)}
 	if candidate.ech {return Err(Refuse::Ech)}
-	// "Every candidate must have `pins`" on `tls`: the pin is asked on top of a chain that validates, never in its place.
+	// "Every candidate must have `pins`" on `tls`: the pin is asked on top of a chain that validates, never in its place, except where the signed profile marks the candidate self-signed.
 	if matches!(target, Target::Tls {..}) && candidate.pins.is_empty() {return Err(Refuse::Pins)}
 	// A profile's host and path were read by `veilway-proto`. A target a caller built by hand was not, and both go into a request as they are.
 	if [path, &candidate.host].iter().any(|text| text.is_empty() || text.bytes().any(|byte| byte <= b' ' || byte == 0x7f || byte == b'?')) || !path.starts_with('/') {return Err(Refuse::Request)}

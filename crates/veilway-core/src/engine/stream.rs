@@ -309,6 +309,7 @@ impl Origin {
 }
 
 /// One transport of a listener: the path its proofs arrive on and the tunnel they open.
+#[derive(Clone)]
 pub struct Route {
 	/// Tells the route from every other the listener ever had. A session ends when its route is no longer served.
 	id: u64,
@@ -627,6 +628,12 @@ impl Listener {
 		}
 		*self.served.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(served);
 		self.relearn.notify_one();
+	}
+
+	/// A certificate the node made anew under the config in force: the next connection is answered with it, and nothing else changes. What runs keeps the certificate it was accepted with.
+	pub fn certify(&self, acceptor: Acceptor) {
+		let mut served = self.served.write().unwrap_or_else(|e| e.into_inner());
+		*served = Arc::new(Served {acceptor: Some(acceptor), routes: served.routes.clone(), origin: served.origin.clone(), proxy: served.proxy, host: served.host.clone(), pools: served.pools, front: served.front.clone()});
 	}
 
 	/// The end of a listener whose address no config has any more: its sessions end, and so does every connection it holds.

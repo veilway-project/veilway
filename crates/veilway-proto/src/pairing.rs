@@ -152,6 +152,7 @@ pub fn transports_json(transports: &[Transport]) -> String {
 		members.extend(candidate.verify_name.as_ref().map(|name| format!("\"verify_name\":{}", text(name))));
 		members.extend(candidate.ech.as_ref().map(|ech| format!("\"ech\":{}", text(&STANDARD.encode(ech)))));
 		if !candidate.pins.is_empty() {members.push(format!("\"pins\":[{}]", candidate.pins.iter().map(|pin| text(&key_text(pin))).collect::<Vec<_>>().join(",")))}
+		if candidate.self_signed {members.push("\"self_signed\":true".to_owned())}
 		format!("{{{}}}", members.join(","))
 	}).collect::<Vec<_>>().join(","));
 	format!("[{}]", transports.iter().map(|transport| match transport {
@@ -171,11 +172,11 @@ pub fn transports(text: &[u8]) -> Result<Vec<Transport>, CodeError> {
 	items.iter().map(listed).collect()
 }
 
-// "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use.
+// "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use. A `self_signed` candidate is refused too: a link's `peer.transports` has no such member, so the pairing would end in a link the other node cannot hold.
 fn listed(item: &json::Json) -> Result<Transport, CodeError> {
 	payload::transport(item).ok().filter(|transport| match transport {
 		Transport::Fronted(_) => false,
-		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none()),
+		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none() && !candidate.self_signed),
 		_ => true,
 	}).ok_or(CodeError::Member("transports"))
 }
@@ -451,7 +452,7 @@ mod tests {
 
 	fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
 
-	fn candidate(pinned: bool) -> Candidate {Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), sni: Some("node.example".into()), host: "node.example".into(), verify_name: None, ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}}}
+	fn candidate(pinned: bool) -> Candidate {Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), sni: Some("node.example".into()), host: "node.example".into(), verify_name: None, ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}, self_signed: false}}
 
 	fn terms(direction: Direction) -> Terms {
 		Terms {direction, name: "exit in the north".into(), inbound_public_key: x25519([1; 32], X25519_BASEPOINT_BYTES), transport_public_key: Some(x25519([2; 32], X25519_BASEPOINT_BYTES)), dialler: vec!["10.9.0.2".parse().unwrap(), "fd00:9::2".parse().unwrap()], listener: if direction == Direction::Reverse {vec!["10.9.0.3".parse().unwrap(), "fd00:9::3".parse().unwrap()]} else {Vec::new()}, mtu: 1390, transports: vec![Transport::UdpObfs(vec![Dial::parse("203.0.113.9:51821").unwrap(), Dial::parse("[2001:db8::9]:51821").unwrap()]), Transport::Tls(Stream {path: "/assets/app-3f9c2e71.js".into(), candidates: vec![candidate(true)]}), Transport::Ws(Stream {path: "/assets/live-7c1d0a52.js".into(), candidates: vec![candidate(false)]}), Transport::Udp(vec![Dial::parse("10.1.2.3:51820").unwrap()])]}

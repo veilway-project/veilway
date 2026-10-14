@@ -5,8 +5,8 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{control, l3, link, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Config, Host as Named, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::{certificate, control, l3, link, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{loops, Certificate, Config, Host as Named, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use time::OffsetDateTime;
 use tokio::net::{lookup_host, TcpListener, UdpSocket};
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch;
@@ -103,6 +104,8 @@ pub struct Staged {
 	/// The stream listeners the node does not have yet, and for every address stream transports listen on, what its certificate files hold now, when it ends TLS, and where its decoy origin is now.
 	tls: Vec<(SocketAddr, TcpListener)>,
 	streams: HashMap<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>,
+	/// The self-signed certificates of those listeners, each with whether it was made now.
+	certified: Vec<(certificate::Made, bool)>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
 	tunnels: Vec<(Arc<Tunnel>, IpStack, Receiver<Vec<u8>>)>,
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
@@ -189,7 +192,7 @@ impl Host {
 			if shared.replay.set(guard.clone()).is_ok() {tokio::spawn(guard.run(shared.now));}
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
-		let (mut listeners, mut streams) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new());
+		let (mut listeners, mut streams, mut certified) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate() {
 				match transport {
@@ -205,12 +208,22 @@ impl Host {
 						// Once for each address, on every reload: the certificate is read again, and the name of the decoy origin is resolved again ("resolved once per reload"). Transports that share an address have the same files and the same origin.
 						if streams.contains_key(&listen.0) {continue}
 						// "A native `ws` or `fronted` listener never ends TLS itself. A listener where the node ends TLS is `tls`."
-						let acceptor = if let Transport::Tls {tls, ..} = transport {
-							let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
-							#[cfg(unix)]
-							if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
-							Some(ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?)
-						} else {None};
+						let acceptor = match transport {
+							Transport::Tls {tls: Certificate::Files(tls), ..} => {
+								let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
+								#[cfg(unix)]
+								if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
+								Some(ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?)
+							}
+							// The key is made on the first start and kept. The certificate is read again on every reload, and made anew when it is due.
+							Transport::Tls {tls: Certificate::SelfSigned(own), ..} => {
+								let (made, fresh) = certificate::ensure(certificate::files(&self.dir, &certificate::stem(&inbound.tag, &inbound.transports, t)), listen.0, own.name.as_deref(), (shared.now)()).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls.self_signed: inbound `{}` has no self-signed certificate: {e:#}", inbound.tag))?;
+								let acceptor = ws::acceptor(&made.files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls.self_signed: inbound `{}` cannot load the certificate the node made: {e:#}", inbound.tag))?;
+								certified.push((made, fresh));
+								Some(acceptor)
+							}
+							_ => None,
+						};
 						let origin = match &decoy.origin.0.host {
 							Named::Ip(ip) => SocketAddr::new(*ip, decoy.origin.0.port),
 							Named::Name(name) => tokio::time::timeout(RESOLVE, lookup_host((name.as_str(), decoy.origin.0.port))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].decoy.origin: the name of the decoy origin of inbound `{}` does not resolve", inbound.tag))?,
@@ -294,12 +307,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, tunnels: fresh, loopbacks, l3: staged})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, certified, tunnels: fresh, loopbacks, l3: staged})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, tunnels, loopbacks, l3} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, certified, tunnels, loopbacks, l3} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -389,6 +402,9 @@ impl Host {
 			let listener = shared.stream.listen(addr, served);
 			self.tls.insert(addr, (listener.clone(), [Task(stream::accept(shared, listener.clone(), socket)), Task(stream::learn(&listener))]));
 		}
+		// The pin is said at every start and reload: it is what the operator copies into profiles, and the log is where a node without the control API shows it.
+		for (made, fresh) in &certified {tracing::info!("stream listener {}: tls with a self-signed certificate the node {}, valid until {}, pin {}", made.listen, if *fresh {"made now"} else {"keeps"}, OffsetDateTime::from_unix_timestamp(made.not_after).map_or_else(|_| made.not_after.to_string(), |at| at.date().to_string()), made.pin_text())}
+		*shared.certificates.lock().unwrap_or_else(|e| e.into_inner()) = certified.into_iter().map(|(made, _)| made).collect();
 		for (addr, socket) in udp {self.udp.insert(addr, (socket, None));}
 		// A socket is read for the tunnel and the transport that have its address now. One whose address nobody has any more is closed, and so is its reader. A `udp-obfs` listener that keeps its tunnel keeps its sessions.
 		self.udp.retain(|addr, (socket, reader)| match wanted.get(addr) {
@@ -438,6 +454,28 @@ impl Host {
 				Backend::Chain {links} => tracing::info!("exit {}: chain, leaves from another node through {} link(s)", exit.tag, links.len()),
 			}
 			if matches!(exit.backend, Backend::Netstack {icmp_echo: Fallback::Direct, ..}) && plan.pools.iter().any(|(pool, _)| pool.addr().is_ipv6()) && icmp::ping_socket(false).is_err() {tracing::warn!("exit {}: this system gives the node no ping socket for ipv6, so ipv6 pings through the exit get no answer", exit.tag)}
+		}
+	}
+
+	/// Makes every self-signed certificate that is due anew with its key, which needs no new pin, and has its listener answer with it from the next connection on. A key that is gone or changed stops the renewal, and so does anything else that fails: it is tried again an hour later, and the listener keeps the certificate it has. The list is not held while files are read and written.
+	pub fn renew(&self, shared: &Arc<Shared>) {
+		let now = (shared.now)();
+		let due: Vec<certificate::Made> = shared.certificates.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|made| made.due(now.unix_timestamp())).cloned().collect();
+		for made in due {
+			let result = certificate::renew(&made, now).and_then(|renewed| Ok((ws::acceptor(&renewed.files)?, renewed)));
+			let mut held = shared.certificates.lock().unwrap_or_else(|e| e.into_inner());
+			let Some(slot) = held.iter_mut().find(|slot| slot.listen == made.listen && slot.files.key == made.files.key) else {continue};
+			match result {
+				Ok((acceptor, renewed)) => {
+					if let Some((listener, _)) = self.tls.get(&made.listen) {listener.certify(acceptor)}
+					tracing::info!("stream listener {}: its self-signed certificate was made anew with the same key, valid until {}, pin {}", made.listen, OffsetDateTime::from_unix_timestamp(renewed.not_after).map_or_else(|_| renewed.not_after.to_string(), |at| at.date().to_string()), renewed.pin_text());
+					*slot = renewed;
+				}
+				Err(e) => {
+					slot.retry = now.unix_timestamp() + certificate::RETRY;
+					tracing::warn!("stream listener {}: its self-signed certificate is due and could not be made anew: {e:#}. It is tried again in an hour, and the listener serves the one it has until then", made.listen);
+				}
+			}
 		}
 	}
 

@@ -235,7 +235,7 @@ pub fn connection_wait(random: &mut Random) -> Result<Duration, NoRandom> {Ok(Du
 /// - A session that opens is remembered for the network, and the refusal wait returns to its start. The reconnect wait does not: it does when a session has stayed open for `LIVED`.
 /// - A refusal "does not mark the candidate or the transport as failed, and does not spend the candidate budget". The same candidate is tried again after the refusal wait, at most 3 times in a row, each candidate with its own count, and then the client moves on after the wait without setting it aside. An offset in it becomes the clock offset: it is there only when the candidate was pinned. A refusal without one while an offset is held makes the next attempt one on the device's clock, and if that one opens the offset is dropped.
 /// - `End::Unanswered` is tried again at once, once, and the WireGuard layer must then open with a handshake initiation. A second one in a row is an unreachable candidate.
-/// - An unreachable candidate "is then not tried again on that network for 1 hour". Silence on a datagram transport that worked here within 7 days is tried again with the reconnect waits "for 90 s in all" first.
+/// - An unreachable candidate "is then not tried again on that network for 1 hour". A certificate that fails its candidate's check, a pin that does not match on a self-signed candidate included, is one: the client moves on at once, and it never counts as a refusal, since the answer was not authenticated. Silence on a datagram transport that worked here within 7 days is tried again with the reconnect waits "for 90 s in all" first.
 /// - What is the device's own state marks nothing and waits the reconnect wait: `End::Offline`, and a certificate that is not valid at the time the device's clock shows.
 /// - A session that was open and is lost is opened again after the reconnect wait, and after `FLAPS` sessions in a row that did not live `LIVED` the client moves on.
 pub fn outcome(network: &mut Network, standing: &mut Standing, profile: u64, transport: usize, candidate: usize, ended: Option<Ended>, now: u64, random: &mut Random) -> Result<Next, NoRandom> {
@@ -437,6 +437,20 @@ mod tests {
 		let (mut network, mut standing) = states();
 		for offline in [Some(Ended::Closed(End::Offline)), Some(Ended::Unreachable(Unreachable::CertificateTime))] {assert!(matches!(outcome(&mut network, &mut standing, P, 0, 0, offline, NOW, &mut random), Ok(Next::Again(wait)) if wait.as_secs() <= 3))}
 		assert!(network.aside.is_empty());
+	}
+
+	// "A certificate that fails the check of its candidate, including a pin that does not match, makes that candidate unreachable for this attempt, at once and with no refusal wait, and the client moves on. It never counts as the node refusing the device." Self-signed or not.
+	#[test]
+	fn a_certificate_that_does_not_match_moves_on_at_once_and_is_no_refusal() {
+		let (mut network, mut standing) = states();
+		standing.offset = Some((30, NOW - 10));
+		outcome(&mut network, &mut standing, P, 1, 0, REFUSED, NOW, &mut random).unwrap();
+		let (refusals, rows) = (standing.refusals, standing.rows.clone());
+		assert_eq!(outcome(&mut network, &mut standing, P, 1, 1, Some(Ended::Unreachable(Unreachable::Certificate)), NOW, &mut random), Ok(Next::Move(Duration::ZERO)));
+		// No refusal is counted and no wait doubles. The offset a pinned answer gave stays, since an answer that was not authenticated says nothing of the clock.
+		assert_eq!((standing.refusals, standing.rows.clone(), standing.offset, standing.bare), (refusals, rows, Some((30, NOW - 10)), false));
+		assert_eq!(network.aside, [(1, Some(1), NOW + HOUR)]);
+		assert!(matches!(candidates(&mut network, P, 1, 2, &[], false, 7, NOW + 1), Pick::Try(picked) if picked == [0]));
 	}
 
 	// A clock that stepped back, and a state file that is damaged: no value in it holds anything for longer than a mark lasts.

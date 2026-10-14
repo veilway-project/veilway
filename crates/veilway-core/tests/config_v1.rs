@@ -260,6 +260,7 @@ fn required_and_optional_keys() {
 		"inbounds[0].transports[0]": |d| remove(d, "/inbounds/0/transports/0", "listen");
 		"inbounds[0].transports[0]": |d| remove(d, "/inbounds/0/transports/0", "type");
 		"inbounds[0].transports[1].tls": |d| d["inbounds"][0]["transports"][1]["tls"] = json!({"cert": "a.pem"});
+		"inbounds[0].transports[1]": |d| d["inbounds"][0]["transports"][1]["tls"] = json!({"self_signed": true});
 		"outbounds[0]": |d| remove(d, "/outbounds/0", "server");
 		"exits[0].backend": |d| remove(d, "/exits/0/backend", "outbound");
 		"exits[0]": |d| remove(d, "/exits/0", "backend");

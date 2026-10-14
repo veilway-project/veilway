@@ -602,6 +602,36 @@ async fn the_decoy_origin_of_a_tls_transport_is_asked_for_its_page_and_for_the_p
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Config reference, the `tls` row: with `self_signed: true` the node "reports the pin (the SHA-256 of the SubjectPublicKeyInfo) in `veilway doctor`". Doctor makes and writes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pin_of_a_certificate_the_node_makes_itself_is_said_and_nothing_is_made() {
+	let (dir, server, listen) = (scratch("self-signed"), dns(true).await, free());
+	config(&dir, &[server], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let mut document: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap()).unwrap();
+	(document["inbounds"][0]["type"], document["inbounds"][0]["transport_keys"], document["inbounds"][0]["upgrade_cookie"], document["users"][0]["devices"][0]["transport_secrets"]) = (json!("veilway"), json!([veilway_wg::encode_key(&[0x51; 32])]), json!("sid"), json!([veilway_wg::encode_key(&[0xa1; 32])]));
+	document["inbounds"][0]["transports"] = json!([{"type": "tls", "listen": listen.to_string(), "path": "/assets/doctor-5e1f.js", "tls": {"self_signed": true}, "decoy": {"origin": format!("http://{}", free())}}]);
+	private(&dir, "config.json", &document.to_string());
+	let said = || async {
+		let (_, printed, _) = doctor(&dir, &["--json"]).await;
+		let document: Value = serde_json::from_str(&printed).unwrap();
+		let line = document["checks"].as_array().unwrap().iter().find(|line| line["check"] == "certificate").unwrap().clone();
+		(line["status"].as_str().unwrap().to_string(), line["message"].as_str().unwrap().to_string())
+	};
+	// Before the first start there is no key, and doctor makes none.
+	let before = listing(&dir);
+	let (status, message) = said().await;
+	assert!(status == "ok" && message.contains("at its next start") && listing(&dir) == before, "{status}: {message}");
+	// Once the node made them, the pin is the one the node says.
+	let (made, _) = veilway_core::engine::certificate::ensure(veilway_core::engine::certificate::files(&dir, "home"), listen, None, time::OffsetDateTime::now_utc()).unwrap();
+	let (status, message) = said().await;
+	assert!(status == "ok" && message.contains(&format!("pin {}", made.pin_text())) && message.contains("more days"), "{status}: {message}");
+	// A key file the node would not use is a failure of the start, and is left as it is.
+	std::fs::write(&made.files.key, "no key").unwrap();
+	let (status, message) = said().await;
+	assert!(status == "fail" && message.contains("not a key of ECDSA on P-256") && std::fs::read_to_string(&made.files.key).unwrap() == "no key", "{status}: {message}");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Transports page, "Who ends TLS": "A native `ws` or `fronted` listener never ends TLS itself", so doctor says whether anybody but this host reaches such a listener, asks its decoy origin as it asks that of `tls`, and tells from the counts of a node that runs whether the web server in front names its visitors in the header the config says.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_proxy_path_of_a_listener_is_held_to_loopback_and_to_the_header_its_proxy_sends() {

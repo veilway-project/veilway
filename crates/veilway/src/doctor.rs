@@ -17,10 +17,10 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use veilway_core::config::{self, Backend, Policy, Transport};
+use veilway_core::config::{self, Backend, Certificate, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
-use veilway_core::engine::{dns, icmp, probe, replay, stream};
+use veilway_core::engine::{certificate, dns, icmp, probe, replay, stream};
 use veilway_proto::replay::{STEP, WINDOW};
 use veilway_wg::ws::{self, TlsFiles};
 use x509_parser::extensions::GeneralName;
@@ -356,7 +356,28 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
-			let (Transport::Ws {tls: Some(tls), ..} | Transport::Tls {tls, ..}) = transport else {continue};
+			let tls = match transport {
+				Transport::Ws {tls: Some(tls), ..} | Transport::Tls {tls: Certificate::Files(tls), ..} => tls,
+				// The certificate the node makes itself: the pin of the key it keeps, which is what profiles carry. Nothing is made or written here.
+				Transport::Tls {listen, tls: Certificate::SelfSigned(_), ..} => {
+					let files = certificate::files(dir, &certificate::stem(&inbound.tag, &inbound.transports, t));
+					if !read.insert((files.cert.clone(), files.key.clone())) {continue}
+					let (status, message) = match certificate::read(files, listen.0) {
+						Ok(None) => (Status::Ok, "the node makes its own key and self-signed certificate at its next start, and says the pin then".to_string()),
+						Ok(Some(made)) => {
+							let (pin, until) = (made.pin_text(), (made.not_after - now) / DAY);
+							let said = if made.not_after == 0 {format!("the node keeps its own key, pin {pin}, and makes a certificate of it at its next start")} else if made.not_after < now {format!("the node keeps its own key, pin {pin}, and its self-signed certificate has run out: the node makes one anew with the same key at its next start")} else {format!("the node keeps its own key, pin {pin}, and a self-signed certificate of it valid for {until} more days, which it makes anew with the same key before it ends")};
+							#[cfg(unix)]
+							if std::fs::metadata(&made.files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {lines.push(line(Status::Warn, "certificate", format!("inbound {}, transports[{t}].tls", inbound.tag), format!("{said}, but others than the node's user can read the key file: restrict it (chmod 600)")));continue}
+							(Status::Ok, said)
+						}
+						Err(e) => (Status::Fail, format!("{e:#}, so `veilway run` would not start")),
+					};
+					lines.push(line(status, "certificate", format!("inbound {}, transports[{t}].tls", inbound.tag), message));
+					continue;
+				}
+				_ => continue,
+			};
 			let (cert, key) = (dir.join(&tls.cert), dir.join(&tls.key));
 			if !read.insert((cert.clone(), key.clone())) {continue}
 			let (status, message) = certificate(&cert, &key, now);

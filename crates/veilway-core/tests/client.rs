@@ -9,8 +9,10 @@ use etherparse::{PacketBuilder, TcpHeader};
 use proxied::*;
 use rcgen::PublicKeyData;
 use ring::digest::{digest, SHA256};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{RootCertStore, ServerConfig};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -124,7 +126,7 @@ async fn net(test: &'static str, time: Time, change: impl FnOnce(&mut Value)) ->
 fn link(n: usize) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}}
 
 impl Net {
-	fn front(&self, address: SocketAddr, pinned: bool) -> Front {Front {address, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: if pinned {vec![self.pin]} else {Vec::new()}, ech: false}}
+	fn front(&self, address: SocketAddr, pinned: bool) -> Front {Front {address, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: if pinned {vec![self.pin]} else {Vec::new()}, ech: false, self_signed: false}}
 
 	/// The target of a transport by its name. `ws` is pinned here, as a client's is that reaches the operator's own web server.
 	fn target(&self, kind: &str) -> Target {
@@ -431,7 +433,7 @@ async fn a_node_that_was_killed_refuses_until_its_clock_passes_its_floor() {
 	let behind = listen();
 	for (transport, addr) in doc["inbounds"][0]["transports"].as_array_mut().unwrap().iter_mut().zip([behind, behind, obfs, tls]) {transport["listen"] = json!(addr.to_string())}
 	let again = start(&doc, &dir, time).await.unwrap();
-	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false}});
+	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false}});
 	// A refusal on the stream, with the date of a clock that is right, and silence on `udp-obfs`: neither marks anything.
 	let (mut refused, mut silent) = (peer(0, &link(0), on_tls.clone(), 1, env.clone(), wireguard(0)), peer(1, &link(1), Target::UdpObfs(obfs), 1, env.clone(), wireguard(1)));
 	let ended = refused.ended().await;
@@ -466,7 +468,7 @@ async fn a_node_that_restarted_takes_the_proof_and_not_the_keepalive_and_nothing
 	let behind = listen();
 	for (transport, addr) in doc["inbounds"][0]["transports"].as_array_mut().unwrap().iter_mut().zip([behind, behind, listen(), tls]) {transport["listen"] = json!(addr.to_string())}
 	let again = start(&doc, &dir, time).await.unwrap();
-	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false}});
+	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false}});
 	// The device's tunnel is up as far as the device knows, so its session opens with a keepalive. The node takes the proof, cannot place the keepalive, and says nothing until its own 10 s are over.
 	let (started, mut forgotten) = (Instant::now(), peer(0, &link(0), on_tls.clone(), 1, env.clone(), (tunn.clone(), up.clone(), source.clone())));
 	let ended = forgotten.ended().await;
@@ -612,4 +614,92 @@ async fn udp_obfs_moves_to_a_new_socket_without_a_new_handshake() {
 	assert!(net.node.engine.peers(Some("a"))[0].handshake >= handshakes && peer.session.state() == State::Established);
 	peer.session.close().await;
 	net.node.engine.shutdown().await;
+}
+
+// A client that takes any certificate and keeps it: what the tests look at a listener's certificate with. No client of the library is ever this.
+#[derive(Debug)]
+struct Seen(Mutex<Vec<u8>>);
+
+impl ServerCertVerifier for Seen {
+	fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+		*self.0.lock().unwrap() = end_entity.to_vec();
+		Ok(ServerCertVerified::assertion())
+	}
+	fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {Ok(HandshakeSignatureValid::assertion())}
+	fn verify_tls13_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {Ok(HandshakeSignatureValid::assertion())}
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()}
+}
+
+/// The certificate a TLS listener answers a new connection with.
+async fn shown(addr: SocketAddr) -> Vec<u8> {
+	let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+	let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().unwrap().dangerous().with_custom_certificate_verifier(seen.clone()).with_no_client_auth();
+	let _ = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(ServerName::try_from("node.test").unwrap(), tokio::net::TcpStream::connect(addr).await.unwrap()).await;
+	let shown = seen.0.lock().unwrap().clone();
+	shown
+}
+
+// Transports page, "`tls`": "For a self-signed one the node makes the key and the certificate itself when its config asks for it, keeps the key on the node with mode 600, and never sends it anywhere. The node reports the SHA-256 of the certificate's SubjectPublicKeyInfo", and a client whose profile marks the candidate `self_signed` trusts it by that pin alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_makes_its_own_certificate_and_a_profile_that_pins_it_reaches_the_node_through_it() {
+	let (time, tls) = (time!(), listen());
+	let mut node = launch("client-self-signed", time, |doc| {
+		let transports = doc["inbounds"][0]["transports"].as_array_mut().unwrap();
+		let origin = transports[0]["decoy"].clone();
+		transports.push(json!({"type": "tls", "listen": tls.to_string(), "path": TLS_PATH, "tls": {"self_signed": true}, "decoy": origin}));
+	}).await;
+	let made = node.engine.certificates();
+	assert_eq!(made.iter().map(|made| made.listen).collect::<Vec<_>>(), [tls]);
+	let made = made[0].clone();
+	// What the files hold: the pin is the key's, and nothing in the certificate is a fixed placeholder or names the program.
+	let read = |path: &Path| {
+		let der = CertificateDer::from_pem_file(path).unwrap();
+		let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+		let names: Vec<String> = cert.subject_alternative_name().unwrap().unwrap().value.general_names.iter().map(|name| name.to_string()).collect();
+		(digest(&SHA256, cert.public_key().raw).as_ref().to_vec(), cert.subject().to_string(), cert.issuer().to_string(), names, cert.raw_serial().to_vec(), cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp(), cert.public_key().algorithm.parameters.as_ref().and_then(|curve| curve.as_oid().ok()).map(|oid| oid.to_id_string()), cert.basic_constraints().unwrap().map(|constraints| constraints.value.ca), cert.key_usage().unwrap().map(|usage| (usage.value.digital_signature(), usage.value.key_cert_sign())), cert.extended_key_usage().unwrap().map(|usage| (usage.value.server_auth, usage.value.client_auth)), der.to_vec())
+	};
+	let (pin, subject, issuer, names, serial, not_before, not_after, curve, ca, usage, extended, der) = read(&made.files.cert);
+	let name = subject.strip_prefix("CN=").unwrap().to_owned();
+	assert_eq!((pin.as_slice(), issuer, names, not_after - not_before, (made.not_before, made.not_after)), (&made.pin[..], subject.clone(), vec![format!("DNSName({name})")], not_after - not_before, (not_before, not_after)));
+	assert!((80 * 86_400..101 * 86_400).contains(&(not_after - not_before)) && not_before <= time.secs() as i64 && not_before > time.secs() as i64 - 7 * 86_400 - 5);
+	assert!(name.contains('.') && name.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'.') && (8..=16).contains(&serial.len()), "{name} {serial:?}");
+	assert_eq!((curve.as_deref(), ca, usage, extended), (Some("1.2.840.10045.3.1.7"), Some(false), Some((true, false)), Some((true, false))));
+	assert!(!der.windows(5).any(|window| window.eq_ignore_ascii_case(b"rcgen") || window.eq_ignore_ascii_case(b"veilw")));
+	assert_eq!(shown(tls).await, der);
+	#[cfg(unix)]
+	for path in [&made.files.key, &made.files.cert] {assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777, 0o600, "{path:?}")}
+	// A device whose profile pins that key alone reaches its tunnel, with no server name and with one, and no root of any kind is asked for.
+	let candidate = |pins: Vec<[u8; 32]>, sni: Option<&str>, self_signed: bool| Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins, ech: false, self_signed}};
+	let env = |roots: RootCertStore| Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots: Arc::new(roots), socket: None};
+	for (n, sni) in [(0, None), (1, Some("node.test"))] {
+		let mut device = peer(n, &link(n), candidate(vec![made.pin], sni, true), 1, env(RootCertStore::empty()), wireguard(n));
+		device.connect().await.unwrap_or_else(|ended| panic!("{sni:?}: {ended:?}"));
+		assert_eq!(device.leaves(41000 + n as u16).await.as_deref(), Some("main"), "{sni:?}");
+		device.session.close().await;
+	}
+	// A pin that does not match ends the candidate at once, and so does the right pin on a candidate from an authority: the chain is checked there whatever the server sends, and the node's certificate has none.
+	let (other, mut roots) = (rcgen::generate_simple_self_signed(vec!["node.test".to_string()]).unwrap(), RootCertStore::empty());
+	roots.add(CertificateDer::from(other.cert.der().to_vec())).unwrap();
+	let other_pin: [u8; 32] = digest(&SHA256, &other.signing_key.subject_public_key_info()).as_ref().try_into().unwrap();
+	for (target, roots) in [(candidate(vec![other_pin], None, true), RootCertStore::empty()), (candidate(vec![made.pin], Some("node.test"), false), roots)] {
+		let started = Instant::now();
+		assert_eq!(peer(2, &link(2), target, 1, env(roots), wireguard(2)).ended().await, Ended::Unreachable(Unreachable::Certificate));
+		assert!(started.elapsed() < 2 * SECOND, "{:?}", started.elapsed());
+	}
+	// A reload keeps the key, and the certificate with it.
+	node.reload(|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().last_mut().unwrap()["limits"] = json!({"sessions": 100})).await;
+	assert_eq!(node.engine.certificates().iter().map(|again| (again.pin, again.not_before)).collect::<Vec<_>>(), [(made.pin, made.not_before)]);
+	assert_eq!(read(&made.files.cert).11, der);
+	// After 85 days the certificate is made anew with the same key and the same name, and the listener answers with it: the pin in every profile stays good.
+	time.ahead.fetch_add(85 * 86_400, Ordering::SeqCst);
+	eventually("the certificate was not made anew", || node.engine.certificates().first().is_some_and(|again| again.not_before > made.not_before)).await;
+	let (again_pin, again_subject, _, _, again_serial, again_before, .., again) = read(&made.files.cert);
+	assert!(again_pin == pin && again_subject == subject && again_serial != serial && again_before >= time.secs() as i64 - 7 * 86_400 - 5 && node.engine.certificates()[0].pin == made.pin);
+	assert_eq!(shown(tls).await, again);
+	eventually("the replay limit did not follow the clock", || node.engine.replay().is_none_or(|replay| replay.limit >= time.secs())).await;
+	let mut device = peer(3, &link(3), candidate(vec![made.pin], None, true), 1, env(RootCertStore::empty()), wireguard(3));
+	device.connect().await.unwrap();
+	assert!(device.session.numbers().heard.is_some());
+	device.session.close().await;
+	node.engine.shutdown().await;
 }
