@@ -1,41 +1,75 @@
-/* Liquid glass. A glass surface is the theme's surface colour laid as a scrim over a blurred, saturated copy of whatever is behind it. The scrim opacity (--glass-tint) never goes under the value at which all text passes AA over pure black and pure white; test/contrast.test.ts holds that line. */
+/* Liquid glass. A pane is a thin scrim of the theme's surface colour over a blurred, saturated copy of what is behind it, lit from above: a specular line on the top edge, a soft gradient down the surface, a darker lip at the bottom, a shadow underneath and a trace of grain against banding.
+   The app paints its own backdrop, so a pane never sits over unknown content. src/theme/tokens.ts lists every colour that can be behind each kind of pane and test/contrast.test.ts fails when any text allowed on it drops under AA. The numbers the two share (--sheen, --shade, --well, --scrim, --glow-*, --shaft*) come from colors.css.
+   Four layers, thinnest to thickest:
+   sheet    rests on the backdrop and holds content. Nothing but the backdrop is ever behind it, so it can be the clearest.
+   chrome   navigation and tooltips. Content scrolls under it, so it is denser and blurs wider.
+   popover  menus and toasts. They can open over anything, the dimmed page included.
+   dialog   the same density as a popover, the widest blur and the deepest shadow, over a scrim.
+   A sheet inside a sheet does not blur again: glass is not stacked on glass. */
+:root { --glass-on: 1; }
 :root, [data-scheme], [data-material] {
-	--glass-bg: color-mix(in srgb, var(--c-surface) calc(var(--glass-tint) * 100%), transparent);
-	--glass-filter: blur(var(--glass-blur)) saturate(1.6);
+	--glass-rim: light-dark(rgb(255 255 255 / 0.95), rgb(255 255 255 / 0.3));
+	--glass-lip: light-dark(rgb(0 0 0 / 0.07), rgb(0 0 0 / 0.34));
 	/* The edge of a pane of float glass is green. Here it is the accent, mixed into the border. */
-	--glass-edge: color-mix(in srgb, var(--c-accent-ink) 24%, var(--c-line));
-	--glass-specular: light-dark(rgb(255 255 255 / 0.9), rgb(255 255 255 / 0.17));
+	--glass-edge: light-dark(color-mix(in srgb, color-mix(in srgb, var(--c-accent-ink) 30%, white) 78%, transparent), color-mix(in srgb, color-mix(in srgb, var(--c-accent-ink) 40%, var(--c-text)) 17%, transparent));
+	/* Light only ever helps dark text and shade only ever helps light text, so each scheme keeps the harmful one inside the checked amount and is free with the other. The grain takes the rest of that amount. */
+	--glass-light: light-dark(rgb(255 255 255 / 0.2), rgb(255 255 255 / calc(var(--sheen) * 0.5)));
+	--glass-dark: light-dark(rgb(0 0 0 / calc(var(--shade) * 0.5)), rgb(0 0 0 / 0.2));
+	--glass-grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .5 0 0 0 0 .5 0 0 0 0 .5 0 0 0 .16 -.05'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+	--well-bg: color-mix(in srgb, var(--c-sunken) calc(100% - (100% - var(--well)) * var(--glass-on)), transparent);
 }
-/* Solid fallbacks: the OS asks for less transparency, the browser cannot blur, or the user chose solid. data-material="glass" is the user overriding the OS. */
+/* Solid fallbacks: the OS asks for less transparency, the browser cannot blur, or the user chose solid. Every pane keeps its edge, gradient and shadow and loses only what it lets through. data-material="glass" is the user overriding the OS. */
 @media (prefers-reduced-transparency: reduce) {
-	:root:not([data-material="glass"]) { --glass-bg: var(--c-surface); --glass-filter: none; }
+	:root:not([data-material="glass"]) { --glass-on: 0; --glass-off: none; --glass-grain: none; }
 }
+[data-material="solid"] { --glass-on: 0; --glass-off: none; --glass-grain: none; }
+[data-material="glass"] { --glass-on: 1; --glass-off: initial; }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-	:root, [data-scheme], [data-material] { --glass-bg: var(--c-surface); --glass-filter: none; }
+	:root, [data-scheme], [data-material] { --glass-on: 0; --glass-off: none; --glass-grain: none; }
 }
-[data-material="solid"] { --glass-bg: var(--c-surface); --glass-filter: none; }
 .vw-glass {
-	background: var(--glass-bg);
-	-webkit-backdrop-filter: var(--glass-filter);
-	backdrop-filter: var(--glass-filter);
+	--g-tint: var(--glass-tint);
+	--g-blur: 1;
+	--g-shadow: var(--shadow-2);
+	background-color: color-mix(in srgb, var(--c-surface) calc(100% - (1 - var(--g-tint)) * var(--glass-on) * 100%), transparent);
+	background-image: var(--glass-grain), linear-gradient(to bottom, var(--glass-light), transparent 46%, transparent 58%, var(--glass-dark));
+	/* The blur radius is fixed per layer and never animated. */
+	-webkit-backdrop-filter: var(--glass-off, blur(calc(var(--glass-blur) * var(--g-blur))) saturate(var(--glass-saturate)));
+	backdrop-filter: var(--glass-off, blur(calc(var(--glass-blur) * var(--g-blur))) saturate(var(--glass-saturate)));
 	border: 1px solid var(--glass-edge);
 	border-radius: var(--r-3);
-	box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-2);
+	box-shadow: inset 0 1px 0 var(--glass-rim), inset 0 -1px 0 var(--glass-lip), 0 0 0 1px color-mix(in srgb, var(--shadow-ink) 16%, transparent), var(--g-shadow);
 }
-.vw-glass[data-depth="1"] { box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-1); }
-.vw-glass[data-depth="3"] { box-shadow: inset 0 1px 0 var(--glass-specular), var(--shadow-3); }
-/* A well is a recess inside a surface. It is opaque: glass is never stacked on glass. */
+.vw-glass[data-depth="1"] { --g-shadow: var(--shadow-1); }
+.vw-glass[data-layer="chrome"] { --g-tint: var(--glass-tint-float); --g-blur: 1.25; --g-shadow: var(--shadow-2); }
+.vw-glass[data-layer="popover"] { --g-tint: var(--glass-tint-thick); --g-shadow: var(--shadow-3); }
+.vw-glass[data-layer="dialog"] { --g-tint: var(--glass-tint-thick); --g-blur: 1.5; --g-shadow: var(--shadow-4); }
+.vw-glass :where(.vw-glass:not([data-layer]), .vw-glass[data-layer="sheet"]) { --glass-off: none; --glass-grain: none; --g-shadow: none; }
+/* A well is a recess cut into a pane: more of the sunken colour, a shadow under its top edge, no blur of its own. Status colours and chart marks, which a bare sheet cannot always hold at AA, go in a well or on a wash. */
 .vw-well {
-	background: var(--c-sunken);
+	background: var(--well-bg);
 	border: 1px solid var(--c-line);
 	border-radius: var(--r-2);
+	box-shadow: inset 0 1px 3px color-mix(in srgb, var(--shadow-ink) 34%, transparent);
 }
-/* The page behind the glass: two glows and the slanted bands of the app icon. Together the layers stay under the strength the contrast rules allow for text set straight on the backdrop (FIELD_STRENGTH in src/theme/tokens.ts). */
-.vw-backdrop {
-	background-color: var(--c-bg);
+/* The page behind the glass: the background colour, two glows, and the strokes of the app icon as shafts of light at the icon's slant. The two glows sit in opposite corners and each has faded out before the other passes half strength; the two small ones stay under half. The contrast rules count on that. data-fixed pins the light to the viewport so content scrolls through it. data-lit="off" turns the light down; the client does that while it is not connected. */
+.vw-backdrop { position: relative; isolation: isolate; background-color: var(--c-bg); }
+.vw-backdrop::before, .vw-backdrop::after { content: ""; position: absolute; inset: 0; z-index: -1; pointer-events: none; transition: opacity var(--dur-4) var(--ease); }
+.vw-backdrop[data-fixed]::before, .vw-backdrop[data-fixed]::after { position: fixed; }
+.vw-backdrop::before {
 	background-image:
-		linear-gradient(115.6deg, transparent 0 46%, color-mix(in srgb, var(--c-field-1) 22%, transparent) 46% 58%, transparent 58% 61%, color-mix(in srgb, var(--c-field-1) 16%, transparent) 61% 64.4%, transparent 64.4% 66.2%, color-mix(in srgb, var(--c-field-1) 10%, transparent) 66.2% 69.6%, transparent 69.6% 71.4%, color-mix(in srgb, var(--c-field-1) 5%, transparent) 71.4% 74.8%, transparent 74.8%),
-		radial-gradient(80% 60% at 0% 0%, color-mix(in srgb, var(--c-field-1) 46%, transparent), transparent 70%),
-		radial-gradient(90% 80% at 100% 100%, color-mix(in srgb, var(--c-field-2) 52%, transparent), transparent 72%);
-	background-attachment: fixed;
+		radial-gradient(ellipse 95% 85% at 8% -6%, color-mix(in srgb, var(--c-field-1) var(--glow-1), transparent), transparent 74%),
+		radial-gradient(ellipse 100% 90% at 104% 104%, color-mix(in srgb, var(--c-field-2) var(--glow-2), transparent), transparent 72%),
+		radial-gradient(ellipse 38% 34% at 96% 6%, color-mix(in srgb, var(--c-field-2) calc(var(--glow-2) * 0.4), transparent), transparent 76%),
+		radial-gradient(ellipse 40% 36% at -2% 92%, color-mix(in srgb, var(--c-field-1) calc(var(--glow-1) * 0.36), transparent), transparent 76%);
 }
+.vw-backdrop::after {
+	--shaft-ink: color-mix(in srgb, var(--c-field-1), white var(--shaft-white));
+	inset-block-end: auto;
+	block-size: min(100%, 1040px);
+	background-image: linear-gradient(115.6deg, transparent 0 41%, color-mix(in srgb, var(--shaft-ink) var(--shaft), transparent) 41% 52.5%, transparent 52.5% 55.2%, color-mix(in srgb, var(--shaft-ink) calc(var(--shaft) * 0.66), transparent) 55.2% 57.9%, transparent 57.9% 59.8%, color-mix(in srgb, var(--shaft-ink) calc(var(--shaft) * 0.42), transparent) 59.8% 62.5%, transparent 62.5% 64.4%, color-mix(in srgb, var(--shaft-ink) calc(var(--shaft) * 0.22), transparent) 64.4% 67.1%, transparent 67.1%);
+	-webkit-mask-image: linear-gradient(to bottom, #000 34%, transparent);
+	mask-image: linear-gradient(to bottom, #000 34%, transparent);
+}
+.vw-backdrop[data-lit="off"]::before { opacity: 0.55; }
+.vw-backdrop[data-lit="off"]::after { opacity: 0.14; }

@@ -5,9 +5,9 @@
 	gap: var(--s-2);
 	min-block-size: var(--control-h);
 	padding: var(--s-1) var(--s-4);
-	border: 1px solid var(--c-line-strong);
+	border: 1px solid color-mix(in srgb, var(--c-text) 30%, transparent);
 	border-radius: var(--r-2);
-	background: transparent;
+	background: color-mix(in srgb, var(--c-text) 4%, transparent);
 	color: var(--c-text);
 	font-weight: var(--weight-strong);
 	line-height: var(--leading-tight);
@@ -19,11 +19,12 @@
 .vw-button:active { background: var(--pressed); transform: translateY(1px); }
 .vw-button[data-size="sm"] { min-block-size: calc(var(--control-h) - 8px); padding-inline: var(--s-3); font-size: var(--text-2); }
 /* The primary action is the tile of the app icon: the same green, the same pale ink, one lit edge. Hover adds a halo and leaves the fill alone, so the label's contrast never moves. */
-.vw-button[data-variant="primary"] { background: var(--c-accent); border-color: transparent; color: var(--c-on-accent); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), var(--shadow-1); }
+.vw-button[data-variant="primary"] { background: var(--c-accent) linear-gradient(to bottom, rgb(255 255 255 / 0.09), transparent 42%); border-color: transparent; color: var(--c-on-accent); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), var(--shadow-1); }
 .vw-button[data-variant="primary"]:hover { box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.22), 0 0 0 3px color-mix(in srgb, var(--c-accent) 40%, transparent); }
-.vw-button[data-variant="quiet"] { border-color: transparent; }
-.vw-button[data-variant="danger"] { background: var(--wash-unsafe); border-color: color-mix(in srgb, var(--c-unsafe) 45%, var(--wash-unsafe)); color: var(--c-unsafe); }
-.vw-button[data-variant="danger"]:hover { box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-unsafe) 30%, transparent); }
+.vw-button[data-variant="quiet"] { border-color: transparent; background: transparent; }
+.vw-button[data-variant="quiet"]:hover { background: var(--hover); }
+.vw-button[data-variant="danger"] { background: var(--wash-danger); border-color: color-mix(in srgb, var(--c-danger) 45%, var(--wash-danger)); color: var(--c-danger); }
+.vw-button[data-variant="danger"]:hover { box-shadow: 0 0 0 3px color-mix(in srgb, var(--c-danger) 30%, transparent); }
 .vw-button:disabled, .vw-icon-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .vw-icon-button {
 	display: inline-grid;
@@ -46,14 +47,17 @@
 .vw-label .vw-muted { font-weight: var(--weight-regular); }
 .vw-note { display: flex; gap: var(--s-1); align-items: start; font-size: var(--text-2); color: var(--c-text-muted); }
 .vw-note .vw-icon { margin-block-start: 0.12em; }
-.vw-field[data-invalid] .vw-note { color: var(--c-unsafe); }
-.vw-field[data-invalid] :is(.vw-input, .vw-input-group) { border-color: var(--c-unsafe); }
+/* On a sheet the error text stays in the text colour and the mark beside it carries the red: status colours are only checked as marks there, not as small text. */
+.vw-field[data-invalid] .vw-note { color: var(--c-text); }
+.vw-field[data-invalid] .vw-note .vw-icon { color: var(--c-danger); }
+.vw-field[data-invalid] :is(.vw-input, .vw-input-group) { border-color: var(--c-danger); }
 .vw-input, .vw-input-group {
 	inline-size: 100%;
 	min-block-size: var(--control-h);
-	background: var(--c-sunken);
+	background: var(--well-bg);
 	border: 1px solid var(--c-line-strong);
 	border-radius: var(--r-2);
+	box-shadow: inset 0 1px 2px color-mix(in srgb, var(--shadow-ink) 30%, transparent);
 	color: var(--c-text);
 }
 .vw-input { padding: 0 var(--s-3); }
@@ -68,7 +72,7 @@
 .vw-input-action:hover, .vw-input-action[aria-pressed="true"] { color: var(--c-text); background: var(--hover); }
 .vw-select { display: flex; align-items: center; justify-content: space-between; gap: var(--s-2); text-align: start; cursor: pointer; }
 .vw-select[data-placeholder] { color: var(--c-text-muted); }
-.vw-menu { min-inline-size: var(--radix-select-trigger-width); max-block-size: var(--radix-select-content-available-height); padding: var(--s-1); z-index: 60; }
+.vw-menu { border-radius: var(--r-2); min-inline-size: var(--radix-select-trigger-width); max-block-size: var(--radix-select-content-available-height); padding: var(--s-1); z-index: 60; }
 .vw-menu-item { display: flex; align-items: center; gap: var(--s-2); min-block-size: var(--control-h); padding-inline: var(--s-2) var(--s-6); border-radius: var(--r-1); position: relative; cursor: pointer; user-select: none; }
 .vw-menu-item[data-highlighted] { background: var(--hover); outline: none; }
 .vw-menu-item[data-state="checked"] { font-weight: var(--weight-strong); }
@@ -80,8 +84,8 @@
 .vw-check-row label { display: grid; cursor: pointer; }
 .vw-radio-group { display: grid; gap: var(--s-2); margin-block-start: var(--s-1); }
 /* The switch is a slot with a square key in it. On is shown three ways: the key has moved, the slot is filled, and a tick mark appears where the key was. */
-.vw-switch { flex: none; position: relative; display: flex; inline-size: 42px; block-size: 24px; padding: 3px; border: 1px solid var(--c-line-strong); border-radius: 4px; background: var(--c-sunken); cursor: pointer; transition: background-color var(--dur-2) var(--ease); }
-.vw-switch-thumb { inline-size: 16px; block-size: 16px; border-radius: 2px; background: var(--c-text-muted); transition: margin var(--dur-2) var(--ease), background-color var(--dur-2) var(--ease); }
+.vw-switch { flex: none; position: relative; display: flex; inline-size: 42px; block-size: 24px; padding: 3px; border: 1px solid var(--c-line-strong); border-radius: 6px; background: var(--c-sunken); cursor: pointer; transition: background-color var(--dur-2) var(--ease); }
+.vw-switch-thumb { inline-size: 16px; block-size: 16px; border-radius: 3px; background: var(--c-text-muted); transition: margin var(--dur-2) var(--ease), background-color var(--dur-2) var(--ease); }
 .vw-switch[data-state="checked"] { background: var(--c-accent); border-color: var(--c-accent); }
 .vw-switch[data-state="checked"] .vw-switch-thumb { margin-inline-start: 18px; background: var(--c-on-accent); }
 .vw-switch[data-state="checked"]::before { content: ""; position: absolute; inset-block: 7px; inset-inline-start: 9px; inline-size: 2px; background: var(--c-on-accent); }
@@ -109,6 +113,51 @@
 .vw-tab[data-state="active"] { color: var(--c-text); font-weight: var(--weight-strong); box-shadow: inset 0 -2px 0 var(--c-accent-ink); }
 .vw-tab:focus-visible { outline-offset: -2px; }
 .vw-segmented { display: inline-flex; inline-size: fit-content; max-inline-size: 100%; padding: 2px; gap: 2px; border: 1px solid var(--c-line-strong); border-radius: var(--r-2); background: var(--c-sunken); }
-.vw-segment { min-block-size: calc(var(--control-h) - 6px); padding: 0 var(--s-3); border: 0; border-radius: 4px; background: none; color: var(--c-text-muted); font-size: var(--text-2); white-space: nowrap; cursor: pointer; }
+.vw-segment { min-block-size: calc(var(--control-h) - 6px); padding: 0 var(--s-3); border: 0; border-radius: calc(var(--r-2) - 3px); background: none; color: var(--c-text-muted); font-size: var(--text-2); white-space: nowrap; cursor: pointer; }
 .vw-segment:hover { color: var(--c-text); }
 .vw-segment[data-state="on"] { background: var(--c-surface); color: var(--c-text); font-weight: var(--weight-strong); box-shadow: 0 0 0 1px var(--c-line-strong); }
+
+/* The connect control. The track is a sheet of glass; the key and the strokes behind it lean at the slant of the app icon and do not turn around in right-to-left layouts, because the icon does not. The key needs 14px of room at each end for its lean. */
+.vw-connect {
+	--key-w: 78px;
+	--key-inset: 19px;
+	position: relative;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	inline-size: 100%;
+	min-block-size: 68px;
+	padding-block: 0;
+	padding-inline: calc(var(--key-w) + 2 * var(--key-inset)) var(--s-4);
+	overflow: hidden;
+	color: var(--c-text);
+	font-size: var(--text-4);
+	font-weight: var(--weight-strong);
+	line-height: var(--leading-tight);
+	cursor: pointer;
+	transition: padding-inline var(--dur-3) var(--ease);
+}
+.vw-connect:not([data-state="off"]) { padding-inline: var(--s-4) calc(var(--key-w) + 2 * var(--key-inset) + 38px); }
+.vw-connect:disabled { opacity: 0.5; cursor: not-allowed; }
+.vw-connect-slide { position: absolute; inset-block: 5px; inset-inline-start: var(--key-inset); inline-size: var(--key-w); transform: skewX(calc(-1 * var(--slant))); transition: inset-inline-start var(--dur-3) var(--ease); }
+.vw-connect:not([data-state="off"]) .vw-connect-slide { inset-inline-start: calc(100% - var(--key-w) - var(--key-inset)); }
+.vw-connect-key { position: absolute; inset: 0; display: grid; place-items: center; border: 1px solid var(--c-line-strong); border-radius: var(--r-2); background: color-mix(in srgb, var(--c-text) 9%, transparent); box-shadow: inset 0 1px 0 var(--glass-rim); transition: background-color var(--dur-3) var(--ease), box-shadow var(--dur-3) var(--ease), color var(--dur-3) var(--ease); }
+.vw-connect-key .vw-icon { inline-size: 24px; block-size: 24px; stroke-width: 1.8; transform: skewX(var(--slant)); }
+.vw-connect:hover:not(:disabled) .vw-connect-key { background: color-mix(in srgb, var(--c-text) 16%, transparent); }
+.vw-connect:active:not(:disabled) .vw-connect-slide { scale: 0.97; }
+.vw-connect[data-state="on"] .vw-connect-key, .vw-connect[data-state="on"]:hover .vw-connect-key { background: var(--c-accent); border-color: transparent; color: var(--c-on-accent); box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.3), 0 0 0 1px color-mix(in srgb, var(--c-accent-ink) 45%, transparent), 0 4px 22px -2px color-mix(in srgb, var(--c-accent-ink) 50%, transparent); }
+.vw-connect-trail { position: absolute; inset-block: 7px; inset-inline-end: calc(100% + 7px); display: flex; flex-direction: row-reverse; gap: 6px; }
+.vw-connect-trail i, .vw-strokes i { display: block; inline-size: 7px; border-radius: 1px; background: var(--c-accent-ink); opacity: 0; transition: opacity var(--dur-2) var(--ease); }
+.vw-connect[data-state="on"] .vw-connect-trail i:nth-child(1), .vw-strokes i:nth-child(1) { opacity: 0.92; transition-delay: 90ms; }
+.vw-connect[data-state="on"] .vw-connect-trail i:nth-child(2), .vw-strokes i:nth-child(2) { opacity: 0.56; transition-delay: 170ms; }
+.vw-connect[data-state="on"] .vw-connect-trail i:nth-child(3), .vw-strokes i:nth-child(3) { opacity: 0.28; transition-delay: 250ms; }
+.vw-connect[data-state="connecting"] .vw-connect-trail i { opacity: 0.56; }
+/* The three strokes on their own are the sign for work under way. With motion allowed they light in turn; without it they hold the fading row of the icon. */
+.vw-strokes { display: flex; gap: 3px; block-size: 18px; transform: skewX(calc(-1 * var(--slant))); }
+.vw-strokes i { inline-size: 4px; }
+@media (prefers-reduced-motion: no-preference) {
+	:root:not([data-motion="reduced"]) :is(.vw-connect[data-state="connecting"] .vw-connect-trail, .vw-strokes) i { animation: vw-stroke 1.2s var(--ease) infinite; }
+	:root:not([data-motion="reduced"]) :is(.vw-connect-trail, .vw-strokes) i:nth-child(2) { animation-delay: 160ms; }
+	:root:not([data-motion="reduced"]) :is(.vw-connect-trail, .vw-strokes) i:nth-child(3) { animation-delay: 320ms; }
+}
+@keyframes vw-stroke { 0%, 100% { opacity: 0.2; } 35% { opacity: 0.95; } }

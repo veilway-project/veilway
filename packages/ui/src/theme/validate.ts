@@ -1,6 +1,6 @@
 import {THEME_FORMAT} from "../brand.ts";
 import {BLACK, WHITE, contrast, luminance, mix, parseHex, toHex} from "./color.ts";
-import {BLUR_MAX, COLOR_KEYS, MAX_BYTES, MAX_NAME, RULES, audit, grounds, minTint, type Palette, type Theme} from "./tokens.ts";
+import {BLUR_MAX, COLOR_KEYS, MAX_BYTES, MAX_NAME, RULES, findings, grounds, minTint, type Palette, type Theme, type Tints} from "./tokens.ts";
 
 export type IssueCode = "not-text" | "too-large" | "too-deep" | "not-json" | "not-object" | "unknown-key" | "missing-key" | "bad-type" | "bad-value" | "bad-color" | "scheme-mismatch" | "low-contrast" | "ink-adjusted" | "tint-raised";
 export type Issue = {code: IssueCode, path: string};
@@ -11,6 +11,8 @@ const GLASS_KEYS = ["tint", "blur"];
 const MAX_ISSUES = 12;
 // A pair this far under its minimum is refused outright; anything closer is repaired by moving the foreground.
 const REFUSE_BELOW = 2 / 3;
+// Colours are judged first with every pane solid, which is also what the solid setting shows. How thin the glass may then get is a separate question with its own answer.
+const SOLID: Tints = {glass: 1, float: 1, thick: 1};
 
 function refuse(code: IssueCode, path: string): Verdict {
 	return {ok: false, errors: [{code, path}]};
@@ -70,23 +72,24 @@ export function validateTheme(input: unknown): Verdict {
 	}
 	if (errors.length > 0) return {ok: false, errors: errors.slice(0, MAX_ISSUES)};
 	if ((luminance(p.text) > luminance(p.surface)) !== (raw.scheme === "dark") || (luminance(p.text) > luminance(p.bg)) !== (raw.scheme === "dark")) return refuse("scheme-mismatch", "scheme");
-	const corrections: Issue[] = [];
+	const corrections: Issue[] = [], blur = Math.round(glass.blur as number);
 	for (const rule of RULES) {
-		const solid = rule.on.filter(on => on !== "glass"), path = "colors." + rule.fg;
-		const worst = () => Math.min(...solid.flatMap(on => grounds(p, 1, on, rule.fg)).map(g => contrast(p[rule.fg], g)));
+		const path = "colors." + rule.fg;
+		const worst = () => Math.min(...rule.on.flatMap(on => grounds(p, SOLID, blur, on, rule.fg)).map(g => contrast(p[rule.fg], g)));
 		if (worst() >= rule.min) continue;
 		if (worst() < rule.min * REFUSE_BELOW) {
 			errors.push({code: "low-contrast", path});
 			continue;
 		}
-		const start = p[rule.fg], pole = luminance(grounds(p, 1, solid[0]!, rule.fg)[0]!) < 0.18 ? WHITE : BLACK;
+		const start = p[rule.fg], pole = luminance(grounds(p, SOLID, blur, rule.on[0]!, rule.fg)[0]!) < 0.18 ? WHITE : BLACK;
 		for (let step = 1; step <= 20 && worst() < rule.min; step++) p[rule.fg] = parseHex(toHex(mix(start, pole, step / 20))) ?? start;
 		if (worst() < rule.min) errors.push({code: "low-contrast", path});
 		else if (!corrections.some(c => c.path === path)) corrections.push({code: "ink-adjusted", path});
 	}
 	// A repair can move a status colour and with it the wash other text sits on, so the whole set is judged once more.
-	for (const f of audit(p, 1)) if (f.ratio < f.min && !errors.some(e => e.path === "colors." + f.fg)) errors.push({code: "low-contrast", path: "colors." + f.fg});
-	const floor = minTint(p);
+	for (const f of findings(p, SOLID, blur)) if (f.ratio < f.min && !errors.some(e => e.path === "colors." + f.fg)) errors.push({code: "low-contrast", path: "colors." + f.fg});
+	// The backdrop colours, the surface colour and the tint are judged together here: the floor is the thinnest sheet this palette can read through over its own backdrop.
+	const floor = minTint(p, blur);
 	if (errors.length > 0 || floor === null) return {ok: false, errors: errors.slice(0, MAX_ISSUES)};
 	if ((glass.tint as number) < floor) corrections.push({code: "tint-raised", path: "glass.tint"});
 	return {ok: true, corrections, theme: {
@@ -95,7 +98,7 @@ export function validateTheme(input: unknown): Verdict {
 		name: raw.name as string,
 		scheme: raw.scheme as Theme["scheme"],
 		colors: Object.fromEntries(COLOR_KEYS.map(k => [k, toHex(p[k]).toUpperCase()])) as Theme["colors"],
-		glass: {tint: Math.round(Math.max(floor, glass.tint as number) * 100) / 100, blur: Math.round(glass.blur as number)}
+		glass: {tint: Math.round(Math.max(floor, glass.tint as number) * 100) / 100, blur}
 	}};
 }
 

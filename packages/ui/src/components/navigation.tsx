@@ -7,7 +7,7 @@ export type NavItem = {id: string, label: string, icon: IconName};
 // One navigation model for the panel and the clients. In a wide container it is a rail beside the content; in a narrow one (a phone, a compact client window) the same items become a bar under it. "auto" lets the Shell's width decide.
 export function Nav({items, value, onChange, layout = "auto", header}: {items: NavItem[], value: string, onChange: (id: string) => void, layout?: "auto" | "rail" | "bar", header?: ReactNode}) {
 	const {t} = useI18n();
-	return <nav className="vw-glass vw-nav" data-layout={layout} aria-label={t("nav.label")}>
+	return <nav className="vw-glass vw-nav" data-layer="chrome" data-layout={layout} aria-label={t("nav.label")}>
 		{header && <div className="vw-nav-header">{header}</div>}
 		<ul>{items.map(item => <li key={item.id}><button type="button" className="vw-nav-item" aria-current={item.id === value ? "page" : undefined} onClick={() => onChange(item.id)}><Icon name={item.icon}/><span>{item.label}</span></button></li>)}</ul>
 	</nav>;

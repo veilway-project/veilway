@@ -2,18 +2,10 @@ import {line as lineShape} from "d3-shape";
 import type {ReactNode} from "react";
 import {Icon, useI18n} from "./core.tsx";
 
-export type Rating = "protected" | "detectable" | "unsafe";
-
-// The three bars are the strokes of the app icon. How many are solid, and the stroke through them, carry the rating without colour: three solid, one solid and two hollow, three hollow and struck through.
-export function RatingBadge({rating, detail}: {rating: Rating, detail?: boolean}) {
-	const {t} = useI18n(), solid = rating === "protected" ? 3 : rating === "detectable" ? 1 : 0;
-	return <span className="vw-rating" data-rating={rating} data-detail={detail ? "" : undefined} aria-label={detail ? undefined : t("rating.label", {rating: t(`rating.${rating}`)})}>
-		<svg className="vw-rating-glyph" viewBox="0 0 20 14" aria-hidden="true">
-			{[0, 1, 2].map(i => <polygon key={i} points={`${i * 5.2 + 6.4},1 ${i * 5.2 + 9.6},1 ${i * 5.2 + 3.9},13 ${i * 5.2 + 0.7},13`} data-solid={i < solid ? "" : undefined}/>)}
-			{rating === "unsafe" && <line x1="1" y1="3" x2="19" y2="11"/>}
-		</svg>
-		<span className="vw-rating-text"><strong>{t(`rating.${rating}`)}</strong>{detail && <span>{t(`rating.${rating}.detail`)}</span>}</span>
-	</span>;
+// Apps never rate a connection. The one thing they say is that an unsafe one is not secure: this mark where connections are listed, a danger Banner with unsafe.title and unsafe.body where it is in use, and a confirmation before connecting.
+export function UnsafeNote() {
+	const {t} = useI18n();
+	return <span className="vw-unsafe"><Icon name="error"/>{t("unsafe.label")}</span>;
 }
 
 // Bytes used against a quota. The bar is a meter, the numbers beside it say the same thing, and the level (under 80%, near the limit, over it) is spelled out in the percentage as well as the colour. total null means no limit. compact drops the visible label, for a table row that already names its user.
@@ -35,11 +27,16 @@ export function Sparkline({values, label}: {values: number[], label: string}) {
 	</svg>;
 }
 
-// A figure with its label. Tiles are not boxed: a row of them is divided by hairlines inside one surface.
-export function StatTile({label, value, unit, detail, trend}: {label: string, value: string, unit?: string, detail?: ReactNode, trend?: number[]}) {
-	return <div className="vw-stat">
+// Large figures are not set in the text face. Its zero is slashed, which is right for a key or an address and wrong at display size, where a lone 0 reads as the letter Ø. Runs of Latin digits in a display figure get the class that switches them to the figures face; Persian digits already come from it.
+export function figures(value: string) {
+	return value.split(/(\d[\d.,:]*)/).map((part, i) => i % 2 ? <span key={i} className="vw-figure">{part}</span> : part);
+}
+
+// A figure with its label. Tiles are not boxed: a row of them is divided by hairlines inside one surface. lead marks the one figure a row is about; it is set a step larger and takes the wider share.
+export function StatTile({label, value, unit, detail, trend, lead}: {label: string, value: string, unit?: string, detail?: ReactNode, trend?: number[], lead?: boolean}) {
+	return <div className="vw-stat" data-lead={lead ? "" : undefined}>
 		<span className="vw-stat-label">{label}</span>
-		<span className="vw-stat-value">{value}{unit && <span className="vw-stat-unit">{unit}</span>}</span>
+		<span className="vw-stat-value">{figures(value)}{unit && <span className="vw-stat-unit">{unit}</span>}</span>
 		{trend && <Sparkline values={trend} label={label}/>}
 		{detail && <span className="vw-muted vw-small">{detail}</span>}
 	</div>;

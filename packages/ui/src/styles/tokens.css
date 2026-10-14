@@ -14,7 +14,8 @@
 	--leading-tight: 1.2;
 	--weight-regular: 400;
 	--weight-strong: 620;
-	--tracking-display: -0.012em;
+	--weight-display: 680;
+	--tracking-display: -0.018em;
 	--s-1: 4px;
 	--s-2: 8px;
 	--s-3: 12px;
@@ -24,15 +25,17 @@
 	--s-7: 48px;
 	--s-8: 64px;
 	/* Three radii, nested: a control inside a surface inside a window. Nothing is ever fully rounded. */
-	--r-1: 3px;
-	--r-2: 6px;
-	--r-3: 10px;
+	--r-1: 4px;
+	--r-2: 10px;
+	--r-3: 18px;
 	--control-h: 36px;
 	--dur-1: 110ms;
 	--dur-2: 180ms;
 	--dur-3: 280ms;
+	/* The one slow duration: the light behind the glass coming up or going down with the connection. */
+	--dur-4: 620ms;
 	--ease: cubic-bezier(0.2, 0.7, 0.2, 1);
-	/* The slant of the stroke in the app icon, used for the backdrop bands, the selected mark in navigation and the rating glyph. */
+	/* The slant of the stroke in the app icon, used for the backdrop bands, the selected mark in navigation and the connect key. */
 	--slant: 25.6deg;
 }
 /* Persian has no capitals to lean on and taller marks above and below the line: one step larger at small sizes, more leading, never any tracking. */
@@ -43,25 +46,28 @@
 	--leading: 1.8;
 	--leading-tight: 1.45;
 	--weight-strong: 650;
+	--weight-display: 700;
 	--tracking-display: 0;
 }
 @media (pointer: coarse) {
 	:root { --control-h: 44px; }
 }
 :root, [data-scheme] {
-	--shadow-ink: color-mix(in srgb, var(--c-bg) 35%, black);
-	--shadow-1: 0 1px 2px color-mix(in srgb, var(--shadow-ink) 24%, transparent);
-	--shadow-2: 0 1px 2px color-mix(in srgb, var(--shadow-ink) 22%, transparent), 0 10px 28px -10px color-mix(in srgb, var(--shadow-ink) 50%, transparent);
-	--shadow-3: 0 2px 4px color-mix(in srgb, var(--shadow-ink) 24%, transparent), 0 28px 64px -16px color-mix(in srgb, var(--shadow-ink) 70%, transparent);
+	--shadow-ink: color-mix(in srgb, var(--c-bg) var(--shadow-ink-bg), black);
+	/* One light from above, in three parts: a crisp contact line, a short mid shadow and a wide ambient one that grows with the height of the layer. */
+	--shadow-1: 0 1px 1px color-mix(in srgb, var(--shadow-ink) 18%, transparent), 0 2px 6px -1px color-mix(in srgb, var(--shadow-ink) 20%, transparent), 0 10px 20px -10px color-mix(in srgb, var(--shadow-ink) 32%, transparent);
+	--shadow-2: 0 1px 1px color-mix(in srgb, var(--shadow-ink) 18%, transparent), 0 4px 10px -2px color-mix(in srgb, var(--shadow-ink) 20%, transparent), 0 22px 44px -18px color-mix(in srgb, var(--shadow-ink) 50%, transparent);
+	--shadow-3: 0 1px 2px color-mix(in srgb, var(--shadow-ink) 20%, transparent), 0 8px 20px -6px color-mix(in srgb, var(--shadow-ink) 26%, transparent), 0 32px 64px -20px color-mix(in srgb, var(--shadow-ink) 64%, transparent);
+	--shadow-4: 0 2px 4px color-mix(in srgb, var(--shadow-ink) 22%, transparent), 0 12px 28px -8px color-mix(in srgb, var(--shadow-ink) 30%, transparent), 0 52px 110px -24px color-mix(in srgb, var(--shadow-ink) 80%, transparent);
 	--wash-info: color-mix(in srgb, var(--c-info) var(--wash-strength), var(--c-surface));
-	--wash-protected: color-mix(in srgb, var(--c-protected) var(--wash-strength), var(--c-surface));
-	--wash-detectable: color-mix(in srgb, var(--c-detectable) var(--wash-strength), var(--c-surface));
-	--wash-unsafe: color-mix(in srgb, var(--c-unsafe) var(--wash-strength), var(--c-surface));
+	--wash-success: color-mix(in srgb, var(--c-success) var(--wash-strength), var(--c-surface));
+	--wash-warning: color-mix(in srgb, var(--c-warning) var(--wash-strength), var(--c-surface));
+	--wash-danger: color-mix(in srgb, var(--c-danger) var(--wash-strength), var(--c-surface));
 	/* Hover and pressed fills. They sit under primary text only, which has contrast to spare. */
 	--hover: color-mix(in srgb, var(--c-text) 7%, transparent);
 	--pressed: color-mix(in srgb, var(--c-text) 12%, transparent);
 }
 @media (prefers-reduced-motion: reduce) {
-	:root:not([data-motion="full"]) { --dur-1: 0.01ms; --dur-2: 0.01ms; --dur-3: 0.01ms; }
+	:root:not([data-motion="full"]) { --dur-1: 0.01ms; --dur-2: 0.01ms; --dur-3: 0.01ms; --dur-4: 0.01ms; }
 }
-[data-motion="reduced"] { --dur-1: 0.01ms; --dur-2: 0.01ms; --dur-3: 0.01ms; }
+[data-motion="reduced"] { --dur-1: 0.01ms; --dur-2: 0.01ms; --dur-3: 0.01ms; --dur-4: 0.01ms; }

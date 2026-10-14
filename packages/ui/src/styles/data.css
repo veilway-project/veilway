@@ -3,18 +3,22 @@
 .vw-stat { display: grid; align-content: start; gap: var(--s-1); min-inline-size: 0; padding-inline: var(--s-4); margin-inline-start: -1px; border-inline-start: 1px solid var(--c-line); }
 .vw-stat-label { font-size: var(--text-2); color: var(--c-text-muted); }
 .vw-stat-value { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--s-1); font-size: var(--text-6); font-weight: var(--weight-strong); line-height: 1.15; letter-spacing: var(--tracking-display); }
+.vw-stat[data-lead] { grid-column: span 2; }
+.vw-stat[data-lead] .vw-stat-value { font-size: var(--text-7); font-weight: var(--weight-display); line-height: 1.08; letter-spacing: calc(var(--tracking-display) * 1.4); }
+.vw-stat[data-lead] .vw-stat-unit { font-size: var(--text-3); }
 .vw-stat-unit { white-space: nowrap; font-size: var(--text-2); font-weight: var(--weight-regular); letter-spacing: 0; color: var(--c-text-muted); }
 .vw-sparkline { inline-size: 96px; block-size: 28px; overflow: visible; }
 .vw-sparkline path { fill: none; stroke: var(--c-text-muted); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
-.vw-sparkline circle { fill: var(--c-chart-1); stroke: var(--c-surface); stroke-width: 2; }
+/* The mark on the last reading is in the text colour: a tile sits on bare glass, where chart colours are not checked. */
+.vw-sparkline circle { fill: var(--c-text); }
 
 .vw-usage { display: grid; gap: var(--s-1); --fill: var(--c-chart-1); }
-.vw-usage[data-level="near"] { --fill: var(--c-detectable); }
-.vw-usage[data-level="over"] { --fill: var(--c-unsafe); }
+.vw-usage[data-level="near"] { --fill: var(--c-warning); }
+.vw-usage[data-level="over"] { --fill: var(--c-danger); }
 .vw-usage-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0 var(--s-3); }
 .vw-usage-bar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--s-3); }
 /* The track is a lighter step of the fill, so the level reads along the whole bar. Square at the start, 2px at the data end. */
-.vw-meter { block-size: 8px; border-radius: 2px; background: color-mix(in srgb, var(--fill) 24%, var(--c-sunken)); overflow: hidden; }
+.vw-meter { block-size: 8px; border-radius: 3px; background: color-mix(in srgb, var(--fill) 24%, var(--c-sunken)); overflow: hidden; }
 .vw-meter span { display: block; block-size: 100%; background: var(--fill); border-start-end-radius: 2px; border-end-end-radius: 2px; transition: inline-size var(--dur-3) var(--ease); }
 
 .vw-list > li + li { border-block-start: 1px solid var(--c-line); }
@@ -46,7 +50,11 @@ button.vw-row[aria-pressed="true"] .vw-row-trailing > .vw-icon:last-child { colo
 	.vw-table td:first-child::before { content: none; }
 }
 
-.vw-chart { display: grid; gap: var(--s-3); min-inline-size: 0; }
+/* A chart is an instrument set into the glass: the whole figure is a well, so its lines and legend keys always have a ground they are checked against. */
+.vw-chart { display: grid; gap: var(--s-3); min-inline-size: 0; padding: var(--s-4); border: 1px solid var(--c-line); border-radius: var(--r-2); background: var(--well-bg); box-shadow: inset 0 1px 3px color-mix(in srgb, var(--shadow-ink) 34%, transparent); }
+@container shell (max-width: 480px) {
+	.vw-chart { padding: var(--s-3); }
+}
 .vw-chart-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-2) var(--s-4); }
 .vw-legend { display: flex; flex-wrap: wrap; gap: var(--s-1) var(--s-5); }
 .vw-legend li { display: flex; align-items: center; gap: var(--s-2); color: var(--c-text-muted); }
@@ -60,7 +68,7 @@ button.vw-row[aria-pressed="true"] .vw-row-trailing > .vw-icon:last-child { colo
 .vw-tick { fill: var(--c-text-muted); font-size: var(--text-1); font-variant-numeric: tabular-nums; }
 .vw-line { fill: none; stroke: var(--series); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .vw-area { fill: var(--series); opacity: 0.1; }
-.vw-dot { fill: var(--series); stroke: var(--c-surface); stroke-width: 2; }
+.vw-dot { fill: var(--series); stroke: var(--c-sunken); stroke-width: 2; }
 .vw-crosshair { stroke: var(--c-line-strong); stroke-width: 1; }
 .vw-axis-unit { position: absolute; top: 0; left: 0; line-height: 1; font-size: var(--text-1); color: var(--c-text-muted); }
 .vw-tooltip { position: absolute; top: var(--s-4); z-index: 5; display: grid; gap: 2px; padding: var(--s-2) var(--s-3); border-radius: var(--r-2); white-space: nowrap; pointer-events: none; transform: translateX(12px); }

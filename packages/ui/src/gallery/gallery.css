@@ -16,10 +16,14 @@
 
 .g-use { display: grid; grid-template-columns: minmax(0, 360px) minmax(0, 1fr); gap: var(--s-5); align-items: start; }
 .g-specimen { display: grid; gap: var(--s-2); min-inline-size: 0; }
-.g-window { block-size: 700px; overflow: auto; border: 1px solid var(--c-line-strong); border-radius: var(--r-3); box-shadow: var(--shadow-3); background-attachment: scroll; scrollbar-width: thin; }
-.g-window > .vw-shell { min-block-size: 100%; display: grid; }
-.g-connect { display: grid; justify-items: start; gap: var(--s-2); padding-block: var(--s-5) var(--s-2); }
-.g-connect .vw-button { margin-block-start: var(--s-3); min-inline-size: 60%; }
+/* The client window: the backdrop stays put and the content scrolls inside it, as it does in the real window. */
+.g-window { block-size: 720px; overflow: hidden; border: 1px solid var(--c-line-strong); border-radius: var(--r-3); box-shadow: var(--shadow-3); }
+.g-scroll { block-size: 100%; overflow: auto; scrollbar-width: thin; }
+.g-scroll > .vw-shell { min-block-size: 100%; display: grid; }
+.g-hero { display: grid; gap: var(--s-2); padding-block: var(--s-6) var(--s-1); }
+.g-hero-place { display: grid; justify-items: start; margin-block-end: var(--s-4); font-size: var(--text-4); line-height: var(--leading-tight); }
+.g-hero-place .vw-code { font-size: var(--text-2); line-height: var(--leading); }
+.g-panel-head { padding-block: var(--s-2) 0; }
 .g-user { display: grid; justify-items: start; }
 @container shell (max-width: 1040px) {
 	.g-use { grid-template-columns: minmax(0, 1fr); }
@@ -42,7 +46,7 @@
 .g-spaces li, .g-motion li { display: grid; grid-template-columns: 4rem auto; align-items: center; gap: var(--s-3); }
 .g-space { block-size: 12px; background: var(--c-accent-ink); border-radius: 1px; }
 .g-radii { display: flex; flex-wrap: wrap; gap: var(--s-3); }
-.g-radius, .g-depth { display: grid; place-items: center; inline-size: 64px; block-size: 64px; }
+.g-radius { display: grid; place-items: center; inline-size: 64px; block-size: 64px; }
 .g-radius { border: 1px solid var(--c-line-strong); background: var(--c-sunken); }
 .g-motion { display: grid; gap: var(--s-2); inline-size: 100%; }
 .g-motion li { grid-template-columns: 4.5rem minmax(0, 1fr); }
@@ -51,17 +55,14 @@
 .g-track span { display: block; inline-size: 24px; block-size: 100%; background: var(--c-accent-ink); transition: margin-inline-start var(--ease); }
 .g-motion[data-moved] .g-track span { margin-inline-start: calc(100% - 24px); }
 
-/* A deliberately loud strip to hold the glass against: full-strength colours, white, black and large type. */
-.g-busy { position: relative; display: grid; border-radius: var(--r-2); overflow: hidden; border: 1px solid var(--c-line-strong); }
-.g-busy-back { position: absolute; inset: 0; display: grid; grid-template-columns: repeat(5, 1fr); }
-.g-busy-back span:nth-child(1) { background: var(--c-accent); }
-.g-busy-back span:nth-child(2) { background: #FFFFFF; }
-.g-busy-back span:nth-child(3) { background: var(--c-chart-2); }
-.g-busy-back span:nth-child(4) { background: #000000; }
-.g-busy-back span:nth-child(5) { background: var(--c-detectable); }
-.g-busy-back strong { position: absolute; inset-block-start: 4%; inset-inline: 0; text-align: center; font-size: clamp(2rem, 9cqi, 5.5rem); line-height: 1; color: #8A8A8A; mix-blend-mode: difference; white-space: nowrap; }
-.g-panes { position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: var(--s-4); padding: var(--s-7) var(--s-4) var(--s-4); container-type: inline-size; }
+/* The glass specimens stand on a backdrop of their own with large type behind them, so the blur of each layer has something to show. */
+.g-bare { display: grid; gap: var(--s-4); min-inline-size: 0; }
+.g-bare > header { display: grid; gap: var(--s-1); max-inline-size: 68ch; }
+.g-stage { overflow: hidden; border: 1px solid var(--c-line-strong); border-radius: var(--r-3); container-type: inline-size; }
+.g-stage-copy { position: absolute; inset: 0; display: grid; align-content: space-evenly; justify-items: center; padding: var(--s-4); font-family: var(--font-mono); font-size: clamp(1.5rem, 6cqi, 4rem); line-height: 1; white-space: nowrap; color: color-mix(in srgb, var(--c-text) 50%, transparent); }
+.g-panes { position: relative; display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: var(--s-5); padding: var(--s-6) var(--s-5); }
 .g-pane { display: grid; gap: var(--s-1); padding: var(--s-4); align-content: start; }
+.g-pane .vw-well { margin-block-start: var(--s-2); }
 
 .g-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s-5); align-items: start; max-inline-size: 760px; }
 .g-form-wide { grid-column: 1 / -1; }
@@ -70,7 +71,6 @@
 	.g-type li { grid-template-columns: minmax(0, 1fr); gap: var(--s-1); }
 	.g-panel { padding: var(--s-4); gap: var(--s-4); }
 }
-.g-ratings { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: var(--s-3); }
 .g-provider { max-inline-size: 420px; }
 .g-link { padding: var(--s-3); }
 .g-usages { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: var(--s-5) var(--s-6); }
@@ -81,8 +81,8 @@
 .g-editor { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s-5); align-items: start; }
 .g-colors { display: grid; gap: var(--s-2); }
 .g-colors input[type="color"] { inline-size: 40px; block-size: 32px; padding: 0; border: 1px solid var(--c-line-strong); border-radius: var(--r-1); background: none; cursor: pointer; }
-.g-preview { position: sticky; inset-block-start: var(--s-4); display: grid; padding: var(--s-5); border: 1px solid var(--c-line-strong); border-radius: var(--r-3); background-attachment: scroll; }
+.g-preview { position: sticky; inset-block-start: var(--s-4); display: grid; padding: var(--s-5); border: 1px solid var(--c-line-strong); border-radius: var(--r-3); overflow: hidden; }
 @container shell (max-width: 900px) {
 	.g-editor { grid-template-columns: minmax(0, 1fr); }
-	.g-preview { position: static; order: -1; }
+	.g-preview { position: relative; order: -1; }
 }

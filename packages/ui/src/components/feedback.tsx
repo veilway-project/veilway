@@ -10,7 +10,7 @@ export function Dialog({open, onOpenChange, title, description, children, footer
 	const {t} = useI18n();
 	return <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}><DialogPrimitive.Portal>
 		<DialogPrimitive.Overlay className="vw-overlay"/>
-		<DialogPrimitive.Content className="vw-glass vw-dialog" data-depth="3" {...(description ? {} : {"aria-describedby": undefined})}>
+		<DialogPrimitive.Content className="vw-glass vw-dialog" data-layer="dialog" {...(description ? {} : {"aria-describedby": undefined})}>
 			<div className="vw-dialog-head"><DialogPrimitive.Title className="vw-h3">{title}</DialogPrimitive.Title><DialogPrimitive.Close asChild><IconButton icon="close" label={t("action.close")}/></DialogPrimitive.Close></div>
 			{description && <DialogPrimitive.Description className="vw-muted">{description}</DialogPrimitive.Description>}
 			{children}
@@ -24,7 +24,7 @@ export function ConfirmDialog({open, onOpenChange, title, body, confirmLabel, da
 	const {t} = useI18n();
 	return <AlertDialog.Root open={open} onOpenChange={onOpenChange}><AlertDialog.Portal>
 		<AlertDialog.Overlay className="vw-overlay"/>
-		<AlertDialog.Content className="vw-glass vw-dialog" data-depth="3">
+		<AlertDialog.Content className="vw-glass vw-dialog" data-layer="dialog">
 			<AlertDialog.Title className="vw-h3">{title}</AlertDialog.Title>
 			<AlertDialog.Description className="vw-muted">{body}</AlertDialog.Description>
 			<div className="vw-dialog-foot"><AlertDialog.Cancel asChild><Button>{t("action.cancel")}</Button></AlertDialog.Cancel><AlertDialog.Action asChild><Button variant={danger ? "danger" : "primary"} onClick={onConfirm}>{confirmLabel}</Button></AlertDialog.Action></div>
@@ -40,7 +40,7 @@ export function ToastProvider({children}: {children: ReactNode}) {
 	const push = useCallback((toast: ToastInput) => setItems(list => [...list, {...toast, id: next.current++}]), []);
 	return <ToastContext.Provider value={push}><ToastPrimitive.Provider label={t("toast.region")} swipeDirection={dir === "rtl" ? "left" : "right"}>
 		{children}
-		{items.map(item => <ToastPrimitive.Root key={item.id} className="vw-glass vw-toast" data-depth="3" data-tone={item.tone ?? "info"} onOpenChange={open => { if (!open) setItems(list => list.filter(other => other.id !== item.id)); }}>
+		{items.map(item => <ToastPrimitive.Root key={item.id} className="vw-glass vw-toast" data-layer="popover" data-tone={item.tone ?? "info"} onOpenChange={open => { if (!open) setItems(list => list.filter(other => other.id !== item.id)); }}>
 			<Icon name={TONE_ICON[item.tone ?? "info"]}/>
 			<div><ToastPrimitive.Title className="vw-toast-title">{item.title}</ToastPrimitive.Title>{item.body && <ToastPrimitive.Description className="vw-muted vw-small">{item.body}</ToastPrimitive.Description>}</div>
 			<ToastPrimitive.Close asChild><IconButton icon="close" label={t("action.dismiss")}/></ToastPrimitive.Close>
@@ -61,10 +61,10 @@ export function Banner({tone, title, children, action}: {tone: Tone, title: stri
 	</div>;
 }
 
-// An empty list or a failed load. The title says what is the case, the body what to do about it, and the action does it.
-export function StateBlock({kind, title, children, action}: {kind: "empty" | "error", title: string, children?: ReactNode, action?: ReactNode}) {
-	return <div className="vw-state" data-kind={kind} role={kind === "error" ? "alert" : undefined}>
-		<span className="vw-state-icon"><Icon name={kind === "error" ? "error" : "inbox"}/></span>
+// An empty list, a failed load, or a load still under way. The title says what is the case, the body what to do about it or what is being waited for, and the action does it. Loading shows the three strokes of the icon lighting in turn.
+export function StateBlock({kind, title, children, action}: {kind: "empty" | "error" | "loading", title: string, children?: ReactNode, action?: ReactNode}) {
+	return <div className="vw-state" data-kind={kind} role={kind === "error" ? "alert" : kind === "loading" ? "status" : undefined}>
+		<span className="vw-state-icon">{kind === "loading" ? <span className="vw-strokes" aria-hidden="true"><i/><i/><i/></span> : <Icon name={kind === "error" ? "error" : "inbox"}/>}</span>
 		<strong className="vw-h3">{title}</strong>
 		{children && <p className="vw-muted">{children}</p>}
 		{action}
