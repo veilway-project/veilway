@@ -62,7 +62,7 @@ The desktop installer is signed with a separate key that the app's updater check
 
 ## Status of the obfuscation layer
 
-The tunnel itself is WireGuard, through the boringtun implementation, with its cryptography unchanged. The layer around it that makes traffic harder to recognise and block (transports and obfuscation) is **experimental and has not been externally reviewed**. It has had no independent audit. Do not treat it as proven against a capable censor, and do not rely on it alone where being detected has serious consequences. This notice will be updated when a review has taken place.
+The tunnel itself is WireGuard, through the boringtun implementation, with its cryptography unchanged. The layer around it that makes traffic harder to recognize and block (transports and obfuscation) is **experimental and has not been externally reviewed**. It has had no independent audit. Do not treat it as proven against a capable censor, and do not rely on it alone where being detected has serious consequences. This notice will be updated when a review has taken place.
 
 ## Good faith
 

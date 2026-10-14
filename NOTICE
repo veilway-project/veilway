@@ -6,7 +6,7 @@ This product includes software developed by the Veilway contributors.
 
 Veilway is licensed under the Apache License, Version 2.0. See the LICENSE
 file. If you redistribute Veilway or a work derived from it, section 4 of
-that licence requires you to keep this NOTICE file with it.
+that license requires you to keep this NOTICE file with it.
 
 The name "Veilway" and the Veilway logo are not licensed for use by
 derived works. See TRADEMARKS.md.
@@ -14,16 +14,16 @@ derived works. See TRADEMARKS.md.
 Third-party software shipped with Veilway
 =========================================
 
-The components below keep their own licences. Other dependencies are
+The components below keep their own licenses. Other dependencies are
 fetched from crates.io at build time and are listed with their versions
-in Cargo.lock; each stays under the licence its authors published it with.
+in Cargo.lock; each stays under the license its authors published it with.
 
 ipstack 1.0.1 (vendor/ipstack)
 ------------------------------
 
 Authors: Narrowlink <opensource@narrowlink.com>
 Source: https://github.com/narrowlink/ipstack
-Licence: Apache License, Version 2.0 (vendor/ipstack/LICENSE)
+License: Apache License, Version 2.0 (vendor/ipstack/LICENSE)
 
 The upstream distribution carries no NOTICE file and no separate copyright
 line. The copy in vendor/ipstack is modified: the TCP stream reports end of
@@ -35,6 +35,6 @@ boringtun 0.7.1
 ---------------
 
 Source: https://github.com/cloudflare/boringtun
-Licence: BSD 3-Clause, full text in licenses/boringtun-BSD-3-Clause.txt.
+License: BSD 3-Clause, full text in licenses/boringtun-BSD-3-Clause.txt.
 
 Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
