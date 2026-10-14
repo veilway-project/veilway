@@ -90,6 +90,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Every enabled node link with its state and its counters. No key and no secret. */
+        get: operations["listLinks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/openapi.json": {
         parameters: {
             query?: never;
@@ -246,7 +263,7 @@ export interface components {
             saved: boolean;
         };
         /** @enum {string} */
-        Backend: "netstack" | "l3" | "block";
+        Backend: "netstack" | "l3" | "block" | "chain";
         /** @description Tags or names of one kind. */
         Changes: {
             added: string[];
@@ -404,6 +421,10 @@ export interface components {
             interface_flips: number;
             /** @description Whether the interface of an l3 backend is up. While it is not, what is routed to the exit is answered as unreachable and the node tries to bring the interface up again: 2 seconds after it went down, then after twice the wait each time, once a minute at most. Null for any other backend. */
             interface_up: boolean | null;
+            /** @description Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend. */
+            link_up: boolean | null;
+            /** @description The node links of a chain backend, by tag, which `/v1/links` reports on. Empty for every other backend. */
+            links: string[];
             name: string;
             /** @description The tag of the outbound of a netstack backend. */
             outbound: string | null;
@@ -451,6 +472,61 @@ export interface components {
         Lagged: {
             /** Format: uint64 */
             missed: number;
+        };
+        /** @description One node link. It holds no key and no secret. */
+        Link: {
+            /** Format: uint */
+            candidate_index: number | null;
+            /** @description On the exit half: why this node cut the link off. Null for a link that may run. */
+            denied: components["schemas"]["Denied"] | null;
+            /**
+             * Format: uint64
+             * @description Packets that came out of the link and were not carried: on the entry half what answers no flow, on the exit half what the gate, the source check or a limit refused.
+             */
+            dropped: number;
+            /** @description On the entry half: the exit with a chain backend the link is behind. */
+            exit: string | null;
+            /**
+             * Format: uint
+             * @description The flows the link carries: the translations of the entry half, or the flows of the exit half in the flow table.
+             */
+            flows: number;
+            half: components["schemas"]["LinkHalf"];
+            /**
+             * Format: uint64
+             * @description Seconds since the link's tunnel last completed a handshake. Null without a session.
+             */
+            handshake_secs: number | null;
+            id: components["schemas"]["LinkId"];
+            role: components["schemas"]["LinkRole"];
+            /** @description The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns. */
+            size_warning: boolean;
+            state: components["schemas"]["LinkState"];
+            /**
+             * Format: uint64
+             * @description How often `state` changed.
+             */
+            state_flips: number;
+            /**
+             * Format: uint64
+             * @description Seconds the link has been in `state`.
+             */
+            state_secs: number;
+            tag: string;
+            /** @description Inner packets. Up is what this node sent into the link, down what it took out of it. */
+            traffic: components["schemas"]["Traffic"];
+            /** @description On the node that dials: the transport it is at, and the places of that transport and of its candidate or endpoint in the other node's list, from 0. Null on the node that is dialled. */
+            transport: components["schemas"]["Transport"] | null;
+            /** Format: uint */
+            transport_index: number | null;
+        };
+        LinkHalf: "entry" | "exit";
+        /** @description the id of a link: 22 characters of base64url without padding */
+        LinkId: string;
+        LinkRole: "listener" | "dialler";
+        LinkState: "up" | "connecting" | "unreachable" | "refused" | "ended";
+        Links: {
+            links: components["schemas"]["Link"][];
         };
         /**
          * @description The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.
@@ -1407,6 +1483,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Exits"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listLinks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Links"];
                 };
             };
             /** @description The request was not finished within 30 seconds. */

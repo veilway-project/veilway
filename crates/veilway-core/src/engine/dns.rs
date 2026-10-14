@@ -16,6 +16,7 @@ pub const REFUSED: u8 = 5;
 const TYPE_A: u16 = 1;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
+const TYPE_OPT: u16 = 41;
 
 /// `name` is lowercase and only present when it is a domain as a config may write one in a rule. Any other name (the root, a label with an underscore, bytes that are not text) is still a question, one that no `domain` condition can match.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +109,21 @@ pub fn response(message: &[u8]) -> Option<Response> {
 		at = fixed + 10 + len;
 	}
 	Some(Response {id: word(message, 0)?, rcode: message[3] & 0x0f, truncated: message[2] & 0x02 != 0, question, addresses})
+}
+
+/// Holds the UDP size a query offers (EDNS, RFC 6891) to at most `size`, so that a server truncates an answer that would not fit rather than send it. A query with no OPT record offers 512 bytes, which fits any link, and is left as it was: one added would bring an OPT record back to a client that never asked for one (RFC 6891, section 7). So is a message that is no standard query.
+pub fn edns(message: &mut [u8], size: u16) {
+	let Some(additional) = query(message).and_then(|_| word(message, 10)).map(usize::from) else {return};
+	let Some((_, mut at)) = question(message) else {return};
+	for _ in 0..additional.min(MAX_RECORDS) {
+		let Some((_, fixed)) = name(message, at, MAX_POINTERS) else {return};
+		let (Some(kind), Some(offered), Some(len)) = (word(message, fixed), word(message, fixed + 2), word(message, fixed + 8)) else {return};
+		if kind == TYPE_OPT {
+			if offered > size {message[fixed + 2..fixed + 4].copy_from_slice(&size.to_be_bytes())}
+			return;
+		}
+		at = fixed + 10 + usize::from(len);
+	}
 }
 
 /// Cuts an answer down to what one datagram may carry and sets its TC bit, so the client asks again over TCP.
@@ -283,5 +299,23 @@ mod tests {
 		let mut tiny = vec![1, 2];
 		clip(&mut tiny, 1);
 		assert_eq!(tiny, [1]);
+	}
+
+	#[test]
+	fn a_query_offers_no_more_than_the_link_carries() {
+		let opt = |size: u16| [&[0, 0, 41][..], &size.to_be_bytes(), &[0, 0, 0, 0, 0, 0]].concat();
+		let offered = |raw: &[u8]| (word(raw, 10).unwrap(), word(raw, raw.len() - 8).unwrap());
+		// An offer above the size is lowered, one below it is kept, and a record before the OPT one is walked past.
+		for (asked, kept) in [(4096, 1362), (1232, 1232), (512, 512)] {
+			let mut raw = message([1, 0], [1, 0, 0, 2], &[&asking("example.com", 28), &record(&[0], 99, 1, 0, &[1, 2, 3]), &opt(asked)]);
+			edns(&mut raw, 1362);
+			assert_eq!(offered(&raw), (2, kept));
+		}
+		// A query with no OPT record, what is no standard query, and one that holds a record cut short are left as they were.
+		for mut raw in [message([1, 0], [1, 0, 0, 0], &[&asking("example.com", 1)]), message([0x81, 0x80], [1, 0, 0, 0], &[&asking("example.com", 1)]), message([1, 0], [1, 0, 0, 1], &[&asking("example.com", 1), &[0, 0, 41, 16]]), message([1, 0], [1, 0, 0, 1], &[&asking("example.com", 1)])] {
+			let before = raw.clone();
+			edns(&mut raw, 1362);
+			assert_eq!(raw, before);
+		}
 	}
 }

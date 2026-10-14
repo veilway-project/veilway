@@ -309,6 +309,8 @@ impl Shared {
 					Backend::Netstack {..} => true,
 					Backend::L3 {..} => plan.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
 					Backend::Block => false,
+					// A chain exit works while one of its links is up.
+					Backend::Chain {ref links} => links.iter().any(|link| plan.up(*link)),
 				},
 				// Nothing measures load yet.
 				load: Load::Unknown,

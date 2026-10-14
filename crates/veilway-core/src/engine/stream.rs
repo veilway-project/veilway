@@ -1946,7 +1946,7 @@ impl Bench {
 		let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
 		let plan = Plan::new(&config, now(), &Plan::default(), vec![tunnel.clone()])?;
 		for device in &plan.devices {tunnel.lock().add(device.public_key, device.preshared_key)}
-		let shared = Arc::new(Shared::new(plan, super::gate::is_local, now, None, None, veilway_proto::control::USAGE_PUSH));
+		let shared = Arc::new(Shared::new(plan, super::gate::is_local, now, None, None, veilway_proto::control::USAGE_PUSH, Arc::new(rustls::RootCertStore::empty())));
 		let _ = shared.replay.set(Arc::new(Guard::unwritten(config.replay.cache(), super::replay::seconds(now()))));
 		let ((origin, origins), cookie) = (mpsc::unbounded_channel(), inbound.upgrade_cookie.clone().unwrap_or_default());
 		let routes: Vec<Route> = inbound.transports.iter().filter_map(|transport| match transport {

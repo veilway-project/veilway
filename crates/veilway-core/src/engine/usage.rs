@@ -2,7 +2,7 @@
 //! The config document never holds any of it. The file is keyed by user name, like everything else the engine keeps for a user.
 //! Next to the users it holds the exit each device chose on the control channel, keyed by the device's public key (control channel page, "Exit selection").
 use super::{Shared, Traffic, UserState};
-use crate::config::{MAX_QUOTA_BYTES, MAX_USERS};
+use crate::config::{MAX_LINKS, MAX_QUOTA_BYTES, MAX_USERS};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, Visitor};
@@ -21,6 +21,8 @@ use time::OffsetDateTime;
 pub const VERSION: u64 = 1;
 /// A state file larger than this is not read. An entry of a user takes at most 253 bytes, so the file of a config with as many users as a config may have stays below it, and `save` writes only as many devices as still fit.
 pub const MAX_FILE_BYTES: u64 = 16 << 20;
+/// The accounts a file holds: the users of a config, and the account of each node link (`link:<tag>`) beside them, so that a full list of users costs no link its count and no link a user theirs.
+const ACCOUNTS: usize = MAX_USERS + MAX_LINKS;
 /// The exits of at most this many devices are kept in the file, and no more than the file has room for next to its users. The rest of the devices that chose one have chosen none after a restart.
 pub const MAX_SELECTIONS: usize = 65536;
 /// What one user and one device take in the file at most, in bytes, with the comma behind them.
@@ -115,10 +117,10 @@ impl<'de> Visitor<'de> for Stored {
 			let Stored(version, Parsed {users, devices, skipped}, found) = &mut self;
 			match key.as_str() {
 				"version" => *version = Some(map.next_value()?),
-				// Each entry is looked at by itself, so one that is no entry costs its own user their count and nobody else theirs. A file holds no more users than a config may have: what comes after that many is counted and not kept.
+				// Each entry is looked at by itself, so one that is no entry costs its own user their count and nobody else theirs. A file holds no more accounts than a config may have: what comes after that many is counted and not kept.
 				"users" => {
 					*found = true;
-					map.next_value_seed(Entries(|name: String, raw: &str| match serde_json::from_str::<Entry>(raw).ok().filter(|_| users.len() < MAX_USERS) {
+					map.next_value_seed(Entries(|name: String, raw: &str| match serde_json::from_str::<Entry>(raw).ok().filter(|_| users.len() < ACCOUNTS) {
 						Some(entry) => users.push((name, UserState {
 							traffic: Traffic {up_packets: AtomicU64::new(entry.up_packets.0), up_bytes: AtomicU64::new(entry.up_bytes.0), down_packets: AtomicU64::new(entry.down_packets.0), down_bytes: AtomicU64::new(entry.down_bytes.0)},
 							used: AtomicU64::new(entry.used_bytes.0),
@@ -427,12 +429,12 @@ mod tests {
 			let ((bytes, entries), before) = (filled(entry, devices), peak());
 			let (started, parsed) = (Instant::now(), parse(&bytes).unwrap());
 			assert_eq!(parsed.users.len() + parsed.devices.len() + parsed.skipped, entries, "{what}");
-			assert!(parsed.users.len() <= MAX_USERS && parsed.devices.len() <= MAX_SELECTIONS, "{what}");
+			assert!(parsed.users.len() <= ACCOUNTS && parsed.devices.len() <= MAX_SELECTIONS, "{what}");
 			if std::env::var_os("VEILWAY_MEASURE").is_some() {eprintln!("MEASURE {what}: {} MiB, {entries} entries, {} kept, parsed in {:?}, peak {} MiB ({} MiB before the parse, with the file in memory)", bytes.len() >> 20, parsed.users.len() + parsed.devices.len(), started.elapsed(), peak(), before)}
 		}
-		// As many well formed users as fit: no more than a config may have are kept.
+		// As many well formed users as fit: no more accounts than a config may have are kept.
 		let (bytes, entries) = filled(entry, false);
-		assert!(entries > MAX_USERS && parse(&bytes).is_ok_and(|parsed| (parsed.users.len(), parsed.skipped) == (MAX_USERS, entries - MAX_USERS)));
+		assert!(entries > ACCOUNTS && parse(&bytes).is_ok_and(|parsed| (parsed.users.len(), parsed.skipped) == (ACCOUNTS, entries - ACCOUNTS)));
 	}
 
 	/// A new directory for one test, which removes it when it is done.

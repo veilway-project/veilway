@@ -129,6 +129,44 @@
             "type"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The entry half of node links: what is routed to the exit leaves from another node, through one of these links.",
+          "properties": {
+            "links": {
+              "description": "The tags of 1 to 4 links that lead to the same exit node. Each is a link whose entry half this node is.",
+              "items": {
+                "not": {
+                  "enum": [
+                    "all",
+                    "any",
+                    "block",
+                    "reject",
+                    "drop",
+                    "local",
+                    "direct",
+                    "user"
+                  ]
+                },
+                "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+                "type": "string"
+              },
+              "maxItems": 4,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "chain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "links"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -531,6 +569,336 @@
       "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
       "type": "string"
     },
+    "Link": {
+      "additionalProperties": false,
+      "dependentRequired": {
+        "inbound": [
+          "public_key"
+        ],
+        "peer": [
+          "private_key"
+        ],
+        "private_key": [
+          "peer"
+        ],
+        "public_key": [
+          "inbound"
+        ],
+        "quota_period": [
+          "quota_bytes"
+        ]
+      },
+      "description": "One node link, as its pairing left it on this node. A link with `inbound` and `public_key` is one this node is dialled for, and a link with `peer` and `private_key` one it dials.\nWith `direction`, that says which half the node is: the exit half when it is dialled in a forward link or dials a reverse one, and the entry half otherwise. The entry half is used through an exit with a `chain` backend.",
+      "properties": {
+        "addresses": {
+          "$ref": "#/$defs/LinkAddresses"
+        },
+        "allow_private": {
+          "description": "On the exit half: whether private networks are decided by the rules for this link. Defaults to false, which refuses them whatever the rules say.",
+          "type": "boolean"
+        },
+        "direction": {
+          "$ref": "#/$defs/LinkDirection"
+        },
+        "enabled": {
+          "description": "Defaults to true. A link that is not enabled is validated like any other and neither dialled nor answered.",
+          "type": "boolean"
+        },
+        "exit": {
+          "description": "On the exit half: the exit the link leaves through when no rule names one. Without it that is `routing.default`.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "exits": {
+          "description": "On the exit half, where it is needed: the exits the link may leave through. None of them is a `chain` exit.",
+          "items": {
+            "not": {
+              "enum": [
+                "all",
+                "any",
+                "block",
+                "reject",
+                "drop",
+                "local",
+                "direct",
+                "user"
+              ]
+            },
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "expires_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "id": {
+          "$ref": "#/$defs/LinkId"
+        },
+        "inbound": {
+          "description": "On the node that is dialled: the tag of the `veilway` inbound the link connects to. That inbound carries no users' devices.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "max_flows": {
+          "description": "On the exit half: the flows the link may have at once. Defaults to 16384.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "mtu": {
+          "description": "Defaults to 1390 when the link lists `udp-obfs`, and to 1420 otherwise.",
+          "format": "uint16",
+          "maximum": 1500,
+          "minimum": 1280,
+          "type": "integer"
+        },
+        "peer": {
+          "$ref": "#/$defs/LinkPeer",
+          "description": "On the node that dials: the other node's keys and transports."
+        },
+        "private_key": {
+          "$ref": "#/$defs/Key",
+          "description": "A secret. No diagnostic, log line or `Debug` output shows it."
+        },
+        "public_key": {
+          "$ref": "#/$defs/Key",
+          "description": "On the node that is dialled: the WireGuard public key the other node made for this link."
+        },
+        "quota_bytes": {
+          "description": "On the exit half. The quota and its period mean what they mean for a user.",
+          "format": "uint64",
+          "maximum": 9007199254740991,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "quota_period": {
+          "$ref": "#/$defs/QuotaPeriod"
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "transport_secret": {
+          "$ref": "#/$defs/TransportSecret",
+          "description": "The secret the two nodes agreed on when they were paired. It never travels."
+        }
+      },
+      "required": [
+        "tag",
+        "id",
+        "direction",
+        "addresses",
+        "transport_secret"
+      ],
+      "type": "object"
+    },
+    "LinkAddresses": {
+      "additionalProperties": false,
+      "description": "The addresses pairing fixed for a link, all from the inbound pool of the node the link connects to.",
+      "properties": {
+        "dialler": {
+          "description": "The address of the node that dials: at most one IPv4 and one IPv6.",
+          "items": {
+            "$ref": "#/$defs/Ip"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "listener": {
+          "description": "The link address of the node that is dialled, in a reverse link and in no other: one for each family of `dialler`.",
+          "items": {
+            "$ref": "#/$defs/Ip"
+          },
+          "maxItems": 2,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "dialler"
+      ],
+      "type": "object"
+    },
+    "LinkCandidate": {
+      "additionalProperties": false,
+      "description": "One way to reach the other node of a link through its web server or directly, as a profile of a subscription writes a candidate.",
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/Addr"
+        },
+        "host": {
+          "description": "The `Host` of the request.",
+          "maxLength": 253,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pins": {
+          "description": "Needed by a `tls` candidate. The certificate chain is always validated, and a pin is a second condition.",
+          "items": {
+            "$ref": "#/$defs/Pin"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "sni": {
+          "description": "The server name that is shown, or empty for none.",
+          "maxLength": 253,
+          "type": "string"
+        },
+        "verify_name": {
+          "description": "The name the certificate is held against when `sni` is empty, and only then.",
+          "maxLength": 253,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "address",
+        "sni",
+        "host"
+      ],
+      "type": "object"
+    },
+    "LinkDirection": {
+      "description": "Who dials. In a forward link the entry dials the exit, in a reverse link the exit dials the entry.",
+      "enum": [
+        "forward",
+        "reverse"
+      ],
+      "type": "string"
+    },
+    "LinkId": {
+      "description": "the id of a link: 22 characters of base64url without padding",
+      "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$",
+      "type": "string"
+    },
+    "LinkPeer": {
+      "additionalProperties": false,
+      "description": "What the node that dials a link holds of the node it dials, \"as the offer gave them\".",
+      "properties": {
+        "inbound_public_key": {
+          "$ref": "#/$defs/Key",
+          "description": "The WireGuard public key of the inbound the link connects to."
+        },
+        "transport_public_key": {
+          "$ref": "#/$defs/Key",
+          "description": "The node transport public key of that inbound. Needed when a `tls` or `ws` transport is listed."
+        },
+        "transports": {
+          "description": "In the other node's order of preference.",
+          "items": {
+            "$ref": "#/$defs/LinkTransport"
+          },
+          "maxItems": 8,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "inbound_public_key",
+        "transports"
+      ],
+      "type": "object"
+    },
+    "LinkTransport": {
+      "additionalProperties": false,
+      "description": "One transport of the node a link dials, in the shape a profile of a subscription has: `endpoints` for `udp` and `udp-obfs`, `path` and `candidates` for `tls` and `ws`.",
+      "properties": {
+        "candidates": {
+          "items": {
+            "$ref": "#/$defs/LinkCandidate"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "endpoints": {
+          "items": {
+            "$ref": "#/$defs/Addr"
+          },
+          "maxItems": 16,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "path": {
+          "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/LinkTransportType"
+        }
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
+    },
+    "LinkTransportType": {
+      "oneOf": [
+        {
+          "enum": [
+            "udp",
+            "udp-obfs",
+            "tls",
+            "ws"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "fronted",
+          "description": "Read so that validation can say why a link has none.",
+          "type": "string"
+        }
+      ]
+    },
     "Log": {
       "additionalProperties": false,
       "properties": {
@@ -734,6 +1102,11 @@
       },
       "type": "object"
     },
+    "Pin": {
+      "description": "a certificate pin: 44 characters of standard base64 with padding",
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "type": "string"
+    },
     "PortRange": {
       "oneOf": [
         {
@@ -873,6 +1246,11 @@
         },
         {
           "required": [
+            "link"
+          ]
+        },
+        {
+          "required": [
             "ip"
           ]
         },
@@ -994,6 +1372,29 @@
             "$ref": "#/$defs/IpEntry"
           },
           "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "link": {
+          "description": "The tags of node links whose exit half this node is: the rule matches what arrives from one of them. A link has no user and no group.",
+          "items": {
+            "not": {
+              "enum": [
+                "all",
+                "any",
+                "block",
+                "reject",
+                "drop",
+                "local",
+                "direct",
+                "user"
+              ]
+            },
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 64,
           "minItems": 1,
           "type": "array",
           "uniqueItems": true
@@ -1486,6 +1887,15 @@
     "inbounds": {
       "items": {
         "$ref": "#/$defs/Inbound"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "links": {
+      "description": "The node links of this node: each joins it to one other node, so that users connect to one of the two and their traffic leaves from the other.",
+      "items": {
+        "$ref": "#/$defs/Link"
       },
       "maxItems": 64,
       "type": "array",

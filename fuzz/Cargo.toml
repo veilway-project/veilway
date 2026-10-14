@@ -149,6 +149,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="fuzz_pairing"
+path="fuzz_targets/fuzz_pairing.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="obfs_listener"
 path="fuzz_targets/obfs_listener.rs"
 test=false

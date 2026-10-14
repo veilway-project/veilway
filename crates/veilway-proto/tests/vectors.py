@@ -331,6 +331,28 @@ subscription_seeds = {
     "fuzz_links/headers": b"\x01subscription-userinfo: upload=1; download=2; total=3; expire=1700000000\nprofile-title: Example\nprofile-update-interval: 12\nsupport-url: https://example.com/help\n",
 }
 
+# Node links: the two codes, the pairing hash and the link's transport secret, written out as the node links page writes them. The pairing private keys are 0x03 bytes on the listener and 0x05 bytes on the dialler.
+def std(data): return base64.b64encode(data).decode()
+def code(prefix, data): return prefix + b64(data) + b"." + b64(hashlib.sha256(data).digest()[:4])
+link_object = json.dumps({"v": 1, "id": b64(bytes(range(16))).decode(), "direction": "forward", "expires_at": 1700000600, "name": "exit in the north", "inbound_public_key": std(x25519(b"\x01" * 32, BASE)), "transport_public_key": std(x25519(b"\x02" * 32, BASE)), "pairing_public_key": std(x25519(b"\x03" * 32, BASE)), "addresses": {"dialler": ["10.9.0.2", "fd00:9::2"]}, "mtu": 1390, "transports": [{"type": "udp-obfs", "endpoints": ["203.0.113.9:51821"]}, {"type": "tls", "path": "/assets/app-3f9c2e71.js", "candidates": [{"address": "203.0.113.9:443", "sni": "node.example", "host": "node.example", "pins": [std(b"\x07" * 32)]}]}]}, separators=(",", ":")).encode()
+link_answer = bytes(range(16)) + x25519(b"\x04" * 32, BASE) + x25519(b"\x05" * 32, BASE)
+link_hash = hashlib.sha256(b"veilway v1 link pairing\0" + struct.pack(">I", len(link_object)) + link_object + link_answer).digest()
+link_shared = x25519(b"\x05" * 32, x25519(b"\x03" * 32, BASE))
+assert link_shared == x25519(b"\x03" * 32, x25519(b"\x05" * 32, BASE))
+link_offer_code, link_answer_code = code(b"vwlink1.", link_object), code(b"vwlinka1.", link_answer)
+assert len(link_answer_code) == 123 and len(link_offer_code) <= 2048
+print("link_offer", link_offer_code.decode())
+print("link_answer", link_answer_code.decode())
+print("link_hash", link_hash.hex())
+print("link_secret", expand(extract(b"veilway v1 link secret\0", link_shared), link_hash, 32).hex())
+subscription_seeds.update({
+    "fuzz_pairing/offer": b"\x00" + link_offer_code,
+    "fuzz_pairing/offer-reverse": b"\x00" + code(b"vwlink1.", link_object.replace(b"\"forward\"", b"\"reverse\"").replace(b"\"fd00:9::2\"]", b"\"fd00:9::2\"],\"listener\":[\"10.9.0.3\",\"fd00:9::3\"]")),
+    "fuzz_pairing/offer-object": b"\x02" + link_object,
+    "fuzz_pairing/answer": b"\x01" + link_answer_code,
+    "fuzz_pairing/answer-bytes": b"\x03" + link_answer,
+})
+
 if len(sys.argv) > 1:
     root = sys.argv[1]
     auth = h("002102") + client_mac

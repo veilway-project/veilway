@@ -14,6 +14,8 @@ bench=[]
 ring.workspace=true
 hpke.workspace=true
 subtle.workspace=true
+# The key agreement of a node link's pairing. `ring` agrees only with a private key it drew itself, and this crate draws nothing.
+x25519-dalek.workspace=true
 base64.workspace=true
 serde.workspace=true
 serde_json.workspace=true

@@ -17,10 +17,14 @@ use tokio::sync::Notify;
 pub const MAX_FLOWS: usize = 65536;
 pub const MAX_FLOWS_PER_USER: usize = 1024;
 pub const MAX_FLOWS_PER_DEVICE: usize = 512;
+/// The places of the table no flow from a node link may take.
+pub const RESERVED: usize = MAX_FLOWS / 4;
 /// Refused flows remembered at once. They are counted apart from the flows above and the oldest gives way to a new one.
 pub const MAX_REFUSALS: usize = 4096;
 /// How long a flow is kept after its last packet while no handler holds it: a flow delivered between users, or one the stack has not accepted yet.
 pub const FLOW_IDLE: Duration = Duration::from_secs(30);
+/// How long after its device last sent on a flow answers from a node link still keep the flow. A device answers what it is sent, so a flow in use is never this quiet on the device's side.
+pub const ANSWERED: Duration = Duration::from_secs(60);
 /// The same for a flow that carries nothing: one that was refused, or one whose handler has ended and only sees stragglers. Short, so such flows do not use up a device's share of the table.
 pub const CLOSED_IDLE: Duration = Duration::from_secs(10);
 
@@ -168,7 +172,8 @@ fn tcp_end(key: &Key, (seq, ack): (u32, u32), last: Option<&[u8]>) -> Option<Vec
 /// `owner` is the device and the user a carried flow counts against. A refusal has none: it counts against nobody.
 /// `closing` is set once a TCP flow that no handler watches has shown a FIN or RST. `names` is what the user had resolved to the destination when the flow began, which is what `domain` rules saw.
 /// `gone` wakes whoever waits in `Flows::quiet` for this entry when it leaves the table, and nobody else: what ends one device's flows costs no other device's handler a look at the table. A refusal has no handler and no `gone`.
-struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, idle: Duration, closing: bool, names: Vec<Arc<str>>, heard: Heard, gone: Option<Arc<Notify>>}
+/// `sent` is when the device last sent a packet on the flow, which bounds how long answers from a node link keep it, see `Flows::answered`.
+struct Entry {id: u64, owner: Option<([u8; 32], Arc<str>)>, decision: Decision, seen: Instant, sent: Instant, idle: Duration, closing: bool, names: Vec<Arc<str>>, heard: Heard, gone: Option<Arc<Notify>>}
 
 /// A flow that a change of the config ended, for whoever tells its device.
 pub struct Ended {pub key: Key, pub device: [u8; 32], pub heard: Heard}
@@ -179,6 +184,8 @@ struct Table {
 	/// The carried flows of each device, so that what concerns one device never goes through the table.
 	per_device: HashMap<[u8; 32], HashSet<Key>>,
 	per_user: HashMap<Arc<str>, usize>,
+	/// Echo identifiers each device holds through node links past the first of each of its ping flows, which count against its share and its user's as flows do, see `Flows::echo`.
+	echoes: HashMap<[u8; 32], usize>,
 	/// Entries that are not refusals.
 	carried: usize,
 	/// Refusals in the order they were made, by key and entry id. One that has expired stays here until the next sweep.
@@ -232,6 +239,53 @@ impl Flows {
 		}
 	}
 
+	/// `get` for a packet the device itself sent on the flow, which is what lets answers from a node link keep the flow, see `answered`.
+	pub fn sent(&self, key: &Key, generation: u64, heard: Heard) -> Option<(u64, Decision)> {
+		let found = self.get(key, generation, heard);
+		if found.is_some() {if let Some(entry) = self.lock().flows.get_mut(key) {entry.sent = Instant::now()}}
+		found
+	}
+
+	/// The device and the decision of the live flow of entry `id`, for an answer that came out of a node link. The answer counts as traffic on the flow only while the flow is not closing and its device sent on it within the flow's idle time, and within `ANSWERED`:
+	/// an exit cannot keep a flow alive by itself, and so cannot fill a user's share of the table from its side. A flow the device leaves without closing it then lasts as one through an l3 exit does, its idle time after the last packet.
+	pub fn answered(&self, key: &Key, id: u64, generation: u64) -> Option<([u8; 32], Decision)> {
+		let mut table = self.lock();
+		if table.generation != generation {return None}
+		let entry = table.flows.get_mut(key).filter(|entry| entry.id == id && entry.seen.elapsed() <= entry.idle)?;
+		let device = entry.owner.as_ref()?.0;
+		if !entry.closing && entry.sent.elapsed() <= entry.idle.min(ANSWERED) {entry.seen = Instant::now()}
+		Some((device, entry.decision))
+	}
+
+	/// Counts one more echo identifier of the ping flow of entry `id` against its device's and its user's share of the table, as one more flow, and says whom it was counted against. None when the flow is gone or either share is full.
+	pub fn echo(&self, key: &Key, id: u64) -> Option<([u8; 32], Arc<str>)> {
+		let mut table = self.lock();
+		let (device, user) = table.flows.get(key).filter(|entry| entry.id == id)?.owner.clone()?;
+		if table.per_user.get(&user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).map_or(0, HashSet::len) + table.echoes.get(&device).copied().unwrap_or(0) >= MAX_FLOWS_PER_DEVICE {return None}
+		*table.per_user.entry(user.clone()).or_default() += 1;
+		*table.echoes.entry(device).or_default() += 1;
+		Some((device, user))
+	}
+
+	/// Gives back what `echo` counted.
+	pub fn unecho(&self, device: &[u8; 32], user: &Arc<str>) {
+		let mut table = self.lock();
+		if let Some(count) = table.echoes.get_mut(device) {
+			*count -= 1;
+			if *count == 0 {table.echoes.remove(device);}
+		}
+		if let Some(count) = table.per_user.get_mut(user) {
+			*count -= 1;
+			if *count == 0 {table.per_user.remove(user);}
+		}
+	}
+
+	/// Which of the entries named by key and id are still in the table, under one look at it.
+	pub fn held(&self, entries: &[(Key, u64)]) -> Vec<bool> {
+		let table = self.lock();
+		entries.iter().map(|(key, id)| table.flows.get(key).is_some_and(|entry| entry.id == *id)).collect()
+	}
+
 	/// The public key of the device a live flow belongs to, and the flow's decision. It counts as traffic on the flow, like `get`. A refusal belongs to nobody and gives None.
 	pub fn owned(&self, key: &Key, generation: u64) -> Option<([u8; 32], Decision)> {
 		let mut table = self.lock();
@@ -245,7 +299,12 @@ impl Flows {
 	/// Records the decision for a new flow and returns the id of its entry. Err when the table, the user's share of it or the device's is full, which a refusal never is:
 	/// it is remembered only to spare the rules, so it takes the place of the oldest refusal and no room from a flow that carries something.
 	#[allow(clippy::too_many_arguments)]
-	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision, names: Vec<Arc<str>>, heard: Heard, generation: u64) -> Result<u64, Reason> {
+	pub fn insert(&self, key: Key, device: [u8; 32], user: &str, decision: Decision, names: Vec<Arc<str>>, heard: Heard, generation: u64) -> Result<u64, Reason> {self.capped(key, device, user, decision, names, heard, generation, MAX_FLOWS_PER_DEVICE, MAX_FLOWS_PER_USER, false)}
+
+	/// `insert` with the device's and the user's share of the table given: a node link has a share of its own, `max_flows`, for its one record and its account alike ("Limits of a link, each its own and not a user's share").
+	/// A link (`reserve`) also leaves a quarter of the table to the users of the node: what arrives from links never takes the last `RESERVED` places.
+	#[allow(clippy::too_many_arguments)]
+	pub fn capped(&self, key: Key, device: [u8; 32], user: &str, decision: Decision, names: Vec<Arc<str>>, heard: Heard, generation: u64, per_device: usize, per_user: usize, reserve: bool) -> Result<u64, Reason> {
 		let mut table = self.lock();
 		if table.generation != generation {return Err(Reason::Stale)}
 		// A flow that expired a moment ago may still sit here until the next sweep.
@@ -260,7 +319,7 @@ impl Flows {
 			table.refusals.push_back((key, id));
 			(None, CLOSED_IDLE)
 		} else {
-			if table.carried >= MAX_FLOWS || table.per_user.get(user).is_some_and(|count| *count >= MAX_FLOWS_PER_USER) || table.per_device.get(&device).is_some_and(|keys| keys.len() >= MAX_FLOWS_PER_DEVICE) {return Err(Reason::FlowTableFull)}
+			if table.carried >= MAX_FLOWS - if reserve {RESERVED} else {0} || table.per_user.get(user).is_some_and(|count| *count >= per_user) || table.per_device.get(&device).map_or(0, HashSet::len) + table.echoes.get(&device).copied().unwrap_or(0) >= per_device {return Err(Reason::FlowTableFull)}
 			let user = table.per_user.get_key_value(user).map_or_else(|| Arc::from(user), |(name, _)| name.clone());
 			table.per_device.entry(device).or_default().insert(key);
 			*table.per_user.entry(user.clone()).or_default() += 1;
@@ -268,7 +327,7 @@ impl Flows {
 			(Some((device, user)), FLOW_IDLE)
 		};
 		let gone = owner.is_some().then(|| Arc::new(Notify::new()));
-		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), idle, closing: false, names, heard, gone});
+		table.flows.insert(key, Entry {id, owner, decision, seen: Instant::now(), sent: Instant::now(), idle, closing: false, names, heard, gone});
 		Ok(id)
 	}
 
@@ -420,6 +479,7 @@ pub fn evaluate<'a>(plan: &'a Plan, inbound: usize, user: usize, dst: IpAddr, pr
 		rule.inbound.as_ref().is_none_or(|list| list.contains(&inbound))
 			&& rule.user.as_ref().is_none_or(|list| list.contains(&user))
 			&& rule.group.as_ref().is_none_or(|list| list.iter().any(|group| plan.users[user].groups.contains(group)))
+			&& rule.link.as_ref().is_none_or(|list| plan.users[user].link.is_some_and(|link| list.contains(&link)))
 			&& rule.ip.as_ref().is_none_or(|list| list.iter().any(matches))
 			&& rule.protocol.as_ref().is_none_or(|list| list.contains(&protocol))
 			&& rule.port.as_ref().is_none_or(|list| ports && list.iter().any(|(lo, hi)| (*lo..=*hi).contains(&dport)))
@@ -436,6 +496,48 @@ mod tests {
 	fn key(sport: u16) -> Key {Key {protocol: 6, src: "10.7.0.2".parse().unwrap(), dst: "1.1.1.1".parse().unwrap(), sport, dport: 443}}
 
 	const REFUSED: Decision = Decision::Refuse {reason: Reason::Rule, reset: true};
+
+	#[test]
+	fn an_answer_from_a_link_keeps_a_flow_only_while_its_device_sends_on_it() {
+		let flows = Flows::default();
+		let (open, closed) = (flows.insert(key(1), [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, Vec::new(), None, 0).unwrap(), flows.insert(key(2), [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, Vec::new(), None, 0).unwrap());
+		flows.track(&key(2), closed, FLOW_IDLE, true);
+		let aged = |key: &Key, by: Duration| if let Some(entry) = flows.lock().flows.get_mut(key) {(entry.seen, entry.sent) = (entry.seen - by, entry.sent - by)};
+		// An answer to the flow the device sends on keeps it, to the same entry only.
+		aged(&key(1), Duration::from_secs(20));
+		assert!(flows.answered(&key(1), open + 99, 0).is_none() && flows.answered(&key(1), open, 1).is_none());
+		assert_eq!(flows.answered(&key(1), open, 0), Some(([1; 32], Decision::Exit {exit: 0, by: By::Backend})));
+		assert!(flows.lock().flows[&key(1)].seen.elapsed() < Duration::from_secs(1), "an answer to a flow in use did not keep it");
+		// Once its device has been quiet for the flow's idle time, answers no longer keep it, however many come, and it ends.
+		for _ in 0..3 {
+			aged(&key(1), FLOW_IDLE / 2);
+			flows.answered(&key(1), open, 0);
+		}
+		assert!(flows.get(&key(1), 0, None).is_none(), "answers alone kept a flow its device left");
+		// A flow its device closed is never kept by answers either.
+		aged(&key(2), Duration::from_secs(20));
+		flows.answered(&key(2), closed, 0);
+		aged(&key(2), Duration::from_secs(20));
+		assert!(flows.get(&key(2), 0, None).is_none(), "answers kept a flow its device closed");
+		// What the device sends keeps the flow, and lets answers keep it again.
+		let again = flows.insert(key(3), [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, Vec::new(), None, 0).unwrap();
+		aged(&key(3), FLOW_IDLE - Duration::from_secs(1));
+		assert!(flows.sent(&key(3), 0, None).is_some());
+		aged(&key(3), Duration::from_secs(20));
+		flows.answered(&key(3), again, 0);
+		aged(&key(3), Duration::from_secs(20));
+		assert!(flows.get(&key(3), 0, None).is_some(), "an answer did not keep a flow its device had just sent on");
+	}
+
+	#[test]
+	fn links_leave_a_quarter_of_the_table_to_the_users() {
+		let flows = Flows::default();
+		let key = |n: usize| Key {protocol: Protocol::UDP, src: IpAddr::from([10, (n >> 16) as u8, (n >> 8) as u8, n as u8]), dst: IpAddr::from([1, 1, 1, 1]), sport: 1, dport: 2};
+		let linked = (0..MAX_FLOWS).filter(|n| flows.capped(key(*n), [(*n % 4) as u8; 32], &format!("link:{}", n % 4), Decision::Deliver, Vec::new(), None, 0, MAX_FLOWS, MAX_FLOWS, true).is_ok()).count();
+		assert_eq!(linked, MAX_FLOWS - RESERVED, "links took places that are kept for users");
+		let users = (MAX_FLOWS..2 * MAX_FLOWS).filter(|n| flows.insert(key(*n), [(*n / MAX_FLOWS_PER_DEVICE) as u8 | 0x80; 32], &format!("user{}", n / MAX_FLOWS_PER_USER), Decision::Deliver, Vec::new(), None, 0).is_ok()).count();
+		assert_eq!(users, RESERVED, "the users did not get the places kept for them");
+	}
 
 	#[test]
 	fn the_table_is_bounded_per_device_per_user_and_in_total() {

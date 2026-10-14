@@ -44,7 +44,8 @@
         "enum": [
           "netstack",
           "l3",
-          "block"
+          "block",
+          "chain"
         ],
         "type": "string"
       },
@@ -453,6 +454,20 @@
               "null"
             ]
           },
+          "link_up": {
+            "description": "Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "links": {
+            "description": "The node links of a chain backend, by tag, which `/v1/links` reports on. Empty for every other backend.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "name": {
             "type": "string"
           },
@@ -503,6 +518,8 @@
           "interface_up",
           "interface_down_secs",
           "interface_flips",
+          "links",
+          "link_up",
           "traffic"
         ],
         "type": "object"
@@ -609,6 +626,208 @@
         },
         "required": [
           "missed"
+        ],
+        "type": "object"
+      },
+      "Link": {
+        "description": "One node link. It holds no key and no secret.",
+        "properties": {
+          "candidate_index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "denied": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Denied"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "On the exit half: why this node cut the link off. Null for a link that may run."
+          },
+          "dropped": {
+            "description": "Packets that came out of the link and were not carried: on the entry half what answers no flow, on the exit half what the gate, the source check or a limit refused.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "exit": {
+            "description": "On the entry half: the exit with a chain backend the link is behind.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flows": {
+            "description": "The flows the link carries: the translations of the entry half, or the flows of the exit half in the flow table.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "half": {
+            "$ref": "#/components/schemas/LinkHalf"
+          },
+          "handshake_secs": {
+            "description": "Seconds since the link's tunnel last completed a handshake. Null without a session.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "$ref": "#/components/schemas/LinkId"
+          },
+          "role": {
+            "$ref": "#/components/schemas/LinkRole"
+          },
+          "size_warning": {
+            "description": "The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns.",
+            "type": "boolean"
+          },
+          "state": {
+            "$ref": "#/components/schemas/LinkState"
+          },
+          "state_flips": {
+            "description": "How often `state` changed.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state_secs": {
+            "description": "Seconds the link has been in `state`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/Traffic",
+            "description": "Inner packets. Up is what this node sent into the link, down what it took out of it."
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Transport"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "On the node that dials: the transport it is at, and the places of that transport and of its candidate or endpoint in the other node's list, from 0. Null on the node that is dialled."
+          },
+          "transport_index": {
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "tag",
+          "id",
+          "half",
+          "role",
+          "state",
+          "state_secs",
+          "handshake_secs",
+          "transport",
+          "transport_index",
+          "candidate_index",
+          "size_warning",
+          "denied",
+          "exit",
+          "flows",
+          "dropped",
+          "state_flips",
+          "traffic"
+        ],
+        "type": "object"
+      },
+      "LinkHalf": {
+        "oneOf": [
+          {
+            "const": "entry",
+            "description": "This node has the users and sends their packets into the link, through an exit with a chain backend.",
+            "type": "string"
+          },
+          {
+            "const": "exit",
+            "description": "What arrives from the link leaves from this node, under its own gate, rules and limits.",
+            "type": "string"
+          }
+        ]
+      },
+      "LinkId": {
+        "description": "the id of a link: 22 characters of base64url without padding",
+        "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$",
+        "type": "string"
+      },
+      "LinkRole": {
+        "oneOf": [
+          {
+            "const": "listener",
+            "description": "The link connects to an inbound of this node.",
+            "type": "string"
+          },
+          {
+            "const": "dialler",
+            "description": "This node dials the other one.",
+            "type": "string"
+          }
+        ]
+      },
+      "LinkState": {
+        "oneOf": [
+          {
+            "const": "up",
+            "description": "A WireGuard handshake completed within the last 180 seconds.",
+            "type": "string"
+          },
+          {
+            "const": "connecting",
+            "description": "The node dials and has no session yet, or it is dialled and has heard no handshake yet.",
+            "type": "string"
+          },
+          {
+            "const": "unreachable",
+            "description": "The node dials and no candidate of the other node answers.",
+            "type": "string"
+          },
+          {
+            "const": "refused",
+            "description": "The node dials and the other node answers and does not take the proof.",
+            "type": "string"
+          },
+          {
+            "const": "ended",
+            "description": "No handshake for 24 hours, so the other node has ended the link or one of the two is misconfigured, or this node cut the link off for its quota or its expiry (`denied`). A node that dials tries once a day from here on.",
+            "type": "string"
+          }
+        ]
+      },
+      "Links": {
+        "properties": {
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/Link"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "links"
         ],
         "type": "object"
       },
@@ -2487,6 +2706,45 @@
           }
         },
         "summary": "Every exit with what the node knows of its upstream, and its counters."
+      }
+    },
+    "/v1/links": {
+      "get": {
+        "operationId": "listLinks",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Links"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every enabled node link with its state and its counters. No key and no secret."
       }
     },
     "/v1/openapi.json": {

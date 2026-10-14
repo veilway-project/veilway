@@ -308,10 +308,11 @@ impl State {
 		let seats: Vec<Arc<Seat>> = self.limits().devices.values().flat_map(|account| account.seats.iter().filter_map(Weak::upgrade)).filter(|seat| !seat.over()).collect();
 		let mut ended = 0;
 		for seat in seats {
-			let (at, device) = (plan.inbound_of(&seat.tunnel), plan.by_key.get(&seat.device).map(|device| &plan.devices[*device]));
+			let at = plan.inbound_of(&seat.tunnel);
 			// "When a node transport key is removed, sessions opened with it are dropped within one second, by the same path": removing it is the operator's one answer to a key that leaked.
 			let keyed = seat.key.is_none_or(|key| at.and_then(|at| plan.inbounds[at].native.as_ref()?.prover.as_ref()).is_some_and(|prover| prover.keys.contains(&key)));
-			if cut(&seat.device) || !keyed || !device.zip(at).is_some_and(|(device, at)| device.inbounds.contains(&at) && device.secrets.contains(&seat.secret.0)) {
+			// A node link this node is dialled for is held to the same: the session of a link that was removed or changed ends with it.
+			if cut(&seat.device) || !keyed || !at.is_some_and(|at| plan.holds(at, &seat.device, &seat.secret.0)) {
 				seat.end(Ended::Revoked);
 				ended += 1;
 			}

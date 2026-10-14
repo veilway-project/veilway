@@ -1,11 +1,13 @@
 //! Everything that relates one value of the document to another. Messages name other places by path and never repeat a value.
 use super::model::{domain, ident};
 use super::*;
-use crate::engine::gate;
+use crate::engine::{gate, route};
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::IpAddr;
+use veilway_proto::subscription::is_host;
+use veilway_proto::subscription::payload::dialable;
 use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
 
 const TAG_RULE: &str = "expected a tag: 1 to 64 characters from a-z, 0-9, _ and -, starting with a letter or digit";
@@ -268,6 +270,11 @@ impl Config {
 		if self.exits.len() > MAX_EXITS {r.error("exits", format!("expected at most {MAX_EXITS} exits"))}
 		let exit_tags = tags(&mut r, "exits", self.exits.iter().map(|exit| exit.tag.as_str()));
 		let mut interfaces: HashMap<&str, usize> = HashMap::new();
+		// Node links page, "Numbers that are judgement calls": "Links on one node: at most 64." The links are looked at further down. Their tags are needed here, where a `chain` exit names them, and `chained` holds the exit that names each.
+		if self.links.len() > MAX_LINKS {r.error("links", format!("expected at most {MAX_LINKS} links"))}
+		let links = &self.links[..self.links.len().min(MAX_LINKS)];
+		let link_tags = tags(&mut r, "links", links.iter().map(|link| link.tag.as_str()));
+		let mut chained: HashMap<usize, usize> = HashMap::new();
 		for (i, exit) in self.exits.iter().enumerate().take(MAX_EXITS) {
 			let at = format!("exits[{i}]");
 			// One filter for every text a node hands to a client, the one a client applies before it shows it (`veilway_proto::control::display`): a name it would change is refused here, so what an operator sees accepted is what a user sees.
@@ -318,6 +325,18 @@ impl Config {
 					}
 				}
 				Backend::Block {} => {}
+				// "A `chain` exit may name 1 to 4 links. Each has its own keys and its own addresses", and each leads to the same node, which only the operator knows.
+				Backend::Chain(chain) => {
+					if !(1..=MAX_CHAIN_LINKS).contains(&chain.links.len()) {r.error(format!("{at}.backend.links"), format!("expected 1 to {MAX_CHAIN_LINKS} link tags"))}
+					index(&mut r, |j| format!("{at}.backend.links[{j}]"), chain.links.iter().take(MAX_CHAIN_LINKS));
+					for (j, tag) in chain.links.iter().enumerate().take(MAX_CHAIN_LINKS) {
+						match link_tags.get(tag.as_str()).map(|l| (*l, &links[*l])) {
+							None => r.error(format!("{at}.backend.links[{j}]"), "expected the tag of a link, found a tag no link has"),
+							Some((_, link)) if !link.entry() => r.error(format!("{at}.backend.links[{j}]"), "expected a link whose entry half this node is: one it dials in a forward link, or is dialled for in a reverse link. This link is the exit half, which takes traffic from the other node and never sends users into it"),
+							Some((l, _)) => if let Some(first) = chained.insert(l, i).filter(|first| *first != i) {r.error(format!("{at}.backend.links[{j}]"), format!("expected a link no other exit names, found a link of exits[{first}]"))},
+						}
+					}
+				}
 			}
 		}
 		let default_exit = exit_tags.get(self.routing.default.as_str()).copied();
@@ -417,6 +436,140 @@ impl Config {
 			}
 			sets.push([entitled, member, homes]);
 		}
+		// Node links page. On the node it connects to, a link is "a peer on a `veilway` inbound: a WireGuard public key, a transport secret, and one tunnel address per family from that inbound's pool". On the node that dials, it is a client of that inbound's transports.
+		let peopled = sets.iter().fold(Bits::default(), |all, set| Bits(std::array::from_fn(|word| all.0[word] | set[2].0[word])));
+		// The flow table keeps a quarter of its places from links, and links whose shares come to more than half of it can still leave the node's own users less than their shares add up to.
+		let shares: u64 = links.iter().filter(|link| !link.entry() && link.enabled != Some(false)).map(|link| u64::from(link.max_flows.unwrap_or(DEFAULT_LINK_FLOWS))).sum();
+		if shares > (route::MAX_FLOWS / 2) as u64 {r.warning("links", format!("the max_flows of the links this node is the exit of come to {shares}, more than half of the {} flows the node holds: links that fill their shares leave this node's own users with less", route::MAX_FLOWS))}
+		let (lowest, mut link_ids, mut link_keys, mut foreign) =(self.inbounds.iter().take(MAX_INBOUNDS).map(Inbound::mtu).min(), HashSet::new(), HashSet::new(), HashSet::new());
+		for (i, link) in links.iter().enumerate() {
+			let at = |key: &str| format!("links[{i}].{key}");
+			let (dialled, dials, entry, reverse) = (link.inbound.is_some(), link.peer.is_some(), link.entry(), link.direction == LinkDirection::Reverse);
+			if dialled == dials {r.error(format!("links[{i}]"), "expected either `inbound` with `public_key`, on the node the link connects to, or `peer` with `private_key`, on the node that dials")}
+			if dialled != link.public_key.is_some() {r.error(at("public_key"), "expected `inbound` and `public_key` together, or neither")}
+			if dials != link.private_key.is_some() {r.error(at("private_key"), "expected `peer` and `private_key` together, or neither")}
+			if !link_ids.insert(link.id.0) {r.error(at("id"), "expected an id no other link has")}
+			// "Validation refuses a link whose key is also a device's." A link is known on both nodes by the WireGuard public key the dialling node made for it, so no two links share one either.
+			if let Some(identity) = link.identity() {
+				let key = if link.public_key.is_some() {"public_key"} else {"private_key"};
+				if inbound_keys.contains_key(&identity) || device_keys.contains(&identity) {r.error(at(key), "expected a key of the link's own: its public half is the public key of an inbound or of a device")} else if !link_keys.insert(identity) {r.error(at(key), "expected a key no other link uses")}
+			}
+			// The secret is a device transport secret from the pairing on, and is held to what one is held to.
+			if wireguard.contains(&link.transport_secret.0) || link.identity() == Some(link.transport_secret.0) || link.private_key.as_ref().is_some_and(|key| key.expose().0 == link.transport_secret.0) {r.error(at("transport_secret"), "expected a secret that is not a WireGuard key of this config")} else if node_keys.contains(&link.transport_secret.0) {r.error(at("transport_secret"), "expected a secret that is not a transport key of an inbound")} else if !secrets.insert(link.transport_secret.0) {r.error(at("transport_secret"), "expected a secret no device and no other link uses")}
+			let home = link.inbound.as_ref().and_then(|tag| inbound_tags.get(tag.as_str()).copied());
+			match (&link.inbound, home.map(|home| &self.inbounds[home])) {
+				(None, _) => {}
+				(Some(_), None) => r.error(at("inbound"), "expected the tag of an inbound, found a tag no inbound has"),
+				(Some(_), Some(inbound)) if inbound.kind != InboundType::Veilway => r.error(at("inbound"), "expected a veilway inbound: a link is a device session on a native transport, which a wireguard inbound has none of"),
+				(Some(_), Some(inbound)) => {
+					// "Which transports a link may list. `udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1."
+					if inbound.transports.iter().any(|transport| matches!(transport, Transport::Fronted {..})) {r.error(at("inbound"), "expected an inbound without a fronted transport: a link carries the traffic of many users, and polling that through a CDN is not a transport of a link in this version")}
+					// "Until one device can no longer crowd an inbound's packet queue, an inbound that carries a link carries no users' devices."
+					if small && home.is_some_and(|home| peopled.has(home)) {r.error(at("inbound"), "expected an inbound that carries no users' devices: a link has an inbound to itself, or shares one only with other links")}
+				}
+			}
+			let (dialler, listener) = (&link.addresses.dialler, link.addresses.listener.as_deref());
+			if !(1..=2).contains(&dialler.len()) || (dialler.len() == 2 && dialler[0].0.is_ipv4() == dialler[1].0.is_ipv4()) {r.error(at("addresses.dialler"), "expected 1 or 2 addresses, at most one IPv4 and one IPv6")}
+			match listener {
+				None if reverse => r.error(at("addresses.listener"), "expected the link address of the node that is dialled: a reverse link has one for each family of `dialler`"),
+				Some(_) if !reverse => r.error(at("addresses.listener"), "expected no such key: only a reverse link has a second address"),
+				Some(listener) if listener.len() != dialler.len() || listener.iter().zip(dialler).any(|(listener, dialler)| listener.0.is_ipv4() != dialler.0.is_ipv4() || listener == dialler) => r.error(at("addresses.listener"), "expected one address for each family of `dialler`, in the same order, and none of them the dialler's own"),
+				_ => {}
+			}
+			for (key, j, Ip(ip)) in dialler.iter().take(2).enumerate().map(|(j, ip)| ("dialler", j, ip)).chain(listener.into_iter().flatten().take(2).enumerate().map(|(j, ip)| ("listener", j, ip))) {
+				let (here, (v6, n)) = (at(&format!("addresses.{key}[{j}]")), number(*ip));
+				let pool = spans.partition_point(|span| (span.0, span.1) <= (v6, n)).checked_sub(1).map(|s| spans[s]).filter(|span| span.0 == v6 && n <= span.2).map(|span| pools[span.3]);
+				match (pool, home) {
+					// "Pairing fixes the dialler's address, one per family, from the listener's inbound pool", and the listener's link address of a reverse link comes from there too.
+					(Some((pool, inbound)), Some(home)) if inbound == home => {
+						if *ip == pool.addr() || *ip == pool.network() || (!v6 && *ip == pool.broadcast()) {r.error(&here, "expected a host address that is not the gateway, network or broadcast address of its pool")}
+						if !addresses.insert(*ip) {r.error(&here, "expected an address no device and no other link uses")}
+					}
+					(_, Some(_)) => r.error(&here, "expected an address inside the pool of the link's inbound: pairing takes a link's addresses from that pool"),
+					_ if dialled => {}
+					// "The node that pastes an offer refuses it when an address in it lies inside one of its own inbound pools."
+					(Some(_), None) => r.error(&here, "expected an address outside every inbound pool of this node: it comes from a pool of the node this link dials, and here it would be two things at once"),
+					(None, None) if !pool_ranges.iter().any(|range| range.contains(ip)) => r.error(&here, "expected an address inside 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 or fc00::/7, where the pool it comes from lies"),
+					// The page lets two links from two operators carry the same addresses on the node that dials them. Where that node is the exit half, the address is the source of everything the link sends, and the flow table and the stack tell flows apart by it: two links with one address would be one sender. So it is refused there.
+					(None, None) => if dials && !entry && key == "listener" && !foreign.insert(*ip) {r.error(&here, "expected an address no other link of this node has for the node it dials: what arrives from a link is told from everything else by this address, so two links cannot share it. Pair the link again with another address")},
+				}
+			}
+			let obfs = Link {mtu: None, ..link.clone()}.mtu(&self.inbounds) == DEFAULT_MTU_OBFS;
+			match link.mtu {
+				Some(mtu) if !(MIN_MTU..=MAX_MTU).contains(&mtu) => r.error(at("mtu"), format!("expected an integer from {MIN_MTU} to {MAX_MTU}")),
+				Some(mtu) if obfs && mtu > DEFAULT_MTU_OBFS => r.warning(at("mtu"), format!("above {DEFAULT_MTU_OBFS} a full-size udp-obfs packet does not fit a 1500 byte path over IPv6, and nothing is fragmented for a link")),
+				Some(mtu) if mtu > DEFAULT_MTU => r.warning(at("mtu"), format!("above {DEFAULT_MTU} the outer packet is lost on a normal path over a datagram transport, and nothing is fragmented for a link")),
+				_ => {}
+			}
+			let own = [("exit", link.exit.is_some()), ("exits", link.exits.is_some()), ("allow_private", link.allow_private.is_some()), ("max_flows", link.max_flows.is_some()), ("quota_bytes", link.quota_bytes.is_some()), ("quota_period", link.quota_period.is_some()), ("expires_at", link.expires_at.is_some())];
+			if entry {
+				for (key, _) in own.iter().filter(|(_, present)| *present) {r.error(at(key), "expected no such key on the entry half of a link: what a link may reach and use is for the node its traffic leaves from to say")}
+				if dialled != dials && !chained.contains_key(&i) {r.warning(format!("links[{i}]"), "never used: no exit with a chain backend names this link")}
+			} else {
+				let mut entitled = Bits::default();
+				match &link.exits {
+					None => r.error(at("exits"), "expected the exits the link may leave through: this node is the exit half of the link"),
+					Some(list) => {
+						if list.is_empty() {r.warning(at("exits"), "an empty list lets this link leave through no exit")}
+						index(&mut r, |j| at(&format!("exits[{j}]")), list.iter().take(MAX_EXITS));
+						for (j, tag) in list.iter().enumerate().take(MAX_EXITS) {
+							match exit_tags.get(tag.as_str()) {
+								None => r.error(at(&format!("exits[{j}]")), "expected the tag of an exit, found a tag no exit has"),
+								// "A link may not leave through another link." A `via` policy never names a `chain` exit, so the list itself is all there is to hold to it.
+								Some(e) if matches!(self.exits[*e].backend, Backend::Chain(_)) => r.error(at(&format!("exits[{j}]")), "expected an exit that leaves from this node: a link may not leave through another link"),
+								Some(e) if small => {
+									entitled.set(*e);
+									// "Validation warns when an `l3` exit that a link may use has a larger MTU than the link": the link's `mtu` counts into the MTU of that exit's interface.
+									if matches!(self.exits[*e].backend, Backend::L3(_)) && lowest.is_some_and(|lowest| link.mtu(&self.inbounds) < lowest) {r.warning(at("mtu"), format!("below the mtu of every inbound: the interface of the l3 exit at exits[{e}] takes this mtu, which lowers it for that exit's own users as well"))}
+								}
+								Some(_) => {}
+							}
+						}
+					}
+				}
+				match link.exit.as_deref().map(|tag| exit_tags.get(tag)) {
+					Some(None) => r.error(at("exit"), "expected the tag of an exit, found a tag no exit has"),
+					Some(Some(e)) if small && link.exits.is_some() && !entitled.has(*e) => r.error(at("exit"), "expected an exit that is in this link's exits"),
+					None if small && entitled != Bits::default() && default_exit.is_some_and(|d| !entitled.has(d)) => r.error(at("exits"), "the link has no exit of its own, so routing.default must be in this list"),
+					_ => {}
+				}
+				if link.max_flows.is_some_and(|flows| !(1..=MAX_LINK_FLOWS).contains(&flows)) {r.error(at("max_flows"), format!("expected an integer from 1 to {MAX_LINK_FLOWS}"))}
+				if link.quota_bytes.is_some_and(|quota| !(1..=MAX_QUOTA_BYTES).contains(&quota)) {r.error(at("quota_bytes"), format!("expected an integer from 1 to {MAX_QUOTA_BYTES}"))}
+				if link.quota_period.is_some() && link.quota_bytes.is_none() {r.error(at("quota_period"), "needs quota_bytes")}
+			}
+			let Some(peer) = &link.peer else {continue};
+			if inbound_keys.contains_key(&peer.inbound_public_key.0) {r.error(at("peer.inbound_public_key"), "expected the key of the other node's inbound, found the public key of an inbound of this node")}
+			if !(1..=MAX_TRANSPORTS).contains(&peer.transports.len()) {r.error(at("peer.transports"), format!("expected 1 to {MAX_TRANSPORTS} transports"))}
+			let mut dialled_at: Vec<(String, SocketAddr)> = Vec::new();
+			for (j, transport) in peer.transports.iter().enumerate().take(MAX_TRANSPORTS) {
+				let (at, stream) = (at(&format!("peer.transports[{j}]")), transport.kind != LinkTransportType::Udp && transport.kind != LinkTransportType::UdpObfs);
+				// "Not `fronted` in version 1: a link carries the traffic of many users, and polling that through a CDN multiplies the requests a third party serves."
+				if transport.kind == LinkTransportType::Fronted {r.error(format!("{at}.type"), "expected udp, udp-obfs, tls or ws: fronted is not a transport of a link in this version")}
+				if stream != transport.endpoints.is_none() || stream != transport.path.is_some() || stream != transport.candidates.is_some() {r.error(&at, if stream {"expected `path` and `candidates` and no `endpoints`"} else {"expected `endpoints` and neither `path` nor `candidates`"})}
+				if stream && peer.transport_public_key.is_none() {r.error(format!("links[{i}].peer.transport_public_key"), "expected the node transport public key of the other node's inbound: the proofs of a tls or ws transport are sealed to it")}
+				if transport.path.as_ref().is_some_and(|path| !path.starts_with('/') || !(MIN_PROOF_PATH_BYTES..=MAX_WS_PATH_BYTES).contains(&path.len()) || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~/-".contains(&b)) || path.split('/').any(|part| part == "..")) {r.error(format!("{at}.path"), format!("expected a path that starts with /, is {MIN_PROOF_PATH_BYTES} to {MAX_WS_PATH_BYTES} bytes from A-Z a-z 0-9 . _ ~ / - and has no .. component"))}
+				if transport.endpoints.as_ref().is_some_and(|list| !(1..=MAX_LINK_CANDIDATES).contains(&list.len())) {r.error(format!("{at}.endpoints"), format!("expected 1 to {MAX_LINK_CANDIDATES} endpoints"))}
+				if transport.candidates.as_ref().is_some_and(|list| !(1..=MAX_LINK_CANDIDATES).contains(&list.len())) {r.error(format!("{at}.candidates"), format!("expected 1 to {MAX_LINK_CANDIDATES} candidates"))}
+				dialled_at.extend(transport.endpoints.iter().flatten().take(MAX_LINK_CANDIDATES).enumerate().map(|(k, endpoint)| (format!("{at}.endpoints[{k}]"), endpoint.0)));
+				for (k, candidate) in transport.candidates.iter().flatten().enumerate().take(MAX_LINK_CANDIDATES) {
+					let at = format!("{at}.candidates[{k}]");
+					dialled_at.push((format!("{at}.address"), candidate.address.0));
+					if !candidate.sni.is_empty() && !is_host(&candidate.sni) {r.error(format!("{at}.sni"), "expected a lowercase host name, or an empty string for no server name")}
+					if !is_host(&candidate.host) {r.error(format!("{at}.host"), "expected a lowercase host name")}
+					// "Required when `sni` is empty and not allowed otherwise."
+					if candidate.verify_name.is_some() != candidate.sni.is_empty() || candidate.verify_name.as_ref().is_some_and(|name| !is_host(name)) {r.error(format!("{at}.verify_name"), "expected a lowercase host name when sni is empty, and no such key otherwise")}
+					match &candidate.pins {
+						None if transport.kind == LinkTransportType::Tls => r.error(format!("{at}.pins"), "expected 1 to 4 pins: every candidate of a tls transport has one, on top of a certificate chain that validates"),
+						Some(pins) if !(1..=MAX_LINK_PINS).contains(&pins.len()) => r.error(format!("{at}.pins"), format!("expected 1 to {MAX_LINK_PINS} pins")),
+						_ => {}
+					}
+				}
+			}
+			// "Where a link may dial. The refusals of the subscription format hold: no loopback, link-local, unspecified or multicast address, and none of the forms that carry an IPv4 address inside an IPv6 one." A private address was shown to the operator when the link was paired, and is said again here.
+			for (here, address) in dialled_at {
+				if !dialable(address.ip()) {r.error(here, "expected an address a node may be told to dial: not loopback, link-local, unspecified, multicast, broadcast or in 0.0.0.0/8, and no IPv6 address that carries an IPv4 address")} else if pools.iter().any(|(pool, _)| pool.contains(&address.ip())) {r.error(here, "expected an address outside every inbound pool of this node")} else if pool_ranges.iter().any(|net| net.contains(&address.ip())) {r.warning(here, "a private address: the link dials inside a private network, which is right only where the two nodes share one")}
+			}
+		}
 		if self.notices.len() > MAX_NOTICES {r.error("notices", format!("expected at most {MAX_NOTICES} notices"))}
 		for (i, notice) in self.notices.iter().enumerate().take(MAX_NOTICES) {
 			// Held to what a client shows: text its filter would change or cut is refused here, so a device shows what the operator wrote.
@@ -505,7 +658,7 @@ impl Config {
 		for (i, rule) in rules.iter().enumerate() {
 			let at = format!("routing.rules[{i}]");
 			let present = [
-				condition(&mut r, &at, "inbound", &rule.inbound), condition(&mut r, &at, "user", &rule.user), condition(&mut r, &at, "group", &rule.group),
+				condition(&mut r, &at, "inbound", &rule.inbound), condition(&mut r, &at, "user", &rule.user), condition(&mut r, &at, "group", &rule.group), condition(&mut r, &at, "link", &rule.link),
 				condition(&mut r, &at, "ip", &rule.ip), condition(&mut r, &at, "domain", &rule.domain), condition(&mut r, &at, "protocol", &rule.protocol),
 				condition(&mut r, &at, "port", &rule.port), condition(&mut r, &at, "icmp_type", &rule.icmp_type), condition(&mut r, &at, "icmp_code", &rule.icmp_code),
 			];
@@ -524,6 +677,21 @@ impl Config {
 					Some(_) => {}
 					None => r.error(format!("{at}.group[{j}]"), "expected a group declared in groups"),
 				}
+			}
+			// "A routing rule can match on `link`, a list of link tags", and only what arrives from a link can match it: a link of which this node is the exit half.
+			for (j, tag) in rule.link.iter().flatten().enumerate().take(MAX_LINKS) {
+				match link_tags.get(tag.as_str()).map(|l| &links[*l]) {
+					None => r.error(format!("{at}.link[{j}]"), "expected the tag of a link, found a tag no link has"),
+					Some(link) if link.entry() => r.error(format!("{at}.link[{j}]"), "expected a link whose exit half this node is: from the entry half of a link nothing arrives but answers"),
+					Some(link) => if let Action::Exit(exit) = &rule.action {
+						if link.exits.as_ref().is_some_and(|list| !list.contains(exit)) {r.error(format!("{at}.link[{j}]"), "the rule sends this link to an exit that is not in the link's exits")}
+					},
+				}
+			}
+			if rule.link.is_some() && (rule.user.is_some() || rule.group.is_some()) {r.error(&at, "expected no user and no group next to link: a link has neither, so the rule would never match")}
+			// "The exit never learns which name an address of a link's flow was looked up for, so a rule of the exit that matches by `domain` never matches a link's traffic. Validation warns when a rule with a `domain` condition could apply to a link."
+			if live(rule) && rule.domain.is_some() && rule.user.is_none() && rule.group.is_none() && links.iter().any(|link| !link.entry() && link.enabled != Some(false) && rule.link.as_ref().is_none_or(|list| list.contains(&link.tag)) && rule.inbound.as_ref().is_none_or(|list| link.inbound.as_ref().is_some_and(|tag| list.contains(tag)))) {
+				r.warning(format!("{at}.domain"), "never matches what arrives from a link: the names behind a link's traffic were resolved by the other node, and this node never learns them. A block by name does not cover a link");
 			}
 			for (j, entry) in rule.ip.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
 				if matches!(entry, IpEntry::Tunnel(tag) if !inbound_tags.contains_key(tag.as_str())) {r.error(format!("{at}.ip[{j}]"), "expected tunnel:users or tunnel: with the tag of an inbound, found a tag no inbound has")}
@@ -555,7 +723,7 @@ impl Config {
 			}
 			// What follows reasons about what the rule does to flows, and a disabled rule does nothing.
 			let Some(target) = target.filter(|_| small && live(rule)) else {continue};
-			if rule.user.is_none() && countable {
+			if rule.user.is_none() && rule.link.is_none() && countable {
 				let affected: usize = classes.iter().filter(|([entitled, member, homes], _)| *entitled != Bits::default() && !(0..4).all(|w| reach[target].0[w] & !entitled.0[w] == 0) && (rule.group.is_none() || member.meets(&of)) && (rule.inbound.is_none() || homes.meets(&from))).map(|(_, count)| count).sum();
 				if affected > 0 {r.warning(format!("{at}.action"), format!("{affected} users this rule can match are not entitled to its exit or to an exit that one hands traffic to; their flows are rejected"))}
 			}
@@ -569,11 +737,11 @@ impl Config {
 			}
 		}
 		// An enabled rule that refuses whatever its ip entries match, for every user, on the inbounds it names or on all of them. Only `tunnel:users` and `geoip:private` are asked for: `tunnel:<tag>` covers one destination tunnel, which isolates nobody on its own.
-		let refuses = |rule: &Rule, entry: Option<&IpEntry>| live(rule) && matches!(rule.action, Action::Block | Action::Reject) && rule.user.is_none() && rule.group.is_none() && rule.domain.is_none() && rule.icmp_type.is_none() && rule.icmp_code.is_none()
+		let refuses = |rule: &Rule, entry: Option<&IpEntry>| live(rule) && matches!(rule.action, Action::Block | Action::Reject) && rule.user.is_none() && rule.link.is_none() && rule.group.is_none() && rule.domain.is_none() && rule.icmp_type.is_none() && rule.icmp_code.is_none()
 			&& entry.is_none_or(|entry| rule.protocol.is_none() && rule.port.is_none() && rule.ip.as_ref().is_some_and(|list| list.contains(entry)));
 		if !rules.iter().any(|rule| refuses(rule, Some(&IpEntry::Users)) && rule.inbound.is_none()) {
 			let isolated: HashSet<&str> = rules.iter().filter(|rule| refuses(rule, Some(&IpEntry::Users))).flat_map(|rule| rule.inbound.iter().flatten()).map(String::as_str).collect();
-			let open: Vec<String> = self.inbounds.iter().enumerate().take(MAX_INBOUNDS).filter(|(_, inbound)| !isolated.contains(inbound.tag.as_str())).map(|(i, _)| format!("inbounds[{i}]")).collect();
+			let open: Vec<String> = self.inbounds.iter().enumerate().take(MAX_INBOUNDS).filter(|(_, inbound)| !isolated.contains(inbound.tag.as_str()) && !links.iter().any(|link| link.inbound.as_deref() == Some(inbound.tag.as_str()))).map(|(i, _)| format!("inbounds[{i}]")).collect();
 			if isolated.is_empty() {r.warning("routing.rules", "no enabled block or reject rule has tunnel:users in ip and no other condition, so users can reach each other's devices")} else if !open.is_empty() {
 				r.warning("routing.rules", format!("no enabled block or reject rule with tunnel:users in ip covers {}, so users there can reach each other's devices", open.join(", ")));
 			}
@@ -590,21 +758,21 @@ impl Config {
 			if let Some((i, _)) = first.filter(|(_, rule)| refuses(rule, None)) {r.warning(format!("routing.rules[{i}]"), format!("refuses {at} on port 53 before any rule sends it to an exit, so the node cannot reach its own resolver"))}
 		}
 		if shadow && r.errors.is_empty() {
-			let shape = |rule: &Rule| [rule.inbound.is_some(), rule.user.is_some(), rule.group.is_some(), rule.ip.is_some(), rule.domain.is_some(), rule.protocol.is_some(), rule.port.is_some(), rule.icmp_type.is_some(), rule.icmp_code.is_some()];
-			let size = |rule: &Rule| [rule.inbound.as_ref().map_or(0, Vec::len), rule.user.as_ref().map_or(0, Vec::len), rule.group.as_ref().map_or(0, Vec::len), rule.ip.as_ref().map_or(0, Vec::len), rule.domain.as_ref().map_or(0, Vec::len), rule.protocol.as_ref().map_or(0, Vec::len), rule.port.as_ref().map_or(0, Vec::len), rule.icmp_type.as_ref().map_or(0, Vec::len), rule.icmp_code.as_ref().map_or(0, Vec::len)].iter().sum::<usize>();
-			let facts: Vec<([bool; 9], usize)> = rules.iter().map(|rule| (shape(rule), size(rule))).collect();
+			let shape = |rule: &Rule| [rule.inbound.is_some(), rule.user.is_some(), rule.group.is_some(), rule.link.is_some(), rule.ip.is_some(), rule.domain.is_some(), rule.protocol.is_some(), rule.port.is_some(), rule.icmp_type.is_some(), rule.icmp_code.is_some()];
+			let size = |rule: &Rule| [rule.inbound.as_ref().map_or(0, Vec::len), rule.user.as_ref().map_or(0, Vec::len), rule.group.as_ref().map_or(0, Vec::len), rule.link.as_ref().map_or(0, Vec::len), rule.ip.as_ref().map_or(0, Vec::len), rule.domain.as_ref().map_or(0, Vec::len), rule.protocol.as_ref().map_or(0, Vec::len), rule.port.as_ref().map_or(0, Vec::len), rule.icmp_type.as_ref().map_or(0, Vec::len), rule.icmp_code.as_ref().map_or(0, Vec::len)].iter().sum::<usize>();
+			let facts: Vec<([bool; 10], usize)> = rules.iter().map(|rule| (shape(rule), size(rule))).collect();
 			let mut budget = SHADOW_BUDGET;
 			'late: for (j, late) in rules.iter().enumerate().skip(1).filter(|(_, rule)| live(rule)) {
 				for (i, early) in rules[..j].iter().enumerate().filter(|(_, rule)| live(rule)) {
 					// An earlier rule can only cover a later one that has every condition it has.
-					let comparable = (0..9).all(|c| !facts[i].0[c] || facts[j].0[c]);
+					let comparable = (0..10).all(|c| !facts[i].0[c] || facts[j].0[c]);
 					let cost = if comparable {facts[i].1.saturating_mul(facts[j].1).saturating_add(1)} else {1};
 					if cost > budget {
 						r.shadow_cut_short = true;
 						break 'late;
 					}
 					budget -= cost;
-					let covered = comparable && within(&early.inbound, &late.inbound, |e, l| e == l) && within(&early.user, &late.user, |e, l| e == l) && within(&early.group, &late.group, |e, l| e == l)
+					let covered = comparable && within(&early.inbound, &late.inbound, |e, l| e == l) && within(&early.user, &late.user, |e, l| e == l) && within(&early.link, &late.link, |e, l| e == l) && within(&early.group, &late.group, |e, l| e == l)
 						&& within(&early.protocol, &late.protocol, |e, l| e == l) && within(&early.icmp_type, &late.icmp_type, |e, l| e == l) && within(&early.icmp_code, &late.icmp_code, |e, l| e == l)
 						&& within(&early.port, &late.port, |e, l| e.lo <= l.lo && l.hi <= e.hi) && within(&early.ip, &late.ip, |e, l| e == l || matches!((e, l), (IpEntry::Users, IpEntry::Tunnel(_))) || matches!(l, IpEntry::Net(l) if inside(e, l)))
 						&& within(&early.domain, &late.domain, |e, l| e == l || e.strip_prefix("*.").is_some_and(|base| {

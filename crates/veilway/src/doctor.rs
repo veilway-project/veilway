@@ -36,6 +36,8 @@ const RENEW_DAYS: i64 = 14;
 const MAX_SHOWN: usize = 8;
 const MAX_NAME_SHOWN: usize = 80;
 const DAY: i64 = 86400;
+/// A clock below this, 2023-11-14 in Unix seconds, is one that was never set: no proof made with it is taken by another node.
+const CLOCK_SET: i64 = 1_700_000_000;
 /// The lines of a socks5 outbound, in the order they are tried.
 const STEPS: [&str; 4] = ["tcp connect", "handshake", "connect", "udp associate"];
 /// What the `node` and `socket` lines are about when there is no path of a control socket.
@@ -330,6 +332,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	#[cfg(not(unix))]
 	#[allow(unused_variables)]
 	let ((listens, interfaces, proxy), node, socket) = ((Vec::<(SocketAddr, bool)>::new(), Vec::<String>::new(), None::<(u64, u64, u64)>), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()), (Status::Skipped, NO_SOCKET.to_string(), "this system has no control API".to_string()));
+	// Whether a node answers on the control socket, which the links are asked about further down.
+	let answering = node.0 == Status::Ok && node.2.starts_with("a node answers");
 	lines.push(line(node.0, "node", node.1, node.2));
 	let (config, mut bound, mut read, now) = (Arc::new(loaded), HashSet::new(), HashSet::new(), SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64));
 	for inbound in &config.inbounds {
@@ -394,11 +398,46 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			});
 		}
 	}
+	// Node links (node links page, "veilway doctor"), without dialling anything. Their addresses, their keys, the inbound of a link and what a link may reach are validation's, whose lines stand above. Here: the clock the proofs are made with, the size users can send next to the size the link carries, and the state of each link as a node that runs reports it.
+	let links: Vec<&config::Link> = config.links.iter().filter(|link| link.enabled != Some(false)).collect();
+	if !links.is_empty() {
+		// A link proves itself with timestamps like any device: a clock years behind is refused by the other node, whatever else is right.
+		lines.push(if now >= CLOCK_SET {line(Status::Ok, "link", "clock", "the clock is set, and the proofs of a link are made with it")} else {line(Status::Fail, "link", "clock", "the clock of this host is years behind, so the other node refuses every proof of a link: set the clock (NTP) first")});
+	}
+	for (i, link) in config.links.iter().enumerate().filter(|(_, link)| link.enabled != Some(false) && link.entry()) {
+		// "That the link's `mtu` is not below the `mtu` of an inbound whose users are routed to it": what does not fit the link is refused at the entry, and only TCP is lowered to fit.
+		let (mtu, chained) = (link.mtu(&config.inbounds), config.exits.iter().filter(|exit| matches!(&exit.backend, Backend::Chain(chain) if chain.links.contains(&link.tag))).count());
+		let above: Vec<&str> = config.inbounds.iter().filter(|inbound| inbound.mtu() > mtu && link.inbound.as_deref() != Some(inbound.tag.as_str()) && config.users.iter().any(|user| user.devices.iter().any(|device| device.addresses.iter().any(|address| inbound.address.iter().any(|pool| pool.0.contains(&address.0)))))).map(|inbound| inbound.tag.as_str()).collect();
+		lines.push(match (chained, above.is_empty()) {
+			(0, _) => line(Status::Warn, "link", format!("links[{i}]"), "no exit with a chain backend names this link, so nothing is routed to it"),
+			(_, true) => line(Status::Ok, "link", format!("links[{i}].mtu"), format!("{mtu}, which no inbound with users is above")),
+			(_, false) => line(Status::Warn, "link", format!("links[{i}].mtu"), format!("{mtu}, below the mtu of inbound(s) {}: a user there can send larger packets than the link carries. TCP is lowered to fit and anything else that is larger is refused with \"fragmentation needed\". Set those inbounds' mtu to {mtu} or less to avoid it", above.join(", "))),
+		});
+	}
+	#[cfg(unix)]
+	if !links.is_empty() {
+		match api.as_deref().filter(|_| answering) {
+			None => lines.push(line(Status::Skipped, "link", "state", "no node answers on the control socket, so the state of the links cannot be told: run doctor again while the node runs")),
+			Some(socket) => match veilway_api::request(socket, "GET", "/v1/links", None, wait).await.ok().filter(|(status, _)| *status == 200).and_then(|(_, body)| serde_json::from_slice::<serde_json::Value>(&body).ok()) {
+				None => lines.push(line(Status::Warn, "link", "state", "the node that runs did not say what state its links are in. Is it a node of this version?")),
+				Some(answer) => for reported in answer["links"].as_array().into_iter().flatten() {
+					let (tag, state, secs) = (reported["tag"].as_str().unwrap_or("?"), reported["state"].as_str().unwrap_or("?"), reported["state_secs"].as_u64().unwrap_or(0));
+					lines.push(match state {
+						"up" if reported["size_warning"] == true => line(Status::Warn, "link", format!("link {tag}"), format!("up for {secs} s, with a size warning: the system refused an outer packet of the link for its size, so its mtu is likely too high for the path. Lower it on both nodes")),
+						"up" => line(Status::Ok, "link", format!("link {tag}"), format!("up for {secs} s")),
+						"connecting" => line(Status::Warn, "link", format!("link {tag}"), format!("connecting for {secs} s: no handshake yet. The other node may not have the link in its config yet")),
+						"ended" => line(Status::Fail, "link", format!("link {tag}"), format!("ended or misconfigured for {secs} s: no handshake for a day, or this node cut it off (denied: {}). The other operator may have removed it, or the two configs disagree: pair again", reported["denied"].as_str().unwrap_or("no"))),
+						other => line(Status::Warn, "link", format!("link {tag}"), format!("{other} for {secs} s: {}", if other == "refused" {"the other node answers and does not take the proof: it no longer has the link, or the two configs disagree"} else {"no candidate of the other node answers: check its addresses and that this host may reach them"})),
+					});
+				}
+			},
+		}
+	}
 	// An exit on a direct outbound and an l3 exit with `masquerade` send the queries of the node's resolver from the node itself.
 	let direct = config.exits.iter().any(|exit| match &exit.backend {
 		Backend::Netstack(netstack) => config.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Direct {tag, ..} if *tag == netstack.outbound)),
 		Backend::L3(l3) => l3.masquerade != Some(false),
-		Backend::Block {} => false,
+		Backend::Block {} | Backend::Chain(_) => false,
 	});
 	let (servers, limit, mut tasks): (Arc<[SocketAddr]>, _, _) = (config.dns.servers.iter().map(|server| server.0).collect(), Arc::new(Semaphore::new(AT_ONCE)), JoinSet::new());
 	// Every server the node's resolver may ask, with where the config names it: those of `dns.servers`, then those of each set under the tag of the set. A server that two lists name is asked for each.

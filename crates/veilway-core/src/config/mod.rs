@@ -42,6 +42,14 @@ pub const MAX_NOTICE_BYTES: usize = 280;
 pub const MAX_DNS_SERVERS: usize = 4;
 pub const MAX_DNS_SETS: usize = 32;
 pub const MAX_INBOUND_ADDRESSES: usize = 2;
+/// Node links page, "Numbers that are judgement calls": "Links on one node: at most 64", "Parallel links behind one `chain` exit: 1 to 4", and "Flows of one link at the exit: 16,384 by default, set by the exit's operator", which no operator sets above what the flow table holds.
+pub const MAX_LINKS: usize = 64;
+pub const MAX_CHAIN_LINKS: usize = 4;
+pub const DEFAULT_LINK_FLOWS: u32 = 16384;
+pub const MAX_LINK_FLOWS: u32 = 65536;
+/// The endpoints or candidates of one transport a link dials, and the pins of one candidate, as a profile of a subscription has them.
+pub const MAX_LINK_CANDIDATES: usize = 16;
+pub const MAX_LINK_PINS: usize = 4;
 pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_EXIT_NAME_CHARS: usize = 64;
 pub const MAX_INTERFACE_BYTES: usize = 15;
@@ -214,6 +222,9 @@ pub fn transport_secret() -> io::Result<String> {
 	SystemRandom::new().fill(&mut secret).map_err(|_| io::Error::other("the system gave no random bytes"))?;
 	Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret))
 }
+
+/// The system's secure random source in the shape `veilway-proto` takes one, for whoever pairs a node link from here.
+pub fn random(bytes: &mut [u8]) -> Result<(), veilway_proto::NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| veilway_proto::NoRandom)}
 
 /// A new node transport key as a config writes it, and its public half as a profile carries it: an X25519 key from the system's secure random source, in base64. The private half goes into `transport_keys` of one inbound of one node, and nowhere else.
 pub fn transport_key() -> io::Result<(String, String)> {

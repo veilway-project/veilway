@@ -11,6 +11,7 @@ export type Stats = Schemas["Stats"];
 export type Replay = Schemas["Replay"];
 export type Session = Schemas["Session"];
 export type Exit = Schemas["Exit"];
+export type Link = Schemas["Link"];
 export type Problem = Schemas["Problem"];
 /** A config v1 document. The generated schema calls it an object nobody can fill in, so the client takes any object and the node does the checking. */
 export type ConfigDocument = Record<string, unknown>;
@@ -94,6 +95,9 @@ export class Client {
 	async listSessions(): Promise<Session[]> {return (await this.json<{sessions: Session[]}>("GET", "/v1/sessions")).sessions}
 
 	async listExits(): Promise<Exit[]> {return (await this.json<{exits: Exit[]}>("GET", "/v1/exits")).exits}
+
+	/** Every enabled node link with its state and its counters. */
+	async listLinks(): Promise<Link[]> {return (await this.json<{links: Link[]}>("GET", "/v1/links")).links}
 
 	/** The event stream. It ends when the node closes it or when `signal` aborts, and throws when the node refuses it or sends something that is not an event. Event names this client does not know are skipped. */
 	async *events(signal?: AbortSignal): AsyncGenerator<NodeEvent, void, undefined> {

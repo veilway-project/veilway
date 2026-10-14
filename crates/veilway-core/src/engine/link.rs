@@ -1,0 +1,354 @@
+//! Node links at run time (node links page, "Lifetime"): what the node knows of each link, the state it reports, and the task that dials a link this node dials.
+//! On the wire a link is nothing new: "one device session on a native transport, with WireGuard inside". The node that is dialled has the link as a peer of a `veilway` inbound, and everything the listeners do for a device they do for it. The node that dials has a tunnel for the link alone, whose one peer is the other node, and reaches it with the client's side of the transports (`veilway-transport`), by the client's rules for candidates, refusals and waits (`choice`), with no user to ask: "the listener's operator decided which transports the offer lists, and the dialler's operator accepted them at pairing".
+//! What a link carries is not here: `chain` is the entry half, and the exit half is the path every decrypted packet takes, with the link's own limits.
+use super::inbound::{Tunnel, Via};
+use super::plan::{Dialled, Plan};
+use super::{Shared, Traffic};
+use crate::config::random;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
+use veilway_proto::subscription::payload::Transport;
+use veilway_transport::choice::{self, Class, Network, Next, Pick, Standing};
+use veilway_transport::{End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
+use veilway_wg::MAX_PACKET;
+
+/// "Up: a WireGuard handshake completed within the last 180 s."
+pub const UP: Duration = Duration::from_secs(180);
+/// "A link reported as ended or misconfigured: after 24 h of nothing but refusals, or 24 h without a handshake. From then on the dialler tries once a day."
+pub const ENDED: Duration = Duration::from_secs(86_400);
+/// "A size warning on a link: cleared 600 s after the last report."
+pub const WARNED: Duration = Duration::from_secs(600);
+/// Datagrams of a link's tunnel that wait for the dialler's session. One that finds the queue full is dropped and counted: "Drop, do not queue."
+const QUEUE: usize = 256;
+
+/// What a node reports of a link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+	Up,
+	/// "The dialler is trying, or the listener has not heard a handshake yet."
+	Connecting,
+	/// "Dialler only: no candidate answers."
+	Unreachable,
+	/// "Dialler only: the listener answers and does not accept the proof."
+	Refused,
+	/// "Ended or misconfigured", and a link this node itself cut off for its quota or its expiry.
+	Ended,
+}
+
+impl Status {
+	/// The name the control API gives the state. It is part of that API and does not change.
+	pub fn name(self) -> &'static str {
+		match self {
+			Status::Up => "up",
+			Status::Connecting => "connecting",
+			Status::Unreachable => "unreachable",
+			Status::Refused => "refused",
+			Status::Ended => "ended",
+		}
+	}
+}
+
+/// What the node has learnt of one link while running. It belongs to the link's id and key and outlives a reload that keeps both.
+pub struct State {
+	/// The state the link is reported in, and since when.
+	status: Mutex<(Status, Instant)>,
+	/// Changes of that state, in any direction.
+	pub flips: AtomicU64,
+	/// Inner IP packets and their bytes: up is what this node sent into the link, down what it took out of it.
+	pub traffic: Traffic,
+	/// Packets that came out of the link and were not carried: on the entry half what answers no flow or is not for the link's address, on the exit half what the gate, the rules or a limit refused.
+	pub dropped: AtomicU64,
+	/// When the link was last up, or since when the node has had it.
+	heard: Mutex<Instant>,
+	/// What the dialler's last attempt came to when it failed, and the transport and candidate it is at, as places in the other node's list.
+	attempt: Mutex<(Option<Status>, Option<(usize, usize)>)>,
+	/// When the system last refused an outer packet of the link for its size.
+	warned: Mutex<Option<Instant>>,
+}
+
+impl Default for State {
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default()}}
+}
+
+impl State {
+	/// The state, and how long the link has been in it.
+	pub fn status(&self) -> (Status, Duration) {
+		let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+		(status.0, status.1.elapsed())
+	}
+
+	/// The transport and the candidate or endpoint the dialler is at.
+	pub fn at(&self) -> Option<(usize, usize)> {self.attempt.lock().unwrap_or_else(|e| e.into_inner()).1}
+
+	/// "Up, with a size warning": "the system has reported packet too big for the link's own outer packets, which suggests the link's `mtu` is too high for the path". "Anyone on the path can forge such a report, which is why it only warns and changes nothing."
+	pub fn warning(&self) -> bool {self.warned.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < WARNED)}
+
+	pub(super) fn warn(&self, tag: &str) {
+		if self.warned.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::info!("link {tag}: the system refused an outer packet of the link for its size, so the link's mtu is likely too high for the path between the two nodes. Full-size packets are lost until it is lowered on both nodes. The warning clears {}s after the last such report", WARNED.as_secs())}
+	}
+
+	fn tried(&self, failed: Option<Status>, at: Option<(usize, usize)>) {*self.attempt.lock().unwrap_or_else(|e| e.into_inner()) = (failed, at)}
+}
+
+impl Shared {
+	/// Once a second: holds every link's state against its tunnel and says each change, "logged at info with the link's tag, and counted". Nothing is latched: a link is up again the moment its tunnel has a handshake, with no action by anyone.
+	pub(super) fn check_links(&self) {
+		let plan = self.plan();
+		for (at, link) in plan.links.iter().enumerate() {
+			let (state, now, up) = (&link.state, Instant::now(), plan.up(at));
+			let quiet = {
+				let mut heard = state.heard.lock().unwrap_or_else(|e| e.into_inner());
+				if up {*heard = now}
+				now.saturating_duration_since(*heard)
+			};
+			let next = if up {Status::Up} else if link.denied.is_some() || quiet >= ENDED {Status::Ended} else {state.attempt.lock().unwrap_or_else(|e| e.into_inner()).0.filter(|_| link.dialled.is_some()).unwrap_or(Status::Connecting)};
+			let mut status = state.status.lock().unwrap_or_else(|e| e.into_inner());
+			if status.0 == next {continue}
+			tracing::info!("link {}: {} after {}s of {}{}", link.tag, next.name(), status.1.elapsed().as_secs(), status.0.name(), match (next, link.denied, link.exit) {
+				(Status::Ended, Some(denied), _) => format!(": this node cut it off ({denied:?})"),
+				(Status::Ended, None, _) => format!(": no handshake for {} hours. The other node has ended the link or one of the two is misconfigured{}", ENDED.as_secs() / 3600, if link.dialled.is_some() {", and this node tries once a day from here on"} else {""}),
+				(Status::Up, ..) => String::new(),
+				(_, _, Some(exit)) if !plan.exits.get(exit).is_some_and(|exit| matches!(&exit.backend, super::plan::Backend::Chain {links} if links.iter().any(|other| plan.up(*other)))) => format!(": exit {} is down, and what is routed to it is answered as unreachable", plan.exits[exit].tag),
+				_ => String::new(),
+			});
+			state.flips.fetch_add(1, Ordering::Relaxed);
+			*status = (next, now);
+		}
+	}
+}
+
+/// The way into the session of a link this node dials. The tunnel of the link sends through it whatever it has for the other node, and a datagram that finds no room is dropped and counted.
+pub struct Dialler {out: mpsc::Sender<Vec<u8>>, pub unsent: AtomicU64}
+
+impl Dialler {
+	pub fn push(&self, datagram: &[u8]) {
+		if self.out.try_send(datagram.to_vec()).is_err() {self.unsent.fetch_add(1, Ordering::Relaxed);}
+	}
+}
+
+/// What carries the datagrams of one attempt: a session of the client's side of the native transports, or for plain `udp`, which "is WireGuard itself and needs no transport", a socket.
+enum Carrier {Native(Session), Plain(UdpSocket)}
+
+/// One session to one candidate, from the dial to its end. `opened` is told once, when the session is one: a chunk of the node opened on a native transport, and a datagram of the other node authenticated on plain `udp`.
+#[allow(clippy::too_many_arguments)]
+async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &State, queue: &mut mpsc::Receiver<Vec<u8>>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
+	let (key, mut made) = (dialled.link.inbound, Vec::new());
+	let source: Source = Arc::new(Mutex::new({
+		let tunnel = tunnel.clone();
+		// "A keepalive of a tunnel that is already up, or else a fresh handshake initiation."
+		move |want: Want| {
+			let (mut peers, mut out) = (tunnel.lock(), Vec::new());
+			let peer = peers.wg.index(&key)?;
+			match (want, peers.wg.time_since_last_handshake(peer).is_some()) {
+				(Want::First, false) => peers.wg.initiate(peer, &mut out),
+				(Want::Keepalive, false) => return None,
+				(_, true) => peers.wg.encapsulate(peer, &[], &mut out),
+			}
+			out.pop()
+		}
+	}));
+	let (to, mut carrier) = match (&dialled.transports[transport], Target::of(&dialled.transports[transport], candidate)) {
+		(_, Some(target)) => match Session::open(&dialled.link, target, env, source.clone()) {
+			Ok(session) => (SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), Carrier::Native(session)),
+			// What the client's side refuses before it dials is a fault of the link's entry in the config, which validation does not let through. It is said, and held against the candidate like one that cannot be reached.
+			Err(refused) => {
+				tracing::warn!("link {tag}: transport {} of the other node cannot be dialled as the config has it ({refused})", transport + 1);
+				return Ended::Unreachable(Unreachable::Connect);
+			}
+		},
+		(Transport::Udp(endpoints), None) => {
+			let Some(to) = endpoints.get(candidate).map(|endpoint| endpoint.address()) else {return Ended::Unreachable(Unreachable::Connect)};
+			let local: SocketAddr = if to.is_ipv4() {(Ipv4Addr::UNSPECIFIED, 0).into()} else {(Ipv6Addr::UNSPECIFIED, 0).into()};
+			let socket = match UdpSocket::bind(local).await {
+				Ok(socket) if socket.connect(to).await.is_ok() => socket,
+				_ => return Ended::Closed(End::Offline),
+			};
+			// "The client and the node send every outer packet of a datagram transport with fragmentation prohibited."
+			let _ = super::host::fragmenting(&socket, to.is_ipv6(), true);
+			if let Some(first) = source.lock().ok().and_then(|mut source| source(Want::First)) {let _ = socket.send(&first).await;}
+			(to, Carrier::Plain(socket))
+		}
+		_ => return Ended::Unreachable(Unreachable::Connect),
+	};
+	// From here the tunnel's own packets for the other node, its timers' among them, leave through this session.
+	{
+		let mut peers = tunnel.lock();
+		if let Some(peer) = peers.wg.index(&key) {peers.heard(peer, Via::Dial(me.clone()))}
+	}
+	let (started, mut live, mut full, mut buf, mut tick) = (Instant::now(), false, 0u64, vec![0u8; MAX_PACKET], tokio::time::interval(Duration::from_secs(1)));
+	loop {
+		let received = async {
+			match &mut carrier {
+				Carrier::Native(session) => session.recv().await,
+				Carrier::Plain(socket) => loop {
+					// An error on a connected socket is an ICMP error for an earlier datagram. Whether the other node is there is for the time limits below to say.
+					if let Ok(n) = socket.recv(&mut buf).await {break Ok(buf[..n].to_vec())}
+				},
+			}
+		};
+		tokio::select! {
+			received = received => {
+				let datagram = match received {
+					Ok(datagram) => datagram,
+					Err(ended) => return ended,
+				};
+				let (bound, mut carried) = {
+					let (mut peers, mut carried) = (tunnel.lock(), Vec::new());
+					(peers.wg.recv_bound(&key, to, &datagram, &mut made, &mut carried), carried)
+				};
+				for answer in made.drain(..) {
+					match &carrier {
+						Carrier::Native(session) => full += u64::from(!session.send(answer, Kind::Handshake)),
+						Carrier::Plain(socket) => drop(socket.send(&answer).await),
+					}
+				}
+				if !bound.is_some_and(|bound| bound.proven) {continue}
+				if !live && matches!(carrier, Carrier::Plain(_)) {
+					live = true;
+					opened();
+				}
+				let plan = shared.plan();
+				let Some(at) = plan.inbound_of(tunnel) else {continue};
+				for packet in carried.drain(..) {shared.ingress(&plan, at, key, packet).await}
+			}
+			Some(datagram) = queue.recv() => {
+				// A handshake initiation of a tunnel that has had no handshake for as long as a link may be quiet is one WireGuard's timer made "because the node stopped answering": on `udp-obfs` it opens a new session, and on a stream it wants an answer or the session is lost.
+				let kind = match datagram.first() {
+					Some(1) if !shared.plan().inbound_of(tunnel).and_then(|at| shared.plan().inbounds[at].link).is_some_and(|link| shared.plan().up(link)) => Kind::Stalled,
+					Some(1..=3) => Kind::Handshake,
+					_ => Kind::Packet {flow: 0, control: false},
+				};
+				match &carrier {
+					Carrier::Native(session) => full += u64::from(!session.send(datagram, kind)),
+					Carrier::Plain(socket) => {
+						#[cfg(unix)]
+						if socket.send(&datagram).await.is_err_and(|e| e.raw_os_error() == Some(libc::EMSGSIZE)) {state.warn(tag)}
+						#[cfg(not(unix))]
+						let _ = socket.send(&datagram).await;
+					}
+				}
+			}
+			_ = tick.tick() => match &carrier {
+				Carrier::Native(session) => {
+					if !live && session.state() == Opened::Established {
+						live = true;
+						opened();
+					}
+					// What the session dropped and this task did not see refused for a full queue was refused for its size, by the session or by the system.
+					if session.numbers().dropped > full {
+						full = session.numbers().dropped;
+						state.warn(tag);
+					}
+				}
+				// Plain `udp` has no session to say that it ended: silence at the start is an endpoint that does not answer, and a tunnel that has gone quiet for as long as a link may is a session that is lost.
+				Carrier::Plain(_) => {
+					let quiet = !shared.plan().inbound_of(tunnel).and_then(|at| shared.plan().inbounds[at].link).is_some_and(|link| shared.plan().up(link));
+					if !live && started.elapsed() >= ATTEMPT {return Ended::Unreachable(Unreachable::Silence)}
+					if live && quiet {return Ended::Closed(End::Lost)}
+				}
+			},
+		}
+	}
+}
+
+/// Dials one link for as long as the handle it returns is not aborted: transport by transport and candidate by candidate, as `choice` says, with the waits of the client rules, which this adds no numbers of its own to.
+/// Nothing is remembered for ever: a candidate that is set aside comes back within the hour, a refusal is tried again after its wait, and a link that has been quiet for a day is still tried once a day.
+pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc<Dialled>, state: Arc<State>) -> (Arc<Dialler>, AbortHandle) {
+	let ((out, mut queue), shared) = (mpsc::channel(QUEUE), shared.clone());
+	let dialler = Arc::new(Dialler {out, unsent: AtomicU64::new(0)});
+	let (me, dialling) = (Arc::downgrade(&dialler), shared.dialling.clone());
+	let task = tokio::spawn(async move {
+		let _dialling = dialling;
+		// There is no user to ask, so every class of transport the other node listed is agreed to.
+		let (mut network, mut standing, profile) = (Network::default(), Standing {consent: vec![Class::Cover, Class::NoCover, Class::Exposed, Class::Plain], ..Standing::default()}, choice::digest(&dialled.transports));
+		let (mut seed, offset, key, clock) = ([0u8; 8], Arc::new(AtomicI64::new(0)), dialled.link.inbound, shared.now);
+		let _ = random(&mut seed);
+		let now = move || clock().unix_timestamp().max(0) as u64;
+		// A link that is reported as ended is tried once a day, "because the address it dials may by then be someone else's".
+		let rest = |wait: Duration, state: &State| if state.status().0 == Status::Ended {wait.max(ENDED)} else {wait};
+		// Sessions in a row that opened and ended before `choice::LIVED`.
+		let (mut rounds, mut quick) = (0u32, 0u32);
+		loop {
+			let (order, mut tried) = (choice::plan(&dialled.transports, false, &network, &standing, now()).order, 0u32);
+			for transport in order.iter().copied() {
+				let (count, mut passed) = (match &dialled.transports[transport] {
+					Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
+					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.len(),
+				}, Vec::new());
+				tried += 1;
+				let unreachable = loop {
+					let candidate = match choice::candidates(&mut network, profile, transport, count, &passed, order.len() == 1, u64::from_le_bytes(seed), now()) {
+						Pick::Try(picked) => picked[0],
+						Pick::Wait(until) => {
+							tokio::time::sleep(Duration::from_secs(until.saturating_sub(now()).clamp(1, choice::HOUR))).await;
+							continue;
+						}
+						Pick::Passed => break false,
+						Pick::Nothing => break true,
+					};
+					loop {
+						let failed = state.attempt.lock().unwrap_or_else(|e| e.into_inner()).0;
+						state.tried(failed, Some((transport, candidate)));
+						// The clock proofs are made with is the node's, and the offset a pinned candidate's answer gave while one is held.
+						let env = Env {device: Arc::new(now), now: Arc::new({
+							let offset = offset.clone();
+							move || now().saturating_add_signed(offset.load(Ordering::Relaxed))
+						}), roots: shared.roots.clone(), socket: None};
+						let (mut open, began) = (false, Instant::now());
+						let ended = session(&shared, &tunnel, &me, &tag, &dialled, &state, &mut queue, transport, candidate, env, &mut || open = true).await;
+						// The tunnel's packets have nowhere to go until the next session, and what waited for this one is not for the next.
+						while queue.try_recv().is_ok() {}
+						// "The node no longer knows the tunnel, as after its restart": the next attempt opens with a handshake initiation.
+						if ended == Ended::Closed(End::Unanswered) {tunnel.lock().wg.drop_sessions(&key);}
+						let mut next = Ok(Next::Rest);
+						if open {next = choice::outcome(&mut network, &mut standing, profile, transport, candidate, None, now(), &mut random)}
+						if next.is_ok() {next = choice::outcome(&mut network, &mut standing, profile, transport, candidate, Some(ended), now(), &mut random)}
+						offset.store(choice::clock(now(), &standing) as i64 - now() as i64, Ordering::Relaxed);
+						state.tried(match ended {
+							Ended::Refused(_) => Some(Status::Refused),
+							Ended::Unreachable(_) | Ended::Closed(End::Unanswered | End::Offline) => Some(Status::Unreachable),
+							Ended::Closed(_) => None,
+						}, None);
+						quick = if open && began.elapsed() < Duration::from_secs(choice::LIVED) {quick.saturating_add(1)} else {0};
+						// A node that keeps closing the session soon after it opened is said at info at the first of those and at each doubling of their count, so one that does it all day leaves a few lines and not one a second.
+						if quick <= 1 || quick.is_power_of_two() {tracing::info!("link {tag}: the session over transport {} of the other node ended ({ended:?}){}", transport + 1, if quick > 1 {format!(" soon after it opened, {quick} times in a row")} else if open {" after it was open".to_string()} else {" before it opened".to_string()})} else {tracing::debug!("link {tag}: the session over transport {} of the other node ended soon after it opened, {quick} times in a row", transport + 1)}
+						// On the last transport the marks of its candidates are passed over and the one that just failed comes straight back. A dial that fails at once, a refused connection, would then be made again at once and for ever, so an attempt that did not open waits at least the wait between transports. Only the one retry of a node that forgot the tunnel goes at once.
+						let next = next.map(|next| match next {
+							Next::Again(wait) | Next::Move(wait) if !open && ended != Ended::Closed(End::Unanswered) => {
+								let least = choice::transport_wait(&mut random).unwrap_or(Duration::from_secs(2));
+								if matches!(next, Next::Again(_)) {Next::Again(wait.max(least))} else {Next::Move(wait.max(least))}
+							}
+							next => next,
+						});
+						match next {
+							Ok(Next::Again(wait)) => tokio::time::sleep(rest(wait, &state)).await,
+							Ok(Next::Move(wait)) => {
+								if matches!(ended, Ended::Refused(_)) {passed.push(candidate)}
+								tokio::time::sleep(rest(wait, &state)).await;
+								break;
+							}
+							// A session nobody asked to close does not rest, and a random source that failed is no reason to stop dialling: both wait as a lost session does, the reconnect wait of the client rules, doubled for each session in a row that the other node closed soon after it opened.
+							Ok(Next::Rest) | Err(_) => tokio::time::sleep(rest(choice::reconnect_wait(quick.max(1), &mut random).unwrap_or(Duration::ZERO).max(Duration::from_secs(1)), &state)).await,
+						}
+					}
+				};
+				tokio::time::sleep(rest(choice::fallback(&mut network, profile, &order, transport, unreachable, tried, rounds + 1, now(), &mut random).unwrap_or(Duration::from_secs(30)), &state)).await;
+			}
+			rounds = rounds.saturating_add(1);
+			// A plan that holds no transport is a list of the other node's that this build can dial none of.
+			if order.is_empty() {tokio::time::sleep(ENDED).await}
+		}
+	});
+	(dialler, task.abort_handle())
+}
+
+/// The numbers of the links of a plan the control API reports, see `Engine::links`.
+pub(super) fn flows(shared: &Shared, plan: &Plan, at: usize) -> usize {
+	let link = &plan.links[at];
+	if link.entry {shared.nat.of(&link.id)} else {shared.flows.of_device(&link.identity)}
+}

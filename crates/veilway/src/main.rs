@@ -1,7 +1,8 @@
 mod doctor;
+mod link;
 
 use clap::{Parser, Subcommand};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -80,6 +81,40 @@ enum Command {
 	Gensecret,
 	/// WireGuard over WebSocket bridge
 	Bridge {#[command(subcommand)] command: Bridge},
+	/// Pair a node link with another node: one command on each node, which each print the entry for that node's config once both operators have compared the fingerprint
+	Link {#[command(subcommand)] command: Link},
+}
+
+#[derive(Subcommand)]
+enum Link {
+	/// On the node the link connects to: make an offer code, take the answer code, and confirm. Exit status: 0 paired, 2 not confirmed, 1 anything else
+	Offer {
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+		/// The tag the link gets in this node's config
+		#[arg(long)] tag: String,
+		/// The veilway inbound the link connects to, which carries no users' devices
+		#[arg(long)] inbound: String,
+		/// A reverse link: the other node dials and is the exit, and this node has the users. Without it the link is a forward one, and this node is the exit
+		#[arg(long)] reverse: bool,
+		/// This operator's label for the link, which the other operator is shown
+		#[arg(long)] name: String,
+		/// The address of the node that dials, from the inbound's pool: one, or an IPv4 and then an IPv6 one
+		#[arg(long, required = true)] address: Vec<IpAddr>,
+		/// In a reverse link: this node's own link address, from the same pool, one for each --address
+		#[arg(long)] listener_address: Vec<IpAddr>,
+		/// A JSON file with the transports the other node may dial, in this node's order of preference and in the shape a profile of a subscription has
+		#[arg(long)] transports: PathBuf,
+		/// The link's mtu [default: 1390 with a udp-obfs transport on the inbound, 1420 without]
+		#[arg(long, value_parser = clap::value_parser!(u16).range(1280..=1500))] mtu: Option<u16>,
+		/// Seconds the offer is good for
+		#[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))] lifetime: u64,
+	},
+	/// On the node that dials: read an offer code, show where it dials, make the answer code, and confirm. Exit status as for offer
+	Answer {
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+		/// The tag the link gets in this node's config
+		#[arg(long)] tag: String,
+	},
 }
 
 #[cfg(unix)]
@@ -357,6 +392,8 @@ async fn main() -> anyhow::Result<()> {
 				}
 			})
 		}
+		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, transports, mtu, lifetime}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, &transports, mtu, lifetime)),
+		Command::Link {command: Link::Answer {config, tag}} => std::process::exit(link::answer(&config, &tag)),
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());
 			Ok(())

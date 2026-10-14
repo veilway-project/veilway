@@ -363,6 +363,24 @@ impl Config {
 				}
 			}
 		}
+		// A link's two secrets stand for those of the running link with the same tag: its `private_key` by the plain marker, and its `transport_secret` by the marker that names it.
+		if let Some(Json::Arr(links)) = root.get_mut("links") {
+			for (i, link) in links.iter_mut().enumerate() {
+				let Json::Obj(link) = link else {continue};
+				let was = named(link, "tag").and_then(|tag| running.links.iter().find(|was| was.tag == tag));
+				if let Some(Json::Str(value)) = link.get_mut("transport_secret").filter(|value| matches!(&**value, Json::Str(value) if value.starts_with("<redacted"))) {
+					match was.filter(|was| super::reload::marker(&was.transport_secret.0) == *value) {
+						Some(was) => *value = STANDARD.encode(was.transport_secret.0),
+						None => report.error(format!("links[{i}].transport_secret"), "expected a transport secret: the marker stands for the secret of the running link with this tag, as the config that was read shows it, and no link runs under this tag with a secret this marker names. A link that is new has to be sent with its secret"),
+					}
+				}
+				if !marked(link, "private_key") {continue}
+				match was.and_then(|was| was.private_key.as_ref()) {
+					Some(kept) => drop(link.insert("private_key".to_string(), Json::Str(STANDARD.encode(kept.expose().0)))),
+					None => report.error(format!("links[{i}].private_key"), "expected a key: the marker stands for the private key of the running link with this tag, and no link runs under it with one"),
+				}
+			}
+		}
 		if !report.errors.is_empty() {return Err(report)}
 		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| (config, spelled)).map_err(|e| Report {errors: vec![Diagnostic {path: e.path.unwrap_or_default(), message: e.message}], ..Report::default()})
 	}

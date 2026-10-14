@@ -728,3 +728,28 @@ async fn a_config_that_cannot_be_read_ends_with_status_two_and_one_that_is_wrong
 	for secret in &secrets {assert!(!document.contains(secret), "`{secret}` is in what doctor printed")}
 	std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// "`veilway doctor` checks, without dialling anything: that the clock is set, that the link's `mtu` is not below the `mtu` of an inbound whose users are routed to it, and, from a running node, each link's state." What validation holds a link to stands in the config lines.
+#[tokio::test]
+async fn a_link_is_looked_at_without_dialling_it() {
+	let (dir, server) = (scratch("link"), dns(false).await);
+	let key = |byte: u8| veilway_wg::encode_key(&[byte; 32]);
+	let document = |mtu: u16, chained: bool| json!({
+		"version": 1, "dns": {"servers": [server.to_string()]},
+		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": key(0x11), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": free().to_string()}]}],
+		"outbounds": [{"tag": "plain", "type": "direct"}],
+		"exits": if chained {json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}, {"tag": "far", "backend": {"type": "chain", "links": ["far"]}}])} else {json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}])},
+		"routing": {"default": "main", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}, {"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]},
+		"users": [{"name": "a", "exits": "all", "devices": [{"name": "phone", "public_key": key(0x21), "addresses": ["10.7.0.2"]}]}],
+		"links": [{"tag": "far", "id": "AAECAwQFBgcICQoLDA0ODw", "direction": "forward", "mtu": mtu, "addresses": {"dialler": ["10.9.0.2"]}, "transport_secret": key(0x41), "private_key": key(0x31), "peer": {"inbound_public_key": key(0x61), "transports": [{"type": "udp-obfs", "endpoints": ["203.0.113.9:51821"]}]}}]
+	}).to_string();
+	for (mtu, chained, check) in [(1300, true, "warn"), (1420, true, "ok"), (1420, false, "warn")] {
+		private(&dir, "config.json", &document(mtu, chained));
+		let (_, printed, _) = doctor(&dir, &["--json", "--no-api"]).await;
+		let parsed: Value = serde_json::from_str(&printed).unwrap();
+		assert_eq!((status(&parsed, "link", "clock"), status(&parsed, "link", "links[0]"), status(&parsed, "link", "state")), ("ok", check, "skipped"), "{parsed:#}");
+		// The secret and the private key of the link are in no line.
+		assert!(!printed.contains(&key(0x41)) && !printed.contains(&key(0x31)));
+	}
+	std::fs::remove_dir_all(&dir).unwrap();
+}

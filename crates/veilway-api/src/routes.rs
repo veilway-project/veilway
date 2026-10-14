@@ -22,6 +22,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
+use veilway_core::engine::link::Status;
 use veilway_core::{Denied, Over, Reason, Reset};
 
 pub(crate) const EVENTS: &str = "/v1/events";
@@ -127,7 +128,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 
 async fn status(State(api): State<Arc<Api>>) -> Response {
 	let (snapshot, plan) = (api.engine.snapshot(), api.engine.plan());
-	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.inbounds.len(), exits: plan.exits.len(), users: plan.users.len(), flows: api.engine.flows()})
+	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows()})
 }
 
 async fn running(State(api): State<Arc<Api>>) -> Response {
@@ -293,7 +294,7 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 }
 
 async fn exits(State(api): State<Arc<Api>>) -> Response {
-	let (snapshot, counters, health) = (api.engine.snapshot(), api.engine.counters(), api.engine.exit_health());
+	let (snapshot, counters, health, links) = (api.engine.snapshot(), api.engine.counters(), api.engine.exit_health(), api.engine.links());
 	json(StatusCode::OK, &model::Exits {exits: snapshot.config.exits.iter().map(|exit| {
 		let (health, outbound) = (health.iter().find(|health| health.exit == exit.tag), if let veilway_core::config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None});
 		// Only a SOCKS5 proxy can refuse to relay UDP, so only an exit through one has anything to say here.
@@ -306,6 +307,7 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 				veilway_core::config::Backend::Netstack(_) => model::Backend::Netstack,
 				veilway_core::config::Backend::L3(_) => model::Backend::L3,
 				veilway_core::config::Backend::Block {} => model::Backend::Block,
+				veilway_core::config::Backend::Chain(_) => model::Backend::Chain,
 			},
 			outbound,
 			udp: proxied.then_some(down.is_none()),
@@ -314,8 +316,40 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			interface_up: health.and_then(|health| health.interface_down).map(|down| down.is_none()),
 			interface_down_secs: health.and_then(|health| health.interface_down).flatten().map(|down| down.as_secs()),
 			interface_flips: health.map_or(0, |health| health.interface_flips),
+			links: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {chain.links.clone()} else {Vec::new()},
+			link_up: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {Some(links.iter().any(|link| chain.links.contains(&link.tag) && link.status == Status::Up))} else {None},
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
 		}
+	}).collect()})
+}
+
+async fn links(State(api): State<Arc<Api>>) -> Response {
+	json(StatusCode::OK, &model::Links {links: api.engine.links().into_iter().map(|link| model::Link {
+		tag: link.tag, id: veilway_core::config::LinkId(link.id),
+		half: if link.entry {model::LinkHalf::Entry} else {model::LinkHalf::Exit},
+		role: if link.listener {model::LinkRole::Listener} else {model::LinkRole::Dialler},
+		state: match link.status {
+			Status::Up => model::LinkState::Up,
+			Status::Connecting => model::LinkState::Connecting,
+			Status::Unreachable => model::LinkState::Unreachable,
+			Status::Refused => model::LinkState::Refused,
+			Status::Ended => model::LinkState::Ended,
+		},
+		state_secs: link.since.as_secs(), handshake_secs: link.handshake.map(|age| age.as_secs()),
+		transport: link.transport.map(|(name, ..)| match name {
+			"udp" => model::Transport::Udp,
+			"udp-obfs" => model::Transport::UdpObfs,
+			"tls" => model::Transport::Tls,
+			_ => model::Transport::Ws,
+		}),
+		transport_index: link.transport.map(|(_, at, _)| at), candidate_index: link.transport.map(|(.., candidate)| candidate),
+		size_warning: link.warning,
+		denied: link.denied.map(|denied| match denied {
+			Denied::Disabled => model::Denied::Disabled,
+			Denied::Expired => model::Denied::Expired,
+			Denied::Quota => model::Denied::Quota,
+		}),
+		exit: link.exit, flows: link.flows, dropped: link.dropped, state_flips: link.flips, traffic: link.traffic.into(),
 	}).collect()})
 }
 
@@ -419,6 +453,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::Stats, _, _>(schemas, Method::GET, "/v1/stats", "stats", "Every counter at one moment, with rates in bytes per second over the last 5 seconds.", stats, false, &[]),
 		route::<model::Sessions, _, _>(schemas, Method::GET, "/v1/sessions", "listSessions", "The devices with a live session.", sessions, false, &[]),
 		route::<model::Exits, _, _>(schemas, Method::GET, "/v1/exits", "listExits", "Every exit with what the node knows of its upstream, and its counters.", exits, false, &[]),
+		route::<model::Links, _, _>(schemas, Method::GET, "/v1/links", "listLinks", "Every enabled node link with its state and its counters. No key and no secret.", links, false, &[]),
 		stream,
 		route::<BTreeMap<String, serde_json::Value>, _, _>(schemas, Method::GET, "/v1/openapi.json", "openapi", "This document.", openapi, false, &[]),
 	]

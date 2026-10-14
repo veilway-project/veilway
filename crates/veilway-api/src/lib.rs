@@ -329,8 +329,8 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 					let plan = api.engine.plan();
 					{
 						let mut samples = api.samples.lock().unwrap_or_else(|e| e.into_inner());
-						let names = samples.back().filter(|last| last.generation == plan.generation).map(|last| last.names.clone()).unwrap_or_else(|| Arc::new(plan.users.iter().map(|user| (USER, user.name.clone())).chain(plan.inbounds.iter().map(|inbound| (INBOUND, inbound.tag.clone()))).chain(plan.exits.iter().map(|exit| (EXIT, exit.tag.clone()))).collect()));
-						let bytes = plan.users.iter().map(|user| user.state.traffic.totals()).chain(plan.inbounds.iter().map(|inbound| inbound.traffic.totals())).chain(plan.exits.iter().map(|exit| exit.traffic.totals())).map(|totals| (totals.up_bytes, totals.down_bytes)).collect();
+						let names = samples.back().filter(|last| last.generation == plan.generation).map(|last| last.names.clone()).unwrap_or_else(|| Arc::new(plan.users.iter().take(plan.people).map(|user| (USER, user.name.clone())).chain(plan.inbounds.iter().take(plan.listening).map(|inbound| (INBOUND, inbound.tag.clone()))).chain(plan.exits.iter().map(|exit| (EXIT, exit.tag.clone()))).collect()));
+						let bytes = plan.users.iter().take(plan.people).map(|user| user.state.traffic.totals()).chain(plan.inbounds.iter().take(plan.listening).map(|inbound| inbound.traffic.totals())).chain(plan.exits.iter().map(|exit| exit.traffic.totals())).map(|totals| (totals.up_bytes, totals.down_bytes)).collect();
 						samples.push_back(Sample {at: Instant::now(), generation: plan.generation, names, bytes});
 						if samples.len() > WINDOW + 1 {samples.pop_front();}
 					}

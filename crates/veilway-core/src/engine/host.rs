@@ -3,9 +3,9 @@
 use super::icmp::{self, Kind};
 use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
-use super::plan::{Backend, Denied, Fallback, Holder, Outbound, Plan, User};
+use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{control, l3, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
+use super::{control, l3, link, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{loops, Config, Host as Named, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
@@ -51,12 +51,12 @@ enum Reader {Plain(Arc<Tunnel>), Obfs(Arc<obfs::Listener>)}
 /// With `whole` the socket sets "do not fragment" on everything it sends and never fragments by a path MTU it has learnt, so neither the host nor a router cuts a packet. Without it the socket is put back to what the system does by itself.
 /// Only Linux has this here: no dependency of the tree sets the option of another system without `unsafe`. There a `veilway` inbound is told at start that its packets may be fragmented.
 #[cfg(target_os = "linux")]
-fn fragmenting(socket: &UdpSocket, v6: bool, whole: bool) -> io::Result<()> {
+pub(super) fn fragmenting(socket: &UdpSocket, v6: bool, whole: bool) -> io::Result<()> {
 	Ok(if v6 {sockopt::set_ipv6_mtu_discover(socket, if whole {sockopt::Ipv6PathMtuDiscovery::PROBE} else {sockopt::Ipv6PathMtuDiscovery::WANT})?} else {sockopt::set_ip_mtu_discover(socket, if whole {sockopt::Ipv4PathMtuDiscovery::PROBE} else {sockopt::Ipv4PathMtuDiscovery::WANT})?})
 }
 
 #[cfg(not(target_os = "linux"))]
-fn fragmenting(_: &UdpSocket, _: bool, whole: bool) -> io::Result<()> {if whole {Err(io::ErrorKind::Unsupported.into())} else {Ok(())}}
+pub(super) fn fragmenting(_: &UdpSocket, _: bool, whole: bool) -> io::Result<()> {if whole {Err(io::ErrorKind::Unsupported.into())} else {Ok(())}}
 
 /// A tunnel as it runs: its tasks, and the loopback socket every `ws` transport of the inbound relays to, with its address and the task that reads it. An inbound without a `ws` transport has none.
 struct Running {tunnel: Arc<Tunnel>, _tasks: Vec<Task>, loopback: Option<(SocketAddr, Arc<UdpSocket>, Task)>}
@@ -86,6 +86,10 @@ pub struct Host {
 	routes: u64,
 	/// The listen addresses the last commit gave back to the host.
 	released: HashSet<SocketAddr>,
+	/// The tunnel of each node link this node dials, by the tag of its place among the inbounds of a plan, with what it was made for: the link's key, the other node's key and the MTU. A link that keeps all three keeps its tunnel and its sessions.
+	shapes: HashMap<String, ([u8; 32], [u8; 32], u16)>,
+	/// The task that dials each link, by the link's tag, with what it dials: the tunnel, the link's id and keys and secret, its MTU and the other node's transports. Anything else is a new task.
+	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64))>,
 }
 
 /// What `prepare` took for a config that is not in force yet. Dropping it gives all of it back.
@@ -140,7 +144,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 				(IpAddr::V6(src), IpAddr::V6(dst)) => PacketBuilder::ipv6(src.octets(), dst.octets(), 64).udp(flow.key.sport, flow.key.dport).write(&mut raw, &[]),
 				_ => return None,
 			};
-			let gateway = plan.inbounds[from.inbound].pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == flow.key.src.is_ipv4());
+			let gateway = plan.gateway(from.inbound, flow.key.src.is_ipv4());
 			built.ok().and_then(|_| netstack::parse(&raw)).zip(gateway).and_then(|(packet, gateway)| icmp::error(&raw, &packet, Kind::Prohibited, gateway, &plan.pools))
 		}
 		_ => None,
@@ -149,22 +153,24 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new()}}
 
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
 	pub async fn prepare(&mut self, shared: &Arc<Shared>, config: &Arc<Config>, restart: &[&str]) -> anyhow::Result<Staged> {
 		let (old, mut fresh) = (shared.plan(), Vec::new());
-		let tunnels = config.inbounds.iter().map(|inbound| match self.tunnels.get(&inbound.tag).filter(|_| !restart.contains(&inbound.tag.as_str())) {
-			Some(running) => running.tunnel.clone(),
+		// The tunnel of every inbound, and behind them the tunnel of every enabled link this node dials, in the order of the config: a link this node dials has a tunnel of its own, whose one peer is the other node.
+		let dialled: Vec<(String, [u8; 32], [u8; 32], u16)> = config.links.iter().filter(|link| link.enabled != Some(false)).filter_map(|link| Some((format!("link:{}", link.tag), link.private_key.as_ref()?.expose().0, link.peer.as_ref()?.inbound_public_key.0, link.mtu(&config.inbounds)))).collect();
+		let tunnels = config.inbounds.iter().map(|inbound| (inbound.tag.clone(), inbound.private_key.expose().0, inbound.mtu(), self.tunnels.get(&inbound.tag).filter(|_| !restart.contains(&inbound.tag.as_str())).map(|running| running.tunnel.clone()))).chain(dialled.iter().map(|(tag, private, other, mtu)| (tag.clone(), *private, *mtu, self.tunnels.get(tag).filter(|_| self.shapes.get(tag) == Some(&(*private, *other, *mtu))).map(|running| running.tunnel.clone())))).map(|(tag, private, mtu, running)| match running {
+			Some(running) => running,
 			None => {
 				let (to_stack, from_wg) = mpsc::channel::<Vec<u8>>(QUEUE);
 				let (to_wg, from_stack) = mpsc::channel::<Vec<u8>>(QUEUE);
 				let (mut stack, mut tcp) = (IpStackConfig::default(), TcpConfig::default());
 				// A tunnel outlives the exits of the config it started under, so its stack waits longer than any exit may ask and each flow's handler keeps the time of its own exit.
 				tcp.timeout = Duration::from_secs(u64::from(MAX_TCP_IDLE_SECS) + STACK_MARGIN);
-				stack.mtu_unchecked(inbound.mtu()).packet_information(false).udp_timeout(Duration::from_secs(u64::from(MAX_UDP_IDLE_SECS) + STACK_MARGIN)).with_tcp_config(tcp);
-				let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
+				stack.mtu_unchecked(mtu).packet_information(false).udp_timeout(Duration::from_secs(u64::from(MAX_UDP_IDLE_SECS) + STACK_MARGIN)).with_tcp_config(tcp);
+				let tunnel = Arc::new(Tunnel::new(tag, Peers {wg: Wg::new(private), via: Vec::new()}, to_stack));
 				fresh.push((tunnel.clone(), IpStack::new(stack, PacketDev::new(from_wg, to_wg)), from_stack));
 				tunnel
 			}
@@ -173,6 +179,7 @@ impl Host {
 		for (tunnel, ..) in &fresh {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
 			for device in plan.devices.iter().filter(|device| device.inbounds.contains(&at)) {peers.add(device.public_key, device.preshared_key)}
+			for link in plan.links.iter().filter(|link| link.inbound == at && link.denied.is_none()) {peers.add(link.key, None)}
 		}
 		// "`veilway run` refuses to start a config that has an obfuscated transport" without a replay file it can write and lock. The memory is taken once, by the first config that needs it, and kept for as long as the process runs.
 		if let (Some(i), None) = (plan.inbounds.iter().position(|inbound| inbound.native.is_some()), shared.replay.get()) {
@@ -238,9 +245,12 @@ impl Host {
 			let (first, second) = (wired.next(), wired.next());
 			if let (Some((_, first, ..)), Some((_, second, ..))) = (first, second) {anyhow::bail!("exits `{}` and `{}` both have an l3 backend: this build runs one l3 exit per node, so remove one of them", first.tag, second.tag)}
 			first.map(|(at, exit, interface, masquerade)| {
-				let mut pools: Vec<IpNet> = plan.pools.iter().map(|(pool, _)| pool.trunc()).collect();
+				// The links that may leave through the exit count into it: "the link's `mtu` counts into the MTU of an `l3` exit's interface, so that the kernel does not hand back packets the link cannot carry". The entry's link address of a link this node dials lies in no pool of this node, so it is routed to the interface by itself.
+				let using: Vec<&plan::Link> = plan.links.iter().filter(|link| link.user.is_some_and(|user| plan.users[user].entitled.as_ref().is_none_or(|list| list.contains(&at)))).collect();
+				let mut pools: Vec<IpNet> = plan.pools.iter().map(|(pool, _)| pool.trunc()).chain(using.iter().filter(|link| !link.listener).flat_map(|link| link.addresses.iter().map(|address| IpNet::from(*address)))).collect();
 				pools.sort();
-				(at, l3::Wanted {tag: exit.tag.clone(), interface: interface.clone(), masquerade: *masquerade, pools, mtu: plan.inbounds.iter().map(|inbound| inbound.mtu).min().unwrap_or(DEFAULT_MTU)})
+				pools.dedup();
+				(at, l3::Wanted {tag: exit.tag.clone(), interface: interface.clone(), masquerade: *masquerade, pools, mtu: plan.inbounds.iter().take(plan.listening).map(|inbound| inbound.mtu).chain(using.iter().map(|link| link.mtu)).min().unwrap_or(DEFAULT_MTU)})
 			})
 		};
 		for exit in &plan.exits {
@@ -307,6 +317,21 @@ impl Host {
 			self.tunnels.insert(tunnel.tag.clone(), Running {tunnel, _tasks: tasks, loopback: None});
 		}
 		self.tunnels.retain(|tag, _| plan.inbounds.iter().any(|inbound| inbound.tag == *tag));
+		self.shapes = plan.links.iter().filter_map(|link| Some((plan.inbounds[link.inbound].tag.clone(), (plan.inbounds[link.inbound].private_key, link.key, link.mtu))).filter(|_| link.dialled.is_some())).collect();
+		// A link this node dials is dialled while it is enabled and not cut off. One that is the same link through the same tunnel keeps its task and its session, and any other task ends here, with its session.
+		let mut diallers = std::mem::take(&mut self.diallers);
+		for link in plan.links.iter().filter(|link| link.denied.is_none()) {
+			let (Some(dialled), tunnel) = (&link.dialled, &plan.inbounds[link.inbound].tunnel) else {continue};
+			let shape = (link.id, link.key, link.identity, link.secret, link.mtu, veilway_transport::choice::digest(&dialled.transports));
+			let kept = diallers.remove(&link.tag).filter(|(_, _, was, of)| Arc::ptr_eq(was, tunnel) && *of == shape);
+			let running = kept.unwrap_or_else(|| {
+				tracing::info!("link {}: dialling the other node, over {} transport(s) in its order", link.tag, dialled.transports.len());
+				let (dialler, task) = link::dial(shared, tunnel.clone(), link.tag.clone(), dialled.clone(), link.state.clone());
+				(dialler, Task(task), tunnel.clone(), shape)
+			});
+			self.diallers.insert(link.tag.clone(), running);
+		}
+		for tag in diallers.keys() {tracing::info!("link {tag}: no longer dialled")}
 		for (tunnel, addr, socket) in loopbacks {
 			if let Some(running) = self.tunnels.get_mut(&tunnel.tag) {running.loopback = Some((addr, socket.clone(), Task(inbound::read(shared, tunnel, socket, Over::Ws))))}
 		}
@@ -410,6 +435,7 @@ impl Host {
 				Backend::Netstack {..} => tracing::info!("exit {}: netstack, direct from this node", exit.tag),
 				Backend::L3 {masquerade, ..} => if !masquerade && plan.hijack {tracing::warn!("exit {}: l3 without masquerade carries no query of the node's resolver, so dns fails for flows routed to it unless a rule sends the dns servers on port 53 to another exit", exit.tag)},
 				Backend::Block => tracing::info!("exit {}: block", exit.tag),
+				Backend::Chain {links} => tracing::info!("exit {}: chain, leaves from another node through {} link(s)", exit.tag, links.len()),
 			}
 			if matches!(exit.backend, Backend::Netstack {icmp_echo: Fallback::Direct, ..}) && plan.pools.iter().any(|(pool, _)| pool.addr().is_ipv6()) && icmp::ping_socket(false).is_err() {tracing::warn!("exit {}: this system gives the node no ping socket for ipv6, so ipv6 pings through the exit get no answer", exit.tag)}
 		}
@@ -441,6 +467,8 @@ impl Host {
 		// Next to the reason stands what the control channel says of it in a `bye` ("Being cut off"). A device whose addresses or preshared key changed is none of the four cases a `bye` has, so it is told nothing and finds out as it did before.
 		let cut: HashMap<[u8; 32], (&str, Option<ByeReason>)> = old.devices.iter().filter_map(|was| {
 			let name = old.users[was.user].name.as_str();
+			// The record of a link is the same while its link is: same key, same addresses, not cut off.
+			if was.link.is_some() {return plan.by_key.get(&was.public_key).map(|at| &plan.devices[*at]).filter(|is| is.link.is_some() && is.addresses == was.addresses).is_none().then_some((was.public_key, ("its link was removed, changed or cut off", None)))}
 			Some((was.public_key, match plan.by_key.get(&was.public_key).map(|at| &plan.devices[*at]) {
 				Some(is) if plan.users[is.user].name != name => ("its key was given to another user", Some(ByeReason::Disabled)),
 				Some(is) if is.addresses != was.addresses => ("its addresses changed", None),
@@ -462,6 +490,8 @@ impl Host {
 			(Backend::Netstack {outbound, tcp_idle, udp_idle, icmp_echo, udp, other}, Backend::Netstack {outbound: now, tcp_idle: tcp, udp_idle: quiet, icmp_echo: echo, udp: datagrams, other: rest}) => outbound == now && tcp_idle == tcp && udp_idle == quiet && alike(*icmp_echo, *echo) && alike(*udp, *datagrams) && alike(*other, *rest),
 			(Backend::L3 {interface, masquerade}, Backend::L3 {interface: now, masquerade: nat}) => interface == now && masquerade == nat,
 			(Backend::Block, Backend::Block) => true,
+			// A flow stays on its link while the link stays: one whose link is gone from the exit is refused at its next packet, see `chain`.
+			(Backend::Chain {..}, Backend::Chain {..}) => true,
 			_ => false,
 		})).collect();
 		let judge = |key: &Key, device: &[u8; 32], user: &str, decision: Decision, names: &[Arc<str>]| {
@@ -527,6 +557,19 @@ impl Host {
 					if peers.wg.index(&device.public_key).is_none() {peers.add(device.public_key, device.preshared_key)}
 				}
 			}
+			// A link is a peer while it is the same link through the same tunnel. Any other loses its sessions here: "The sessions and the tunnel are dropped within one second on the node that removed it."
+			for was in old.links.iter().filter(|was| was.denied.is_none()) {
+				let tunnel = &old.inbounds[was.inbound].tunnel;
+				let stays = plan.links.iter().any(|is| is.denied.is_none() && is.id == was.id && is.key == was.key && is.identity == was.identity && is.secret == was.secret && is.addresses == was.addresses && Arc::ptr_eq(&plan.inbounds[is.inbound].tunnel, tunnel));
+				if !stays {
+					tunnel.lock().wg.remove_peer(&was.key);
+					tracing::info!("link {}: its sessions are dropped: the link was removed, changed or cut off", was.tag);
+				}
+			}
+			for link in plan.links.iter().filter(|link| link.denied.is_none()) {
+				let mut peers = plan.inbounds[link.inbound].tunnel.lock();
+				if peers.wg.index(&link.key).is_none() {peers.add(link.key, None)}
+			}
 			// `Plan::new` held each count against the period the plan was compiled in without touching it. The plan is in force from here, so this is where a count whose period is over starts over,
 			// and where a period the state file has more than one whole period after the node's clock is put right at start.
 			let now = (shared.now)().unix_timestamp();
@@ -580,7 +623,7 @@ impl Host {
 		for (was, at) in old.exits.iter().zip(&exits) {
 			if at.is_none() && was.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() && tags.contains_key(was.tag.as_str()) {shared.publish(Event::ExitUdpChanged {exit: was.tag.clone(), udp: true})}
 		}
-		for (was, reason) in old.devices.iter().filter_map(|was| cut.get(&was.public_key).map(|(reason, _)| (was, reason))).take(MAX_NAMES_LOGGED) {
+		for (was, reason) in old.devices.iter().filter(|was| was.link.is_none()).filter_map(|was| cut.get(&was.public_key).map(|(reason, _)| (was, reason))).take(MAX_NAMES_LOGGED) {
 			tracing::info!("user {} device {}: cut off, {reason}: its session keys and its flows are gone and the user's dns memory is cleared", old.users[was.user].name, was.name);
 		}
 		if cut.len() > MAX_NAMES_LOGGED {tracing::info!("{} more devices were cut off", cut.len() - MAX_NAMES_LOGGED)}
@@ -590,7 +633,7 @@ impl Host {
 		if moved.len() > MAX_NAMES_LOGGED {tracing::info!("{} more users had their dns memory cleared because their dns servers changed", moved.len() - MAX_NAMES_LOGGED)}
 		if ended > 0 {tracing::info!("{ended} flow(s) ended with the config they were routed by")}
 		// A user is an event when what `denied` says of them turns, not when one of their devices changes. The plan before the first one holds what the state file remembered and nobody was connected under it.
-		for was in old.users.iter().filter(|_| old.generation > 0) {
+		for was in old.users.iter().filter(|was| old.generation > 0 && was.link.is_none()) {
 			match (was.denied, users.get(was.name.as_str()).map(|is| is.denied)) {
 				(None, None) => shared.publish(Event::UserCutOff {user: was.name.clone(), reason: CutOff::Removed}),
 				(None, Some(Some(denied))) => shared.publish(Event::UserCutOff {user: was.name.clone(), reason: match denied {

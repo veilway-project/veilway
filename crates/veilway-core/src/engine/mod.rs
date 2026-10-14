@@ -1,5 +1,6 @@
 //! The engine: one WireGuard tunnel per inbound, every decrypted packet checked and routed, and TCP and UDP flows re-dialled by a userspace stack through the outbound of the exit they were routed to.
 //! Only an `l3` exit uses a TUN device and kernel routing, and only for the flows that were routed to it.
+mod chain;
 pub mod control;
 pub mod dns;
 mod flows;
@@ -9,6 +10,7 @@ pub mod icmp;
 mod inbound;
 pub mod l3;
 pub mod limits;
+pub mod link;
 pub mod netstack;
 pub mod obfs;
 pub mod plan;
@@ -28,6 +30,7 @@ pub use route::Reason;
 
 use crate::config::{Applied, ApplyError, Config, Diff, Revision, Snapshot, Store};
 use host::Host;
+use rustls::RootCertStore;
 use resolver::{Names, Resolver};
 use route::Flows;
 use std::collections::HashMap;
@@ -116,6 +119,33 @@ pub struct Peer {
 	pub mtu: Option<u16>,
 }
 
+/// One node link as `Engine::links` gives it.
+#[derive(Clone, Debug)]
+pub struct LinkReport {
+	pub tag: String,
+	pub id: [u8; 16],
+	/// Whether this node is the entry half, and whether it is the node the link connects to.
+	pub entry: bool,
+	pub listener: bool,
+	pub status: link::Status,
+	/// How long the link has been in that state.
+	pub since: Duration,
+	/// How long ago its tunnel last completed a handshake. None without a session.
+	pub handshake: Option<Duration>,
+	/// On the node that dials: the kind of transport it is at, and the places of that transport and its candidate or endpoint in the other node's list.
+	pub transport: Option<(&'static str, usize, usize)>,
+	pub flows: usize,
+	/// Inner packets: up is what this node sent into the link, down what it took out.
+	pub traffic: Totals,
+	pub dropped: u64,
+	pub flips: u64,
+	pub warning: bool,
+	/// On the exit half: a link this node cut off for its quota or its expiry.
+	pub denied: Option<Denied>,
+	/// On the entry half: the `chain` exit the link is behind.
+	pub exit: Option<String>,
+}
+
 /// What the engine knows of the upstream of one exit, as `Engine::exit_health` gives it.
 #[derive(Clone, Debug)]
 pub struct ExitHealth {
@@ -147,10 +177,12 @@ pub struct Options {
 	pub replay: Option<PathBuf>,
 	/// The range, in milliseconds, the control channel draws the shortest time between two `usage` pushes of one connection from. It is `veilway_proto::control::USAGE_PUSH`, 30 to 90 s, and tests replace it so as not to wait that long.
 	pub usage_push: RangeInclusive<u32>,
+	/// The certificates the TLS of a node link this node dials must lead to. None is the Mozilla root list, and tests give the root of the certificates they make.
+	pub roots: Option<Arc<RootCertStore>>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -294,12 +326,18 @@ pub struct Shared {
 	replay: OnceLock<Arc<replay::Guard>>,
 	/// Where the replay file is. None for a node that was given no path, which starts no obfuscated transport.
 	replay_path: Option<PathBuf>,
+	/// The translations of the `chain` exits, see `chain`.
+	nat: chain::Nat,
+	/// What the TLS of a node link this node dials is validated against.
+	roots: Arc<RootCertStore>,
+	/// Held once more by every dialler task of a node link while it runs, so that its count says how many still dial: a link a reload removed must stop within a second.
+	dialling: Arc<()>,
 }
 
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
-	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay}
+	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -462,7 +500,10 @@ impl Engine {
 
 	pub fn plan(&self) -> Arc<Plan> {self.shared.plan()}
 
-	pub fn user(&self, name: &str) -> Option<Totals> {self.plan().users.iter().find(|user| user.name == name).map(|user| user.state.traffic.totals())}
+	pub fn user(&self, name: &str) -> Option<Totals> {
+		let plan = self.plan();
+		plan.users.iter().take(plan.people).find(|user| user.name == name).map(|user| user.state.traffic.totals())
+	}
 
 	pub fn inbound(&self, tag: &str) -> Option<Totals> {self.plan().inbounds.iter().find(|inbound| inbound.tag == tag).map(|inbound| inbound.traffic.totals())}
 
@@ -475,14 +516,38 @@ impl Engine {
 	pub fn counters(&self) -> Counters {
 		let plan = self.plan();
 		Counters {
-			users: plan.users.iter().map(Usage::of).collect(),
-			inbounds: plan.inbounds.iter().map(|inbound| (inbound.tag.clone(), inbound.traffic.totals())).collect(),
+			users: plan.users.iter().take(plan.people).map(Usage::of).collect(),
+			inbounds: plan.inbounds.iter().take(plan.listening).map(|inbound| (inbound.tag.clone(), inbound.traffic.totals())).collect(),
 			exits: plan.exits.iter().map(|exit| (exit.tag.clone(), exit.traffic.totals())).collect(),
 		}
 	}
 
 	/// The counters of one user of the config that runs, as `counters` has them, without those of anybody else.
-	pub fn usage(&self, name: &str) -> Option<Usage> {self.plan().users.iter().find(|user| user.name == name).map(Usage::of)}
+	pub fn usage(&self, name: &str) -> Option<Usage> {
+		let plan = self.plan();
+		plan.users.iter().take(plan.people).find(|user| user.name == name).map(Usage::of)
+	}
+
+	/// The dialler tasks of node links that still run, those of links that a reload removed included until they have stopped.
+	pub fn diallers(&self) -> usize {Arc::strong_count(&self.shared.dialling) - 1}
+
+	/// Every enabled node link of the config that runs, in its order, with its state and its numbers. No key and no secret.
+	pub fn links(&self) -> Vec<LinkReport> {
+		let plan = self.plan();
+		plan.links.iter().enumerate().map(|(at, link)| {
+			let (status, since) = link.state.status();
+			LinkReport {
+				tag: link.tag.clone(), id: link.id, entry: link.entry, listener: link.listener, status, since, handshake: plan.handshake(at),
+				transport: link.dialled.as_ref().zip(link.state.at()).map(|(dialled, (transport, candidate))| (match dialled.transports.get(transport) {
+					Some(veilway_proto::subscription::payload::Transport::Udp(_)) => "udp",
+					Some(veilway_proto::subscription::payload::Transport::UdpObfs(_)) => "udp-obfs",
+					Some(veilway_proto::subscription::payload::Transport::Tls(_)) => "tls",
+					_ => "ws",
+				}, transport, candidate)),
+				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
+			}
+		}).collect()
+	}
 
 	/// Starts the quota count of the user called `name` over at the operator's word: `used_bytes` is 0 and `period_start` is the start of the quota period the clock is in, or 0 for a user without a `quota_period`.
 	/// What the user sent and received in all is a record of the node and not of the quota, so it stays unless `totals` is set, which zeroes those four counters as well. Nothing else of the user is touched: sessions, flows and DNS memory stay.
@@ -493,7 +558,7 @@ impl Engine {
 		// Held so that no reload puts another plan in force halfway. Nothing between here and the switch waits, so whoever stops waiting for this leaves no reset half done.
 		let mut host = self.host.lock().await;
 		let plan = self.shared.plan();
-		let user = plan.users.iter().find(|user| user.name == name)?;
+		let user = plan.users.iter().take(plan.people).find(|user| user.name == name)?;
 		let (state, start) = (&user.state, user.period.map_or(0, |period| usage::starts((self.shared.now)())[period as usize]));
 		let used = state.used.swap(0, Ordering::Relaxed);
 		state.since.store(start, Ordering::Relaxed);
@@ -581,8 +646,9 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (users, devices, writable) = usage::load(&path);
 		(users, devices, writable.then_some(path))
 	});
-	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state)}).collect(), ..Plan::default()};
-	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push));
+	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER}).collect(), ..Plan::default()};
+	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
+	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots));
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let mut host = Host::new(options.dir);
 	let staged = match host.prepare(&shared, &store.current().config, &[]).await {
@@ -610,6 +676,8 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 							shared.limits.sweep(clock);
 							shared.obfs.sweep(clock);
 							shared.stream.sweep();
+							shared.nat.sweep(&shared.flows);
+							shared.check_links();
 						}
 					}
 					_ = shared.over.notified() => {}
