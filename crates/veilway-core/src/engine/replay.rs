@@ -525,6 +525,7 @@ mod tests {
 	}
 
 	// A path that is no place for a replay file gets no lock file next to it, and a link or anything else in the place of the lock file is not followed.
+	#[cfg(unix)]
 	#[test]
 	fn a_path_that_is_refused_leaves_nothing_behind_and_the_lock_is_a_regular_file_of_the_node() {
 		let (lock, before) = (Path::new("/dev/null.lock"), Path::new("/dev/null.lock").exists());
