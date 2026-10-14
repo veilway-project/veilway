@@ -468,6 +468,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "etherparse"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17304d06addb3283cdc4bd528e42dd95e73c8ee2d6492ffce415e93660885449"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -678,7 +687,7 @@ name = "ipstack"
 version = "1.0.1"
 dependencies = [
  "ahash",
- "etherparse",
+ "etherparse 0.20.3",
  "log",
  "rand",
  "serde_json",
@@ -1352,9 +1361,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "bytes",
  "libc",
@@ -1508,8 +1517,8 @@ name = "veilway-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
- "etherparse",
+ "base64 0.23.1",
+ "etherparse 0.21.0",
  "ipnet",
  "ipstack",
  "libc",
@@ -1537,7 +1546,7 @@ dependencies = [
 name = "veilway-engine"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "boringtun",
  "ring",
  "rustls",
@@ -1592,7 +1601,7 @@ dependencies = [
 name = "veilway-proto"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "hpke",
  "ring",
  "serde",
@@ -1605,7 +1614,7 @@ dependencies = [
 name = "veilway-transport"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "ring",
  "rustix",
  "rustls",
@@ -1621,7 +1630,7 @@ name = "veilway-wg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "boringtun",
  "futures-util",
  "rand_core 0.6.4",
