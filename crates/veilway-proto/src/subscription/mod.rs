@@ -5,7 +5,8 @@
 //! Two properties are carried by the types and not by the caller's care. A payload is read only from an `envelope::Verified`, which nothing but `envelope::verify` makes, so no byte of a payload is parsed before its signature was checked under a key that was held. And a `fetch::Request` of a client comes only out of the steps of `client`, the first of which is the user's yes to what the link alone shows.
 use crate::{control::{display, Untrusted}, unicode::strong};
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
-use std::fmt;
+use payload::dialable;
+use std::{fmt, net::IpAddr};
 use subtle::ConstantTimeEq;
 
 pub mod client;
@@ -172,11 +173,17 @@ impl fmt::Debug for Url {
 
 impl Url {
 	/// `limit` is the longest text, `query` and `fragment` say whether the URL may have those parts.
-	pub fn parse(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {
+	pub fn parse(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, false)}
+	/// `parse` for the URL of a pinned endpoint ("A pinned endpoint"), whose host may also be an IP literal: a dotted IPv4 address or an IPv6 address in brackets, in the one spelling Rust prints (so lowercase, no zone, no leading zeros), that is `dialable`. A pinned endpoint has no certificate that names it, so an address is all a provider with no domain has to put here.
+	pub fn pinned(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, true)}
+	fn read(text: &str, limit: usize, query: bool, fragment: bool, literal: bool) -> Option<Self> {
 		let rest = text.strip_prefix("https://").filter(|_| text.len() <= limit)?;
 		let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
-		let (host, port) = authority.split_once(':').map_or((authority, None), |(host, port)| (host, Some(port)));
-		if !is_host(host) || port.is_some_and(|port| port.len() > 5 || port.starts_with('0') || !port.bytes().all(|byte| byte.is_ascii_digit()) || port.parse::<u16>().is_err()) {return None}
+		let (host, port) = if authority.starts_with('[') {
+			let (host, rest) = authority.split_at(authority.find(']')? + 1);
+			(host, if rest.is_empty() {None} else {Some(rest.strip_prefix(':')?)})
+		} else {authority.split_once(':').map_or((authority, None), |(host, port)| (host, Some(port)))};
+		if !(is_host(host) || (literal && address(host).is_some_and(dialable))) || port.is_some_and(|port| port.len() > 5 || port.starts_with('0') || !port.bytes().all(|byte| byte.is_ascii_digit()) || port.parse::<u16>().is_err()) {return None}
 		let (tail, part) = tail.split_once('#').map_or((tail, None), |(tail, part)| (tail, Some(part)));
 		let (path, asked) = tail.split_once('?').map_or((tail, None), |(path, asked)| (path, Some(asked)));
 		if (part.is_some() && !fragment) || (asked.is_some() && !query) || part.is_some_and(|part| part.contains('#')) {return None}
@@ -191,10 +198,18 @@ impl Url {
 	pub fn authority(&self) -> String {format!("{}:{}", self.host(), self.port())}
 	/// The whole URL as it was written.
 	pub fn as_str(&self) -> &str {&self.text}
-	/// The host name, which is ASCII by the rule of `is_host`. It is what a screen shows before the URL is opened or fetched.
+	/// The host name, which is ASCII by the rule of `is_host`, or an IP literal as written (with its brackets when it is IPv6) in a URL that was read with `pinned`. It is what a screen shows before the URL is opened or fetched.
 	pub fn host(&self) -> &str {&self.text[8..8 + self.host]}
+	/// The address when the host is an IP literal, which only a pinned endpoint's can be: it is dialled with no lookup and sent no server name.
+	pub fn literal(&self) -> Option<IpAddr> {address(self.host())}
 	/// The port, 443 when the URL names none.
 	pub fn port(&self) -> u16 {self.text[8 + self.host..].strip_prefix(':').and_then(|rest| rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].parse().ok()).unwrap_or(443)}
+}
+
+// An IP literal in its one spelling, as a URL host: `1.2.3.4` or `[::1]`. One spelling, so that two spellings of an address cannot be two hosts to the rules that compare `authority`.
+fn address(host: &str) -> Option<IpAddr> {
+	let ip = match host.strip_prefix('[') {Some(inner) => IpAddr::V6(inner.strip_suffix(']')?.parse().ok()?), None => IpAddr::V4(host.parse().ok()?)};
+	(match ip {IpAddr::V4(ip) => ip.to_string(), IpAddr::V6(ip) => format!("[{ip}]")} == host).then_some(ip)
 }
 
 // "Every base64url part has no padding and no white space, and its unused trailing bits are zero." The decoder refuses all three as it is set up here, which a test of `envelope` shows.
@@ -244,6 +259,16 @@ mod tests {
 		assert!(Url::parse("https://example.com/a?b", URL_MAX, false, true).is_none() && Url::parse("https://example.com/a#b", URL_MAX, true, false).is_none());
 		let long = format!("https://example.com/{}", "a".repeat(URL_MAX - 20));
 		assert!(Url::parse(&long, URL_MAX, true, true).is_some() && Url::parse(&format!("{long}a"), URL_MAX, true, true).is_none());
+	}
+
+	#[test]
+	fn only_a_pinned_url_has_an_address_for_a_host_and_in_one_spelling() {
+		for (text, host, port) in [("https://203.0.113.7/s", "203.0.113.7", 443), ("https://203.0.113.7:8443/s?a=b", "203.0.113.7", 8443), ("https://[2001:db8::1]/s", "[2001:db8::1]", 443), ("https://[2001:db8::1]:444/s", "[2001:db8::1]", 444), ("https://example.com:8443/s", "example.com", 8443)] {
+			let url = Url::pinned(text, URL_MAX, true, false).unwrap();
+			assert_eq!((url.host(), url.port(), url.literal().is_some(), Url::parse(text, URL_MAX, true, false).is_some()), (host, port, host != "example.com", host == "example.com"), "{text}");
+		}
+		for text in ["https://127.0.0.1/", "https://[::1]/", "https://0.0.0.0/", "https://169.254.1.1/", "https://224.0.0.1/", "https://255.255.255.255/", "https://[fe80::1]/", "https://[::ffff:203.0.113.7]/", "https://[2001:DB8::1]/", "https://[2001:db8:0:0:0:0:0:1]/", "https://[2001:db8::1%25eth0]/", "https://203.000.113.007/", "https://203.0.113/", "https://3405803783/", "https://0xcb007107/", "https://[2001:db8::1/", "https://[2001:db8::1]x/", "https://[2001:db8::1]:/", "https://[2001:db8::1]:0/", "https://[]/", "https://2001:db8::1/", "https://u@203.0.113.7/", "https://203.0.113.7:99999/"] {assert!(Url::pinned(text, URL_MAX, true, false).is_none(), "{text}")}
+		assert_eq!(Url::pinned("https://example.com/", URL_MAX, true, false).unwrap().literal(), None);
 	}
 
 	#[test]

@@ -347,6 +347,24 @@ print("link_offer", link_offer_code.decode())
 print("link_answer", link_answer_code.decode())
 print("link_hash", link_hash.hex())
 print("link_secret", expand(extract(b"veilway v1 link secret\0", link_shared), link_hash, 32).hex())
+# A pinned endpoint ("A pinned endpoint"): a link with a third field, the pin of the endpoint's own certificate, and documents that list it with a standby and that name pinned refresh entries (one with an address for its host, one for the link's own host and port).
+pin_active, pin_standby, pin_mirror, pin_next = (hashlib.sha256(name).digest() for name in (b"endpoint active", b"endpoint standby", b"endpoint mirror", b"endpoint next"))
+pinned_fragment = fragment + b"." + b64(pin_active)
+pinned_entries = [{"url": "https://203.0.113.7:8443/s", "pins": [key64(pin_mirror)]}, {"url": "https://[2001:db8::7]/s", "pins": [key64(pin_mirror), key64(pin_standby)]}, "https://mirror.example.net/s", {"url": "https://sub.example.com/other", "pins": [key64(pin_active)]}]
+subscription_seeds.update({
+    "fuzz_deeplink/native-pinned": b"veilway://sub/sub.example.com/s" + pinned_fragment,
+    "fuzz_deeplink/native-pinned-https": b"https://sub.example.com/s" + pinned_fragment,
+    "fuzz_deeplink/native-pinned-address": b"veilway://sub/203.0.113.7:8443/s" + pinned_fragment,
+    "fuzz_deeplink/native-pinned-ipv6": b"veilway://sub/[2001:db8::1]/s" + pinned_fragment,
+    "fuzz_subscription/pinned": b"\x00" + payload(8, [sub_pk1], private=True, endpoint_pins=[key64(pin_active), key64(pin_standby)], refresh_urls=pinned_entries),
+    "fuzz_subscription/refresh-with-pinned-link": b"\x08" + payload(2, [sub_pk1], at=issued + 60, endpoint_pins=[key64(pin_active), key64(pin_standby)], refresh_urls=pinned_entries),
+    "fuzz_subscription/switch-with-pinned-link": b"\x08" + payload(3, [sub_pk1], at=issued + 60, endpoint_pins=[key64(pin_active), key64(pin_next)]),
+    # For a client that holds the entries of `refresh-with-pinned-link` confirmed (settings 0x1c): one list keeps a pin of each, one names pins nobody held for the entry on the link's own host and port, one for a confirmed host.
+    "fuzz_subscription/refresh-confirmed-pinned": b"\x1c" + payload(3, [sub_pk1], at=issued + 60, endpoint_pins=[key64(pin_active), key64(pin_next)], refresh_urls=[{"url": "https://203.0.113.7:8443/s", "pins": [key64(pin_mirror), key64(pin_next)]}, {"url": "https://sub.example.com/other", "pins": [key64(pin_active), key64(pin_next)]}]),
+    "fuzz_subscription/refresh-link-entry-new-pin": b"\x1c" + payload(3, [sub_pk1], at=issued + 60, refresh_urls=[{"url": "https://sub.example.com/other", "pins": [key64(pin_next)]}]),
+    "fuzz_subscription/refresh-confirmed-new-pin": b"\x1c" + payload(3, [sub_pk1], at=issued + 60, refresh_urls=[{"url": "https://203.0.113.7:8443/s", "pins": [key64(pin_next)]}]),
+    "fuzz_subscription/list-for-unpinned-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, endpoint_pins=[key64(pin_active)]),
+})
 subscription_seeds.update({
     "fuzz_pairing/offer": b"\x00" + link_offer_code,
     "fuzz_pairing/offer-reverse": b"\x00" + code(b"vwlink1.", link_object.replace(b"\"forward\"", b"\"reverse\"").replace(b"\"fd00:9::2\"]", b"\"fd00:9::2\"],\"listener\":[\"10.9.0.3\",\"fd00:9::3\"]")),
