@@ -35,6 +35,8 @@ const OBFS: &str = "10.99.0.1:5001";
 const TLS: &str = "10.99.0.2:5002";
 const DEAD_TLS: &str = "10.99.0.3:5003";
 const SLOW_TLS: &str = "10.99.0.5:5005";
+/// How long a stop the node decided may take to reach the engine: the `bye` is a datagram that a loaded runner can lose, and then only the idle keepalive and the liveness limit show the cut-off (G57).
+const STOP: Duration = Duration::from_secs(60);
 const PLAIN: &str = "10.99.0.4:5004";
 const ID: &str = "test-subscription-0001";
 
@@ -542,7 +544,7 @@ async fn a_bye_stops_the_tunnel_until_its_reason_is_gone_and_counts_against_no_c
 	let mut events = run.tunnel.events();
 	// Disabled: the node says so before it cuts the device off.
 	net.reload(|doc| doc["users"][0]["enabled"] = json!(false)).await;
-	let status = run.until("the tunnel did not stop", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})).await;
+	let status = run.until("the tunnel did not stop", STOP, |status| matches!(status.state, State::Stopped {..})).await;
 	let State::Stopped {reason, retry: Retry::At(at)} = status.state else {panic!("{:?}", status.state)};
 	assert_eq!((reason, status.say), (Stop::Disabled, Some(Say::Disabled)));
 	assert!((time.secs() + 55..=time.secs() + 125).contains(&at), "tries again in {} s", at.saturating_sub(time.secs()));
@@ -583,7 +585,7 @@ async fn a_quota_that_is_used_up_waits_for_the_next_period_and_an_expired_accoun
 		PacketBuilder::ipv4(address(0), PUBLIC, 64).icmpv4_echo_request(9, seq).write(&mut out, &[0x5a; 1200]).unwrap();
 		run.tunnel.send(out);
 	}
-	let status = run.until("the tunnel did not stop for its quota", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})).await;
+	let status = run.until("the tunnel did not stop for its quota", STOP, |status| matches!(status.state, State::Stopped {..})).await;
 	// "When the next period starts, worked out from `period` and `period_start` of the last `usage`."
 	let usage = status.usage.expect("a last usage");
 	assert!(usage.used_bytes >= usage.quota_bytes && usage.period == veilway_proto::control::Period::Daily, "{usage:?}");
@@ -597,7 +599,7 @@ async fn a_quota_that_is_used_up_waits_for_the_next_period_and_an_expired_accoun
 	run.until("the channel did not open again", Duration::from_secs(20), |status| status.control).await;
 	// An account that expired: nothing but the user, or a refreshed subscription with a later expiry, brings the tunnel back.
 	net.reload(|doc| doc["users"][0]["expires_at"] = json!("2020-01-01T00:00:00Z")).await;
-	let status = run.until("the tunnel did not stop for its expiry", Duration::from_secs(10), |status| matches!(status.state, State::Stopped {..})).await;
+	let status = run.until("the tunnel did not stop for its expiry", STOP, |status| matches!(status.state, State::Stopped {..})).await;
 	assert_eq!(status.state, State::Stopped {reason: Stop::Expired, retry: Retry::Asked});
 	let attempts = status.counters.attempts;
 	tokio::time::sleep(Duration::from_secs(2)).await;
