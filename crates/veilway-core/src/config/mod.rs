@@ -19,6 +19,7 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::time::Duration;
 
 pub const VERSION: u64 = 1;
 pub const MAX_FILE_BYTES: u64 = 64 << 20;
@@ -193,9 +194,15 @@ pub fn load(path: &Path, shadow: bool) -> (Option<Config>, Report) {
 /// A path that is a link is followed first: the link stays and the file it names is replaced. The bytes hold keys and passwords.
 /// The temporary file has a name of this one write, so two writes never meet in it, and no file is ever removed that this write did not make: a name that is taken is an error. A write that is killed halfway leaves its temporary file behind.
 pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
-	let target = match fs::canonicalize(path) {
-		Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
-		target => target?,
+	// Windows refuses with "access denied" or a sharing violation for as long as another write of this file, a reader or a scanner holds it, so what it refuses is tried again for a moment.
+	let busy = |e: &io::Error, tries: u32| cfg!(windows) && tries < 200 && e.kind() == io::ErrorKind::PermissionDenied;
+	let mut tries = 0;
+	let target = loop {
+		match fs::canonicalize(path) {
+			Err(e) if e.kind() == io::ErrorKind::NotFound => break path.to_path_buf(),
+			Err(e) if busy(&e, tries) => {tries += 1; std::thread::sleep(Duration::from_millis(10))}
+			target => break target?,
+		}
 	};
 	let (mut name, mut tmp) = ([0u8; 8], target.clone().into_os_string());
 	SystemRandom::new().fill(&mut name).map_err(|_| io::Error::other("the system gave no random name for the temporary file"))?;
@@ -206,7 +213,16 @@ pub fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 	#[cfg(unix)]
 	std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
 	let mut file = options.open(&tmp)?;
-	let written = file.write_all(bytes).and_then(|_| file.sync_all()).and_then(|_| fs::rename(&tmp, &target));
+	let written = file.write_all(bytes).and_then(|_| file.sync_all()).and_then(|_| {
+		drop(file);
+		let mut tries = 0;
+		loop {
+			match fs::rename(&tmp, &target) {
+				Err(e) if busy(&e, tries) => {tries += 1; std::thread::sleep(Duration::from_millis(10))}
+				done => break done,
+			}
+		}
+	});
 	if written.is_err() {
 		let _ = fs::remove_file(&tmp);
 		return written;
