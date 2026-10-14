@@ -430,10 +430,10 @@ impl Device {
 
 	/// A new connection with the upgrade request for `path`, its proof made for `name` with the timestamp `at`. What the node answered up to the end of its head, or all of it when the connection closed first. On a `101` the session's keys are the device's from here on.
 	async fn open_as(&mut self, path: &str, name: Name, at: u64) -> String {
+		let proof = self.prover.prove(name, at, &mut random).unwrap();
 		let socket = TcpSocket::new_v4().unwrap();
 		socket.bind(SocketAddr::new(self.from, 0)).unwrap();
 		let mut io = self.connector.connect(ServerName::try_from("node.test").unwrap(), socket.connect(self.node).await.unwrap()).await.unwrap();
-		let proof = self.prover.prove(name, at, &mut random).unwrap();
 		io.write_all(&upgrade(path, &proof.token)).await.unwrap();
 		let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
 		let end = loop {
@@ -1248,8 +1248,9 @@ async fn an_origin_that_is_slow_closes_early_or_loops_back_harms_no_user() {
 	let closer = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let mut early = site().await;
 	early.addr = closer.local_addr().unwrap();
+	// The node decides at the origin's close, by spec, so an origin that closed within microseconds of accepting would race the request line on loopback and say nothing about real users. A web server that gives up early takes some milliseconds.
 	tokio::spawn(async move {
-		while let Ok((stream, _)) = closer.accept().await {drop(stream)}
+		while let Ok((stream, _)) = closer.accept().await {tokio::spawn(async move {tokio::time::sleep(Duration::from_millis(50)).await; drop(stream)});}
 	});
 	let early = launch_at("early", time, early, |_| {}).await;
 	assert_eq!(early.ask(b"GET / HTTP/1.1\r\nHost: node.test\r\n\r\n").await, (String::new(), true));
