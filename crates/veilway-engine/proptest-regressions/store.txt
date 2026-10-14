@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc adf39f61d31299eeaef26e4270df90de638e604987324af34d5bede8bb0f945d # shrinks to saved = Saved { seed: 0, profiles: {"_aAaaa-0aa0aA00A/_": Kept { standing: Standing { profile: 0, refusals: 0, rows: [], losses: 0, opened: None, short: 0, unanswered: false, consent: [], offset: None, bare: false }, networks: [("aa0000a0a000a0aa", Network { profile: 0, worked: None, aside: [], tried: [], silent: None }), ("0aa0aa00aaa0a0a0", Network { profile: 0, worked: None, aside: [], tried: [], silent: None })], mtus: [], declined: [], stream_first: None }} }

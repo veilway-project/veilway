@@ -1534,6 +1534,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "veilway-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "boringtun",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "veilway-proto",
+ "veilway-transport",
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
 name = "veilway-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -1543,6 +1562,7 @@ dependencies = [
  "time",
  "tokio",
  "veilway-core",
+ "veilway-engine",
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",

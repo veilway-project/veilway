@@ -46,6 +46,8 @@ libc.workspace=true
 rustix.workspace=true
 
 [dev-dependencies]
+# The client engine runs against the node in tests/engine.rs.
+veilway-engine={path="../veilway-engine", features=["testing", "unencrypted-vault"]}
 # The crate's own tests are built with the listener over pipes in memory.
 veilway-core={path=".", features=["bench"]}
 boringtun.workspace=true

@@ -145,8 +145,11 @@ impl Machine {
 	pub fn deadline(&self) -> Instant {[self.held.as_ref().map(|held| held.at), self.attempt.as_ref().map(|attempt| retry(attempt).unwrap_or(attempt.started + ATTEMPT)), self.awaiting, self.live.as_ref().filter(|_| self.attempt.is_none() && self.held.is_none()).map(|_| self.idle)].into_iter().flatten().min().unwrap_or(self.idle + ATTEMPT)}
 }
 
+/// Whether this system can prohibit fragmentation of what a datagram socket sends. Where it cannot, `bound` says so in the log, and a caller that probes the path's MTU has no use for the probes: they would be fragmented, not lost.
+pub const DONT_FRAGMENT: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
 // A socket for one node, with fragmentation of what it sends prohibited where the system has the option. The caller's hook has the socket before it is connected. Every failure here is the device's: no socket, no address, no route, or a hook that said no.
-async fn bound(to: SocketAddr, hook: &Option<Hook>) -> std::io::Result<UdpSocket> {
+pub async fn bound(to: SocketAddr, hook: &Option<Hook>) -> std::io::Result<UdpSocket> {
 	let socket = if to.is_ipv4() {UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?} else {UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).await?};
 	if let Some(hook) = hook {hook(SockRef::from(&socket))?}
 	// A connected socket takes datagrams from the node's address and port alone.
@@ -219,10 +222,23 @@ pub(crate) async fn run(port: &mut Port, link: &Link, to: SocketAddr) -> Ended {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::sync::Arc;
 	use veilway_proto::subscription::payload::Padding as Bounds;
 	use veilway_proto::subscription::Secret;
 
 	const TIME: u64 = 1_700_000_000;
+
+	// "No outer fragmentation": the socket of plain `udp` and of `udp-obfs` alike is made here, and the system is told to probe the path and never to fragment.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	#[tokio::test]
+	async fn the_socket_of_a_datagram_transport_is_made_with_fragmentation_prohibited() {
+		let socket = bound("127.0.0.1:9".parse().unwrap(), &None).await.unwrap();
+		assert_eq!(sockopt::ip_mtu_discover(&socket).unwrap(), sockopt::Ipv4PathMtuDiscovery::PROBE);
+		assert!(DONT_FRAGMENT);
+		// The caller's hook has the socket before it is connected, and a hook that says no is a device that cannot dial.
+		let refused: Hook = Arc::new(|_| Err(std::io::Error::other("no")));
+		assert!(bound("127.0.0.1:9".parse().unwrap(), &Some(refused)).await.is_err());
+	}
 
 	fn link() -> Link {Link {inbound: [1; 32], device: [2; 32], secret: Secret::new([3; 32]), node: None, mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}}
 

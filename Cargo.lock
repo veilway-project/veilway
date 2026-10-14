@@ -2009,11 +2009,32 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "veilway-core",
+ "veilway-engine",
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",
  "webpki-roots 1.0.9",
  "x509-parser",
+]
+
+[[package]]
+name = "veilway-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "boringtun",
+ "proptest",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "veilway-proto",
+ "veilway-transport",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]

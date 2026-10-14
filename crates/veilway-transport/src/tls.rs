@@ -59,6 +59,16 @@ impl ServerCertVerifier for Alone {
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {self.algorithms.supported_schemes()}
 }
 
+/// The TLS config of an endpoint that is held to its pins alone: the check of a self-signed candidate, for the subscription page's "A pinned endpoint". TLS 1.3 only, the pin and the handshake's signature under the pinned key, no chain, no name and no date, no early data and no resumed session, so that every fetch shows its certificate. `sni` says whether a server name is sent: a host name is, an IP literal is not.
+pub fn pin_only(pins: &[[u8; 32]], sni: bool) -> Result<ClientConfig, rustls::Error> {
+	if pins.is_empty() {return Err(UNPINNED)}
+	let provider = Arc::new(default_provider());
+	let algorithms = provider.signature_verification_algorithms;
+	let mut config = ClientConfig::builder_with_provider(provider).with_protocol_versions(&[&TLS13])?.dangerous().with_custom_certificate_verifier(Arc::new(Alone {pins: pins.to_vec(), algorithms})).with_no_client_auth();
+	(config.enable_sni, config.enable_early_data, config.resumption, config.alpn_protocols) = (sni, false, rustls::client::Resumption::disabled(), vec![b"http/1.1".to_vec()]);
+	Ok(config)
+}
+
 /// The name a candidate's certificate must be valid for: its `sni`, or its `verify_name` when no server name is sent. A host name, and never an address.
 /// A self-signed candidate is held to no name. One without a `sni` is given the address it dials, because the library connects to a name: an address is never sent as a server name, and the check of such a candidate does not read it.
 pub(crate) fn name(candidate: &Front) -> Result<ServerName<'static>, Refuse> {

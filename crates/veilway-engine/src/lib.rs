@@ -1,0 +1,225 @@
+//! The platform-free core of the client engine (protocol pages: transports, control channel, subscription format).
+//!
+//! A `Tunnel` takes an accepted subscription and one of its profiles and runs one tunnel to a node: it chooses candidates and races two of them as the client rules say, opens a transport session, runs WireGuard over it, and exposes the tunnel as a packet interface, whole IP packets in and whole IP packets out, for a platform layer to connect to a TUN device. Over the tunnel it runs the device's side of the control channel: exits and their selection, usage, notices, `bye` and MTU discovery. `import` is the flow that brings a subscription in: a link, the user's yes, the fetch, the confirmation and the storing.
+//!
+//! What is not here: any operating system layer. There is no TUN device, no route, no DNS change and no kill switch. The platform keeps the kill switch in force around this engine ("between attempts nothing leaves the device but the transport's own connection"), and every socket the engine opens is handed to the `Settings::socket` hook before it is connected, so that the platform can let exactly those through. A pinned subscription endpoint is checked by its pins alone, see `import`. The platform also supplies the `import::Vault` that keeps the subscriptions' secrets (the engine ships no vault that is safe to use), and the list of the device's own networks.
+//!
+//! What an app gets (`Status`) has no rating or class word in it. A candidate being tried is given by its place in the signed profile and nothing else, and the reasons for what went wrong are `Say`, plain words with a stable code.
+#![forbid(unsafe_code)]
+// The `testing` and `unencrypted-vault` features are for tests: the first lets a wait be skipped and a dial be re-pointed after its checks, the second keeps the subscriptions' secrets in a plain file. A build without debug assertions has neither, unless it is a fuzz build or says in so many words (`--cfg veilway_release_tests`) that it is a test run.
+#[cfg(all(any(feature = "testing", feature = "unencrypted-vault"), not(debug_assertions), not(test), not(fuzzing), not(veilway_release_tests)))]
+compile_error!("the `testing` and `unencrypted-vault` features of veilway-engine are for tests and are not allowed in a release build");
+
+mod carry;
+mod channel;
+/// The reader of what a node sends after the opening, for the fuzz targets.
+#[cfg(feature = "fuzz")]
+pub use channel::{Event as ChannelEvent, Reader};
+mod engine;
+pub mod import;
+/// Public with the `fuzz` feature, for the fuzz targets that feed it bytes.
+#[cfg(feature = "fuzz")]
+pub mod ip;
+#[cfg(not(feature = "fuzz"))]
+mod ip;
+mod mtu;
+pub mod status;
+pub mod store;
+#[cfg(feature = "fuzz")]
+pub mod tcp;
+#[cfg(not(feature = "fuzz"))]
+mod tcp;
+mod wire;
+
+use engine::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, watch};
+use tokio::task::JoinHandle;
+use veilway_proto::subscription::client::{Held, Permit};
+use veilway_proto::subscription::payload::{Network, RatingCap, Transport, Usage};
+use veilway_proto::subscription::Tag;
+use veilway_proto::NoRandom;
+use veilway_transport::choice;
+use veilway_transport::{Hook, Link};
+
+pub use status::{Attempt, Counters, Event, ExitView, NoticeView, Retry, Say, State, Status, Stop, UsageView};
+pub use store::Store;
+pub use veilway_transport::choice::Class;
+pub use veilway_transport::Clock;
+
+/// The system's secure random source, as `veilway-proto` takes one.
+pub(crate) fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), bytes).map_err(|_| NoRandom)}
+
+use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+
+/// How a wait is made. A test hands in its own to run the client's waits, which are seconds and minutes long, against a clock it moves itself. Only with the `testing` feature: a wait that returns at once removes every backoff of the client rules, and no build that ships has the field.
+pub type Pause = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Where an address of a profile is really dialled. A profile cannot name a loopback address, so a test that runs a node on one says so here. Only with the `testing` feature, since it re-points a dial after the checks of the address were made; nothing a profile, a node or a subscription says can set it.
+pub type Redirect = Arc<dyn Fn(SocketAddr) -> SocketAddr + Send + Sync>;
+
+/// What a tunnel is given by the platform and the app, once. Made with `new` and changed as its fields are.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct Settings {
+	/// What the client remembers between runs.
+	pub store: Arc<Store>,
+	/// The device's clock in Unix seconds, as it is.
+	pub clock: Clock,
+	/// The certificates a TLS chain must lead to: the platform's, or `webpki_roots`' through `roots`.
+	pub roots: Arc<rustls::RootCertStore>,
+	/// What is done to every socket after it is made and before it is connected: keep it out of the tunnel, bind it to an interface, mark it for the firewall. A failure ends the attempt and nothing is dialled.
+	pub socket: Option<Hook>,
+	/// The device's own networks at the start, the addresses it holds on interfaces that are not a tunnel and the default gateway. "Skipped at each connect: an address inside one of the device's own networks." `Tunnel::moved` gives the list again at every change of network.
+	pub networks: Vec<Network>,
+	/// A description of the network the device is on, "what the system exposes": interface type, gateway address, wireless network name or operator code. It is kept only as a hash.
+	pub network: String,
+	/// The languages of the app, in order of preference, for the texts a signed profile has in several.
+	pub languages: Vec<Tag>,
+	// The hooks of the tests. The field is in every build, so that `Settings` is the same struct in all of them; it can be set only with the `testing` feature.
+	hooks: Hooks,
+}
+
+#[derive(Clone, Default)]
+struct Hooks {pause: Option<Pause>, redirect: Option<Redirect>}
+
+impl Settings {
+	/// The settings of a tunnel with the three things every platform has: where the client remembers things, the device's clock and the roots. The rest starts empty and is set as the fields are: the hook for the sockets, the device's own networks, the app's languages.
+	pub fn new(store: Arc<Store>, clock: Clock, roots: Arc<rustls::RootCertStore>, network: String) -> Self {Self {store, clock, roots, socket: None, networks: Vec::new(), network, languages: Vec::new(), hooks: Hooks::default()}}
+	/// Makes the waits of the client rules with `pause` and not with the runtime's sleep. Only with the `testing` feature.
+	#[cfg(feature = "testing")]
+	pub fn with_pause(mut self, pause: Pause) -> Self {
+		self.hooks.pause = Some(pause);
+		self
+	}
+	/// Re-points every dial after the checks of its address. Only with the `testing` feature.
+	#[cfg(feature = "testing")]
+	pub fn with_redirect(mut self, redirect: Redirect) -> Self {
+		self.hooks.redirect = Some(redirect);
+		self
+	}
+}
+
+/// The roots of the Mozilla list, for a platform that has none of its own.
+pub fn default_roots() -> Arc<rustls::RootCertStore> {Arc::new(rustls::RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()})}
+
+/// What the user said yes to for this start. Each is asked of the user first, and a start without it does not happen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Agree {
+	/// "This profile connects to a private address", once per profile.
+	pub private: bool,
+	/// The plain warning for an Unsafe profile was shown and the user tapped once.
+	pub unsafe_profile: bool,
+}
+
+/// Why a tunnel was not started. Nothing was sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartError {
+	/// The subscription has no profile of that id.
+	NoProfile,
+	/// The permit was given for another subscription.
+	Permit,
+	/// The profile has no transport secret or no device key this build can use.
+	NoKey,
+	/// The profile is Unsafe. The app shows its plain warning and starts again with `Agree::unsafe_profile`.
+	Unsafe,
+	/// The profile names a private address. The app asks, and starts again with `Agree::private`.
+	Private,
+	/// The classes of way of connecting the user was not yet asked about. The app asks in plain words (`ask_text`), stores the answer with `Store::agree` or `Store::decline`, and starts again.
+	Ask(Vec<Class>),
+	/// Nothing the profile lists can be used: no transport this build can open, or none the user agreed to.
+	Nothing,
+}
+
+impl std::fmt::Display for StartError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "tunnel not started: {self:?}")}
+}
+
+impl std::error::Error for StartError {}
+
+/// The question to put to the user for a class, "in plain words". It names no class and no rating.
+pub fn ask_text(class: Class) -> &'static str {
+	match class {
+		Class::Cover => "Use the connection that looks like ordinary web traffic?",
+		Class::NoCover => "On some networks the only way through may be one that does not look like web traffic. Someone watching the network can tell that something unusual is going on, though not what. Allow it for this connection?",
+		Class::Exposed => "On some networks the only way through may be one that is easy to recognise. Someone watching the network can tell that you are using a tunnel. Allow it for this connection?",
+		Class::Plain => "On some networks the only way through may be a plain tunnel that is easy to recognise as a VPN. Someone watching the network can tell that you are using one. Allow it for this connection?",
+	}
+}
+
+/// One tunnel. Dropping it stops it; `stop` waits for the session to be closed first.
+pub struct Tunnel {
+	commands: mpsc::UnboundedSender<Command>,
+	status: watch::Receiver<Status>,
+	events: broadcast::Sender<Event>,
+	into: mpsc::Sender<Vec<u8>>,
+	out: mpsc::Receiver<Vec<u8>>,
+	refused: Arc<AtomicU64>,
+	task: JoinHandle<()>,
+}
+
+impl Tunnel {
+	/// Starts a tunnel for a profile of an accepted subscription. `permit` is the answer of `Held::connect`, which asks for the user's confirmation when the document is long out of date. Called inside a tokio runtime. It returns at once: `status` says how it goes.
+	pub fn start(settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree) -> Result<Self, StartError> {
+		let subscription = held.subscription();
+		if permit.id() != held.id() {return Err(StartError::Permit)}
+		let profile = subscription.profiles.iter().find(|candidate| candidate.id == profile).ok_or(StartError::NoProfile)?;
+		let key = profile.device.private_key.clone().or_else(|| held.device().map(|device| device.private().clone())).ok_or(StartError::NoKey)?;
+		let link = Link::of(profile).ok_or(StartError::NoKey)?;
+		if profile.rating_cap == Some(RatingCap::Unsafe) && !agree.unsafe_profile {return Err(StartError::Unsafe)}
+		if !agree.private && profile.transports.iter().any(|transport| addresses(transport).iter().any(|address| address.private())) {return Err(StartError::Private)}
+		let (store_key, now) = (store::profile_key(held.id().as_str(), &profile.id), (settings.clock)());
+		let kept = settings.store.kept(&store_key);
+		let plan = choice::plan(&profile.transports, kept.stream_first.unwrap_or(profile.stream_first), &kept.network(&store::network_key(settings.store.seed(), &settings.network)), &kept.standing, now);
+		let ask: Vec<Class> = plan.ask.into_iter().filter(|class| !kept.declined.contains(class)).collect();
+		if !ask.is_empty() {return Err(StartError::Ask(ask))}
+		if plan.order.is_empty() {return Err(StartError::Nothing)}
+		let (commands, input) = mpsc::unbounded_channel();
+		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
+		let (status_tx, status) = watch::channel(Status::off(profile.name.as_str().to_owned(), profile.mtu));
+		let core = engine::Core::new(engine::Parts {settings, profile: profile.clone(), subscription: Arc::new(subscription.clone()), link, key, store_key, kept, commands: input, from_platform: from, to_platform: to, status: status_tx, events: events.clone(), refused: refused.clone()});
+		Ok(Self {commands, status, events, into, out, refused, task: tokio::spawn(core.run())})
+	}
+	/// The state of the tunnel and everything an app shows of it.
+	pub fn status(&self) -> Status {self.status.borrow().clone()}
+	/// The status as something to wait on: it changes at every state change and about once a second while the counters move.
+	pub fn watch(&self) -> watch::Receiver<Status> {self.status.clone()}
+	/// Things that happen once.
+	pub fn events(&self) -> broadcast::Receiver<Event> {self.events.subscribe()}
+	/// Hands one IP packet from the device to the tunnel. False when it was dropped because the queue is full. Packets handed in while no session is open are dropped and counted: the kill switch is the platform's, and nothing leaves the device outside the tunnel.
+	pub fn send(&self, packet: Vec<u8>) -> bool {
+		let queued = self.into.try_send(packet).is_ok();
+		if !queued {self.refused.fetch_add(1, Ordering::Relaxed);}
+		queued
+	}
+	/// The next IP packet out of the tunnel for the device, or None when the tunnel has stopped.
+	pub async fn recv(&mut self) -> Option<Vec<u8>> {self.out.recv().await}
+	/// Asks the node for this exit, or for none. Applied once the control channel is open, and a node that refuses is told in `Event::Exit`.
+	pub fn select_exit(&self, tag: Option<String>) {let _ = self.commands.send(Command::Exit(tag));}
+	/// "The user asks to connect again": every mark, count and wait starts over, and a stop by the node that waits is ended. The hour's budget of new addresses and the user's answers stay.
+	pub fn connect_again(&self) {let _ = self.commands.send(Command::Again);}
+	/// The device's network changed. `network` describes the new one, as `Settings::network` does, and `networks` are its own networks as they are now, as `Settings::networks` has them: a candidate inside them is not dialled from here on, and a session to one is ended.
+	pub fn moved(&self, network: String, networks: Vec<Network>) {let _ = self.commands.send(Command::Moved(network, networks));}
+	/// The system reported that a packet was too big for the path: the MTU is confirmed again at once. What the report says of a size is never used.
+	pub fn reprobe(&self) {let _ = self.commands.send(Command::Reprobe);}
+	/// A refreshed subscription brought new numbers. A stop for a used-up quota or an expired account ends when they show the cause is gone.
+	pub fn refreshed(&self, usage: Option<Usage>) {let _ = self.commands.send(Command::Refreshed(usage));}
+	/// Hands the tunnel a message as if the node had sent it over the control channel, to see what the engine does with one it should not believe. Only with the `testing` feature.
+	#[cfg(feature = "testing")]
+	pub fn inject(&self, message: veilway_proto::control::NodeMessage) {let _ = self.commands.send(Command::Inject(message));}
+	/// Stops the tunnel, closing its session the way its transport closes one, and gives the last status.
+	pub async fn stop(self) -> Status {
+		let _ = self.commands.send(Command::Stop);
+		let _ = self.task.await;
+		self.status.borrow().clone()
+	}
+}
+
+// The dial addresses a transport of a profile lists.
+fn addresses(transport: &Transport) -> Vec<veilway_proto::subscription::payload::Dial> {
+	match transport {
+		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
+		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+	}
+}
