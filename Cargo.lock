@@ -1927,9 +1927,11 @@ dependencies = [
  "boringtun",
  "clap",
  "etherparse",
+ "ipnet",
  "libc",
  "rcgen",
  "ring",
+ "rustix",
  "serde_json",
  "time",
  "tokio",
@@ -1937,6 +1939,8 @@ dependencies = [
  "tracing-subscriber",
  "veilway-api",
  "veilway-core",
+ "veilway-engine",
+ "veilway-linux",
  "veilway-proto",
  "veilway-wg",
  "x509-parser",
@@ -2040,6 +2044,28 @@ dependencies = [
 [[package]]
 name = "veilway-ffi"
 version = "0.1.0"
+
+[[package]]
+name = "veilway-linux"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "ipnet",
+ "libc",
+ "rcgen",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "socket2",
+ "tokio",
+ "tracing",
+ "veilway-engine",
+ "veilway-proto",
+ "veilway-transport",
+ "veilway-wg",
+]
 
 [[package]]
 name = "veilway-proto"

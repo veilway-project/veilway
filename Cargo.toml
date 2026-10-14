@@ -1,6 +1,6 @@
 [workspace]
 resolver="2"
-members=["crates/veilway-wg", "crates/veilway-proto", "crates/veilway-transport", "crates/veilway-engine", "crates/veilway-core", "crates/veilway-api", "crates/veilway-xray", "crates/veilway-client", "crates/veilway-ffi", "crates/veilway"]
+members=["crates/veilway-wg", "crates/veilway-proto", "crates/veilway-transport", "crates/veilway-engine", "crates/veilway-linux", "crates/veilway-core", "crates/veilway-api", "crates/veilway-xray", "crates/veilway-client", "crates/veilway-ffi", "crates/veilway"]
 exclude=["apps/desktop/src-tauri", "fuzz"]
 
 [workspace.package]

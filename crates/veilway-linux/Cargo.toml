@@ -1,0 +1,32 @@
+[package]
+name="veilway-linux"
+version.workspace=true
+edition.workspace=true
+license.workspace=true
+repository.workspace=true
+publish.workspace=true
+
+[dependencies]
+veilway-engine={path="../veilway-engine"}
+veilway-proto={path="../veilway-proto"}
+veilway-transport={path="../veilway-transport"}
+tokio.workspace=true
+tracing.workspace=true
+anyhow.workspace=true
+serde.workspace=true
+serde_json.workspace=true
+ipnet.workspace=true
+# Raw ioctl for the TUN device and the kernel keyring's system calls: the only `unsafe` in the platform layer, each with its reason.
+libc.workspace=true
+# Netlink sockets, the lock on the run directory and signals to the running client, all in safe code.
+rustix={workspace=true, features=["fs", "process"]}
+# `set_mark` is the socket option the kill switch and the policy routing key on, behind the `all` feature.
+socket2={workspace=true, features=["all"]}
+# The AEAD of the vault file, and the random bytes of its key.
+ring.workspace=true
+
+[dev-dependencies]
+# The gate's setup tool (examples/gate_setup.rs) makes a node's config and a signed subscription for it.
+veilway-wg={path="../veilway-wg"}
+rcgen.workspace=true
+base64.workspace=true
