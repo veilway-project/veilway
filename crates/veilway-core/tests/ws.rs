@@ -107,6 +107,8 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 		("another method", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("a head request and one behind it", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /after HTTP/1.1\r\nHost: node.test\r\n\r\n")], late),
 		("a body", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")], late),
+		// On Windows the origin drops this connection with a reset, which throws its answer away, so the origin itself has no answer to compare with.
+		#[cfg(not(windows))]
 		("a body that comes in pieces", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 10\r\n\r\nhel"), Step::Wait(300), send("lo the"), Step::Wait(300), send("r")], late),
 		("a body that never comes whole", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 10\r\n\r\nhel")], last),
 		("an older version", vec![send("GET / HTTP/1.0\r\n\r\n")], late),
