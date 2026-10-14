@@ -508,13 +508,13 @@ Every row needs a `cargo-fuzz` target that lands in the same change as the parse
 | 21 | Legacy subscription headers | Network | `veilway-proto` | `fuzz_sub_headers` | Planned |
 | 22 | Subscription link in both forms, the `veilway://` deep link and a whole document in a link or a file, checked against an exact grammar before anything else | Any web page or app, clipboard, QR code, file | `veilway-proto` | `fuzz_deeplink` | Planned |
 | 23 | QR payload | Camera, image | Decoder library, then rows 19, 20, 22 | covered by 19, 20, 22 | Planned |
-| 24 | Theme file | Anyone | `packages/ui` validator and its Rust twin | `fuzz_theme` | Planned |
+| 24 | Theme file | Anyone | `veilway-ui` `packages/ui` validator and its Rust twin | `fuzz_theme` | Planned |
 | 25 | Provider cards | Provider | `veilway-proto` | `fuzz_cards` | Planned |
 | 26 | Provider logo image | Provider | Image decode and re-encode | `fuzz_card_logo` | Planned |
 | 27 | `.mmdb` | Download | GeoIP reader | `fuzz_mmdb` | Planned |
 | 28 | `geoip.dat`, `geosite.dat` | Download | Geo data reader | `fuzz_geodat` | Planned |
 | 29 | Rule set file | Community | Router | `fuzz_ruleset` | Planned |
-| 30 | Locale pack | Community | `packages/i18n` loader | `fuzz_locale` | Planned |
+| 30 | Locale pack | Community | `veilway-ui` `packages/i18n` loader | `fuzz_locale` | Planned |
 | 31 | Add-on archive and hash list | Download | `veilway-xray` | `fuzz_addon_archive` | Planned |
 | 32 | Sidecar stats output | Local process | `veilway-xray` | `fuzz_xray_stats` | Planned |
 | 33 | Control API request bodies | Panel, third-party tools | `veilway-api` | `fuzz_api_request` | Planned |

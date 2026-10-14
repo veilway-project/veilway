@@ -4,7 +4,7 @@
 
 Update this block at the end of every work session.
 
-- Active phase: 2, step 4 next (steps 1 to 3 are done). Phase 3, the design system in `packages/ui` and `packages/i18n`, was built ahead of order and its gate passes: the gallery was reviewed in dark and light, English and Persian, and the look approved, the contrast checks pass, and a hostile theme file is rejected. Blur cost in Android WebView is not measured yet. Phase 1 is finished and its gate passes. Phase 1 history: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
+- Active phase: 2, step 4 next (steps 1 to 3 are done). Phase 3, the design system (now in the `veilway-ui` repository), was built ahead of order and its gate passes: the gallery was reviewed in dark and light, English and Persian, and the look approved, the contrast checks pass, and a hostile theme file is rejected. Blur cost in Android WebView is not measured yet. Phase 1 is finished and its gate passes. Phase 1 history: step 1 (config v1, reload store, parser fuzz target) and step 2a: the engine runs on config v1 with one WireGuard tunnel per inbound (`udp` and `ws` transports), the ingress checks, routing rules without `domain`, the flow table with per-user and per-device shares, entitlement, `netstack` exits (direct and socks5), `block` exits, delivery between users, ping answered by the node, and counters per user, inbound and exit. The old single-tunnel config is gone.
 - Step 2b is done too: every tunnel DNS query is answered by the node's own resolver (UDP and TCP port 53, servers tried in order, REFUSED when the rules refuse), names are remembered per user, and `domain` rules match on them. Fuzz targets: `config`, `packet`, `dns`.
 - Step 2c is done too: rejected traffic gets the matching ICMP error, every `unsupported` policy of a `netstack` exit works (`local`, `reject`, `drop`, `direct`, `via`), and the `l3` exit runs on Linux (one TUN device, kernel forwarding and source NAT through `ip` and `nft`, return traffic only for live flows). Only one `l3` exit per node for now.
 - Step 2d is done too: `veilway run` reloads its config on SIGHUP (`Engine::reload`), a refused or failing file leaves the running config in force, every live flow is decided again under the new config, and a user who is disabled, removed or expired (or a device that is removed or re-keyed) loses sessions, flows and DNS memory within a second. `THREAT_MODEL.md` now describes the engine as built.
@@ -22,7 +22,8 @@ Update this block at the end of every work session.
 - Node links are built (step 3 is finished): pairing codes, fingerprints and the link secret in `veilway-proto` (`pairing.rs`), `links[]` and the `chain` backend in the config, forward and reverse links on both nodes (`engine/chain.rs` for the entry's translation, `engine/link.rs` for the dialler and link state), `GET /v1/links`, `doctor` checks and `veilway link offer|answer`. Two code reviews, all findings built. Open: threat model gap G56, the catalogue's `linked` mark, the panel's pairing screens.
 - Last finished step: Phase 2, step 3. Of step 4: the subscription reader and the transport library
 - The proxy path has had one adversarial review and its findings are built: nothing the origin says or does between two requests reaches the proxy, nothing behind a complete answer does, a long head still names its visitor, a `fronted` session keeps a digest of its last request and not the request, and `probe_start` is answered on `udp` and `udp-obfs` alone. `sh scripts/gate-front.sh` holds the path against nginx in front and nginx and HAProxy behind, in Docker, and passes. It is run by hand.
-- Next action: self-signed certificates for `tls` (see "Self-signed certificates"), the approved new look in `packages/ui`, then Phase 2 step 4: the client engine around the transport library, with the client's side of the control channel and the tests G39 names.
+- The second look is in `veilway-ui`, and `veilway-ui` was split out of this repository ahead of the Phase 2 gate, with its history, because nothing in flight touched it.
+- Next action: self-signed certificates for `tls` (see "Self-signed certificates"), then Phase 2 step 4: the client engine around the transport library, with the client's side of the control channel and the tests G39 names.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
 
@@ -152,13 +153,13 @@ The tree above is one repository today. It is split along the lines of what ship
 | Repository | Holds | Depends on |
 |---|---|---|
 | `veilway` | The core: every crate, the `veilway` binary, the control API with its OpenAPI document and the generated TypeScript client, the fuzz targets, the plan and the threat model | Nothing of the others |
-| `veilway-ui` | `packages/ui` and `packages/i18n`: the design system and the locale packs | Nothing of the others |
+| `veilway-ui` | `packages/ui` and `packages/i18n`: the design system and the locale packs. Split out already | Nothing of the others |
 | `veilway-panel` | The panel server and its web app. It starts life in its own repository in Phase 4 | The core's client and API by a pinned version, `veilway-ui` by a pinned version |
 | `veilway-desktop` | `apps/desktop` | The core's client and protocol crates by a pinned tag, `veilway-ui` by a pinned version |
 | `veilway-android` | The Android app, from Phase 7 | The same |
 | `veilway-docs`, `.github` | As today | |
 
-Rules for the split: it happens at a phase gate with no work in flight, never in the middle of a phase; each part keeps its history (the files are moved with their commits, not copied); every repository carries the licence, the notice, the contributor agreement and the same identity and push rules; a dependency between repositories is always a pinned tag or version, never a branch; and a change that crosses repositories lands in the core first, is tagged, and is then taken up by the others. The first split is `veilway-ui` and `veilway-desktop` out of `veilway`, at the Phase 2 gate. Until then everything stays where it is.
+Rules for the split: it happens at a phase gate with no work in flight, never in the middle of a phase; each part keeps its history (the files are moved with their commits, not copied); every repository carries the licence, the notice, the contributor agreement and the same identity and push rules; a dependency between repositories is always a pinned tag or version, never a branch; and a change that crosses repositories lands in the core first, is tagged, and is then taken up by the others. `veilway-ui` was split out first, early, since nothing in flight touched it. `veilway-desktop` follows at the Phase 2 gate. Until then everything else stays where it is.
 
 ## Core design
 
@@ -345,7 +346,7 @@ Load the `frontend-preferences` skill before any UI work. Where it conflicts wit
 - **Material**: liquid glass. Translucent layered surfaces with backdrop blur and saturation, a thin specular edge, soft depth. Content stays readable because every glass surface carries a tint scrim that guarantees AA contrast.
 - **Fallbacks**: solid surfaces when the OS asks for reduced transparency, on low-end devices, and as a user setting. Blur is expensive in Android WebView; measure it.
 - **Shape**: small consistent radius. No pill shapes anywhere, no uppercase eyebrow labels, no emoji.
-- **Tokens**: CSS variables in `packages/ui`, shared by panel, desktop and Android. Themes only change tokens.
+- **Tokens**: CSS variables in `veilway-ui` (`packages/ui`), shared by panel, desktop and Android. Themes only change tokens.
 - **RTL**: CSS logical properties everywhere, mirrored icons where direction matters, Vazirmatn for Persian, optional Persian digits and Jalali dates.
 - **Ecosystem feel**: the same navigation model, components, motion and wording in panel and clients. A user who knows one knows the other.
 - **Stack**: React, TypeScript, Vite, accessible unstyled primitives (Radix or equivalent), an i18n library with ICU plurals, a small charting library for live stats. Confirm current versions with context7.
