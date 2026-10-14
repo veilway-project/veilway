@@ -1,13 +1,13 @@
 # Veilway name and logo
 
-The code in this repository is open source under the Apache License 2.0. The name is not part of that grant: section 6 of the licence gives no right to use the project's names or logos. This page says what you may do with them.
+The code in this repository is open source under the Apache License 2.0. The name is not part of that grant: section 6 of the license gives no right to use the project's names or logos. This page says what you may do with them.
 
 "The marks" below means the name "Veilway", the Veilway logo and icons, and any name or logo close enough to be confused with them. They belong to the Veilway project owner, whether or not they are registered where you live.
 
 ## What you may do without asking
 
 - Use the name to refer to the project truthfully: "works with Veilway", "a Veilway server", "a guide to setting up Veilway".
-- Distribute builds made from unmodified source of an official release under the name Veilway, with the original logo. This covers packaging for an operating system or distribution, including the small changes packaging needs (install paths, build flags, service files), as long as behaviour stays the same.
+- Distribute builds made from unmodified source of an official release under the name Veilway, with the original logo. This covers packaging for an operating system or distribution, including the small changes packaging needs (install paths, build flags, service files), as long as behavior stays the same.
 - Say that your project is "based on Veilway" or "a fork of Veilway", in plain text, when that is true.
 - Write articles, tutorials, talks and reviews about Veilway and show screenshots of it.
 - Keep a fork under the same repository name for the purpose of contributing back, as long as you do not publish releases or builds from it under the Veilway name.
@@ -19,7 +19,7 @@ If you change the code beyond packaging and give the result to other people, it 
 - Give it a different name. Not "Veilway Plus", "Veilway Pro", "OpenVeilway" or anything else that contains the name or sounds like it.
 - Give it a different logo and icon.
 - Change the identifiers a user or an operating system would see as Veilway: application name, bundle identifier, update endpoint.
-- Keep the credit. The licence requires the copyright notices, the `LICENSE` file and the `NOTICE` file to stay with the code and with what you distribute. "Based on Veilway" in your README or about screen is welcome.
+- Keep the credit. The license requires the copyright notices, the `LICENSE` file and the `NOTICE` file to stay with the code and with what you distribute. "Based on Veilway" in your README or about screen is welcome.
 
 ## What nobody may do
 
@@ -34,6 +34,6 @@ People use this software on networks where a tampered build can put them in dang
 
 ## Asking for permission
 
-For anything this page does not cover, open a thread in [GitHub Discussions](https://github.com/veilway-project/veilway/discussions) and describe what you want to do. Permission is only valid when it is given in writing by the Veilway project owner: the person or legal entity that controls the Veilway project and holds the `veilway-project` GitHub organisation (a single party, however many accounts hold the organisation's Owner role), and any successor that party names in a signed, public transfer notice in the repository. Holding an Owner role or gaining access to the organisation does not by itself make anyone the project owner.
+For anything this page does not cover, open a thread in [GitHub Discussions](https://github.com/veilway-project/veilway/discussions) and describe what you want to do. Permission is only valid when it is given in writing by the Veilway project owner: the person or legal entity that controls the Veilway project and holds the `veilway-project` GitHub organization (a single party, however many accounts hold the organization's Owner role), and any successor that party names in a signed, public transfer notice in the repository. Holding an Owner role or gaining access to the organization does not by itself make anyone the project owner.
 
 If you see the name being misused, report it the same way. If the misuse puts users at risk, use the private form at https://github.com/veilway-project/veilway/security/advisories/new instead.

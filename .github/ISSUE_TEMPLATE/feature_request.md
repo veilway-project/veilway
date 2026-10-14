@@ -18,7 +18,7 @@ What are you trying to do, and what gets in the way today?
 
 ## What you would like
 
-Describe the behaviour, not the implementation, unless you have one in mind.
+Describe the behavior, not the implementation, unless you have one in mind.
 
 ## Who it is for
 

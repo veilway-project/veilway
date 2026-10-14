@@ -94,15 +94,15 @@ If you are unsure, copy the style of the file you are editing.
 
 The first time you open a pull request, a bot asks you to sign the agreement in [CLA.md](CLA.md) by replying with one line. You do this once, not per pull request.
 
-Why it exists, in plain words: under an open source licence every contributor still owns the lines they wrote. If the project ever needs to change its licence, for example to move to a newer licence version or to fix a compatibility problem, it would need written consent from every person who ever contributed, including people who can no longer be reached. For a project used on hostile networks, where contributors may have good reasons to disappear, that is a real risk. The CLA solves it up front.
+Why it exists, in plain words: under an open source license every contributor still owns the lines they wrote. If the project ever needs to change its license, for example to move to a newer license version or to fix a compatibility problem, it would need written consent from every person who ever contributed, including people who can no longer be reached. For a project used on hostile networks, where contributors may have good reasons to disappear, that is a real risk. The CLA solves it up front.
 
 What you agree to:
 
 - You keep the copyright on your work and can use it anywhere else.
-- You give the project a permanent licence to use your contribution and to license it under other terms, including terms that are not open source, plus the same patent licence Apache-2.0 contains.
+- You give the project a permanent license to use your contribution and to license it under other terms, including terms that are not open source, plus the same patent license Apache-2.0 contains.
 - You confirm the work is yours to contribute.
 
-What the project promises you in the same document: anything already released stays available under the open licence it was released under. A later licence change cannot take released code back.
+What the project promises you in the same document: anything already released stays available under the open license it was released under. A later license change cannot take released code back.
 
 Some people do not sign CLAs on principle. We respect that. Bug reports, reviews, testing and discussion need no CLA and are just as welcome.
 
@@ -111,7 +111,7 @@ Some people do not sign CLAs on principle. We respect that. Bug reports, reviews
 - The copyright line in the project is "The Veilway Authors". That means everyone who has contributed, not one person or company.
 - You stay the author of your commits in the git history. If a pull request is squashed, co-authors are kept with `Co-authored-by` lines.
 - Contributors are listed in the README, and each release's notes name the people whose work is in it. That includes reports, testing, translation and review, not only code.
-- The licence requires anyone who uses the code to keep the copyright notices and the `NOTICE` file, which credits the Veilway contributors. [TRADEMARKS.md](TRADEMARKS.md) stops a fork from presenting the project as its own.
+- The license requires anyone who uses the code to keep the copyright notices and the `NOTICE` file, which credits the Veilway contributors. [TRADEMARKS.md](TRADEMARKS.md) stops a fork from presenting the project as its own.
 
 If you want to be credited under a different name, or not listed at all, say so in your pull request.
 

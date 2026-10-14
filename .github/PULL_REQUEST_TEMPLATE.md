@@ -22,7 +22,7 @@ Commands you ran, and the systems and networks you tried it on. For anything tha
 - [ ] Code follows the style in CONTRIBUTING.md
 - [ ] No real server addresses, keys, passwords or subscription links in code, tests, logs or screenshots
 - [ ] UI changes: screenshots attached in dark and light, English and Persian
-- [ ] Docs updated or a follow-up opened in `veilway-docs`, if behaviour or config changed
+- [ ] Docs updated or a follow-up opened in `veilway-docs`, if behavior or config changed
 - [ ] I have signed the CLA, or will when the bot asks
 
 ## Notes for the reviewer

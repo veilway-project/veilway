@@ -16,10 +16,10 @@ one engine, a web panel and first-party clients.
 <p align="center">
 <a href="https://github.com/veilway-project/veilway/actions/workflows/ci.yml"><img alt="ci" src="https://github.com/veilway-project/veilway/actions/workflows/ci.yml/badge.svg"></a>
 <a href="https://github.com/veilway-project/veilway/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/veilway-project/veilway?display_name=tag"></a>
-<a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-Apache--2.0-blue"></a>
+<a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
-<!-- SCREENSHOT SLOT 1 (hero): desktop client, connected state, dark mode, about 380px wide, centred. Produce it from the real UI. Do not add a mockup. -->
+<!-- SCREENSHOT SLOT 1 (hero): desktop client, connected state, dark mode, about 380px wide, centered. Produce it from the real UI. Do not add a mockup. -->
 
 ## What it is
 
@@ -62,7 +62,7 @@ The full plan with the gate for each phase is in [PLAN.md](PLAN.md).
 
 | Phase | Delivers |
 |---|---|
-| 0, done | Repository layout, licence and community files, CI, threat model |
+| 0, done | Repository layout, license and community files, CI, threat model |
 | 1, done | Core engine: versioned config with hot reload, several inbounds, flow table and router, exits (userspace stack, and TUN with NAT on Linux for every IP protocol), users, quotas, stats, control API |
 | 2, in progress | Native protocol: a control channel inside the tunnel, transports (TLS, obfuscated UDP, fronted HTTP, a fake TLS spike), node links, client engine on Windows, macOS and Linux with IPv6. The spec, the node side, the transport library and node links are built; the client engine is next |
 | 3, done | Shared design system for panel and clients, themes. It lives in [veilway-ui](https://github.com/veilway-project/veilway-ui) |
@@ -319,8 +319,8 @@ Everyone who lands a change is listed on the [contributors page](https://github.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md). Please do not open a public issue for one.
 
-## Licence and credit
+## License and credit
 
-Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright The Veilway Authors. The licence does not cover the name: forks need their own name and logo, see [TRADEMARKS.md](TRADEMARKS.md).
+Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE). Copyright The Veilway Authors. The license does not cover the name: forks need their own name and logo, see [TRADEMARKS.md](TRADEMARKS.md).
 
 Veilway stands on [boringtun](https://github.com/cloudflare/boringtun) for the WireGuard protocol, [ipstack](https://github.com/narrowlink/ipstack) for userspace TCP/IP (patched in `vendor/ipstack`), [Wintun](https://www.wintun.net) for the Windows adapter and [Tauri](https://tauri.app) for the desktop shell. WireGuard is a registered trademark of Jason A. Donenfeld.
