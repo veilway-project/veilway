@@ -32,8 +32,8 @@ Update this block at the end of every work session.
 
 One ecosystem with four parts that look and feel like one product:
 
-1. **Core + SDK** (Rust). The engine that Xray is today: inbounds, outbounds, routing, users, stats, a control API. Embeddable as a library and runnable as a daemon.
-2. **Panel** (web). The 3x-ui replacement: users, inbounds, outbounds, routing, exits, subscriptions, stats.
+1. **Core + SDK** (Rust). The engine: inbounds, outbounds, routing, users, stats, a control API. Embeddable as a library and runnable as a daemon.
+2. **Panel** (web). Users, inbounds, outbounds, routing, exits, subscriptions, stats.
 3. **Clients**. Desktop first (Windows, macOS, Linux), then Android. Subscriptions and stats from day one.
 4. **Docs**, in a separate repo (`veilway-docs`): protocol spec, config reference, SDK guides, panel and client manuals, English and Persian.
 
@@ -52,7 +52,7 @@ The honest size of this: about 25 to 35 long build sessions for everything below
 | Cryptography | WireGuard's own tunnel (boringtun), unchanged. What is new is around it: transports, obfuscation, a control channel | Keeps an audited design at the center. The improvement over plain WireGuard comes from the envelope, not from new crypto. |
 | Contributions | A CLA signed once per contributor, through a bot on the first pull request | Lets the project relicense later without tracking down every contributor. |
 | Control API | HTTP + JSON with an OpenAPI schema, events over SSE | Easy for third parties in any language. The TypeScript SDK is generated from the schema. |
-| Panel backend | Rust (axum) + SQLite, the React app embedded in the binary | One static binary to install, like 3x-ui, and it shares types with the core. |
+| Panel backend | Rust (axum) + SQLite, the React app embedded in the binary | One static binary to install, and it shares types with the core. |
 | UI | React + TypeScript + Vite for panel and clients, one shared design package | Same components everywhere is what makes it feel like one ecosystem. |
 | Desktop shell | Tauri 2 | Already working in the current code for Windows. |
 | Xray support | Optional add-on that runs the official `xray` binary as a managed sidecar | No Go code embedded, no license mixing, off by default. |
