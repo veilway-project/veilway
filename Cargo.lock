@@ -2010,6 +2010,7 @@ dependencies = [
  "tracing-subscriber",
  "veilway-core",
  "veilway-proto",
+ "veilway-transport",
  "veilway-wg",
 ]
 
@@ -2033,6 +2034,19 @@ dependencies = [
 [[package]]
 name = "veilway-transport"
 version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rcgen",
+ "ring",
+ "rustix",
+ "rustls",
+ "socket2",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "veilway-proto",
+]
 
 [[package]]
 name = "veilway-wg"
