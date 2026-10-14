@@ -12,6 +12,8 @@ libfuzzer-sys="0.4"
 serde_json="1"
 veilway-core={path="../crates/veilway-core", features=["bench"]}
 veilway-proto={path="../crates/veilway-proto"}
+# The client_* targets drive what the client's side of the transports reads from the network.
+veilway-transport={path="../crates/veilway-transport"}
 # The obfs_listener target drives real WireGuard peers against the node's listener.
 veilway-wg={path="../crates/veilway-wg"}
 # The chunk target seals plaintexts itself, with the library the crate opens them with, and the subscription targets sign documents with it.
@@ -170,6 +172,41 @@ bench=false
 [[bin]]
 name="fronted_session"
 path="fuzz_targets/fronted_session.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="client_upgrade"
+path="fuzz_targets/client_upgrade.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="client_frames"
+path="fuzz_targets/client_frames.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="client_fronted"
+path="fuzz_targets/client_fronted.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="client_udp"
+path="fuzz_targets/client_udp.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="client_choice"
+path="fuzz_targets/client_choice.rs"
 test=false
 doc=false
 bench=false

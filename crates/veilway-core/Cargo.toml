@@ -50,5 +50,7 @@ rcgen.workspace=true
 hyper.workspace=true
 hyper-util.workspace=true
 http-body-util.workspace=true
+# The tests of the client library against this node (`tests/client.rs`). The library does not depend on this crate, so there is no cycle.
+veilway-transport={path="../veilway-transport"}
 # The tests of the proxy path wait five minutes for a connection to be given up, on a clock that is paused and moved for them.
 tokio={workspace=true, features=["test-util"]}

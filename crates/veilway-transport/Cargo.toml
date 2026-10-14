@@ -5,3 +5,28 @@ edition.workspace=true
 license.workspace=true
 repository.workspace=true
 publish.workspace=true
+
+[dependencies]
+veilway-proto={path="../veilway-proto"}
+tokio.workspace=true
+# TLS for `tls`, `ws` and `fronted`, with the library the node ends it with. Its handshake is its own and is recognisable as such: see the crate documentation.
+tokio-rustls.workspace=true
+rustls.workspace=true
+# SHA-256 of a certificate's SubjectPublicKeyInfo for the pins, and the system's random source. No cryptography is written here.
+ring.workspace=true
+base64.workspace=true
+tracing.workspace=true
+
+# The caller's hook is handed every socket before it is connected, as a reference of this crate's type.
+socket2.workspace=true
+
+# The socket option that prohibits fragmentation of what `udp-obfs` sends, the one the node sets.
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+rustix.workspace=true
+
+[dev-dependencies]
+# Certificates made for each test of what the client accepts and refuses.
+rcgen.workspace=true
+# The validity times of those certificates.
+time.workspace=true
+tokio={workspace=true, features=["test-util"]}
