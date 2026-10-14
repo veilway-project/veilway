@@ -392,7 +392,7 @@ pub async fn front(upstream: SocketAddr) -> Front {
 					let _ = client.set_nodelay(true);
 					let (mut from_client, write) = client.into_split();
 					let (from_client, mut buf, mut to_client, mut to_upstream, mut relay) = (&mut from_client, Vec::new(), Some(write), None::<OwnedWriteHalf>, None::<JoinHandle<()>>);
-					// When the answer last moved, in milliseconds after `base`: a client that is still being handed an answer is not a client that left the next request unsent.
+					// When the answer last moved, in milliseconds after `base`, and `u64::MAX` while a write to the client is under way: a client that is still being handed an answer is not a client that left the next request unsent.
 					let moved = Arc::new(AtomicU64::new(0));
 					loop {
 						// A whole head, within its time, before anybody is asked. What ends the wait otherwise: the upstream closed, the client closed its side, or the client gave up or took too long.
@@ -409,7 +409,7 @@ pub async fn front(upstream: SocketAddr) -> Front {
 								} => break Err(None),
 								got = async {
 									loop {
-										let at = || deadline.max(base + Duration::from_millis(moved.load(Ordering::Relaxed)) + FRONT_HEAD);
+										let at = || match moved.load(Ordering::Relaxed) {u64::MAX => tokio::time::Instant::now() + FRONT_HEAD, at => deadline.max(base + Duration::from_millis(at) + SECOND)};
 										let got = tokio::time::timeout_at(at(), from_client.read(&mut read)).await;
 										if got.is_err() && tokio::time::Instant::now() < at() {continue}
 										break got;
@@ -451,6 +451,7 @@ pub async fn front(upstream: SocketAddr) -> Front {
 								loop {
 									match from_upstream.read(&mut answer).await {
 										Ok(size) if size > 0 => {
+											moved.store(u64::MAX, Ordering::Relaxed);
 											if to_client.write_all(&answer[..size]).await.is_err() {return}
 											moved.store(base.elapsed().as_millis() as u64, Ordering::Relaxed);
 										}
