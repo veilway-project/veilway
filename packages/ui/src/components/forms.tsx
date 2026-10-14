@@ -45,7 +45,7 @@ export function SelectField({label, hint, error, optional, value, onChange, opti
 	const {t} = useI18n();
 	return <Field label={label} hint={hint} error={error} optional={optional}>{ids => <SelectPrimitive.Root value={value} onValueChange={onChange} disabled={disabled}>
 		<SelectPrimitive.Trigger {...ids} className="vw-input vw-select"><SelectPrimitive.Value placeholder={t("select.placeholder")}/><SelectPrimitive.Icon><Icon name="chevronDown"/></SelectPrimitive.Icon></SelectPrimitive.Trigger>
-		<SelectPrimitive.Portal><SelectPrimitive.Content className="vw-glass vw-menu" data-depth="3" position="popper" sideOffset={4}><SelectPrimitive.Viewport>
+		<SelectPrimitive.Portal><SelectPrimitive.Content className="vw-glass vw-menu" data-layer="popover" position="popper" sideOffset={4}><SelectPrimitive.Viewport>
 			{options.map(o => <SelectPrimitive.Item key={o.value} value={o.value} className="vw-menu-item"><SelectPrimitive.ItemText>{o.label}</SelectPrimitive.ItemText>{o.detail && <span className="vw-muted vw-small">{o.detail}</span>}<SelectPrimitive.ItemIndicator className="vw-menu-check"><Icon name="check"/></SelectPrimitive.ItemIndicator></SelectPrimitive.Item>)}
 		</SelectPrimitive.Viewport></SelectPrimitive.Content></SelectPrimitive.Portal>
 	</SelectPrimitive.Root>}</Field>;

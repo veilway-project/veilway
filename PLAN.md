@@ -423,7 +423,7 @@ Gate: with the client connected over port 443 next to a decoy site, `ping`, DNS,
 ### Phase 3: design system (2 sessions)
 
 1. Tokens, glass material with fallbacks, typography for Latin and Persian.
-2. Components: navigation, lists, forms, dialogs, stat tiles, charts, toasts, the security rating badge (not a pill).
+2. Components: navigation, lists, forms, dialogs, stat tiles, charts, toasts, the plain warning for an Unsafe connection (no rating labels in apps, not a pill).
 3. A gallery page showing everything in dark/light and English/Persian.
 4. Theme schema, validator, editor, import/export.
 

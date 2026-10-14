@@ -2,7 +2,7 @@
 	"$schema": "https://json-schema.org/draft/2020-12/schema",
 	"$id": "veilway-theme.schema.json",
 	"title": "Veilway theme",
-	"description": "Colour tokens plus glass tint and blur strength. A theme file is at most 16384 bytes. The schema describes the shape; the validator also checks text contrast and may refuse or repair a theme that passes this schema.",
+	"description": "Colour tokens plus glass tint and blur strength. A theme file is at most 16384 bytes. The schema describes the shape; the validator also checks text contrast, on solid surfaces and through the glass over the backdrop these colours make, and may refuse or repair a theme that passes this schema.",
 	"type": "object",
 	"additionalProperties": false,
 	"required": ["format", "version", "name", "scheme", "colors", "glass"],
@@ -14,13 +14,13 @@
 		"colors": {
 			"type": "object",
 			"additionalProperties": false,
-			"required": ["bg", "field1", "field2", "surface", "sunken", "text", "textMuted", "line", "lineStrong", "accent", "onAccent", "accentInk", "info", "protected", "detectable", "unsafe", "chart1", "chart2", "focus"],
+			"required": ["bg", "field1", "field2", "surface", "sunken", "text", "textMuted", "line", "lineStrong", "accent", "onAccent", "accentInk", "info", "success", "warning", "danger", "chart1", "chart2", "focus"],
 			"properties": {
-				"bg": {"$ref": "#/$defs/color", "description": "Page background"},
-				"field1": {"$ref": "#/$defs/color", "description": "First backdrop glow"},
+				"bg": {"$ref": "#/$defs/color", "description": "Page background, the darkest or lightest thing behind the glass"},
+				"field1": {"$ref": "#/$defs/color", "description": "First backdrop glow and the colour of the light shafts"},
 				"field2": {"$ref": "#/$defs/color", "description": "Second backdrop glow"},
-				"surface": {"$ref": "#/$defs/color", "description": "Solid surface and the scrim of every glass surface"},
-				"sunken": {"$ref": "#/$defs/color", "description": "Inputs and wells"},
+				"surface": {"$ref": "#/$defs/color", "description": "Solid surface and the scrim of every pane of glass"},
+				"sunken": {"$ref": "#/$defs/color", "description": "Inputs, chart frames and other wells cut into glass"},
 				"text": {"$ref": "#/$defs/color", "description": "Primary text"},
 				"textMuted": {"$ref": "#/$defs/color", "description": "Secondary text"},
 				"line": {"$ref": "#/$defs/color", "description": "Dividers"},
@@ -29,9 +29,9 @@
 				"onAccent": {"$ref": "#/$defs/color", "description": "Text on the accent fill"},
 				"accentInk": {"$ref": "#/$defs/color", "description": "Accent as text or icon on a surface"},
 				"info": {"$ref": "#/$defs/color", "description": "Informational text and marks"},
-				"protected": {"$ref": "#/$defs/color", "description": "Protected rating and success"},
-				"detectable": {"$ref": "#/$defs/color", "description": "Detectable rating and warnings"},
-				"unsafe": {"$ref": "#/$defs/color", "description": "Unsafe rating and errors"},
+				"success": {"$ref": "#/$defs/color", "description": "Success: a check that passed, a healthy state"},
+				"warning": {"$ref": "#/$defs/color", "description": "Warnings and a quota that is nearly used"},
+				"danger": {"$ref": "#/$defs/color", "description": "Errors, an unsafe connection and a destructive action"},
 				"chart1": {"$ref": "#/$defs/color", "description": "First chart series (download)"},
 				"chart2": {"$ref": "#/$defs/color", "description": "Second chart series (upload)"},
 				"focus": {"$ref": "#/$defs/color", "description": "Keyboard focus ring"}
@@ -42,8 +42,8 @@
 			"additionalProperties": false,
 			"required": ["tint", "blur"],
 			"properties": {
-				"tint": {"type": "number", "minimum": 0, "maximum": 1, "description": "Opacity of the scrim. Raised on import to the lowest value that keeps text readable."},
-				"blur": {"type": "number", "minimum": 0, "maximum": 40, "description": "Backdrop blur in CSS pixels"}
+				"tint": {"type": "number", "minimum": 0, "maximum": 1, "description": "Opacity of the scrim of a sheet resting on the backdrop. Raised on import to the lowest value at which text reads through the sheet over this own backdrop of this theme. Navigation, menus and dialogs are denser by a fixed step and a file cannot set them."},
+				"blur": {"type": "number", "minimum": 0, "maximum": 40, "description": "Backdrop blur of a sheet in CSS pixels. With less blur, layers that float over content are made denser."}
 			}
 		}
 	},

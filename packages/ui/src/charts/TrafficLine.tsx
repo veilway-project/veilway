@@ -40,7 +40,7 @@ export function TrafficLine({points, label, height = 220}: {points: TrafficPoint
 		{table ? <DataTable caption={label} rows={points.filter((_, i) => i % Math.ceil(points.length / 8) === 0)} rowKey={p => String(p.time.getTime())} columns={[{id: "time", header: t("chart.time"), cell: p => <span className="vw-num">{clock(p.time)}</span>}, {id: "down", header: names.down, align: "end", cell: p => <span className="vw-num">{rate(p.down).text}</span>}, {id: "up", header: names.up, align: "end", cell: p => <span className="vw-num">{rate(p.up).text}</span>}]}/> : <div className="vw-chart-frame" ref={frame} dir="ltr">
 			<svg width={width} height={height} role="img" aria-label={label} tabIndex={0} onPointerMove={move} onPointerLeave={() => setAt(null)} onKeyDown={key} onBlur={() => setAt(null)}>
 				{y.ticks(4).map(tick => <g key={tick}><line className="vw-grid" x1={PAD.left} x2={width - PAD.right} y1={y(tick)} y2={y(tick)}/><text className="vw-tick" x={PAD.left - 8} y={y(tick)} dy="0.32em" textAnchor="end">{number(tick)}</text></g>)}
-				{[0, 1 / 3, 2 / 3, 1].map(part => points[Math.round(part * (points.length - 1))]).map((p, i) => p && <text key={i} className="vw-tick" x={PAD.left + i / 3 * (width - PAD.left - PAD.right)} y={height - 6} textAnchor={i === 0 ? "start" : i === 3 ? "end" : "middle"}>{clock(p.time)}</text>)}
+				{(width < 400 ? [0, 0.5, 1] : [0, 1 / 3, 2 / 3, 1]).map((part, i, parts) => [part, points[Math.round(part * (points.length - 1))], i === 0 ? "start" : i === parts.length - 1 ? "end" : "middle"] as const).map(([part, p, anchor]) => p && <text key={part} className="vw-tick" x={PAD.left + part * (width - PAD.left - PAD.right)} y={height - 6} textAnchor={anchor}>{clock(p.time)}</text>)}
 				{SERIES.map(s => <g key={s} data-series={s}>
 					<path className="vw-area" d={area<TrafficPoint>().x((_, i) => x(i)).y0(y(0)).y1(p => y(p[s] / unitSize)).curve(curveMonotoneX)(points) ?? ""}/>
 					<path className="vw-line" d={line<TrafficPoint>().x((_, i) => x(i)).y(p => y(p[s] / unitSize)).curve(curveMonotoneX)(points) ?? ""}/>
@@ -49,7 +49,7 @@ export function TrafficLine({points, label, height = 220}: {points: TrafficPoint
 				{shown && at !== null && <g><line className="vw-crosshair" x1={x(at)} x2={x(at)} y1={PAD.top} y2={height - PAD.bottom}/>{SERIES.map(s => <circle key={s} className="vw-dot" data-series={s} cx={x(at)} cy={y(shown[s] / unitSize)} r="4"/>)}</g>}
 			</svg>
 			<span className="vw-axis-unit">{rate(unitSize).unit}</span>
-			{shown && at !== null && <div className="vw-glass vw-tooltip" data-depth="3" dir={dir} data-side={x(at) > width / 2 ? "before" : "after"} style={{left: x(at)}}>
+			{shown && at !== null && <div className="vw-glass vw-tooltip" data-layer="chrome" dir={dir} data-side={x(at) > width / 2 ? "before" : "after"} style={{left: x(at)}}>
 				<span className="vw-muted vw-small vw-num">{clock(shown.time)}</span>
 				{SERIES.map(s => <span key={s} className="vw-tooltip-row"><span className="vw-legend-key" data-series={s}/><strong className="vw-num">{rate(shown[s]).text}</strong><span className="vw-muted">{names[s]}</span></span>)}
 			</div>}

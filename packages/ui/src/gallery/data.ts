@@ -1,4 +1,4 @@
-import type {ProviderItem, Rating, TrafficPoint} from "../index.ts";
+import type {ProviderItem, TrafficPoint} from "../index.ts";
 
 // Sample content for the gallery. Names are placeholders, addresses come from the documentation ranges, and nothing here is read from a real node.
 const GB = 1024 ** 3;
@@ -11,13 +11,13 @@ export const USERS: SampleUser[] = [
 	{name: "press-desk", group: "team", used: 96.8 * GB, quota: null, daysLeft: 61, devices: 6, online: true}
 ];
 
-export type SampleExit = {id: string, place: "fra" | "ams" | "hel" | "ist" | "dxb", latency: number, rating: Rating, host: string};
+export type SampleExit = {id: string, place: "fra" | "ams" | "hel" | "ist" | "dxb", latency: number, unsafe?: boolean, host: string};
 export const EXITS: SampleExit[] = [
-	{id: "de-fra", place: "fra", latency: 48, rating: "protected", host: "fra.vpn.example.net"},
-	{id: "nl-ams", place: "ams", latency: 52, rating: "detectable", host: "ams.vpn.example.net"},
-	{id: "fi-hel", place: "hel", latency: 71, rating: "detectable", host: "hel.vpn.example.net"},
-	{id: "tr-ist", place: "ist", latency: 34, rating: "detectable", host: "198.51.100.24"},
-	{id: "ae-dxb", place: "dxb", latency: 29, rating: "unsafe", host: "203.0.113.42"}
+	{id: "de-fra", place: "fra", latency: 48, host: "fra.vpn.example.net"},
+	{id: "nl-ams", place: "ams", latency: 52, host: "ams.vpn.example.net"},
+	{id: "fi-hel", place: "hel", latency: 71, host: "hel.vpn.example.net"},
+	{id: "tr-ist", place: "ist", latency: 34, host: "198.51.100.24"},
+	{id: "ae-dxb", place: "dxb", latency: 29, unsafe: true, host: "203.0.113.42"}
 ];
 
 export const SAMPLE_LINK = "https://sub.example.net/s/4Qm8dX2vT7kLp0Zc";

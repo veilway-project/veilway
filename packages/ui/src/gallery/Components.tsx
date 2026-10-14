@@ -1,5 +1,5 @@
 import {useState} from "react";
-import {Banner, Button, Checkbox, ConfirmDialog, DataTable, Dialog, IconButton, List, ListRow, NumberField, ProviderCard, RadioGroup, RatingBadge, SecretField, Segmented, SelectField, StateBlock, Switch, Tabs, TextField, UsageBar, useToast} from "../index.ts";
+import {Banner, Button, Checkbox, ConfirmDialog, DataTable, Dialog, IconButton, List, ListRow, NumberField, ProviderCard, RadioGroup, SecretField, Segmented, SelectField, StateBlock, Switch, Tabs, TextField, UnsafeNote, UsageBar, useToast} from "../index.ts";
 import {EXITS, PROVIDER_CARDS, PROVIDER_CARDS_FA, SAMPLE_KEY, SAMPLE_LINK, USERS} from "./data.ts";
 import {Panel, useG} from "./shared.tsx";
 
@@ -36,8 +36,9 @@ export function Components() {
 					{id: "expiry", header: t("g.col.expiry"), cell: u => t("count.daysLeft", {count: u.daysLeft})},
 					{id: "devices", header: t("g.col.devices"), align: "end", cell: u => <span className="vw-num">{number(u.devices)}</span>}
 				]}/>},
-				{id: "list", label: t("g.comp.list"), content: <List label={t("g.client.exits")}>{EXITS.map(e => <ListRow key={e.id} current={e.id === exit} onClick={() => setExit(e.id)} title={t(`g.place.${e.place}`)} detail={<span className="vw-code">{e.host}</span>} trailing={<RatingBadge rating={e.rating}/>}/>)}</List>},
+				{id: "list", label: t("g.comp.list"), content: <List label={t("g.client.exits")}>{EXITS.map(e => <ListRow key={e.id} current={e.id === exit} onClick={() => setExit(e.id)} title={t(`g.place.${e.place}`)} detail={<span className="vw-code">{e.host}</span>} trailing={e.unsafe && <UnsafeNote/>}/>)}</List>},
 				{id: "empty", label: t("g.comp.empty"), content: <StateBlock kind="empty" title={t("g.state.emptyTitle")} action={<Button variant="primary" icon="plus">{t("g.panel.addUser")}</Button>}>{t("g.state.emptyBody")}</StateBlock>},
+				{id: "loading", label: t("g.comp.loading"), content: <StateBlock kind="loading" title={t("g.state.loadingTitle")}>{t("g.state.loadingBody")}</StateBlock>},
 				{id: "error", label: t("g.comp.failed"), content: <StateBlock kind="error" title={t("g.state.errorTitle")} action={<Button icon="refresh">{t("action.retry")}</Button>}>{t("g.state.errorBody")}</StateBlock>}
 			]}/>
 		</Panel>
@@ -55,9 +56,9 @@ export function Components() {
 				<Banner tone="success" title={t("g.banner.okTitle")}/>
 			</div>
 		</Panel>
-		<Panel title={t("g.comp.rating")} note={t("g.comp.ratingNote")}>
-			<div className="g-cluster"><RatingBadge rating="protected"/><RatingBadge rating="detectable"/><RatingBadge rating="unsafe"/></div>
-			<div className="g-ratings"><RatingBadge rating="protected" detail/><RatingBadge rating="detectable" detail/><RatingBadge rating="unsafe" detail/></div>
+		<Panel title={t("g.comp.unsafe")} note={t("g.comp.unsafeNote")}>
+			<div className="g-cluster"><UnsafeNote/></div>
+			<Banner tone="danger" title={t("unsafe.title")}>{t("unsafe.body")}</Banner>
 		</Panel>
 		<Panel title={t("g.comp.provider")} note={t("g.comp.providerNote")}>
 			{provider ? <div className="g-provider"><ProviderCard provider="ExampleNet" accent="#C2410C" cards={locale === "fa" ? PROVIDER_CARDS_FA : PROVIDER_CARDS} onHide={() => setProvider(false)} onOpenLink={url => toast({title: t("g.client.opened"), body: url})}/></div> : <Button variant="quiet" icon="eye" onClick={() => setProvider(true)}>{t("g.client.showProvider")}</Button>}

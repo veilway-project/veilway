@@ -1,6 +1,6 @@
 import {useMemo, useRef, useState, type CSSProperties} from "react";
 import hostile from "../../test/hostile.veilway-theme?raw";
-import {BLUR_MAX, BUILTIN, Banner, Button, COLOR_KEYS, Glass, MAX_BYTES, MAX_NAME, RatingBadge, Segmented, Slider, THEME_EXTENSION, TextField, UsageBar, minTint, palette, parseHex, serializeTheme, themeVars, validateTheme, type Issue, type Theme} from "../index.ts";
+import {BLUR_MAX, BUILTIN, Backdrop, Banner, Button, COLOR_KEYS, Glass, MAX_BYTES, MAX_NAME, Segmented, Slider, THEME_EXTENSION, TextField, UnsafeNote, UsageBar, minTint, palette, parseHex, serializeTheme, themeVars, validateTheme, type Issue, type Theme} from "../index.ts";
 import {Panel, useG} from "./shared.tsx";
 
 const GB = 1024 ** 3;
@@ -8,7 +8,7 @@ const GB = 1024 ** 3;
 // The editor never trusts its own draft: every change is written out as a theme file and read back through the same validator an imported file goes through. What you see in the preview is what the validator returned.
 export function Themes({active, onApply}: {active: Theme, onApply: (theme: Theme | null) => void}) {
 	const {t, number} = useG(), file = useRef<HTMLInputElement>(null), [draft, setDraft] = useState<Theme>(active), [refused, setRefused] = useState<Issue[] | null>(null), [good, setGood] = useState<Theme>(active);
-	const verdict = useMemo(() => validateTheme(serializeTheme(draft)), [draft]), shown = verdict.ok ? verdict.theme : good, floor = minTint(palette(shown)) ?? 1;
+	const verdict = useMemo(() => validateTheme(serializeTheme(draft)), [draft]), shown = verdict.ok ? verdict.theme : good, floor = minTint(palette(shown), shown.glass.blur) ?? 1;
 	// The preview keeps showing the last theme that passed while the draft is unreadable.
 	const update = (next: Theme) => {
 		const result = validateTheme(serializeTheme(next));
@@ -57,16 +57,16 @@ export function Themes({active, onApply}: {active: Theme, onApply: (theme: Theme
 						<span className="vw-code vw-muted vw-small">{shown.colors[key]}</span>
 					</li>)}</ul>
 				</div>
-				<div className="vw-root vw-backdrop g-preview" data-scheme={shown.scheme} data-material="glass" style={themeVars(shown) as CSSProperties}>
+				<Backdrop className="vw-root g-preview" data-scheme={shown.scheme} data-material="glass" style={themeVars(shown) as CSSProperties}>
 					<Glass className="g-pad g-stack">
 						<h3 className="vw-h2">{shown.name}</h3>
 						<p className="vw-muted">{t("g.theme.previewBody")}</p>
 						<div className="g-cluster"><Button variant="primary" icon="power">{t("action.connect")}</Button><Button>{t("action.cancel")}</Button></div>
-						<div className="g-cluster"><RatingBadge rating="protected"/><RatingBadge rating="detectable"/><RatingBadge rating="unsafe"/></div>
+						<div className="g-cluster"><UnsafeNote/></div>
 						<UsageBar label={t("g.client.month")} used={31.4 * GB} total={50 * GB}/>
 						<input className="vw-input vw-code" dir="ltr" readOnly aria-label={t("g.form.address")} value="fra.vpn.example.net:8443"/>
 					</Glass>
-				</div>
+				</Backdrop>
 			</div>
 		</Panel>
 	</>;

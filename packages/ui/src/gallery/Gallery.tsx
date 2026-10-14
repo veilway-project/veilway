@@ -1,5 +1,5 @@
 import {useEffect, useState} from "react";
-import {BUILTIN, Button, DEFAULT_SETTINGS, Dialog, Nav, PRODUCT, RadioGroup, Segmented, Shell, Switch, ToastProvider, UiProvider, type UiSettings} from "../index.ts";
+import {BUILTIN, Backdrop, Button, DEFAULT_SETTINGS, Dialog, Nav, PRODUCT, RadioGroup, Segmented, Shell, Switch, ToastProvider, UiProvider, type UiSettings} from "../index.ts";
 import {Components} from "./Components.tsx";
 import {COPY} from "./copy.ts";
 import {DataPage} from "./DataPage.tsx";
@@ -29,7 +29,7 @@ export function Gallery() {
 function Frame({page, onPage, settings, onSettings, still}: {page: Page, onPage: (page: Page) => void, settings: UiSettings, onSettings: (settings: UiSettings) => void, still: boolean}) {
 	const {t, date} = useG(), [display, setDisplay] = useState(false);
 	const scheme = settings.theme?.scheme ?? (settings.scheme === "system" ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : settings.scheme), active = settings.theme ?? BUILTIN[scheme];
-	return <div className="vw-backdrop g-page">
+	return <Backdrop fixed className="g-page">
 		<Shell nav={<Nav value={page} onChange={id => onPage(id as Page)} items={PAGES.map(id => ({id, label: t(`g.nav.${id}`), icon: PAGE_ICON[id]}))} header={<div className="g-brand">
 			<svg viewBox="0 0 1024 1024" aria-hidden="true"><defs><linearGradient id="g-tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#22795A"/><stop offset="1" stopColor="#145540"/></linearGradient><clipPath id="g-band"><rect x="0" y="262" width="1024" height="500"/></clipPath><mask id="g-behind" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1024"><rect width="1024" height="1024" fill="#fff"/><path d="M242.2 200L543.7 828" stroke="#000" strokeWidth="152"/></mask></defs><rect x="64" y="64" width="896" height="896" rx="150" fill="url(#g-tile)"/><g clipPath="url(#g-band)" fill="none" stroke="#F1F8F4"><g mask="url(#g-behind)"><path d="M734.1 200L432.6 828" strokeWidth="34"/><path d="M781.8 200L480.3 828" strokeWidth="34" strokeOpacity="0.6"/><path d="M829.5 200L528 828" strokeWidth="34" strokeOpacity="0.32"/></g><path d="M242.2 200L543.7 828" strokeWidth="120"/></g></svg>
 			<div><strong>{PRODUCT}</strong><span className="vw-muted vw-small">{t("g.brand")}</span></div>
@@ -57,5 +57,5 @@ function Frame({page, onPage, settings, onSettings, still}: {page: Page, onPage:
 				<Switch label={t("g.set.jalali")} hint={t("g.set.persianOnly")} checked={settings.jalali} onChange={jalali => onSettings({...settings, jalali})}/>
 			</div>
 		</Dialog>
-	</div>;
+	</Backdrop>;
 }

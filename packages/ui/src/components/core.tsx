@@ -83,6 +83,14 @@ export function IconButton({icon, label, className, type = "button", ...rest}: O
 	return <button {...rest} type={type} className={"vw-icon-button" + (className ? " " + className : "")} aria-label={label} title={label}><Icon name={icon}/></button>;
 }
 
-export function Glass({depth = 2, className, children, ...rest}: HTMLAttributes<HTMLDivElement> & {depth?: 1 | 2 | 3}) {
-	return <div {...rest} className={"vw-glass" + (className ? " " + className : "")} data-depth={depth}>{children}</div>;
+export type GlassLayer = "sheet" | "chrome" | "popover" | "dialog";
+
+// A pane of glass. layer says what can be behind it, which decides how dense it is: a sheet rests on the backdrop, chrome has content scrolling under it, a popover or dialog can open over anything. depth only sets how far a sheet lifts; 3 is the older way of asking for a popover.
+export function Glass({depth = 2, layer, className, children, ...rest}: HTMLAttributes<HTMLDivElement> & {depth?: 1 | 2 | 3, layer?: GlassLayer}) {
+	return <div {...rest} className={"vw-glass" + (className ? " " + className : "")} data-depth={depth} data-layer={layer ?? (depth === 3 ? "popover" : "sheet")}>{children}</div>;
+}
+
+// The page behind the glass. fixed pins its light to the viewport, for the root of an app. lit false turns the light down: a client passes its connection state here, so the whole window shows it.
+export function Backdrop({lit = true, fixed, className, children, ...rest}: HTMLAttributes<HTMLDivElement> & {lit?: boolean, fixed?: boolean}) {
+	return <div {...rest} className={"vw-backdrop" + (className ? " " + className : "")} data-lit={lit ? undefined : "off"} data-fixed={fixed ? "" : undefined}>{children}</div>;
 }
