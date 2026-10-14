@@ -46,7 +46,7 @@ features = ["std"]
 default-features = false
 
 [dependencies.etherparse]
-version = "0.20"
+version = "0.21"
 features = ["std"]
 default-features = false
 
