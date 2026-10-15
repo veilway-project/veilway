@@ -1,4 +1,4 @@
-//! `veilway connect`, `disconnect` and `status`: the client on Linux and Windows, driven from a terminal until an app does it. The engine and the platform layer are the libraries `veilway-engine` and `veilway-linux` or `veilway-windows` (both are `platform` here, and answer to the same calls); what is here is the questions put to the user and the words the state is shown in.
+//! `veilway connect`, `disconnect` and `status`: the client on Linux, macOS and Windows, driven from a terminal until an app does it. The engine and the platform layer are the libraries `veilway-engine` and `veilway-linux`, `veilway-macos` or `veilway-windows` (all are `platform` here, and answer to the same calls); what is here is the questions put to the user and the words the state is shown in.
 use anyhow::{anyhow, bail, Context};
 use clap::Args;
 use ipnet::IpNet;
@@ -6,7 +6,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use tokio::signal::unix::{signal, Signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown, CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
@@ -14,6 +14,8 @@ use veilway_engine::import::{self, Fetcher, Library};
 use veilway_engine::{ask_text, default_roots, Agree, Retry, Settings, StartError, State, Status, Store};
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
+#[cfg(target_os = "macos")]
+use veilway_macos as platform;
 #[cfg(windows)]
 use veilway_windows as platform;
 use platform::state::{self, Ended};
@@ -43,9 +45,10 @@ pub struct Connect {
 	#[arg(long)] no_kill_switch: bool,
 	/// The name of the tunnel's network device
 	#[cfg_attr(target_os = "linux", arg(long, default_value = "vw0"))]
+	#[cfg_attr(target_os = "macos", arg(long, default_value = "utun"))]
 	#[cfg_attr(windows, arg(long, default_value = "Veilway"))]
 	interface: String,
-	/// Where the client keeps its vault and what it remembers. On Linux as root: /var/lib/veilway/client, and the environment is not looked at. Otherwise $VEILWAY_DATA_DIR, else veilway in $XDG_DATA_HOME, else in ~/.local/share. On Windows: Veilway\client in ProgramData, which only administrators can use
+	/// Where the client keeps its vault and what it remembers. On Linux as root: /var/lib/veilway/client, and the environment is not looked at. Otherwise $VEILWAY_DATA_DIR, else veilway in $XDG_DATA_HOME, else in ~/.local/share. On macOS: Veilway/client in /Library/Application Support, which only root can use. On Windows: Veilway\client in ProgramData, which only administrators can use
 	#[arg(long)] data_dir: Option<PathBuf>,
 }
 
@@ -59,6 +62,15 @@ fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 	Ok(dir)
 }
 
+/// The directory for the vault and the memory of the client on macOS: the one given, else `client` in `/Library/Application Support/Veilway`. The client changes the routes, the firewall and the resolver, which only root can do, and the directory is root's: a link, another owner or a directory others can write in is an error.
+#[cfg(target_os = "macos")]
+fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+	if !rustix::process::geteuid().is_root() {bail!("the client changes the routes, the firewall and the resolver, which only root can do: run it with sudo")}
+	let dir = given.unwrap_or_else(|| Path::new(state::DATA).join("client"));
+	state::secure_dir(&dir, 0o700).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
+	Ok(dir)
+}
+
 /// The directory for the vault and the memory of the client: the one given, else `Veilway\client` in ProgramData. It is made for administrators and SYSTEM only, and a link is an error.
 #[cfg(windows)]
 fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
@@ -68,10 +80,10 @@ fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 }
 
 /// The signals that end a connection: they are taken before anything is changed, so that one during the set-up or at a question does not end the process in the middle. SIGINT and SIGTERM are the user asking to stop. SIGHUP is a closed terminal, and is not.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct Signals {terminate: Signal, interrupt: Signal, hangup: Signal}
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 impl Signals {
 	fn new() -> std::io::Result<Self> {Ok(Self {terminate: signal(SignalKind::terminate())?, interrupt: signal(SignalKind::interrupt())?, hangup: signal(SignalKind::hangup())?})}
 	async fn next(&mut self) -> Stop {tokio::select! {_ = self.terminate.recv() => Stop::Asked, _ = self.interrupt.recv() => Stop::Asked, _ = self.hangup.recv() => Stop::Hangup}}
@@ -247,7 +259,7 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 				shown = key;
 			}
 		};
-		#[cfg(target_os = "linux")]
+		#[cfg(unix)]
 		let stop = signals.next();
 		#[cfg(windows)]
 		let stop = async {tokio::select! {reason = signals.next() => reason, () = lock.stop_asked() => Stop::Asked}};
@@ -292,18 +304,18 @@ pub async fn disconnect() -> anyhow::Result<()> {
 	// A client that runs is asked to stop, which it does the clean way. Only when none holds the lock is there anything to clean up by hand, and the lock is then taken for it: a client that starts meanwhile finds it held, and this command never touches what a running one has made.
 	match state::terminate(&options.run_dir, Duration::from_secs(20)).await? {
 		Ended::NotRunning => {}
-		#[cfg(target_os = "linux")]
+		#[cfg(unix)]
 		Ended::Stopped(_) => println!("The connection stopped."),
 		#[cfg(windows)]
 		Ended::Stopped => println!("The connection stopped."),
-		#[cfg(target_os = "linux")]
+		#[cfg(unix)]
 		Ended::Killed(_) => println!("The connection did not stop in time and was ended."),
 	}
 	let lock = state::lock(&options.run_dir).await?;
 	let cleaned = platform::cleanup(&options, &lock)?;
 	#[cfg(target_os = "linux")]
 	let left: Vec<&str> = [(cleaned.kill_switch, "the kill switch"), (cleaned.routes > 0, "the routing rules and routes")].into_iter().filter(|(found, _)| *found).map(|(_, name)| name).collect();
-	#[cfg(windows)]
+	#[cfg(any(windows, target_os = "macos"))]
 	let left: Vec<&str> = [(cleaned.kill_switch, "the kill switch"), (cleaned.resolver, "the name resolution rule")].into_iter().filter(|(found, _)| *found).map(|(_, name)| name).collect();
 	if !left.is_empty() {println!("Removed what the connection left in force: {}.", left.join(", "))}
 	#[cfg(target_os = "linux")]
@@ -315,7 +327,7 @@ pub async fn disconnect() -> anyhow::Result<()> {
 	}
 	#[cfg(target_os = "linux")]
 	let nothing = left.is_empty() && cleaned.resolver == Restored::Nothing;
-	#[cfg(windows)]
+	#[cfg(any(windows, target_os = "macos"))]
 	let nothing = left.is_empty();
 	if nothing {println!("Nothing is in force. Your normal connection is as it was.")} else {println!("Your normal connection is back.")}
 	Ok(())

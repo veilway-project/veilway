@@ -1,4 +1,4 @@
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod client;
 mod doctor;
 mod link;
@@ -73,13 +73,13 @@ enum Command {
 	#[cfg(unix)]
 	Replay {#[command(subcommand)] command: Replay},
 	/// Connect this device to a Veilway server with a subscription, as root or with CAP_NET_ADMIN. It stays in the foreground until it is stopped, and while it runs nothing leaves the device outside the tunnel. Questions are answered on the terminal. Exit status: 0 disconnected, 1 anything else
-	#[cfg(any(target_os = "linux", windows))]
+	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 	Connect(client::Connect),
 	/// Stop the connection that runs and remove everything it made, including a kill switch that a connection that crashed left in force
-	#[cfg(any(target_os = "linux", windows))]
+	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 	Disconnect,
 	/// Show the connection in plain words. Exit status: 0 a connection runs, 3 none does
-	#[cfg(any(target_os = "linux", windows))]
+	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 	Status,
 	/// Print the JSON Schema of config version 1
 	Schema,
@@ -405,11 +405,11 @@ async fn main() -> anyhow::Result<()> {
 		}
 		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, transports, mtu, lifetime}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, &transports, mtu, lifetime)),
 		Command::Link {command: Link::Answer {config, tag}} => std::process::exit(link::answer(&config, &tag)),
-		#[cfg(any(target_os = "linux", windows))]
+		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Connect(args) => client::connect(args).await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
-		#[cfg(any(target_os = "linux", windows))]
+		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Disconnect => client::disconnect().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
-		#[cfg(any(target_os = "linux", windows))]
+		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Status => std::process::exit(client::show()),
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());

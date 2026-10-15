@@ -35,11 +35,16 @@ veilway-linux={path="../veilway-linux"}
 # Whether the client runs as root, which decides where it keeps its files.
 rustix={workspace=true, features=["process"]}
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The same commands on macOS: the engine and its macOS layer, which only root can run.
+veilway-macos={path="../veilway-macos"}
+rustix={workspace=true, features=["process"]}
+
 [target.'cfg(windows)'.dependencies]
 # The same commands on Windows: the engine and its Windows layer.
 veilway-windows={path="../veilway-windows"}
 
-[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 veilway-engine={path="../veilway-engine"}
 ipnet.workspace=true
 
