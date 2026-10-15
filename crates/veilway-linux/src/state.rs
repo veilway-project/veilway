@@ -24,7 +24,8 @@ pub fn program(name: &str) -> io::Result<PathBuf> {PROGRAMS.iter().map(|dir| Pat
 
 /// A directory this user owns, that nobody else can write in, and that is not a link. Made with `mode` if it is not there. A client that runs as root must not be walked into `/etc` by a path a user planted, so a directory that fails this is an error and is never changed to fit.
 pub fn secure_dir(path: &Path, mode: u32) -> io::Result<()> {
-	if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {fs::create_dir_all(parent)?}
+	// A parent made here gets 0755 whatever the caller's umask is: under umask 0 it would be 0777, and a folder inside it could then be swapped by anyone.
+	if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {fs::DirBuilder::new().recursive(true).mode(0o755).create(parent)?}
 	match fs::symlink_metadata(path) {
 		Ok(meta) if meta.is_dir() && meta.uid() == geteuid().as_raw() && meta.mode() & 0o022 == 0 => Ok(()),
 		Ok(_) => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{} is not a directory of this user that only this user can write in", path.display()))),

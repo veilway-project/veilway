@@ -17,7 +17,7 @@
 # For testing only, to run against a release server of your own (scripts/gate-alpha.sh does): VEILWAY_RELEASE_BASE
 # (default https://github.com, still https only), VEILWAY_RAW_BASE (default https://raw.githubusercontent.com),
 # VEILWAY_NODE_PUBKEY and VEILWAY_PANEL_PUBKEY (default: the key below). They change where a download comes from
-# and which key is trusted. The checks themselves are the same.
+# and which key is trusted. The checks themselves are the same. Each one is printed and needs a yes; with --yes, VEILWAY_TESTING=1 too.
 set -euo pipefail
 umask 022
 
@@ -30,10 +30,15 @@ PANEL_PUBKEY="${VEILWAY_PANEL_PUBKEY:-$PUBKEY}"
 RELEASE_BASE="${VEILWAY_RELEASE_BASE:-https://github.com}"
 RAW_BASE="${VEILWAY_RAW_BASE:-https://raw.githubusercontent.com}"
 PANEL_PORT="${VEILWAY_PANEL_PORT:-8480}"
+TAG_RE='^v?[0-9A-Za-z._-]+$'
+OVERRIDES=()
+for v in VEILWAY_RELEASE_BASE VEILWAY_RAW_BASE VEILWAY_NODE_PUBKEY VEILWAY_PANEL_PUBKEY; do if [ -n "${!v:-}" ]; then OVERRIDES+=("$v=${!v}"); fi; done
 BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/veilway"
+NODE_DIR="$CONF_DIR/node"
 STATE_DIR="/var/lib/veilway"
 PANEL_DIR="/var/lib/veilway-panel"
+VER_DIR="/var/lib/veilway-installer"
 BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
 DRY=0
@@ -140,6 +145,7 @@ ensure_tools() {
 		fi
 		[ "$DRY" = 1 ] || has minisign || die "minisign did not install"
 	fi
+	has setpriv || die "setpriv (util-linux) is needed to write the node's files as the node user"
 }
 
 spin() {
@@ -155,16 +161,38 @@ spin() {
 
 fetch() {
 	local url="$1" out="$2" msg="$3" rc=0
-	curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --connect-timeout 15 -o "$out" "$url" &
+	curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --connect-timeout 15 -o "$out" "$url" &
 	spin $! "$msg" || rc=$?
 	[ "$rc" = 0 ] || die "download failed: $url"
 }
 
 latest_tag() {
-	local repo="$1" url
-	url="$(curl -fsSL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$RELEASE_BASE/$repo/releases/latest")" || die "cannot reach GitHub"
-	case "$url" in */releases/tag/*) printf '%s' "${url##*/}" ;; *) die "$repo has no published release yet" ;; esac
+	local repo="$1" url tag
+	url="$(curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$RELEASE_BASE/$repo/releases/latest")" || die "cannot reach GitHub"
+	case "$url" in */releases/tag/*) tag="${url##*/}" ;; *) die "$repo has no published release yet" ;; esac
+	[[ "$tag" =~ $TAG_RE ]] || die "the latest tag of $repo, \"$tag\", is not a release tag: refusing"
+	printf '%s' "$tag"
 }
+
+# The version the node or the panel was installed at. Files of the old layout are read until the new one exists.
+installed_version() {
+	local legacy="$STATE_DIR/node.version" f v=""
+	[ "$1" = panel ] && legacy="$PANEL_DIR/panel.version"
+	for f in "$VER_DIR/$1.version" "$legacy"; do
+		if [ -f "$f" ] && [ ! -L "$f" ]; then v="$(cat "$f")"; break; fi
+	done
+	if [[ "$v" =~ $TAG_RE ]]; then printf '%s' "$v"; fi
+	return 0
+}
+
+# A link in these folders may have been planted by the node user, so root stops instead of following it.
+refuse_links() {
+	local l
+	while read -r l; do die "$l is a link: remove it and run this again"; done < <(find "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR" -maxdepth 2 -type l 2>/dev/null)
+}
+
+# Writes into the node's folder run as the node user, so root never writes or follows a link there.
+as_node_user() { setpriv --reuid veilway --regid veilway --clear-groups "$@"; }
 
 # Downloads one asset with its signature into $TMP and refuses unless both the signature and the trusted comment match.
 download_verified() {
@@ -188,7 +216,7 @@ install_binary() {
 }
 
 fetch_and_install() {
-	local which="$1" repo key name dest tag product
+	local which="$1" repo key name dest tag product cur vf
 	if [ "$which" = node ]; then repo="$CORE_REPO"; key="$NODE_PUBKEY"; product=veilway; name="veilway-$TARGET"; dest="$BIN_DIR/veilway"
 	else repo="$PANEL_REPO"; key="$PANEL_PUBKEY"; product=veilway-panel; name="veilway-panel-$TARGET"; dest="$BIN_DIR/veilway-panel"; fi
 	if [ "$DRY" = 1 ]; then
@@ -198,10 +226,16 @@ fetch_and_install() {
 		return 0
 	fi
 	tag="$(release_tag "$repo")"
+	cur="$(installed_version "$which")"
+	if [ -z "$WANT_VERSION" ] && [ -n "$cur" ] && [ "$cur" != "$tag" ] && [ "$(printf '%s\n%s\n' "$cur" "$tag" | sort -V | head -n 1)" = "$tag" ]; then
+		die "$tag is older than the installed $cur: refusing a downgrade (pass --version $tag to do it on purpose)"
+	fi
 	download_verified "$repo" "$key" "$name" "$tag" "$product"
 	install_binary "$TMP/$name" "$dest"
 	step "installed $dest ($tag)"
-	if [ "$which" = node ]; then printf '%s\n' "$tag" >"$STATE_DIR/node.version"; else printf '%s\n' "$tag" >"$PANEL_DIR/panel.version"; fi
+	install -d -m 0755 "$VER_DIR"
+	vf="$(mktemp "$VER_DIR/.$which.XXXXXX")"
+	printf '%s\n' "$tag" >"$vf"; chmod 0644 "$vf"; mv -f "$vf" "$VER_DIR/$which.version"
 }
 
 ensure_user() {
@@ -241,7 +275,7 @@ Wants=network-online.target
 [Service]
 User=veilway
 Group=veilway
-ExecStart=$BIN_DIR/veilway run --config $CONF_DIR/config.json --state $STATE_DIR/veilway-state.json --replay $STATE_DIR/veilway-replay --api /run/veilway/control.sock
+ExecStart=$BIN_DIR/veilway run --config $NODE_DIR/config.json --state $STATE_DIR/veilway-state.json --replay $STATE_DIR/veilway-replay --api /run/veilway/control.sock
 ExecReload=/bin/kill -HUP \$MAINPID
 # The control socket is made with mode 600; the panel reaches it through the group veilway.
 ExecStartPost=-/usr/bin/timeout 10 /bin/sh -c "until [ -S /run/veilway/control.sock ]; do sleep 0.2; done; chmod 660 /run/veilway/control.sock"
@@ -254,8 +288,8 @@ NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ProtectSystem=strict
-# The node writes the config it applied through the control API and the key of a self-signed tls certificate next to it.
-ReadWritePaths=$STATE_DIR $CONF_DIR
+# The node writes the config it applied through the control API and the key of a self-signed tls certificate next to it, in its own folder.
+ReadWritePaths=$STATE_DIR $NODE_DIR
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=false
@@ -320,25 +354,40 @@ svc() {
 
 daemon_reload() { has_systemd && act systemctl daemon-reload || true; }
 
+# The node's files moved from /etc/veilway into its own folder. They are copied as the node user, then the old copy is removed.
+prepare_node_dir() {
+	local f
+	act install -d -m 0700 -o veilway -g veilway "$NODE_DIR"
+	[ "$DRY" = 1 ] && { dry "move $CONF_DIR/config.json and $CONF_DIR/tls-* into $NODE_DIR, where they are"; return 0; }
+	for f in "$CONF_DIR/config.json" "$CONF_DIR"/tls-*; do
+		[ -f "$f" ] || continue
+		if [ -e "$NODE_DIR/${f##*/}" ]; then warn "kept $f: $NODE_DIR/${f##*/} already exists"; continue; fi
+		as_node_user cp -n -- "$f" "$NODE_DIR/${f##*/}" || die "cannot copy $f to $NODE_DIR"
+		rm -f -- "$f"
+		step "moved $f to $NODE_DIR"
+	done
+}
+
 install_node() {
 	step "node"
 	ensure_user veilway "$STATE_DIR"
 	act install -d -m 0750 -o veilway -g veilway "$STATE_DIR"
-	act install -d -m 0770 -o root -g veilway "$CONF_DIR"
+	act install -d -m 0750 -o root -g veilway "$CONF_DIR"
 	fetch_and_install node
+	prepare_node_dir
 	node_unit
 	daemon_reload
 	if [ "$DRY" = 1 ]; then
 		dry "write $CONF_DIR/config.example.json from the release tag"
-		dry "write $CONF_DIR/config.json if there is none: no inbound and one direct exit, for the panel to fill in"
+		dry "write $NODE_DIR/config.json if there is none: no inbound and one direct exit, for the panel to fill in"
 	else
-		tag="$(cat "$STATE_DIR/node.version" 2>/dev/null || echo main)"
-		if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "$RAW_BASE/$CORE_REPO/$tag/config.example.json" 2>/dev/null; then
+		tag="$(installed_version node)"
+		if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "$RAW_BASE/$CORE_REPO/${tag:-main}/config.example.json" 2>/dev/null; then
 			step "wrote $CONF_DIR/config.example.json"
 		fi
 		# A node needs a config to run, and the panel needs a running node to change it, so a fresh install starts with a node that has no inbound.
-		if [ ! -f "$CONF_DIR/config.json" ]; then
-			cat >"$CONF_DIR/config.json" <<'EOF'
+		if [ ! -e "$NODE_DIR/config.json" ]; then
+			( umask 077; as_node_user tee "$NODE_DIR/config.json" >/dev/null ) <<'EOF'
 {
 	"version": 1,
 	"dns": {"servers": ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]},
@@ -352,10 +401,10 @@ install_node() {
 	]}
 }
 EOF
-			step "wrote $CONF_DIR/config.json: no inbound yet, add one in the panel"
+			step "wrote $NODE_DIR/config.json: no inbound yet, add one in the panel"
 		fi
-		chown veilway:veilway "$CONF_DIR/config.json"
-		chmod 0600 "$CONF_DIR/config.json"
+		chown -h veilway:veilway "$NODE_DIR/config.json"
+		as_node_user chmod 0600 "$NODE_DIR/config.json"
 	fi
 	if run_check; then svc enable veilway.service; svc restart veilway.service; else warn "config has errors: the node was not restarted"; fi
 }
@@ -365,7 +414,7 @@ install_panel() {
 	ensure_user veilway "$STATE_DIR"
 	ensure_user veilway-panel "$PANEL_DIR"
 	act install -d -m 0750 -o veilway-panel -g veilway-panel "$PANEL_DIR"
-	act install -d -m 0770 -o root -g veilway "$CONF_DIR"
+	act install -d -m 0750 -o root -g veilway "$CONF_DIR"
 	fetch_and_install panel
 	panel_config
 	panel_unit
@@ -441,6 +490,7 @@ do_install() {
 	comp="$(pick_component "${1:-}")"
 	what="$comp"
 	need_root
+	refuse_links
 	detect_target
 	ensure_tools
 	[ "$DRY" = 1 ] || { TMP="$(mktemp -d)"; install -d -m 0755 "$STATE_DIR" 2>/dev/null || true; }
@@ -458,21 +508,25 @@ do_install() {
 do_update() {
 	local comp="${1:-both}" cur
 	need_root
+	refuse_links
 	detect_target
 	ensure_tools
 	[ "$DRY" = 1 ] || TMP="$(mktemp -d)"
 	if [ "$comp" = node ] || [ "$comp" = both ]; then
 		if [ -x "$BIN_DIR/veilway" ] || [ "$DRY" = 1 ]; then
-			cur="$(cat "$STATE_DIR/node.version" 2>/dev/null || echo unknown)"
-			info "node is at $cur"
+			cur="$(installed_version node)"
+			info "node is at ${cur:-unknown}"
 			fetch_and_install node
+			prepare_node_dir
+			node_unit
+			daemon_reload
 			svc restart veilway.service
 		else info "node is not installed, skipped"; fi
 	fi
 	if [ "$comp" = panel ] || [ "$comp" = both ]; then
 		if [ -x "$BIN_DIR/veilway-panel" ] || [ "$DRY" = 1 ]; then
-			cur="$(cat "$PANEL_DIR/panel.version" 2>/dev/null || echo unknown)"
-			info "panel is at $cur"
+			cur="$(installed_version panel)"
+			info "panel is at ${cur:-unknown}"
 			fetch_and_install panel
 			svc restart veilway-panel.service
 		else info "panel is not installed, skipped"; fi
@@ -493,13 +547,13 @@ do_status() {
 	header
 	printf '  %s%-14s %-34s %s%s\n' "$B" "Part" "State" "Version" "$Z"
 	printf '  %s%s%s\n' "$D" "$(rule 62)" "$Z"
-	v="$(cat "$STATE_DIR/node.version" 2>/dev/null || echo "-")"
+	v="$(installed_version node)"; v="${v:--}"
 	[ -x "$BIN_DIR/veilway" ] || v="not installed"
 	printf '  %-14s %-34s %s\n' "node" "$(unit_state veilway.service)" "$v"
-	v="$(cat "$PANEL_DIR/panel.version" 2>/dev/null || echo "-")"
+	v="$(installed_version panel)"; v="${v:--}"
 	[ -x "$BIN_DIR/veilway-panel" ] || v="not installed"
 	printf '  %-14s %-34s %s\n' "panel" "$(unit_state veilway-panel.service)" "$v"
-	printf '  %-14s %-34s %s\n' "config" "$([ -f "$CONF_DIR/config.json" ] && echo present || echo missing)" "$CONF_DIR/config.json"
+	printf '  %-14s %-34s %s\n' "config" "$([ -f "$NODE_DIR/config.json" ] && echo present || echo missing)" "$NODE_DIR/config.json"
 	printf '  %-14s %-34s %s\n' "state" "$([ -d "$STATE_DIR" ] && echo present || echo missing)" "$STATE_DIR"
 	printf '  %-14s %-34s %s\n' "backups" "$(find "$BACKUP_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files" "$BACKUP_DIR"
 	printf '\n'
@@ -520,27 +574,27 @@ do_restart() {
 	[ "$comp" = node ] || svc restart veilway-panel.service
 }
 
-node_flags() { printf '%s\n' --config "$CONF_DIR/config.json" --state "$STATE_DIR/veilway-state.json" --replay "$STATE_DIR/veilway-replay" --api /run/veilway/control.sock; }
+node_flags() { printf '%s\n' --config "$NODE_DIR/config.json" --state "$STATE_DIR/veilway-state.json" --replay "$STATE_DIR/veilway-replay" --api /run/veilway/control.sock; }
 
 # Runs veilway as the service user so the file checks match what the service sees.
 as_node() {
-	local flags
-	mapfile -t flags < <(node_flags)
-	if [ "$(id -u)" = 0 ] && has setpriv; then setpriv --reuid veilway --regid veilway --clear-groups "$BIN_DIR/veilway" "$1" "${flags[@]}"
-	else "$BIN_DIR/veilway" "$1" "${flags[@]}"; fi
+	if [ "$(id -u)" = 0 ] && has setpriv; then setpriv --reuid veilway --regid veilway --clear-groups "$BIN_DIR/veilway" "$@"
+	else "$BIN_DIR/veilway" "$@"; fi
 }
 
 run_check() {
+	if [ "$DRY" = 1 ]; then dry "veilway check of $NODE_DIR/config.json as the service user"; return 0; fi
 	[ -x "$BIN_DIR/veilway" ] || die "the node is not installed"
-	[ -f "$CONF_DIR/config.json" ] || die "no $CONF_DIR/config.json yet"
-	if [ "$DRY" = 1 ]; then dry "veilway check --config $CONF_DIR/config.json"; return 0; fi
-	"$BIN_DIR/veilway" check --config "$CONF_DIR/config.json"
+	[ -f "$NODE_DIR/config.json" ] || die "no $NODE_DIR/config.json yet"
+	as_node check --config "$NODE_DIR/config.json"
 }
 
 do_doctor() {
+	local flags
 	[ -x "$BIN_DIR/veilway" ] || die "the node is not installed"
 	if [ "$DRY" = 1 ]; then dry "veilway doctor with the service's paths"; return 0; fi
-	as_node doctor
+	mapfile -t flags < <(node_flags)
+	as_node doctor "${flags[@]}"
 }
 
 backup_paths() { printf '%s\n' "${CONF_DIR#/}" "${STATE_DIR#/}/veilway-state.json" "${PANEL_DIR#/}"; }
@@ -561,16 +615,19 @@ do_backup() {
 do_restore() {
 	local file="${1:-}"
 	need_root
+	refuse_links
 	[ -n "$file" ] || die "usage: veilway.sh restore <backup.tar.gz>"
 	[ -r "$file" ] || [ "$DRY" = 1 ] || die "cannot read $file"
 	confirm "Restore $file over $CONF_DIR, the usage state and the panel data?" || die "cancelled"
 	if [ "$DRY" = 1 ]; then dry "stop services, save current files to $BACKUP_DIR, extract $file to /, fix owners, start services"; return 0; fi
 	grep -qE '(^/|(^|/)\.\.(/|$))' <<<"$(tar -tzf "$file")" && die "the archive has unsafe paths: refusing"
+	grep -q '^[lh]' <<<"$(tar -tvzf "$file")" && die "the archive has links: refusing"
 	do_backup "$BACKUP_DIR/pre-restore-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || true
 	svc stop veilway.service; svc stop veilway-panel.service
 	tar -xzf "$file" -C / --no-same-owner
-	id veilway >/dev/null 2>&1 && { chown -R root:veilway "$CONF_DIR"; chown veilway:veilway "$CONF_DIR/config.json" 2>/dev/null || true; chown veilway:veilway "$STATE_DIR/veilway-state.json" 2>/dev/null || true; }
-	id veilway-panel >/dev/null 2>&1 && chown -R veilway-panel:veilway-panel "$PANEL_DIR"
+	id veilway >/dev/null 2>&1 && { chown root:veilway "$CONF_DIR"; chmod 0750 "$CONF_DIR"; prepare_node_dir; chown -h -R veilway:veilway "$NODE_DIR"; chown -h veilway:veilway "$STATE_DIR/veilway-state.json" 2>/dev/null || true; }
+	chown -h root:veilway-panel "$CONF_DIR/panel.json" 2>/dev/null || true
+	id veilway-panel >/dev/null 2>&1 && chown -h -R veilway-panel:veilway-panel "$PANEL_DIR"
 	svc start veilway.service; svc start veilway-panel.service
 	step "restored from $file"
 }
@@ -593,8 +650,8 @@ do_uninstall() {
 
 do_version() {
 	local n p
-	n="$([ -x "$BIN_DIR/veilway" ] && cat "$STATE_DIR/node.version" 2>/dev/null || echo "not installed")"
-	p="$([ -x "$BIN_DIR/veilway-panel" ] && cat "$PANEL_DIR/panel.version" 2>/dev/null || echo "not installed")"
+	n="$([ -x "$BIN_DIR/veilway" ] && installed_version node || echo "not installed")"
+	p="$([ -x "$BIN_DIR/veilway-panel" ] && installed_version panel || echo "not installed")"
 	row "installer" "$SCRIPT_VERSION"
 	row "node" "$n"
 	row "panel" "$p"
@@ -626,6 +683,17 @@ menu() {
 	done
 }
 
+# The test overrides move downloads and trusted keys away from the release channel, so each one is shown and needs a yes.
+accept_overrides() {
+	local v
+	[ "${#OVERRIDES[@]}" -gt 0 ] || return 0
+	warn "test overrides are set, so downloads and keys do not come from the release channel:"
+	for v in "${OVERRIDES[@]}"; do info "$v"; done
+	[ "$DRY" = 1 ] && return 0
+	if [ "$ASSUME_YES" = 1 ]; then [ "${VEILWAY_TESTING:-}" = 1 ] || die "test overrides with --yes need VEILWAY_TESTING=1"; return 0; fi
+	[ "$(ask "Use these test overrides? [y/N]" n | tr '[:upper:]' '[:lower:]')" = y ] || die "cancelled"
+}
+
 main() {
 	local args=() cmd
 	while [ $# -gt 0 ]; do
@@ -639,7 +707,10 @@ main() {
 		esac
 		shift
 	done
-	[ -z "$WANT_VERSION" ] || [[ "$WANT_VERSION" =~ ^v?[0-9A-Za-z._-]+$ ]] || die "that version is not a release tag"
+	[ -z "$WANT_VERSION" ] || [[ "$WANT_VERSION" =~ $TAG_RE ]] || die "that version is not a release tag"
+	[[ "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$PANEL_PORT))" -ge 1 ] && [ "$((10#$PANEL_PORT))" -le 65535 ] || die "VEILWAY_PANEL_PORT must be a port from 1 to 65535"
+	PANEL_PORT=$((10#$PANEL_PORT))
+	accept_overrides
 	[ "$DRY" = 1 ] && warn "dry run: nothing will be changed"
 	cmd="${args[0]:-}"
 	[ "${#args[@]}" -gt 0 ] && args=("${args[@]:1}")

@@ -118,7 +118,7 @@ wait_for 60 srv sh -c 'systemctl is-system-running 2>/dev/null | grep -q -E "run
 srv ip route add $A.0/24 via $RB
 srv sh -c 'cp /gate/ca.pem /usr/local/share/ca-certificates/gate-ca.crt && update-ca-certificates >/dev/null 2>&1' || die "trusting the test CA in the server"
 echo "== 1. the install script, node and panel, against the local release server"
-srv env VEILWAY_RELEASE_BASE=https://$RELHOST VEILWAY_RAW_BASE=https://$RELHOST/raw VEILWAY_NODE_PUBKEY="$NODE_PUBKEY" VEILWAY_PANEL_PUBKEY="$PANEL_PUBKEY" bash /veilway.sh install both --yes 2>&1 | tee "$WORK/install.log" | sed 's/^/    /'
+srv env VEILWAY_TESTING=1 VEILWAY_RELEASE_BASE=https://$RELHOST VEILWAY_RAW_BASE=https://$RELHOST/raw VEILWAY_NODE_PUBKEY="$NODE_PUBKEY" VEILWAY_PANEL_PUBKEY="$PANEL_PUBKEY" bash /veilway.sh install both --yes 2>&1 | tee "$WORK/install.log" | sed 's/^/    /'
 [ "${PIPESTATUS[0]}" = 0 ]; check $? "veilway.sh install both finished" "log in $WORK/install.log"
 srv systemctl is-active veilway.service veilway-panel.service >/dev/null; check $? "the node and the panel services run"
 srv test -S /run/veilway/control.sock; check $? "the node's control socket exists"
