@@ -12,7 +12,7 @@
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
 # comment must read "veilway <tag> <asset>". Nothing is installed without that check.
-# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8080), VEILWAY_PANEL_PUBKEY (default: the key below).
+# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480), VEILWAY_PANEL_PUBKEY (default: the key below).
 set -euo pipefail
 umask 022
 
