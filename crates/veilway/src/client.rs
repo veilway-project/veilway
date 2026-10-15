@@ -67,8 +67,17 @@ fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 	if !rustix::process::geteuid().is_root() {bail!("the client changes the routes, the firewall and the resolver, which only root can do: run it with sudo")}
 	let dir = given.unwrap_or_else(|| Path::new(state::DATA).join("client"));
-	state::secure_dir(&dir, 0o700).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
-	Ok(dir)
+	// Every folder above it is checked too (root's, closed to others), and the resolved path is the one used.
+	state::secure_tree(&dir, 0o700).with_context(|| format!("cannot use {} for the client's files", dir.display()))
+}
+
+/// What the LaunchDaemon runs at boot: the kill switch back, if a connection that did not stop left it to be.
+#[cfg(target_os = "macos")]
+pub async fn restore() -> anyhow::Result<()> {
+	let options = Options::default();
+	let lock = state::lock(&options.run_dir).await?;
+	if platform::restore(&options, &lock)? {println!("The kill switch of a connection that did not stop was put back.")} else {println!("Nothing to restore.")}
+	Ok(())
 }
 
 /// The directory for the vault and the memory of the client: the one given, else `Veilway\client` in ProgramData. It is made for administrators and SYSTEM only, and a link is an error.

@@ -2,12 +2,13 @@
 use crate::dns::{self, Pinned};
 use crate::firewall::{self, Endpoint, Rules};
 use crate::networks::{self, Own};
+use crate::persist;
 use crate::routes::{self, Layout, Routes};
 use crate::tun::{self, Tun};
 use crate::{rtsock, sock, state, watch::Watch};
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,7 @@ pub struct Options {
 	/// With the LAN: let mDNS, LLMNR and NetBIOS go too, so that local names resolve. Without it they are dropped, as every query for a name outside the tunnel is.
 	pub local_names: bool,
 	pub run_dir: PathBuf,
-	/// Where what has to survive a crash is kept: the pf token. Root only.
+	/// Where what has to survive a reboot is kept: the marker that brings the kill switch back at boot. Root only. The pf token is in `run_dir`, which a reboot empties as it does pf.
 	pub state_dir: PathBuf,
 }
 
@@ -87,10 +88,15 @@ pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings,
 	let (own, physical) = (networks::read(None).map_err(|error| before(error.into()))?, Arc::new(AtomicU32::new(0)));
 	physical.store(own.interface.unwrap_or(0), Ordering::Relaxed);
 	let gateways = profile.gateways.clone();
-	let protected = Layout {routes: &options.routes, gateways: &gateways}.protected();
+	let protected = Layout {routes: &options.routes, gateways: &gateways, addresses: &profile.device.addresses}.protected();
 	let rules = Rules {tun: None, nodes: endpoints(profile), protected, lan: options.allow_lan, local_names: options.local_names};
 	// With the kill switch off nothing is protected, but names still only go through the tunnel (port 53 is blocked elsewhere), and what an earlier client left is replaced, so that its rules do not drop this client's connections to nodes the old profile did not list.
-	firewall::install(&Rules {protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()}, &options.state_dir, true).map_err(|error| before(error.into()))?;
+	let first = Rules {protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()};
+	firewall::install(&first, &options.run_dir, true).map_err(|error| before(error.into()))?;
+	// The rules do not survive a reboot, so a connection with the kill switch on leaves a marker that a LaunchDaemon turns back into the rules at boot. Without the kill switch there is nothing to restore.
+	if options.kill_switch {
+		if let Err(error) = persist::arm(&options.state_dir, &first.ruleset()) {tracing::warn!(%error, "the kill switch will not be restored at boot if this device restarts before `veilway disconnect`")}
+	} else if let Err(error) = persist::forget(&options.state_dir) {tracing::warn!(%error, "the marker of an earlier connection could not be removed")}
 	if options.kill_switch {tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device")}
 	settings.socket = Some(sock::hook(physical.clone()));
 	let mut up = Up::default();
@@ -104,7 +110,7 @@ pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings,
 			let problems = up.undo(options, !options.kill_switch).await;
 			if !problems.is_empty() {tracing::warn!(?problems, "the connection could not be closed down completely")}
 			tracing::error!(error = format!("{error:#}"), kill_switch = options.kill_switch, "the connection ended without being asked to");
-			Err(Failure {error, kept: options.kill_switch})
+			Err(Failure {error, kept: options.kill_switch && firewall::present() != Some(false)})
 		}
 	}
 }
@@ -123,15 +129,16 @@ impl Up {
 		let tun = self.tun.insert(Tun::create(&options.interface)?);
 		tun::configure(&tun.name, &profile.device.addresses, &profile.gateways, mtu)?;
 		// The interface is known now: from here the tunnel's traffic may leave by it, and the routes below may send it there.
-		firewall::install(&Rules {tun: Some(tun.name.clone()), protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()}, &options.state_dir, false)?;
-		let skipped = rtsock::apply(tun.index, &routes::plan(&Layout {routes: &options.routes, gateways: &profile.gateways}))?;
+		let enforced = Rules {tun: Some(tun.name.clone()), protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()};
+		firewall::install(&enforced, &options.run_dir, false)?;
+		let skipped = rtsock::apply(tun.index, &routes::plan(&Layout {routes: &options.routes, gateways: &profile.gateways, addresses: &profile.device.addresses}))?;
 		if !skipped.is_empty() {tracing::info!(?skipped, "some routes that this device may not have could not be made")}
 		let dns = self.dns.insert(Pinned::pin(&profile.gateways)?);
 		// The name of the interface is the kernel's own and the rest is the profile's: nothing a node says reaches here (invariant 23).
 		let applied = Applied {interface: tun.name.clone(), kill_switch: options.kill_switch, dns: dns.describe(), split: match &options.routes {Routes::Full => None, Routes::Split(nets) => Some(nets.iter().map(ToString::to_string).collect())}, allow_lan: options.allow_lan};
 		tracing::info!(interface = %tun.name, mtu, resolver = dns.describe(), "the tunnel's interface is up, with its routes and its resolver");
 		let (mut buf, watch, mut dropped) = (vec![0u8; 65536], Watch::open()?, 0u64);
-		let (mut ticker, settle, mut burst) = (interval(Duration::from_secs(30)), sleep(Duration::MAX), None::<Instant>);
+		let (mut ticker, settle, mut burst) = (interval(Duration::from_secs(10)), sleep(Duration::MAX), None::<Instant>);
 		tokio::pin!(stop, settle);
 		on_status(&status_rx.borrow_and_update().clone(), &applied);
 		loop {
@@ -180,17 +187,21 @@ impl Up {
 						}
 						Err(error) => tracing::warn!(%error, "the device's networks could not be read"),
 					}
+					guard(&enforced, &options.run_dir);
 					match dns.verify() {
 						Ok(true) => tracing::info!("something replaced the resolver entry and it was set again"),
 						Ok(false) => {}
 						Err(error) => tracing::warn!(%error, "the resolver entry could not be checked"),
 					}
 				}
-				_ = ticker.tick() => match dns.verify() {
-					Ok(true) => tracing::info!("something replaced the resolver entry and it was set again"),
-					Ok(false) => {}
-					Err(error) => tracing::warn!(%error, "the resolver entry could not be checked"),
-				},
+				_ = ticker.tick() => {
+					guard(&enforced, &options.run_dir);
+					match dns.verify() {
+						Ok(true) => tracing::info!("something replaced the resolver entry and it was set again"),
+						Ok(false) => {}
+						Err(error) => tracing::warn!(%error, "the resolver entry could not be checked"),
+					}
+				}
 				reason = &mut stop => return match reason {Stop::Asked => Ok(()), Stop::Hangup => Err(anyhow::anyhow!("the terminal went away"))},
 			}
 		}
@@ -212,11 +223,20 @@ impl Up {
 		}
 		if let Err(error) = dns::clear() {problems.push(format!("resolver: {error}"))}
 		state::remove_status(&options.run_dir);
-		match firewall::remove(&options.state_dir) {
+		match firewall::remove(&options.run_dir).and_then(|()| persist::forget(&options.state_dir)) {
 			Ok(()) => tracing::info!("the kill switch was removed"),
 			Err(error) => problems.push(format!("the kill switch is still in force and `veilway disconnect` removes it: {error}")),
 		}
 		problems
+	}
+}
+
+// Checks that the kill switch is in force and puts it back if something took it away.
+fn guard(rules: &Rules, run_dir: &Path) {
+	match firewall::verify(rules, run_dir) {
+		Ok(true) => tracing::warn!("the kill switch had been taken away (pf disabled, or the anchor flushed, by another program) and was put back"),
+		Ok(false) => {}
+		Err(error) => tracing::error!(%error, "the kill switch is not in force and could not be put back"),
 	}
 }
 
@@ -232,12 +252,22 @@ pub fn cleanup(options: &Options, _lock: &state::Lock) -> anyhow::Result<Cleaned
 		Err(error) => problems.push(format!("resolver: {error}")),
 	}
 	state::remove_status(&options.run_dir);
-	if firewall::present() != Some(false) {
-		match firewall::remove(&options.state_dir) {
-			Ok(()) => cleaned.kill_switch = true,
-			Err(error) => problems.push(format!("the kill switch: {error}")),
-		}
+	// Whether pf is on or not, rules in the anchor, a token or a marker are taken away: a disabled pf still has them, and the marker would bring them back at boot.
+	let was = firewall::loaded() == Some(true);
+	match firewall::remove(&options.run_dir).and_then(|()| persist::forget(&options.state_dir)) {
+		Ok(()) => cleaned.kill_switch = was,
+		Err(error) => problems.push(format!("the kill switch: {error}")),
 	}
 	tracing::info!(?cleaned, ?problems, "cleaned up");
 	if problems.is_empty() {Ok(cleaned)} else {Err(anyhow::anyhow!("{}", problems.join("; ")))}
+}
+
+/// What the LaunchDaemon runs at boot (`veilway restore`): puts the kill switch back if a connection left a marker, and does nothing if none did. True when it put it back. The lock is the proof that no client runs, which would have its own rules in force.
+pub fn restore(options: &Options, _lock: &state::Lock) -> anyhow::Result<bool> {
+	state::secure_dir(&options.run_dir, 0o755)?;
+	state::secure_dir(&options.state_dir, 0o700)?;
+	let Some(ruleset) = persist::kept(&options.state_dir)? else {return Ok(false)};
+	firewall::install_text(&ruleset, &options.run_dir, false)?;
+	tracing::info!("the kill switch of a connection that did not stop was put back at boot");
+	Ok(true)
 }

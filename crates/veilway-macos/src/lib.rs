@@ -8,12 +8,18 @@
 //!
 //! **What is not tested.** This layer was written without a Mac. It is compile-checked on Linux (`cargo check --target aarch64-apple-darwin`, with zig as the C compiler for `ring`), which covers the code behind `cfg(target_os = "macos")` for types and names; nothing has run, and the pure parts (everything the tests above name) are what the unit tests run on Linux. The macOS runner of GitHub Actions and a real Mac are still to show: the utun (the control socket, the four-byte header, `ifconfig` with a point-to-point address), the routes (that an interface route with a link-level gateway is accepted as `route -interface` makes it, that `RTM_GET` for `0/0` answers with the primary default route and its interface, the byte layout of the messages), `IP_BOUND_IF` (that a socket bound to the physical interface is never caught by the halves), every pf rule (that `pfctl` takes the syntax, that the rules of the other anchors under `com.apple` come before ours and let nothing through that ours would block, that `quick` rules of ours decide, `no state` for DHCP, that the first install's flush of states cuts the connections that were open), `pfctl -E` and its token (the output the parser reads), the resolver entry (that `mDNSResponder` makes the match-all supplemental resolver of it the first, that `scutil` takes the empty string, that scoped queries do not go around it), the system keychain (that root can add and read the item without a prompt, what happens when the binary is replaced by a build with another signature), the folder checks on `/var/run` and `/Library/Application Support`, the routing socket's change messages, and the other traffic of macOS with the kill switch on (Apple services, captive portal detection, AirDrop, Handoff).
 //!
-//! **Known limits.** The pf rules are not reloaded after a reboot, so a reboot while connected ends with no kill switch until the user connects again (the Windows layer has boot-time filters, and macOS has no equivalent without a launch daemon, which comes with the app). The client cannot tell its own transport socket from another root process's, so the rule for the nodes is by address, port and protocol, as on the other systems without a mark. `allow_lan` lets the LAN's ranges out only; the routes of a full tunnel do not take the physical link's on-link subnets into the tunnel, so with the kill switch off the LAN stays reachable. Inbound is blocked on every interface that is not the tunnel, except DHCP, neighbor discovery and, with local names, the LAN's answers to mDNS, LLMNR and NetBIOS. The caches of `mDNSResponder` are not flushed.
+//! **Known limits.** The pf rules do not survive a reboot. A connection with the kill switch on leaves a marker (the tunnel-less ruleset) and a LaunchDaemon, installed at the first connect, runs `veilway restore` at boot to load it (`persist`); both go only with a clean stop or `cleanup`. The daemon races the system's own pf setup at boot, which nothing here has seen, and it names the program only if the program and its folders are root's. Another program that disables pf or flushes the anchor is noticed within ten seconds or at the next change of the networks, and the rules and pf are put back (`firewall::verify`). The client cannot tell its own transport socket from another root process's, so the rule for the nodes is by address, port and protocol, as on the other systems without a mark. `allow_lan` lets the LAN's ranges out only; the routes of a full tunnel do not take the physical link's on-link subnets into the tunnel, so with the kill switch off the LAN stays reachable. Inbound is blocked on every interface that is not the tunnel, except DHCP, neighbor discovery and, with local names, the LAN's answers to mDNS, LLMNR and NetBIOS. The caches of `mDNSResponder` are not flushed.
+// What touches files, owners and modes, or runs the system's programs, is Unix only (the workspace builds this crate on Windows too, where only the plain data below compiles and is tested).
+#[cfg(unix)]
 pub mod dns;
+#[cfg(unix)]
 pub mod firewall;
 pub mod networks;
+#[cfg(unix)]
+pub mod persist;
 pub mod routes;
 pub mod rtsock;
+#[cfg(unix)]
 pub mod state;
 pub mod tun;
 pub mod vault;
@@ -27,4 +33,4 @@ mod watch;
 #[cfg(target_os = "macos")]
 pub use routes::Routes;
 #[cfg(target_os = "macos")]
-pub use run::{cleanup, run, Applied, Cleaned, Failure, Options, Stop};
+pub use run::{cleanup, restore, run, Applied, Cleaned, Failure, Options, Stop};

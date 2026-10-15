@@ -31,8 +31,28 @@ pub fn dumped_servers(output: &str) -> Vec<IpAddr> {
 	found
 }
 
-/// Whether the entry is there with exactly these servers.
-pub fn rule_holds(output: &str, servers: &[IpAddr]) -> bool {dumped_servers(output) == servers.iter().take(SERVERS_MAX).copied().collect::<Vec<_>>()}
+/// The match domains a dump of the entry lists. scutil takes `""` as an empty string and the dump shows `0 : ` with nothing after the colon; if it had stored the two quote characters the dump would show them, and `rule_holds` refuses that.
+pub fn dumped_domains(output: &str) -> Vec<String> {
+	let (mut inside, mut found) = (false, Vec::new());
+	for line in output.lines().map(str::trim) {
+		if line.starts_with("SupplementalMatchDomains") {inside = true} else if inside && line == "}" {break} else if inside {
+			if let Some((_, value)) = line.split_once(':') {found.push(value.trim().to_owned())}
+		}
+	}
+	found
+}
+
+/// Whether the entry is there with exactly these servers and the one empty match domain.
+pub fn rule_holds(output: &str, servers: &[IpAddr]) -> bool {dumped_servers(output) == servers.iter().take(SERVERS_MAX).copied().collect::<Vec<_>>() && dumped_domains(output) == [""]}
+
+// Tells `mDNSResponder` to read its configuration and drop its cache, so that a name asked before the pin (or after its removal) is not answered from the old resolver. Not being able to is told and not an error.
+fn flush_cache() {
+	match program("killall").and_then(|path| Command::new(path).args(["-HUP", "mDNSResponder"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()) {
+		Ok(status) if status.success() => {}
+		Ok(status) => tracing::warn!(%status, "mDNSResponder was not told to flush its cache"),
+		Err(error) => tracing::warn!(%error, "mDNSResponder was not told to flush its cache"),
+	}
+}
 
 /// The name servers of the first resolver of the default configuration in the output of `scutil --dns`, which is the one a name that matches no domain of another goes to.
 pub fn first_resolver(output: &str) -> Vec<IpAddr> {
@@ -67,7 +87,12 @@ fn run(script: &str) -> io::Result<String> {
 fn dump() -> io::Result<String> {Ok(scutil(&[], &show_script())?.1)}
 
 /// Removes the entry. Nothing is wrong if it is not there.
-pub fn clear() -> io::Result<()> {if present()? {run(&remove_script()).map(drop)} else {Ok(())}}
+pub fn clear() -> io::Result<()> {
+	if !present()? {return Ok(())}
+	run(&remove_script())?;
+	flush_cache();
+	Ok(())
+}
 
 /// Whether an entry of ours is in the store, from an earlier connection or this one.
 pub fn present() -> io::Result<bool> {Ok(!dumped_servers(&dump()?).is_empty())}
@@ -80,7 +105,8 @@ impl Pinned {
 		if servers.is_empty() {return Err(io::Error::new(io::ErrorKind::InvalidInput, "the profile names no resolver"))}
 		run(&set_script(servers))?;
 		let pinned = Self {servers: servers.to_vec()};
-		if !pinned.holds()? {return Err(io::Error::other("the resolver entry was set and is not in the store"))}
+		if !pinned.holds()? {return Err(io::Error::other("the resolver entry was set and is not in the store as it was meant to be (the servers, and one empty match domain)"))}
+		flush_cache();
 		match scutil(&["--dns"], "") {
 			Ok((true, dump)) if first_resolver(&dump) != pinned.servers.iter().take(SERVERS_MAX).copied().collect::<Vec<_>>() => tracing::warn!(first = ?first_resolver(&dump), "the first resolver of the system is not the tunnel's, so some names may not resolve while pf blocks the port"),
 			Ok(_) => {}
@@ -94,6 +120,7 @@ impl Pinned {
 	pub fn verify(&self) -> io::Result<bool> {
 		if self.holds()? {return Ok(false)}
 		run(&set_script(&self.servers))?;
+		flush_cache();
 		Ok(true)
 	}
 	pub fn restore(self) -> io::Result<()> {clear()}
@@ -130,6 +157,8 @@ mod tests {
 		assert!(!rule_holds("  No such key\n", &servers()));
 		assert!(!rule_holds(&DUMP.replace("10.200.0.1", "9.9.9.9"), &servers()));
 		assert!(dumped_servers("").is_empty());
+		assert_eq!(dumped_domains(DUMP), [""]);
+		assert!(!rule_holds(&DUMP.replace("0 : \n  }\n  SupplementalMatchOrders", "0 : \"\"\n  }\n  SupplementalMatchOrders"), &servers()), "two literal quote characters are not an empty string");
 	}
 
 	#[test]
