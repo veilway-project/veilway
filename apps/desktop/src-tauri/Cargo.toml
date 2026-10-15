@@ -5,7 +5,7 @@ edition="2021"
 license="Apache-2.0"
 publish=false
 repository="https://github.com/veilway-project/veilway"
-description="Windows desktop client for Veilway"
+description="Desktop client for Veilway"
 
 # Standalone: the root workspace excludes this path so the Tauri crate keeps its own lockfile and profiles.
 [workspace]
@@ -14,16 +14,43 @@ description="Windows desktop client for Veilway"
 tauri-build="2"
 
 [dependencies]
-veilway-client={path="../../../crates/veilway-client"}
+veilway-engine={path="../../../crates/veilway-engine"}
+veilway-proto={path="../../../crates/veilway-proto"}
 tauri={version="2", features=["tray-icon"]}
 tauri-plugin-single-instance="2"
 tauri-plugin-updater="2"
 tauri-plugin-process="2"
 serde={version="1", features=["derive"]}
 serde_json="1"
-tokio={version="1", features=["sync", "time", "rt"]}
+tokio={version="1", features=["rt-multi-thread", "net", "io-util", "sync", "time", "macros"]}
 tracing="0.1"
 tracing-subscriber={version="0.3", default-features=false, features=["registry", "std"]}
+anyhow="1"
+base64="0.23"
+ring="0.17"
+ipnet={version="2", features=["serde"]}
+# Pictures are read in the unprivileged app, with size limits, and only to find a QR code in them.
+image={version="0.25", default-features=false, features=["png", "jpeg"]}
+rqrr="0.9"
+
+# The platform layer runs in the helper, which is this same binary started with --helper and elevated once (see helper.rs).
+[target.'cfg(unix)'.dependencies]
+libc="0.2.150"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+veilway-linux={path="../../../crates/veilway-linux"}
+rustix={version="1", default-features=false, features=["std", "process"]}
+
+[target.'cfg(target_os = "macos")'.dependencies]
+veilway-macos={path="../../../crates/veilway-macos"}
+rustix={version="1", default-features=false, features=["std", "process"]}
+
+[target.'cfg(windows)'.dependencies]
+veilway-windows={path="../../../crates/veilway-windows"}
+
+[dev-dependencies]
+veilway-engine={path="../../../crates/veilway-engine", features=["unencrypted-vault", "testing"]}
+qrcode={version="0.14", default-features=false}
 
 [profile.release]
 opt-level="s"
