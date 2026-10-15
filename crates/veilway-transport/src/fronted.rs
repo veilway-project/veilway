@@ -26,10 +26,10 @@ pub(crate) const POLL_LEAST: Duration = Duration::from_secs(60);
 const REPEATS: usize = 3;
 
 // One request with a body: "Both bodies are sent with `Content-Type: application/octet-stream` and a `Content-Length`", and exactly one of the latter.
-// The other fields are those of Chrome's `fetch` from a page of the same host. `identity` because the client reads no content coding: a front that compressed the answer would break the session.
+// The other fields are those of Chrome's `fetch` from a page of the same host. Chrome's `Accept-Encoding` too: the node's answers are `application/octet-stream` of sealed bytes, which fronts do not compress, and an answer that comes with a content coding is refused as a fault.
 fn post(path: &str, query: &str, host: &str, body: &[u8]) -> Vec<u8> {
 	let (_, platform, mobile, _) = PLATFORM;
-	[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nsec-ch-ua: \"Google Chrome\";v=\"{CHROME}\", \"Chromium\";v=\"{CHROME}\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-platform: {platform}\r\nsec-ch-ua-mobile: {mobile}\r\n{}Content-Type: application/octet-stream\r\nAccept: */*\r\nOrigin: https://{host}\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\nReferer: https://{host}/\r\nAccept-Encoding: identity\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n", body.len(), http::user_agent()).as_bytes(), body].concat()
+	[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nsec-ch-ua: \"Google Chrome\";v=\"{CHROME}\", \"Chromium\";v=\"{CHROME}\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-platform: {platform}\r\nsec-ch-ua-mobile: {mobile}\r\n{}Content-Type: application/octet-stream\r\nAccept: */*\r\nOrigin: https://{host}\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\nReferer: https://{host}/\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n", body.len(), http::user_agent()).as_bytes(), body].concat()
 }
 
 // Writes one request and reads its answer into `buf`, which then holds nothing else. `written` is set when the request has left whole. Where the body of a `200` lies and whether the answer ends its connection, or how the exchange stopped: by what the peer said, a `close_notify` included, or cut.
