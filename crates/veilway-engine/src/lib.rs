@@ -77,6 +77,8 @@ pub struct Settings {
 	pub network: String,
 	/// The languages of the app, in order of preference, for the texts a signed profile has in several.
 	pub languages: Vec<Tag>,
+	/// Filled by `Tunnel::start`: the way for an app to reach the tunnel a platform layer runs for it (`select_exit`).
+	pub handle: Handle,
 	// The hooks of the tests. The field is in every build, so that `Settings` is the same struct in all of them; it can be set only with the `testing` feature.
 	hooks: Hooks,
 }
@@ -86,7 +88,7 @@ struct Hooks {pause: Option<Pause>, redirect: Option<Redirect>}
 
 impl Settings {
 	/// The settings of a tunnel with the three things every platform has: where the client remembers things, the device's clock and the roots. The rest starts empty and is set as the fields are: the hook for the sockets, the device's own networks, the app's languages.
-	pub fn new(store: Arc<Store>, clock: Clock, roots: Arc<rustls::RootCertStore>, network: String) -> Self {Self {store, clock, roots, socket: None, networks: Vec::new(), network, languages: Vec::new(), hooks: Hooks::default()}}
+	pub fn new(store: Arc<Store>, clock: Clock, roots: Arc<rustls::RootCertStore>, network: String) -> Self {Self {store, clock, roots, socket: None, networks: Vec::new(), network, languages: Vec::new(), handle: Handle::default(), hooks: Hooks::default()}}
 	/// Makes the waits of the client rules with `pause` and not with the runtime's sleep. Only with the `testing` feature.
 	#[cfg(feature = "testing")]
 	pub fn with_pause(mut self, pause: Pause) -> Self {
@@ -99,6 +101,16 @@ impl Settings {
 		self.hooks.redirect = Some(redirect);
 		self
 	}
+}
+
+/// The commands of the running tunnel, for an app whose platform layer owns the `Tunnel`. It is empty until a tunnel started with these settings, and a command to a tunnel that ended is dropped (`false`).
+#[derive(Clone, Default)]
+pub struct Handle(Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<Command>>>>);
+
+impl Handle {
+	fn send(&self, command: Command) -> bool {self.0.lock().unwrap().as_ref().is_some_and(|sender| sender.send(command).is_ok())}
+	pub fn select_exit(&self, tag: Option<String>) -> bool {self.send(Command::Exit(tag))}
+	pub fn connect_again(&self) -> bool {self.send(Command::Again)}
 }
 
 /// The roots of the Mozilla list, for a platform that has none of its own.
@@ -176,6 +188,7 @@ impl Tunnel {
 		if !ask.is_empty() {return Err(StartError::Ask(ask))}
 		if plan.order.is_empty() {return Err(StartError::Nothing)}
 		let (commands, input) = mpsc::unbounded_channel();
+		*settings.handle.0.lock().unwrap() = Some(commands.clone());
 		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
 		let (status_tx, status) = watch::channel(Status::off(profile.name.as_str().to_owned(), profile.mtu));
 		let core = engine::Core::new(engine::Parts {settings, profile: profile.clone(), subscription: Arc::new(subscription.clone()), link, key, store_key, kept, commands: input, from_platform: from, to_platform: to, status: status_tx, events: events.clone(), refused: refused.clone()});

@@ -9,6 +9,34 @@ pub const REQUEST_MAX: usize = 4 << 20;
 /// The longest line the app reads from the helper: a library with logos.
 pub const REPLY_MAX: usize = 16 << 20;
 pub const TOKEN_LEN: usize = 64;
+pub const NONCE_LEN: usize = 32;
+
+pub fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
+
+fn unhex(text: &str) -> Option<Vec<u8>> {
+	if text.len() % 2 != 0 || !text.is_ascii() {return None}
+	(0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
+}
+
+pub fn random_hex(bytes: usize) -> std::io::Result<String> {
+	let mut buffer = vec![0u8; bytes];
+	ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buffer).map_err(|_| std::io::Error::other("no random source"))?;
+	Ok(hex(&buffer))
+}
+
+fn message(role: &str, first: &str, second: &str) -> String {format!("veilway-desktop-helper|{role}|{first}|{second}")}
+
+/// HMAC-SHA256 under the token over the role ("server" or "client") and the two nonces, the first being the one the prover was given.
+pub fn proof(token: &str, role: &str, first: &str, second: &str) -> String {
+	hex(ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes()), message(role, first, second).as_bytes()).as_ref())
+}
+
+/// Checks a proof in constant time.
+pub fn verify(token: &str, role: &str, first: &str, second: &str, given: &str) -> bool {
+	unhex(given).is_some_and(|bytes| ring::hmac::verify(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token.as_bytes()), message(role, first, second).as_bytes(), &bytes).is_ok())
+}
+
+pub fn nonce_ok(nonce: &str) -> bool {nonce.len() == NONCE_LEN && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -31,8 +59,10 @@ pub struct Options {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "call", rename_all = "snake_case")]
 pub enum Call {
-	/// The first line of every connection: the token the app wrote in its own folder.
-	Hello { token: String },
+	/// The first line of every connection: the window's nonce. Nothing secret crosses the channel; see `proof`.
+	Hello { nonce: String },
+	/// The window's proof that it holds the token, answering the helper's `Challenge`.
+	Auth { proof: String },
 	Library { languages: Vec<String> },
 	/// Step 1 of an import. Nothing leaves the device until `ImportProceed`.
 	ImportOpen { source: Source },
@@ -63,6 +93,8 @@ pub struct Frame {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Out {
+	/// The helper's nonce and its proof that it holds the token, so that a window never talks to a process that only listens where the helper should.
+	Challenge { nonce: String, proof: String },
 	Reply { id: u64, ok: Option<Value>, error: Option<String> },
 	Status(StatusView),
 	/// The engine or the platform needs a yes from the user before it goes on. The kill switch is in force while it waits.
@@ -94,6 +126,16 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn proofs_bind_the_role_the_nonces_and_the_token() {
+		let (token, client, server) = ("t".repeat(TOKEN_LEN), "a".repeat(NONCE_LEN), "b".repeat(NONCE_LEN));
+		let given = proof(&token, "server", &client, &server);
+		assert!(verify(&token, "server", &client, &server, &given));
+		assert!(!verify(&token, "client", &client, &server, &given) && !verify(&token, "server", &server, &client, &given) && !verify(&"u".repeat(TOKEN_LEN), "server", &client, &server, &given));
+		assert!(!verify(&token, "server", &client, &server, "zz") && !verify(&token, "server", &client, &server, ""));
+		assert!(nonce_ok(&random_hex(NONCE_LEN / 2).unwrap()) && !nonce_ok("short"));
+	}
+
+	#[test]
 	fn frames_carry_the_id_beside_the_call() {
 		let frame = Frame {id: 7, call: Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options {kill_switch: true, ..Options::default()}}};
 		let text = serde_json::to_string(&frame).unwrap();
@@ -104,7 +146,7 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {token: "t".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed, Call::ImportKeep {keep: true}, Call::ImportCancel, Call::Refresh {subscription: "s".into()}, Call::Remove {subscription: "s".into()}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed, Call::ImportKeep {keep: true}, Call::ImportCancel, Call::Refresh {subscription: "s".into()}, Call::Remove {subscription: "s".into()}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);

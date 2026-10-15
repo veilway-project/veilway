@@ -2,13 +2,14 @@
 //!
 //! **Design.** The window is an ordinary unprivileged process. The helper is this same executable started with `--helper --dir <folder>` and raised once per session, by the system's own prompt: `pkexec` on Linux, `osascript ... with administrator privileges` on macOS, `Start-Process -Verb RunAs` on Windows (`link.rs`). Everything that touches a secret or a system setting lives here: the vault (the root-only data folder of the platform layer, so the window never holds a key or a token), the routes, the kill switch and the resolver, the stored subscriptions and every fetch. The window sends ids and answers, never paths or commands, and receives plain views (`view.rs`).
 //!
-//! **The channel.** A loopback TCP socket on a port the helper picks, one JSON object per line (`proto.rs`). The first line has to carry the token, 32 random bytes in hex that the window wrote to its own folder (mode 600, inside the user's profile) before it started the helper; the helper reads that file without following a link, compares in constant time, drops a connection that does not say it within five seconds, and reads nothing longer than the limits. The token never goes on a command line. The port is written to `<folder>/port` with an exclusive create, so a planted link is never followed by a root process. Any process of the same user can read the token and so drive the helper; it cannot make it do more than the protocol allows (connect a held subscription, disconnect, import with the user's answers). That is the same trust as the user's own `sudo veilway connect`, and it is written down as a limit, not hidden.
+//! **The channel.** A unix socket in a folder only root can write (`/run/veilway-desktop`, `/var/run/veilway-desktop` on macOS), or a named pipe with an access list for the user's SID on Windows (`ipc.rs`); one JSON object per line (`proto.rs`). The socket belongs to the user who raised the helper (polkit's `PKEXEC_UID`, the uid the window names on macOS), is mode 600, and every peer is checked for that uid. Behind that, a mutual proof: the window writes a fresh token (32 random bytes in hex) to its own folder before each helper start, and the two sides prove they hold it with HMAC-SHA256 over each other's nonces, so the token is never sent and a process that only listens where the helper should learns nothing and is not believed. The one thing root reads from the user's side is that token file, through `openat` from a folder opened once with `O_DIRECTORY|O_NOFOLLOW` and owned by that user, as a regular file of theirs; the helper writes nothing there. Requests are read one at a time per connection, longer than the limits is an error, and a window that stops reading (256 lines queued) is dropped. Any process of the same user can still read the token and so drive the helper; it cannot make it do more than the protocol allows (connect a held subscription, disconnect, import with the user's answers). That is the same trust as the user's own `sudo veilway connect`, and it is written down as a limit, not hidden. What the helper logs to the window is only what the veilway crates log at INFO and above, without path, file, key or secret fields. The helper never decodes a picture: a logo goes to the window as raw bytes within a size cap, and the window checks it.
 //!
 //! **Lifetime and the kill switch.** Closing the window or killing the app leaves the helper and a running tunnel as they are (the tray keeps the tunnel up, and a crashed window must not drop the kill switch). The helper exits on `Quit`, or when no window has been connected for two minutes and no tunnel runs. A connection that ends on its own keeps the kill switch in force exactly like the platform layer says (`Ended { kept: true }`), and only `Disconnect` (the platform's `cleanup`) lifts it. The helper adds no teardown of its own to any other path.
 //!
 //! **Per OS.** Linux: root through polkit; the executable and every folder above it have to be root's and closed to others in a release build, or the helper refuses (whoever could replace the file would be root). macOS: root through the administrator prompt; the program is the one in the app bundle, which a drag install leaves writable by the installing user, so a signed LaunchDaemon (`SMAppService`) that checks the signature of its client is the proper form and is open. Windows: an elevated process; `check_install_dir` of the platform layer refuses a folder others can write, and `wintun.dll` has to sit next to the executable (`tauri.windows.conf.json`). A tunnel that is up while the window is away is why Windows NCSI (lesson 3) and the name rules (lesson 6) stay the platform layer's business: nothing here changes them.
 use crate::logs::{LogLayer, START};
-use crate::proto::{read_line, write_line, Call, Frame, Options, Out, Source, REQUEST_MAX, TOKEN_LEN};
+use crate::ipc::{self, Conn, Server};
+use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
 use crate::view::{library_view, status_view, subscription_view, tags, AppliedOut, SubscriptionOut};
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
@@ -19,12 +20,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex, Notify};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use veilway_engine::import::{self, Fetcher, Library, Reviewed};
-use veilway_engine::{ask_text, default_roots, Agree, Settings, StartError, Status, Store};
+use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store};
 use veilway_proto::subscription::client::{Fetching, Standing, Offer, NativeOffer, CarriedOffer};
 use veilway_proto::subscription::payload::Id;
 #[cfg(target_os = "linux")]
@@ -36,11 +36,13 @@ use veilway_windows as platform;
 use platform::state;
 use platform::vault::SecretVault;
 use platform::{Applied, Routes, Stop};
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::MetadataExt;
 
 const IDLE_EXIT: Duration = Duration::from_secs(120);
 const HELLO_WAIT: Duration = Duration::from_secs(5);
+/// What a window may have waiting to be written before it is dropped as one that does not read.
+const CLIENT_QUEUE: usize = 256;
 const STOP_WAIT: Duration = Duration::from_secs(30);
 
 pub fn now() -> u64 {SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())}
@@ -66,6 +68,7 @@ pub struct Core {
 	last: Mutex<Option<crate::view::StatusView>>,
 	quit: Notify,
 	clients: AtomicUsize,
+	handle: Mutex<Option<Handle>>,
 }
 
 #[derive(Serialize)]
@@ -82,7 +85,7 @@ fn kept_message(failure: &platform::Failure) -> String {
 
 impl Core {
 	pub fn new(library: Library, store: Arc<Store>, run: PathBuf) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), store, run, languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0)})
+		Arc::new(Self {library: AsyncMutex::new(library), store, run, languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
 	}
 
 	fn send(&self, out: Out) {let _ = self.push.send(out);}
@@ -95,7 +98,7 @@ impl Core {
 	pub async fn call(self: &Arc<Self>, call: Call) -> Result<Value, String> {
 		let fetcher = || Fetcher::new(default_roots(), None);
 		match call {
-			Call::Hello {..} => Ok(Value::Null),
+			Call::Hello {..} | Call::Auth {..} => Ok(Value::Null),
 			Call::Library {languages} => {
 				*self.languages.lock().unwrap() = languages.into_iter().take(8).collect();
 				self.library_value().await
@@ -115,6 +118,7 @@ impl Core {
 			}
 			Call::ImportProceed => {
 				let mut pending = self.pending.lock().await;
+				if matches!(pending.as_ref(), Some(Pending::Native(_) | Pending::Fetching(_))) {self.fetch_gate()?}
 				let library = self.library.lock().await;
 				let reviewed = match pending.take() {
 					Some(Pending::Native(offer)) => {
@@ -134,7 +138,10 @@ impl Core {
 				to_value(out)
 			}
 			Call::ImportKeep {keep} => {
-				let Some(Pending::Reviewed(reviewed)) = self.pending.lock().await.take() else {return Err("There is no subscription waiting to be kept.".into())};
+				let mut pending = self.pending.lock().await;
+				if keep && matches!(pending.as_ref(), Some(Pending::Reviewed(reviewed)) if reviewed.endpoint.is_some()) {self.fetch_gate()?}
+				let Some(Pending::Reviewed(reviewed)) = pending.take() else {return Err("There is no subscription waiting to be kept.".into())};
+				drop(pending);
 				if keep {
 					let mut library = self.library.lock().await;
 					// A vault that could not be written says why: the user has to know that no safe place for the key was found.
@@ -151,6 +158,7 @@ impl Core {
 				Ok(Value::Null)
 			}
 			Call::Refresh {subscription: id} => {
+				self.fetch_gate()?;
 				let mut library = self.library.lock().await;
 				let at = library.held().iter().position(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?;
 				fetcher().refresh(&mut library, at, now()).await.map_err(|error| error.text().to_owned())?;
@@ -174,17 +182,27 @@ impl Core {
 				self.disconnect().await.map_err(|error| format!("{error:#}"))?;
 				Ok(Value::Null)
 			}
-			Call::SelectExit {..} => Err("Choosing an exit is not available yet: the platform layer does not hand the running tunnel to the app.".into()),
+			Call::SelectExit {tag} => {
+				let sent = self.handle.lock().unwrap().as_ref().is_some_and(|handle| handle.select_exit(tag));
+				if sent {Ok(Value::Null)} else {Err("There is no running tunnel to change the exit of.".into())}
+			}
 			Call::Status => {
 				let running = self.running.lock().unwrap().is_some();
 				to_value(json!({"connected": running, "status": self.last.lock().unwrap().clone(), "kill_switch_kept": !running && platform::firewall::present() == Some(true)}))
 			}
 			Call::Quit => {
-				if self.running.lock().unwrap().is_some() {let _ = self.disconnect().await;}
+				// A kill switch left by a connection that ended on its own is lifted too: quitting the app is the user saying they are done.
+				if self.running.lock().unwrap().is_some() || platform::firewall::present() == Some(true) {let _ = self.disconnect().await;}
 				self.quit.notify_one();
 				Ok(Value::Null)
 			}
 		}
+	}
+
+	/// Fetches go out as the system's own traffic, so while a tunnel runs they go through it. With none running and the kill switch left in force by an earlier connection they could only fail, or be the very leak the switch is there to stop, so they are refused with what to do.
+	fn fetch_gate(&self) -> Result<(), String> {
+		if self.running.lock().unwrap().is_none() && platform::firewall::present() == Some(true) {return Err("The kill switch is still in force from an earlier connection, so nothing can be fetched outside the tunnel. Connect first, or disconnect to lift the kill switch.".into())}
+		Ok(())
 	}
 
 	/// A failed fetch keeps the step, so that the user can try again or cancel.
@@ -212,6 +230,7 @@ impl Core {
 				Err(error) => Err((error.to_string(), false)),
 			};
 			core.running.lock().unwrap().take();
+			*core.handle.lock().unwrap() = None;
 			*core.last.lock().unwrap() = None;
 			core.send(match ended {Ok(()) => Out::Ended {error: None, kept: false}, Err((error, kept)) => Out::Ended {error: Some(error), kept}});
 			let _ = done_tx.send(true);
@@ -235,6 +254,7 @@ impl Core {
 		};
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
+		*self.handle.lock().unwrap() = Some(settings.handle.clone());
 		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: options.allow_lan, local_names: options.local_names, routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
 		// The one lock every command takes, held to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
@@ -324,7 +344,7 @@ fn data_dir() -> anyhow::Result<PathBuf> {
 	Ok(dir)
 }
 
-/// Whoever can replace the executable is root once it runs, so a release build runs elevated only from a place that only root can write. (macOS: see the head of this file.)
+/// Whoever can replace the executable is root once it runs, so a release build runs elevated only from a place that only root can write. (macOS: see the head of this file.) That is also why there is no AppImage: it runs from wherever the user keeps it, so the Linux bundles are deb and rpm only.
 fn trusted_exe() -> anyhow::Result<()> {
 	#[cfg(windows)]
 	state::check_install_dir()?;
@@ -339,59 +359,83 @@ fn trusted_exe() -> anyhow::Result<()> {
 	Ok(())
 }
 
-fn open_token(path: &Path) -> std::io::Result<std::fs::File> {
-	let mut open = std::fs::OpenOptions::new();
-	open.read(true);
-	#[cfg(unix)]
-	open.custom_flags(libc::O_NOFOLLOW);
-	open.open(path)
+/// The user who raised the helper: polkit says so on Linux; on macOS the window names its own uid, and the folder it names has to be that user's (`read_user_file`).
+#[cfg(unix)]
+fn elevating_uid(given: Option<&str>) -> anyhow::Result<u32> {
+	#[cfg(target_os = "linux")]
+	let named = {
+		let _ = given;
+		["PKEXEC_UID", "SUDO_UID"].iter().find_map(|name| std::env::var(name).ok())
+	};
+	#[cfg(target_os = "macos")]
+	let named = given.map(str::to_owned).or_else(|| std::env::var("SUDO_UID").ok());
+	let uid: u32 = named.and_then(|text| text.parse().ok()).ok_or_else(|| anyhow!("the helper does not know which user raised it"))?;
+	if uid == 0 {bail!("the app has to run as your own user, not as root")}
+	Ok(uid)
 }
 
-fn same(left: &str, right: &str) -> bool {left.len() == right.len() && left.bytes().zip(right.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0}
+/// The mutual proof of the token (see `proto.rs`), within five seconds per step. The token never crosses; the id is the one the window used.
+async fn handshake(read: &mut BufReader<tokio::io::ReadHalf<Conn>>, write: &mut tokio::io::WriteHalf<Conn>, token: &str) -> Option<u64> {
+	let first = tokio::time::timeout(HELLO_WAIT, read_line(read, 1024)).await.ok()?.ok()??;
+	let Frame {call: Call::Hello {nonce: theirs}, ..} = serde_json::from_str(&first).ok()? else {return None};
+	if !nonce_ok(&theirs) {return None}
+	let ours = random_hex(NONCE_LEN / 2).ok()?;
+	write_line(write, &Out::Challenge {proof: proof(token, "server", &theirs, &ours), nonce: ours.clone()}).await.ok()?;
+	let second = tokio::time::timeout(HELLO_WAIT, read_line(read, 1024)).await.ok()?.ok()??;
+	let Frame {id, call: Call::Auth {proof: given}} = serde_json::from_str(&second).ok()? else {return None};
+	verify(token, "client", &ours, &theirs, &given).then_some(id)
+}
 
-async fn client(core: Arc<Core>, stream: TcpStream, token: Arc<String>) {
-	let (read, mut write) = stream.into_split();
+async fn client(core: Arc<Core>, conn: Conn, token: Arc<String>) {
+	let (read, mut write) = tokio::io::split(conn);
 	let mut read = BufReader::new(read);
-	let hello = tokio::time::timeout(HELLO_WAIT, read_line(&mut read, 1024)).await;
-	let ok = matches!(hello, Ok(Ok(Some(ref line))) if matches!(serde_json::from_str::<Frame>(line), Ok(Frame {call: Call::Hello {token: ref given}, ..}) if same(given, &token)));
-	if !ok {return}
-	let id = match hello {Ok(Ok(Some(line))) => serde_json::from_str::<Frame>(&line).map_or(0, |frame| frame.id), _ => 0};
+	let Some(id) = handshake(&mut read, &mut write, &token).await else {return};
 	core.clients.fetch_add(1, Ordering::SeqCst);
-	let (out, mut lines) = mpsc::unbounded_channel::<Out>();
+	// Bounded: a window that stops reading is dropped and does not make the helper hold what it was told.
+	let (out, mut lines) = mpsc::channel::<Out>(CLIENT_QUEUE);
+	let kick = Arc::new(Notify::new());
 	let writer = tokio::spawn(async move {
 		while let Some(line) = lines.recv().await {if write_line(&mut write, &line).await.is_err() {break}}
 	});
-	let _ = out.send(Out::Reply {id, ok: Some(Value::Null), error: None});
-	if let Some(status) = core.last.lock().unwrap().clone() {let _ = out.send(Out::Status(status));}
-	let (mut pushes, forward) = (core.push.subscribe(), out.clone());
+	let _ = out.try_send(Out::Reply {id, ok: Some(Value::Null), error: None});
+	if let Some(status) = core.last.lock().unwrap().clone() {let _ = out.try_send(Out::Status(status));}
+	let (mut pushes, forward, full) = (core.push.subscribe(), out.clone(), kick.clone());
 	let pusher = tokio::spawn(async move {
 		loop {
 			match pushes.recv().await {
-				Ok(push) => if forward.send(push).is_err() {break},
+				Ok(push) => if forward.try_send(push).is_err() {
+					full.notify_one();
+					break;
+				},
 				Err(broadcast::error::RecvError::Lagged(_)) => {}
 				Err(broadcast::error::RecvError::Closed) => break,
 			}
 		}
 	});
-	while let Ok(Some(line)) = read_line(&mut read, REQUEST_MAX).await {
+	// One request at a time per connection: the next line is not read before the answer to this one is queued.
+	loop {
+		let line = tokio::select! {line = read_line(&mut read, REQUEST_MAX) => line, () = kick.notified() => break};
+		let Ok(Some(line)) = line else {break};
 		let Ok(frame) = serde_json::from_str::<Frame>(&line) else {break};
-		let (core, out) = (core.clone(), out.clone());
-		tokio::spawn(async move {
-			let reply = match core.call(frame.call).await {Ok(value) => Out::Reply {id: frame.id, ok: Some(value), error: None}, Err(error) => Out::Reply {id: frame.id, ok: None, error: Some(error)}};
-			let _ = out.send(reply);
-		});
+		let reply = match core.call(frame.call).await {Ok(value) => Out::Reply {id: frame.id, ok: Some(value), error: None}, Err(error) => Out::Reply {id: frame.id, ok: None, error: Some(error)}};
+		if out.try_send(reply).is_err() {break}
 	}
 	pusher.abort();
-	writer.abort();
+	drop(out);
+	// What is queued is still written, so that the answer to a Quit reaches the window.
+	let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
 	core.clients.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// Serves until `Quit`, or until no window has been here for `IDLE_EXIT` while no tunnel runs.
-pub async fn serve(core: Arc<Core>, listener: TcpListener, token: String) {
+pub async fn serve(core: Arc<Core>, mut server: Server, token: String) {
 	let (token, mut idle_since, mut tick) = (Arc::new(token), Instant::now(), tokio::time::interval(Duration::from_secs(5)));
 	loop {
 		tokio::select! {
-			accepted = listener.accept() => if let Ok((stream, _)) = accepted {tokio::spawn(client(core.clone(), stream, token.clone()));},
+			accepted = server.accept() => match accepted {
+				Ok(conn) => {tokio::spawn(client(core.clone(), conn, token.clone()));}
+				Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+			},
 			() = core.quit.notified() => break,
 			_ = tick.tick() => {
 				if core.clients.load(Ordering::SeqCst) > 0 || core.running.lock().unwrap().is_some() {idle_since = Instant::now()} else if idle_since.elapsed() > IDLE_EXIT {break}
@@ -400,10 +444,10 @@ pub async fn serve(core: Arc<Core>, listener: TcpListener, token: String) {
 	}
 }
 
-/// The entry of `--helper --dir <folder>`: returns the process's exit code.
-pub fn main(dir: &Path) -> i32 {
+/// The entry of `--helper --dir <folder> [--uid <n> | --sid <sid>]`: returns the process's exit code. `owner` is the user's uid on macOS and the user's SID on Windows.
+pub fn main(dir: &Path, owner: Option<&str>) -> i32 {
 	let _ = START.set(Instant::now());
-	match run(dir) {
+	match run(dir, owner) {
 		Ok(()) => 0,
 		Err(error) => {
 			eprintln!("{error:#}");
@@ -412,96 +456,115 @@ pub fn main(dir: &Path) -> i32 {
 	}
 }
 
-fn run(dir: &Path) -> anyhow::Result<()> {
+fn run(dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
 	trusted_exe()?;
-	let meta = std::fs::symlink_metadata(dir).context("the helper's folder is missing")?;
-	if !meta.is_dir() {bail!("the helper's folder is a link or not a folder")}
-	let mut token = String::new();
-	std::io::Read::read_to_string(&mut std::io::Read::take(open_token(&dir.join("token")).context("cannot read the token")?, TOKEN_LEN as u64 + 1), &mut token)?;
-	if token.len() != TOKEN_LEN || !token.bytes().all(|byte| byte.is_ascii_hexdigit()) {bail!("the token is not what the app writes")}
+	#[cfg(unix)]
+	let uid = elevating_uid(owner)?;
+	#[cfg(unix)]
+	let text = ipc::read_user_file(dir, "token", uid, TOKEN_LEN + 1).context("cannot read the token")?;
+	#[cfg(windows)]
+	let text = ipc::read_user_file(dir, "token", 0, TOKEN_LEN + 1).context("cannot read the token")?;
+	if text.len() != TOKEN_LEN || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {bail!("the token is not what the app writes")}
 	let data = data_dir()?;
 	let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
 	let (library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
 	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir);
 	let sink = core.push.clone();
-	tracing_subscriber::registry().with(LogLayer(move |line| {let _ = sink.send(Out::Log {line});})).init();
+	tracing_subscriber::registry().with(LogLayer {sink: move |line| {let _ = sink.send(Out::Log {line});}, helper: true}).init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}
 	runtime.block_on(async {
-		let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
-		let port_file = dir.join("port");
-		let _ = std::fs::remove_file(&port_file);
-		// An exclusive create: a link planted at this name is an error and is never followed by a process with these rights.
-		std::io::Write::write_all(&mut std::fs::OpenOptions::new().write(true).create_new(true).open(&port_file)?, listener.local_addr()?.port().to_string().as_bytes())?;
+		#[cfg(unix)]
+		let server = {
+			ipc::ensure_run_dir()?;
+			Server::bind(&ipc::socket_path(), uid)?
+		};
+		#[cfg(windows)]
+		let server = Server::bind(owner.ok_or_else(|| anyhow!("the helper does not know which user raised it"))?)?;
 		tracing::info!("the helper is ready");
-		serve(core, listener, token).await;
-		let _ = std::fs::remove_file(&port_file);
+		serve(core, server, text).await;
+		#[cfg(unix)]
+		let _ = std::fs::remove_file(ipc::socket_path());
 		anyhow::Ok(())
 	})
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::*;
-	use crate::proto::{read_line, write_line};
+	use crate::link::Link;
+	use std::os::unix::fs::DirBuilderExt;
 	use tokio::io::AsyncWriteExt;
 	use veilway_engine::import::FileVault;
 
-	async fn start(dir: &Path) -> (Arc<Core>, std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+	fn token() -> String {"a".repeat(TOKEN_LEN)}
+
+	fn euid() -> u32 {unsafe {libc::geteuid()}}
+
+	async fn start(name: &str, uid: u32) -> Option<(Arc<Core>, PathBuf, tokio::task::JoinHandle<()>)> {
+		let dir = std::env::temp_dir().join(format!("veilway-helper-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
 		let (library, _) = Library::open(Box::new(FileVault(dir.join("vault")))).unwrap();
 		let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))), dir.join("run"));
-		let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-		let addr = listener.local_addr().unwrap();
-		let task = tokio::spawn(serve(core.clone(), listener, "a".repeat(TOKEN_LEN)));
-		(core, addr, task)
+		let socket = dir.join("helper.sock");
+		let server = Server::bind(&socket, uid).ok()?;
+		let task = tokio::spawn(serve(core.clone(), server, token()));
+		Some((core, socket, task))
 	}
 
-	async fn connect(addr: std::net::SocketAddr, token: &str) -> Option<(BufReader<tokio::net::tcp::OwnedReadHalf>, tokio::net::tcp::OwnedWriteHalf)> {
-		let (read, mut write) = TcpStream::connect(addr).await.unwrap().into_split();
-		let mut read = BufReader::new(read);
-		write_line(&mut write, &Frame {id: 1, call: Call::Hello {token: token.into()}}).await.unwrap();
-		match read_line(&mut read, 1 << 20).await {Ok(Some(_)) => Some((read, write)), _ => None}
-	}
-
-	async fn ask(read: &mut BufReader<tokio::net::tcp::OwnedReadHalf>, write: &mut tokio::net::tcp::OwnedWriteHalf, id: u64, call: Call) -> (Option<Value>, Option<String>) {
-		write_line(write, &Frame {id, call}).await.unwrap();
-		loop {
-			let line = read_line(read, 1 << 24).await.unwrap().unwrap();
-			if let Out::Reply {id: got, ok, error} = serde_json::from_str(&line).unwrap() {if got == id {return (ok, error)}}
-		}
-	}
+	async fn link(socket: &Path, token: &str) -> std::io::Result<Arc<Link>> {Link::over(ipc::connect_to(socket).await?, token, Arc::new(|_| {})).await}
 
 	#[tokio::test]
 	async fn only_the_token_opens_the_channel_and_requests_are_answered() {
-		let dir = std::env::temp_dir().join(format!("veilway-helper-{}", now()));
+		let (_core, socket, _task) = start("auth", euid()).await.unwrap();
+		assert!(link(&socket, &"b".repeat(TOKEN_LEN)).await.is_err());
+		let link = link(&socket, &token()).await.unwrap();
+		assert_eq!(link.call(Call::Library {languages: vec!["en".into()]}).await.unwrap(), json!([]));
+		assert!(link.call(Call::ImportOpen {source: Source::Link {text: "not a link".into()}}).await.is_err());
+		assert_eq!(link.call(Call::ImportProceed).await.unwrap_err(), "There is no import waiting for a yes.");
+		assert_eq!(link.call(Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await.unwrap_err(), "That subscription is not held.");
+		assert_eq!(link.call(Call::Answer {yes: true}).await.unwrap_err(), "There is no question waiting.");
+		assert_eq!(link.call(Call::SelectExit {tag: None}).await.unwrap_err(), "There is no running tunnel to change the exit of.");
+	}
+
+	#[tokio::test]
+	async fn a_user_other_than_the_one_who_raised_the_helper_is_not_let_in() {
+		// Needs the right to give the socket away; without it there is nothing to show.
+		let Some((_core, socket, _task)) = start("peer", euid() + 1).await else {return};
+		assert!(link(&socket, &token()).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn a_listener_that_does_not_hold_the_token_is_not_trusted_and_learns_nothing() {
+		let dir = std::env::temp_dir().join(format!("veilway-helper-fake-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::create_dir_all(&dir).unwrap();
-		let (_core, addr, _task) = start(&dir).await;
-		assert!(connect(addr, &"b".repeat(TOKEN_LEN)).await.is_none());
-		let (mut read, mut write) = connect(addr, &"a".repeat(TOKEN_LEN)).await.unwrap();
-		let (ok, _) = ask(&mut read, &mut write, 2, Call::Library {languages: vec!["en".into()]}).await;
-		assert_eq!(ok, Some(json!([])));
-		let (ok, error) = ask(&mut read, &mut write, 3, Call::ImportOpen {source: Source::Link {text: "not a link".into()}}).await;
-		assert!(ok.is_none() && error.is_some());
-		let (_, error) = ask(&mut read, &mut write, 4, Call::ImportProceed).await;
-		assert_eq!(error.as_deref(), Some("There is no import waiting for a yes."));
-		let (_, error) = ask(&mut read, &mut write, 5, Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await;
-		assert_eq!(error.as_deref(), Some("That subscription is not held."));
-		let (_, error) = ask(&mut read, &mut write, 6, Call::Answer {yes: true}).await;
-		assert_eq!(error.as_deref(), Some("There is no question waiting."));
+		let socket = dir.join("fake.sock");
+		let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+		let fake = tokio::spawn(async move {
+			let (stream, _) = listener.accept().await.unwrap();
+			let (read, mut write) = tokio::io::split(stream);
+			let mut read = BufReader::new(read);
+			let hello = read_line(&mut read, 1024).await.unwrap().unwrap();
+			write_line(&mut write, &Out::Challenge {nonce: "c".repeat(NONCE_LEN), proof: proof(&"x".repeat(TOKEN_LEN), "server", "n", "c")}).await.unwrap();
+			let more = tokio::time::timeout(Duration::from_millis(500), read_line(&mut read, 1024)).await;
+			(hello, more.map_or(false, |line| matches!(line, Ok(Some(_)))))
+		});
+		assert!(link(&socket, &token()).await.is_err());
+		let (hello, got_proof) = fake.await.unwrap();
+		assert!(!hello.contains(&token()) && !got_proof);
 		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[tokio::test]
 	async fn a_line_that_is_no_request_ends_the_connection_and_quit_ends_the_server() {
-		let dir = std::env::temp_dir().join(format!("veilway-helper-quit-{}", now()));
-		std::fs::create_dir_all(&dir).unwrap();
-		let (_core, addr, task) = start(&dir).await;
-		let (mut read, mut write) = connect(addr, &"a".repeat(TOKEN_LEN)).await.unwrap();
-		write.write_all(b"{\"id\":2,\"call\":\"run_this\"}\n").await.unwrap();
-		assert!(matches!(read_line(&mut read, 1 << 20).await, Ok(None) | Err(_)));
-		let (mut read, mut write) = connect(addr, &"a".repeat(TOKEN_LEN)).await.unwrap();
-		write_line(&mut write, &Frame {id: 9, call: Call::Quit}).await.unwrap();
-		let _ = read_line(&mut read, 1 << 20).await;
+		let (_core, socket, task) = start("quit", euid()).await.unwrap();
+		let link_ok = link(&socket, &token()).await.unwrap();
+		let mut raw = ipc::connect_to(&socket).await.unwrap();
+		raw.write_all(b"{\"id\":2,\"call\":\"run_this\"}\n").await.unwrap();
+		let mut buffer = [0u8; 16];
+		assert_eq!(tokio::io::AsyncReadExt::read(&mut raw, &mut buffer).await.unwrap_or(0), 0);
+		assert_eq!(link_ok.call(Call::Quit).await.unwrap(), Value::Null);
 		tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap();
-		let _ = std::fs::remove_dir_all(&dir);
 	}
 }

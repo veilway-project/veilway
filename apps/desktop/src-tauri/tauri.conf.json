@@ -40,6 +40,11 @@
     "active": true,
     "createUpdaterArtifacts": true,
     "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    },
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"],
     "shortDescription": "WireGuard client that tunnels over WSS",
     "longDescription": "Connects to a Veilway relay over WebSocket TLS and routes all traffic through it."

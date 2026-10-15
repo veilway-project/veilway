@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem="windows")]
 //! Tauri shell around `veilway-engine` and the platform layer. The window is unprivileged and never holds a key: the engine, the vault and the system changes live in a helper (`helper.rs`, this same executable started with `--helper` and raised once through the system's prompt), and the commands below pass the UI's asks to it over `link.rs`. The UI is static HTML in ../ui.
 mod helper;
+mod ipc;
 mod link;
 mod logs;
 mod proto;
@@ -55,11 +56,17 @@ fn forward(app:&AppHandle, out:Out){
 		Out::Question{text}=>{let _=app.emit("question", text);}
 		Out::Ended{error, kept}=>{let _=app.emit("ended", serde_json::json!({"error":error, "kept":kept}));}
 		Out::Log{line}=>push_log(line),
-		Out::Reply{..}=>{}
+		Out::Reply{..}|Out::Challenge{..}=>{}
 	}
 }
 
 async fn ask(backend:&State<'_, Arc<Backend>>, call:Call)->Result<Value, String>{backend.call(call).await}
+
+/// Like `ask` for answers that carry logos: the pictures are checked here, in the process without rights, and become `data:` URLs or nothing.
+async fn ask_branded(backend:&State<'_, Arc<Backend>>, call:Call)->Result<Value, String>{
+	let mut value=backend.call(call).await?;
+	tokio::task::spawn_blocking(move || {view::brand(&mut value); value}).await.map_err(|e| e.to_string())
+}
 
 /// Step 1 of an import, from a link or a subscription file. Returns what the user is asked about first; nothing is sent anywhere until `import_proceed`.
 #[tauri::command]
@@ -74,23 +81,23 @@ async fn import_qr(backend:State<'_, Arc<Backend>>, data:String)->Result<Value, 
 }
 
 #[tauri::command]
-async fn import_proceed(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::ImportProceed).await}
+async fn import_proceed(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask_branded(&backend, Call::ImportProceed).await}
 
 #[tauri::command]
-async fn import_keep(backend:State<'_, Arc<Backend>>, keep:bool)->Result<Value, String>{ask(&backend, Call::ImportKeep{keep}).await}
+async fn import_keep(backend:State<'_, Arc<Backend>>, keep:bool)->Result<Value, String>{ask_branded(&backend, Call::ImportKeep{keep}).await}
 
 #[tauri::command]
 async fn import_cancel(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::ImportCancel).await}
 
 /// The subscriptions and their connections, provider cards and branding included. `languages` are the UI's, best first.
 #[tauri::command]
-async fn library(backend:State<'_, Arc<Backend>>, languages:Vec<String>)->Result<Value, String>{ask(&backend, Call::Library{languages}).await}
+async fn library(backend:State<'_, Arc<Backend>>, languages:Vec<String>)->Result<Value, String>{ask_branded(&backend, Call::Library{languages}).await}
 
 #[tauri::command]
-async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask(&backend, Call::Refresh{subscription:id}).await}
+async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Refresh{subscription:id}).await}
 
 #[tauri::command]
-async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask(&backend, Call::Remove{subscription:id}).await}
+async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Remove{subscription:id}).await}
 
 #[tauri::command]
 async fn connect(backend:State<'_, Arc<Backend>>, subscription:String, profile:String, options:Options)->Result<Value, String>{
@@ -177,11 +184,12 @@ fn show(app:&AppHandle){
 fn main(){
 	let args:Vec<String>=std::env::args().collect();
 	if args.get(1).map(String::as_str)==Some("--helper"){
-		let dir=args.iter().position(|a| a=="--dir").and_then(|i| args.get(i+1)).map(PathBuf::from);
-		std::process::exit(dir.map_or(2, |d| helper::main(&d)));
+		let after=|name:&str| args.iter().position(|a| a==name).and_then(|i| args.get(i+1));
+		let owner=after("--uid").or_else(|| after("--sid")).map(String::as_str);
+		std::process::exit(after("--dir").map_or(2, |d| helper::main(&PathBuf::from(d), owner)));
 	}
 	let _=START.set(Instant::now());
-	tracing_subscriber::registry().with(LogLayer(push_log)).init();
+	tracing_subscriber::registry().with(LogLayer{sink:push_log, helper:false}).init();
 	tauri::Builder::default()
 		// Has to be the first plugin: a second launch only raises the window of the one hiding in the tray.
 		.plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
