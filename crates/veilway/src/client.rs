@@ -1,4 +1,4 @@
-//! `veilway connect`, `disconnect` and `status`: the client on Linux, driven from a terminal until an app does it. The engine and the Linux layer are the libraries `veilway-engine` and `veilway-linux`; what is here is the questions put to the user and the words the state is shown in.
+//! `veilway connect`, `disconnect` and `status`: the client on Linux and Windows, driven from a terminal until an app does it. The engine and the platform layer are the libraries `veilway-engine` and `veilway-linux` or `veilway-windows` (both are `platform` here, and answer to the same calls); what is here is the questions put to the user and the words the state is shown in.
 use anyhow::{anyhow, bail, Context};
 use clap::Args;
 use ipnet::IpNet;
@@ -6,13 +6,21 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "linux")]
 use tokio::signal::unix::{signal, Signal, SignalKind};
+#[cfg(windows)]
+use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown, CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
 use veilway_engine::import::{self, Fetcher, Library};
 use veilway_engine::{ask_text, default_roots, Agree, Retry, Settings, StartError, State, Status, Store};
-use veilway_linux::state::{self, Ended};
-use veilway_linux::vault::SecretVault;
-use veilway_linux::dns::Restored;
-use veilway_linux::{Applied, Options, Routes, Stop};
+#[cfg(target_os = "linux")]
+use veilway_linux as platform;
+#[cfg(windows)]
+use veilway_windows as platform;
+use platform::state::{self, Ended};
+use platform::vault::SecretVault;
+#[cfg(target_os = "linux")]
+use platform::dns::Restored;
+use platform::{Applied, Options, Routes, Stop};
 use veilway_proto::subscription::client::{Offer, Standing};
 use veilway_proto::subscription::payload::Id;
 use veilway_proto::subscription::Tag;
@@ -34,26 +42,49 @@ pub struct Connect {
 	/// Do not block what is not tunnelled when the tunnel is down or reconnecting
 	#[arg(long)] no_kill_switch: bool,
 	/// The name of the tunnel's network device
-	#[arg(long, default_value = "vw0")] interface: String,
-	/// Where the client keeps its vault and what it remembers. As root: /var/lib/veilway/client, and the environment is not looked at. Otherwise $VEILWAY_DATA_DIR, else veilway in $XDG_DATA_HOME, else in ~/.local/share
+	#[cfg_attr(target_os = "linux", arg(long, default_value = "vw0"))]
+	#[cfg_attr(windows, arg(long, default_value = "Veilway"))]
+	interface: String,
+	/// Where the client keeps its vault and what it remembers. On Linux as root: /var/lib/veilway/client, and the environment is not looked at. Otherwise $VEILWAY_DATA_DIR, else veilway in $XDG_DATA_HOME, else in ~/.local/share. On Windows: Veilway\client in ProgramData, which only administrators can use
 	#[arg(long)] data_dir: Option<PathBuf>,
 }
 
 fn now() -> u64 {SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())}
 
 /// The directory for the vault and the memory of the client. A client that runs as root takes nothing from the environment, which whoever started it with `sudo -E` could have pointed anywhere, and a directory that is a link, is not its own or can be written by others is an error and is never changed to fit.
+#[cfg(target_os = "linux")]
 fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 	let dir = if rustix::process::geteuid().is_root() {given.unwrap_or_else(|| PathBuf::from("/var/lib/veilway/client"))} else {given.or_else(|| std::env::var_os("VEILWAY_DATA_DIR").map(PathBuf::from)).or_else(|| std::env::var_os("XDG_DATA_HOME").filter(|value| !value.is_empty()).map(|value| PathBuf::from(value).join("veilway")).or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share/veilway")))).ok_or_else(|| anyhow!("there is no data directory: set HOME or name one with --data-dir"))?};
 	state::secure_dir(&dir, 0o700).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
 	Ok(dir)
 }
 
+/// The directory for the vault and the memory of the client: the one given, else `Veilway\client` in ProgramData. It is made for administrators and SYSTEM only, and a link is an error.
+#[cfg(windows)]
+fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+	let dir = given.unwrap_or_else(state::default_data_dir);
+	state::secure_dir(&dir).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
+	Ok(dir)
+}
+
 /// The signals that end a connection: they are taken before anything is changed, so that one during the set-up or at a question does not end the process in the middle. SIGINT and SIGTERM are the user asking to stop. SIGHUP is a closed terminal, and is not.
+#[cfg(target_os = "linux")]
 struct Signals {terminate: Signal, interrupt: Signal, hangup: Signal}
 
+#[cfg(target_os = "linux")]
 impl Signals {
 	fn new() -> std::io::Result<Self> {Ok(Self {terminate: signal(SignalKind::terminate())?, interrupt: signal(SignalKind::interrupt())?, hangup: signal(SignalKind::hangup())?})}
 	async fn next(&mut self) -> Stop {tokio::select! {_ = self.terminate.recv() => Stop::Asked, _ = self.interrupt.recv() => Stop::Asked, _ = self.hangup.recv() => Stop::Hangup}}
+}
+
+/// The events that end a connection on Windows, taken before anything is changed. Ctrl+C, Ctrl+Break and a shutdown or logoff are the user asking to stop (`veilway disconnect` is the other way, a named event the lock holds). Closing the console window is not: nobody is there to see, and the kill switch stays.
+#[cfg(windows)]
+struct Signals {c: CtrlC, brk: CtrlBreak, close: CtrlClose, logoff: CtrlLogoff, shutdown: CtrlShutdown}
+
+#[cfg(windows)]
+impl Signals {
+	fn new() -> std::io::Result<Self> {Ok(Self {c: ctrl_c()?, brk: ctrl_break()?, close: ctrl_close()?, logoff: ctrl_logoff()?, shutdown: ctrl_shutdown()?})}
+	async fn next(&mut self) -> Stop {tokio::select! {_ = self.c.recv() => Stop::Asked, _ = self.brk.recv() => Stop::Asked, _ = self.logoff.recv() => Stop::Asked, _ = self.shutdown.recv() => Stop::Asked, _ = self.close.recv() => Stop::Hangup}}
 }
 
 /// The terminal went away while a question waited. It is not an answer, and it lifts nothing.
@@ -169,13 +200,13 @@ async fn import_source(library: &mut Library, source: &str, signals: &mut Signal
 fn short(id: &Id) -> &str {&id.as_str()[..id.as_str().len().min(12)]}
 
 /// What the user is told when a connection ended without being asked to: the kill switch stays in force, and only `veilway disconnect` lifts it.
-fn kept_message(failure: &veilway_linux::Failure) -> String {
+fn kept_message(failure: &platform::Failure) -> String {
 	if failure.kept {format!("{failure}. The connection ended on its own, and the kill switch is still in force, so nothing leaves this device outside the tunnel. Run `veilway disconnect` to restore your normal connection.")} else {format!("{failure}")}
 }
 
 pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).with_writer(std::io::stderr).init();
-	let (data, run) = (data_dir(args.data_dir.clone())?, PathBuf::from(state::DEFAULT));
+	let (data, run) = (data_dir(args.data_dir.clone())?, Options::default().run_dir);
 	let mut signals = Signals::new()?;
 	let (mut library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
 	for _ in damaged {eprintln!("A stored subscription does not read any more and is left out.")}
@@ -216,8 +247,11 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 				shown = key;
 			}
 		};
+		#[cfg(target_os = "linux")]
 		let stop = signals.next();
-		let outcome = veilway_linux::run(&options, &lock, settings.clone(), held, &profile.id, &permit, agree, on_status, stop).await;
+		#[cfg(windows)]
+		let stop = async {tokio::select! {reason = signals.next() => reason, () = lock.stop_asked() => Stop::Asked}};
+		let outcome = platform::run(&options, &lock, settings.clone(), held, &profile.id, &permit, agree, on_status, stop).await;
 		let _ = store.flush();
 		let Err(failure) = outcome else {break};
 		// The tunnel did not start because the user has still to say something. The kill switch is in force while the question waits. A no, or a stop, is the user's own end of it, and lifts what is in force; any other end is not.
@@ -241,9 +275,9 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 			Some(_) | None => bail!(kept_message(&failure)),
 		};
 		// The terminal going away is not an answer: nobody is there, and the kill switch stays like after any other end.
-		if answer.as_ref().err().is_some_and(|error| error.downcast_ref::<HangUp>().is_some()) {bail!(kept_message(&veilway_linux::Failure {error: anyhow!("the terminal went away (SIGHUP)"), kept: true}))}
+		if answer.as_ref().err().is_some_and(|error| error.downcast_ref::<HangUp>().is_some()) {bail!(kept_message(&platform::Failure {error: anyhow!("the terminal went away (SIGHUP)"), kept: true}))}
 		if !matches!(answer, Ok(true)) {
-			let cleaned = veilway_linux::cleanup(&options, &lock);
+			let cleaned = platform::cleanup(&options, &lock);
 			let _ = store.flush();
 			cleaned?;
 			bail!(answer.err().map_or_else(|| "Not connected.".to_owned(), |error| error.to_string()));
@@ -258,25 +292,37 @@ pub async fn disconnect() -> anyhow::Result<()> {
 	// A client that runs is asked to stop, which it does the clean way. Only when none holds the lock is there anything to clean up by hand, and the lock is then taken for it: a client that starts meanwhile finds it held, and this command never touches what a running one has made.
 	match state::terminate(&options.run_dir, Duration::from_secs(20)).await? {
 		Ended::NotRunning => {}
+		#[cfg(target_os = "linux")]
 		Ended::Stopped(_) => println!("The connection stopped."),
+		#[cfg(windows)]
+		Ended::Stopped => println!("The connection stopped."),
+		#[cfg(target_os = "linux")]
 		Ended::Killed(_) => println!("The connection did not stop in time and was ended."),
 	}
 	let lock = state::lock(&options.run_dir).await?;
-	let cleaned = veilway_linux::cleanup(&options, &lock)?;
+	let cleaned = platform::cleanup(&options, &lock)?;
+	#[cfg(target_os = "linux")]
 	let left: Vec<&str> = [(cleaned.kill_switch, "the kill switch"), (cleaned.routes > 0, "the routing rules and routes")].into_iter().filter(|(found, _)| *found).map(|(_, name)| name).collect();
+	#[cfg(windows)]
+	let left: Vec<&str> = [(cleaned.kill_switch, "the kill switch"), (cleaned.resolver, "the name resolution rule")].into_iter().filter(|(found, _)| *found).map(|(_, name)| name).collect();
 	if !left.is_empty() {println!("Removed what the connection left in force: {}.", left.join(", "))}
+	#[cfg(target_os = "linux")]
 	match cleaned.resolver {
 		Restored::Put => println!("Put /etc/resolv.conf back as it was before the connection."),
 		Restored::LeftAlone => println!("Another program rewrote /etc/resolv.conf while the connection was up, so it was left as that program made it. Check that it names a resolver you want."),
 		Restored::Damaged => println!("The saved copy of /etc/resolv.conf could not be read, so the file was left as it is, and the copy was moved aside as resolv.conf.bad in /var/lib/veilway. Check that /etc/resolv.conf names a resolver you want."),
 		Restored::Nothing => {}
 	}
-	if left.is_empty() && cleaned.resolver == Restored::Nothing {println!("Nothing is in force. Your normal connection is as it was.")} else {println!("Your normal connection is back.")}
+	#[cfg(target_os = "linux")]
+	let nothing = left.is_empty() && cleaned.resolver == Restored::Nothing;
+	#[cfg(windows)]
+	let nothing = left.is_empty();
+	if nothing {println!("Nothing is in force. Your normal connection is as it was.")} else {println!("Your normal connection is back.")}
 	Ok(())
 }
 
 pub fn show() -> i32 {
-	let run = PathBuf::from(state::DEFAULT);
+	let run = Options::default().run_dir;
 	if state::holder(&run) != state::Holder::Free {
 		match state::read_status(&run) {
 			Ok(text) => print!("{text}"),
@@ -285,7 +331,7 @@ pub fn show() -> i32 {
 		return 0;
 	}
 	println!("Not connected.");
-	if veilway_linux::firewall::present() == Some(true) {println!("The kill switch is still in force because the connection ended without being stopped. Nothing leaves this device outside the tunnel. Run `veilway disconnect` to restore your normal connection.")}
+	if platform::firewall::present() == Some(true) {println!("The kill switch is still in force because the connection ended without being stopped. Nothing leaves this device outside the tunnel. Run `veilway disconnect` to restore your normal connection.")}
 	3
 }
 
@@ -328,10 +374,10 @@ mod tests {
 
 	#[test]
 	fn a_connection_that_ended_on_its_own_says_the_kill_switch_stays() {
-		let kept = veilway_linux::Failure {error: anyhow!("the engine stopped on its own"), kept: true};
+		let kept = platform::Failure {error: anyhow!("the engine stopped on its own"), kept: true};
 		let text = kept_message(&kept);
 		assert!(text.contains("kill switch is still in force") && text.contains("veilway disconnect"));
-		assert!(!kept_message(&veilway_linux::Failure {error: anyhow!("no"), kept: false}).contains("kill switch"));
+		assert!(!kept_message(&platform::Failure {error: anyhow!("no"), kept: false}).contains("kill switch"));
 	}
 
 	#[test]

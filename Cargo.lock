@@ -1952,6 +1952,7 @@ dependencies = [
  "veilway-linux",
  "veilway-proto",
  "veilway-wg",
+ "veilway-windows",
  "x509-parser",
 ]
 
@@ -2122,6 +2123,22 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "tracing",
+]
+
+[[package]]
+name = "veilway-windows"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ipnet",
+ "socket2",
+ "tokio",
+ "tracing",
+ "veilway-engine",
+ "veilway-proto",
+ "veilway-transport",
+ "windows-sys 0.61.2",
+ "wintun-bindings",
 ]
 
 [[package]]
