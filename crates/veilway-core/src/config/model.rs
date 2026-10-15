@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -535,6 +535,9 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_LINKS))]
 	pub links: Vec<Link>,
+	/// The Xray add-on: inbounds of Xray that carry the users listed in their `clients`. Off when the key is absent.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub xray: Option<Xray>,
 }
 
 /// Accepted proofs one source may bring: `burst` at once, then `rate` a second. A source is an IPv4 address or an IPv6 /64.
@@ -1398,4 +1401,49 @@ impl Link {
 		let obfs = self.peer.as_ref().is_some_and(|peer| peer.transports.iter().any(|transport| transport.kind == LinkTransportType::UdpObfs)) || self.inbound.as_ref().is_some_and(|tag| inbounds.iter().any(|inbound| inbound.tag == *tag && inbound.enveloped()));
 		self.mtu.unwrap_or(if obfs {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})
 	}
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XrayProtocol {
+	/// Needs `tls`. The client secret is a UUID.
+	Vless,
+	/// Needs `tls`. The client secret is a password.
+	Trojan,
+	/// The cipher is chacha20-ietf-poly1305. The client secret is a password.
+	Shadowsocks,
+}
+
+/// The Xray add-on's part of the config. Xray runs as a child of the node and only ever reaches the network through the node: its traffic is attributed to the user of the client, and the node's gate, rules, exits and quotas apply to it.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Xray {
+	#[schemars(length(max = MAX_XRAY_INBOUNDS))]
+	pub inbounds: Vec<XrayInbound>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XrayInbound {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	pub protocol: XrayProtocol,
+	/// The public listener of Xray.
+	pub listen: Addr,
+	/// The certificate files of the listener. Required for `vless` and `trojan`, and not allowed for `shadowsocks`, which encrypts itself.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub tls: Option<Tls>,
+	/// The users that may use this inbound, each with the credential they present to it.
+	#[schemars(length(max = MAX_USERS))]
+	pub clients: Vec<XrayClient>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct XrayClient {
+	#[schemars(pattern(NAME_PATTERN))]
+	pub user: String,
+	/// A UUID for `vless`, otherwise a password of 8 to 128 characters from A-Z a-z 0-9 and _ - . + / =.
+	#[schemars(length(min = 8, max = 128))]
+	pub secret: Secret<String>,
 }

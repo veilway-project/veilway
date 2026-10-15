@@ -131,6 +131,8 @@ pub struct Diff {
 	pub rules_reordered: bool,
 	pub notices: bool,
 	pub public_addresses: bool,
+	/// The `xray` section changed in any way.
+	pub xray: bool,
 	/// `replay` changed. The per-source rate is in force at once, the cache size at the next start.
 	pub replay: bool,
 	/// One entry per tag in `inbounds.changed`.
@@ -222,6 +224,7 @@ impl Diff {
 			routing_default: old.routing.default != new.routing.default,
 			notices: old.notices != new.notices,
 			public_addresses: old.public_addresses != new.public_addresses,
+			xray: old.xray != new.xray,
 			replay: old.replay.cache() != new.replay.cache() || old.replay.per_source() != new.replay.per_source(),
 			rules_reordered: !old.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| new_rules.contains(tag)).eq(new.routing.rules.iter().map(|rule| rule.tag.as_str()).filter(|tag| old_rules.contains(tag))),
 			inbound_changes,

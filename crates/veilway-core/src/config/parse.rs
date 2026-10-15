@@ -381,6 +381,24 @@ impl Config {
 				}
 			}
 		}
+		// A client's secret stands for the secret of the same user's client in the running Xray inbound with the same tag.
+		if let Some(Json::Obj(xray)) = root.get_mut("xray") {
+			if let Some(Json::Arr(inbounds)) = xray.get_mut("inbounds") {
+				for (i, inbound) in inbounds.iter_mut().enumerate() {
+					let Json::Obj(inbound) = inbound else {continue};
+					let was = named(inbound, "tag").and_then(|tag| running.xray.as_ref()?.inbounds.iter().find(|was| was.tag == tag));
+					let Some(Json::Arr(clients)) = inbound.get_mut("clients") else {continue};
+					for (c, client) in clients.iter_mut().enumerate() {
+						let Json::Obj(client) = client else {continue};
+						if !marked(client, "secret") {continue}
+						match was.zip(named(client, "user")).and_then(|(was, user)| was.clients.iter().find(|kept| kept.user == user)) {
+							Some(kept) => drop(client.insert("secret".to_string(), Json::Str(kept.secret.expose().clone()))),
+							None => report.error(format!("xray.inbounds[{i}].clients[{c}].secret"), "expected a secret: the marker stands for the secret of the same user in the running xray inbound with this tag, and none runs with one. A client that is new has to be sent with its secret"),
+						}
+					}
+				}
+			}
+		}
 		if !report.errors.is_empty() {return Err(report)}
 		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| (config, spelled)).map_err(|e| Report {errors: vec![Diagnostic {path: e.path.unwrap_or_default(), message: e.message}], ..Report::default()})
 	}

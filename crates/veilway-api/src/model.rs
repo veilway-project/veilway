@@ -149,6 +149,18 @@ pub struct Status {
 	pub certificates: Vec<SelfSigned>,
 	/// The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none.
 	pub public_addresses: Vec<config::Host>,
+	pub addons: Addons,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct Addons {pub xray: XrayAddon}
+
+#[derive(Serialize, JsonSchema)]
+pub struct XrayAddon {
+	/// Whether the add-on's executable is in the add-on folder.
+	pub installed: bool,
+	/// The release of Xray-core this node runs.
+	pub release: String,
 }
 
 /// A certificate the node made for a `tls` listener, with the key it keeps.

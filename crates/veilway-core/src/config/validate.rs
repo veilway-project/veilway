@@ -793,6 +793,33 @@ impl Config {
 				}
 			}
 		}
+		if let Some(xray) = &self.xray {
+			if xray.inbounds.len() > MAX_XRAY_INBOUNDS {r.error("xray.inbounds", format!("expected at most {MAX_XRAY_INBOUNDS} inbounds"))}
+			tags(&mut r, "xray.inbounds", xray.inbounds.iter().map(|inbound| inbound.tag.as_str()));
+			index(&mut r, |i| format!("xray.inbounds[{i}].listen"), xray.inbounds.iter().take(MAX_XRAY_INBOUNDS).map(|inbound| inbound.listen.0));
+			for (i, inbound) in xray.inbounds.iter().enumerate().take(MAX_XRAY_INBOUNDS) {
+				let at = format!("xray.inbounds[{i}]");
+				match (&inbound.tls, inbound.protocol == XrayProtocol::Shadowsocks) {
+					(None, false) => r.error(format!("{at}.tls"), "expected the certificate files of the listener: vless and trojan are never served in the clear"),
+					(Some(_), true) => r.error(format!("{at}.tls"), "expected no tls: shadowsocks encrypts itself"),
+					_ => {}
+				}
+				index(&mut r, |j| format!("{at}.clients[{j}].user"), inbound.clients.iter().take(MAX_USERS).map(|client| client.user.as_str()));
+				for (j, client) in inbound.clients.iter().enumerate().take(MAX_USERS) {
+					let at = format!("{at}.clients[{j}]");
+					if !user_names.contains_key(client.user.as_str()) {r.error(format!("{at}.user"), "expected the name of a user, found a name no user has")}
+					let secret = client.secret.expose();
+					if secret == REDACTED {
+						r.error(format!("{at}.secret"), "expected a secret, found the marker the control API shows in the place of one: write the secret itself");
+					} else if inbound.protocol == XrayProtocol::Vless {
+						let groups: Vec<usize> = secret.split('-').map(str::len).collect();
+						if groups != [8, 4, 4, 4, 12] || !secret.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit()) {r.error(format!("{at}.secret"), "expected a UUID such as 5783a3e7-e373-51cd-8642-c83782b807c5")}
+					} else if !(8..=128).contains(&secret.len()) || !secret.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.+/=".contains(&b)) {
+						r.error(format!("{at}.secret"), "expected 8 to 128 characters from A-Z a-z 0-9 and _ - . + / =");
+					}
+				}
+			}
+		}
 		r
 	}
 }

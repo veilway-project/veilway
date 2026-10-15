@@ -8,6 +8,7 @@
 #   bash veilway.sh status | logs [node|panel] | restart [node|panel|both]
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
+#   sudo bash veilway.sh addon xray [install|remove|status]
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
@@ -37,6 +38,8 @@ BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/veilway"
 NODE_DIR="$CONF_DIR/node"
 STATE_DIR="/var/lib/veilway"
+ADDON_DIR="/usr/local/lib/veilway/addons"
+XRAY_RELEASE="v26.3.27"
 PANEL_DIR="/var/lib/veilway-panel"
 VER_DIR="/var/lib/veilway-installer"
 BACKUP_DIR="/var/backups/veilway"
@@ -639,6 +642,7 @@ do_uninstall() {
 	svc stop veilway.service || true; svc stop veilway-panel.service || true
 	svc disable veilway.service || true; svc disable veilway-panel.service || true
 	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	act rm -rf "$ADDON_DIR"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR and $PANEL_DIR? The backup above keeps a copy."; then
 		act rm -rf "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR"
@@ -683,6 +687,58 @@ menu() {
 	done
 }
 
+# SHA-256 of the archives of the one Xray-core release this Veilway runs, from the .dgst files the release publishes. Nothing else is trusted: an archive that does not match is refused, and the node checks the executable inside against its own pin before every start.
+xray_pin() {
+	case "$1" in
+		linux-64) printf '%s' 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ;;
+		linux-arm64-v8a) printf '%s' 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ;;
+	esac
+}
+
+# The add-on lives in a folder only root can write, so the node, which runs the executable, can never replace it.
+do_addon() {
+	local name="${1:-}" action="${2:-install}" arch pin got
+	[ "$name" = xray ] || die "the only add-on is xray: try addon xray install, remove or status"
+	case "$action" in
+		install)
+			need_root
+			refuse_links
+			detect_target
+			ensure_tools
+			has unzip || { info "installing unzip"; pkg_install unzip || die "install unzip with your package manager and run this again"; }
+			case "$TARGET" in x86_64*) arch=linux-64 ;; *) arch=linux-arm64-v8a ;; esac
+			pin="$(xray_pin "$arch")"
+			if [ "$DRY" = 1 ]; then
+				dry "download Xray-core $XRAY_RELEASE (Xray-$arch.zip) from $RELEASE_BASE/XTLS/Xray-core"
+				dry "refuse unless its SHA-256 is $pin"
+				dry "install the executable into $ADDON_DIR/xray, owned by root"
+				return 0
+			fi
+			TMP="$(mktemp -d)"
+			fetch "$RELEASE_BASE/XTLS/Xray-core/releases/download/$XRAY_RELEASE/Xray-$arch.zip" "$TMP/xray.zip" "downloading Xray-core $XRAY_RELEASE"
+			got="$(sha256sum "$TMP/xray.zip" | cut -d' ' -f1)"
+			[ "$got" = "$pin" ] || die "the archive's SHA-256 is $got, not the pinned $pin: refusing"
+			step "the archive matches the pinned SHA-256"
+			unzip -p "$TMP/xray.zip" xray >"$TMP/xray" || die "the archive has no xray executable"
+			install -d -m 0755 -o root -g root "$ADDON_DIR" "$ADDON_DIR/xray"
+			install -m 0755 -o root -g root "$TMP/xray" "$ADDON_DIR/xray/xray.new"
+			mv -f "$ADDON_DIR/xray/xray.new" "$ADDON_DIR/xray/xray"
+			step "installed Xray-core $XRAY_RELEASE in $ADDON_DIR/xray"
+			info "the node starts it when its config has an xray inbound; create one in the panel"
+			;;
+		remove)
+			need_root
+			act rm -rf "$ADDON_DIR/xray"
+			has_systemd && systemctl is-active --quiet veilway.service && svc restart veilway.service || true
+			step "removed the xray add-on; the node stops it on its restart"
+			;;
+		status)
+			if [ -x "$ADDON_DIR/xray/xray" ]; then row "xray" "installed ($XRAY_RELEASE pinned, $(sha256sum "$ADDON_DIR/xray/xray" | cut -c1-16)...)"; else row "xray" "not installed"; fi
+			;;
+		*) die "unknown action \"$action\": try install, remove or status" ;;
+	esac
+}
+
 # The test overrides move downloads and trusted keys away from the release channel, so each one is shown and needs a yes.
 accept_overrides() {
 	local v
@@ -702,7 +758,7 @@ main() {
 			--yes | -y) ASSUME_YES=1 ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
-			-h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+			-h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) args+=("$1") ;;
 		esac
 		shift
@@ -727,6 +783,7 @@ main() {
 		restore) do_restore "${args[0]:-}" ;;
 		uninstall) header; do_uninstall ;;
 		version) do_version ;;
+		addon) header; do_addon "${args[0]:-}" "${args[1]:-install}" ;;
 		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, uninstall, version" ;;
 	esac
 }

@@ -159,6 +159,7 @@ fn every_category_is_reported() {
 		rules_reordered: false,
 		notices: false,
 		public_addresses: false,
+		xray: false,
 		replay: false,
 		inbound_changes: inbound("home", true, &[], &[]),
 		user_changes: vec![UserChange {devices_readdressed: vec![Key([0x21; 32])], ..alice()}],
