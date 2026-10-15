@@ -157,7 +157,7 @@ def xray():
 	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "tj", "protocol": "trojan", "port": 8445, "cert": "/gate/node.crt", "key": "/gate/node.key", "host": E["PANEL_HOST"]}, expect=None)
 	check(status == 200, "a trojan inbound is made", "answered %d" % status)
 	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "ss", "protocol": "shadowsocks", "port": 8446, "host": E["PANEL_HOST"]}, expect=None)
-	check(status == 200, "a shadowsocks inbound is made, which makes its server key"
+	check(status == 200, "a shadowsocks inbound is made, which makes its server key", "answered %d" % status)
 	_, created = panel.call("POST", "/users", {"name": "alice", "quota_bytes": 5 * 1024 ** 3, "quota_period": "monthly"})
 	uid = created["user"]["id"]
 	_, made = panel.call("POST", "/users/%d/devices" % uid, {"name": "panel-keyed"})
