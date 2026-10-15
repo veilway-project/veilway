@@ -352,7 +352,7 @@ impl Channel {
 	/// The next message that is no pushed `usage`.
 	async fn answer(&mut self, client: &mut Client) -> Option<NodeMessage> {
 		loop {
-			match self.next(client, Duration::from_secs(3)).await {
+			match self.next(client, Duration::from_secs(10)).await {
 				Some(NodeMessage::Usage(usage)) => self.usage.push(usage),
 				other => return other,
 			}
