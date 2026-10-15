@@ -22,6 +22,8 @@ pub mod route;
 pub mod stream;
 pub mod usage;
 pub mod xray;
+#[cfg(target_os = "linux")]
+pub mod xray_host;
 
 pub use control::ControlTotals;
 pub use obfs::ObfsTotals;
@@ -183,10 +185,12 @@ pub struct Options {
 	pub roots: Option<Arc<RootCertStore>>,
 	/// The folder the Xray add-on is installed in, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
 	pub addons: Option<PathBuf>,
+	/// The unix socket of the Xray host, which starts Xray as a user of its own, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
+	pub xray_socket: Option<PathBuf>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -364,7 +368,7 @@ impl Shared {
 }
 
 /// A running engine. Its tasks live until the process exits and go on serving the config they have, and `shutdown` takes back what an l3 exit set up on the host. Dropping it does so too, without waiting for the l3 tasks to end.
-pub struct Engine {shared: Arc<Shared>, store: Arc<Store>, host: Arc<tokio::sync::Mutex<Host>>, l3: Arc<Mutex<Option<host::Wired>>>, started: Instant, written: Arc<Mutex<u64>>, addons: Option<PathBuf>}
+pub struct Engine {shared: Arc<Shared>, store: Arc<Store>, host: Arc<tokio::sync::Mutex<Host>>, l3: Arc<Mutex<Option<host::Wired>>>, started: Instant, written: Arc<Mutex<u64>>, addons: Option<PathBuf>, xray: (Arc<tokio::sync::Notify>, tokio::task::JoinHandle<()>)}
 
 /// Says what became of a reload to whoever listens for events. `before` is the generation that ran when it began: bytes that already ran put nothing in force and are no event, and neither is a reload that was turned away for its base revision.
 fn announce(shared: &Shared, before: u64, result: &Result<Applied, ApplyError<anyhow::Error>>) {
@@ -393,6 +397,7 @@ async fn persist(file: PathBuf, bytes: Vec<u8>, generation: u64, written: Arc<Mu
 impl Drop for Engine {
 	fn drop(&mut self) {
 		self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
+		self.xray.1.abort();
 		if let Some(replay) = self.shared.replay.get() {replay.abandon()}
 	}
 }
@@ -401,7 +406,10 @@ impl Engine {
 	/// Stops the l3 exit and removes its interface, routes and firewall rules from the host, then writes the state file one last time. Everything else the engine holds goes with the process.
 	/// The host comes first and the write is given `usage::LAST_WRITE` and no longer: a disk that hangs must not leave the firewall rules of a node that is going away in place.
 	/// Before any of that every open control connection is told to say `bye`, on a best effort: the byes are given `control::BYE_WAIT` to leave and no longer.
-	pub async fn shutdown(self) {
+	pub async fn shutdown(mut self) {
+		// Xray goes first: it is killed and awaited before anything else is let go, so it never serves a user the node has stopped counting.
+		self.xray.0.notify_one();
+		let _ = tokio::time::timeout(Duration::from_secs(10), &mut self.xray.1).await;
 		if self.shared.dismiss() > 0 {tokio::time::sleep(control::BYE_WAIT).await}
 		let wired = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 		if let Some(wired) = wired {wired.running.close().await}
@@ -731,6 +739,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 			}
 		});
 	}
-	tokio::spawn(xray::run(shared.clone(), store.clone(), dir, options.addons.clone()));
-	Ok(Engine {shared, store, host, l3, started: Instant::now(), written: Arc::default(), addons: options.addons})
+	let stopped = Arc::new(tokio::sync::Notify::new());
+	let xray = (stopped.clone(), tokio::spawn(xray::run(shared.clone(), store.clone(), dir, options.xray_socket, stopped)));
+	Ok(Engine {shared, store, host, l3, started: Instant::now(), written: Arc::default(), addons: options.addons, xray})
 }

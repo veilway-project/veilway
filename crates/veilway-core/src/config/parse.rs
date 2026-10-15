@@ -387,6 +387,12 @@ impl Config {
 				for (i, inbound) in inbounds.iter_mut().enumerate() {
 					let Json::Obj(inbound) = inbound else {continue};
 					let was = named(inbound, "tag").and_then(|tag| running.xray.as_ref()?.inbounds.iter().find(|was| was.tag == tag));
+					if marked(inbound, "server_key") {
+						match was.and_then(|was| was.server_key.as_ref()) {
+							Some(kept) => drop(inbound.insert("server_key".to_string(), Json::Str(kept.expose().clone()))),
+							None => report.error(format!("xray.inbounds[{i}].server_key"), "expected a key: the marker stands for the server key of the running xray inbound with this tag, and none runs with one"),
+						}
+					}
 					let Some(Json::Arr(clients)) = inbound.get_mut("clients") else {continue};
 					for (c, client) in clients.iter_mut().enumerate() {
 						let Json::Obj(client) = client else {continue};

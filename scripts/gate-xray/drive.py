@@ -5,6 +5,7 @@ drive.py config     login, reauth, settings and the node's config with its inbou
 drive.py xray       an xray inbound, a user with a device, and the user's link
 drive.py usage      the user's usage as the panel has it
 drive.py limit      QUOTA bytes and ENABLED 0 or 1 for the user, pushed to the node
+drive.py rotate     new Xray credentials for the user, and the links that come of them
 
 Prints PASS or FAIL per check and exits 1 if any failed. What it learns goes to $STATE/state.json."""
 import base64, hashlib, hmac, http.client, json, os, ssl, struct, sys, time, urllib.parse
@@ -148,21 +149,30 @@ def xray():
 	panel.reauth(state)
 	_, node = panel.call("GET", "/xray")
 	check(node["installed"] is True and node["inbounds"] == [], "the panel sees the add-on installed and no xray inbound yet", json.dumps(node)[:200])
-	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "web", "protocol": "vless", "port": 8444, "cert": "/gate/node.crt", "key": "/gate/node.key", "host": E["PANEL_HOST"]}, expect=None)
+	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "web", "protocol": "vless", "port": 8444, "cert": "/gate/node.crt", "key": "/gate/node.key", "host": E["PANEL_HOST"], "decoy": "http://127.0.0.1:1"}, expect=None)
 	check(status == 200, "an xray inbound with the node's certificate is made", "answered %d" % status)
+	panel.call("DELETE", "/xray/inbounds/web")
+	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "web", "protocol": "vless", "port": 8444, "cert": "/gate/node.crt", "key": "/gate/node.key", "host": E["PANEL_HOST"]}, expect=None)
+	check(status == 200, "and again, with the decoy taken from the node's tls transport", "answered %d" % status)
+	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "tj", "protocol": "trojan", "port": 8445, "cert": "/gate/node.crt", "key": "/gate/node.key", "host": E["PANEL_HOST"]}, expect=None)
+	check(status == 200, "a trojan inbound is made", "answered %d" % status)
+	status, _ = panel.call("POST", "/xray/inbounds", {"tag": "ss", "protocol": "shadowsocks", "port": 8446, "host": E["PANEL_HOST"]}, expect=None)
+	check(status == 200, "a shadowsocks inbound is made, which makes its server key"
 	_, created = panel.call("POST", "/users", {"name": "alice", "quota_bytes": 5 * 1024 ** 3, "quota_period": "monthly"})
 	uid = created["user"]["id"]
 	_, made = panel.call("POST", "/users/%d/devices" % uid, {"name": "panel-keyed"})
 	check(made["node"]["synced"] is True, "alice has a device, so the node knows her", json.dumps(made["node"]))
 	_, node = panel.call("GET", "/xray")
-	check([(i["tag"], i["protocol"], i["port"], i["security"], i["clients"]) for i in node["inbounds"]] == [("web", "vless", 8444, "tls", 1)], "the inbound lists alice as its one client", json.dumps(node["inbounds"]))
+	check([(i["tag"], i["protocol"], i["port"], i["security"], i["clients"]) for i in node["inbounds"]] == [("web", "vless", 8444, "tls", 1), ("tj", "trojan", 8445, "tls", 1), ("ss", "shadowsocks", 8446, "none", 1)], "the inbounds list alice as their one client", json.dumps(node["inbounds"]))
 	_, shown = panel.call("GET", "/users/%d/xray" % uid)
-	links = shown["links"]
-	check(len(links) == 1 and links[0]["link"].startswith("vless://") and "<svg" in links[0]["qr_svg"], "alice's xray link comes with a QR code")
+	links = {link["tag"]: link for link in shown["links"]}
+	check(sorted(links) == ["ss", "tj", "web"] and links["web"]["link"].startswith("vless://") and "<svg" in links["web"]["qr_svg"], "alice's xray links come with QR codes")
 	_, config = panel.call("GET", "/config")
 	secrets = json.dumps(config["document"].get("xray", {}))
-	check(links[0]["link"].split("//")[1].split("@")[0] not in secrets, "the node's config shown by the panel hides the client's id")
-	state.update(xray_link=links[0]["link"], user_id=uid)
+	check(all(part not in secrets for link in links.values() for part in (lambda parts: parts[1:] if len(parts) > 1 else parts)(link["link"].split("//")[1].split("@")[0].split(":"))), "the node's config shown by the panel hides every credential and the server key")
+	_, derived = panel.call("GET", "/profiles/derived")
+	check(derived["templates"] and all(template["profile"].get("rating_cap") == "detectable" for template in derived["templates"]), "every native profile is capped at Detectable while an xray inbound shares the address")
+	state.update(xray_link=links["web"]["link"], ss_link=links["ss"]["link"], tj_link=links["tj"]["link"], user_id=uid)
 	save(state)
 
 
@@ -194,6 +204,19 @@ def limit():
 	check(status == 200, "the change is pushed to the node", "quota %s, enabled %s" % (body["quota_bytes"], body["enabled"]))
 
 
-{"setup": setup, "config": config, "xray": xray, "usage": usage, "limit": limit}[sys.argv[1]]()
+def rotate():
+	panel, state = Panel(), load()
+	panel.login(state)
+	panel.reauth(state)
+	_, done = panel.call("POST", "/users/%d/xray/rotate" % state["user_id"], {})
+	check(done["ok"] is True and done["node"]["synced"] is True, "new xray credentials are made for alice and pushed to the node", json.dumps(done)[:200])
+	_, shown = panel.call("GET", "/users/%d/xray" % state["user_id"])
+	links = {link["tag"]: link["link"] for link in shown["links"]}
+	check(links["web"] != state["xray_link"] and links["tj"] != state["tj_link"] and links["ss"] != state["ss_link"], "every link of alice is a new one")
+	state.update(xray_link=links["web"], ss_link=links["ss"], tj_link=links["tj"])
+	save(state)
+
+
+{"setup": setup, "config": config, "xray": xray, "usage": usage, "limit": limit, "rotate": rotate}[sys.argv[1]]()
 print("%d failed" % len(FAILS) if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

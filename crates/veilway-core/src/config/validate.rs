@@ -2,6 +2,8 @@
 use super::model::{domain, ident};
 use super::*;
 use crate::engine::{gate, route};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -799,12 +801,27 @@ impl Config {
 			index(&mut r, |i| format!("xray.inbounds[{i}].listen"), xray.inbounds.iter().take(MAX_XRAY_INBOUNDS).map(|inbound| inbound.listen.0));
 			for (i, inbound) in xray.inbounds.iter().enumerate().take(MAX_XRAY_INBOUNDS) {
 				let at = format!("xray.inbounds[{i}]");
-				match (&inbound.tls, inbound.protocol == XrayProtocol::Shadowsocks) {
+				let sealed = inbound.protocol == XrayProtocol::Shadowsocks;
+				match (&inbound.tls, sealed) {
 					(None, false) => r.error(format!("{at}.tls"), "expected the certificate files of the listener: vless and trojan are never served in the clear"),
 					(Some(_), true) => r.error(format!("{at}.tls"), "expected no tls: shadowsocks encrypts itself"),
 					_ => {}
 				}
+				match (&inbound.decoy, sealed) {
+					(None, false) => r.error(format!("{at}.decoy"), "expected the origin of the operator's own web server, such as http://127.0.0.1:8080: a connection that is not a user's is sent there, so the listener answers a stranger as a web server would"),
+					(Some(_), true) => r.error(format!("{at}.decoy"), "expected no decoy: shadowsocks answers a stranger with nothing"),
+					_ => {}
+				}
+				let key32 = |text: &str| STANDARD.decode(text).is_ok_and(|bytes| bytes.len() == 32) && text.len() == 44;
+				match (&inbound.server_key, sealed) {
+					(None, true) => r.error(format!("{at}.server_key"), "expected the server's key: 32 bytes as standard base64"),
+					(Some(_), false) => r.error(format!("{at}.server_key"), "expected no server_key: only shadowsocks has one"),
+					(Some(key), true) if key.expose() == REDACTED => r.error(format!("{at}.server_key"), "expected a key, found the marker the control API shows in the place of one: write the key itself"),
+					(Some(key), true) if !key32(key.expose()) => r.error(format!("{at}.server_key"), "expected 32 bytes as standard base64, 44 characters with padding"),
+					_ => {}
+				}
 				index(&mut r, |j| format!("{at}.clients[{j}].user"), inbound.clients.iter().take(MAX_USERS).map(|client| client.user.as_str()));
+				let mut seen = HashSet::new();
 				for (j, client) in inbound.clients.iter().enumerate().take(MAX_USERS) {
 					let at = format!("{at}.clients[{j}]");
 					if !user_names.contains_key(client.user.as_str()) {r.error(format!("{at}.user"), "expected the name of a user, found a name no user has")}
@@ -814,9 +831,13 @@ impl Config {
 					} else if inbound.protocol == XrayProtocol::Vless {
 						let groups: Vec<usize> = secret.split('-').map(str::len).collect();
 						if groups != [8, 4, 4, 4, 12] || !secret.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit()) {r.error(format!("{at}.secret"), "expected a UUID such as 5783a3e7-e373-51cd-8642-c83782b807c5")}
-					} else if !(8..=128).contains(&secret.len()) || !secret.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.+/=".contains(&b)) {
-						r.error(format!("{at}.secret"), "expected 8 to 128 characters from A-Z a-z 0-9 and _ - . + / =");
+					} else if sealed {
+						if !key32(secret) {r.error(format!("{at}.secret"), "expected 32 bytes as standard base64, 44 characters with padding")}
+					} else if !(22..=128).contains(&secret.len()) || !secret.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.+/=".contains(&b)) {
+						r.error(format!("{at}.secret"), "expected 22 to 128 characters from A-Z a-z 0-9 and _ - . + / =");
 					}
+					// Two clients with one secret cannot be told apart by Xray, so one of them would be counted as the other.
+					if !seen.insert(if inbound.protocol == XrayProtocol::Vless {secret.to_ascii_lowercase()} else {secret.clone()}) {r.error(format!("{at}.secret"), "expected a secret no other client of this inbound has")}
 				}
 			}
 		}
