@@ -1,0 +1,33 @@
+/* Layout only. Color, type, glass and controls come from @veilway/ui and are not restyled here. */
+html, body, #app { block-size: 100%; margin: 0; }
+.d-app { min-block-size: 100dvh; }
+.d-app > .vw-shell { min-block-size: 100dvh; display: grid; }
+.d-page { display: grid; gap: var(--s-4); align-content: start; min-inline-size: 0; inline-size: 100%; max-inline-size: 40rem; }
+.d-panel { display: grid; gap: var(--s-4); align-content: start; padding: var(--s-4); min-inline-size: 0; }
+.d-list { padding: var(--s-1) var(--s-2); }
+.d-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-2) var(--s-3); }
+.d-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--s-2); }
+.d-actions.d-start { justify-content: flex-start; }
+.d-start { justify-self: start; }
+.d-hero { display: grid; gap: var(--s-2); padding-block: var(--s-5) var(--s-1); }
+.d-place { display: grid; justify-items: start; margin: 0 0 var(--s-2); font-size: var(--text-4); line-height: var(--leading-tight); }
+.d-place .vw-small { line-height: var(--leading); }
+.d-say { margin: 0 0 var(--s-2); max-inline-size: 52ch; }
+.d-intro { display: grid; gap: var(--s-2); padding-block: var(--s-5) var(--s-1); }
+.d-intro p, .d-panel > p { margin: 0; max-inline-size: 60ch; }
+.d-form { display: grid; gap: var(--s-3); justify-items: start; }
+.d-form > .vw-field { inline-size: 100%; }
+.d-key { display: grid; gap: 2px; margin: 0; }
+.d-key .vw-code { overflow-wrap: anywhere; }
+.d-setting { display: grid; gap: var(--s-2); justify-items: start; }
+.d-progress { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); }
+.d-progress .vw-meter { flex: 1 1 8rem; }
+.d-row-actions { display: inline-flex; align-items: center; gap: var(--s-1); }
+.d-logo { display: grid; place-items: center; inline-size: 32px; block-size: 32px; border-radius: var(--r-1); background: var(--c-sunken); font-weight: var(--weight-strong); object-fit: contain; }
+.d-log { margin: 0; max-block-size: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-2); line-height: var(--leading); }
+.d-log:focus-visible { outline: 2px solid var(--c-focus); outline-offset: 2px; border-radius: var(--r-1); }
+.d-back .vw-icon { transform: scaleX(-1); }
+[dir="rtl"] .d-back .vw-icon[data-flip] { transform: none; }
+.d-brand { display: flex; align-items: center; gap: var(--s-3); }
+.d-brand svg { inline-size: 36px; block-size: 36px; flex: none; }
+.d-brand div { display: grid; line-height: var(--leading-tight); }
