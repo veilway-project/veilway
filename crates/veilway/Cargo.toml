@@ -31,11 +31,17 @@ libc.workspace=true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `connect`, `disconnect` and `status`: the client engine and its Linux layer.
-veilway-engine={path="../veilway-engine"}
 veilway-linux={path="../veilway-linux"}
-ipnet.workspace=true
 # Whether the client runs as root, which decides where it keeps its files.
 rustix={workspace=true, features=["process"]}
+
+[target.'cfg(windows)'.dependencies]
+# The same commands on Windows: the engine and its Windows layer.
+veilway-windows={path="../veilway-windows"}
+
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+veilway-engine={path="../veilway-engine"}
+ipnet.workspace=true
 
 [dev-dependencies]
 rcgen.workspace=true
