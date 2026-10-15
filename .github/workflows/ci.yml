@@ -21,6 +21,13 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # BoringSSL (the client's browser-like TLS hello, `veilway-transport`) is built from source: cmake and a C compiler are on the Linux and macOS runners, and on Windows it needs NASM and Ninja next to MSVC and cmake.
+      - name: Tools for BoringSSL
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install nasm ninja -y --no-progress
+          "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
       # macOS has only 127.0.0.1 on loopback; the tests dial from these as the addresses of separate visitors.
       - name: Alias the loopback addresses the tests use
         if: matrix.os == 'macos-latest'
