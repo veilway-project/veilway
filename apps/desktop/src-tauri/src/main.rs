@@ -100,7 +100,7 @@ async fn import_qr(backend:State<'_, Arc<Backend>>, data:String)->Result<Value, 
 }
 
 #[tauri::command]
-async fn import_proceed(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask_branded(&backend, Call::ImportProceed).await}
+async fn import_proceed(backend:State<'_, Arc<Backend>>, private:Option<Vec<String>>)->Result<Value, String>{ask_branded(&backend, Call::ImportProceed{private:private.unwrap_or_default()}).await}
 
 #[tauri::command]
 async fn import_keep(backend:State<'_, Arc<Backend>>, keep:bool)->Result<Value, String>{ask_branded(&backend, Call::ImportKeep{keep}).await}
@@ -113,7 +113,7 @@ async fn import_cancel(backend:State<'_, Arc<Backend>>)->Result<Value, String>{a
 async fn library(backend:State<'_, Arc<Backend>>, languages:Vec<String>)->Result<Value, String>{ask_branded(&backend, Call::Library{languages}).await}
 
 #[tauri::command]
-async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Refresh{subscription:id}).await}
+async fn refresh(backend:State<'_, Arc<Backend>>, id:String, private:Option<Vec<String>>)->Result<Value, String>{ask_branded(&backend, Call::Refresh{subscription:id, private:private.unwrap_or_default()}).await}
 
 #[tauri::command]
 async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Remove{subscription:id}).await}

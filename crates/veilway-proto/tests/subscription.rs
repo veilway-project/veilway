@@ -1416,6 +1416,28 @@ fn the_seeds_of_a_pinned_endpoint_read_as_what_their_names_say() {
 }
 
 #[test]
+fn a_yes_to_private_addresses_is_kept_only_for_askable_ones_and_read_back_as_untrusted() {
+	use std::net::IpAddr;
+	use veilway_proto::subscription::client::{Stored, PRIVATE_MAX};
+	let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+	let mut held = self::held();
+	assert!(held.private_addresses().is_empty() && held.stored().private.is_empty());
+	// Loopback, link-local (cloud metadata), unspecified, multicast, broadcast, an IPv4-mapped form and a public address can never be said yes to.
+	held.allow_private(&["127.0.0.1", "169.254.169.254", "fe80::1", "0.0.0.0", "224.0.0.1", "255.255.255.255", "::ffff:192.168.1.20", "64:ff9b::c0a8:114", "198.51.101.7", "8.8.8.8"].map(ip));
+	assert!(held.private_addresses().is_empty());
+	held.allow_private(&["192.168.1.20", "192.168.1.20", "fd00::20"].map(ip));
+	assert_eq!(held.private_addresses(), ["192.168.1.20", "fd00::20"].map(ip));
+	let restored = Held::restore(held.stored()).unwrap();
+	assert_eq!(restored.private_addresses(), held.private_addresses());
+	// Storage is read as untrusted: a refused address in it is dropped, and a list longer than the cap keeps the newest.
+	let long: Vec<IpAddr> = (1..=PRIVATE_MAX as u8 + 4).map(|n| IpAddr::from([10, 0, 0, n])).collect();
+	let read = Held::restore(Stored {private: [vec![ip("127.0.0.1"), ip("169.254.169.254")], long.clone()].concat(), ..held.stored()}).unwrap();
+	assert_eq!(read.private_addresses(), &long[4..]);
+	// A subscription that was stored before the yes existed has none.
+	assert!(Held::restore(Stored {private: Vec::new(), ..held.stored()}).unwrap().private_addresses().is_empty());
+}
+
+#[test]
 fn what_is_stored_of_the_pins_holds_together_or_is_given_back() {
 	use veilway_proto::subscription::client::Stored;
 	let held = pinned("203.0.113.7", 1, &[("/endpoint_pins", pins(&[1, 2]))]);

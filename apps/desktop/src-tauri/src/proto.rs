@@ -67,12 +67,13 @@ pub enum Call {
 	Library { languages: Vec<String> },
 	/// Step 1 of an import. Nothing leaves the device until `ImportProceed`.
 	ImportOpen { source: Source },
-	/// The user's first yes (a native link contacts the provider's server, a carried one is read).
-	ImportProceed,
+	/// The user's first yes (a native link contacts the provider's server, a carried one is read). `private` is the private addresses the user said yes to after the question "This subscription is on a private address", exactly as that question showed them.
+	ImportProceed {#[serde(default)] private: Vec<String>},
 	/// The user's second answer, after seeing the provider and the connections.
 	ImportKeep { keep: bool },
 	ImportCancel,
-	Refresh { subscription: String },
+	/// `private` is as in `ImportProceed`, for a subscription that already is held: the yes is kept with it.
+	Refresh { subscription: String, #[serde(default)] private: Vec<String> },
 	Remove { subscription: String },
 	Connect { subscription: String, profile: String, options: Options },
 	/// "Let apps reach devices on this network" for one subscription, saved and used from the next connect. The local network goes through the tunnel unless this is on.
@@ -149,7 +150,7 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed, Call::ImportKeep {keep: true}, Call::ImportCancel, Call::Refresh {subscription: "s".into()}, Call::Remove {subscription: "s".into()}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportCancel, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);

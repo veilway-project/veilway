@@ -28,6 +28,8 @@ pub const BACKOFF_MAX: u64 = 86_400;
 /// "Fetch timeouts: 10 s to connect, 30 s in all."
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// The most private addresses a subscription remembers a yes for.
+pub const PRIVATE_MAX: usize = 16;
 
 /// Why an answer was not taken. Every one of them leaves what is held as it was, and none of them can be accepted by the user: "There is no button that accepts it."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -312,7 +314,7 @@ impl Review {
 		if endpoint_changed != self.rechecked {return Err(Box::new(Declined {failure: Failure::Changed, release: Self::release(self.origin, self.key)}))}
 		let replaces = before.map(|_| Replaced {id: self.subscription.id.clone(), key: self.key});
 		let hosts = if self.origin.is_some() {self.subscription.refresh_urls.iter().map(Refresh::key).collect()} else {Vec::new()};
-		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, pins: self.pins};
+		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, pins: self.pins, private: Vec::new()};
 		Ok(Accepted {confirm: held.request(Op::Confirm(name)), held, replaces, endpoint_changed})
 	}
 	/// The user declines. "The client sends `"release"`, so that the device place is freed, and keeps nothing: not the document, not the link, not the key it made." `None` for a whole document, which took no place.
@@ -321,7 +323,7 @@ impl Review {
 
 /// What a client holds for one subscription: the link it came by and the device made for it, unless it came as a whole document, the last good document as it was delivered, the pins the link's endpoint is checked by, and the refresh hosts the user has confirmed, each with its port and whether it is pinned. The keys held, the id, the serial and the times are those of the last good document, so they cannot disagree with it.
 #[derive(Clone, PartialEq)]
-pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>, pins: Vec<[u8; 32]>}
+pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>, pins: Vec<[u8; 32]>, private: Vec<IpAddr>}
 
 // The document holds transport secrets, and with a provider-issued key the device's private key. None of it is printed, and neither is the link.
 impl fmt::Debug for Held {
@@ -395,6 +397,8 @@ pub struct Stored {
 	pub hosts: Vec<String>,
 	/// The pins the link's endpoint is checked by: empty for a link with no pin, otherwise 1 or 2.
 	pub pins: Vec<[u8; 32]>,
+	/// The private addresses the user said yes to for this subscription's endpoints. Missing in an older vault, which is no yes. Read as untrusted: `Held::restore` keeps only addresses `Held::allow_private` would.
+	pub private: Vec<IpAddr>,
 }
 
 impl fmt::Debug for Stored {
@@ -497,7 +501,14 @@ impl Held {
 		if self.standing(now) == Standing::Stale {Err(Stale(permit))} else {Ok(permit)}
 	}
 	/// The value to put in storage.
-	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone(), pins: self.pins.clone()}}
+	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone(), pins: self.pins.clone(), private: self.private.clone()}}
+	/// The private addresses the user said yes to for this subscription's endpoints: "Fetching" asks once per address, and a name that comes to another private address asks again. A fetch may dial a private address only if it is in this list.
+	pub fn private_addresses(&self) -> &[IpAddr] {&self.private}
+	/// Remembers the user's yes to `addresses`, the ones the question showed. Only an address that is `private` and `dialable` is kept, so a yes can never reach a loopback, link-local or other refused address. At most `PRIVATE_MAX` are kept, the oldest dropped first.
+	pub fn allow_private(&mut self, addresses: &[IpAddr]) {
+		for address in addresses.iter().filter(|address| payload::dialable(**address) && payload::private(**address)) {if !self.private.contains(address) {self.private.push(*address)}}
+		if self.private.len() > PRIVATE_MAX {self.private.drain(..self.private.len() - PRIVATE_MAX);}
+	}
 	/// A `Held` out of storage. The document is verified again under the stored keys and read again, so a `Held` never holds a document that would not pass today's reader. The clock is not asked: an old document is still the last good one. A confirmed host that is no `host:port`, or that the document does not list, is not kept, and the user is asked about it again.
 	/// The stored device is not compared with the keys in the document, and the stored keys are not compared with anything: what is stored is trusted.
 	pub fn restore(stored: Stored) -> Result<Self, Damaged> {
@@ -513,7 +524,11 @@ impl Held {
 		match payload::parse(&verified) {
 			// Every step that stores pins stores exactly the list of the document when it has one, so pins that differ from it are storage that does not hold together, and are not trusted for a recovery fetch.
 			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.is_some() && !subscription.endpoint_pins.is_empty() && stored.pins != subscription.endpoint_pins => Err(Damaged::Broken(stored.origin.map(Box::new))),
-			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.as_ref().is_none_or(|(link, _)| endpoint_ok(&subscription, link, &stored.pins).is_ok()) => Ok(Self {hosts: stored.hosts.into_iter().filter(|host| subscription.refresh_urls.iter().any(|entry| entry.key() == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins}),
+			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.as_ref().is_none_or(|(link, _)| endpoint_ok(&subscription, link, &stored.pins).is_ok()) => {
+				let mut held = Self {hosts: stored.hosts.into_iter().filter(|host| subscription.refresh_urls.iter().any(|entry| entry.key() == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins, private: Vec::new()};
+				held.allow_private(&stored.private);
+				Ok(held)
+			}
 			_ => Err(Damaged::Unread(origin.map(|(link, device)| Box::new(Fetching {link, device, keys, pins: stored.pins})))),
 		}
 	}

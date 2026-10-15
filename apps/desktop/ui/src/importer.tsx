@@ -1,15 +1,16 @@
 import {Banner, Button, Glass, List, ListRow, TextField} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
 import {base64, useD} from "./kit.tsx";
-import {call, type Offer, type Review, type Subscription} from "./tauri.ts";
+import {asksPrivate, call, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void}) {
-	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
+	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const qr = (picture: Blob) => run(base64(picture).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_qr", {data})), setOffer);
-	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setOffer(null); setReview(null); setError(null); if (!first) onCancel(); };
+	const proceed = (agreed?: string[]) => run(call("import_proceed", agreed ? {private: agreed} : {}), found => { if (asksPrivate(found)) { setAsked(found.ask_private); } else { setAsked(null); setReview(found); } });
+	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
 	useEffect(() => {
 		if (offer || review) return;
 		const paste = (event: ClipboardEvent) => { const picture = Array.from(event.clipboardData?.files ?? []).find(f => f.type.startsWith("image/")); if (picture) { event.preventDefault(); qr(picture); } };
@@ -42,6 +43,17 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 			</Glass>
 		</div>;
 	}
+	if (offer && asked) {
+		const addresses = `\u2066${asked.addresses.join(", ")}\u2069`;
+		return <div className="d-page">
+			<Glass className="d-panel">
+				<h1 className="vw-h2">{t("private.title")}</h1>
+				<p>{t("private.body", {addresses})}</p>
+				{failure}
+				<div className="d-actions"><Button onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => proceed(asked.addresses)}>{t("private.yes")}</Button></div>
+			</Glass>
+		</div>;
+	}
 	if (offer) {
 		const native = offer.kind === "native", host = offer.host ?? "";
 		return <div className="d-page">
@@ -51,7 +63,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				{key(offer.fingerprint)}
 				{native && offer.pinned && <p className="vw-muted vw-small">{t("import.pinned")}</p>}
 				{failure}
-				<div className="d-actions"><Button onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => run(call("import_proceed"), setReview)}>{native ? t("import.native.yes", {host}) : t("import.carried.yes")}</Button></div>
+				<div className="d-actions"><Button onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => proceed()}>{native ? t("import.native.yes", {host}) : t("import.carried.yes")}</Button></div>
 			</Glass>
 		</div>;
 	}

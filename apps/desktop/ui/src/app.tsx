@@ -1,4 +1,4 @@
-import {Backdrop, Banner, Button, DEFAULT_SETTINGS, Dialog, Nav, PRODUCT, Shell, StateBlock, ToastProvider, UiProvider, useToast, type TrafficPoint} from "@veilway/ui";
+import {Backdrop, Banner, Button, ConfirmDialog, DEFAULT_SETTINGS, Dialog, Nav, PRODUCT, Shell, StateBlock, ToastProvider, UiProvider, useToast, type TrafficPoint} from "@veilway/ui";
 import {useEffect, useMemo, useRef, useState} from "react";
 import {Home} from "./home.tsx";
 import {Importer} from "./importer.tsx";
@@ -7,7 +7,7 @@ import {Library} from "./library.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {fa} from "./locales/fa.ts";
 import {SettingsPage} from "./settings.tsx";
-import {call, on, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo} from "./tauri.ts";
+import {asksPrivate, call, on, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo} from "./tauri.ts";
 import {UsagePage} from "./usage.tsx";
 
 const PACKS = {en, fa};
@@ -37,7 +37,7 @@ function Brand() {
 
 function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void}) {
 	const {t, locale, percent} = useD(), toast = useToast();
-	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null);
+	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null), [privateAsk, setPrivateAsk] = useState<{id: string, addresses: string[]} | null>(null);
 	const [running, setRunning] = useState<Running>(IDLE), [busy, setBusy] = useState(false), [ended, setEnded] = useState<Ended | null>(null), [question, setQuestion] = useState<string | null>(null), [points, setPoints] = useState<TrafficPoint[]>([]), [logs, setLogs] = useState<string[]>([]);
 	const [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null);
 	const last = useRef<{at: number, sent: number, received: number} | null>(null);
@@ -80,7 +80,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		setBusy(true);
 		call("disconnect").then(() => { setRunning(IDLE); setEnded(null); setPoints([]); }, error => toast({tone: "danger", title: t("home.ended"), body: error})).finally(() => setBusy(false));
 	};
-	const refresh = (id: string) => call("refresh", {id}).then(found => { setLibrary(found); toast({tone: "success", title: t("library.refreshed")}); }, error => toast({tone: "danger", title: t("library.refreshFailed"), body: error}));
+	const refresh = (id: string, agreed?: string[]) => call("refresh", agreed ? {id, private: agreed} : {id}).then(found => { if (asksPrivate(found)) return setPrivateAsk({id, addresses: found.ask_private.addresses}); setLibrary(found); toast({tone: "success", title: t("library.refreshed")}); }, error => toast({tone: "danger", title: t("library.refreshFailed"), body: error}));
 	const answer = (yes: boolean) => {
 		setQuestion(null);
 		call("answer", {yes}).catch(error => toast({tone: "danger", title: t("question.failed"), body: error}));
@@ -101,5 +101,6 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	return <Backdrop fixed lit={lit} className="d-app">
 		<Shell nav={<Nav header={<Brand/>} value={adding ? "subscriptions" : tab} onChange={id => { setAdding(false); setTab(id); }} items={[{id: "home", label: t("nav.home"), icon: "power"}, {id: "usage", label: t("nav.usage"), icon: "chart"}, {id: "subscriptions", label: t("nav.subscriptions"), icon: "inbox"}, {id: "settings", label: t("nav.settings"), icon: "settings"}]}/>} banner={updateBanner}>{content}</Shell>
 		<Dialog open={kind !== null} onOpenChange={open => { if (!open && question !== null) answer(false); }} title={t(`question.${kind ?? "other"}.title` as DesktopKey)} description={kind === "other" ? question ?? "" : t(`question.${kind ?? "other"}.body` as DesktopKey)} footer={<><Button onClick={() => answer(false)}>{t("question.no")}</Button><Button variant={kind === "unsafe" || kind === "stale" ? "danger" : "primary"} onClick={() => answer(true)}>{t(`question.${kind ?? "other"}.yes` as DesktopKey)}</Button></>}/>
+		<ConfirmDialog open={privateAsk !== null} onOpenChange={open => { if (!open) setPrivateAsk(null); }} title={t("private.title")} body={t("private.body", {addresses: `\u2066${privateAsk?.addresses.join(", ") ?? ""}\u2069`})} confirmLabel={t("private.yes")} onConfirm={() => { if (privateAsk) refresh(privateAsk.id, privateAsk.addresses); }}/>
 	</Backdrop>;
 }
