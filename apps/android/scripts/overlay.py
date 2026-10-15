@@ -39,7 +39,21 @@ components = """
 if "VeilwayVpnService" not in text:
     text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + permissions, text, count=1)
     text = text.replace("</application>", components + "    </application>", 1)
-    manifest.write_text(text)
+# The vault and its key are not backed up or transferred: the key is wrapped by a Keystore key that no restore brings back, so a restored vault could not be opened.
+text = re.sub(r"\s+android:(allowBackup|dataExtractionRules|fullBackupContent)=\"[^\"]*\"", "", text)
+text = re.sub(r"<application\b", "<application android:allowBackup=\"false\" android:dataExtractionRules=\"@xml/data_extraction_rules\" android:fullBackupContent=\"@xml/backup_rules\"", text, count=1)
+manifest.write_text(text)
+xml = gen / "res" / "xml"
+xml.mkdir(parents=True, exist_ok=True)
+(xml / "data_extraction_rules.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+<data-extraction-rules>
+    <cloud-backup><exclude domain="root" path="." /></cloud-backup>
+    <device-transfer><exclude domain="root" path="." /></device-transfer>
+</data-extraction-rules>
+""")
+(xml / "backup_rules.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+<full-backup-content><exclude domain="root" path="." /></full-backup-content>
+""")
 # The template targets the newest SDK; androidx needs at least 36 to compile, and the SDK volume has 35 and 36.
 gradle = root / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
 text = gradle.read_text()

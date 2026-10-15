@@ -10,8 +10,6 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
-import android.net.NetworkCapabilities
-import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import java.net.Inet6Address
@@ -32,15 +30,18 @@ class VeilwayVpnService : VpnService() {
 		private const val CHANNEL = "vpn"
 		private const val ONGOING = 1
 		private const val FAILED = 2
+		private const val RETRIES = 4
 
 		@Volatile var instance: VeilwayVpnService? = null
 	}
 
 	private val worker = Executors.newSingleThreadExecutor()
-	private val networks = LinkedHashMap<Network, LinkProperties>()
+	/** The default network the system reports, the one the phone's packets leave by (the service's own sockets are kept out of the VPN). */
+	@Volatile private var underlying: Pair<Network, LinkProperties>? = null
 	private var callback: ConnectivityManager.NetworkCallback? = null
 	private var state = "connecting"
 	private var finished = false
+	private var retries = 0
 
 	override fun onCreate() {
 		super.onCreate()
@@ -51,6 +52,7 @@ class VeilwayVpnService : VpnService() {
 
 	override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
 		val wanted = Wanted(this)
+		Native.lockdown(Build.VERSION.SDK_INT >= 29 && isLockdownEnabled)
 		if (intent?.action == ACTION_STOP) {
 			wanted.wanted = false
 			startForegroundNow()
@@ -66,13 +68,11 @@ class VeilwayVpnService : VpnService() {
 			finish(null)
 			return START_NOT_STICKY
 		}
+		// A start while a session runs asks for the same connection again; the engine answers yes to that, and refuses another one.
+		val resumed = callback != null
 		finished = false
 		watchNetworks()
-		val (subscription, profile, options) = Triple(wanted.subscription!!, wanted.profile!!, wanted.options)
-		worker.execute {
-			val error = Native.connect(subscription, profile, options)
-			if (error != null) finish(error)
-		}
+		start(resumed, 0)
 		return START_STICKY
 	}
 
@@ -83,29 +83,69 @@ class VeilwayVpnService : VpnService() {
 		addresses.forEach { val (ip, prefix) = split(it); builder.addAddress(ip, prefix) }
 		dns.forEach { builder.addDnsServer(it) }
 		routes.forEach { val (ip, prefix) = split(it); builder.addRoute(ip, prefix) }
-		if (Build.VERSION.SDK_INT >= 29) builder.setMetered(false)
-		best()?.let { builder.setUnderlyingNetworks(arrayOf(it)) }
+		underlying?.first?.let { builder.setUnderlyingNetworks(arrayOf(it)) }
 		return try {
 			builder.establish()?.detachFd() ?: -1
 		} catch (e: Exception) { -1 }
 	}
 
-	fun show(newState: String) {
+	@Synchronized fun show(newState: String) {
 		state = newState
+		if (newState == "connected") retries = 0
 		getSystemService(NotificationManager::class.java).notify(ONGOING, ongoing())
 	}
 
-	/** The engine's connection ended (or the user asked it to): the service goes, and says why when it was not the user. */
+	/** The engine's connection ended (or the user asked it to): the service goes, and says why when it was not the user. A connection that ended on its own is started again, a few times with a longer pause each time, while the user still wants it. */
 	@Synchronized fun finish(error: String?) {
 		if (finished) return
+		val wanted = Wanted(this)
+		if (error != null && wanted.wanted && retries < RETRIES) {
+			retries += 1
+			show("reconnecting")
+			start(false, 1000L shl retries)
+			return
+		}
 		finished = true
 		unwatchNetworks()
 		stopForeground(STOP_FOREGROUND_REMOVE)
 		if (error != null) {
-			Wanted(this).wanted = false
-			getSystemService(NotificationManager::class.java).notify(FAILED, notification(label("Veilway disconnected", "اتصال وی‌ال‌وی قطع شد"), error, false))
+			wanted.wanted = false
+			alert(error)
 		}
 		stopSelf()
+	}
+
+	/** Starts the wanted connection on the worker, after a pause that a stop cuts short. A refusal from the engine is final; a failure to open the storage is not. */
+	private fun start(resumed: Boolean, pause: Long) {
+		worker.execute {
+			val end = System.currentTimeMillis() + pause
+			while (Wanted(this).wanted && System.currentTimeMillis() < end) Thread.sleep(100)
+			val wanted = Wanted(this)
+			if (!wanted.wanted) return@execute finish(null)
+			if (!open()) return@execute finish("Veilway could not open its storage. Try again.")
+			val error = Native.connect(wanted.subscription!!, wanted.profile!!, wanted.options) ?: return@execute
+			if (resumed) return@execute alert(error)
+			wanted.wanted = false
+			finish(error)
+		}
+	}
+
+	/** The engine's storage opens once the Keystore answers, so a failed try is repeated a few times with a growing pause. */
+	private fun open(): Boolean {
+		for (attempt in 0 until 4) {
+			if (Native.init(filesDir.absolutePath)) return true
+			Thread.sleep(500L shl attempt)
+		}
+		return false
+	}
+
+	/** A failure notice. Its text stays off the lock screen: the public version says only that the connection ended. */
+	private fun alert(text: String) {
+		val alert = notification(label("Veilway disconnected", "اتصال وی‌ال‌وی قطع شد"), text, false).apply {
+			visibility = Notification.VISIBILITY_PRIVATE
+			publicVersion = notification("Veilway", label("Disconnected", "اتصال قطع شد"), false)
+		}
+		getSystemService(NotificationManager::class.java).notify(FAILED, alert)
 	}
 
 	/** The user turned the VPN off in the system's settings, or another VPN app took over. */
@@ -146,20 +186,10 @@ class VeilwayVpnService : VpnService() {
 		if (Build.VERSION.SDK_INT >= 34) startForeground(ONGOING, ongoing(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED) else startForeground(ONGOING, ongoing())
 	}
 
-	/** Prefers wifi and ethernet over mobile data, and the newest of equals. */
-	private fun best(): Network? {
-		val manager = getSystemService(ConnectivityManager::class.java)
-		fun rank(network: Network): Int {
-			val caps = manager.getNetworkCapabilities(network) ?: return 0
-			return if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) || caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) 2 else if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) 1 else 0
-		}
-		return synchronized(networks) { networks.keys.withIndex().maxWithOrNull(compareBy({ rank(it.value) }, { it.index }))?.value }
-	}
-
 	/** Tells the engine which networks the phone is on, and the system which one carries the VPN, so that the engine reconnects when the phone moves from wifi to mobile data and back. */
 	private fun update() {
-		val network = best()
-		val properties = synchronized(networks) { network?.let { networks[it] } }
+		val current = underlying
+		val properties = current?.second
 		val found = ArrayList<String>()
 		var description = "android:none"
 		if (properties != null) {
@@ -168,26 +198,24 @@ class VeilwayVpnService : VpnService() {
 			if (gateway != null) found.add("${gateway.hostAddress?.substringBefore('%')}/${if (gateway is Inet6Address) 128 else 32}")
 			description = "android:${properties.interfaceName}:${gateway?.hostAddress ?: "?"}"
 		}
-		try { setUnderlyingNetworks(network?.let { arrayOf(it) }) } catch (e: Exception) { }
+		try { setUnderlyingNetworks(current?.let { arrayOf(it.first) }) } catch (e: Exception) { }
 		Native.networkChanged(description, found.toTypedArray())
 	}
 
 	private fun watchNetworks() {
 		if (callback != null) return
-		val manager = getSystemService(ConnectivityManager::class.java)
-		val request = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET).addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build()
 		val watcher = object : ConnectivityManager.NetworkCallback() {
-			override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) { synchronized(networks) { networks.remove(network); networks[network] = properties }; update() }
-			override fun onLost(network: Network) { synchronized(networks) { networks.remove(network) }; update() }
+			override fun onLinkPropertiesChanged(network: Network, properties: LinkProperties) { underlying = network to properties; update() }
+			override fun onLost(network: Network) { if (underlying?.first == network) underlying = null; update() }
 		}
 		callback = watcher
-		manager.registerNetworkCallback(request, watcher)
+		getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(watcher)
 	}
 
 	private fun unwatchNetworks() {
 		val watcher = callback ?: return
 		callback = null
+		underlying = null
 		try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(watcher) } catch (e: Exception) { }
-		synchronized(networks) { networks.clear() }
 	}
 }

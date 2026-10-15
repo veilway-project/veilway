@@ -6,6 +6,7 @@ use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use veilway_engine::import::{read_vault, write_vault, Vault};
 use veilway_engine::store::{read_limited, write_atomic};
 use veilway_proto::subscription::client::Stored;
@@ -16,6 +17,9 @@ const HEADER: usize = 4;
 const NONCE: usize = 12;
 const TAG: usize = 16;
 const FILE_MAX: usize = 64 * BODY_MAX + 64;
+
+/// Set when the vault's key is gone (a restore, a reset of the lock screen): the vault opens empty and host.rs says so once the log is up.
+pub static KEY_LOST: AtomicBool = AtomicBool::new(false);
 
 pub struct AndroidVault {path: PathBuf, key_path: PathBuf}
 
@@ -35,8 +39,9 @@ impl AndroidVault {
 
 	fn key(&self, create: bool) -> io::Result<Option<[u8; 32]>> {
 		if let Some(wrapped) = self.read(&self.key_path, 256)? {
-			let plain = bridge::unwrap(&wrapped).ok_or_else(|| Self::missing("did not open the key of the vault (the key may be gone after a reset of the phone's lock screen or a restore)"))?;
-			return Ok(Some(plain.try_into().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the vault key is not 32 bytes"))?));
+			// An empty answer means the key is gone; a missing answer means the Keystore did not respond, and that is an error the service retries.
+			let plain = bridge::unwrap(&wrapped).ok_or_else(|| io::Error::other("the Android Keystore did not answer, the vault is opened again later"))?;
+			if let Ok(key) = <[u8; 32]>::try_from(plain.as_slice()) {return Ok(Some(key))}
 		}
 		if !create {return Ok(None)}
 		let mut key = [0u8; 32];
@@ -55,7 +60,7 @@ impl Vault for AndroidVault {
 		let Some(file) = self.read(&self.path, FILE_MAX)? else {return Ok(Vec::new())};
 		let bad = || io::Error::new(io::ErrorKind::InvalidData, "the vault file does not decrypt: it is damaged, or its key is not the one it was made with");
 		if file.len() < HEADER + NONCE + TAG || &file[..HEADER] != MAGIC {return Err(bad())}
-		let key = self.key(false)?.ok_or_else(|| Self::missing("has no key for this vault (the subscriptions in it must be imported again)"))?;
+		let Some(key) = self.key(false)? else {KEY_LOST.store(true, Ordering::Relaxed); return Ok(Vec::new())};
 		let nonce = Nonce::try_assume_unique_for_key(&file[HEADER..HEADER + NONCE]).map_err(|_| bad())?;
 		let mut buffer = file[HEADER + NONCE..].to_vec();
 		let plain = cipher(&key)?.open_in_place(nonce, Aad::from(&file[..HEADER]), &mut buffer).map_err(|_| bad())?.len();
