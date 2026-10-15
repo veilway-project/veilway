@@ -538,6 +538,8 @@ async fn every_route_answers() {
 	// A node without links lists none.
 	assert_eq!(get(&node.socket, "/v1/links").await.json, json!({"links": []}));
 	ask("GET", "/v1/links");
+	assert_eq!(get(&node.socket, "/v1/inbounds").await.json["inbounds"][0]["tag"], json!("home"));
+	ask("GET", "/v1/inbounds");
 	assert_eq!(exits.json["exits"].as_array().map(Vec::len), Some(2));
 	let (main, sink) = (&exits.json["exits"][0], &exits.json["exits"][1]);
 	assert_eq!((&main["tag"], &main["name"], &main["backend"], &main["outbound"], &main["udp"], &main["udp_down_secs"], &main["udp_flips"]), (&json!("main"), &json!("Main"), &json!("netstack"), &json!("proxy"), &json!(true), &Value::Null, &json!(0)), "{main}");
@@ -1397,7 +1399,7 @@ async fn an_outbound_is_the_sum_of_the_exits_that_leave_through_it() {
 		assert!(sum, "{stats}");
 		(proxy.clone(), stats["outbounds"][1].clone(), [main.clone(), second.clone()])
 	};
-	let unused = json!({"name": "spare", "traffic": {"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}, "up_bytes_per_sec": 0, "down_bytes_per_sec": 0, "udp": null, "udp_down_secs": null, "udp_flips": 0});
+	let unused = json!({"name": "spare", "traffic": {"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}, "up_bytes_per_sec": 0, "down_bytes_per_sec": 0, "udp": null, "udp_down_secs": null, "udp_flips": 0, "latency_ms": null, "measured_at": null});
 	let (proxy, spare, _) = read(&node.socket).await;
 	assert_eq!((&proxy["traffic"]["up_bytes"], &proxy["udp"], &proxy["udp_down_secs"], &proxy["udp_flips"], &spare), (&json!(0), &json!(true), &Value::Null, &json!(0), &unused), "{proxy}");
 	// A new TCP flow through each exit every 200 ms for three seconds.
@@ -1473,11 +1475,68 @@ async fn a_replay_reset_is_written_before_it_is_answered_and_touches_no_usage() 
 	node.end().await;
 }
 
+// A profile takes the WireGuard key of an inbound and the public half of its first transport key, and every transport is rated Detectable in version 1. No private key comes out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_inbound_lists_the_public_keys_a_profile_takes_and_the_rating_of_each_transport() {
+	let mut setup = setup().await;
+	let (private, native, node_key) = (setup.private, veilway_wg::generate_key(), veilway_wg::generate_key());
+	let listed = json!({"tag": "native", "type": "veilway", "private_key": veilway_wg::encode_key(&native), "address": ["10.9.0.1/24"], "transport_keys": [veilway_wg::encode_key(&node_key)], "transports": [{"type": "udp-obfs", "listen": listen().to_string()}, {"type": "fronted", "listen": listen().to_string(), "path": "/relay/inbound-path", "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For"}]});
+	setup.doc["inbounds"].as_array_mut().unwrap().push(listed);
+	let node = launch(setup).await;
+	let answer = get(&node.socket, "/v1/inbounds").await;
+	let public = |key: &[u8; 32]| veilway_wg::encode_key(&veilway_wg::public_key(key));
+	let transport_public = veilway_wg::encode_key(&veilway_proto::proof::public_key(&node_key));
+	assert_eq!(answer.status, 200);
+	assert_eq!(answer.json, json!({"inbounds": [
+		{"tag": "home", "kind": "wireguard", "public_key": public(&private), "transport_public_key": null, "transports": [{"transport": "udp", "rating": "detectable"}]},
+		{"tag": "native", "kind": "veilway", "public_key": public(&native), "transport_public_key": transport_public, "transports": [{"transport": "udp-obfs", "rating": "detectable"}, {"transport": "fronted", "rating": "detectable"}]}
+	], "public_addresses": []}));
+	no_secret_in(&answer.body, "the inbounds listing");
+	node.end().await;
+}
+
+// The proxy's greeting is timed by the flow that dials it, and nothing else is: a direct outbound and an exit that never dialled show nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_proxy_of_an_outbound_shows_how_long_its_greeting_took_once_a_flow_has_used_it() {
+	let mut setup = setup().await;
+	setup.doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "spare", "type": "direct"}));
+	let node = launch(setup).await;
+	let mut a = Client::connect(node.keys[0], None, node.public, node.addr).await;
+	let before = get(&node.socket, "/v1/stats").await.json;
+	assert_eq!((&before["outbounds"][0]["latency_ms"], &before["outbounds"][0]["measured_at"]), (&Value::Null, &Value::Null), "{before}");
+	assert_eq!(a.greeted(PEER_A, 41500).await, GREETING.to_vec());
+	let stats = get(&node.socket, "/v1/stats").await.json;
+	let (latency, measured) = (&stats["outbounds"][0]["latency_ms"], &stats["outbounds"][0]["measured_at"]);
+	assert!(latency.as_u64().is_some() && measured.as_i64().is_some_and(|at| at > 1_700_000_000), "{stats}");
+	assert_eq!((&stats["outbounds"][1]["latency_ms"], &stats["outbounds"][1]["measured_at"]), (&Value::Null, &Value::Null), "{stats}");
+	let exits = get(&node.socket, "/v1/exits").await.json;
+	assert_eq!((&exits["exits"][0]["latency_ms"], &exits["exits"][0]["measured_at"]), (latency, measured), "{exits}");
+	assert_eq!((&exits["exits"][1]["latency_ms"], &exits["exits"][1]["measured_at"]), (&Value::Null, &Value::Null), "{exits}");
+	node.end().await;
+}
+
+// A node names its public addresses once, in the config, and every profile reads them from status and from the inbound listing. A port in one is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_names_its_public_addresses_and_refuses_one_with_a_port() {
+	let mut setup = setup().await;
+	let listed = json!(["node.example.net", "192.0.2.7", "2001:db8::7"]);
+	setup.doc["public_addresses"] = listed.clone();
+	let mut with_port = setup.doc.clone();
+	with_port["public_addresses"] = json!(["192.0.2.7:443"]);
+	let node = launch(setup).await;
+	let (status, inbounds) = (get(&node.socket, "/v1/status").await.json, get(&node.socket, "/v1/inbounds").await.json);
+	assert_eq!((&status["public_addresses"], &inbounds["public_addresses"]), (&listed, &listed), "{status}");
+	let answer = send(&node.socket, "POST", "/v1/config/validate", None, &with_port).await;
+	assert_eq!((answer.status, &answer.json["valid"]), (200, &json!(false)), "{}", answer.json);
+	assert!(answer.json.to_string().contains("public_addresses[0]"), "{}", answer.json);
+	node.end().await;
+}
+
 #[test]
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/links"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();

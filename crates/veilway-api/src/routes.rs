@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
@@ -128,7 +128,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 
 async fn status(State(api): State<Arc<Api>>) -> Response {
 	let (snapshot, plan) = (api.engine.snapshot(), api.engine.plan());
-	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), not_before: made.not_before, not_after: made.not_after}).collect()})
+	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), not_before: made.not_before, not_after: made.not_after}).collect(), public_addresses: snapshot.config.public_addresses.clone()})
 }
 
 async fn running(State(api): State<Arc<Api>>) -> Response {
@@ -294,12 +294,13 @@ async fn sessions(State(api): State<Arc<Api>>) -> Response {
 }
 
 async fn exits(State(api): State<Arc<Api>>) -> Response {
-	let (snapshot, counters, health, links) = (api.engine.snapshot(), api.engine.counters(), api.engine.exit_health(), api.engine.links());
+	let (snapshot, counters, health, links, latencies) = (api.engine.snapshot(), api.engine.counters(), api.engine.exit_health(), api.engine.links(), api.engine.latencies());
 	json(StatusCode::OK, &model::Exits {exits: snapshot.config.exits.iter().map(|exit| {
 		let (health, outbound) = (health.iter().find(|health| health.exit == exit.tag), if let veilway_core::config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None});
 		// Only a SOCKS5 proxy can refuse to relay UDP, so only an exit through one has anything to say here.
 		let proxied = outbound.as_ref().is_some_and(|tag| snapshot.config.outbounds.iter().any(|outbound| matches!(outbound, Outbound::Socks5 {tag: of, ..} if of == tag)));
 		let down = health.and_then(|health| health.no_udp).filter(|_| proxied);
+		let latency = outbound.as_ref().and_then(|tag| latencies.get(tag)).copied();
 		model::Exit {
 			tag: exit.tag.clone(),
 			name: exit.name.clone().unwrap_or_else(|| exit.tag.clone()),
@@ -318,9 +319,31 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			interface_flips: health.map_or(0, |health| health.interface_flips),
 			links: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {chain.links.clone()} else {Vec::new()},
 			link_up: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {Some(links.iter().any(|link| chain.links.contains(&link.tag) && link.status == Status::Up))} else {None},
+			latency_ms: latency.map(|(took, _)| took.as_millis() as u64),
+			measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64),
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
 		}
 	}).collect()})
+}
+
+async fn inbounds(State(api): State<Arc<Api>>) -> Response {
+	let snapshot = api.engine.snapshot();
+	json(StatusCode::OK, &model::Inbounds {inbounds: snapshot.config.inbounds.iter().map(|inbound| model::InboundInfo {
+		tag: inbound.tag.clone(),
+		kind: match inbound.kind {veilway_core::config::InboundType::Wireguard => model::InboundKind::Wireguard, veilway_core::config::InboundType::Veilway => model::InboundKind::Veilway},
+		public_key: inbound.public_key(),
+		transport_public_key: inbound.transport_public_key(),
+		transports: inbound.transports.iter().map(|transport| model::InboundTransport {
+			transport: match transport {
+				veilway_core::config::Transport::Udp {..} => model::Transport::Udp,
+				veilway_core::config::Transport::Ws {..} | veilway_core::config::Transport::WsNative {..} => model::Transport::Ws,
+				veilway_core::config::Transport::UdpObfs {..} => model::Transport::UdpObfs,
+				veilway_core::config::Transport::Tls {..} => model::Transport::Tls,
+				veilway_core::config::Transport::Fronted {..} => model::Transport::Fronted,
+			},
+			rating: transport.rating(),
+		}).collect(),
+	}).collect(), public_addresses: snapshot.config.public_addresses.clone()})
 }
 
 async fn links(State(api): State<Arc<Api>>) -> Response {
@@ -453,6 +476,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::Stats, _, _>(schemas, Method::GET, "/v1/stats", "stats", "Every counter at one moment, with rates in bytes per second over the last 5 seconds.", stats, false, &[]),
 		route::<model::Sessions, _, _>(schemas, Method::GET, "/v1/sessions", "listSessions", "The devices with a live session.", sessions, false, &[]),
 		route::<model::Exits, _, _>(schemas, Method::GET, "/v1/exits", "listExits", "Every exit with what the node knows of its upstream, and its counters.", exits, false, &[]),
+		route::<model::Inbounds, _, _>(schemas, Method::GET, "/v1/inbounds", "listInbounds", "Every inbound of the running config with its WireGuard public key, the public half of its node transport key, and the rating of each transport: what a censor can see of a profile of it. No private key.", inbounds, false, &[]),
 		route::<model::Links, _, _>(schemas, Method::GET, "/v1/links", "listLinks", "Every enabled node link with its state and its counters. No key and no secret.", links, false, &[]),
 		stream,
 		route::<BTreeMap<String, serde_json::Value>, _, _>(schemas, Method::GET, "/v1/openapi.json", "openapi", "This document.", openapi, false, &[]),
@@ -481,7 +505,7 @@ impl Api {
 			model::Rated {name: name.to_string(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down}
 		};
 		// An outbound counts nothing itself: its numbers are those of its exits, added up here. Exits are matched by tag, because the document and the counters are read one after the other and a reload may come in between.
-		let (snapshot, health) = (self.engine.snapshot(), self.engine.exit_health());
+		let (snapshot, health, latencies) = (self.engine.snapshot(), self.engine.exit_health(), self.engine.latencies());
 		let through: HashMap<&str, &str> = snapshot.config.exits.iter().filter_map(|exit| if let veilway_core::config::Backend::Netstack(netstack) = &exit.backend {Some((exit.tag.as_str(), netstack.outbound.as_str()))} else {None}).collect();
 		let mut sums: HashMap<&str, (veilway_core::Totals, (u64, u64), Option<Duration>, u64)> = HashMap::new();
 		for (tag, totals) in &counters.exits {
@@ -507,7 +531,8 @@ impl Api {
 				let (totals, (up, down), refused, flips) = sums.get(tag.as_str()).copied().unwrap_or_default();
 				// Only a SOCKS5 proxy can refuse to relay UDP, as in `exits`.
 				let refused = refused.filter(|_| proxied);
-				model::OutboundStats {name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}}
+				let latency = latencies.get(tag).copied();
+				model::OutboundStats {name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}, latency_ms: latency.map(|(took, _)| took.as_millis() as u64), measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64)}
 			}).collect(),
 			drops: Reason::ALL.iter().map(|reason| (reason.name().to_string(), self.engine.dropped(*reason))).collect(),
 			dns: model::Dns {answered: dns.answered, refused: dns.refused, failed: dns.failed, malformed: dns.malformed, throttled: dns.throttled},

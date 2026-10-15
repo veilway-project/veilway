@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -327,6 +327,14 @@ text_value!(GatewayNet, "a gateway address with its prefix such as 10.7.0.1/24",
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Host {Ip(IpAddr), Name(String)}
 
+text_value!(Host, "an IP address or a lowercase host name, with no port", "^[0-9A-Za-z.:-]{1,253}$", |s| {
+	if let Ok(addr) = ip(s) {return Ok(Host::Ip(addr))}
+	if domain(s, false) {Ok(Host::Name(s.to_string()))} else {Err("an IP address or a lowercase host name, with no port")}
+}, |host| match host {
+	Host::Ip(addr) => addr.to_string(),
+	Host::Name(name) => name.clone(),
+});
+
 /// A SOCKS5 server: an address or a host name, and a port.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostPort {pub host: Host, pub port: u16}
@@ -516,6 +524,10 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_NOTICES))]
 	pub notices: Vec<Notice>,
+	/// The addresses a profile of this node is given, as host names or IP addresses with no port: each transport keeps the port of its own listener.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_PUBLIC_ADDRESSES))]
+	pub public_addresses: Vec<Host>,
 	/// The replay memory of the obfuscated transports. Only a node with such a transport keeps one.
 	#[serde(default, skip_serializing_if = "Replay::is_default")]
 	pub replay: Replay,
@@ -688,6 +700,12 @@ impl Inbound {
 
 	/// The fields the upgrade answer takes from the decoy origin: "The default list is `Server`, `Date` on a `tls` listener and empty on a `ws` listener, where the front web server adds its own." `tls` says which of the two the answer is for.
 	pub fn upgrade_headers(&self, tls: bool) -> Vec<String> {self.upgrade_headers.clone().unwrap_or_else(|| DEFAULT_UPGRADE_HEADERS.iter().filter(|_| tls).map(|name| name.to_string()).collect())}
+
+	/// The WireGuard public key of the inbound.
+	pub fn public_key(&self) -> Key {Key(veilway_wg::public_key(&self.private_key.expose().0))}
+
+	/// The public half of the first node transport key, which a profile carries.
+	pub fn transport_public_key(&self) -> Option<Key> {self.transport_keys.as_ref()?.first().map(|key| Key(veilway_proto::proof::public_key(&key.0)))}
 }
 
 /// Transports page, "Padding", rule 4: the bounds "may be set per profile for the client and per inbound for the node, inside the bounds in the table of numbers".
@@ -793,6 +811,11 @@ impl<'de> Deserialize<'de> for Certificate {
 	}
 }
 
+/// What a censor can see of a profile's connection, computed here so that the panel and the clients agree. See PLAN.md, "three ratings".
+#[derive(Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Rating {Protected, Detectable, Unsafe}
+
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transport {
@@ -868,6 +891,9 @@ impl Transport {
 
 	/// Whether the transport has a UDP socket of its own.
 	pub fn datagram(&self) -> bool {matches!(self, Transport::Udp {..} | Transport::UdpObfs {..})}
+
+	/// Version 1: no transport has passed the tests Protected needs, and none is weaker than Detectable, so every transport is Detectable.
+	pub fn rating(&self) -> Rating {Rating::Detectable}
 
 	/// The decoy origin of a transport that takes the stream proof.
 	pub fn decoy(&self) -> Option<&Decoy> {

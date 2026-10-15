@@ -90,6 +90,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/inbounds": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Every inbound of the running config with its WireGuard public key, the public half of its node transport key, and the rating of each transport: what a censor can see of a profile of it. No private key. */
+        get: operations["listInbounds"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/links": {
         parameters: {
             query?: never;
@@ -374,6 +391,7 @@ export interface components {
             log: boolean;
             notices: boolean;
             outbounds: components["schemas"]["Changes"];
+            public_addresses: boolean;
             /** @description `replay` changed. The rate per source is in force at once, the cache size from the next start of the node. */
             replay: boolean;
             routing_default: boolean;
@@ -421,10 +439,20 @@ export interface components {
             interface_flips: number;
             /** @description Whether the interface of an l3 backend is up. While it is not, what is routed to the exit is answered as unreachable and the node tries to bring the interface up again: 2 seconds after it went down, then after twice the wait each time, once a minute at most. Null for any other backend. */
             interface_up: boolean | null;
+            /**
+             * Format: uint64
+             * @description How long the proxy of the outbound took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, for an exit with no SOCKS5 outbound, and until a flow has used the proxy. A reload starts it over.
+             */
+            latency_ms: number | null;
             /** @description Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend. */
             link_up: boolean | null;
             /** @description The node links of a chain backend, by tag, which `/v1/links` reports on. Empty for every other backend. */
             links: string[];
+            /**
+             * Format: int64
+             * @description Unix seconds when `latency_ms` was measured.
+             */
+            measured_at: number | null;
             name: string;
             /** @description The tag of the outbound of a netstack backend. */
             outbound: string | null;
@@ -459,6 +487,8 @@ export interface components {
             /** @description One plain sentence, for people. */
             message: string;
         };
+        /** @description an IP address or a lowercase host name, with no port */
+        Host: string;
         InboundChange: {
             /** @description The tunnel restarts and every session of it drops. */
             restart: boolean;
@@ -468,6 +498,30 @@ export interface components {
             /** @description Indexes into the transports of the running inbound. */
             transports_stopped: number[];
         };
+        /** @description An inbound with what a client profile takes from it. No private key. */
+        InboundInfo: {
+            kind: components["schemas"]["InboundKind"];
+            /** @description The WireGuard public key of the inbound. */
+            public_key: components["schemas"]["Key"];
+            tag: string;
+            /** @description The public half of the node transport key a profile carries. Null for an inbound with no `transport_keys`. */
+            transport_public_key: components["schemas"]["Key"] | null;
+            transports: components["schemas"]["InboundTransport"][];
+        };
+        /** @enum {string} */
+        InboundKind: "wireguard" | "veilway";
+        /** @description One transport of an inbound, with the rating a profile of it gets. */
+        InboundTransport: {
+            rating: components["schemas"]["Rating"];
+            transport: components["schemas"]["Transport"];
+        };
+        Inbounds: {
+            inbounds: components["schemas"]["InboundInfo"][];
+            /** @description The node's public addresses, as `GET /v1/status` gives them. */
+            public_addresses: components["schemas"]["Host"][];
+        };
+        /** @description a WireGuard key: 44 characters of standard base64 with padding */
+        Key: string;
         /** @description The data of a `lagged` event: this many events, the ones whose ids are missing before the next event, never reached the reader. It was too slow for them, or the node made them faster than it keeps them for anybody. It has no id. */
         Lagged: {
             /** Format: uint64 */
@@ -535,6 +589,16 @@ export interface components {
         OutboundStats: {
             /** Format: uint64 */
             down_bytes_per_sec: number;
+            /**
+             * Format: uint64
+             * @description How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.
+             */
+            latency_ms: number | null;
+            /**
+             * Format: int64
+             * @description Unix seconds when `latency_ms` was measured.
+             */
+            measured_at: number | null;
             /** @description The tag of the outbound. */
             name: string;
             /** @description The sum of `traffic` over the exits whose backend names this outbound, all zero for an outbound no exit uses. It holds everything those exits count, which includes what their `unsupported` policy sent around the proxy with `"direct"`. */
@@ -574,6 +638,11 @@ export interface components {
             /** Format: uint64 */
             up_bytes_per_sec: number;
         };
+        /**
+         * @description What a censor can see of a profile's connection, computed here so that the panel and the clients agree. See PLAN.md, "three ratings".
+         * @enum {string}
+         */
+        Rating: "protected" | "detectable" | "unsafe";
         /** @enum {string} */
         Reason: "disabled" | "expired" | "quota" | "removed";
         /** @description The replay memory of the node. Times are Unix seconds on the node's clock. */
@@ -765,6 +834,8 @@ export interface components {
             generation: number;
             /** Format: uint */
             inbounds: number;
+            /** @description The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none. */
+            public_addresses: components["schemas"]["Host"][];
             /** @description What `If-Match` takes: 64 hex digits that name the bytes of the running config. Only this run of the node gives them this name: nobody else can work it out from a document, and after a restart the same config has another one. */
             revision: string;
             /** Format: uint64 */
@@ -1502,6 +1573,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Exits"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listInbounds: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Inbounds"];
                 };
             };
             /** @description The request was not finished within 30 seconds. */

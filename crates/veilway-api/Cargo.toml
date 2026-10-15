@@ -24,6 +24,7 @@ socket2.workspace=true
 
 [target.'cfg(unix)'.dev-dependencies]
 veilway-wg={path="../veilway-wg"}
+veilway-proto={path="../veilway-proto"}
 boringtun.workspace=true
 etherparse.workspace=true
 tracing-subscriber.workspace=true

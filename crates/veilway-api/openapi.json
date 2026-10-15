@@ -306,6 +306,9 @@
           "outbounds": {
             "$ref": "#/components/schemas/Changes"
           },
+          "public_addresses": {
+            "type": "boolean"
+          },
           "replay": {
             "description": "`replay` changed. The rate per source is in force at once, the cache size from the next start of the node.",
             "type": "boolean"
@@ -340,6 +343,7 @@
           "routing_default",
           "rules_reordered",
           "notices",
+          "public_addresses",
           "replay",
           "inbound_changes",
           "user_changes"
@@ -454,6 +458,15 @@
               "null"
             ]
           },
+          "latency_ms": {
+            "description": "How long the proxy of the outbound took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, for an exit with no SOCKS5 outbound, and until a flow has used the proxy. A reload starts it over.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "link_up": {
             "description": "Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend.",
             "type": [
@@ -467,6 +480,14 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "measured_at": {
+            "description": "Unix seconds when `latency_ms` was measured.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "name": {
             "type": "string"
@@ -520,6 +541,8 @@
           "interface_flips",
           "links",
           "link_up",
+          "latency_ms",
+          "measured_at",
           "traffic"
         ],
         "type": "object"
@@ -579,6 +602,11 @@
         ],
         "type": "object"
       },
+      "Host": {
+        "description": "an IP address or a lowercase host name, with no port",
+        "pattern": "^[0-9A-Za-z.:-]{1,253}$",
+        "type": "string"
+      },
       "InboundChange": {
         "properties": {
           "restart": {
@@ -614,6 +642,96 @@
           "transports_started"
         ],
         "type": "object"
+      },
+      "InboundInfo": {
+        "description": "An inbound with what a client profile takes from it. No private key.",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/InboundKind"
+          },
+          "public_key": {
+            "$ref": "#/components/schemas/Key",
+            "description": "The WireGuard public key of the inbound."
+          },
+          "tag": {
+            "type": "string"
+          },
+          "transport_public_key": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Key"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The public half of the node transport key a profile carries. Null for an inbound with no `transport_keys`."
+          },
+          "transports": {
+            "items": {
+              "$ref": "#/components/schemas/InboundTransport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "tag",
+          "kind",
+          "public_key",
+          "transport_public_key",
+          "transports"
+        ],
+        "type": "object"
+      },
+      "InboundKind": {
+        "enum": [
+          "wireguard",
+          "veilway"
+        ],
+        "type": "string"
+      },
+      "InboundTransport": {
+        "description": "One transport of an inbound, with the rating a profile of it gets.",
+        "properties": {
+          "rating": {
+            "$ref": "#/components/schemas/Rating"
+          },
+          "transport": {
+            "$ref": "#/components/schemas/Transport"
+          }
+        },
+        "required": [
+          "transport",
+          "rating"
+        ],
+        "type": "object"
+      },
+      "Inbounds": {
+        "properties": {
+          "inbounds": {
+            "items": {
+              "$ref": "#/components/schemas/InboundInfo"
+            },
+            "type": "array"
+          },
+          "public_addresses": {
+            "description": "The node's public addresses, as `GET /v1/status` gives them.",
+            "items": {
+              "$ref": "#/components/schemas/Host"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "inbounds",
+          "public_addresses"
+        ],
+        "type": "object"
+      },
+      "Key": {
+        "description": "a WireGuard key: 44 characters of standard base64 with padding",
+        "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+        "type": "string"
       },
       "Lagged": {
         "description": "The data of a `lagged` event: this many events, the ones whose ids are missing before the next event, never reached the reader. It was too slow for them, or the node made them faster than it keeps them for anybody. It has no id.",
@@ -839,6 +957,23 @@
             "minimum": 0,
             "type": "integer"
           },
+          "latency_ms": {
+            "description": "How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "measured_at": {
+            "description": "Unix seconds when `latency_ms` was measured.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "name": {
             "description": "The tag of the outbound.",
             "type": "string"
@@ -883,7 +1018,9 @@
           "down_bytes_per_sec",
           "udp",
           "udp_down_secs",
-          "udp_flips"
+          "udp_flips",
+          "latency_ms",
+          "measured_at"
         ],
         "type": "object"
       },
@@ -939,6 +1076,15 @@
           "down_bytes_per_sec"
         ],
         "type": "object"
+      },
+      "Rating": {
+        "description": "What a censor can see of a profile's connection, computed here so that the panel and the clients agree. See PLAN.md, \"three ratings\".",
+        "enum": [
+          "protected",
+          "detectable",
+          "unsafe"
+        ],
+        "type": "string"
       },
       "Reason": {
         "enum": [
@@ -1395,6 +1541,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "public_addresses": {
+            "description": "The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none.",
+            "items": {
+              "$ref": "#/components/schemas/Host"
+            },
+            "type": "array"
+          },
           "revision": {
             "description": "What `If-Match` takes: 64 hex digits that name the bytes of the running config. Only this run of the node gives them this name: nobody else can work it out from a document, and after a restart the same config has another one.",
             "type": "string"
@@ -1422,7 +1575,8 @@
           "exits",
           "users",
           "flows",
-          "certificates"
+          "certificates",
+          "public_addresses"
         ],
         "type": "object"
       },
@@ -2744,6 +2898,45 @@
           }
         },
         "summary": "Every exit with what the node knows of its upstream, and its counters."
+      }
+    },
+    "/v1/inbounds": {
+      "get": {
+        "operationId": "listInbounds",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Inbounds"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every inbound of the running config with its WireGuard public key, the public half of its node transport key, and the rating of each transport: what a censor can see of a profile of it. No private key."
       }
     },
     "/v1/links": {

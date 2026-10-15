@@ -41,7 +41,7 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use tokio::sync::{broadcast, mpsc, Notify, Semaphore};
 use tokio::time::MissedTickBehavior;
@@ -500,6 +500,9 @@ impl Engine {
 			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed))}
 		}).collect()
 	}
+
+	/// The last measured proxy latency of each SOCKS5 outbound that has one, by tag, and when it was measured.
+	pub fn latencies(&self) -> HashMap<String, (Duration, SystemTime)> {self.plan().latency.iter().filter_map(|(tag, latency)| latency.get().map(|measured| (tag.clone(), measured))).collect()}
 
 	pub fn plan(&self) -> Arc<Plan> {self.shared.plan()}
 

@@ -417,6 +417,11 @@
       "pattern": "^[0-9A-Fa-f:.]+/[1-9][0-9]{0,2}$",
       "type": "string"
     },
+    "Host": {
+      "description": "an IP address or a lowercase host name, with no port",
+      "pattern": "^[0-9A-Za-z.:-]{1,253}$",
+      "type": "string"
+    },
     "HostPort": {
       "description": "a host and port such as proxy.example.com:1080, with an IPv6 address in brackets",
       "pattern": "^([a-z0-9.-]{1,253}|\\[[0-9A-Fa-f:.]+\\]):[1-9][0-9]{0,4}$",
@@ -1953,6 +1958,15 @@
         "$ref": "#/$defs/Outbound"
       },
       "maxItems": 256,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "public_addresses": {
+      "description": "The addresses a profile of this node is given, as host names or IP addresses with no port: each transport keeps the port of its own listener.",
+      "items": {
+        "$ref": "#/$defs/Host"
+      },
+      "maxItems": 8,
       "type": "array",
       "uniqueItems": true
     },
