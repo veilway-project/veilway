@@ -72,6 +72,16 @@ The full plan with the gate for each phase is in [PLAN.md](PLAN.md).
 | 7 | Android client |
 | 8 | Complete docs in both languages, SDK examples, fuzzing in CI, signed releases |
 
+## Install
+
+On a Linux server with systemd (x86_64 or aarch64), the recommended way is the install script. It downloads the signed release, checks the minisign signature and the tag in it (it refuses otherwise), sets up systemd units and a dedicated user, and also updates, backs up and removes:
+
+```
+curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
+```
+
+With no arguments it shows a menu. The same actions work as commands: `install node|panel|both`, `update`, `status`, `logs`, `restart`, `check`, `doctor`, `backup`, `restore <file>`, `uninstall` and `version`. `--dry-run` prints what would happen and changes nothing. Read the script before you run it as root if you like: it is `scripts/veilway.sh`. The panel listens on loopback only, so put your own web server in front of it. There is no published release yet.
+
 ## Quick start
 
 There is no published release yet, so build from source. You need a stable Rust toolchain. An upstream SOCKS5 proxy is optional: an exit can also leave directly from the server.
