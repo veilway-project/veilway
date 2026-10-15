@@ -382,6 +382,8 @@ async fn every_answer_that_is_no_session_is_a_refusal_and_is_read_inside_its_bou
 		let Some((head, _)) = head(&mut io).await else {return};
 		let _ = io.write_all(&upgraded(&head)).await;
 		let _ = io.shutdown().await;
+		// What the client sent is read before the drop: on Windows a close with unread data is a reset, which the client rightly calls a cut.
+		let _ = tokio::time::timeout(SECOND, async {let mut buf = [0u8; 4096]; while matches!(io.read(&mut buf).await, Ok(read) if read > 0) {}}).await;
 	}).await;
 	assert_eq!(tried(&root.roots, ws(front(addr, "node.test", &[]))).await, refusal(Answer::Unopened));
 }
