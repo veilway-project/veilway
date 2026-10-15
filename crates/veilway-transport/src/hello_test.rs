@@ -82,8 +82,8 @@ async fn flight(sni: Option<&str>) -> Hello {
 	parse(&record)
 }
 
-// The target is Chrome's wss:// hello shape: Chrome 131's JA4 with ALPS left out (this client's ALPN is `http/1.1` alone, as a WebSocket sends it, so Chrome sends no ALPS). It still needs confirming against a real Chrome capture.
-const TARGET: &str = "t13d1515h1_8daaf6152771_0a20fe35d3a5";
+// Measured from a capture of Chrome 155.0.8059 (stable) opening a `wss://` connection on a first visit: ALPN `http/1.1` alone, so no ALPS, and 16 extensions. JA4 leaves GREASE out, so the GREASE signature algorithm in front of the list does not show here.
+const TARGET: &str = "t13d1516h1_8daaf6152771_5b37b36a67c0";
 
 #[tokio::test]
 async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
@@ -93,6 +93,8 @@ async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
 		assert_eq!(ja4(&hello), TARGET);
 		assert_eq!(hello.groups, [0x11ec, 0x001d, 0x0017, 0x0018]);
 		assert_eq!(hello.shares, [0x11ec, 0x001d]);
+		assert_eq!(hello.sigalgs, [0x0904, 0x0905, 0x0906, 0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601]);
+		assert!(hello.extensions.contains(&0xca34) && !hello.extensions.contains(&0x44cd));
 		assert_eq!((hello.formats.as_slice(), hello.alpn.as_slice(), hello.ech), (&[0][..], &b"http/1.1"[..], true));
 		orders.insert(ja3(&hello));
 	}
@@ -102,5 +104,5 @@ async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
 #[tokio::test]
 async fn a_candidate_with_no_server_name_sends_none() {
 	let hello = flight(None).await;
-	assert!(!hello.sni && ja4(&hello).starts_with("t13i1514h1_8daaf6152771_0a20fe35d3a5"));
+	assert!(!hello.sni && ja4(&hello).starts_with("t13i1515h1_8daaf6152771_5b37b36a67c0"));
 }
