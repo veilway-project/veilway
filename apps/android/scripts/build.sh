@@ -18,6 +18,12 @@ npm ci --prefix "$UI/packages/i18n"
 npm ci --prefix "$UI/packages/ui"
 [ -d src-tauri/gen/android ] || tauri android init --ci
 python3 scripts/overlay.py "$ROOT/apps/android"
+# init leaves Tauri's own launcher icon in res/, so ours is drawn over it each build
+icons=$(mktemp -d)
+tauri icon -o "$icons" src-tauri/icons/icon.png
+[ -d "$icons/android" ] || { echo "tauri icon made no Android icons" >&2; exit 1; }
+cp -R "$icons/android/." src-tauri/gen/android/app/src/main/res/
+rm -rf "$icons"
 tauri android build --apk --target aarch64 --ci
 unsigned=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
 out="$ROOT/apps/android/dist"
