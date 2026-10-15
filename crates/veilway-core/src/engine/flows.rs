@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use tokio_socks::tcp::Socks5Stream;
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -117,16 +116,36 @@ pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> 
 	Ok((control, relay))
 }
 
-/// The only way out of a `socks5` outbound. Every byte a flow sends through one leaves through this SOCKS5 CONNECT.
-pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<Socks5Stream<TcpStream>> {
+/// The only way out of a `socks5` outbound. Every byte a flow sends through one leaves through this SOCKS5 CONNECT. The time up to the end of the greeting is the proxy's own, since the CONNECT and the destination come after it, and it is what `up.latency` keeps.
+pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<TcpStream> {
 	let connect = async {
-		Ok::<_, tokio_socks::Error>(match &up.auth {
-			Some((user, pass)) => Socks5Stream::connect_with_password(up.addr.as_str(), dst, user, pass).await?,
-			None => Socks5Stream::connect(up.addr.as_str(), dst).await?,
-		})
+		let started = Instant::now();
+		let mut control = TcpStream::connect(up.addr.as_str()).await?;
+		greet(&mut control, up).await?;
+		up.latency.set(started.elapsed());
+		let mut request = vec![5, 1, 0];
+		request.extend_from_slice(&udp_header(dst)[3..]);
+		control.write_all(&request).await?;
+		let mut head = [0u8; 4];
+		control.read_exact(&mut head).await?;
+		anyhow::ensure!(head[0] == 5, "upstream did not answer socks5");
+		anyhow::ensure!(head[1] == 0, "upstream refused connect with reply {}", head[1]);
+		let rest = match head[3] {
+			1 => 6,
+			4 => 18,
+			3 => {
+				let mut len = [0u8; 1];
+				control.read_exact(&mut len).await?;
+				usize::from(len[0]) + 2
+			}
+			a => anyhow::bail!("upstream bound to address type {a}, which we do not speak"),
+		};
+		let mut bound = vec![0u8; rest];
+		control.read_exact(&mut bound).await?;
+		Ok::<_, anyhow::Error>(control)
 	};
 	match tokio::time::timeout(DIAL_TIMEOUT, connect).await {
-		Ok(r) => Ok(r?),
+		Ok(r) => r,
 		Err(_) => anyhow::bail!("socks5 connect timed out"),
 	}
 }

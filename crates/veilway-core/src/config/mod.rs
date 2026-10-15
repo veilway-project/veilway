@@ -41,6 +41,8 @@ pub const MAX_TRANSPORT_SECRETS: usize = 2;
 /// The control channel carries at most this many notices, of at most this many bytes each.
 pub const MAX_NOTICES: usize = 4;
 pub const MAX_NOTICE_BYTES: usize = 280;
+/// The addresses a node names to its profiles, at most this many.
+pub const MAX_PUBLIC_ADDRESSES: usize = 8;
 pub const MAX_DNS_SERVERS: usize = 4;
 pub const MAX_DNS_SETS: usize = 32;
 pub const MAX_INBOUND_ADDRESSES: usize = 2;

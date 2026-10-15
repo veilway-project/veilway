@@ -86,7 +86,7 @@ async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duratio
 async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Duration) -> Vec<Line> {
 	let (config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..}) = outbound;
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
-	match Outbound::of(outbound) {
+	match Outbound::of(outbound, Arc::default()) {
 		Outbound::Direct {bind} => {
 			// The engine passes over a server of the other family than the outbound is bound to, see `resolver`.
 			let Some((at, target)) = servers.iter().copied().enumerate().find(|(_, server)| bind.is_none_or(|bind| bind.is_ipv4() == server.is_ipv4())) else {

@@ -93,6 +93,7 @@ pub struct Diff {
 	pub routing_default: bool,
 	pub rules_reordered: bool,
 	pub notices: bool,
+	pub public_addresses: bool,
 	/// `replay` changed. The rate per source is in force at once, the cache size from the next start of the node.
 	pub replay: bool,
 	pub inbound_changes: Vec<InboundChange>,
@@ -113,6 +114,7 @@ impl From<&config::Diff> for Diff {
 			routing_default: diff.routing_default,
 			rules_reordered: diff.rules_reordered,
 			notices: diff.notices,
+			public_addresses: diff.public_addresses,
 			replay: diff.replay,
 			inbound_changes: diff.inbound_changes.iter().map(|change| InboundChange {tag: change.tag.clone(), restart: change.restart, transports_stopped: change.transports_stopped.clone(), transports_started: change.transports_started.clone()}).collect(),
 			user_changes: diff.user_changes.iter().map(|change| UserChange {name: change.name.clone(), devices_added: keys(&change.devices_added), devices_removed: keys(&change.devices_removed), devices_readdressed: keys(&change.devices_readdressed), devices_rekeyed: keys(&change.devices_rekeyed), devices_secrets_changed: keys(&change.devices_secrets_changed), lost_access: change.lost_access}).collect(),
@@ -145,6 +147,8 @@ pub struct Status {
 	pub flows: usize,
 	/// The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none.
 	pub certificates: Vec<SelfSigned>,
+	/// The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none.
+	pub public_addresses: Vec<config::Host>,
 }
 
 /// A certificate the node made for a `tls` listener, with the key it keeps.
@@ -269,6 +273,10 @@ pub struct OutboundStats {
 	pub udp_down_secs: Option<u64>,
 	/// How often the proxy switched between relaying UDP and not, added up over its exits. Exits that learn of one change each count it.
 	pub udp_flips: u64,
+	/// How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.
+	pub latency_ms: Option<u64>,
+	/// Unix seconds when `latency_ms` was measured.
+	pub measured_at: Option<i64>,
 }
 
 /// What the node's resolver did with the DNS queries of its tunnels since start.
@@ -563,6 +571,36 @@ pub struct Sessions {pub sessions: Vec<Session>}
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
+pub enum InboundKind {Wireguard, Veilway}
+
+/// One transport of an inbound, with the rating a profile of it gets.
+#[derive(Serialize, JsonSchema)]
+pub struct InboundTransport {
+	pub transport: Transport,
+	pub rating: config::Rating,
+}
+
+/// An inbound with what a client profile takes from it. No private key.
+#[derive(Serialize, JsonSchema)]
+pub struct InboundInfo {
+	pub tag: String,
+	pub kind: InboundKind,
+	/// The WireGuard public key of the inbound.
+	pub public_key: Key,
+	/// The public half of the node transport key a profile carries. Null for an inbound with no `transport_keys`.
+	pub transport_public_key: Option<Key>,
+	pub transports: Vec<InboundTransport>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct Inbounds {
+	pub inbounds: Vec<InboundInfo>,
+	/// The node's public addresses, as `GET /v1/status` gives them.
+	pub public_addresses: Vec<config::Host>,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
 pub enum Backend {Netstack, L3, Block, Chain}
 
 #[derive(Serialize, JsonSchema)]
@@ -588,6 +626,10 @@ pub struct Exit {
 	pub links: Vec<String>,
 	/// Whether one of those links is up. While none is, what is routed to the exit is answered as unreachable and leaves no other way. Null for every other backend.
 	pub link_up: Option<bool>,
+	/// How long the proxy of the outbound took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, for an exit with no SOCKS5 outbound, and until a flow has used the proxy. A reload starts it over.
+	pub latency_ms: Option<u64>,
+	/// Unix seconds when `latency_ms` was measured.
+	pub measured_at: Option<i64>,
 	pub traffic: Traffic,
 }
 

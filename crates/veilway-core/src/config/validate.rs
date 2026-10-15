@@ -575,6 +575,8 @@ impl Config {
 				if !dialable(address.ip()) {r.error(here, "expected an address a node may be told to dial: not loopback, link-local, unspecified, multicast, broadcast or in 0.0.0.0/8, and no IPv6 address that carries an IPv4 address")} else if pools.iter().any(|(pool, _)| pool.contains(&address.ip())) {r.error(here, "expected an address outside every inbound pool of this node")} else if pool_ranges.iter().any(|net| net.contains(&address.ip())) {r.warning(here, "a private address: the link dials inside a private network, which is right only where the two nodes share one")}
 			}
 		}
+		if self.public_addresses.len() > MAX_PUBLIC_ADDRESSES {r.error("public_addresses", format!("expected at most {MAX_PUBLIC_ADDRESSES} addresses"))}
+		for (i, address) in self.public_addresses.iter().enumerate() {if self.public_addresses[..i].contains(address) {r.error(format!("public_addresses[{i}]"), "expected an address that is not listed before")}}
 		if self.notices.len() > MAX_NOTICES {r.error("notices", format!("expected at most {MAX_NOTICES} notices"))}
 		for (i, notice) in self.notices.iter().enumerate().take(MAX_NOTICES) {
 			// Held to what a client shows: text its filter would change or cut is refused here, so a device shows what the operator wrote.

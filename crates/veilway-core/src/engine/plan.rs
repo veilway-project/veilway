@@ -12,7 +12,7 @@ use std::fmt::{self, Display};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
 use tokio::runtime::{Handle, RuntimeFlavor};
 use veilway_proto::chunk::{NORMAL_DEFAULT, WIDE_DEFAULT};
@@ -23,15 +23,29 @@ use veilway_proto::subscription::Secret;
 use veilway_proto::{proof, udp_obfs, NoRandom};
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
-#[derive(PartialEq, Eq)]
-pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>}
+pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>, pub latency: Arc<Latency>}
+
+/// Equal when they name the same proxy with the same credentials: what was measured of it does not count.
+impl PartialEq for Upstream {fn eq(&self, other: &Upstream) -> bool {self.addr == other.addr && self.auth == other.auth}}
+
+impl Eq for Upstream {}
+
+/// When the proxy of an outbound last answered a flow's greeting, and how long that took. A plan that is put in force starts with none.
+#[derive(Default)]
+pub struct Latency(Mutex<Option<(Duration, SystemTime)>>);
+
+impl Latency {
+	pub fn set(&self, took: Duration) {*self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some((took, SystemTime::now()))}
+
+	pub fn get(&self) -> Option<(Duration, SystemTime)> {*self.0.lock().unwrap_or_else(|e| e.into_inner())}
+}
 
 #[derive(PartialEq, Eq)]
 pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
 
 impl Outbound {
 	/// An outbound of the config as the engine dials through it.
-	pub fn of(outbound: &config::Outbound) -> Outbound {
+	pub fn of(outbound: &config::Outbound, latency: Arc<Latency>) -> Outbound {
 		match outbound {
 			config::Outbound::Direct {bind, ..} => Outbound::Direct {bind: bind.map(|ip| ip.0)},
 			config::Outbound::Socks5 {server, username, password, ..} => Outbound::Socks5(Upstream {
@@ -41,6 +55,7 @@ impl Outbound {
 					config::Host::Name(name) => format!("{name}:{}", server.port),
 				},
 				auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
+				latency,
 			}),
 		}
 	}
@@ -357,6 +372,8 @@ pub struct Plan {
 	pub states: HashMap<[u8; 32], (usize, Arc<control::State>)>,
 	/// The operator's notices, as the control channel sends them.
 	pub notices: Vec<(NoticeSeverity, String)>,
+	/// The latency each outbound's proxy was last measured at, by tag. The exits through an outbound share its entry.
+	pub latency: HashMap<String, Arc<Latency>>,
 	/// Every enabled node link of the config, in its order.
 	pub links: Vec<Link>,
 	/// The links this node is dialled for, by the key that names them, which is the key their packets arrive under.
@@ -396,11 +413,12 @@ impl Plan {
 				Some(Policy::Via(tag)) => Fallback::Via(find(&exit_tags, tag)?),
 			})
 		};
+		let latency: HashMap<String, Arc<Latency>> = config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => (tag.clone(), Arc::new(Latency::default()))}).collect();
 		let mut exits: Vec<Exit> = Vec::with_capacity(config.exits.len());
 		for exit in &config.exits {
 			let backend = match &exit.backend {
 				config::Backend::Netstack(netstack) => Backend::Netstack {
-					outbound: Outbound::of(&config.outbounds[find(&outbound_tags, &netstack.outbound)?]),
+					outbound: Outbound::of(&config.outbounds[find(&outbound_tags, &netstack.outbound)?], latency.get(&netstack.outbound).cloned().ok_or_else(stale)?),
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
 					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,
@@ -605,6 +623,7 @@ impl Plan {
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),
 			l3: None,
 			notices: config.notices.iter().map(|notice| (notice.severity, notice.text.clone())).collect(),
+			latency,
 			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry, starts, states, links, by_link, linked, people, listening,
 		})
 	}
