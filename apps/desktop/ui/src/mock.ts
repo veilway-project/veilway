@@ -3,7 +3,7 @@
 import type {Running, StatusView, Subscription} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
-try { localStorage.setItem("veilway-desktop", JSON.stringify({locale: query.get("lang") === "fa" ? "fa" : "en", scheme: query.get("scheme") ?? "system", killSwitch: true, choice: null, hidden: []})); } catch { /* private window */ }
+try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: null, hidden: []})); } catch { /* private window */ }
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
@@ -46,8 +46,11 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	library: args => { languages = (args.languages as string[]) ?? ["en"]; return held ? [subscription(languages[0] === "fa")] : []; },
 	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: false}),
 	log_history: () => ["0.4s client ready", "1.2s connect requested", "2.0s connected through Frankfurt"],
-	get_settings: () => ({auto_update: false, theme: "dark"}),
+	get_settings: () => ({auto_update: false, theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true}),
 	set_settings: () => null,
+	get_autostart: () => false,
+	set_autostart: () => null,
+	open_link: () => null,
 	check_update: () => ({available: false, version: "0.1.0", notes: "", current: "0.1.0"}),
 	connect: () => { connected = true; return null; },
 	disconnect: () => { connected = false; return null; },

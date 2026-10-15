@@ -15,11 +15,16 @@ const IDLE: Running = {connected: false, status: null, kill_switch_kept: false};
 // The engine asks in English; each known question has its own words here. Anything else is shown as the engine wrote it.
 const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe", "does not check who"], ["stale", "expired more than 30 days"], ["cover", "looks like ordinary web traffic"], ["nocover", "does not look like web traffic"], ["plain", "plain tunnel"], ["exposed", "using a tunnel"]];
 
+// Used only until the helper's settings arrive, and when they cannot be read.
+const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true};
+
 export function App() {
-	const [prefs, setPrefs] = useState<Prefs>(loadPrefs);
-	const settings = useMemo(() => ({...DEFAULT_SETTINGS, locale: prefs.locale, scheme: prefs.scheme}), [prefs.locale, prefs.scheme]);
+	const [prefs, setPrefs] = useState<Prefs>(loadPrefs), [saved, setSaved] = useState<Settings | null>(null);
+	useEffect(() => { call("get_settings").then(setSaved, () => setSaved(FALLBACK)); }, []);
+	const locale: "en" | "fa" = saved?.locale === "fa" ? "fa" : "en";
+	const settings = useMemo(() => ({...DEFAULT_SETTINGS, locale, scheme: prefs.scheme}), [locale, prefs.scheme]);
 	const change = (next: Partial<Prefs>) => setPrefs(old => { const merged = {...old, ...next}; savePrefs(merged); return merged; });
-	return <UiProvider settings={settings} extra={PACKS}><ToastProvider><Root prefs={prefs} onPrefs={change}/></ToastProvider></UiProvider>;
+	return <UiProvider settings={settings} extra={PACKS}><ToastProvider>{saved && <Root prefs={prefs} onPrefs={change} settings={saved} onSettings={setSaved}/>}</ToastProvider></UiProvider>;
 }
 
 function Brand() {
@@ -30,11 +35,11 @@ function Brand() {
 	</div>;
 }
 
-function Root({prefs, onPrefs}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void}) {
+function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void}) {
 	const {t, locale, percent} = useD(), toast = useToast();
 	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null);
 	const [running, setRunning] = useState<Running>(IDLE), [busy, setBusy] = useState(false), [ended, setEnded] = useState<Ended | null>(null), [question, setQuestion] = useState<string | null>(null), [points, setPoints] = useState<TrafficPoint[]>([]), [logs, setLogs] = useState<string[]>([]);
-	const [appSettings, setAppSettings] = useState<Settings>({auto_update: true, theme: "dark"}), [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null);
+	const [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null);
 	const last = useRef<{at: number, sent: number, received: number} | null>(null);
 	const loadLibrary = () => { setLibraryError(null); call("library", {languages: locale === "fa" ? ["fa", "en"] : ["en"]}).then(setLibrary, setLibraryError); };
 	useEffect(loadLibrary, [locale]);
@@ -42,10 +47,7 @@ function Root({prefs, onPrefs}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) =
 	useEffect(() => {
 		call("status").then(setRunning, () => setRunning(IDLE));
 		call("log_history").then(setLogs, () => setLogs([]));
-		call("get_settings").then(found => {
-			setAppSettings(found);
-			if (found.auto_update) call("check_update").then(info => setUpdate(info.available ? info : null), () => setUpdate(null));
-		}, () => {});
+		if (settings.auto_update) call("check_update").then(info => setUpdate(info.available ? info : null), () => setUpdate(null));
 		const offs = [on("status", status => setRunning(old => ({...old, connected: true, status}))), on("question", setQuestion), on("ended", done => {
 			setRunning({...IDLE, kill_switch_kept: done.kept});
 			setQuestion(null);
@@ -72,7 +74,7 @@ function Root({prefs, onPrefs}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) =
 		if (!chosen) return;
 		setBusy(true);
 		setEnded(null);
-		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {kill_switch: prefs.killSwitch, allow_lan: false, local_names: false, routes: []}}).then(() => setRunning(old => ({...old, connected: true})), error => toast({tone: "danger", title: t("home.connectFailed"), body: error})).finally(() => setBusy(false));
+		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {allow_lan: false, local_names: false, routes: []}}).then(() => setRunning(old => ({...old, connected: true})), error => toast({tone: "danger", title: t("home.connectFailed"), body: error})).finally(() => setBusy(false));
 	};
 	const disconnect = () => {
 		setBusy(true);
@@ -84,7 +86,7 @@ function Root({prefs, onPrefs}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) =
 		call("answer", {yes}).catch(error => toast({tone: "danger", title: t("question.failed"), body: error}));
 	};
 	const install = () => { setProgress({downloaded: 0, total: null}); call("install_update").catch(error => { setProgress(null); toast({tone: "danger", title: t("update.failed"), body: error}); }); };
-	const saveSettings = (next: Settings) => { setAppSettings(next); call("set_settings", {settings: next}).catch(error => toast({tone: "danger", title: t("settings.saveFailed"), body: error})); };
+	const saveSettings = (next: Settings) => { onSettings(next); call("set_settings", {settings: next}).catch(error => toast({tone: "danger", title: t("settings.saveFailed"), body: error})); };
 	const kind = question === null ? null : QUESTIONS.find(([, words]) => question.includes(words))?.[0] ?? "other";
 	const updateBanner = update && <Banner tone="info" title={t("update.title", {version: update.version})} action={!progress && <Button size="sm" variant="primary" onClick={install}>{t("update.install")}</Button>}>
 		{progress ? <span className="d-progress"><span>{t("update.installing")}</span>{progress.total ? <><span className="vw-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.downloaded}><span style={{inlineSize: Math.min(100, progress.downloaded / progress.total * 100) + "%"}}/></span><strong className="vw-num vw-small">{percent(progress.downloaded / progress.total)}</strong></> : null}</span> : update.notes.slice(0, 200)}
@@ -93,7 +95,7 @@ function Root({prefs, onPrefs}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) =
 		: adding || library.length === 0 ? <Importer first={library.length === 0} onCancel={() => setAdding(false)} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
 		: tab === "subscriptions" ? <Library library={library} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
-		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={appSettings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
+		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
 		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh}/>;
 	const lit = running.status?.state === "connected";
 	return <Backdrop fixed lit={lit} className="d-app">

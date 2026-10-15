@@ -12,9 +12,9 @@ export type Subscription = {id: string, provider: string, standing: "current" | 
 export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, in_file: boolean};
 export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, left_out: string[], preview: Subscription};
 export type Running = {connected: boolean, status: StatusView | null, kill_switch_kept: boolean};
-export type Settings = {auto_update: boolean, theme: string};
+export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean};
 export type UpdateInfo = {available: boolean, version: string, notes: string, current: string};
-export type Options = {kill_switch: boolean, allow_lan: boolean, local_names: boolean, routes: string[]};
+export type Options = {allow_lan: boolean, local_names: boolean, routes: string[]};
 export type Ended = {error: string | null, kept: boolean};
 export type Progress = {downloaded: number, total: number | null};
 
@@ -36,7 +36,10 @@ type Commands = {
 	check_update: [{}, UpdateInfo],
 	install_update: [{}, null],
 	get_settings: [{}, Settings],
-	set_settings: [{settings: Settings}, null]
+	set_settings: [{settings: Settings}, null],
+	open_link: [{url: string}, null],
+	get_autostart: [{}, boolean],
+	set_autostart: [{enabled: boolean}, null]
 };
 
 type Events = {status: StatusView, question: string, ended: Ended, log: string, "update-progress": Progress};

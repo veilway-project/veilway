@@ -49,6 +49,8 @@ pub enum Source {
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct Options {
+	/// Set by the app from its settings, so a window that does not send it is not an error.
+	#[serde(default)]
 	pub kill_switch: bool,
 	pub allow_lan: bool,
 	pub local_names: bool,

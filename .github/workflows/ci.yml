@@ -46,6 +46,30 @@ jobs:
             cargo test --workspace -- --exact "$t" 2>&1 | grep -q "^test $t \.\.\. ok" || { echo "::error::$t failed twice"; exit 1; }
             echo "::warning::$t is flaky: it failed once and passed on its own"
           done <<< "$failed"
+      # The UI depends on veilway-ui by a path next to the repository, and checkout refuses a path outside the workspace, so it is moved up after the checkout.
+      - uses: actions/checkout@v7
+        if: matrix.os == 'windows-latest'
+        with:
+          repository: veilway-project/veilway-ui
+          path: veilway-ui
+      - uses: actions/setup-node@v7
+        if: matrix.os == 'windows-latest'
+        with:
+          node-version: 22
+      - name: Install veilway-ui's UI package
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Move-Item -Path veilway-ui -Destination ..
+          npm ci --prefix ../veilway-ui/packages/i18n
+          npm ci --prefix ../veilway-ui/packages/ui
+      - name: Build the desktop UI
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        working-directory: apps/desktop/ui
+        run: |
+          npm ci
+          npm run build
       - name: Build the desktop app
         if: matrix.os == 'windows-latest'
         shell: pwsh

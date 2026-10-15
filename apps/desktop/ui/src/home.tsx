@@ -22,8 +22,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		...subscription.cards.map((card): ProviderItem => card.kind === "stat" ? {type: "stat", label: card.label, value: card.value, unit: card.unit ?? undefined} : card.kind === "progress" ? {type: "progress", label: card.label, used: card.used, total: card.total} : card.kind === "notice" ? {type: "notice", text: card.text, severity: card.severity === "warning" ? "warning" : card.severity === "critical" ? "critical" : "info"} : {type: "link", label: card.label, url: card.url}),
 		...subscription.support.map(([label, url]) => ({type: "link" as const, label, url}))
 	] : [];
-	// The app has no way to start a browser itself, so a provider link is copied for the user to paste.
-	const open = (url: string) => navigator.clipboard.writeText(url).then(() => toast({tone: "success", title: t("home.linkCopied"), body: t("home.linkCopiedBody", {domain: new URL(url).hostname})}), () => toast({tone: "warning", title: t("home.copyFailed", {url})}));
+	const open = (url: string) => call("open_link", {url}).catch(error => toast({tone: "danger", title: t("home.openFailed"), body: error}));
 	const kept = ended?.kept || (!running.connected && running.kill_switch_kept);
 	return <div className="d-page">
 		<div className="d-hero">
