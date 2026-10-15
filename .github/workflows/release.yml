@@ -15,6 +15,26 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+      # The UI depends on veilway-ui by a path next to the repository, and checkout refuses a path outside the workspace, so it is moved up after the checkout.
+      - uses: actions/checkout@v7
+        with:
+          repository: veilway-project/veilway-ui
+          path: veilway-ui
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Install veilway-ui's UI package
+        shell: pwsh
+        run: |
+          Move-Item -Path veilway-ui -Destination ..
+          npm ci --prefix ../veilway-ui/packages/i18n
+          npm ci --prefix ../veilway-ui/packages/ui
+      - name: Build the desktop UI
+        shell: pwsh
+        working-directory: apps/desktop/ui
+        run: |
+          npm ci
+          npm run build
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

@@ -13,22 +13,27 @@ use logs::{LogLayer, START};
 use proto::{Call, Options, Out, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 static HANDLE:OnceLock<AppHandle>=OnceLock::new();
 static LOGS:OnceLock<Mutex<VecDeque<String>>>=OnceLock::new();
+static LINKS:OnceLock<Mutex<HashSet<String>>>=OnceLock::new();
 const LOG_KEEP:usize=200;
 
 fn logbuf()->&'static Mutex<VecDeque<String>>{LOGS.get_or_init(|| Mutex::new(VecDeque::new()))}
+
+fn linkset()->&'static Mutex<HashSet<String>>{LINKS.get_or_init(|| Mutex::new(HashSet::new()))}
 
 /// Appends to the ring buffer and pushes the same line to the webview as a `log` event.
 fn push_log(line:String){
@@ -43,9 +48,10 @@ fn push_log(line:String){
 struct UpdateInfo{available:bool, version:String, notes:String, current:String}
 
 #[derive(Serialize, Deserialize)]
-struct Settings{auto_update:bool, #[serde(default="dark")] theme:String}
+#[serde(default)]
+struct Settings{auto_update:bool, theme:String, locale:String, kill_switch:bool}
 
-impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark()}}}
+impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark(), locale:"en".into(), kill_switch:true}}}
 
 fn dark()->String{"dark".to_string()}
 
@@ -65,7 +71,20 @@ async fn ask(backend:&State<'_, Arc<Backend>>, call:Call)->Result<Value, String>
 /// Like `ask` for answers that carry logos: the pictures are checked here, in the process without rights, and become `data:` URLs or nothing.
 async fn ask_branded(backend:&State<'_, Arc<Backend>>, call:Call)->Result<Value, String>{
 	let mut value=backend.call(call).await?;
-	tokio::task::spawn_blocking(move || {view::brand(&mut value); value}).await.map_err(|e| e.to_string())
+	let value=tokio::task::spawn_blocking(move || {view::brand(&mut value); value}).await.map_err(|e| e.to_string())?;
+	remember_links(&value);
+	Ok(value)
+}
+
+/// The provider links the library shows are the only ones `open_link` opens. Each whole list the helper sends replaces the last one.
+fn remember_links(value:&Value){
+	let Some(list)=value.as_array() else {return};
+	let links:HashSet<String>=list.iter().flat_map(|subscription| {
+		let support=subscription["support"].as_array().into_iter().flatten().filter_map(|pair| pair.get(1)?.as_str());
+		let cards=subscription["cards"].as_array().into_iter().flatten().filter(|card| card["kind"]=="link").filter_map(|card| card["url"].as_str());
+		support.chain(cards).map(String::from).collect::<Vec<_>>()
+	}).collect();
+	*linkset().lock().unwrap()=links;
 }
 
 /// Step 1 of an import, from a link or a subscription file. Returns what the user is asked about first; nothing is sent anywhere until `import_proceed`.
@@ -100,8 +119,10 @@ async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, Stri
 async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Remove{subscription:id}).await}
 
 #[tauri::command]
-async fn connect(backend:State<'_, Arc<Backend>>, subscription:String, profile:String, options:Options)->Result<Value, String>{
+async fn connect(app:AppHandle, backend:State<'_, Arc<Backend>>, subscription:String, profile:String, mut options:Options)->Result<Value, String>{
 	tracing::info!("connect requested");
+	// The kill switch is the app's setting: the window does not send it.
+	options.kill_switch=load_settings(&app)?.kill_switch;
 	ask(&backend, Call::Connect{subscription, profile, options}).await
 }
 
@@ -119,6 +140,24 @@ async fn status(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&bac
 
 #[tauri::command]
 fn log_history()->Vec<String>{logbuf().lock().unwrap().iter().cloned().collect()}
+
+/// Opens a provider link in the browser or mail app. Only http, https and mailto links the library has shown get through.
+#[tauri::command]
+fn open_link(app:AppHandle, url:String)->Result<(), String>{
+	let scheme=tauri::Url::parse(&url).map_err(|_| "The link is not valid.".to_string())?.scheme().to_string();
+	if !matches!(scheme.as_str(), "http"|"https"|"mailto") || !linkset().lock().unwrap().contains(&url){return Err("This is not one of the provider's links.".into())}
+	app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_autostart(app:AppHandle)->Result<bool, String>{app.autolaunch().is_enabled().map_err(|e| e.to_string())}
+
+#[tauri::command]
+fn set_autostart(app:AppHandle, enabled:bool)->Result<(), String>{
+	let manager=app.autolaunch();
+	let done=if enabled{manager.enable()}else{manager.disable()};
+	done.map_err(|e| e.to_string())
+}
 
 #[tauri::command]
 async fn check_update(app:AppHandle)->Result<UpdateInfo, String>{
@@ -194,16 +233,18 @@ fn main(){
 		// Has to be the first plugin: a second launch only raises the window of the one hiding in the tray.
 		.plugin(tauri_plugin_single_instance::init(|app, _, _| show(app)))
 		.plugin(tauri_plugin_process::init())
+		.plugin(tauri_plugin_autostart::Builder::new().build())
+		.plugin(tauri_plugin_opener::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));
 			app.manage(Arc::new(Backend::new(dir, Arc::new(move |out| forward(&handle, out)))));
 			// tauri.conf.json starts the window dark; only a saved light theme needs correcting here.
 			if let Ok(s)=load_settings(app.handle()){if s.theme=="light"{apply_theme(app.handle(), "light")}}
-			// Shrinks the default 640px height onto short laptop screens; the work area already excludes the taskbar. Any failure keeps the default.
+			// Shrinks the default 760px height onto short laptop screens; the work area already excludes the taskbar. Any failure keeps the default.
 			if let Some(w)=app.get_webview_window("main"){
 				if let (Ok(Some(m)), Ok(outer), Ok(inner))=(w.current_monitor(), w.outer_size(), w.inner_size()){
 					let fit=m.work_area().size.height.saturating_sub(outer.height-inner.height).max((420.0*m.scale_factor()) as u32);

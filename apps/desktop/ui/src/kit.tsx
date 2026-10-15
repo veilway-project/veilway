@@ -4,13 +4,13 @@ import type {DesktopKey} from "./locales/en.ts";
 
 export const useD = () => useI18n<DesktopKey>();
 
-// What only this window remembers. The theme also goes to the app's settings file, so the native title bar matches.
-export type Prefs = {locale: "en" | "fa", scheme: "system" | "dark" | "light", killSwitch: boolean, choice: {subscription: string, profile: string} | null, hidden: string[]};
+// What only this window remembers. The theme, the language and the kill switch also go to the app's settings file, which is what the native title bar and the helper read.
+export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[]};
 const PREFS = "veilway-desktop";
 
 export function loadPrefs(): Prefs {
 	const stored = (() => { try { return JSON.parse(localStorage.getItem(PREFS) ?? "{}") as Partial<Prefs>; } catch { return {}; } })();
-	return {locale: stored.locale === "fa" ? "fa" : "en", scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", killSwitch: stored.killSwitch !== false, choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : []};
+	return {scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : []};
 }
 
 export function savePrefs(prefs: Prefs) {

@@ -16,7 +16,7 @@
         "label": "main",
         "title": "Veilway",
         "width": 420,
-        "height": 640,
+        "height": 760,
         "minWidth": 360,
         "minHeight": 420,
         "resizable": true,
