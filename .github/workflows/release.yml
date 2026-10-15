@@ -106,10 +106,56 @@ jobs:
           name: veilway-${{ matrix.target }}
           path: dist/*
 
+  android:
+    # The release-signed APK, attached to the release by the publish job.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: veilway-project/veilway-ui
+          path: veilway-ui
+      - run: mv veilway-ui ..
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/android/src-tauri
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018"
+      - run: npm install -g @tauri-apps/cli@2
+      - name: Build the APK
+        env:
+          ROOT: ${{ github.workspace }}
+          VEILWAY_UI_DIR: ${{ github.workspace }}/../veilway-ui
+          SKIP_SDK: "1"
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+          VEILWAY_RELEASE: "1"
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: sh apps/android/scripts/build.sh
+      - run: mv apps/android/dist/veilway-*-arm64.apk apps/android/dist/veilway-android-arm64.apk
+      - uses: actions/upload-artifact@v7
+        with:
+          name: veilway-android-arm64
+          path: apps/android/dist/veilway-android-arm64.apk
+
   publish:
-    # Runs after the desktop job so both do not race to create the release for the same tag.
+    # Runs after the desktop and Android jobs so they do not race to create the release for the same tag.
     if: github.ref_type == 'tag' && !cancelled() && needs.build.result == 'success'
-    needs: [build, desktop]
+    needs: [build, desktop, android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
