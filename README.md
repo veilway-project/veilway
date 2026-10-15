@@ -172,6 +172,24 @@ veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
 
 `--insecure` skips certificate verification and is for testing a self-signed relay only.
 
+## Run with Docker
+
+The install script is the recommended way; Docker is an option. Images for linux/amd64 and linux/arm64 are published to `ghcr.io/veilway-project/veilway` on each `v*` tag. The container runs as a non-root user, and its config and state live in volumes.
+
+Put `config.json` in the config volume first, owned by uid 65532 and mode 600 (the commands are in [deploy/compose](deploy/compose/README.md)). Then:
+
+```
+docker run -d --name veilway --restart unless-stopped \
+  -v veilway-config:/etc/veilway -v veilway-data:/var/lib/veilway \
+  -p 51820:51820/udp ghcr.io/veilway-project/veilway:latest
+```
+
+A non-root process cannot bind ports below 1024. Set the port in the config above 1023 and publish it under the port you want, for example `-p 443:8443`.
+
+An `l3` exit needs the TUN device and NET_ADMIN, and its process must run as root: add `--user 0 --cap-add NET_ADMIN --device /dev/net/tun`. Netstack exits need none of these.
+
+[deploy/compose](deploy/compose/README.md) runs the node and the [panel](https://github.com/veilway-project/veilway-panel) together.
+
 ## Server config
 
 `config.json` is one versioned JSON document (`"version": 1`). `veilway check` validates it, and unknown keys are errors.
