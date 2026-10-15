@@ -13,6 +13,9 @@ fn list(servers: &[IpAddr]) -> String {servers.iter().map(ToString::to_string).c
 /// The script that makes the catch-all rule. `servers` are addresses and nothing else, so they go in as they are.
 pub fn add_script(servers: &[IpAddr]) -> String {format!("Add-DnsClientNrptRule -Namespace '.' -NameServers {} -Comment '{COMMENT}'", list(servers))}
 
+/// The script that makes the rule and only then removes the ones that were there, so that there is no moment without one. It stops at the first error.
+pub fn replace_script(servers: &[IpAddr]) -> String {format!("$ErrorActionPreference = 'Stop'; $old = @(Get-DnsClientNrptRule | Where-Object Comment -eq '{COMMENT}'); {}; $old | ForEach-Object {{ Remove-DnsClientNrptRule -Name $_.Name -Force }}", add_script(servers))}
+
 /// The script that removes every rule that is ours, a stale one of a client that crashed too.
 pub fn clear_script() -> String {format!("Get-DnsClientNrptRule | Where-Object Comment -eq '{COMMENT}' | Remove-DnsClientNrptRule -Force")}
 
@@ -41,7 +44,7 @@ pub fn netsh_calls(index: u32, servers: &[IpAddr]) -> Vec<Vec<String>> {
 }
 
 #[cfg(windows)]
-pub use pin::{clear, present, Pinned};
+pub use pin::{clear, group_policy, present, Pinned};
 
 #[cfg(windows)]
 mod pin {
@@ -64,6 +67,27 @@ mod pin {
 	/// Removes the rules that are ours.
 	pub fn clear() -> io::Result<()> {powershell(&clear_script()).map(drop)}
 
+	/// Whether Group Policy sets name resolution rules. Those win over a rule made with the cmdlets, so names would not go through the tunnel, and the connection is refused and not left to leak.
+	pub fn group_policy() -> io::Result<bool> {
+		use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+		use windows_sys::Win32::System::Registry::{RegCloseKey, RegOpenKeyExW, RegQueryInfoKeyW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ};
+		let path: Vec<u16> = "SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient\\DnsPolicyConfig".encode_utf16().chain(std::iter::once(0)).collect();
+		let mut key: HKEY = std::ptr::null_mut();
+		// SAFETY: the path is null-terminated and `key` is a live local the call writes to.
+		match unsafe {RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_READ, &mut key)} {
+			ERROR_SUCCESS => {}
+			2 => return Ok(false),
+			code => return Err(io::Error::from_raw_os_error(code as i32)),
+		}
+		let mut subkeys = 0u32;
+		// SAFETY: the key is open; only the count of subkeys is asked for and every other out parameter is null.
+		let code = unsafe {RegQueryInfoKeyW(key, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null(), &mut subkeys, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())};
+		// SAFETY: the key was opened above and is closed once.
+		unsafe {RegCloseKey(key)};
+		if code != ERROR_SUCCESS {return Err(io::Error::from_raw_os_error(code as i32))}
+		Ok(subkeys > 0)
+	}
+
 	/// Whether a rule of ours is in force.
 	pub fn present() -> io::Result<bool> {powershell(&list_script()).map(|output| output.lines().any(|line| !line.trim().is_empty()))}
 
@@ -75,16 +99,14 @@ mod pin {
 			if servers.is_empty() {return Err(io::Error::other("the profile names no resolver, so names have nowhere to go through the tunnel"))}
 			let netsh = program("netsh.exe")?;
 			for call in netsh_calls(index, servers) {run(&netsh, &call)?;}
-			clear()?;
-			powershell(&add_script(servers))?;
+			powershell(&replace_script(servers))?;
 			Ok(Self {servers: servers.to_vec()})
 		}
 		pub fn describe(&self) -> &'static str {"the name resolution policy (NRPT) and the tunnel's adapter"}
 		/// Whether the rule is still there and still ours, made again if it is not. True when it had to be.
 		pub fn verify(&self) -> io::Result<bool> {
 			if rule_holds(&powershell(&list_script())?, &self.servers) {return Ok(false)}
-			clear()?;
-			powershell(&add_script(&self.servers))?;
+			powershell(&replace_script(&self.servers))?;
 			Ok(true)
 		}
 		/// Takes the rule out. The adapter's own servers go with the adapter.
@@ -102,6 +124,14 @@ mod tests {
 	fn the_catch_all_rule_names_every_server_and_our_comment() {
 		assert_eq!(add_script(&servers()), "Add-DnsClientNrptRule -Namespace '.' -NameServers 10.200.0.1,fd00::1,10.200.0.2 -Comment 'Veilway'");
 		assert!(clear_script().contains("Comment -eq 'Veilway'") && !clear_script().contains("Add-"));
+	}
+
+	#[test]
+	fn the_new_rule_is_made_before_the_old_ones_are_removed_and_errors_stop_it() {
+		let script = replace_script(&servers());
+		assert!(script.starts_with("$ErrorActionPreference = 'Stop';"));
+		let (old, add, remove) = (script.find("$old = @(").unwrap(), script.find("Add-DnsClientNrptRule").unwrap(), script.find("Remove-DnsClientNrptRule").unwrap());
+		assert!(old < add && add < remove);
 	}
 
 	#[test]

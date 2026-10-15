@@ -12,9 +12,13 @@ use std::net::IpAddr;
 const BASE: u128 = 0x5657_0000_0000_4000_8000_0000_0000_0000;
 pub const PROVIDER_KEY: u128 = BASE | 1 << 32;
 pub const SUBLAYER_KEY: u128 = BASE | 2 << 32;
+/// The sublayer of the boot-time copies of the blocks, which the engine applies before it starts.
+pub const SUBLAYER_BOOT_KEY: u128 = BASE | 3 << 32;
 /// How many filters the client may have. The key of filter `i` is `BASE | i`.
 pub const FILTERS_MAX: u16 = 512;
 pub const fn filter_key(index: u16) -> u128 {BASE | index as u128}
+/// The key of boot-time filter `i`.
+pub const fn boot_key(index: u16) -> u128 {BASE | 0x8000 | index as u128}
 
 /// The weights of a filter in the sublayer. WFP takes 0 to 15.
 pub const W_TOP: u8 = 15;
@@ -22,6 +26,8 @@ pub const W_NAMES: u8 = 12;
 pub const W_PERMIT: u8 = 8;
 pub const W_BLOCK: u8 = 1;
 
+/// mDNS, LLMNR, and the NetBIOS name and datagram services.
+const LOCAL_NAMES: [u16; 4] = [5353, 5355, 137, 138];
 const UDP: u8 = 17;
 const TCP: u8 = 6;
 /// The ranges "the LAN" means when the user lets it through: private, link-local, and the multicast groups local discovery uses. Fixed ranges and not the device's current subnets, so that a network that hands out a public subnet as on-link (TunnelCrack LocalNet) gets nothing by it.
@@ -40,13 +46,16 @@ pub enum Cond {
 	Protocol(u8),
 	/// The program that runs this code, by the identity the engine gives its executable.
 	App,
+	/// The port on this side. DHCP is told from other datagrams to port 67 by it.
+	LocalPort(u16),
 	/// The adapter the connection would leave by, by its LUID.
 	Interface(u64),
 }
 
 /// A filter, before it is a call: the layer is that of its family.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Spec {pub name: String, pub v6: bool, pub permit: bool, pub weight: u8, pub conds: Vec<Cond>}
+pub struct Spec {pub name: String, pub v6: bool, /// At the layer where an inbound flow is authorized, and not an outbound one.
+	pub accept: bool, pub permit: bool, pub weight: u8, pub conds: Vec<Cond>}
 
 /// What the filters let through, and what they drop.
 #[derive(Clone)]
@@ -63,26 +72,38 @@ pub struct Rules {
 }
 
 impl Rules {
-	/// The filters, family by family. The order is the order of their keys.
+	/// The filters, family by family, outbound (`ALE_AUTH_CONNECT`) and then inbound (`ALE_AUTH_RECV_ACCEPT`, where a flow that a program listens for is authorized: without them a service on this device answers strangers on the physical network). The order is the order of their keys.
 	pub fn specs(&self) -> Vec<Spec> {
 		let mut found = Vec::new();
-		let mut add = |name: &str, v6: bool, permit: bool, weight: u8, conds: Vec<Cond>| found.push(Spec {name: format!("{name} ({})", if v6 {"IPv6"} else {"IPv4"}), v6, permit, weight, conds});
+		let mut add = |name: &str, v6: bool, accept: bool, permit: bool, weight: u8, conds: Vec<Cond>| found.push(Spec {name: format!("{name} ({}{})", if v6 {"IPv6"} else {"IPv4"}, if accept {", inbound"} else {""}), v6, accept, permit, weight, conds});
 		for v6 in [false, true] {
-			add("loopback", v6, true, W_TOP, vec![Cond::Remote(if v6 {"::1/128"} else {"127.0.0.0/8"}.parse().unwrap())]);
-			if let Some(luid) = self.tun {add("the tunnel", v6, true, W_TOP, vec![Cond::Interface(luid)])}
-			for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, true, W_TOP, vec![Cond::App, Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())])}
-			for protocol in [UDP, TCP] {add("names", v6, false, W_NAMES, vec![Cond::Protocol(protocol), Cond::RemotePort(53)])}
-			if self.lan && !self.local_names {for port in [5353, 5355] {add("local names", v6, false, W_NAMES, vec![Cond::Protocol(UDP), Cond::RemotePort(port)])}}
-			add("DHCP", v6, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::RemotePort(if v6 {547} else {67})]);
-			if self.lan {for net in LAN.iter().map(|net| net.parse::<IpNet>().unwrap()).filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("the LAN", v6, true, W_PERMIT, vec![Cond::Remote(net)])}}
-			for net in self.protected.iter().filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("everything else", v6, false, W_BLOCK, vec![Cond::Remote(*net)])}
+			for accept in [false, true] {
+				add("loopback", v6, accept, true, W_TOP, vec![Cond::Remote(if v6 {"::1/128"} else {"127.0.0.0/8"}.parse().unwrap())]);
+				if let Some(luid) = self.tun {add("the tunnel", v6, accept, true, W_TOP, vec![Cond::Interface(luid)])}
+				for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, accept, true, W_TOP, vec![Cond::App, Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())])}
+				if !accept {for protocol in [UDP, TCP] {add("names", v6, accept, false, W_NAMES, vec![Cond::Protocol(protocol), Cond::RemotePort(53)])}}
+				// mDNS, LLMNR and NetBIOS tell whoever listens which names this device asks for, on any network and not only a LAN that was let through.
+				if !self.local_names {for port in LOCAL_NAMES {add("local names", v6, accept, false, W_NAMES, vec![Cond::Protocol(UDP), Cond::RemotePort(port)])}}
+				let (local, remote) = if v6 {(546, 547)} else {(68, 67)};
+				if accept {
+					add("DHCP", v6, accept, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::LocalPort(local), Cond::RemotePort(remote)]);
+				} else {
+					// The first request goes to everyone, a renewal to the server that leased the address, which is not known here.
+					add("DHCP request", v6, accept, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::LocalPort(local), Cond::RemotePort(remote), Cond::Remote(if v6 {"ff02::1:2/128"} else {"255.255.255.255/32"}.parse().unwrap())]);
+					add("DHCP renewal", v6, accept, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::LocalPort(local), Cond::RemotePort(remote)]);
+				}
+				if self.lan {for net in LAN.iter().map(|net| net.parse::<IpNet>().unwrap()).filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("the LAN", v6, accept, true, W_PERMIT, vec![Cond::Remote(net)])}}
+				for net in self.protected.iter().filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("everything else", v6, accept, false, W_BLOCK, vec![Cond::Remote(*net)])}
+			}
 		}
 		found
 	}
+	/// The blocks that also go in the boot-time store, outbound only: they hold from the start of the system until the engine has loaded the persistent filters.
+	pub fn boot_specs(&self) -> Vec<Spec> {self.specs().into_iter().filter(|spec| !spec.permit && !spec.accept && spec.weight == W_BLOCK).collect()}
 }
 
 #[cfg(windows)]
-pub use wfp::{install, present, remove};
+pub use wfp::{competing, install, present, remove};
 
 #[cfg(windows)]
 mod wfp {
@@ -90,7 +111,7 @@ mod wfp {
 	use std::io;
 	use std::ptr::{null, null_mut};
 	use windows_sys::core::GUID;
-	use windows_sys::Win32::Foundation::{ERROR_SUCCESS, FWP_E_FILTER_NOT_FOUND, FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE};
+	use windows_sys::Win32::Foundation::{ERROR_SUCCESS, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE};
 	use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
 	use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
@@ -118,6 +139,8 @@ mod wfp {
 	}
 
 	/// `NOT_FOUND` codes are fine when removing: the filter was never there.
+	fn gone_exists(code: u32) -> io::Result<()> {if code == FWP_E_ALREADY_EXISTS as u32 {Ok(())} else {check(code)}}
+
 	fn gone(code: u32) -> io::Result<()> {if code == FWP_E_FILTER_NOT_FOUND as u32 || code == FWP_E_SUBLAYER_NOT_FOUND as u32 || code == FWP_E_PROVIDER_NOT_FOUND as u32 {Ok(())} else {check(code)}}
 
 	/// A transaction that is aborted unless it is committed: the old filters and the new ones are never both in force, and never neither.
@@ -147,7 +170,11 @@ mod wfp {
 		for index in 0..FILTERS_MAX {
 			// SAFETY: the key is a live local and the engine is open.
 			gone(unsafe {FwpmFilterDeleteByKey0(engine.0, &guid(filter_key(index)))})?;
+			// SAFETY: as above.
+			gone(unsafe {FwpmFilterDeleteByKey0(engine.0, &guid(boot_key(index)))})?;
 		}
+		// SAFETY: as above.
+		gone(unsafe {FwpmSubLayerDeleteByKey0(engine.0, &guid(SUBLAYER_BOOT_KEY))})?;
 		// SAFETY: as above.
 		gone(unsafe {FwpmSubLayerDeleteByKey0(engine.0, &guid(SUBLAYER_KEY))})?;
 		// SAFETY: as above.
@@ -216,6 +243,11 @@ mod wfp {
 				out.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
 				out.conditionValue.Anonymous.byteBlob = app.0;
 			}
+			Cond::LocalPort(port) => {
+				out.fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
+				out.conditionValue.r#type = FWP_UINT16;
+				out.conditionValue.Anonymous.uint16 = *port;
+			}
 			Cond::Interface(luid) => {
 				let mut value = Box::new(*luid);
 				out.fieldKey = FWPM_CONDITION_IP_LOCAL_INTERFACE;
@@ -227,19 +259,20 @@ mod wfp {
 		out
 	}
 
-	fn add_filter(engine: &Engine, index: u16, spec: &Spec, app: &AppId) -> io::Result<()> {
+	fn add_filter(engine: &Engine, key: u128, boot: bool, spec: &Spec, app: &AppId) -> io::Result<()> {
 		let mut held = Vec::new();
 		let mut conds: Vec<FWPM_FILTER_CONDITION0> = spec.conds.iter().map(|cond| condition(cond, app, &mut held)).collect();
 		let mut name = wide(&format!("Veilway kill switch: {}", spec.name));
 		// SAFETY: a zeroed filter is a valid empty one; the fields that matter are set below.
 		let mut filter: FWPM_FILTER0 = unsafe {std::mem::zeroed()};
-		filter.filterKey = guid(filter_key(index));
+		filter.filterKey = guid(key);
 		filter.displayData.name = name.as_mut_ptr();
-		filter.flags = FWPM_FILTER_FLAG_PERSISTENT;
+		// A boot-time filter is not persistent: it lives in its own store, which the engine reads before it starts.
+		filter.flags = if boot {FWPM_FILTER_FLAG_BOOTTIME} else {FWPM_FILTER_FLAG_PERSISTENT};
 		let mut provider = guid(PROVIDER_KEY);
-		filter.providerKey = &mut provider;
-		filter.layerKey = if spec.v6 {FWPM_LAYER_ALE_AUTH_CONNECT_V6} else {FWPM_LAYER_ALE_AUTH_CONNECT_V4};
-		filter.subLayerKey = guid(SUBLAYER_KEY);
+		if !boot {filter.providerKey = &mut provider;}
+		filter.layerKey = match (spec.v6, spec.accept) {(false, false) => FWPM_LAYER_ALE_AUTH_CONNECT_V4, (true, false) => FWPM_LAYER_ALE_AUTH_CONNECT_V6, (false, true) => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, (true, true) => FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6};
+		filter.subLayerKey = guid(if boot {SUBLAYER_BOOT_KEY} else {SUBLAYER_KEY});
 		filter.weight.r#type = FWP_UINT8;
 		filter.weight.Anonymous.uint8 = spec.weight;
 		filter.numFilterConditions = conds.len() as u32;
@@ -274,8 +307,69 @@ mod wfp {
 		check(unsafe {FwpmProviderAdd0(engine.0, &provider, null_mut())})?;
 		// SAFETY: as above.
 		check(unsafe {FwpmSubLayerAdd0(engine.0, &sublayer, null_mut())})?;
-		for (index, spec) in specs.iter().enumerate() {add_filter(&engine, index as u16, spec, &app)?}
+		for (index, spec) in specs.iter().enumerate() {add_filter(&engine, filter_key(index as u16), false, spec, &app)?}
+		transaction.commit()?;
+		// The boot-time copies are a protection for the window before the engine starts, and a system that refuses them still has the persistent filters.
+		if let Err(error) = install_boot(&engine, &rules.boot_specs(), &app) {tracing::warn!(%error, "the boot-time copies of the kill switch could not be made, so traffic is not blocked while the system starts");}
+		Ok(())
+	}
+
+	fn install_boot(engine: &Engine, specs: &[Spec], app: &AppId) -> io::Result<()> {
+		let transaction = Transaction::begin(engine)?;
+		let mut name = wide("Veilway boot");
+		// SAFETY: a zeroed sublayer is a valid empty one; the fields that matter are set below.
+		let mut sublayer: FWPM_SUBLAYER0 = unsafe {std::mem::zeroed()};
+		sublayer.subLayerKey = guid(SUBLAYER_BOOT_KEY);
+		sublayer.displayData.name = name.as_mut_ptr();
+		sublayer.weight = u16::MAX;
+		// SAFETY: the struct and the name outlive the call, which copies them.
+		gone_exists(unsafe {FwpmSubLayerAdd0(engine.0, &sublayer, null_mut())})?;
+		for (index, spec) in specs.iter().enumerate() {add_filter(engine, boot_key(index as u16), true, spec, app)?}
 		transaction.commit()
+	}
+
+	/// Other providers' filters that can override ours: a permit with the right to clear the action of a block, at the layers ours sit in. A name is all that is known of them, and it is told so that a user who finds the kill switch leaking can see who.
+	pub fn competing() -> io::Result<Vec<String>> {
+		let engine = Engine::open()?;
+		let mut found = Vec::new();
+		for layer in [FWPM_LAYER_ALE_AUTH_CONNECT_V4, FWPM_LAYER_ALE_AUTH_CONNECT_V6, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6] {
+			// SAFETY: a zeroed template is valid and matches every filter of the layer once the layer and the action mask are set.
+			let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe {std::mem::zeroed()};
+			template.layerKey = layer;
+			template.enumType = FWP_FILTER_ENUM_OVERLAPPING;
+			template.actionMask = 0xFFFF_FFFF;
+			let mut handle: HANDLE = null_mut();
+			// SAFETY: the template is live through the call and the handle is a local the call writes to.
+			check(unsafe {FwpmFilterCreateEnumHandle0(engine.0, &template, &mut handle)})?;
+			loop {
+				let (mut entries, mut count): (*mut *mut FWPM_FILTER0, u32) = (null_mut(), 0);
+				// SAFETY: the handle is open; the call writes an array of `count` pointers that is freed below.
+				let code = unsafe {FwpmFilterEnum0(engine.0, handle, 100, &mut entries, &mut count)};
+				if code != ERROR_SUCCESS {
+					// SAFETY: the handle came from the call above and is destroyed once.
+					unsafe {FwpmFilterDestroyEnumHandle0(engine.0, handle)};
+					return check(code).map(|()| found);
+				}
+				if count == 0 {break}
+				// SAFETY: the array holds `count` valid filters until it is freed.
+				for filter in unsafe {std::slice::from_raw_parts(entries, count as usize)}.iter().map(|filter| unsafe {&**filter}) {
+					// SAFETY: a provider key, when there is one, points at a GUID of the filter's own memory.
+					let ours = !filter.providerKey.is_null() && unsafe {let (found, ours) = (*filter.providerKey, guid(PROVIDER_KEY)); found.data1 == ours.data1 && found.data2 == ours.data2 && found.data3 == ours.data3 && found.data4 == ours.data4};
+					if !ours && filter.action.r#type == FWP_ACTION_PERMIT && filter.flags & FWPM_FILTER_FLAG_CLEAR_ACTION_RIGHT != 0 {
+						// SAFETY: the display name is a null-terminated wide string of the filter's own memory, or null.
+						let name = if filter.displayData.name.is_null() {String::new()} else {unsafe {String::from_utf16_lossy(std::slice::from_raw_parts(filter.displayData.name, (0..).take_while(|at| *filter.displayData.name.add(*at) != 0).count()))}};
+						found.push(name);
+					}
+				}
+				let mut freed = entries.cast();
+				// SAFETY: the array came from `FwpmFilterEnum0`, which says to free it with this call.
+				unsafe {FwpmFreeMemory0(&mut freed)};
+				if count < 100 {break}
+			}
+			// SAFETY: as above.
+			unsafe {FwpmFilterDestroyEnumHandle0(engine.0, handle)};
+		}
+		Ok(found)
 	}
 
 	/// Takes the kill switch out. Nothing is wrong if it is not there.
@@ -318,7 +412,8 @@ mod tests {
 		assert_eq!(node.conds, [Cond::App, Cond::Protocol(TCP), Cond::RemotePort(443), Cond::Remote("203.0.113.9/32".parse().unwrap())]);
 		let node6 = specs.iter().find(|spec| spec.name.starts_with("the node (IPv6)")).unwrap();
 		assert!(node6.v6 && node6.conds.contains(&Cond::Protocol(UDP)) && node6.conds.contains(&Cond::Remote("2001:db8::9/128".parse().unwrap())));
-		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("the node")).count(), 2);
+		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("the node") && !spec.accept).count(), 2);
+		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("the node") && spec.accept).count(), 2);
 	}
 
 	#[test]
@@ -335,8 +430,9 @@ mod tests {
 	fn names_are_blocked_in_both_families_and_both_protocols_and_nothing_is_blocked_by_default_in_a_split() {
 		let specs = rules().specs();
 		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("names") && !spec.permit).count(), 4);
+		assert!(specs.iter().all(|spec| !spec.name.starts_with("names") || !spec.accept));
 		let split = Rules {protected: vec!["203.0.113.0/24".parse().unwrap()], ..rules()}.specs();
-		let blocks: Vec<&Spec> = split.iter().filter(|spec| spec.name.starts_with("everything else")).collect();
+		let blocks: Vec<&Spec> = split.iter().filter(|spec| spec.name.starts_with("everything else") && !spec.accept).collect();
 		assert_eq!(blocks.len(), 1);
 		assert_eq!(blocks[0].conds, [Cond::Remote("203.0.113.0/24".parse().unwrap())]);
 		assert!(!blocks[0].v6);
@@ -345,8 +441,9 @@ mod tests {
 	#[test]
 	fn both_families_are_protected_by_a_full_tunnel() {
 		let specs = rules().specs();
-		let blocks: Vec<&Spec> = specs.iter().filter(|spec| spec.name.starts_with("everything else")).collect();
+		let blocks: Vec<&Spec> = specs.iter().filter(|spec| spec.name.starts_with("everything else") && !spec.accept).collect();
 		assert_eq!(blocks.len(), 2);
+		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("everything else") && spec.accept).count(), 2);
 		assert!(blocks.iter().any(|spec| spec.v6) && blocks.iter().any(|spec| !spec.v6));
 	}
 
@@ -359,13 +456,39 @@ mod tests {
 
 	#[test]
 	fn the_lan_is_let_through_only_when_asked_and_its_local_names_only_when_asked_too() {
-		assert!(!rules().specs().iter().any(|spec| spec.name.starts_with("the LAN") || spec.name.starts_with("local names")));
+		assert!(!rules().specs().iter().any(|spec| spec.name.starts_with("the LAN")));
 		let lan = Rules {lan: true, ..rules()}.specs();
 		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv4)")).count(), 5);
 		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv6)")).count(), 3);
-		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("local names") && !spec.permit).count(), 4);
+		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("local names") && !spec.accept).count(), 8);
 		let named = Rules {lan: true, local_names: true, ..rules()}.specs();
 		assert!(!named.iter().any(|spec| spec.name.starts_with("local names")));
+	}
+
+	#[test]
+	fn local_names_and_netbios_are_dropped_with_or_without_the_lan() {
+		let specs = rules().specs();
+		for port in [5353, 5355, 137, 138] {assert!(specs.iter().any(|spec| spec.name.starts_with("local names") && !spec.accept && spec.conds.contains(&Cond::RemotePort(port))), "{port}")}
+	}
+
+	#[test]
+	fn every_outbound_rule_is_mirrored_inbound_except_the_name_block_and_dhcp_is_pinned_to_its_ports() {
+		let specs = rules().specs();
+		for out in specs.iter().filter(|spec| !spec.accept && !spec.name.starts_with("names") && !spec.name.starts_with("DHCP")) {
+			assert!(specs.iter().any(|spec| spec.accept && spec.v6 == out.v6 && spec.permit == out.permit && spec.conds == out.conds), "{}", out.name);
+		}
+		let request = specs.iter().find(|spec| spec.name.starts_with("DHCP request (IPv4)")).unwrap();
+		assert!(request.conds.contains(&Cond::LocalPort(68)) && request.conds.contains(&Cond::Remote("255.255.255.255/32".parse().unwrap())));
+		let reply = specs.iter().find(|spec| spec.name == "DHCP (IPv6, inbound)").unwrap();
+		assert!(reply.accept && reply.conds.contains(&Cond::LocalPort(546)) && reply.conds.contains(&Cond::RemotePort(547)));
+	}
+
+	#[test]
+	fn only_outbound_blocks_get_a_boot_time_copy() {
+		let boot = rules().boot_specs();
+		assert_eq!(boot.len(), 2);
+		assert!(boot.iter().all(|spec| !spec.permit && !spec.accept));
+		assert!(boot_key(0) != filter_key(0) && boot_key(FILTERS_MAX - 1) != filter_key(FILTERS_MAX - 1));
 	}
 
 	#[test]

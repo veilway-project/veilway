@@ -63,7 +63,7 @@ fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 #[cfg(windows)]
 fn data_dir(given: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 	let dir = given.unwrap_or_else(state::default_data_dir);
-	state::secure_dir(&dir).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
+	state::secure_dir(&dir, platform::acl::Access::Private).with_context(|| format!("cannot use {} for the client's files", dir.display()))?;
 	Ok(dir)
 }
 
