@@ -7,8 +7,8 @@ use veilway_proto::subscription::envelope::{self, SigningKey};
 fn main() -> anyhow::Result<()> {
 	let path = std::env::args().nth(1).expect("usage: smoke_subscription <file>");
 	let mut seed = [0u8; 32];
-	SystemRandom::new().fill(&mut seed)?;
-	let provider = Ed25519KeyPair::from_seed_unchecked(&seed)?;
+	SystemRandom::new().fill(&mut seed).map_err(|_| anyhow::anyhow!("no random bytes"))?;
+	let provider = Ed25519KeyPair::from_seed_unchecked(&seed).map_err(|error| anyhow::anyhow!("the provider key: {error}"))?;
 	let public: [u8; 32] = provider.public_key().as_ref().try_into()?;
 	let key = SigningKey::new(public).ok_or_else(|| anyhow::anyhow!("the provider key is not usable"))?;
 	let (device, node) = (veilway_wg::generate_key(), veilway_wg::generate_key());
