@@ -145,3 +145,115 @@ jobs:
       - name: Desktop app
         if: always()
         run: cargo audit --file apps/desktop/src-tauri/Cargo.lock
+
+  # The Windows client on a real Windows runner, as an administrator: a test subscription whose node does not exist, what connect puts in force, the kill switch holding a request to the internet, and disconnect putting everything back. Only on ci/** branches and by hand, because it changes the network of the runner.
+  windows-smoke:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/ci/'))
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tools for BoringSSL
+        shell: pwsh
+        run: |
+          choco install nasm ninja -y --no-progress
+          "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+      - name: Build the client and install it with wintun.dll
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          "SMOKE=$env:RUNNER_TEMP\smoke" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          cargo build -p veilway
+          # The pinned release of apps/desktop/scripts/fetch-wintun.sh, with the same hash.
+          $zip = "$env:RUNNER_TEMP\wintun.zip"
+          Invoke-WebRequest -UseBasicParsing -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash -ne "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51") {Write-Output "::error::the wintun archive does not have the pinned hash"; exit 1}
+          Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun"
+          $dll = Get-ChildItem "$env:RUNNER_TEMP\wintun" -Recurse -Filter wintun.dll | Where-Object {$_.FullName -match "bin.amd64"} | Select-Object -First 1
+          if (-not $dll) {Write-Output "::error::bin/amd64/wintun.dll is not in the archive"; exit 1}
+          # The client loads wintun.dll from the folder of veilway.exe, and as an administrator it refuses a folder that others can write in, so both go to Program Files.
+          $install = Join-Path $env:ProgramFiles "Veilway"
+          New-Item -ItemType Directory -Force -Path $install | Out-Null
+          Copy-Item "target\debug\veilway.exe" $install
+          Copy-Item $dll.FullName $install
+      - name: Record the network state before the test
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force -Path $env:SMOKE | Out-Null
+          Get-NetIPInterface | Out-File "$env:SMOKE\before-interfaces.txt"
+          Get-NetRoute -AddressFamily IPv4 | Out-File "$env:SMOKE\before-routes.txt"
+          Get-DnsClientNrptRule | Out-File "$env:SMOKE\before-nrpt.txt"
+          netsh wfp show filters "file=$env:SMOKE\before-wfp.xml" | Out-Null
+          # The after-state is compared with this one, which is why it must not hold anything of the client's already.
+          if (@(Get-DnsClientNrptRule | Where-Object Comment -eq "Veilway").Count -gt 0) {Write-Output "::error::a name rule of the client is in the table before the test"; exit 1}
+          if ([regex]::Matches((Get-Content -Raw "$env:SMOKE\before-wfp.xml"), '(?i)<filterKey>\s*\{56570000-0000-4000-8000-').Count -gt 0) {Write-Output "::error::kill switch filters of the client are in force before the test"; exit 1}
+          Get-NetRoute -AddressFamily IPv4 | Where-Object InterfaceAlias -ne "Veilway" | ForEach-Object {"$($_.DestinationPrefix) $($_.InterfaceAlias) $($_.NextHop) $($_.RouteMetric)"} | Sort-Object -Unique | Set-Content "$env:SMOKE\before-routes-set.txt"
+          try {$null = Invoke-WebRequest -UseBasicParsing -Uri "https://www.example.com" -TimeoutSec 20} catch {Write-Output "::error::the internet is not reachable before the test: $($_.Exception.Message)"; exit 1}
+      - name: Make a test subscription
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build -p veilway --example smoke_subscription
+          & "target\debug\examples\smoke_subscription.exe" "$env:SMOKE\smoke.vwsub"
+      - name: Connect and check what is in force
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          # The client asks yes or no on the terminal. The answers come from a file, so that every question is answered yes.
+          @("yes") * 10 | Set-Content "$env:SMOKE\answers.txt"
+          Start-Process -FilePath "$env:ProgramFiles\Veilway\veilway.exe" -ArgumentList "connect", "$env:SMOKE\smoke.vwsub" -RedirectStandardInput "$env:SMOKE\answers.txt" -RedirectStandardOutput "$env:SMOKE\connect-out.txt" -RedirectStandardError "$env:SMOKE\connect.log" -WindowStyle Hidden
+          $until = (Get-Date).AddSeconds(30)
+          do {
+            Start-Sleep -Seconds 1
+            $adapter = Get-NetAdapter -Name "Veilway" -ErrorAction SilentlyContinue
+            $routes = @(Get-NetRoute -InterfaceAlias "Veilway" -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object DestinationPrefix -in "0.0.0.0/1", "128.0.0.0/1")
+            $rules = @(Get-DnsClientNrptRule | Where-Object Comment -eq "Veilway")
+          } until (($adapter.Status -eq "Up" -and $routes.Count -eq 2 -and $rules.Count -gt 0) -or (Get-Date) -gt $until)
+          if (-not (Get-Process -Name veilway -ErrorAction SilentlyContinue)) {Write-Output "::error::veilway connect ended before the connection was up, see connect.log"; exit 1}
+          if (-not $adapter -or $adapter.Status -ne "Up") {Write-Output "::error::the Veilway adapter is not up after 30 s"; exit 1}
+          if ($routes.Count -ne 2) {Write-Output "::error::the tunnel routes 0.0.0.0/1 and 128.0.0.0/1 are not both in the table"; exit 1}
+          if (-not ($rules | Where-Object {$_.Namespace -contains "."})) {Write-Output "::error::the name rule of the client is not a catch-all"; exit 1}
+          netsh wfp show filters "file=$env:SMOKE\connected-wfp.xml" | Out-Null
+          if ([regex]::Matches((Get-Content -Raw "$env:SMOKE\connected-wfp.xml"), '(?i)<filterKey>\s*\{56570000-0000-4000-8000-').Count -eq 0) {Write-Output "::error::no kill switch filter is in force while connected"; exit 1}
+          # The node does not exist, so nothing may leave the device outside the tunnel.
+          try {$null = Invoke-WebRequest -UseBasicParsing -Uri "https://www.example.com" -TimeoutSec 8} catch {Write-Output "The request was held: $($_.Exception.Message)"; $held = $true}
+          if (-not $held) {Write-Output "::error::www.example.com answered while the node is unreachable: the kill switch leaks"; exit 1}
+          $status = & "$env:ProgramFiles\Veilway\veilway.exe" status
+          $status
+          if (-not $status -or ($status -join " ") -match "Not connected") {Write-Output "::error::veilway status does not report a connection"; exit 1}
+      - name: Disconnect and check that everything is back
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "$env:ProgramFiles\Veilway\veilway.exe" disconnect
+          $until = (Get-Date).AddSeconds(30)
+          while ((Get-Process -Name veilway -ErrorAction SilentlyContinue) -and (Get-Date) -lt $until) {Start-Sleep -Seconds 1}
+          if (Get-Process -Name veilway -ErrorAction SilentlyContinue) {Write-Output "::error::veilway is still running 30 s after disconnect"; exit 1}
+          Get-NetIPInterface | Out-File "$env:SMOKE\after-interfaces.txt"
+          Get-NetRoute -AddressFamily IPv4 | Out-File "$env:SMOKE\after-routes.txt"
+          Get-DnsClientNrptRule | Out-File "$env:SMOKE\after-nrpt.txt"
+          netsh wfp show filters "file=$env:SMOKE\after-wfp.xml" | Out-Null
+          $adapter = Get-NetAdapter -Name "Veilway" -ErrorAction SilentlyContinue
+          if ($adapter -and $adapter.Status -eq "Up") {Write-Output "::error::the Veilway adapter is still up"; exit 1}
+          if (@(Get-NetRoute -InterfaceAlias "Veilway" -ErrorAction SilentlyContinue).Count -gt 0) {Write-Output "::error::routes into the Veilway adapter are still in the table"; exit 1}
+          if (@(Get-DnsClientNrptRule | Where-Object Comment -eq "Veilway").Count -gt 0) {Write-Output "::error::the client's name rule is still in the table"; exit 1}
+          if ([regex]::Matches((Get-Content -Raw "$env:SMOKE\after-wfp.xml"), '(?i)<filterKey>\s*\{56570000-0000-4000-8000-').Count -gt 0) {Write-Output "::error::kill switch filters are still in force"; exit 1}
+          $routes = Get-NetRoute -AddressFamily IPv4 | Where-Object InterfaceAlias -ne "Veilway" | ForEach-Object {"$($_.DestinationPrefix) $($_.InterfaceAlias) $($_.NextHop) $($_.RouteMetric)"} | Sort-Object -Unique
+          if (Compare-Object (Get-Content "$env:SMOKE\before-routes-set.txt") $routes) {Write-Output "::error::the routes of the other adapters differ from before the connection"; exit 1}
+          try {$null = Invoke-WebRequest -UseBasicParsing -Uri "https://www.example.com" -TimeoutSec 20} catch {Write-Output "::error::the internet is not reachable after disconnect: $($_.Exception.Message)"; exit 1}
+      - name: Stop the client after a failed check
+        if: failure()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          # The kill switch holds the runner's own traffic too, so the logs cannot be uploaded while it is in force.
+          & "$env:ProgramFiles\Veilway\veilway.exe" disconnect
+      - name: Upload the dumps and the client log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-smoke
+          path: ${{ runner.temp }}\smoke
+          retention-days: 14
