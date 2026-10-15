@@ -74,7 +74,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		if (!chosen) return;
 		setBusy(true);
 		setEnded(null);
-		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {allow_lan: false, local_names: false, routes: []}}).then(() => setRunning(old => ({...old, connected: true})), error => toast({tone: "danger", title: t("home.connectFailed"), body: error})).finally(() => setBusy(false));
+		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {local_names: false, routes: []}}).then(() => setRunning(old => ({...old, connected: true})), error => toast({tone: "danger", title: t("home.connectFailed"), body: error})).finally(() => setBusy(false));
 	};
 	const disconnect = () => {
 		setBusy(true);

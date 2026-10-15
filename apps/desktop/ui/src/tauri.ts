@@ -8,13 +8,13 @@ export type Usage = {used_bytes: number, quota_bytes: number, period: string, ex
 export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, applied: unknown};
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
 export type Profile = {id: string, name: string, exits: [string, string][]};
-export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], logo: string | null, accent: string | null, left_out: number};
+export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], logo: string | null, accent: string | null, left_out: number, lan_through_tunnel: boolean};
 export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, in_file: boolean};
 export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, left_out: string[], preview: Subscription};
 export type Running = {connected: boolean, status: StatusView | null, kill_switch_kept: boolean};
 export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean};
 export type UpdateInfo = {available: boolean, version: string, notes: string, current: string};
-export type Options = {allow_lan: boolean, local_names: boolean, routes: string[]};
+export type Options = {local_names: boolean, routes: string[]};
 export type Ended = {error: string | null, kept: boolean};
 export type Progress = {downloaded: number, total: number | null};
 
@@ -27,6 +27,7 @@ type Commands = {
 	library: [{languages: string[]}, Subscription[]],
 	refresh: [{id: string}, Subscription[]],
 	remove: [{id: string}, Subscription[]],
+	set_lan: [{id: string, on: boolean}, Subscription[]],
 	connect: [{subscription: string, profile: string, options: Options}, null],
 	answer: [{yes: boolean}, null],
 	disconnect: [{}, null],

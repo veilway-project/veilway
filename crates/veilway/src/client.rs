@@ -37,10 +37,12 @@ pub struct Connect {
 	#[arg(long)] profile: Option<String>,
 	/// Send only this network through the tunnel (and the tunnel's own gateway), and let the rest leave as it always did. Repeat for more. Without it everything goes through the tunnel
 	#[arg(long = "route")] routes: Vec<IpNet>,
-	/// Let private addresses and local discovery leave outside the tunnel. Names are still only asked through the tunnel
-	#[arg(long)] allow_lan: bool,
-	/// With --allow-lan: also let mDNS and LLMNR out, so that names on the local network resolve. They tell the network which names this device asks for
-	#[arg(long, requires = "allow_lan")] local_names: bool,
+	/// Keep private addresses and local discovery outside the tunnel. This is the default, and the flag is kept for scripts that pass it. Names are still only asked through the tunnel
+	#[arg(long, conflicts_with = "lan_through_tunnel")] allow_lan: bool,
+	/// Send private addresses and local discovery through the tunnel too, for a node that can reach your home network. Without it they stay outside the tunnel
+	#[arg(long)] lan_through_tunnel: bool,
+	/// Also let mDNS and LLMNR out, so that names on the local network resolve. They tell the network which names this device asks for. Not with --lan-through-tunnel
+	#[arg(long, conflicts_with = "lan_through_tunnel")] local_names: bool,
 	/// Do not block what is not tunnelled when the tunnel is down or reconnecting
 	#[arg(long)] no_kill_switch: bool,
 	/// The name of the tunnel's network device
@@ -166,7 +168,7 @@ pub fn render(status: &Status, applied: &Applied, now: u64) -> String {
 	});
 	lines.push(format!("Names: looked up only through the tunnel (set in {}).", applied.dns));
 	lines.push(match &applied.split {None => "Routes: everything goes through the tunnel.".into(), Some(nets) => format!("Routes: only {} goes through the tunnel.", nets.join(", "))});
-	if applied.allow_lan {lines.push("Local network: allowed outside the tunnel.".into())}
+	lines.push(if applied.allow_lan {"Local network: stays outside the tunnel."} else {"Local network: goes through the tunnel."}.into());
 	lines.push(format!("Device: {}, packet size {}.", applied.interface, status.mtu));
 	let counters = status.counters;
 	lines.push(format!("Traffic: {} sent, {} received.", size(counters.bytes_sent), size(counters.bytes_received)));
@@ -252,7 +254,7 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	let store = Arc::new(Store::open(data.join("client.json")));
 	let mut settings = Settings::new(store.clone(), Arc::new(now), default_roots(), String::new());
 	settings.languages = languages();
-	let options = Options {interface: args.interface, kill_switch: !args.no_kill_switch, allow_lan: args.allow_lan, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes)}, run_dir: run.clone(), ..Options::default()};
+	let options = Options {interface: args.interface, kill_switch: !args.no_kill_switch, allow_lan: !args.lan_through_tunnel, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes)}, run_dir: run.clone(), ..Options::default()};
 	// The one lock every command takes, held from here to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 	let lock = state::lock(&run).await?;
 	let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile.id), Agree::default());
@@ -388,7 +390,7 @@ mod tests {
 	fn the_kill_switch_being_off_and_a_split_are_said() {
 		let off = Applied {kill_switch: false, split: Some(vec!["203.0.113.0/24".into()]), allow_lan: true, ..applied()};
 		let text = render(&status(State::Off), &off, 0);
-		assert!(text.contains("Kill switch: off.") && text.contains("only 203.0.113.0/24 goes through the tunnel") && text.contains("Local network: allowed"));
+		assert!(text.contains("Kill switch: off.") && text.contains("only 203.0.113.0/24 goes through the tunnel") && text.contains("Local network: stays outside"));
 		let split = render(&status(State::Off), &Applied {kill_switch: true, ..off}, 0);
 		assert!(split.contains("Kill switch: on for 203.0.113.0/24 only.") && split.contains("All other traffic is not blocked") && !split.contains("Nothing leaves this device"));
 	}

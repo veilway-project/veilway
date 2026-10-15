@@ -92,7 +92,7 @@ impl Core {
 
 	fn tags(&self) -> Vec<veilway_proto::subscription::Tag> {tags(&self.languages.lock().unwrap())}
 
-	async fn library_value(&self) -> Result<Value, String> {to_value(library_view(&*self.library.lock().await, &self.tags(), now()))}
+	async fn library_value(&self) -> Result<Value, String> {to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))}
 
 	/// One request. The error is the text the window shows.
 	pub async fn call(self: &Arc<Self>, call: Call) -> Result<Value, String> {
@@ -133,7 +133,7 @@ impl Core {
 					}
 				};
 				let subscription = reviewed.review.subscription();
-				let out = ReviewOut {fingerprint: reviewed.review.fingerprint().to_string(), replaces: reviewed.review.replaces(), endpoint_changed: reviewed.review.endpoint_changed(), left_out: subscription.refused.iter().map(|refused| format!("{refused:?}")).collect(), preview: subscription_view(subscription, Standing::Current, reviewed.review.refreshes(), &self.tags())};
+				let out = ReviewOut {fingerprint: reviewed.review.fingerprint().to_string(), replaces: reviewed.review.replaces(), endpoint_changed: reviewed.review.endpoint_changed(), left_out: subscription.refused.iter().map(|refused| format!("{refused:?}")).collect(), preview: subscription_view(subscription, Standing::Current, reviewed.review.refreshes(), false, &self.tags())};
 				*pending = Some(Pending::Reviewed(reviewed));
 				to_value(out)
 			}
@@ -171,6 +171,14 @@ impl Core {
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
 				if let Some(found) = found {library.remove(&found).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				drop(library);
+				self.store.set_lan_through_tunnel(&id, false);
+				let _ = self.store.flush();
+				self.library_value().await
+			}
+			Call::SetLan {subscription: id, on} => {
+				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
+				self.store.set_lan_through_tunnel(&id, on);
+				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
 			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
@@ -255,7 +263,7 @@ impl Core {
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
-		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: options.allow_lan, local_names: options.local_names, routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
+		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: !self.store.lan_through_tunnel(held.id().as_str()), local_names: options.local_names && !self.store.lan_through_tunnel(held.id().as_str()), routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
 		// The one lock every command takes, held to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
 		let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default());
