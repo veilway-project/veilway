@@ -335,6 +335,14 @@ A provider can add a few cards to the client's home screen through the signed su
 
 A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint and blur strength. Nothing else: no URLs, fonts, CSS strings or images. The app validates it against a schema, rejects anything over 16 KB, checks text contrast and refuses or auto-corrects unreadable combinations. Built-in editor, export and import in the clients. The panel uses the same token set.
 
+## Shapes of `fronted` (after the alpha)
+
+The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbound by the operator, written into the signed profile, and followed by the client. Spec change in `veilway-docs` first, then an adversarial review, then code.
+
+- **Uplink**: the method (GET, POST, PUT, PATCH or a custom one) and where the data goes (body, query string, path or headers). A request is sent only when there is something to send, gathered per interval. Without a body, data is split over more requests, since a URL holds about 8 KB through most CDNs.
+- **Downlink**: polled answers, as today, or one long-lived Server-Sent Events stream that the node writes to as soon as a packet is there. SSE is text, so its packets are base64 (about a third more bytes); `text/event-stream` is the type CDNs most reliably pass without buffering. A stream whose first events come late falls back to polling.
+- To settle in the spec: uplink requests can arrive out of order (sequence numbers, still no second retransmission layer), padding and timing jitter for every shape, reconnects of the stream at random lengths, and a panel check that a chosen shape passes the operator's actual CDN (custom methods and GET bodies are often refused or dropped).
+
 ## Xray add-on
 
 Off by default, installed on request, removable.
