@@ -82,8 +82,8 @@ async fn flight(sni: Option<&str>) -> Hello {
 	parse(&record)
 }
 
-// The JA4 published for Chrome 131 and later (`t13d1516h2_8daaf6152771_d8a2da3f94cd`), with the two letters of this client's `http/1.1` alone: the hash of the extensions leaves ALPN out. Read from memory of published values, not from a capture of a pinned Chrome, which is still to do.
-const TARGET: &str = "t13d1516h1_8daaf6152771_d8a2da3f94cd";
+// The target is Chrome's wss:// hello shape: Chrome 131's JA4 with ALPS left out (this client's ALPN is `http/1.1` alone, as a WebSocket sends it, so Chrome sends no ALPS). It still needs confirming against a real Chrome capture.
+const TARGET: &str = "t13d1515h1_8daaf6152771_0a20fe35d3a5";
 
 #[tokio::test]
 async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
@@ -102,5 +102,5 @@ async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
 #[tokio::test]
 async fn a_candidate_with_no_server_name_sends_none() {
 	let hello = flight(None).await;
-	assert!(!hello.sni && ja4(&hello).starts_with("t13i1515h1_8daaf6152771_d8a2da3f94cd"));
+	assert!(!hello.sni && ja4(&hello).starts_with("t13i1514h1_8daaf6152771_0a20fe35d3a5"));
 }
