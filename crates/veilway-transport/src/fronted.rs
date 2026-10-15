@@ -5,7 +5,7 @@
 //! A later request is numbered, and when its connection ends before its answer is whole, the identical bytes go out again on a new connection, since the node answers a repeat from the response it stored. Without a valid answer inside 10 s the session is dropped. So is it by an answer that is not a `200`: the node no longer knows the session.
 //! A connection is kept from one request to the next unless the answer says `Connection: close`, and unless the front sent a byte nobody asked for in between: one request is in flight, so nothing stands between two answers.
 //! There is no idle keepalive: "the client's polling is the activity, and the response to each request is the sign of life."
-use crate::http::{self, Stop, HEAD_MAX};
+use crate::http::{self, Stop, CHROME, HEAD_MAX, PLATFORM};
 use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, Unreachable, Want, ATTEMPT};
 use std::ops::Range;
 use std::time::Duration;
@@ -26,7 +26,11 @@ pub(crate) const POLL_LEAST: Duration = Duration::from_secs(60);
 const REPEATS: usize = 3;
 
 // One request with a body: "Both bodies are sent with `Content-Type: application/octet-stream` and a `Content-Length`", and exactly one of the latter.
-fn post(path: &str, query: &str, host: &str, body: &[u8]) -> Vec<u8> {[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(), body].concat()}
+// The other fields are those of Chrome's `fetch` from a page of the same host. `identity` because the client reads no content coding: a front that compressed the answer would break the session.
+fn post(path: &str, query: &str, host: &str, body: &[u8]) -> Vec<u8> {
+	let (_, platform, mobile, _) = PLATFORM;
+	[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nsec-ch-ua: \"Google Chrome\";v=\"{CHROME}\", \"Chromium\";v=\"{CHROME}\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-platform: {platform}\r\nsec-ch-ua-mobile: {mobile}\r\n{}Content-Type: application/octet-stream\r\nAccept: */*\r\nOrigin: https://{host}\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\nReferer: https://{host}/\r\nAccept-Encoding: identity\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n", body.len(), http::user_agent()).as_bytes(), body].concat()
+}
 
 // Writes one request and reads its answer into `buf`, which then holds nothing else. `written` is set when the request has left whole. Where the body of a `200` lies and whether the answer ends its connection, or how the exchange stopped: by what the peer said, a `close_notify` included, or cut.
 // The head is searched as it arrives and read once, and the answer is looked at again only when all of its bytes are there: a front that sends an answer byte by byte costs a read for each byte and no more.
@@ -227,7 +231,17 @@ mod tests {
 	fn a_request_has_exactly_one_length() {
 		let request = post("/assets/sync.js", "token", "front.example", &[7; 40]);
 		let head = String::from_utf8_lossy(&request[..request.len() - 40]).into_owned();
-		assert_eq!(head, "POST /assets/sync.js?token HTTP/1.1\r\nHost: front.example\r\nContent-Type: application/octet-stream\r\nContent-Length: 40\r\n\r\n");
 		assert_eq!(head.to_ascii_lowercase().matches("content-length").count(), 1);
+		assert!(head.starts_with("POST /assets/sync.js?token HTTP/1.1\r\nHost: front.example\r\nConnection: keep-alive\r\nContent-Length: 40\r\n"), "{head}");
+	}
+
+	#[test]
+	fn a_request_has_chromes_fields_in_chromes_order() {
+		let request = post("/assets/sync.js", "token", "front.example", &[7; 40]);
+		let head = String::from_utf8_lossy(&request[..request.len() - 40]).into_owned();
+		let names: Vec<&str> = head.split("\r\n").skip(1).filter_map(|line| line.split_once(": ").map(|(name, _)| name)).collect();
+		assert_eq!(names, ["Host", "Connection", "Content-Length", "sec-ch-ua", "sec-ch-ua-platform", "sec-ch-ua-mobile", "User-Agent", "Content-Type", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language"], "{head}");
+		assert!(head.contains(&format!("Chrome/{CHROME}.0.0.0 ")) && head.contains(&format!("sec-ch-ua: \"Google Chrome\";v=\"{CHROME}\"")), "{head}");
+		assert!(head.contains("Origin: https://front.example\r\n") && head.contains("Referer: https://front.example/\r\n"), "{head}");
 	}
 }
