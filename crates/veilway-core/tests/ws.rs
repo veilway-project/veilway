@@ -80,6 +80,7 @@ fn apart(results: &[(&'static str, String, bool, Times, String, bool, Times)], m
 
 // The heart of the transport. "Not a user. Forward this request to a connection to the decoy origin and relay its response": what comes back through the node is the origin's answer and nothing of the node's, with the same end and at the same moment.
 // The reverse proxy in front is the same on both sides, and it asks nobody before it has a whole request head. So a connection that says nothing, and a head that is never finished, are the reverse proxy's own to end, and the node is not in them at all: they are here to show that, and their moments are the reverse proxy's.
+#[cfg_attr(windows, ignore = "the origin (hyper) on Windows drops connections with a reset that throws its own answer away, so it is no reference to compare with")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_gives() {
 	let time = time!();
@@ -107,8 +108,6 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 		("another method", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\nConnection: close\r\n\r\n")], late),
 		("a head request and one behind it", vec![send("HEAD / HTTP/1.1\r\nHost: node.test\r\n\r\nGET /after HTTP/1.1\r\nHost: node.test\r\n\r\n")], late),
 		("a body", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello")], late),
-		// On Windows the origin drops this connection with a reset, which throws its answer away, so the origin itself has no answer to compare with.
-		#[cfg(not(windows))]
 		("a body that comes in pieces", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 10\r\n\r\nhel"), Step::Wait(300), send("lo the"), Step::Wait(300), send("r")], late),
 		("a body that never comes whole", vec![send("POST /form HTTP/1.1\r\nHost: node.test\r\nContent-Length: 10\r\n\r\nhel")], last),
 		("an older version", vec![send("GET / HTTP/1.0\r\n\r\n")], late),
@@ -169,8 +168,7 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 	let with: Vec<_> = results.iter().filter(|(_, _, closed, _, _, ended, _)| closed == ended).cloned().collect();
 	let (first, close) = (apart(&results, |times| times.first), apart(&with, |times| times.closed));
 	println!("differential, {count} cases: first bytes at most {} ms apart ({}), closes at most {} ms apart ({}) over the {} cases whose end is the origin's answer or the reverse proxy's own, and {kept} cases where the origin gave up a quiet connection and the node kept its proxy's", first.0, first.1, close.0, close.1, with.len());
-	// On Windows the origin (hyper) closes a connection after a request with a body at a moment of its own, a second or more apart between two runs, so only first bytes are timed there.
-	assert!(first.0 <= 400 && (cfg!(windows) || close.0 <= 400) && kept > 0, "first bytes {first:?} and closes {close:?} apart");
+	assert!(first.0 <= 400 && close.0 <= 400 && kept > 0, "first bytes {first:?} and closes {close:?} apart");
 	// Four cases never had a whole head, so the reverse proxy asked nobody. All the others were answered by the origin, and none by the node.
 	assert_eq!(answered, count - 4);
 	// The session of the stranger's two requests is as it was: its client's next request is its next request.
