@@ -14,7 +14,7 @@ fn main() -> anyhow::Result<()> {
 	let (device, node) = (veilway_wg::generate_key(), veilway_wg::generate_key());
 	let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
 	let payload = json!({
-		"v": 1, "subscription_id": "smoke-test-0001", "serial": 1, "issued_at": now - 10, "expires_at": now + 30 * 86_400,
+		"v": 1, "subscription_id": "smoke-test-subscription", "serial": 1, "issued_at": now - 10, "expires_at": now + 30 * 86_400,
 		"signing_keys": [veilway_wg::encode_key(&public)], "provider": {"name": "Smoke test"},
 		"profiles": [{
 			"type": "veilway", "id": "smoke", "name": "Smoke",
