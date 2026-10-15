@@ -35,7 +35,7 @@ ring="0.17"
 ipnet= {version="2", features= ["serde"] }
 # Pictures are read with size limits, and only to find a QR code in them (same as the desktop app).
 image= {version="0.25", default-features=false, features= ["png", "jpeg"] }
-rqrr="0.9"
+rqrr="0.11"
 # Calls into the Kotlin side (the VpnService, the Keystore) and the natives it calls back.
 jni="0.21"
 libc="0.2.150"
