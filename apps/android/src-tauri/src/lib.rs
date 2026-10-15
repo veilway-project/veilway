@@ -94,7 +94,7 @@ async fn import_qr(data: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn import_proceed() -> Result<Value, String> {call_branded(Call::ImportProceed).await}
+async fn import_proceed(private: Option<Vec<String>>) -> Result<Value, String> {call_branded(Call::ImportProceed {private: private.unwrap_or_default()}).await}
 
 #[tauri::command]
 async fn import_keep(keep: bool) -> Result<Value, String> {call_branded(Call::ImportKeep {keep}).await}
@@ -106,7 +106,7 @@ async fn import_cancel() -> Result<Value, String> {host::call(Call::ImportCancel
 async fn library(languages: Vec<String>) -> Result<Value, String> {call_branded(Call::Library {languages}).await}
 
 #[tauri::command]
-async fn refresh(id: String) -> Result<Value, String> {call_branded(Call::Refresh {subscription: id}).await}
+async fn refresh(id: String, private: Option<Vec<String>>) -> Result<Value, String> {call_branded(Call::Refresh {subscription: id, private: private.unwrap_or_default()}).await}
 
 #[tauri::command]
 async fn remove(id: String) -> Result<Value, String> {call_branded(Call::Remove {subscription: id}).await}

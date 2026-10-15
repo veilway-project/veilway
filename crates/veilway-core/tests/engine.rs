@@ -854,7 +854,7 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	// Every answer that is no signed document under the link's key is a failed fetch, and each leaves the step as it was: to try again.
 	for (answer, wanted) in [(Mode::Redirect, "redirect"), (Mode::Missing, "status"), (Mode::Encoded, "encoding"), (Mode::Foreign, "signature")] {
 		*mode.lock().unwrap() = answer;
-		let error = fetcher.fetch(&fetching, &library, time.secs()).await.unwrap_err();
+		let error = fetcher.fetch(&fetching, &library, time.secs(), &[]).await.unwrap_err();
 		let matched = match (&error, wanted) {
 			(import::ImportError::Fetch(import::FetchError::Redirect), "redirect") | (import::ImportError::Fetch(import::FetchError::Status(404)), "status") | (import::ImportError::Fetch(import::FetchError::Encoding), "encoding") | (import::ImportError::Subscription(veilway_proto::subscription::client::Failure::Envelope(_)), "signature") => true,
 			_ => false,
@@ -864,15 +864,15 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	}
 	// A certificate that does not lead to a root held is no answer, and a pin is a check this build does not have: nothing is sent to a pinned endpoint by the chain rules.
 	let (other, _, _) = certify("other.example.com", None);
-	assert!(matches!(Fetcher {roots: other, ..fetcher.clone()}.fetch(&fetching, &library, time.secs()).await, Err(import::ImportError::Fetch(import::FetchError::Certificate))));
+	assert!(matches!(Fetcher {roots: other, ..fetcher.clone()}.fetch(&fetching, &library, time.secs(), &[]).await, Err(import::ImportError::Fetch(import::FetchError::Certificate))));
 	let before = endpoint.seen.lock().unwrap().len();
-	assert_eq!(fetcher.post(fetching.endpoint(), &import::Trust::Pinned(vec![[1; 32]]), b"{}").await, Err(import::FetchError::Pin));
+	assert_eq!(fetcher.post(fetching.endpoint(), &import::Trust::Pinned(vec![[1; 32]]), b"{}", &[]).await, Err(import::FetchError::Pin));
 	assert_eq!(endpoint.seen.lock().unwrap().len(), before);
 	// The answer that passes, once with a body that comes in chunks. Nothing is stored before the second yes.
 	*mode.lock().unwrap() = Mode::Chunked;
-	let again = fetcher.fetch(&fetching, &library, time.secs()).await.unwrap();
+	let again = fetcher.fetch(&fetching, &library, time.secs(), &[]).await.unwrap();
 	*mode.lock().unwrap() = Mode::Normal;
-	let reviewed = fetcher.fetch(&fetching, &library, time.secs()).await.unwrap();
+	let reviewed = fetcher.fetch(&fetching, &library, time.secs(), &[]).await.unwrap();
 	assert_eq!(again.review.subscription(), reviewed.review.subscription());
 	assert!(library.held().is_empty() && !net.dir.join("import.vault").exists());
 	let review = &reviewed.review;
@@ -894,6 +894,11 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(net.dir.join("import.vault")).unwrap().permissions()) & 0o777, 0o600);
 	let (restored, damaged) = Library::open(Box::new(FileVault(net.dir.join("import.vault")))).unwrap();
 	assert!(damaged.is_empty() && restored.held().len() == 1 && restored.held()[0].document() == library.held()[0].document());
+	// A yes to a private address is kept with the subscription in the vault, only for an address that may be asked about at all.
+	assert!(library.held()[0].private_addresses().is_empty());
+	library.allow_private(0, &["192.168.1.20".parse().unwrap(), "127.0.0.1".parse().unwrap()]).unwrap();
+	let (kept, _) = Library::open(Box::new(FileVault(net.dir.join("import.vault")))).unwrap();
+	assert_eq!(kept.held()[0].private_addresses(), ["192.168.1.20".parse::<std::net::IpAddr>().unwrap()]);
 	// A refresh of what is stored: the same document again changes nothing.
 	assert!(matches!(fetcher.refresh(&mut library, 0, time.secs()).await, Ok(veilway_proto::subscription::client::Refreshed::Unchanged)));
 	// The device the import made connects, over each of the profile's transports in turn, with a key no one but this client holds.
@@ -908,7 +913,7 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	let (other_library, _) = Library::open(Box::new(FileVault(net.dir.join("declined.vault")))).unwrap();
 	let Offer::Native(offer) = import::open(&link).unwrap() else {panic!("a native link")};
 	let fetching = import::proceed(offer, None).unwrap();
-	let reviewed = fetcher.fetch(&fetching, &other_library, time.secs()).await.unwrap();
+	let reviewed = fetcher.fetch(&fetching, &other_library, time.secs(), &[]).await.unwrap();
 	fetcher.decline(reviewed).await;
 	let release: Value = serde_json::from_slice(&endpoint.seen.lock().unwrap().last().unwrap().1).unwrap();
 	assert_eq!(release["op"].as_str(), Some("release"));
@@ -1045,10 +1050,10 @@ async fn a_pinned_endpoint_is_trusted_by_its_pin_alone_and_nothing_is_sent_to_on
 	// A pin that is not the certificate's: the handshake fails before a byte of the request is written, and the server's answer is never read.
 	let Offer::Native(other) = import::open(&link(&[7; 32])).unwrap() else {panic!("a native link")};
 	let wrong = import::proceed(other, None).unwrap();
-	assert!(matches!(fetcher.fetch(&wrong, &library, time.secs()).await, Err(import::ImportError::Fetch(import::FetchError::Pin))));
+	assert!(matches!(fetcher.fetch(&wrong, &library, time.secs(), &[]).await, Err(import::ImportError::Fetch(import::FetchError::Pin))));
 	assert!(endpoint.seen.lock().unwrap().is_empty());
 	// The right one passes, and the accepted subscription holds the pin its endpoint is checked by, in the vault too.
-	let reviewed = fetcher.fetch(&fetching, &library, time.secs()).await.unwrap();
+	let reviewed = fetcher.fetch(&fetching, &library, time.secs(), &[]).await.unwrap();
 	assert_eq!(reviewed.pins, [pin]);
 	fetcher.accept(reviewed, None, &mut library).await.unwrap();
 	assert_eq!(library.held()[0].targets().first().map(|(_, pins)| pins.to_vec()), Some(vec![pin]));

@@ -15,6 +15,7 @@ use anyhow::{anyhow, bail, Context};
 use base64::Engine;
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -116,21 +117,27 @@ impl Core {
 				*self.pending.lock().await = Some(pending);
 				to_value(out)
 			}
-			Call::ImportProceed => {
+			Call::ImportProceed {private} => {
+				let allowed: Vec<IpAddr> = private.iter().filter_map(|address| address.parse().ok()).collect();
 				let mut pending = self.pending.lock().await;
 				if matches!(pending.as_ref(), Some(Pending::Native(_) | Pending::Fetching(_))) {self.fetch_gate()?}
 				let library = self.library.lock().await;
 				let reviewed = match pending.take() {
 					Some(Pending::Native(offer)) => {
 						let fetching = import::proceed(offer, None).map_err(|error| error.text().to_owned())?;
-						Self::fetch(&fetcher(), fetching, &library, &mut pending).await?
+						Self::fetch(&fetcher(), fetching, &library, &mut pending, &allowed).await?
 					}
-					Some(Pending::Fetching(fetching)) => Self::fetch(&fetcher(), fetching, &library, &mut pending).await?,
-					Some(Pending::Carried(offer)) => import::proceed_carried(offer, now(), &library).map_err(|error| error.text().to_owned())?,
+					Some(Pending::Fetching(fetching)) => Self::fetch(&fetcher(), fetching, &library, &mut pending, &allowed).await?,
+					Some(Pending::Carried(offer)) => Ok(import::proceed_carried(offer, now(), &library).map_err(|error| error.text().to_owned())?),
 					other => {
 						*pending = other;
 						return Err("There is no import waiting for a yes.".into());
 					}
+				};
+				// A private address the user has not said yes to: the step stays where it was and the window asks.
+				let reviewed = match reviewed {
+					Ok(reviewed) => reviewed,
+					Err(question) => return Ok(question),
 				};
 				let subscription = reviewed.review.subscription();
 				let out = ReviewOut {fingerprint: reviewed.review.fingerprint().to_string(), replaces: reviewed.review.replaces(), endpoint_changed: reviewed.review.endpoint_changed(), left_out: subscription.refused.iter().map(|refused| format!("{refused:?}")).collect(), preview: subscription_view(subscription, Standing::Current, reviewed.review.refreshes(), false, &self.tags())};
@@ -151,17 +158,22 @@ impl Core {
 			}
 			Call::ImportCancel => {
 				match self.pending.lock().await.take() {
-					Some(Pending::Fetching(fetching)) => fetcher().abandon(fetching).await,
+					Some(Pending::Fetching(fetching)) => fetcher().abandon(fetching, &[]).await,
 					Some(Pending::Reviewed(reviewed)) => fetcher().decline(reviewed).await,
 					_ => {}
 				}
 				Ok(Value::Null)
 			}
-			Call::Refresh {subscription: id} => {
+			Call::Refresh {subscription: id, private} => {
 				self.fetch_gate()?;
 				let mut library = self.library.lock().await;
 				let at = library.held().iter().position(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?;
-				fetcher().refresh(&mut library, at, now()).await.map_err(|error| error.text().to_owned())?;
+				let allowed: Vec<IpAddr> = private.iter().filter_map(|address| address.parse().ok()).collect();
+				if !allowed.is_empty() {library.allow_private(at, &allowed).map_err(|error| format!("The choice could not be saved: {error}"))?}
+				match fetcher().refresh(&mut library, at, now()).await {
+					Err(import::ImportError::PrivateEndpoint {host, addresses}) => return Ok(json!({"ask_private": {"host": host, "addresses": addresses}})),
+					other => other.map_err(|error| error.text().to_owned())?,
+				};
 				drop(library);
 				self.library_value().await
 			}
@@ -214,12 +226,16 @@ impl Core {
 	}
 
 	/// A failed fetch keeps the step, so that the user can try again or cancel.
-	async fn fetch(fetcher: &Fetcher, fetching: Fetching, library: &Library, pending: &mut Option<Pending>) -> Result<Reviewed, String> {
-		match fetcher.fetch(&fetching, library, now()).await {
-			Ok(reviewed) => Ok(reviewed),
+	/// An endpoint on a private address that the user has not said yes to is not a failure: the answer is the question for the window, `{"ask_private": {"host", "addresses"}}`, and the step stays.
+	async fn fetch(fetcher: &Fetcher, fetching: Fetching, library: &Library, pending: &mut Option<Pending>, allowed: &[IpAddr]) -> Result<Result<Reviewed, Value>, String> {
+		match fetcher.fetch(&fetching, library, now(), allowed).await {
+			Ok(reviewed) => Ok(Ok(reviewed)),
 			Err(error) => {
 				*pending = Some(Pending::Fetching(fetching));
-				Err(error.text().to_owned())
+				match error {
+					import::ImportError::PrivateEndpoint {host, addresses} => Ok(Err(json!({"ask_private": {"host": host, "addresses": addresses}}))),
+					error => Err(error.text().to_owned()),
+				}
 			}
 		}
 	}
@@ -529,7 +545,7 @@ mod tests {
 		let link = link(&socket, &token()).await.unwrap();
 		assert_eq!(link.call(Call::Library {languages: vec!["en".into()]}).await.unwrap(), json!([]));
 		assert!(link.call(Call::ImportOpen {source: Source::Link {text: "not a link".into()}}).await.is_err());
-		assert_eq!(link.call(Call::ImportProceed).await.unwrap_err(), "There is no import waiting for a yes.");
+		assert_eq!(link.call(Call::ImportProceed {private: Vec::new()}).await.unwrap_err(), "There is no import waiting for a yes.");
 		assert_eq!(link.call(Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await.unwrap_err(), "That subscription is not held.");
 		assert_eq!(link.call(Call::Answer {yes: true}).await.unwrap_err(), "There is no question waiting.");
 		assert_eq!(link.call(Call::SelectExit {tag: None}).await.unwrap_err(), "There is no running tunnel to change the exit of.");

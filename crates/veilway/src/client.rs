@@ -193,7 +193,18 @@ async fn import_source(library: &mut Library, source: &str, signals: &mut Signal
 			eprintln!("If you continue, the link's token and a new key for this device are sent to that server.");
 			if !ask("Continue?", signals).await? {bail!("Nothing was sent.")}
 			let fetching = import::proceed(offer, None).map_err(|error| anyhow!(error.text()))?;
-			fetcher.fetch(&fetching, library, at).await.map_err(|error| anyhow!(error.text()))?
+			let mut allowed = Vec::new();
+			loop {
+				match fetcher.fetch(&fetching, library, at, &allowed).await {
+					Ok(reviewed) => break reviewed,
+					Err(import::ImportError::PrivateEndpoint {addresses, ..}) if allowed.is_empty() => {
+						eprintln!("This subscription is on a private address ({}). Only continue if you run this server yourself, for example at home.", addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+						if !ask("Connect to it?", signals).await? {bail!("Nothing was sent.")}
+						allowed = addresses;
+					}
+					Err(error) => bail!(error.text()),
+				}
+			}
 		}
 		Offer::Carried(offer) => {
 			eprintln!("This {} carries a whole subscription and contacts nobody.", if offer.in_file() {"file"} else {"link"});
