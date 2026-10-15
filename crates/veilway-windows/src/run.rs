@@ -1,4 +1,5 @@
 //! A connection: `run` puts the engine on a Wintun adapter and holds the rest in force, and `cleanup` takes it all out. The order and the rules of failing closed are in the head of `lib.rs`.
+use crate::acl;
 use crate::dns::{self, Pinned};
 use crate::firewall::{self, Endpoint, Rules};
 use crate::networks::{self, Own};
@@ -77,9 +78,10 @@ fn endpoints(profile: &Profile) -> Vec<Endpoint> {
 pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
 	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
 	if !tun::valid_name(&options.interface) {return Err(before(anyhow::anyhow!("{:?} is not a name a network adapter can have", options.interface)))}
-	state::secure_dir(&options.run_dir).map_err(|error| before(error.into()))?;
+	state::secure_dir(&options.run_dir, acl::Access::Read).map_err(|error| before(error.into()))?;
 	let profile = held.subscription().profiles.iter().find(|candidate| candidate.id == profile).ok_or_else(|| before(StartError::NoProfile.into()))?;
 	tracing::info!(interface = %options.interface, kill_switch = options.kill_switch, "connecting");
+	if dns::group_policy().map_err(|error| before(error.into()))? {return Err(before(anyhow::anyhow!("Group Policy sets name resolution rules (DnsPolicyConfig) on this device, and they win over the client's own, so names would not go through the tunnel. Ask the administrator of this device to remove them, or do not connect")))}
 	// A rule of the policy table that an earlier client that did not stop left behind: it is replaced when the new resolvers are set. The kill switch stays in force until the new one replaces it in a single step.
 	if dns::present().map_err(|error| before(error.into()))? {tracing::info!("a name resolution rule of an earlier connection was found and is replaced")}
 	let (own, physical) = (networks::read(None).map_err(|error| before(error.into()))?, Arc::new(AtomicU32::new(0)));
@@ -87,12 +89,13 @@ pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings,
 	let gateways = profile.gateways.clone();
 	let protected = Layout {routes: &options.routes, gateways: &gateways}.protected();
 	let rules = Rules {tun: None, nodes: endpoints(profile), protected, lan: options.allow_lan, local_names: options.local_names};
-	if options.kill_switch {
-		firewall::install(&rules).map_err(|error| before(error.into()))?;
-		tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device");
-	} else {
-		// Filters an earlier client left would drop this client's own connections to nodes the old profile did not list, with the status saying the kill switch is off.
-		firewall::remove().map_err(|error| before(error.into()))?;
+	// With the kill switch off nothing is protected, but names still only go through the tunnel (port 53 is blocked elsewhere), and what an earlier client left is replaced, so that its filters do not drop this client's connections to nodes the old profile did not list.
+	firewall::install(&Rules {protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()}).map_err(|error| before(error.into()))?;
+	if options.kill_switch {tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device")}
+	match firewall::competing() {
+		Ok(names) if !names.is_empty() => tracing::warn!(?names, "other programs' firewall filters can permit traffic the kill switch blocks (they clear the action right)"),
+		Ok(_) => {}
+		Err(error) => tracing::warn!(%error, "the firewall's other filters could not be listed"),
 	}
 	settings.socket = Some(sock::hook(physical.clone()));
 	let mut up = Up::default();
@@ -100,7 +103,7 @@ pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings,
 	match outcome {
 		Ok(()) => {
 			let problems = up.undo(options, true).await;
-			if problems.is_empty() {Ok(())} else {Err(Failure {error: anyhow::anyhow!(problems.join("; ")), kept: options.kill_switch})}
+			if problems.is_empty() {Ok(())} else {Err(Failure {error: anyhow::anyhow!(problems.join("; ")), kept: firewall::present() == Some(true)})}
 		}
 		Err(error) => {
 			let problems = up.undo(options, !options.kill_switch).await;
@@ -127,7 +130,7 @@ impl Up {
 		for address in &profile.device.addresses {ip::add_address(tun.luid, *address, if address.is_ipv4() {32} else {128})?}
 		for (present, family6) in [(v4, false), (v6, true)] {if present {ip::set_interface(tun.luid, family6, Some(u32::from(mtu)), METRIC_TUNNEL)?}}
 		// The adapter is known now: from here the tunnel's traffic may leave by it, and the routes below may send it there.
-		if options.kill_switch {firewall::install(&Rules {tun: Some(tun.luid), ..rules.clone()})?}
+		firewall::install(&Rules {tun: Some(tun.luid), protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()})?;
 		let skipped = ip::apply(tun.luid, &routes::plan(&Layout {routes: &options.routes, gateways: &profile.gateways}))?;
 		if !skipped.is_empty() {tracing::info!(?skipped, "some routes that this device may not have could not be made")}
 		let dns = self.dns.insert(Pinned::pin(tun.index, &profile.gateways)?);

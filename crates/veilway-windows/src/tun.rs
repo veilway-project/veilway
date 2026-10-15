@@ -25,6 +25,7 @@ impl Tun {
 	/// Makes the adapter, or takes the one a client that did not stop left, and starts its session.
 	pub fn create(name: &str) -> io::Result<Self> {
 		if !valid_name(name) {return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a name a network adapter can have")))}
+		crate::state::check_install_dir()?;
 		let dll = std::env::current_exe()?.with_file_name("wintun.dll");
 		// SAFETY: loading a DLL runs its initialization. It is the one next to this executable, which the same installer or script put there, and not a name left to the search path.
 		let wintun = unsafe {wintun_bindings::load_from_path(&dll)}.map_err(|error| io::Error::other(format!("cannot load {} ({error}): wintun.dll has to be next to veilway.exe", dll.display())))?;
