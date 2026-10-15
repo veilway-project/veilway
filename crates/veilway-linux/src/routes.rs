@@ -1,6 +1,6 @@
 //! Policy routing for the tunnel, as a plan that is plain data and then applied.
 //!
-//! The rules, in the order of their priority. The tunnel's own networks (the split networks and the gateways) are looked up in the tunnel's table before anything else. With the LAN let through, its ranges go to the main table. A socket the engine marked is looked up in the main table, as if there were no tunnel: the node is reached the way the device reaches it now, and a change of network (a new default route in the main table) is followed with nothing to do here. DHCP renewals (UDP to port 67 and 547) are looked up in the main table too, so that the lease of the physical link is not sent to the node. All other traffic is looked up in a table of the client's own, where the tunnel's routes are. Nothing a DHCP server or a router advertisement puts in the main table is ever consulted for it, which is what makes TunnelVision's more specific routes useless against it.
+//! The rules, in the order of their priority. The tunnel's own networks (the split networks and the gateways) are looked up in the tunnel's table before anything else. With the local network let through, the subnets the device is on (`veilway_engine::lan::local`) go to the main table. A socket the engine marked is looked up in the main table, as if there were no tunnel: the node is reached the way the device reaches it now, and a change of network (a new default route in the main table) is followed with nothing to do here. DHCP renewals (UDP to port 67 and 547) are looked up in the main table too, so that the lease of the physical link is not sent to the node. All other traffic is looked up in a table of the client's own, where the tunnel's routes are. Nothing a DHCP server or a router advertisement puts in the main table is ever consulted for it, which is what makes TunnelVision's more specific routes useless against it.
 //!
 //! The priorities and the table are this client's own, high and unusual numbers, and a rule is removed by naming all of what it is (its priority, its table, its mark or destination), so that rules another program made are not touched.
 //!
@@ -19,8 +19,6 @@ const METRIC_REFUSE: u32 = 1000;
 /// Not 0, which an IPv6 route is given the default metric 1024 for, and so would lose to the refusing route above.
 const METRIC_TUNNEL: u32 = 1;
 const UDP: u8 = 17;
-/// The networks "the LAN" means when the user lets it through: private ranges, link-local, and the multicast groups local discovery uses. Fixed ranges and not the device's current subnets, so that a network that hands out a public subnet as on-link (TunnelCrack LocalNet) gets nothing by it.
-pub const LAN: [(&str, u8); 8] = [("10.0.0.0", 8), ("172.16.0.0", 12), ("192.168.0.0", 16), ("169.254.0.0", 16), ("224.0.0.0", 24), ("fc00::", 7), ("fe80::", 10), ("ff02::", 16)];
 
 /// What goes into the tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +39,8 @@ pub struct Layout<'a> {
 	pub v4: bool,
 	pub v6: bool,
 	pub gateways: &'a [IpAddr],
-	pub lan: bool,
+	/// What goes outside the tunnel for the user's "let apps reach devices on this network": the subnets of `veilway_engine::lan::local`, empty when it is off.
+	pub lan: Vec<(IpAddr, u8)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +70,7 @@ impl Layout<'_> {
 	fn first(&self) -> Vec<(IpAddr, u8)> {
 		match self.routes {
 			Routes::Split(_) => self.protected(),
-			Routes::Full if self.lan => self.gateways.iter().copied().map(host).collect(),
+			Routes::Full if !self.lan.is_empty() => self.gateways.iter().copied().map(host).collect(),
 			Routes::Full => Vec::new(),
 		}
 	}
@@ -92,12 +91,7 @@ pub fn plan(layout: &Layout) -> Vec<Step> {
 		}
 	}
 	for to in layout.first() {steps.push(Step {item: Item::Rule(Rule {v6: to.0.is_ipv6(), priority: PRIORITY_SPLIT, to: Some(to), table: layout.table, ..Rule::default()}), optional: unused(to.0.is_ipv6())})}
-	if layout.lan {
-		for (text, prefix) in LAN {
-			let ip: IpAddr = text.parse().unwrap();
-			steps.push(Step {item: Item::Rule(Rule {v6: ip.is_ipv6(), priority: PRIORITY_LAN, to: Some((ip, prefix)), table: TABLE_MAIN, ..Rule::default()}), optional: unused(ip.is_ipv6())});
-		}
-	}
+	for (ip, prefix) in &layout.lan {steps.push(Step {item: Item::Rule(Rule {v6: ip.is_ipv6(), priority: PRIORITY_LAN, to: Some((*ip, *prefix)), table: TABLE_MAIN, ..Rule::default()}), optional: unused(ip.is_ipv6())})}
 	for v6 in [false, true] {
 		steps.push(Step {item: Item::Rule(Rule {v6, priority: PRIORITY_MARKED, mark: Some(layout.mark), table: TABLE_MAIN, ..Rule::default()}), optional: unused(v6)});
 		steps.push(Step {item: Item::Rule(dhcp(v6)), optional: true});
@@ -120,15 +114,12 @@ pub fn apply(rt: &mut Rt, steps: &[Step]) -> io::Result<Vec<String>> {
 	Ok(skipped)
 }
 
-/// Every rule this client can have made, in the form a delete names it by: whatever the layout was. The rules to the tunnel's own networks have destinations that are not known here, and are named by their priority and the client's table.
+/// Every rule this client can have made, in the form a delete names it by: whatever the layout was. The rules to the tunnel's own networks and to the local subnets have destinations that are not known here, and are named by their priority and their table.
 pub fn owned(mark: u32, table: u32) -> Vec<Rule> {
 	let mut rules = Vec::new();
 	for v6 in [false, true] {
 		rules.push(Rule {v6, priority: PRIORITY_SPLIT, table, ..Rule::default()});
-		for (text, prefix) in LAN {
-			let ip: IpAddr = text.parse().unwrap();
-			if ip.is_ipv6() == v6 {rules.push(Rule {v6, priority: PRIORITY_LAN, to: Some((ip, prefix)), table: TABLE_MAIN, ..Rule::default()})}
-		}
+		rules.push(Rule {v6, priority: PRIORITY_LAN, table: TABLE_MAIN, ..Rule::default()});
 		rules.push(Rule {v6, priority: PRIORITY_MARKED, mark: Some(mark), table: TABLE_MAIN, ..Rule::default()});
 		rules.push(dhcp(v6));
 		rules.push(Rule {v6, priority: PRIORITY_TUNNEL, table, ..Rule::default()});
@@ -161,7 +152,7 @@ pub fn teardown(rt: &mut Rt, mark: u32, table: u32) -> io::Result<usize> {
 mod tests {
 	use super::*;
 
-	fn layout<'a>(routes: &'a Routes, gateways: &'a [IpAddr], v6: bool, lan: bool) -> Layout<'a> {Layout {mark: 0x5657, table: 0x5657, tun: 9, routes, v4: true, v6, gateways, lan}}
+	fn layout<'a>(routes: &'a Routes, gateways: &'a [IpAddr], v6: bool, lan: &[(&str, u8)]) -> Layout<'a> {Layout {mark: 0x5657, table: 0x5657, tun: 9, routes, v4: true, v6, gateways, lan: lan.iter().map(|(ip, prefix)| (ip.parse().unwrap(), *prefix)).collect()}}
 
 	fn rules(steps: &[Step]) -> Vec<&Rule> {steps.iter().filter_map(|step| if let Item::Rule(rule) = &step.item {Some(rule)} else {None}).collect()}
 
@@ -170,7 +161,7 @@ mod tests {
 	#[test]
 	fn a_full_tunnel_routes_both_families_into_the_device_with_a_blackhole_behind_each() {
 		let gateways = ["10.7.0.1".parse().unwrap(), "fd07::1".parse().unwrap()];
-		let steps = plan(&layout(&Routes::Full, &gateways, true, false));
+		let steps = plan(&layout(&Routes::Full, &gateways, true, &[]));
 		let routes = routes_of(&steps);
 		assert_eq!(routes.len(), 4);
 		assert!(routes.iter().all(|route| route.dst.is_none() && route.table == 0x5657));
@@ -182,7 +173,7 @@ mod tests {
 	#[test]
 	fn a_family_the_profile_has_no_address_for_is_refused_and_not_carried() {
 		let gateways = ["10.7.0.1".parse().unwrap()];
-		let steps = plan(&layout(&Routes::Full, &gateways, false, false));
+		let steps = plan(&layout(&Routes::Full, &gateways, false, &[]));
 		let v6: Vec<_> = routes_of(&steps).into_iter().filter(|route| route.v6).collect();
 		assert_eq!(v6.len(), 1);
 		assert_eq!((v6[0].kind, v6[0].oif), (Kind::Unreachable, None));
@@ -191,7 +182,7 @@ mod tests {
 
 	#[test]
 	fn marked_traffic_and_dhcp_are_looked_up_in_main_before_everything_else_goes_to_the_tunnel_table() {
-		let steps = plan(&layout(&Routes::Full, &[], false, false));
+		let steps = plan(&layout(&Routes::Full, &[], false, &[]));
 		let found = rules(&steps);
 		let v4: Vec<_> = found.iter().filter(|rule| !rule.v6).collect();
 		assert_eq!(v4.len(), 3);
@@ -206,7 +197,7 @@ mod tests {
 	fn a_split_tunnel_routes_its_networks_and_the_gateway_and_nothing_else() {
 		let gateways = ["10.7.0.1".parse().unwrap()];
 		let routes = Routes::Split(vec!["203.0.113.0/24".parse().unwrap()]);
-		let steps = plan(&layout(&routes, &gateways, false, false));
+		let steps = plan(&layout(&routes, &gateways, false, &[]));
 		let dsts: Vec<_> = routes_of(&steps).iter().filter(|route| route.kind == Kind::Unicast).map(|route| route.dst).collect();
 		assert_eq!(dsts, [Some(("203.0.113.0".parse().unwrap(), 24)), Some(("10.7.0.1".parse().unwrap(), 32))]);
 	}
@@ -215,7 +206,7 @@ mod tests {
 	fn the_networks_of_a_split_tunnel_are_looked_up_in_the_tunnel_table_before_the_lan_is() {
 		let gateways = ["10.7.0.1".parse().unwrap()];
 		let routes = Routes::Split(vec!["10.20.0.0/16".parse().unwrap()]);
-		let steps = plan(&layout(&routes, &gateways, false, true));
+		let steps = plan(&layout(&routes, &gateways, false, &[("192.168.1.0", 24)]));
 		let found = rules(&steps);
 		let first: Vec<_> = found.iter().filter(|rule| rule.priority == PRIORITY_SPLIT).map(|rule| (rule.to, rule.table)).collect();
 		assert_eq!(first, [(Some(("10.20.0.0".parse().unwrap(), 16)), 0x5657), (Some(("10.7.0.1".parse().unwrap(), 32)), 0x5657)]);
@@ -226,39 +217,41 @@ mod tests {
 	#[test]
 	fn letting_the_lan_through_keeps_the_gateway_in_the_tunnel_of_a_full_tunnel() {
 		let gateways = ["10.7.0.1".parse().unwrap()];
-		let steps = plan(&layout(&Routes::Full, &gateways, false, true));
+		let steps = plan(&layout(&Routes::Full, &gateways, false, &[("192.168.1.0", 24), ("fe80::", 10)]));
 		let found = rules(&steps);
 		let gateway = found.iter().position(|rule| rule.priority == PRIORITY_SPLIT).unwrap();
 		let first_lan = found.iter().position(|rule| rule.priority == PRIORITY_LAN).unwrap();
 		assert!(gateway < first_lan);
 		assert_eq!(found[gateway].to, Some(("10.7.0.1".parse().unwrap(), 32)));
 		assert!(found.iter().filter(|rule| rule.priority == PRIORITY_LAN).all(|rule| rule.table == TABLE_MAIN));
-		assert!(rules(&plan(&layout(&Routes::Full, &gateways, false, false))).iter().all(|rule| rule.priority != PRIORITY_LAN && rule.priority != PRIORITY_SPLIT));
+		assert!(rules(&plan(&layout(&Routes::Full, &gateways, false, &[]))).iter().all(|rule| rule.priority != PRIORITY_LAN && rule.priority != PRIORITY_SPLIT));
 	}
 
 	#[test]
-	fn the_lan_table_is_all_private_ranges() {
-		for (text, prefix) in LAN {
-			let ip: IpAddr = text.parse().unwrap();
-			assert!(IpNet::new(ip, prefix).is_ok());
-		}
+	fn one_rule_to_the_main_table_per_local_subnet_and_none_for_a_range_that_is_not_one() {
+		let steps = plan(&layout(&Routes::Full, &[], true, &[("192.168.1.0", 24), ("10.4.4.0", 22), ("fe80::", 10)]));
+		let lan: Vec<_> = rules(&steps).into_iter().filter(|rule| rule.priority == PRIORITY_LAN).map(|rule| (rule.to.unwrap(), rule.v6)).collect();
+		assert_eq!(lan, [(("192.168.1.0".parse().unwrap(), 24), false), (("10.4.4.0".parse().unwrap(), 22), false), (("fe80::".parse().unwrap(), 10), true)]);
+		assert!(!lan.iter().any(|((_, prefix), _)| *prefix <= 8), "no whole range such as 10.0.0.0/8");
+		assert!(owned(0x5657, 0x5657).iter().any(|rule| rule.priority == PRIORITY_LAN && rule.to.is_none() && rule.table == TABLE_MAIN), "a teardown removes the rules of whatever subnets there were");
 	}
 
 	#[test]
 	fn a_network_named_twice_is_routed_once() {
 		let gateways = ["10.7.0.1".parse().unwrap(), "10.7.0.1".parse().unwrap(), "10.8.0.1".parse().unwrap(), "10.7.0.1".parse().unwrap()];
 		let routes = Routes::Split(vec!["10.7.0.1/32".parse().unwrap()]);
-		assert_eq!(layout(&routes, &gateways, false, false).protected().len(), 2);
+		assert_eq!(layout(&routes, &gateways, false, &[]).protected().len(), 2);
 	}
 
 	#[test]
 	fn the_rules_a_delete_names_are_all_this_clients_own() {
 		let found = owned(0x5657, 0x5657);
-		assert!(found.iter().all(|rule| rule.table == 0x5657 || rule.mark.is_some() || rule.to.is_some() || rule.dport.is_some()), "a delete that names only a priority would remove other programs' rules");
+		// The one exception is the rule to a local subnet: its destination depends on the network the device was on, so a client that crashed cannot name it, and the priority is the client's own.
+		assert!(found.iter().all(|rule| rule.table == 0x5657 || rule.mark.is_some() || rule.to.is_some() || rule.dport.is_some() || rule.priority == PRIORITY_LAN), "a delete that names only a priority would remove other programs' rules");
 		assert!(found.iter().all(|rule| (5100..5200).contains(&rule.priority)));
-		for step in plan(&layout(&Routes::Full, &["10.7.0.1".parse().unwrap()], true, true)) {
+		for step in plan(&layout(&Routes::Full, &["10.7.0.1".parse().unwrap()], true, &[("192.168.1.0", 24)])) {
 			if let Item::Rule(rule) = step.item {
-				let named = found.iter().any(|owned| owned.v6 == rule.v6 && owned.priority == rule.priority && owned.table == rule.table && (owned.mark == rule.mark) && (owned.to == rule.to || owned.priority == PRIORITY_SPLIT || owned.priority == PRIORITY_TUNNEL) && owned.dport == rule.dport);
+				let named = found.iter().any(|owned| owned.v6 == rule.v6 && owned.priority == rule.priority && owned.table == rule.table && (owned.mark == rule.mark) && (owned.to == rule.to || owned.priority == PRIORITY_SPLIT || owned.priority == PRIORITY_LAN || owned.priority == PRIORITY_TUNNEL) && owned.dport == rule.dport);
 				assert!(named, "{rule:?} would not be removed");
 			}
 		}

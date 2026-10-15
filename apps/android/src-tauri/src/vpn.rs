@@ -11,14 +11,11 @@ use std::net::IpAddr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
-use veilway_engine::{Agree, Settings, StartError, Status, Tunnel};
+use veilway_engine::{lan, Agree, Settings, StartError, Status, Tunnel};
 use veilway_proto::subscription::client::{Held, Permit};
 use veilway_proto::subscription::payload::Profile;
 
 struct Tun {file: AsyncFd<OwnedFd>}
-
-/// What "the local network" means: the private, link-local and local multicast ranges, the same as on the other systems.
-const LAN: [&str; 8] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/24", "fc00::/7", "fe80::/10", "ff02::/16"];
 
 /// The parts of `net` that are in none of the `holes`, as networks. The VPN interface gets these as its routes, so that the holes are left to the system's own network. `VpnService.Builder.excludeRoute` would do it in one call but needs Android 13.
 fn outside(net: IpNet, holes: &[IpNet]) -> Vec<IpNet> {
@@ -28,15 +25,15 @@ fn outside(net: IpNet, holes: &[IpNet]) -> Vec<IpNet> {
 }
 
 impl Tun {
-	fn open(profile: &Profile, options: &Options, lan_outside: bool, mtu: u16) -> Result<Self> {
+	fn open(profile: &Profile, options: &Options, lan: &[(IpAddr, u8)], mtu: u16) -> Result<Self> {
 		let addresses: Vec<String> = profile.device.addresses.iter().map(|ip| format!("{ip}/{}", if ip.is_ipv4() {32} else {128})).collect();
 		let dns: Vec<String> = profile.gateways.iter().map(IpAddr::to_string).collect();
 		let mut routes: Vec<String> = options.routes.iter().map(ToString::to_string).collect();
 		// Everything, both families, so that a packet for a family the profile has no address for is dropped by the engine and does not leave the phone outside the tunnel. With a split list the resolvers are routed too.
 		if routes.is_empty() {
-			// With the local network outside, the resolvers stay routed: they are often inside its ranges, and a query for a name must not leave the phone outside the tunnel.
-			let holes: Vec<IpNet> = if lan_outside {LAN.iter().filter_map(|net| net.parse().ok()).collect()} else {Vec::new()};
-			routes = ["0.0.0.0/0", "::/0"].iter().filter_map(|all| all.parse::<IpNet>().ok()).flat_map(|all| outside(all, &holes)).chain(if lan_outside {profile.gateways.iter().map(|ip| IpNet::from(*ip)).collect()} else {Vec::new()}).map(|net| net.to_string()).collect();
+			// With the local subnets outside, the resolvers stay routed: they are often inside them, and a query for a name must not leave the phone outside the tunnel.
+			let holes: Vec<IpNet> = lan.iter().filter_map(|(ip, prefix)| IpNet::new(*ip, *prefix).ok()).collect();
+			routes = ["0.0.0.0/0", "::/0"].iter().filter_map(|all| all.parse::<IpNet>().ok()).flat_map(|all| outside(all, &holes)).chain(if holes.is_empty() {Vec::new()} else {profile.gateways.iter().map(|ip| IpNet::from(*ip)).collect()}).map(|net| net.to_string()).collect();
 		} else {routes.extend(profile.gateways.iter().map(|ip| format!("{ip}/{}", if ip.is_ipv4() {32} else {128})))}
 		let fd = bridge::establish(&addresses, &dns, &routes, mtu).ok_or_else(|| anyhow!("Android would not set up the VPN. Open the app again and allow the VPN connection, and check that no other VPN app took over."))?;
 		// SAFETY: the descriptor came from `ParcelFileDescriptor.detachFd`, so nothing else owns it.
@@ -70,25 +67,29 @@ impl Tun {
 }
 
 /// Runs a connection until `stop` completes or something fails. Ok is a stop the user asked for. An error is a connection that ended on its own, or a start that needs the user's answer first (`StartError`).
-pub async fn run(options: &Options, lan_outside: bool, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status), stop: impl Future<Output = ()>) -> Result<()> {
+pub async fn run(options: &Options, lan_local: bool, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status), stop: impl Future<Output = ()>) -> Result<()> {
 	let profile = held.subscription().profiles.iter().find(|candidate| candidate.id == profile).ok_or(StartError::NoProfile)?;
-	let Own {networks, description} = bridge::own().borrow().clone();
+	let Own {networks, description, ..} = bridge::own().borrow().clone();
 	settings.socket = Some(bridge::protect_hook());
 	settings.networks = networks;
 	settings.network = description;
 	let mut tunnel = Tunnel::start(settings, held, &profile.id, permit, agree)?;
-	let outcome = carry(&mut tunnel, profile, options, lan_outside, on_status, stop).await;
+	let outcome = carry(&mut tunnel, profile, options, lan_local, on_status, stop).await;
 	let last = tunnel.stop().await;
 	tracing::info!(state = ?last.state, "the tunnel stopped");
 	outcome
 }
 
-async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, lan_outside: bool, mut on_status: impl FnMut(&Status), stop: impl Future<Output = ()>) -> Result<()> {
+async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, lan_local: bool, mut on_status: impl FnMut(&Status), stop: impl Future<Output = ()>) -> Result<()> {
 	let mut status_rx = tunnel.watch();
 	let mut mtu = tunnel.status().mtu;
-	let mut tun = Tun::open(profile, options, lan_outside, mtu)?;
-	tracing::info!(mtu, resolvers = profile.gateways.len(), "the VPN interface is up, with every route and the profile's resolvers");
-	let (mut own_rx, mut buf, mut dropped) = (bridge::own(), vec![0u8; 65536], 0u64);
+	let mut own_rx = bridge::own();
+	// The subnets of the networks the phone is on go outside the VPN only when the user let apps reach them, and never on mobile data, where a private address is the carrier's and not a device of the user's.
+	let local = |own: &Own| if lan_local && !own.cellular {lan::local(&own.networks)} else {Vec::new()};
+	let mut lan = local(&own_rx.borrow());
+	let mut tun = Tun::open(profile, options, &lan, mtu)?;
+	tracing::info!(mtu, resolvers = profile.gateways.len(), subnets = lan.len(), "the VPN interface is up, with its routes and the profile's resolvers");
+	let (mut buf, mut dropped) = (vec![0u8; 65536], 0u64);
 	tokio::pin!(stop);
 	on_status(&status_rx.borrow_and_update().clone());
 	loop {
@@ -111,15 +112,22 @@ async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, lan_ou
 					tracing::info!(from = mtu, to = status.mtu, "the tunnel's MTU changed");
 					mtu = status.mtu;
 					// Android cannot change the MTU of an interface that exists: a new one replaces it.
-					tun = Tun::open(profile, options, lan_outside, mtu)?;
+					tun = Tun::open(profile, options, &lan, mtu)?;
 				}
 				on_status(&status);
 			}
 			changed = own_rx.changed() => {
 				changed?;
-				let Own {networks, description} = own_rx.borrow_and_update().clone();
-				tracing::info!(networks = networks.len(), "the device's networks changed");
-				tunnel.moved(description, networks);
+				let own = own_rx.borrow_and_update().clone();
+				tracing::info!(networks = own.networks.len(), cellular = own.cellular, "the device's networks changed");
+				let moved = local(&own);
+				// The routes of an interface cannot change: the subnets of the new network get a new one, which replaces the old.
+				if moved != lan {
+					lan = moved;
+					tun = Tun::open(profile, options, &lan, mtu)?;
+					tracing::info!(subnets = lan.len(), "the VPN interface was replaced for the subnets of the new network");
+				}
+				tunnel.moved(own.description, own.networks);
 			}
 			() = &mut stop => return Ok(()),
 		}

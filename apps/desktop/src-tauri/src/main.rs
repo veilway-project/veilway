@@ -118,7 +118,7 @@ async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, Stri
 #[tauri::command]
 async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Remove{subscription:id}).await}
 
-/// Saves "Send the local network through the VPN" for a subscription and gives the library back. It applies from the next connect.
+/// Saves "Let apps reach devices on this network" for a subscription and gives the library back. It applies from the next connect.
 #[tauri::command]
 async fn set_lan(backend:State<'_, Arc<Backend>>, id:String, on:bool)->Result<Value, String>{ask_branded(&backend, Call::SetLan{subscription:id, on}).await}
 

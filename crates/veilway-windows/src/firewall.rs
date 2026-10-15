@@ -30,8 +30,6 @@ pub const W_BLOCK: u8 = 1;
 const LOCAL_NAMES: [u16; 4] = [5353, 5355, 137, 138];
 const UDP: u8 = 17;
 const TCP: u8 = 6;
-/// The ranges "the LAN" means when the user lets it through: private, link-local, and the multicast groups local discovery uses. Fixed ranges and not the device's current subnets, so that a network that hands out a public subnet as on-link (TunnelCrack LocalNet) gets nothing by it.
-pub const LAN: [&str; 8] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/24", "fc00::/7", "fe80::/10", "ff02::/16"];
 
 /// An address and port the program may reach, with the protocol of the transport that uses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +64,8 @@ pub struct Rules {
 	pub nodes: Vec<Endpoint>,
 	/// The destinations that go through the tunnel or nowhere. A default route of a family is a prefix of length 0.
 	pub protected: Vec<IpNet>,
-	pub lan: bool,
+	/// The subnets the user let apps reach outside the tunnel (`veilway_engine::lan::local`), empty when it is off.
+	pub lan: Vec<IpNet>,
 	/// The user asked for names on the local network: mDNS and LLMNR are let through with the LAN.
 	pub local_names: bool,
 }
@@ -92,7 +91,7 @@ impl Rules {
 					add("DHCP request", v6, accept, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::LocalPort(local), Cond::RemotePort(remote), Cond::Remote(if v6 {"ff02::1:2/128"} else {"255.255.255.255/32"}.parse().unwrap())]);
 					add("DHCP renewal", v6, accept, true, W_PERMIT, vec![Cond::Protocol(UDP), Cond::LocalPort(local), Cond::RemotePort(remote)]);
 				}
-				if self.lan {for net in LAN.iter().map(|net| net.parse::<IpNet>().unwrap()).filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("the LAN", v6, accept, true, W_PERMIT, vec![Cond::Remote(net)])}}
+				for net in self.lan.iter().filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("the LAN", v6, accept, true, W_PERMIT, vec![Cond::Remote(*net)])}
 				for net in self.protected.iter().filter(|net| matches!(net, IpNet::V6(_)) == v6) {add("everything else", v6, accept, false, W_BLOCK, vec![Cond::Remote(*net)])}
 			}
 		}
@@ -399,7 +398,9 @@ mod wfp {
 mod tests {
 	use super::*;
 
-	fn rules() -> Rules {Rules {tun: Some(7), nodes: vec![Endpoint {ip: "203.0.113.9".parse().unwrap(), port: 443, tcp: true}, Endpoint {ip: "2001:db8::9".parse().unwrap(), port: 51820, tcp: false}], protected: full(), lan: false, local_names: false}}
+	fn home() -> Vec<IpNet> {["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"].iter().map(|net| net.parse().unwrap()).collect()}
+
+	fn rules() -> Rules {Rules {tun: Some(7), nodes: vec![Endpoint {ip: "203.0.113.9".parse().unwrap(), port: 443, tcp: true}, Endpoint {ip: "2001:db8::9".parse().unwrap(), port: 51820, tcp: false}], protected: full(), lan: Vec::new(), local_names: false}}
 
 	fn full() -> Vec<IpNet> {vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]}
 
@@ -457,11 +458,11 @@ mod tests {
 	#[test]
 	fn the_lan_is_let_through_only_when_asked_and_its_local_names_only_when_asked_too() {
 		assert!(!rules().specs().iter().any(|spec| spec.name.starts_with("the LAN")));
-		let lan = Rules {lan: true, ..rules()}.specs();
-		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv4)")).count(), 5);
-		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv6)")).count(), 3);
+		let lan = Rules {lan: home(), ..rules()}.specs();
+		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv4)")).count(), 3);
+		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("the LAN (IPv6)")).count(), 2);
 		assert_eq!(lan.iter().filter(|spec| spec.name.starts_with("local names") && !spec.accept).count(), 8);
-		let named = Rules {lan: true, local_names: true, ..rules()}.specs();
+		let named = Rules {lan: home(), local_names: true, ..rules()}.specs();
 		assert!(!named.iter().any(|spec| spec.name.starts_with("local names")));
 	}
 

@@ -107,9 +107,9 @@ pub struct SubscriptionOut {
 	/// `#rrggbb`
 	pub accent: Option<String>,
 	pub left_out: usize,
-	/// The user's choice to send the local network through the tunnel for this subscription. Off unless chosen.
+	/// The user's choice to let apps reach devices on the networks the device is on outside the tunnel, for this subscription. Off unless chosen.
 	#[serde(default)]
-	pub lan_through_tunnel: bool,
+	pub lan_local: bool,
 }
 
 /// Replaces every `logo` of a library or a review (`{kind, data}` as the helper sent it) with a `data:` URL when the picture passes `logo_url`, and with null when it does not. Runs in the window, the process without rights.
@@ -142,7 +142,7 @@ pub fn logo_url(kind: LogoKind, data: &[u8]) -> Option<String> {
 
 fn notice(notice: &Notice, languages: &[Tag]) -> NoticeOut {NoticeOut {severity: lower(notice.severity), text: notice.text.pick(languages).0.into()}}
 
-pub fn subscription_view(subscription: &Subscription, standing: Standing, can_refresh: bool, lan_through_tunnel: bool, languages: &[Tag]) -> SubscriptionOut {
+pub fn subscription_view(subscription: &Subscription, standing: Standing, can_refresh: bool, lan_local: bool, languages: &[Tag]) -> SubscriptionOut {
 	SubscriptionOut {
 		id: subscription.id.as_str().into(),
 		provider: subscription.provider.pick(languages).0.into(),
@@ -162,12 +162,12 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		logo: subscription.logo.as_ref().filter(|logo| logo.data.len() <= LOGO_BYTES_MAX).map(|logo| LogoOut {kind: logo.kind.word().into(), data: base64::engine::general_purpose::STANDARD.encode(&logo.data)}),
 		accent: subscription.accent.map(|[red, green, blue]| format!("#{red:02x}{green:02x}{blue:02x}")),
 		left_out: subscription.left_out,
-		lan_through_tunnel,
+		lan_local,
 	}
 }
 
 pub fn library_view(library: &Library, store: &Store, languages: &[Tag], now: u64) -> Vec<SubscriptionOut> {
-	library.held().iter().map(|held| subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_through_tunnel(held.subscription().id.as_str()), languages)).collect()
+	library.held().iter().map(|held| subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)).collect()
 }
 
 pub fn tags(languages: &[String]) -> Vec<Tag> {languages.iter().take(8).filter_map(|text| Tag::read(&text.replace('_', "-"))).collect()}

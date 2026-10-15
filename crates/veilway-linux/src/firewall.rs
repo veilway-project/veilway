@@ -5,7 +5,6 @@
 //! The table is in the kernel, not in the process: it stays when the process dies and goes only when `remove` is called, by a clean stop or by `veilway disconnect`.
 //!
 //! `nft` is a program of the system, run with a ruleset on its standard input. That is a choice of this part: the rules are text a person can read with `nft list ruleset`, applied atomically, and the program is on every system that has nftables, which is what the kill switch needs anyway.
-use crate::routes::LAN;
 use crate::state::program;
 use std::io::{self, Write};
 use std::net::IpAddr;
@@ -27,7 +26,8 @@ pub struct Rules {
 	pub nodes: Vec<Endpoint>,
 	/// The destinations that go through the tunnel or nowhere. A default route of a family is a prefix of length 0.
 	pub protected: Vec<(IpAddr, u8)>,
-	pub lan: bool,
+	/// The subnets the user let apps reach outside the tunnel (`veilway_engine::lan::local`), empty when it is off.
+	pub lan: Vec<(IpAddr, u8)>,
 	/// The user asked for names on the local network: mDNS and LLMNR are let through with the LAN.
 	pub local_names: bool,
 }
@@ -51,10 +51,9 @@ impl Rules {
 		if !self.local_names {lines.push("\t\tudp sport { 5353, 5355 } counter drop".into())}
 		// What is tunnelled by network comes before the LAN: a split network inside the LAN's ranges is never let out in clear.
 		for (ip, prefix) in self.protected.iter().filter(|(_, prefix)| *prefix > 0) {lines.push(format!("\t\t{} daddr {ip}/{prefix} counter drop", if ip.is_ipv4() {"ip"} else {"ip6"}))}
-		if self.lan {
-			let (v4, v6): (Vec<_>, Vec<_>) = LAN.iter().partition(|(text, _)| !text.contains(':'));
-			lines.push(format!("\t\tip daddr {{ {} }} accept", v4.iter().map(|(text, prefix)| format!("{text}/{prefix}")).collect::<Vec<_>>().join(", ")));
-			lines.push(format!("\t\tip6 daddr {{ {} }} accept", v6.iter().map(|(text, prefix)| format!("{text}/{prefix}")).collect::<Vec<_>>().join(", ")));
+		for (v6, family) in [(false, "ip"), (true, "ip6")] {
+			let nets: Vec<String> = self.lan.iter().filter(|(ip, _)| ip.is_ipv6() == v6).map(|(ip, prefix)| format!("{ip}/{prefix}")).collect();
+			if !nets.is_empty() {lines.push(format!("\t\t{family} daddr {{ {} }} accept", nets.join(", ")))}
 		}
 		for (ip, _) in self.protected.iter().filter(|(_, prefix)| *prefix == 0) {lines.push(format!("\t\tmeta nfproto {} counter drop", if ip.is_ipv4() {"ipv4"} else {"ipv6"}))}
 		lines.extend(["\t}".into(), "}".into()]);
@@ -88,7 +87,9 @@ mod tests {
 
 	fn node(ip: &str, port: u16, tcp: bool) -> Endpoint {Endpoint {ip: ip.parse().unwrap(), port, tcp}}
 
-	fn rules() -> Rules {Rules {mark: 0x5657, tun: "vw0".into(), nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: vec![("0.0.0.0".parse().unwrap(), 0), ("::".parse().unwrap(), 0)], lan: false, local_names: false}}
+	fn home() -> Vec<(IpAddr, u8)> {["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"].iter().map(|net| {let (ip, prefix) = net.split_once('/').unwrap(); (ip.parse().unwrap(), prefix.parse().unwrap())}).collect()}
+
+	fn rules() -> Rules {Rules {mark: 0x5657, tun: "vw0".into(), nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: vec![("0.0.0.0".parse().unwrap(), 0), ("::".parse().unwrap(), 0)], lan: Vec::new(), local_names: false}}
 
 	// The ruleset is read by the real `nft` when there is one: a rule it refuses fails the run of the gate, and here too where it is installed and may be asked.
 	fn accepted_by_nft(rules: &Rules) {
@@ -137,30 +138,32 @@ mod tests {
 	fn names_are_not_asked_outside_the_tunnel() {
 		let text = rules().ruleset();
 		for rule in ["udp dport { 53, 853, 5353, 5355 } counter drop", "tcp dport { 53, 853, 5353, 5355 } counter drop", "udp sport { 5353, 5355 } counter drop"] {assert!(text.contains(rule), "{rule}")}
-		let lan = Rules {lan: true, ..rules()}.ruleset();
-		assert!(lan.find("udp dport { 53,").unwrap() < lan.find("192.168.0.0/16").unwrap(), "the LAN is let through after the names are dropped");
-		let local = Rules {lan: true, local_names: true, ..rules()}.ruleset();
+		let lan = Rules {lan: home(), ..rules()}.ruleset();
+		assert!(lan.find("udp dport { 53,").unwrap() < lan.find("192.168.1.0/24").unwrap(), "the local subnets are let through after the names are dropped");
+		let local = Rules {lan: home(), local_names: true, ..rules()}.ruleset();
 		assert!(local.contains("udp dport { 53, 853 } counter drop") && !local.contains("5353") && !local.contains("5355"));
-		accepted_by_nft(&Rules {lan: true, ..rules()});
-		accepted_by_nft(&Rules {lan: true, local_names: true, ..rules()});
+		accepted_by_nft(&Rules {lan: home(), ..rules()});
+		accepted_by_nft(&Rules {lan: home(), local_names: true, ..rules()});
 	}
 
 	#[test]
-	fn the_lan_is_let_through_only_when_asked() {
-		assert!(!rules().ruleset().contains("192.168.0.0/16"));
-		let text = Rules {lan: true, ..rules()}.ruleset();
-		assert!(text.contains("ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/24 } accept"));
-		assert!(text.contains("ip6 daddr { fc00::/7, fe80::/10, ff02::/16 } accept"));
-		assert!(text.find("192.168.0.0/16").unwrap() < text.find("meta nfproto ipv4 counter drop").unwrap());
+	fn the_local_subnets_are_let_through_only_when_asked_and_never_a_whole_private_range() {
+		assert!(!rules().ruleset().contains("192.168.1.0/24"));
+		let text = Rules {lan: home(), ..rules()}.ruleset();
+		assert!(text.contains("ip daddr { 192.168.1.0/24, 169.254.0.0/16, 224.0.0.0/24 } accept"));
+		assert!(text.contains("ip6 daddr { fe80::/10, ff02::/16 } accept"));
+		assert!(!text.contains("10.0.0.0/8") && !text.contains("192.168.0.0/16"));
+		assert!(text.find("192.168.1.0/24").unwrap() < text.find("meta nfproto ipv4 counter drop").unwrap());
+		accepted_by_nft(&Rules {lan: home(), ..rules()});
 	}
 
 	#[test]
 	fn a_split_tunnel_drops_only_what_the_tunnel_is_for_and_before_the_lan_is_let_through() {
-		let split = Rules {protected: vec![("10.20.0.0".parse().unwrap(), 16), ("10.7.0.1".parse().unwrap(), 32), ("fd07::1".parse().unwrap(), 128)], lan: true, ..rules()};
+		let split = Rules {protected: vec![("10.20.0.0".parse().unwrap(), 16), ("10.7.0.1".parse().unwrap(), 32), ("fd07::1".parse().unwrap(), 128)], lan: home(), ..rules()};
 		let text = split.ruleset();
 		assert!(text.contains("ip daddr 10.20.0.0/16 counter drop") && text.contains("ip daddr 10.7.0.1/32 counter drop") && text.contains("ip6 daddr fd07::1/128 counter drop"));
 		assert!(!text.contains("meta nfproto"));
-		assert!(text.find("ip daddr 10.20.0.0/16 counter drop").unwrap() < text.find("ip daddr { 10.0.0.0/8").unwrap(), "a split network inside the LAN's ranges would go out in clear");
+		assert!(text.find("ip daddr 10.20.0.0/16 counter drop").unwrap() < text.find("ip daddr { 192.168.1.0/24").unwrap(), "a split network inside a local subnet would go out in clear");
 		accepted_by_nft(&split);
 	}
 

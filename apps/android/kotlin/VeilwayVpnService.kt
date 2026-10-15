@@ -10,8 +10,10 @@ import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
+import android.os.ParcelFileDescriptor
 import java.net.Inet6Address
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -42,6 +44,8 @@ class VeilwayVpnService : VpnService() {
 	private var state = "connecting"
 	private var finished = false
 	private var retries = 0
+	/** The VPN interface as the system holds it for this service. It stays up while the engine reconnects and after it gave up, so that the phone's traffic is dropped and does not leave outside the VPN, until [finish] ends the service. */
+	private var held: ParcelFileDescriptor? = null
 
 	override fun onCreate() {
 		super.onCreate()
@@ -71,13 +75,14 @@ class VeilwayVpnService : VpnService() {
 		// A start while a session runs asks for the same connection again; the engine answers yes to that, and refuses another one.
 		val resumed = callback != null
 		finished = false
+		if (fromWindow) retries = 0
 		watchNetworks()
 		start(resumed, 0)
 		return START_STICKY
 	}
 
-	/** Builds the interface for the engine and hands over its descriptor. Returns -1 when the system refuses. */
-	fun establish(addresses: Array<String>, dns: Array<String>, routes: Array<String>, mtu: Int): Int {
+	/** Builds the interface for the engine and hands over a copy of its descriptor, keeping the interface itself in [held]. Returns -1 when the system refuses, and then the interface that was up stays. */
+	@Synchronized fun establish(addresses: Array<String>, dns: Array<String>, routes: Array<String>, mtu: Int): Int {
 		val builder = Builder().setSession("Veilway").setMtu(mtu).setBlocking(false)
 		fun split(item: String) = item.substringBeforeLast('/') to item.substringAfterLast('/').toInt()
 		addresses.forEach { val (ip, prefix) = split(it); builder.addAddress(ip, prefix) }
@@ -85,7 +90,11 @@ class VeilwayVpnService : VpnService() {
 		routes.forEach { val (ip, prefix) = split(it); builder.addRoute(ip, prefix) }
 		underlying?.first?.let { builder.setUnderlyingNetworks(arrayOf(it)) }
 		return try {
-			builder.establish()?.detachFd() ?: -1
+			val fresh = builder.establish() ?: return -1
+			val copy = fresh.dup()
+			held?.close()
+			held = fresh
+			copy.detachFd()
 		} catch (e: Exception) { -1 }
 	}
 
@@ -95,17 +104,28 @@ class VeilwayVpnService : VpnService() {
 		getSystemService(NotificationManager::class.java).notify(ONGOING, ongoing())
 	}
 
-	/** The engine's connection ended (or the user asked it to): the service goes, and says why when it was not the user. A connection that ended on its own is started again, a few times with a longer pause each time, while the user still wants it. */
+	/**
+	 * The engine's connection ended (or the user asked it to): the service goes, and says why when it was not the user. A connection that ended on its own is started again, a few times with a longer pause each time, while the user still wants it.
+	 * While that goes on, and after the last try, the interface stays up and drops the phone's traffic: the service ends, and the interface with it, only when the user disconnects.
+	 */
 	@Synchronized fun finish(error: String?) {
 		if (finished) return
 		val wanted = Wanted(this)
 		if (error != null && wanted.wanted && retries < RETRIES) {
 			retries += 1
-			show("reconnecting")
+			show("blocked")
 			start(false, 1000L shl retries)
 			return
 		}
+		if (error != null && held != null) {
+			wanted.wanted = false
+			show("stopped")
+			alert(error)
+			return
+		}
 		finished = true
+		held?.close()
+		held = null
 		unwatchNetworks()
 		stopForeground(STOP_FOREGROUND_REMOVE)
 		if (error != null) {
@@ -141,9 +161,9 @@ class VeilwayVpnService : VpnService() {
 
 	/** A failure notice. Its text stays off the lock screen: the public version says only that the connection ended. */
 	private fun alert(text: String) {
-		val alert = notification(label("Veilway disconnected", "اتصال وی‌ال‌وی قطع شد"), text, false).apply {
+		val alert = notification(label("Veilway lost the connection", "اتصال وی‌ال‌وی از دست رفت"), text, false).apply {
 			visibility = Notification.VISIBILITY_PRIVATE
-			publicVersion = notification("Veilway", label("Disconnected", "اتصال قطع شد"), false)
+			publicVersion = notification("Veilway", label("Connection lost", "اتصال از دست رفت"), false)
 		}
 		getSystemService(NotificationManager::class.java).notify(FAILED, alert)
 	}
@@ -155,6 +175,8 @@ class VeilwayVpnService : VpnService() {
 	}
 
 	override fun onDestroy() {
+		held?.close()
+		held = null
 		unwatchNetworks()
 		instance = null
 		worker.shutdown()
@@ -166,7 +188,8 @@ class VeilwayVpnService : VpnService() {
 	private fun ongoing(): Notification {
 		val text = when (state) {
 			"connected" -> label("Connected", "متصل است")
-			"reconnecting" -> label("Reconnecting", "در حال اتصال دوباره")
+			"reconnecting", "blocked" -> label("No connection. Internet blocked until the VPN is back", "اتصال برقرار نیست. اینترنت تا بازگشت وی‌پی‌ان مسدود است")
+			"stopped" -> label("Internet blocked until you reconnect", "اینترنت تا اتصال دوباره مسدود است")
 			else -> label("Connecting", "در حال اتصال")
 		}
 		return notification("Veilway", text, true)
@@ -192,6 +215,9 @@ class VeilwayVpnService : VpnService() {
 		val properties = current?.second
 		val found = ArrayList<String>()
 		var description = "android:none"
+		// Mobile data, or a network whose kind the system will not say: the engine lets nothing local out there.
+		val capabilities = current?.let { getSystemService(ConnectivityManager::class.java).getNetworkCapabilities(it.first) }
+		val cellular = capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)
 		if (properties != null) {
 			properties.linkAddresses.forEach { val ip = it.address; if (!ip.isLinkLocalAddress && !ip.isLoopbackAddress) found.add("${ip.hostAddress?.substringBefore('%')}/${it.prefixLength}") }
 			val gateway = properties.routes.firstOrNull { it.isDefaultRoute && it.gateway != null }?.gateway
@@ -199,7 +225,7 @@ class VeilwayVpnService : VpnService() {
 			description = "android:${properties.interfaceName}:${gateway?.hostAddress ?: "?"}"
 		}
 		try { setUnderlyingNetworks(current?.let { arrayOf(it.first) }) } catch (e: Exception) { }
-		Native.networkChanged(description, found.toTypedArray())
+		Native.networkChanged(description, found.toTypedArray(), cellular)
 	}
 
 	private fun watchNetworks() {

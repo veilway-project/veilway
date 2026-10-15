@@ -171,13 +171,13 @@ impl Core {
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
 				if let Some(found) = found {library.remove(&found).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				drop(library);
-				self.store.set_lan_through_tunnel(&id, false);
+				self.store.set_lan_local(&id, false);
 				let _ = self.store.flush();
 				self.library_value().await
 			}
 			Call::SetLan {subscription: id, on} => {
 				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
-				self.store.set_lan_through_tunnel(&id, on);
+				self.store.set_lan_local(&id, on);
 				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
 			}
@@ -263,7 +263,7 @@ impl Core {
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
-		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: !self.store.lan_through_tunnel(held.id().as_str()), local_names: options.local_names && !self.store.lan_through_tunnel(held.id().as_str()), routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
+		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: self.store.lan_local(held.id().as_str()), local_names: options.local_names && self.store.lan_local(held.id().as_str()), routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
 		// The one lock every command takes, held to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
 		let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default());

@@ -5,7 +5,6 @@
 //! pf is enabled with `pfctl -E`, which hands back a token, kept in the run directory (`/var/run/veilway`, which a reboot empties, as it does pf's enabled state: a token file that outlived a reboot would make `install` skip the enabling). pf is released with that token and never disabled outright, so another program's use of pf is left as it is. After every install `pfctl -s info` must say `Status: Enabled`, and `verify` (the connection runs it on a timer and on every change of the networks) puts the rules and pf back if something else disabled pf or flushed the anchor. The rules are in the kernel, not in the process: they stay when the process dies, and go only when `remove` is called, by a clean stop or by `veilway disconnect`. A reboot ends them; `persist` puts them back at boot.
 //!
 //! The first install flushes pf's states, since a connection that was opened before the kill switch is let through by its state and not by the rules. Later installs do not: a flushed state would cut the transport's own stream in the middle.
-use crate::routes::LAN;
 use crate::state::program;
 use ipnet::IpNet;
 use std::fs;
@@ -35,7 +34,8 @@ pub struct Rules {
 	pub nodes: Vec<Endpoint>,
 	/// The destinations that go through the tunnel or nowhere. A default route of a family is a prefix of length 0.
 	pub protected: Vec<IpNet>,
-	pub lan: bool,
+	/// The subnets the user let apps reach outside the tunnel (`veilway_engine::lan::local`), empty when it is off.
+	pub lan: Vec<IpNet>,
 	/// The user asked for names on the local network: mDNS, LLMNR and NetBIOS are let through with the LAN, on their groups and ports only.
 	pub local_names: bool,
 }
@@ -43,7 +43,7 @@ pub struct Rules {
 impl Rules {
 	/// The ruleset as `pfctl` reads it.
 	pub fn ruleset(&self) -> String {
-		let lan_of = |v6: bool| LAN.iter().copied().filter(|net| net.contains(':') == v6).collect::<Vec<_>>().join(", ");
+		let lan_of = |v6: bool| self.lan.iter().filter(|net| matches!(net, IpNet::V6(_)) == v6).map(ToString::to_string).collect::<Vec<_>>().join(", ");
 		let mut lines = vec!["pass quick on lo0 all".to_owned()];
 		// Outbound only: what comes back is the state of what went out. A pass in from the tunnel would let whoever is on the other side of it reach every service of this device that listens, which nothing here asks for.
 		if let Some(tun) = &self.tun {lines.push(format!("pass out quick on {tun} all {STATE}"))}
@@ -64,15 +64,15 @@ impl Rules {
 			lines.push(format!("block drop quick from any to {net}"));
 			lines.push(format!("block drop quick from {net} to any"));
 		}
-		if self.lan {
-			for v6 in [false, true] {lines.push(format!("pass out quick {} from any to {{ {} }} {STATE}", if v6 {"inet6"} else {"inet"}, lan_of(v6)))}
+		if !self.lan.is_empty() {
+			for v6 in [false, true].into_iter().filter(|v6| !lan_of(*v6).is_empty()) {lines.push(format!("pass out quick {} from any to {{ {} }} {STATE}", if v6 {"inet6"} else {"inet"}, lan_of(v6)))}
 			// A question goes to its group, and the answers that come back to the group come from the LAN. A unicast answer is a packet of the state of the question, or it is dropped.
 			if self.local_names {
 				for (group, port) in LOCAL_NAMES {
 					let v6 = group.contains(':');
 					let family = if v6 {"inet6"} else {"inet"};
 					lines.push(format!("pass out quick {family} proto udp from any to {group} port {port} {STATE}"));
-					lines.push(format!("pass in quick {family} proto udp from {{ {} }} to {group} port {port} {STATE}", lan_of(v6)));
+					if !lan_of(v6).is_empty() {lines.push(format!("pass in quick {family} proto udp from {{ {} }} to {group} port {port} {STATE}", lan_of(v6)))}
 				}
 			}
 		}
@@ -201,7 +201,9 @@ mod tests {
 
 	fn nets(list: &[&str]) -> Vec<IpNet> {list.iter().map(|net| net.parse().unwrap()).collect()}
 
-	fn full() -> Rules {Rules {tun: None, nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: nets(&["0.0.0.0/0", "::/0"]), lan: false, local_names: false}}
+	fn home() -> Vec<IpNet> {nets(&["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"])}
+
+	fn full() -> Rules {Rules {tun: None, nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: nets(&["0.0.0.0/0", "::/0"]), lan: Vec::new(), local_names: false}}
 
 	fn position(text: &str, line: &str) -> usize {text.lines().position(|found| found == line).unwrap_or_else(|| panic!("no rule {line:?} in\n{text}"))}
 
@@ -213,7 +215,7 @@ mod tests {
 
 	#[test]
 	fn every_state_is_bound_to_the_interface_it_was_made_on() {
-		let text = Rules {tun: Some("utun5".into()), lan: true, local_names: true, ..full()}.ruleset();
+		let text = Rules {tun: Some("utun5".into()), lan: home(), local_names: true, ..full()}.ruleset();
 		assert!(text.lines().filter(|line| line.contains("keep state")).all(|line| line.ends_with("keep state (if-bound)")), "{text}");
 		assert!(!text.contains("floating"));
 	}
@@ -251,16 +253,16 @@ mod tests {
 		let text = full().ruleset();
 		position(&text, "block drop quick proto { tcp, udp } from any to any port { 53, 853, 5353, 5355, 137, 138 }");
 		position(&text, "block drop quick proto { tcp, udp } from any port { 53, 853, 5353, 5355, 137, 138 } to any");
-		let lan = Rules {lan: true, local_names: true, ..full()}.ruleset();
+		let lan = Rules {lan: home(), local_names: true, ..full()}.ruleset();
 		position(&lan, "block drop quick proto { tcp, udp } from any to any port { 53, 853 }");
-		assert!(!Rules {lan: true, ..full()}.ruleset().contains("5353 keep"), "no local names, no groups");
+		assert!(!Rules {lan: home(), ..full()}.ruleset().contains("5353 keep"), "no local names, no groups");
 	}
 
 	#[test]
 	fn local_names_reach_their_groups_and_ports_and_not_every_service_of_the_lan() {
-		let text = Rules {lan: true, local_names: true, ..full()}.ruleset();
+		let text = Rules {lan: home(), local_names: true, ..full()}.ruleset();
 		position(&text, "pass out quick inet proto udp from any to 224.0.0.251 port 5353 keep state (if-bound)");
-		position(&text, "pass in quick inet proto udp from { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/24 } to 224.0.0.251 port 5353 keep state (if-bound)");
+		position(&text, "pass in quick inet proto udp from { 192.168.1.0/24, 169.254.0.0/16, 224.0.0.0/24 } to 224.0.0.251 port 5353 keep state (if-bound)");
 		position(&text, "pass out quick inet6 proto udp from any to ff02::fb port 5353 keep state (if-bound)");
 		position(&text, "pass out quick inet proto udp from any to 255.255.255.255 port 137 keep state (if-bound)");
 		position(&text, "pass out quick inet6 proto udp from any to ff02::1:3 port 5355 keep state (if-bound)");
@@ -277,21 +279,21 @@ mod tests {
 
 	#[test]
 	fn the_lan_is_let_out_after_the_names_and_the_protected_networks_and_before_the_final_block() {
-		let text = Rules {lan: true, protected: nets(&["192.168.5.0/24", "0.0.0.0/0", "::/0"]), ..full()}.ruleset();
-		let (names, split, lan4, lan6, last) = (position(&text, "block drop quick proto { tcp, udp } from any to any port { 53, 853, 5353, 5355, 137, 138 }"), position(&text, "block drop quick from any to 192.168.5.0/24"), position(&text, "pass out quick inet from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/24 } keep state (if-bound)"), position(&text, "pass out quick inet6 from any to { fc00::/7, fe80::/10, ff02::/16 } keep state (if-bound)"), position(&text, "block drop quick inet all"));
+		let text = Rules {lan: home(), protected: nets(&["192.168.5.0/24", "0.0.0.0/0", "::/0"]), ..full()}.ruleset();
+		let (names, split, lan4, lan6, last) = (position(&text, "block drop quick proto { tcp, udp } from any to any port { 53, 853, 5353, 5355, 137, 138 }"), position(&text, "block drop quick from any to 192.168.5.0/24"), position(&text, "pass out quick inet from any to { 192.168.1.0/24, 169.254.0.0/16, 224.0.0.0/24 } keep state (if-bound)"), position(&text, "pass out quick inet6 from any to { fe80::/10, ff02::/16 } keep state (if-bound)"), position(&text, "block drop quick inet all"));
 		assert!(names < split && split < lan4 && lan4 < lan6 && lan6 < last);
 	}
 
 	#[test]
 	fn the_tunnels_own_addresses_are_blocked_off_it_even_inside_the_lan() {
-		let text = Rules {lan: true, protected: nets(&["0.0.0.0/0", "::/0", "10.200.0.1/32", "10.200.0.2/32"]), ..full()}.ruleset();
-		let (gateway, lan4) = (position(&text, "block drop quick from any to 10.200.0.1/32"), position(&text, "pass out quick inet from any to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/24 } keep state (if-bound)"));
+		let text = Rules {lan: nets(&["10.200.0.0/24"]), protected: nets(&["0.0.0.0/0", "::/0", "10.200.0.1/32", "10.200.0.2/32"]), ..full()}.ruleset();
+		let (gateway, lan4) = (position(&text, "block drop quick from any to 10.200.0.1/32"), position(&text, "pass out quick inet from any to { 10.200.0.0/24 } keep state (if-bound)"));
 		assert!(gateway < lan4);
 	}
 
 	#[test]
 	fn no_unsolicited_inbound_is_passed_but_dhcp_and_neighbors() {
-		for rules in [full(), Rules {lan: true, ..full()}, Rules {tun: Some("utun3".into()), ..full()}] {
+		for rules in [full(), Rules {lan: home(), ..full()}, Rules {tun: Some("utun3".into()), ..full()}] {
 			let text = rules.ruleset();
 			let inbound: Vec<&str> = text.lines().filter(|line| line.starts_with("pass in")).collect();
 			assert_eq!(inbound.len(), 2, "{inbound:?}");
@@ -343,7 +345,7 @@ mod tests {
 
 	#[test]
 	fn a_ruleset_has_no_blank_lines_and_ends_with_a_newline() {
-		for rules in [full(), Rules {tun: Some("utun2".into()), lan: true, local_names: true, ..full()}] {
+		for rules in [full(), Rules {tun: Some("utun2".into()), lan: home(), local_names: true, ..full()}] {
 			let text = rules.ruleset();
 			assert!(text.ends_with('\n') && !text.contains("\n\n"));
 		}

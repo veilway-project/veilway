@@ -6,9 +6,6 @@
 use ipnet::IpNet;
 use std::net::IpAddr;
 
-/// The networks "the LAN" means when the user lets it through: private ranges, link-local, and the multicast groups local discovery uses. Fixed ranges and not the device's current subnets, so that a network that hands out a public subnet as on-link (TunnelCrack LocalNet) gets nothing by it.
-pub const LAN: [&str; 8] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/24", "fc00::/7", "fe80::/10", "ff02::/16"];
-
 /// What goes into the tunnel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Routes {
@@ -103,10 +100,5 @@ mod tests {
 		let found: Vec<String> = Layout {routes: &Routes::Full, gateways: &gateways, addresses: &addresses}.protected().iter().map(ToString::to_string).collect();
 		assert_eq!(found, ["0.0.0.0/0", "::/0", "10.200.0.1/32", "fd00::1/128", "10.200.0.2/32"]);
 		assert_eq!(plan(&Layout {routes: &Routes::Full, gateways: &gateways, addresses: &addresses}).len(), 6, "the routes are the halves and the gateways");
-	}
-
-	#[test]
-	fn the_lan_is_fixed_ranges_that_parse() {
-		assert!(LAN.iter().all(|net| net.parse::<IpNet>().is_ok()));
 	}
 }

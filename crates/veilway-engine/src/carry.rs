@@ -279,7 +279,7 @@ impl Core {
 	// Sends the packets the control channel or the probe wrote.
 	fn sent(&mut self, c: &mut Carry, carrier: &Carrier, packets: Vec<Vec<u8>>, control: bool) {for packet in packets {self.encapsulate(c, carrier, &packet, control)}}
 	fn moved(&mut self, c: &mut Carry, carrier: &Carrier) {
-		// "An address inside one of the device's own networks" is not dialled at any connect without the user's yes to a private address: the session to one is ended.
+		// "An address inside one of the device's own networks" is not dialled at any connect, but a private one after the user's yes to a private address: the session to one that is skipped is ended.
 		if self.own(c.transport, c.candidate) {
 			tracing::info!(transport = c.transport, candidate = c.candidate, "the network the session was opened to is now the device's own: the session is ended");
 			c.replan = true;

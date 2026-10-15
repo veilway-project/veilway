@@ -16,6 +16,6 @@ object Native {
 	/** Whether the system's always-on VPN blocks the internet without the tunnel. Rust refuses to fetch subscriptions while no tunnel is up. */
 	@JvmStatic external fun lockdown(on: Boolean)
 
-	/** The device's own networks as "address/prefix" strings, and a description of them. */
-	@JvmStatic external fun networkChanged(description: String, networks: Array<String>)
+	/** The device's own networks as "address/prefix" strings, a description of them, and whether the phone's packets leave by mobile data (true when that cannot be told). */
+	@JvmStatic external fun networkChanged(description: String, networks: Array<String>, cellular: Boolean)
 }

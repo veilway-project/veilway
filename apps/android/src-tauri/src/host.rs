@@ -144,13 +144,13 @@ impl Core {
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
 				if let Some(found) = found {library.remove(&found).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				drop(library);
-				self.store.set_lan_through_tunnel(&id, false);
+				self.store.set_lan_local(&id, false);
 				let _ = self.store.flush();
 				self.library_value().await
 			}
 			Call::SetLan {subscription: id, on} => {
 				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
-				self.store.set_lan_through_tunnel(&id, on);
+				self.store.set_lan_local(&id, on);
 				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
 			}
@@ -229,15 +229,15 @@ impl Core {
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
-		let (key, mut agree, lan_outside) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default(), !self.store.lan_through_tunnel(held.id().as_str()));
+		let (key, mut agree, lan_local) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default(), self.store.lan_local(held.id().as_str()));
 		loop {
 			let on_status = |status: &Status| {
-				let view = status_view(status, Some(AppliedOut {interface: "tun".into(), kill_switch: false, dns: "tunnel".into(), split: (!options.routes.is_empty()).then(|| options.routes.iter().map(ToString::to_string).collect()), allow_lan: lan_outside}));
+				let view = status_view(status, Some(AppliedOut {interface: "tun".into(), kill_switch: false, dns: "tunnel".into(), split: (!options.routes.is_empty()).then(|| options.routes.iter().map(ToString::to_string).collect()), allow_lan: lan_local}));
 				crate::bridge::state(&view.state);
 				*self.last.lock().unwrap() = Some(view.clone());
 				self.send(Out::Status(view));
 			};
-			let outcome = vpn::run(&options, lan_outside, settings.clone(), &held, &profile, &permit, agree, on_status, stop.notified()).await;
+			let outcome = vpn::run(&options, lan_local, settings.clone(), &held, &profile, &permit, agree, on_status, stop.notified()).await;
 			let _ = self.store.flush();
 			let Err(error) = outcome else {return Ok(())};
 			// The tunnel did not start because the user has still to say something. A no, or a stop, is the user's own end of it.

@@ -15,7 +15,7 @@ function subscription(fa: boolean): Subscription {
 		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]]}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]]}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
-		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0, lan_through_tunnel: lan
+		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan
 	};
 }
 

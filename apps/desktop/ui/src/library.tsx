@@ -22,7 +22,7 @@ export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: 
 				{subscription.can_refresh && <IconButton icon="refresh" label={t("library.refresh", {provider: subscription.provider})} disabled={refreshing === subscription.id} onClick={() => { setRefreshing(subscription.id); onRefresh(subscription.id).finally(() => setRefreshing(null)); }}/>}
 				<Button size="sm" variant="quiet" disabled={inUse === subscription.id} onClick={() => setRemoving(subscription)}>{t("library.remove")}</Button>
 			</span>}/>
-			<li className="d-row-option"><Checkbox label={t("library.lan")} checked={subscription.lan_through_tunnel} onChange={on => { setLan(subscription, on); }}/><span className="vw-muted vw-small">{t("library.lanHint")}</span></li>
+			<li className="d-row-option"><Checkbox label={t("library.lan")} checked={subscription.lan_local} onChange={on => { setLan(subscription, on); }}/><span className="vw-muted vw-small">{t("library.lanHint")}</span></li>
 		</Fragment>)}</List></Glass>}
 		<ConfirmDialog open={removing !== null} onOpenChange={open => { if (!open) setRemoving(null); }} danger title={t("library.removeTitle", {provider: removing?.provider ?? ""})} body={t("library.removeBody")} confirmLabel={t("library.remove")} onConfirm={() => { if (removing) remove(removing); }}/>
 	</div>;

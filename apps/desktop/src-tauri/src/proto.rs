@@ -75,7 +75,7 @@ pub enum Call {
 	Refresh { subscription: String },
 	Remove { subscription: String },
 	Connect { subscription: String, profile: String, options: Options },
-	/// "Send the local network through the VPN" for one subscription, saved and used from the next connect. The local network stays outside the tunnel unless this is on.
+	/// "Let apps reach devices on this network" for one subscription, saved and used from the next connect. The local network goes through the tunnel unless this is on.
 	SetLan { subscription: String, on: bool },
 	/// The answer to the question the helper last pushed.
 	Answer { yes: bool },
