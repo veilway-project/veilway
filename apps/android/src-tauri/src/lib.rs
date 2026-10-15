@@ -111,6 +111,10 @@ async fn refresh(id: String) -> Result<Value, String> {call_branded(Call::Refres
 #[tauri::command]
 async fn remove(id: String) -> Result<Value, String> {call_branded(Call::Remove {subscription: id}).await}
 
+/// Saves "Send the local network through the VPN" for a subscription and gives the library back. It applies from the next connect.
+#[tauri::command]
+async fn set_lan(id: String, on: bool) -> Result<Value, String> {call_branded(Call::SetLan {subscription: id, on}).await}
+
 /// Asks for the VPN consent (the system's own dialog, once), then starts the service. The service starts the connection, and what happens after that comes back as events. The first call blocks the window's request until the user has answered the dialog.
 #[tauri::command]
 async fn connect(vpn: State<'_, Arc<Vpn>>, subscription: String, profile: String, options: Options) -> Result<Value, String> {
@@ -193,7 +197,7 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

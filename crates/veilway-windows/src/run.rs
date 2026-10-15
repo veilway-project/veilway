@@ -37,7 +37,7 @@ pub struct Options {
 }
 
 impl Default for Options {
-	fn default() -> Self {Self {interface: "Veilway".into(), routes: Routes::Full, kill_switch: true, allow_lan: false, local_names: false, run_dir: state::default_dir()}}
+	fn default() -> Self {Self {interface: "Veilway".into(), routes: Routes::Full, kill_switch: true, allow_lan: true, local_names: false, run_dir: state::default_dir()}}
 }
 
 /// What is in force, once it is, for the app to show.

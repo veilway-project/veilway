@@ -68,12 +68,16 @@ pub(crate) struct Parts {
 	pub status: watch::Sender<Status>,
 	pub events: broadcast::Sender<Event>,
 	pub refused: Arc<AtomicU64>,
+	/// The user said yes to "this profile connects to a private address" for this start.
+	pub private: bool,
 }
 
 pub(crate) struct Core {
 	pub settings: Settings,
 	/// The device's own networks as they are now: the list of `Settings` at the start, and the one `Tunnel::moved` gave after.
 	pub networks: Vec<OwnNetwork>,
+	/// With the user's yes to a private address, an address inside the device's own networks is dialled like any other private one. Without it, it is skipped at every connect.
+	pub consented: bool,
 	pub profile: Profile,
 	pub subscription: Arc<Subscription>,
 	pub link: Link,
@@ -138,12 +142,12 @@ fn untracked(network: &mut Network, transport: usize, candidate: usize, added: &
 
 impl Core {
 	pub(crate) fn new(parts: Parts) -> Self {
-		let Parts {settings, profile, subscription, link, key, store_key, kept, commands, from_platform, to_platform, status, events, refused} = parts;
+		let Parts {settings, profile, subscription, link, key, store_key, kept, commands, from_platform, to_platform, status, events, refused, private} = parts;
 		let (transports, seed) = (profile.transports.clone(), settings.store.seed());
 		let net_key = crate::store::network_key(seed, &settings.network);
 		let wire = Shared::new(Wire::new(key, link.inbound, profile.device.preshared_key.clone()));
 		let initial = status.borrow().clone();
-		Self {networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
+		Self {consented: private, networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
 	}
 	pub(crate) fn unix(&self) -> u64 {(self.settings.clock)()}
 	// The device's clock and the offset a pinned candidate's answer gave, which is what proofs are made with.
@@ -300,7 +304,7 @@ impl Core {
 			for transport in plan.order.iter().copied() {
 				tried += 1;
 				let (candidates, mut retry, mut added) = (count(&self.transports[transport]), Vec::new(), Vec::<usize>::new());
-				// "Skipped at each connect: an address inside one of the device's own networks." They are passed before a pick is made, so that they take no place of the hour's budget and no attempt is counted for them.
+				// "Skipped at each connect: an address inside one of the device's own networks", unless the user agreed to a private address for this profile. They are passed before a pick is made, so that they take no place of the hour's budget and no attempt is counted for them.
 				let mut passed: Vec<usize> = (0..candidates).filter(|candidate| self.own(transport, *candidate)).collect();
 				let unreachable = loop {
 					// A class the user withdrew since the last look is not used for the next attempt.
@@ -393,6 +397,7 @@ impl Core {
 		self.rest(wait).await
 	}
 	pub(crate) fn own(&self, transport: usize, candidate: usize) -> bool {
+		if self.consented {return false}
 		let found = match &self.transports[transport] {
 			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| dial.own(&self.networks)),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.get(candidate).map(|found| found.address.own(&self.networks)),

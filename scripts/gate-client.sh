@@ -25,7 +25,8 @@ exit_code(){ docker exec $P-client cat /connect.exit 2>/dev/null | tr -d ' \r\n'
 tunnelled(){ c curl -sS --max-time 8 http://app.gate.test:8000/ 2>&1; }
 snapshot(){ c sh -c "ip rule; echo ---; ip -6 rule; echo ---; cat /etc/resolv.conf; echo ---; nft list tables" 2>&1; }
 # profile, source file or empty, extra arguments. The answers are yes to everything it asks, the way a person at a terminal would type them.
-connect(){ docker exec -d $P-client sh -c "rm -f /connect.exit; yes yes | veilway connect ${2:-} --profile $1 --data-dir ${DATA:-/data} ${3:-} >/connect.log 2>&1; echo \$? >/connect.exit"; }
+# The LAN stays outside the tunnel by default; the checks below that expect it blocked go through the tunnel, as before, unless a case asks for --allow-lan itself.
+connect(){ more="${3:-}"; case "$more" in *--allow-lan*) ;; *) more="--lan-through-tunnel $more";; esac; docker exec -d $P-client sh -c "rm -f /connect.exit; yes yes | veilway connect ${2:-} --profile $1 --data-dir ${DATA:-/data} $more >/connect.log 2>&1; echo \$? >/connect.exit"; }
 start_dns_capture(){ docker exec -d $P-client sh -c "tcpdump -i eth0 -n -U -w /eth0.pcap 'port 53' >/dev/null 2>&1"; docker exec -d $P-client sh -c "tcpdump -i vw0 -n -U -w /vw0.pcap 'port 53' >/dev/null 2>&1"; sleep 1; }
 packets(){ docker exec $P-client sh -c "tcpdump -nr /$1.pcap 2>/dev/null | wc -l" | tr -d ' \r'; }
 stop_captures(){ docker exec $P-client sh -c 'kill $(pidof tcpdump)' >/dev/null 2>&1; sleep 1; }

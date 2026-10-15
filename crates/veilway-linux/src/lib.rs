@@ -50,7 +50,7 @@ pub struct Options {
 	pub routes: Routes,
 	/// The kill switch. On unless the user turned it off.
 	pub kill_switch: bool,
-	/// Let the LAN's ranges (private, link-local, local multicast) go the way they always did.
+	/// The LAN's ranges (private, link-local, local multicast) stay outside the tunnel and go the way they always did. On by default; off sends them through the tunnel (the user's choice per subscription).
 	pub allow_lan: bool,
 	/// With the LAN: let mDNS and LLMNR go too, so that local names resolve. Without it they are dropped, as every query for a name outside the tunnel is.
 	pub local_names: bool,
@@ -60,7 +60,7 @@ pub struct Options {
 }
 
 impl Default for Options {
-	fn default() -> Self {Self {interface: "vw0".into(), mark: MARK, table: MARK, routes: Routes::Full, kill_switch: true, allow_lan: false, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::STATE)}}
+	fn default() -> Self {Self {interface: "vw0".into(), mark: MARK, table: MARK, routes: Routes::Full, kill_switch: true, allow_lan: true, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::STATE)}}
 }
 
 /// What is in force, once it is, for the app to show.

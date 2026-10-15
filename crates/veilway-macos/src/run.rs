@@ -38,7 +38,7 @@ pub struct Options {
 }
 
 impl Default for Options {
-	fn default() -> Self {Self {interface: "utun".into(), routes: Routes::Full, kill_switch: true, allow_lan: false, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::DATA)}}
+	fn default() -> Self {Self {interface: "utun".into(), routes: Routes::Full, kill_switch: true, allow_lan: true, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::DATA)}}
 }
 
 /// What is in force, once it is, for the app to show.

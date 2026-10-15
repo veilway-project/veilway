@@ -118,6 +118,10 @@ async fn refresh(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, Stri
 #[tauri::command]
 async fn remove(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::Remove{subscription:id}).await}
 
+/// Saves "Send the local network through the VPN" for a subscription and gives the library back. It applies from the next connect.
+#[tauri::command]
+async fn set_lan(backend:State<'_, Arc<Backend>>, id:String, on:bool)->Result<Value, String>{ask_branded(&backend, Call::SetLan{subscription:id, on}).await}
+
 #[tauri::command]
 async fn connect(app:AppHandle, backend:State<'_, Arc<Backend>>, subscription:String, profile:String, mut options:Options)->Result<Value, String>{
 	tracing::info!("connect requested");
@@ -237,7 +241,7 @@ fn main(){
 		.plugin(tauri_plugin_opener::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));

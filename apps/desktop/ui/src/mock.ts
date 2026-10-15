@@ -7,13 +7,15 @@ try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get(
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
+let lan = false;
+
 function subscription(fa: boolean): Subscription {
 	return {
 		id: "sub-harbor", provider: fa ? "هاربر نت" : "Harbor Net", standing: "current", expires_at: now() + 23 * DAY, can_refresh: true,
 		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]]}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]]}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
-		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0
+		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0, lan_through_tunnel: lan
 	};
 }
 
@@ -62,7 +64,8 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	import_keep: args => { if (args.keep) held = 1; return held ? [subscription(languages[0] === "fa")] : []; },
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],
-	remove: () => { held = 0; return []; }
+	remove: () => { held = 0; return []; },
+	set_lan: args => { lan = args.on === true; return [subscription(languages[0] === "fa")]; }
 };
 
 Object.assign(window, {
