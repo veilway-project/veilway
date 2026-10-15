@@ -82,7 +82,8 @@ impl<'a> Head<'a> {
 	/// Whether this is the answer that opens a WebSocket session for the request with `key`: "The client checks `Sec-WebSocket-Accept` as RFC 6455 requires and ends the attempt if it is wrong."
 	pub fn upgraded(&self, key: &[u8]) -> Result<(), Answer> {
 		if self.status != 101 || !self.current {return Err(Answer::Status(self.status))}
-		if self.one("sec-websocket-accept") == Some(websocket::accept(key).as_bytes()) {Ok(())} else {Err(Answer::Accept)}
+		// The request offers Chrome's `permessage-deflate`, which the client cannot read: an answer that takes up any extension ends the attempt.
+		if self.one("sec-websocket-accept") == Some(websocket::accept(key).as_bytes()) && self.values("sec-websocket-extensions").next().is_none() {Ok(())} else {Err(Answer::Accept)}
 	}
 }
 
