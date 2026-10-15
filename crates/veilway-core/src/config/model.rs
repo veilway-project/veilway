@@ -1406,11 +1406,11 @@ impl Link {
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum XrayProtocol {
-	/// Needs `tls`. The client secret is a UUID.
+	/// Needs `tls` and a `decoy`. The client secret is a UUID.
 	Vless,
-	/// Needs `tls`. The client secret is a password.
+	/// Needs `tls` and a `decoy`. The client secret is a password.
 	Trojan,
-	/// The cipher is chacha20-ietf-poly1305. The client secret is a password.
+	/// The cipher is 2022-blake3-aes-256-gcm with a key for the server and one per client. Every key is 32 bytes as standard base64.
 	Shadowsocks,
 }
 
@@ -1433,6 +1433,12 @@ pub struct XrayInbound {
 	/// The certificate files of the listener. Required for `vless` and `trojan`, and not allowed for `shadowsocks`, which encrypts itself.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub tls: Option<Tls>,
+	/// Where a connection that is not a user's goes after the TLS handshake: the operator's own web server, the same one the `decoy.origin` of a `tls` transport names. Required for `vless` and `trojan`, not allowed for `shadowsocks`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub decoy: Option<Origin>,
+	/// The server's key for `shadowsocks`: 32 bytes as standard base64. Required for `shadowsocks`, not allowed for the others.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub server_key: Option<Secret<String>>,
 	/// The users that may use this inbound, each with the credential they present to it.
 	#[schemars(length(max = MAX_USERS))]
 	pub clients: Vec<XrayClient>,
@@ -1443,7 +1449,7 @@ pub struct XrayInbound {
 pub struct XrayClient {
 	#[schemars(pattern(NAME_PATTERN))]
 	pub user: String,
-	/// A UUID for `vless`, otherwise a password of 8 to 128 characters from A-Z a-z 0-9 and _ - . + / =.
-	#[schemars(length(min = 8, max = 128))]
+	/// A UUID for `vless`. For `trojan` a password of 22 to 128 characters from A-Z a-z 0-9 and _ - . + / =. For `shadowsocks` a key of 32 bytes as standard base64. No two clients of an inbound share a secret.
+	#[schemars(length(min = 22, max = 128))]
 	pub secret: Secret<String>,
 }

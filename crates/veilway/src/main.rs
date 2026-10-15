@@ -37,12 +37,21 @@ enum Command {
 		#[arg(long)] replay: Option<PathBuf>,
 		/// The folder the Xray add-on is installed in (scripts/veilway.sh addon xray install). It must not be writable by the user the node runs as
 		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
+		/// The unix socket of the Xray host (`veilway xray-host`, run by its own unit), which starts Xray as a user of its own. The node never runs Xray itself
+		#[arg(long, default_value = "/run/veilway-xray/host.sock")] xray_socket: PathBuf,
 		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
 		/// Run without the control API
 		#[cfg(unix)]
 		#[arg(long)] no_api: bool,
+	},
+	/// Run the host that starts the Xray add-on for the node, as a user of its own (scripts/veilway.sh sets up its unit). It takes its socket from systemd, and makes one at --socket otherwise
+	#[cfg(target_os = "linux")]
+	XrayHost {
+		/// The folder the Xray add-on is installed in. It and the executable must belong to root and be writable by nobody else
+		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
+		#[arg(long)] socket: Option<PathBuf>,
 	},
 	/// Validate a version 1 config and print every error and warning
 	Check {
@@ -225,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state, replay, addons, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -244,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
 			// "In a file of its own, next to the usage state file and separate from it."
 			let state = state.unwrap_or_else(|| dir.join("veilway-state.json"));
 			let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
-			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), addons: Some(addons), ..Options::new(dir)}).await?);
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), addons: Some(addons), xray_socket: Some(xray_socket), ..Options::new(dir)}).await?);
 			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
 			#[cfg(unix)]
 			let (control, mut events) = (if no_api {None} else {
@@ -315,6 +324,11 @@ async fn main() -> anyhow::Result<()> {
 			}
 			kept.store(true, Ordering::SeqCst);
 			Ok(stopped?)
+		}
+		#[cfg(target_os = "linux")]
+		Command::XrayHost {addons, socket} => {
+			tracing_subscriber::fmt().with_env_filter(EnvFilter::new("info")).init();
+			veilway_core::engine::xray_host::run(addons, socket).await
 		}
 		Command::Check {config} => {
 			let (_, report) = veilway_core::config::load(&config, true);

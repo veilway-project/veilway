@@ -1,37 +1,39 @@
-//! The Xray add-on. Xray runs as a child of the node, from the executable the installer put in the add-on folder, which must be the one this build pins. It listens on the public ports of the `xray` section and reaches the network only through a SOCKS5 hop on 127.0.0.1 that this module serves.
+//! The Xray add-on. Xray does not run under the node: it runs as `xray_host` under a user of its own, which the node asks over a unix socket to start the executable the installer put in the add-on folder, which must be the one this build pins. Xray listens on the public ports of the `xray` section and reaches the network only through a SOCKS5 hop on 127.0.0.1 that this module serves.
+//! The node holds one connection to the host for each Xray it wants running: the document goes in over it, and closing it, or the node ending for any reason, stops Xray. So Xray never outlives the node, and has nothing of the node's: not its config, its state, its keys, nor its control socket.
 //! Xray sends each client's traffic out through an outbound of its own, and the outbound logs in to the hop as that client's user. So every connection is a flow of a known user: the hop applies the same gate, rules, exits, entitlement and quota as for a tunnel, and counts into the same per-user and per-exit counters.
-//! Only TCP is carried: the hop answers CONNECT and nothing else. Destinations that are names are resolved here, with the DNS servers of the user's set, and the address that passed the gate is the one dialled.
+//! Only TCP is carried: the hop answers CONNECT and nothing else. Destinations that are names are resolved here, the way the tunnel's resolver does it: with the DNS servers of the user's set, through the exit the rules give that query.
 use super::plan::{Backend, Outbound, Plan};
+use super::resolver::{self, Step};
 use super::route::{self, Reason};
 use super::{dns, flows, gate, Shared};
 use crate::config::{Config, Store, XrayProtocol};
-use ring::digest::{digest, SHA256};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(unix))]
+use tokio::io::DuplexStream as Link;
+#[cfg(unix)]
+use tokio::net::UnixStream as Link;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::{Child, Command};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 
 /// The release of Xray-core this build runs. The installer pins its archives and `PIN` pins what they hold.
 pub const RELEASE: &str = "v26.3.27";
 #[cfg(target_arch = "x86_64")]
-const PIN: &str = "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed";
+pub(super) const PIN: &str = "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed";
 #[cfg(target_arch = "aarch64")]
-const PIN: &str = "c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04";
+pub(super) const PIN: &str = "c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04";
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-const PIN: &str = "";
+pub(super) const PIN: &str = "";
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const DIAL: Duration = Duration::from_secs(10);
-const LOOKUP: Duration = Duration::from_secs(5);
 /// How often a connection looks whether its user is still allowed, which is how long a user cut off by a quota, an expiry or a disable keeps a connection that is open.
 const WATCH: Duration = Duration::from_secs(1);
 const MAX_HANDSHAKES: usize = 256;
@@ -39,14 +41,29 @@ const RESTART_MIN: Duration = Duration::from_secs(3);
 const RESTART_MAX: Duration = Duration::from_secs(60);
 /// A child that ran this long before it ended was working, and its next start is not a retry.
 const HEALTHY: Duration = Duration::from_secs(60);
+/// A change of the config waits this long for the next one before Xray is restarted for it, so a panel that writes several in a row costs one restart.
+const SETTLE: Duration = Duration::from_secs(2);
+/// How long the host is given to answer a start, and to end Xray once the connection is closed.
+const HOST_WAIT: Duration = Duration::from_secs(15);
+const STOP_WAIT: Duration = Duration::from_secs(8);
+/// The most a certificate or key file may hold.
+const MAX_PEM: u64 = 1 << 20;
 const CHUNK: usize = 16384;
 
 /// Where the executable is, in the add-on folder.
 pub fn binary(addons: &Path) -> PathBuf {addons.join("xray").join("xray")}
 
+/// The lines of a PEM file, which Xray takes in its document in the place of a path.
+async fn pem(dir: &Path, name: &str) -> anyhow::Result<Vec<String>> {
+	let file = tokio::fs::File::open(dir.join(name)).await.map_err(|e| anyhow::anyhow!("{name}: {}", e.kind()))?;
+	let mut text = String::new();
+	file.take(MAX_PEM).read_to_string(&mut text).await.map_err(|e| anyhow::anyhow!("{name}: {}", e.kind()))?;
+	Ok(text.lines().map(str::to_string).collect())
+}
+
 /// The document Xray is started with. Users who are disabled are left out, so a change that cuts a user off also stops Xray from accepting their credential. A quota or an expiry is held by the hop, at once.
-/// Everything not listed here goes to a blackhole outbound, which is the first and so the default.
-fn generate(config: &Config, dir: &Path, hop: u16, secret: &str) -> Value {
+/// Everything not listed here goes to a blackhole outbound, which is the first and so the default. Xray has no access log, and the addresses in what it logs are masked. A connection that does not carry a user's credential is handed to the operator's web server on a `vless` or `trojan` listener, as a connection that never was Xray's would be, and a certificate and its key are in the document and not on a path, since Xray has no access to the node's folders.
+fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret: &str) -> Value {
 	let able: Vec<&str> = config.users.iter().filter(|user| user.enabled != Some(false)).map(|user| user.name.as_str()).collect();
 	let (mut inbounds, mut used) = (Vec::new(), Vec::<&str>::new());
 	for inbound in config.xray.iter().flat_map(|xray| &xray.inbounds) {
@@ -54,16 +71,17 @@ fn generate(config: &Config, dir: &Path, hop: u16, secret: &str) -> Value {
 		used.extend(clients.iter().map(|client| client.user.as_str()));
 		let list: Vec<Value> = clients.iter().map(|client| match inbound.protocol {
 			XrayProtocol::Vless => json!({"id": client.secret.expose(), "email": client.user}),
-			XrayProtocol::Trojan => json!({"password": client.secret.expose(), "email": client.user}),
-			XrayProtocol::Shadowsocks => json!({"method": "chacha20-ietf-poly1305", "password": client.secret.expose(), "email": client.user}),
+			XrayProtocol::Trojan | XrayProtocol::Shadowsocks => json!({"password": client.secret.expose(), "email": client.user}),
 		}).collect();
+		let fallbacks: Vec<Value> = inbound.decoy.iter().map(|origin| json!({"dest": if origin.0.port == 80 {format!("{}:80", origin.host())} else {origin.host()}})).collect();
 		let settings = match inbound.protocol {
-			XrayProtocol::Vless => json!({"clients": list, "decryption": "none"}),
-			XrayProtocol::Trojan => json!({"clients": list}),
-			XrayProtocol::Shadowsocks => json!({"clients": list, "network": "tcp"}),
+			XrayProtocol::Vless => json!({"clients": list, "decryption": "none", "fallbacks": fallbacks}),
+			XrayProtocol::Trojan => json!({"clients": list, "fallbacks": fallbacks}),
+			XrayProtocol::Shadowsocks => json!({"method": "2022-blake3-aes-256-gcm", "password": inbound.server_key.as_ref().map_or("", |key| key.expose().as_str()), "clients": list, "network": "tcp"}),
 		};
+		// Only HTTP/1.1 is offered, because the web server behind the fallback is spoken to in the clear and takes no HTTP/2.
 		let stream = match &inbound.tls {
-			Some(tls) => json!({"network": "tcp", "security": "tls", "tlsSettings": {"certificates": [{"certificateFile": dir.join(&tls.cert), "keyFile": dir.join(&tls.key)}]}}),
+			Some(tls) => json!({"network": "tcp", "security": "tls", "tlsSettings": {"alpn": ["http/1.1"], "certificates": [{"certificate": pems.get(tls.cert.as_str()), "key": pems.get(tls.key.as_str())}]}}),
 			None => json!({"network": "tcp"}),
 		};
 		let protocol = match inbound.protocol {
@@ -78,20 +96,31 @@ fn generate(config: &Config, dir: &Path, hop: u16, secret: &str) -> Value {
 	let mut outbounds = vec![json!({"tag": "refused", "protocol": "blackhole"})];
 	outbounds.extend(used.iter().map(|user| json!({"tag": format!("u-{user}"), "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": hop, "users": [{"user": user, "pass": secret}]}]}})));
 	let rules: Vec<Value> = used.iter().map(|user| json!({"type": "field", "user": [user], "outboundTag": format!("u-{user}")})).collect();
-	json!({"log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": outbounds, "routing": {"domainStrategy": "AsIs", "rules": rules}})
+	json!({"log": {"access": "none", "loglevel": "warning", "maskAddress": "full"}, "inbounds": inbounds, "outbounds": outbounds, "routing": {"domainStrategy": "AsIs", "rules": rules}})
 }
 
-/// A running Xray, with the document it was started with.
-struct Running {document: String, process: Child, since: Instant}
+/// A running Xray: the connection that keeps it alive, the document it was started with, and what the host has said since it started it.
+struct Running {document: String, link: Link, since: Instant, said: Vec<u8>}
 
-/// Keeps Xray running as the config says: started when the `xray` section has an inbound, started again with a new document when the section or the users it names change, started again after it ends with a longer wait each time, and stopped when the section goes.
-pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, addons: Option<PathBuf>) {
+/// Closes the connection and waits for the host to say it ended Xray, which it does before it closes its side.
+async fn stop(mut running: Running) {
+	let _ = running.link.shutdown().await;
+	let mut sink = [0u8; 256];
+	let _ = tokio::time::timeout(STOP_WAIT, async {while running.link.read(&mut sink).await.is_ok_and(|n| n > 0) {}}).await;
+}
+
+/// Keeps Xray running as the config says: started when the `xray` section has an inbound, started again with a new document when the section or the users it names change (after `SETTLE` without another change, and with the old one ended first), started again after it ends with a longer wait each time, and stopped when the section goes or `stopped` is notified.
+pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, socket: Option<PathBuf>, stopped: Arc<Notify>) {
 	let mut changes = store.subscribe();
-	let (mut hop, mut running, mut failures, mut waiting): (Option<(JoinHandle<()>, u16, String)>, Option<Running>, u32, Option<Instant>) = (None, None, 0, None);
+	let (mut hop, mut running, mut failures, mut waiting, mut settling): (Option<(JoinHandle<()>, u16, String)>, Option<Running>, u32, Option<Instant>, Option<Instant>) = (None, None, 0, None, None);
 	loop {
 		let config = changes.borrow_and_update().config.clone();
-		if config.xray.as_ref().is_none_or(|xray| xray.inbounds.is_empty()) {
-			if let Some(was) = running.take() {tracing::info!("xray: stopped, the config has no xray inbound any more (pid {})", was.process.id().unwrap_or(0))}
+		if settling.is_some_and(|until| until > Instant::now()) {}
+		else if config.xray.as_ref().is_none_or(|xray| xray.inbounds.is_empty()) {
+			if let Some(was) = running.take() {
+				stop(was).await;
+				tracing::info!("xray: stopped, the config has no xray inbound any more");
+			}
 			if let Some((task, ..)) = hop.take() {task.abort()}
 			failures = 0;
 			waiting = None;
@@ -109,13 +138,26 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, ad
 				}
 			}
 			if let Some((_, port, secret)) = &hop {
-				let document = generate(&config, &dir, *port, secret).to_string();
-				if running.as_ref().is_none_or(|was| was.document != document) {
-					running = None;
-					match start(addons.as_deref(), &document).await {
-						Ok(process) => {
-							tracing::info!("xray {RELEASE}: started (pid {}), {} inbound(s)", process.id().unwrap_or(0), config.xray.iter().flat_map(|xray| &xray.inbounds).count());
-							running = Some(Running {document, process, since: Instant::now()});
+				let (mut files, mut unreadable) = (HashMap::new(), None);
+				for name in config.xray.iter().flat_map(|xray| &xray.inbounds).filter_map(|inbound| inbound.tls.as_ref()).flat_map(|tls| [tls.cert.as_str(), tls.key.as_str()]) {
+					if files.contains_key(name) {continue}
+					match pem(&dir, name).await {
+						Ok(lines) => drop(files.insert(name, lines)),
+						Err(e) => unreadable = Some(e),
+					}
+				}
+				let document = generate(&config, &files, *port, secret).to_string();
+				if unreadable.is_none() && running.as_ref().is_some_and(|was| was.document == document) {}
+				else {
+					if let Some(was) = running.take() {stop(was).await}
+					let started = match unreadable {
+						Some(e) => Err(e.context("a certificate file of an xray inbound cannot be read")),
+						None => start(socket.as_deref(), &document).await,
+					};
+					match started {
+						Ok((link, pid)) => {
+							tracing::info!("xray {RELEASE}: started (pid {pid}), {} inbound(s)", config.xray.iter().flat_map(|xray| &xray.inbounds).count());
+							running = Some(Running {document, link, since: Instant::now(), said: Vec::new()});
 						}
 						Err(e) => {
 							failures += 1;
@@ -127,22 +169,40 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, ad
 				}
 			}
 		}
+		let mut heard = [0u8; 256];
 		tokio::select! {
-			r = changes.changed() => if r.is_err() {return},
-			status = async {
+			_ = stopped.notified() => {
+				if let Some(was) = running.take() {stop(was).await}
+				return;
+			}
+			r = changes.changed() => {
+				if r.is_err() {
+					if let Some(was) = running.take() {stop(was).await}
+					return;
+				}
+				settling = Some(Instant::now() + SETTLE);
+			}
+			read = async {
 				match running.as_mut() {
-					Some(running) => running.process.wait().await,
+					Some(running) => running.link.read(&mut heard).await,
 					None => std::future::pending().await,
 				}
-			} => {
-				let ran = running.take().map_or(Duration::ZERO, |was| was.since.elapsed());
-				failures = if ran >= HEALTHY {1} else {failures + 1};
-				let wait = (RESTART_MIN * 2u32.saturating_pow(failures - 1)).min(RESTART_MAX);
-				tracing::warn!("xray: ended after {}s ({}); starting it again in {}s", ran.as_secs(), status.map_or_else(|e| e.kind().to_string(), |status| status.to_string()), wait.as_secs());
-				waiting = Some(Instant::now() + wait);
-			}
+			} => match read {
+				Ok(n) if n > 0 => if let Some(running) = running.as_mut() {
+					let room = 512 - running.said.len().min(512);
+					running.said.extend_from_slice(&heard[..n.min(room)]);
+				},
+				_ => {
+					let was = running.take();
+					let ran = was.as_ref().map_or(Duration::ZERO, |was| was.since.elapsed());
+					failures = if ran >= HEALTHY {1} else {failures + 1};
+					let wait = (RESTART_MIN * 2u32.saturating_pow(failures - 1)).min(RESTART_MAX);
+					tracing::warn!("xray: ended after {}s ({}); starting it again in {}s", ran.as_secs(), was.as_ref().map_or_else(String::new, |was| String::from_utf8_lossy(&was.said).trim().to_string()), wait.as_secs());
+					waiting = Some(Instant::now() + wait);
+				}
+			},
 			_ = async {
-				match waiting {
+				match [waiting, settling].into_iter().flatten().filter(|until| *until > Instant::now()).min() {
 					Some(until) => tokio::time::sleep_until(until.into()).await,
 					None => std::future::pending().await,
 				}
@@ -151,25 +211,25 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, ad
 	}
 }
 
-/// Starts the executable after checking it against the pin, with nothing from the node's environment and the document on its standard input, so no file with the users' credentials is written.
-async fn start(addons: Option<&Path>, document: &str) -> anyhow::Result<Child> {
-	let addons = addons.ok_or_else(|| anyhow::anyhow!("the node has no add-on folder"))?;
-	let path = binary(addons);
-	let bytes = tokio::fs::read(&path).await.map_err(|e| anyhow::anyhow!("the add-on is not installed ({}): run `scripts/veilway.sh addon xray install`", e.kind()))?;
-	let found: String = digest(&SHA256, &bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
-	anyhow::ensure!(!PIN.is_empty() && found == PIN, "the xray executable is not the pinned release {RELEASE}");
-	drop(bytes);
-	let mut process = Command::new(&path).args(["run", "-config", "stdin:"]).env_clear().current_dir(addons).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true).spawn()?;
-	let mut stdin = process.stdin.take().ok_or_else(|| anyhow::anyhow!("no standard input"))?;
-	stdin.write_all(document.as_bytes()).await?;
-	drop(stdin);
-	for output in [process.stdout.take().map(|out| Box::new(out) as Box<dyn tokio::io::AsyncRead + Unpin + Send>), process.stderr.take().map(|out| Box::new(out) as Box<dyn tokio::io::AsyncRead + Unpin + Send>)].into_iter().flatten() {
-		tokio::spawn(async move {
-			let mut lines = BufReader::new(output).lines();
-			while let Ok(Some(line)) = lines.next_line().await {tracing::debug!("xray: {}", line.chars().take(300).collect::<String>())}
-		});
+/// Asks the host to start Xray with `document`, which it does after checking the executable against the pin. The answer is the process id, and the connection is what keeps Xray alive.
+async fn start(socket: Option<&Path>, document: &str) -> anyhow::Result<(Link, u32)> {
+	let socket = socket.ok_or_else(|| anyhow::anyhow!("the node has no socket to the xray host"))?;
+	#[cfg(unix)]
+	let connect = Link::connect(socket);
+	#[cfg(not(unix))]
+	let connect = async {Err::<Link, _>(std::io::Error::from(std::io::ErrorKind::Unsupported))};
+	let mut link = tokio::time::timeout(HOST_WAIT, connect).await.map_err(|_| anyhow::anyhow!("the xray host did not answer in time"))?.map_err(|e| anyhow::anyhow!("the xray host is not reachable ({}): is veilway-xray.socket running", e.kind()))?;
+	link.write_all(&(document.len() as u32).to_be_bytes()).await?;
+	link.write_all(document.as_bytes()).await?;
+	let (mut said, mut byte) = (Vec::new(), [0u8; 1]);
+	tokio::time::timeout(HOST_WAIT, async {
+		while said.len() < 512 && link.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {said.push(byte[0])}
+	}).await.map_err(|_| anyhow::anyhow!("the xray host did not answer in time"))?;
+	let said = String::from_utf8_lossy(&said).to_string();
+	match said.strip_prefix("ok ").and_then(|pid| pid.parse().ok()) {
+		Some(pid) => Ok((link, pid)),
+		None => anyhow::bail!("{}", said.strip_prefix("error ").unwrap_or("the xray host closed the connection")),
 	}
-	Ok(process)
 }
 
 /// The connections of one user the hop holds, so that a user cannot hold more than a user may have flows.
@@ -306,7 +366,7 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 	let (name, port, found) = match target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
 		Target::Name(name, port) => {
-			let found = resolve(&plan, at, &name).await;
+			let found = resolve(shared, &plan, at, &name).await;
 			(Some(name), port, found)
 		}
 	};
@@ -392,10 +452,11 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 	Ok(())
 }
 
-/// Every address of `name` that the DNS servers of the user's set give, IPv4 first. Empty when none answers or the name is not one a resolver can be asked for.
-async fn resolve(plan: &Plan, user: usize, name: &str) -> Vec<IpAddr> {
+/// Every address of `name` that the DNS servers of the user's set give, IPv4 first, asked the way the tunnel's resolver asks (`resolver::ask`). The query counts for the user and for the exit it went through. Empty when none answers, when the rules or the gate turn the query away, and when the name is not one a resolver can be asked for.
+async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name: &str) -> Vec<IpAddr> {
 	if name.len() > 253 || name.split('.').any(|label| label.is_empty() || label.len() > 63) || !name.is_ascii() {return Vec::new()}
-	let set = &plan.dns[plan.users[user].dns.unwrap_or(0).min(plan.dns.len() - 1)];
+	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {return Vec::new()};
+	let (list, fallback) = (plan.users[user].dns.unwrap_or(0).min(plan.dns.len() - 1), plan.users[user].exit.unwrap_or(plan.default_exit));
 	for qtype in [1u8, 28] {
 		let mut query = vec![0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
 		for label in name.split('.') {
@@ -403,12 +464,22 @@ async fn resolve(plan: &Plan, user: usize, name: &str) -> Vec<IpAddr> {
 			query.extend_from_slice(label.as_bytes());
 		}
 		query.extend_from_slice(&[0, 0, qtype, 0, 1]);
-		for server in &set.servers {
-			let Ok(Some(answer)) = tokio::time::timeout(LOOKUP, flows::lookup(&flows::AROUND, *server, &query)).await else {continue};
-			let Some(response) = dns::response(&answer).filter(|response| response.rcode == 0) else {continue};
-			let found: Vec<IpAddr> = response.addresses.iter().map(|(ip, _)| *ip).filter(|ip| ip.is_ipv4() == (qtype == 1)).collect();
-			if !found.is_empty() {return found}
-			break;
+		for at in 0..plan.dns[list].servers.len() {
+			match resolver::ask(shared, plan, usize::MAX, user, 17, fallback, list, at, &query, Some(name)).await {
+				Step::Refused(reason) => {
+					shared.count(reason);
+					return Vec::new();
+				}
+				Step::Skipped | Step::Silent => continue,
+				Step::Answered(answer, _) => {
+					shared.spend(&plan.users[user], true, query.len());
+					shared.spend(&plan.users[user], false, answer.len());
+					let Some(response) = dns::response(&answer).filter(|response| response.rcode == 0) else {continue};
+					let found: Vec<IpAddr> = response.addresses.iter().map(|(ip, _)| *ip).filter(|ip| ip.is_ipv4() == (qtype == 1)).collect();
+					if !found.is_empty() {return found}
+					break;
+				}
+			}
 		}
 	}
 	Vec::new()

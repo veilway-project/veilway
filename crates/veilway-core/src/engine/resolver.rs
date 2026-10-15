@@ -1,7 +1,7 @@
 //! The node's own resolver: every DNS query from a tunnel is answered here, one query at a time, by asking the configured servers through the exit the rules choose for that query.
 //! What it learns is kept per user, so a rule with a `domain` condition can match the flows that follow.
 use super::flows::{self, HOLD_MARGIN, UDP_OVERHEAD, UDP_OVERHEAD_V6};
-use super::plan::{Action, Backend, Outbound, Pattern};
+use super::plan::{Action, Backend, DnsSet, Outbound, Pattern, Plan};
 use super::route::{self, Key, Reason, CLOSED_IDLE};
 use super::{dns, gate, Shared};
 use ipnet::IpNet;
@@ -100,6 +100,62 @@ pub struct Resolver {
 	pub throttled: AtomicU64,
 }
 
+/// For log lines: nothing for `dns.servers`, so those read as they always did.
+fn listed(set: &DnsSet) -> String {if set.tag.is_empty() {String::new()} else {format!(" of dns set {}", set.tag)}}
+
+/// What one server of a list did with a query.
+pub(super) enum Step {
+	/// The rules, the gate, the user's exits or a blocking exit turned the query away, which ends it.
+	Refused(Reason),
+	/// The server cannot be asked through the exit the query takes.
+	Skipped,
+	/// The server did not answer.
+	Silent,
+	/// The answer, and the exit it came through.
+	Answered(Vec<u8>, usize),
+}
+
+/// Asks server `at` of the list `list` for `user` the question in `message`, which both the tunnel's resolver and the Xray hop do, so a name is looked up the same way whoever asks for it: the rules see the server's address and the name, the exit they choose (`fallback` when they choose none) must be one the user may use and one that carries the server's address, and the query and its answer count for that exit.
+/// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
+/// Without `masquerade` the operator decides where that traffic goes, which the node cannot know, so such an exit carries no query of the node's resolver rather than one that takes another way out.
+/// A `chain` exit carries the query into its link like any other packet, see `chain`.
+pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user: usize, protocol: u8, fallback: usize, list: usize, at: usize, message: &[u8], asked: Option<&str>) -> Step {
+	let (set, server) = (&plan.dns[list], &plan.dns[list].servers[at]);
+	let action = route::evaluate(plan, inbound, user, server.ip(), protocol, 53, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
+	let exit = if let Action::Exit(exit) = action {*exit} else {fallback};
+	let refusal = match (action, &plan.exits[exit].backend) {
+		(Action::Block | Action::Reject, _) => Some(Reason::Rule),
+		// The server is a destination like any other, and the node's own addresses are known only to the host.
+		_ if gate::refused(server.ip(), &plan.pools) || (shared.is_local)(server.ip()) => Some(Reason::Gate),
+		_ if plan.users[user].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) => Some(Reason::Entitlement),
+		(_, Backend::Block) => Some(Reason::BlockExit),
+		_ => None,
+	};
+	if let Some(reason) = refusal {return Step::Refused(reason)}
+	let outbound = match &plan.exits[exit].backend {
+		Backend::Netstack {outbound, ..} => Some(outbound),
+		Backend::L3 {masquerade: true, ..} => Some(&flows::AROUND),
+		Backend::Chain {..} => None,
+		_ => return Step::Skipped,
+	};
+	let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {return Step::Skipped};
+	// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
+	if matches!(outbound, Some(Outbound::Direct {bind: Some(bind)}) if bind.is_ipv4() != server.is_ipv4()) {return Step::Skipped}
+	// A `chain` exit counts the query once it went into a link, which it does not while no link is up.
+	if outbound.is_some() {plan.exits[exit].traffic.up(message.len())}
+	let found = match outbound {
+		Some(outbound) => flows::lookup(outbound, *server, message).await,
+		None => shared.lookup_through(plan, exit, *server, message).await,
+	};
+	let Some(answer) = found else {
+		if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) stopped answering through exit {}", at + 1, set.servers.len(), listed(set), plan.show(server), plan.exits[exit].tag)}
+		return Step::Silent;
+	};
+	if failures.swap(0, Ordering::Relaxed) >= DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) answers again through exit {}", at + 1, set.servers.len(), listed(set), plan.show(server), plan.exits[exit].tag)}
+	plan.exits[exit].traffic.down(answer.len());
+	Step::Answered(answer, exit)
+}
+
 /// Answers one message of the DNS flow `flow` (its key and the id of its entry), which the device with the public key `device` opened. None when it is not a query, which gets no answer at all, and when that device no longer holds the address the flow came from.
 /// The query is a flow from the user to each server in turn on port 53: the rules see the server's address and the name that was asked, and the exit they choose must be one the user may use and one that carries the server's address.
 /// The plan is taken anew for each query, so a flow that outlives a reload is answered by the config that runs.
@@ -115,54 +171,23 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 	// One list of servers and no other: a query that none of them answers fails, whatever the other lists of the config could have said to it.
 	let list = plan.dns_of(user, inbound);
 	let set = &plan.dns[list];
-	// For log lines: nothing for `dns.servers`, so those read as they always did.
-	let listed = || if set.tag.is_empty() {String::new()} else {format!(" of dns set {}", set.tag)};
+	let listed = listed(set);
 	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {
 		resolver.throttled.fetch_add(1, Ordering::Relaxed);
-		tracing::debug!("inbound {tag}: user {who}{}: more than {MAX_IN_FLIGHT} dns queries at once", listed());
+		tracing::debug!("inbound {tag}: user {who}{listed}: more than {MAX_IN_FLIGHT} dns queries at once");
 		return Some(query.reply(dns::SERVFAIL));
 	};
-	for (at, server) in set.servers.iter().enumerate() {
-		let action = route::evaluate(&plan, inbound, user, server.ip(), protocol, 53, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
-		let exit = if let Action::Exit(exit) = action {*exit} else {plan.exit_of(from.device)};
-		let refusal = match (action, &plan.exits[exit].backend) {
-			(Action::Block | Action::Reject, _) => Some(Reason::Rule),
-			// The server is a destination like any other, and the node's own addresses are known only to the host.
-			_ if gate::refused(server.ip(), &plan.pools) || (shared.is_local)(server.ip()) => Some(Reason::Gate),
-			_ if plan.users[user].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) => Some(Reason::Entitlement),
-			(_, Backend::Block) => Some(Reason::BlockExit),
-			_ => None,
+	for at in 0..set.servers.len() {
+		let (exit, answer) = match ask(&shared, &plan, inbound, user, protocol, plan.exit_of(from.device), list, at, &message, asked).await {
+			Step::Refused(reason) => {
+				shared.count(reason);
+				resolver.refused.fetch_add(1, Ordering::Relaxed);
+				tracing::debug!("inbound {tag}: user {who}{listed}: dns query for {} refused: {reason:?}", plan.show(asked.unwrap_or("<no domain>")));
+				return Some(query.reply(dns::REFUSED));
+			}
+			Step::Skipped | Step::Silent => continue,
+			Step::Answered(answer, exit) => (exit, answer),
 		};
-		if let Some(reason) = refusal {
-			shared.count(reason);
-			resolver.refused.fetch_add(1, Ordering::Relaxed);
-			tracing::debug!("inbound {tag}: user {who}{}: dns query for {} refused: {reason:?}", listed(), plan.show(asked.unwrap_or("<no domain>")));
-			return Some(query.reply(dns::REFUSED));
-		}
-		// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
-		// Without `masquerade` the operator decides where that traffic goes, which the node cannot know, so such an exit carries no query of the node's resolver rather than one that takes another way out.
-		// A `chain` exit carries the query into its link like any other packet, see `chain`.
-		let outbound = match &plan.exits[exit].backend {
-			Backend::Netstack {outbound, ..} => Some(outbound),
-			Backend::L3 {masquerade: true, ..} => Some(&flows::AROUND),
-			Backend::Chain {..} => None,
-			_ => continue,
-		};
-		let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {continue};
-		// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
-		if matches!(outbound, Some(Outbound::Direct {bind: Some(bind)}) if bind.is_ipv4() != server.is_ipv4()) {continue}
-		// A `chain` exit counts the query once it went into a link, which it does not while no link is up.
-		if outbound.is_some() {plan.exits[exit].traffic.up(message.len())}
-		let found = match outbound {
-			Some(outbound) => flows::lookup(outbound, *server, &message).await,
-			None => shared.lookup_through(&plan, exit, *server, &message).await,
-		};
-		let Some(answer) = found else {
-			if failures.fetch_add(1, Ordering::Relaxed) + 1 == DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) stopped answering through exit {}", at + 1, set.servers.len(), listed(), plan.show(server), plan.exits[exit].tag)}
-			continue;
-		};
-		if failures.swap(0, Ordering::Relaxed) >= DOWN_AFTER {tracing::info!("dns: server {} of {}{} ({}) answers again through exit {}", at + 1, set.servers.len(), listed(), plan.show(server), plan.exits[exit].tag)}
-		plan.exits[exit].traffic.down(answer.len());
 		resolver.answered.fetch_add(1, Ordering::Relaxed);
 		// Only an answer to the question that was asked is remembered, and only under a name a rule could name.
 		let remembered = asked.zip(dns::response(&answer)).is_some_and(|(name, response)| response.rcode == 0 && response.question.as_ref() == Some(&query.question) && {
@@ -174,11 +199,11 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 			let moved = !Arc::ptr_eq(&now, &plan) && now.by_address.get(&flow.0.src).is_none_or(|at| now.inbounds[at.inbound].tag != tag || !now.dns[now.dns_of(now.devices[at.device].user, at.inbound)].same(set));
 			!moved && shared.flows.holds(&flow.0, flow.1) && names.record(name, &response.addresses, &plan.pools, Instant::now())
 		});
-		tracing::debug!("inbound {tag}: user {who}{}: dns query for {} answered through exit {}{}", listed(), plan.show(asked.unwrap_or("<no domain>")), plan.exits[exit].tag, if remembered {", remembered"} else {""});
+		tracing::debug!("inbound {tag}: user {who}{}: dns query for {} answered through exit {}{}", listed, plan.show(asked.unwrap_or("<no domain>")), plan.exits[exit].tag, if remembered {", remembered"} else {""});
 		return Some(answer);
 	}
 	resolver.failed.fetch_add(1, Ordering::Relaxed);
-	tracing::debug!("inbound {tag}: user {who}{}: dns query for {}: no server answered", listed(), plan.show(asked.unwrap_or("<no domain>")));
+	tracing::debug!("inbound {tag}: user {who}{}: dns query for {}: no server answered", listed, plan.show(asked.unwrap_or("<no domain>")));
 	Some(query.reply(dns::SERVFAIL))
 }
 

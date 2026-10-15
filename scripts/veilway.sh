@@ -310,6 +310,60 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Xray runs under a user of its own, started by a small host process (`veilway xray-host`) that the node asks over a socket only the node can open. So Xray has no file, key, capability or socket of the node's: its folders are out of its sight, it holds no capability but the one to bind a low port, and it ends with the node.
+xray_units() {
+	write_unit "$UNIT_DIR/veilway-xray.socket" <<EOF
+[Unit]
+Description=Veilway Xray host socket
+Documentation=https://github.com/$CORE_REPO
+
+[Socket]
+ListenStream=/run/veilway-xray/host.sock
+SocketUser=veilway
+SocketGroup=veilway
+SocketMode=0600
+DirectoryMode=0755
+
+[Install]
+WantedBy=sockets.target
+EOF
+	write_unit "$UNIT_DIR/veilway-xray.service" <<EOF
+[Unit]
+Description=Veilway Xray host
+Documentation=https://github.com/$CORE_REPO
+Requires=veilway-xray.socket
+After=veilway-xray.socket
+
+[Service]
+User=veilway-xray
+Group=veilway-xray
+ExecStart=$BIN_DIR/veilway xray-host --addons $ADDON_DIR
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+MemoryMax=1G
+TasksMax=4096
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ProtectHome=true
+# Nothing of the node's is in its sight: not its config with the keys, not its state, not its control socket.
+InaccessiblePaths=-$NODE_DIR -$STATE_DIR -$CONF_DIR -$PANEL_DIR -/run/veilway
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0077
+EOF
+}
+
 panel_unit() {
 	write_unit "$UNIT_DIR/veilway-panel.service" <<EOF
 [Unit]
@@ -522,6 +576,7 @@ do_update() {
 			fetch_and_install node
 			prepare_node_dir
 			node_unit
+			[ -f "$UNIT_DIR/veilway-xray.service" ] && xray_units
 			daemon_reload
 			svc restart veilway.service
 		else info "node is not installed, skipped"; fi
@@ -641,13 +696,14 @@ do_uninstall() {
 	do_backup || true
 	svc stop veilway.service || true; svc stop veilway-panel.service || true
 	svc disable veilway.service || true; svc disable veilway-panel.service || true
-	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true; svc disable veilway-xray.socket || true
+	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR and $PANEL_DIR? The backup above keeps a copy."; then
 		act rm -rf "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR"
-		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; }
-		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; }
+		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; act userdel veilway-xray 2>/dev/null || true; }
+		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; act deluser veilway-xray 2>/dev/null || true; }
 	else info "config and data kept"; fi
 	step "uninstalled. Backups are in $BACKUP_DIR"
 }
@@ -711,7 +767,7 @@ do_addon() {
 			if [ "$DRY" = 1 ]; then
 				dry "download Xray-core $XRAY_RELEASE (Xray-$arch.zip) from $RELEASE_BASE/XTLS/Xray-core"
 				dry "refuse unless its SHA-256 is $pin"
-				dry "install the executable into $ADDON_DIR/xray, owned by root"
+				dry "install the executable into $ADDON_DIR/xray, owned by root, and the units that run it under the user veilway-xray"
 				return 0
 			fi
 			TMP="$(mktemp -d)"
@@ -720,20 +776,29 @@ do_addon() {
 			[ "$got" = "$pin" ] || die "the archive's SHA-256 is $got, not the pinned $pin: refusing"
 			step "the archive matches the pinned SHA-256"
 			unzip -p "$TMP/xray.zip" xray >"$TMP/xray" || die "the archive has no xray executable"
+			ensure_user veilway-xray /nonexistent
 			install -d -m 0755 -o root -g root "$ADDON_DIR" "$ADDON_DIR/xray"
 			install -m 0755 -o root -g root "$TMP/xray" "$ADDON_DIR/xray/xray.new"
 			mv -f "$ADDON_DIR/xray/xray.new" "$ADDON_DIR/xray/xray"
 			step "installed Xray-core $XRAY_RELEASE in $ADDON_DIR/xray"
+			xray_units
+			daemon_reload
+			svc enable veilway-xray.socket
+			svc restart veilway-xray.socket
 			info "the node starts it when its config has an xray inbound; create one in the panel"
 			;;
 		remove)
 			need_root
+			svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true
+			svc disable veilway-xray.socket || true
+			act rm -f "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service"
 			act rm -rf "$ADDON_DIR/xray"
+			daemon_reload
 			has_systemd && systemctl is-active --quiet veilway.service && svc restart veilway.service || true
 			step "removed the xray add-on; the node stops it on its restart"
 			;;
 		status)
-			if [ -x "$ADDON_DIR/xray/xray" ]; then row "xray" "installed ($XRAY_RELEASE pinned, $(sha256sum "$ADDON_DIR/xray/xray" | cut -c1-16)...)"; else row "xray" "not installed"; fi
+			if [ -x "$ADDON_DIR/xray/xray" ]; then row "xray" "installed ($XRAY_RELEASE pinned, $(sha256sum "$ADDON_DIR/xray/xray" | cut -c1-16)...), host $(unit_state veilway-xray.socket)"; else row "xray" "not installed"; fi
 			;;
 		*) die "unknown action \"$action\": try install, remove or status" ;;
 	esac

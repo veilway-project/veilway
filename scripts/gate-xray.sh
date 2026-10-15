@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Xray add-on gate (PLAN.md, Phase 6): the node installs the pinned Xray-core with `veilway.sh addon xray install`, the panel makes a VLESS inbound for an existing user, and a stock Xray client uses the link the panel gives as a local SOCKS proxy to fetch through the node. The user's bytes show in the panel, the node's gate, rules and exits apply, and a user who is disabled or over quota loses the connection. Everything runs in Docker containers on this machine.
+# The Xray add-on gate (PLAN.md, Phase 6): the node installs the pinned Xray-core with `veilway.sh addon xray install`, the panel makes a VLESS inbound for an existing user, and a stock Xray client uses the link the panel gives (VLESS, Trojan and Shadowsocks 2022) as a local SOCKS proxy to fetch through the node. The user's bytes show in the panel, the node's gate, rules and exits apply, and a user who is disabled or over quota loses the connection. Xray runs as a user of its own with no capability, sees nothing of the node's, answers a stranger with the decoy web server, ends with the node, and its credentials are made new on request. Everything runs in Docker containers on this machine.
 #   bash scripts/gate-xray.sh                run the whole gate
 #   SKIP_BUILD=1 bash scripts/gate-xray.sh  reuse the binaries of an earlier run (Docker volume veilway-alpha-rel)
 #   KEEP=1 bash scripts/gate-xray.sh        leave the containers running afterwards (names vwxray-*)
@@ -164,14 +164,26 @@ srv sh -c "test -x $ADDONS/xray && [ \"\$(stat -c %U $ADDONS/xray)\" = root ] &&
 node_api /v1/status | grep -q '"installed":true'; check $? "the node says the add-on is installed"
 echo "== 4. the panel makes a VLESS inbound for an existing user"
 count_drive xray -e NODE_IP=$SERVER
-LINK="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["xray_link"])' "$WORK/state/state.json")"
+statekey() { python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))[sys.argv[2]])' "$WORK/state/state.json" "$1"; }
+LINK="$(statekey xray_link)"; SS_LINK="$(statekey ss_link)"; TJ_LINK="$(statekey tj_link)"
 case "$LINK" in vless://*) true ;; *) false ;; esac; check $? "the panel gives a vless:// link for alice"
+case "$SS_LINK" in ss://2022-blake3-aes-256-gcm:*) true ;; *) false ;; esac; check $? "and a Shadowsocks 2022 link with a server key and her key"
+case "$TJ_LINK" in trojan://*) true ;; *) false ;; esac; check $? "and a trojan:// link"
 [ "$FAILS" = 0 ] || { echo "== stopping: the panel side failed"; exit 1; }
 wait_for 60 srv sh -c 'ss -ltn | grep -q ":8444 "'; check $? "xray listens on the port the operator chose"
-srv sh -c 'ss -ltnp | grep "\"xray\"" | grep -v ":8444 "'; [ $? != 0 ]; check $? "xray listens on no other port, so its hop and any API stay inside the node"
+XPID="$(srv pgrep -f '^xray run -config' | head -n 1)"
+[ -n "$XPID" ]; check $? "xray runs, started by the host unit" "pid $XPID"
+srv sh -c "ss -ltnp | grep 'pid=$XPID,' | grep -v ':8444 \|:8445 \|:8446 '"; [ $? != 0 ]; check $? "xray listens on no other port, so its hop and any API stay inside the node"
 srv sh -c 'ss -ltnp | grep "\"veilway\"" | grep -q "127.0.0.1:[0-9]* .*users:"'; check $? "the node's local hop is on 127.0.0.1"
-srv sh -c 'test "$(wc -c </proc/$(pidof xray)/environ)" = 0'; check $? "xray runs with an empty environment"
-srv sh -c 'ls /var/lib/veilway /etc/veilway/node /run/veilway 2>/dev/null | grep -qi xray'; [ $? != 0 ]; check $? "no xray config file is written anywhere the node writes"
+srv sh -c "test \"\$(wc -c </proc/$XPID/environ)\" = 0"; check $? "xray runs with an empty environment"
+srv sh -c "grep -q '^CapEff:.0000000000000000\$' /proc/$XPID/status && grep -q '^CapAmb:.0000000000000000\$' /proc/$XPID/status"; check $? "xray holds no capability at all (CapEff and CapAmb are 0)" "$(srv grep -E '^Cap(Eff|Amb)' /proc/$XPID/status | tr '\n\t' '  ')"
+srv sh -c "grep -q '^NoNewPrivs:.1' /proc/$XPID/status"; check $? "xray cannot gain privileges (no_new_privs)"
+[ "$(srv stat -c %U /proc/$XPID)" = veilway-xray ] && [ "$(srv stat -c %U /proc/$(srv systemctl show -p MainPID --value veilway.service))" = veilway ]; check $? "xray runs as its own user, not the node's"
+srv sh -c "test -z \"\$(ls /proc/$XPID/root/etc/veilway/node /proc/$XPID/root/var/lib/veilway /proc/$XPID/root/run/veilway 2>/dev/null)\""; check $? "the node's config, state and control socket are out of xray's sight"
+srv sh -c "! cat /proc/$XPID/root/var/lib/veilway/veilway-state.json >/dev/null 2>&1"; check $? "xray cannot read the node's usage state"
+srv sh -c "sed -n 's/^MemoryMax=//p' /etc/systemd/system/veilway-xray.service | grep -q ."; check $? "the host unit limits xray's memory"
+srv sh -c 'ls /var/lib/veilway /etc/veilway/node /run/veilway /run/veilway-xray 2>/dev/null | grep -qi "xray.*json\|config"'; [ $? != 0 ]; check $? "no xray config file is written anywhere"
+srv sh -c "grep -r -l 'BEGIN' /proc/$XPID/cmdline /proc/$XPID/environ 2>/dev/null"; [ $? != 0 ]; check $? "the certificate key is not on xray's command line or in its environment"
 echo "== 5. a stock Xray client uses the panel's link"
 docker run -d --name $P-client --network $P-a --ip $CLIENT $LIMITS --cap-add NET_ADMIN --add-host $HOST:$SERVER -v "$WORK/xrayc":/xc:ro -v "$WORK/tls/ca.pem":/ca.pem:ro $P-tools sleep infinity >/dev/null || die "client container"
 cli sh -c 'cp /ca.pem /usr/local/share/ca-certificates/gate-ca.crt && update-ca-certificates >/dev/null 2>&1' || die "client CA"
@@ -179,8 +191,16 @@ cli ip route replace default via $RA || die "client route"
 python3 -I "$HERE/clientcfg.py" "$LINK" 1080 >"$WORK/xrayc/client.json" || die "client config"
 python3 -I "$HERE/clientcfg.py" "$LINK" 1081 --wrong >"$WORK/xrayc/wrong.json" || die "client config"
 docker exec -d $P-client sh -c '/xc/xray run -config /xc/client.json >/xray-client.log 2>&1'
+python3 -I "$HERE/clientcfg.py" "$SS_LINK" 1082 >"$WORK/xrayc/ss.json" || die "client config"
+python3 -I "$HERE/clientcfg.py" "$TJ_LINK" 1083 >"$WORK/xrayc/tj.json" || die "client config"
 docker exec -d $P-client sh -c '/xc/xray run -config /xc/wrong.json >/xray-wrong.log 2>&1'
-wait_for 20 cli sh -c 'ss -ltn | grep -q ":1080 " && ss -ltn | grep -q ":1081 "'; check $? "the stock client runs as a local SOCKS proxy"
+docker exec -d $P-client sh -c '/xc/xray run -config /xc/ss.json >/xray-ss.log 2>&1'
+docker exec -d $P-client sh -c '/xc/xray run -config /xc/tj.json >/xray-tj.log 2>&1'
+wait_for 20 cli sh -c 'ss -ltn | grep -q ":1080 " && ss -ltn | grep -q ":1081 " && ss -ltn | grep -q ":1082 " && ss -ltn | grep -q ":1083 "'; check $? "the stock client runs as a local SOCKS proxy"
+OUTPUT="$(proxied http://$RESP:8000/ 1082)"
+grep -q "src=$SERVER\$" <<<"$OUTPUT"; check $? "Shadowsocks 2022 with the server key and the user's key carries a fetch through the node" "$OUTPUT"
+OUTPUT="$(proxied http://$RESP:8000/ 1083)"
+grep -q "src=$SERVER\$" <<<"$OUTPUT"; check $? "Trojan carries a fetch through the node" "$OUTPUT"
 flows_x() { proxied "http://$RESP:8000/" | grep -q "src=$SERVER\$"; }
 blocked_x() { ! flows_x; }
 proxied() { cli curl -sS --max-time 10 --socks5-hostname 127.0.0.1:${2:-1080} "$1" 2>&1; }
@@ -190,6 +210,16 @@ OUTPUT="$(proxied http://app.gate.test:8000/)"
 grep -q "src=$SERVER\$" <<<"$OUTPUT"; check $? "a name is resolved by the node and fetched through it" "$OUTPUT"
 docker exec $P-resp grep -q "^dns app.gate.test type=1 from=$SERVER\$" /resp.log; check $? "the DNS server was asked by the node, with the node's DNS set"
 ! docker exec $P-resp grep -q "src=$CLIENT" /resp.log; check $? "the responder never saw the client's own address"
+OUTPUT="$(cli curl -sS --max-time 8 https://$HOST:8444/ 2>&1)"
+grep -q "a plain site" <<<"$OUTPUT"; check $? "a stranger on the xray port is answered by the decoy web server" "$OUTPUT"
+OUTPUT="$(cli curl -sS --max-time 8 -X POST --data x https://$HOST:8445/login 2>&1)"
+grep -q "a plain site" <<<"$OUTPUT"; check $? "and on the trojan port too" "$OUTPUT"
+! srv sh -c "journalctl -u veilway-xray.service --no-pager 2>/dev/null | grep -q '$CLIENT'"; check $? "xray logs no client address (no access log, masked addresses)"
+U1="$(node_api /v1/users/alice | grep -o '"used_bytes":[0-9]*')"; E1="$(node_api /v1/exits)"
+proxied http://nothere.gate.test:8000/ >/dev/null
+U2="$(node_api /v1/users/alice | grep -o '"used_bytes":[0-9]*')"; E2="$(node_api /v1/exits)"
+docker exec $P-resp grep -q "^dns nothere.gate.test type=1 from=$SERVER\$" /resp.log; check $? "a name that does not exist is asked of the DNS server by the node, like a tunnel's query"
+[ -n "$U1" ] && [ "$U1" != "$U2" ] && [ "$E1" != "$E2" ]; check $? "and the query counts for the user and for the exit" "$U1 -> $U2"
 ! proxied http://127.0.0.1:8000/ >/dev/null; check $? "the destination gate holds: the node's own loopback is refused"
 ! proxied http://10.55.0.1:8000/ >/dev/null; check $? "the routing rules hold: private networks are refused"
 ! proxied http://$RESP:8000/ 1081 >/dev/null; check $? "a client with another user's id gets nothing"
@@ -202,11 +232,33 @@ count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120
 wait_for 60 flows_x; check $? "and gets it back when the quota is raised"
 count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120 -e ENABLED=0
 wait_for 60 blocked_x; check $? "a disabled user loses it too"
-echo "== 8. the node refuses an executable that is not the pinned one"
-srv sh -c "pkill -x xray; printf '#!/bin/sh\nsleep 1000\n' >$ADDONS/xray.fake && chmod 755 $ADDONS/xray.fake && mv -f $ADDONS/xray.fake $ADDONS/xray"
+echo "== 8. new credentials, and xray ends with the node"
+count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120 -e ENABLED=1
+wait_for 60 flows_x; check $? "alice is back before the rotation"
+count_drive rotate -e NODE_IP=$SERVER
+NEW_LINK="$(statekey xray_link)"
+[ "$NEW_LINK" != "$LINK" ]; check $? "the panel's link for alice is a different one after the rotation"
+python3 -I "$HERE/clientcfg.py" "$NEW_LINK" 1084 >"$WORK/xrayc/new.json" || die "client config"
+docker exec -d $P-client sh -c '/xc/xray run -config /xc/new.json >/xray-new.log 2>&1'
+wait_for 20 cli sh -c 'ss -ltn | grep -q ":1084 "'
+newer_x() { proxied "http://$RESP:8000/" 1084 | grep -q "src=$SERVER\$"; }
+wait_for 60 newer_x; check $? "the new link works once the node has taken the change"
+wait_for 20 blocked_x; check $? "and the old link no longer does"
+OLD="$(srv pgrep -f '^xray run -config' | head -n 1)"
+srv systemctl stop veilway.service
+wait_for 15 srv sh -c '! pgrep -f "^xray run -config"'; check $? "xray ends when the node is stopped"
+srv systemctl start veilway.service
+wait_for 60 srv sh -c 'pgrep -f "^xray run -config"'; check $? "and comes back when the node does"
+KILLED="$(srv pgrep -f '^xray run -config' | head -n 1)"
+srv sh -c "kill -9 \$(systemctl show -p MainPID --value veilway.service)"
+wait_for 15 srv sh -c "! kill -0 $KILLED"; check $? "xray ends when the node is killed outright"
+wait_for 60 srv sh -c 'pgrep -f "^xray run -config"'; check $? "and comes back with the node that systemd starts"
+echo "== 9. the host refuses an executable that is not the pinned one"
+srv sh -c "pkill -f '^xray run -config'; printf '#!/bin/sh\nsleep 1000\n' >$ADDONS/xray.fake && chmod 755 $ADDONS/xray.fake && mv -f $ADDONS/xray.fake $ADDONS/xray"
 count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120 -e ENABLED=1
 sleep 8
 srv sh -c "journalctl -u veilway.service --no-pager 2>/dev/null | grep -q 'not the pinned release'"; check $? "the node logs that it will not run an executable that does not match its pin"
-srv sh -c 'pidof xray' >/dev/null; [ $? != 0 ]; check $? "and no xray runs"
+srv sh -c "pgrep -f '^xray run -config'" >/dev/null; [ $? != 0 ]; check $? "and no xray runs"
+srv sh -c "journalctl -u veilway-xray.service --no-pager 2>/dev/null | grep -q 'not the pinned release'"; check $? "the host logs the same refusal"
 echo "== xray gate: $FAILS failed"
 [ "$FAILS" = 0 ]

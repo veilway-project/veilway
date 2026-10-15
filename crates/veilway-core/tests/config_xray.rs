@@ -16,9 +16,9 @@ fn node() -> Value {
 		"routing": {"default": "main", "rules": []},
 		"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": key(0x21), "addresses": ["10.7.0.2"]}]}],
 		"xray": {"inbounds": [
-			{"tag": "v1", "protocol": "vless", "listen": "0.0.0.0:8444", "tls": {"cert": "node.crt", "key": "node.key"}, "clients": [{"user": "alice", "secret": UUID}]},
-			{"tag": "t1", "protocol": "trojan", "listen": "0.0.0.0:8445", "tls": {"cert": "node.crt", "key": "node.key"}, "clients": [{"user": "alice", "secret": "a-long-password"}]},
-			{"tag": "s1", "protocol": "shadowsocks", "listen": "0.0.0.0:8446", "clients": [{"user": "alice", "secret": "another/password+1="}]}
+			{"tag": "v1", "protocol": "vless", "listen": "0.0.0.0:8444", "tls": {"cert": "node.crt", "key": "node.key"}, "decoy": "http://127.0.0.1:8080", "clients": [{"user": "alice", "secret": UUID}]},
+			{"tag": "t1", "protocol": "trojan", "listen": "0.0.0.0:8445", "tls": {"cert": "node.crt", "key": "node.key"}, "decoy": "http://127.0.0.1:8080", "clients": [{"user": "alice", "secret": "a-long-password-of-enough-length"}]},
+			{"tag": "s1", "protocol": "shadowsocks", "listen": "0.0.0.0:8446", "server_key": key(0x31), "clients": [{"user": "alice", "secret": key(0x32)}]}
 		]}
 	})
 }
@@ -46,6 +46,18 @@ fn each_rule_of_the_section_holds() {
 	refused("xray.inbounds[0].clients[0].user", |doc| doc["xray"]["inbounds"][0]["clients"][0]["user"] = json!("nobody"));
 	refused("xray.inbounds[0].clients[0].secret", |doc| doc["xray"]["inbounds"][0]["clients"][0]["secret"] = json!("not-a-uuid-at-all"));
 	refused("xray.inbounds[1].clients[0].secret", |doc| doc["xray"]["inbounds"][1]["clients"][0]["secret"] = json!("short"));
+	refused("xray.inbounds[1].clients[0].secret", |doc| doc["xray"]["inbounds"][1]["clients"][0]["secret"] = json!("just-under-22-chars"));
+	refused("xray.inbounds[2].clients[0].secret", |doc| doc["xray"]["inbounds"][2]["clients"][0]["secret"] = json!("a-password-not-a-key-at-all-here"));
+	refused("xray.inbounds[2].server_key", |doc| doc["xray"]["inbounds"][2]["server_key"] = json!("c2hvcnQ="));
+	refused("xray.inbounds[2].server_key", |doc| {doc["xray"]["inbounds"][2].as_object_mut().unwrap().remove("server_key");});
+	refused("xray.inbounds[0].server_key", |doc| doc["xray"]["inbounds"][0]["server_key"] = json!(key(0x31)));
+	refused("xray.inbounds[0].decoy", |doc| {doc["xray"]["inbounds"][0].as_object_mut().unwrap().remove("decoy");});
+	refused("xray.inbounds[1].decoy", |doc| {doc["xray"]["inbounds"][1].as_object_mut().unwrap().remove("decoy");});
+	refused("xray.inbounds[2].decoy", |doc| doc["xray"]["inbounds"][2]["decoy"] = json!("http://127.0.0.1:8080"));
+	refused("xray.inbounds[0].clients[1].secret", |doc| {
+		doc["users"].as_array_mut().unwrap().push(json!({"name": "bob", "exits": "all", "devices": [{"name": "phone", "public_key": key(0x22), "addresses": ["10.7.0.3"]}]}));
+		doc["xray"]["inbounds"][0]["clients"].as_array_mut().unwrap().push(json!({"user": "bob", "secret": UUID.to_uppercase()}));
+	});
 	refused("xray.inbounds[1].clients[0].secret", |doc| doc["xray"]["inbounds"][1]["clients"][0]["secret"] = json!("has a space in it"));
 	refused("xray.inbounds[1].tag", |doc| doc["xray"]["inbounds"][1]["tag"] = json!("v1"));
 	refused("xray.inbounds[1].listen", |doc| doc["xray"]["inbounds"][1]["listen"] = json!("0.0.0.0:8444"));
@@ -56,8 +68,8 @@ fn each_rule_of_the_section_holds() {
 fn secrets_are_shown_as_markers_and_kept_for_the_same_user_of_the_same_inbound() {
 	let config = Config::parse(node().to_string().as_bytes()).unwrap();
 	let shown = config.redacted();
-	assert_eq!(shown.to_string().matches(REDACTED).count(), 4);
-	assert!(!shown.to_string().contains(UUID) && !shown.to_string().contains("a-long-password"));
+	assert_eq!(shown.to_string().matches(REDACTED).count(), 5);
+	assert!(!shown.to_string().contains(UUID) && !shown.to_string().contains("a-long-password-of-enough-length"));
 	assert!(check_marker(&shown), "a marker was taken for a secret without a running config to take it from");
 	assert!(Config::parse_keeping(shown.to_string().as_bytes(), &config).ok().map(|(kept, _)| kept) == Some(config.clone()));
 	let mut moved = shown.clone();
