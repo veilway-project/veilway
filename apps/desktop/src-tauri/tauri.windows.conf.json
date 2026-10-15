@@ -1,5 +1,5 @@
 {
   "bundle": {
-    "resources": ["resources/wintun.dll"]
+    "resources": {"resources/wintun.dll": "wintun.dll"}
   }
 }
