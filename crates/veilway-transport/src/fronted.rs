@@ -29,7 +29,8 @@ const REPEATS: usize = 3;
 // The other fields are those of Chrome's `fetch` from a page of the same host. Chrome's `Accept-Encoding` too: the node's answers are `application/octet-stream` of sealed bytes, which fronts do not compress, and an answer that comes with a content coding is refused as a fault.
 fn post(path: &str, query: &str, host: &str, body: &[u8]) -> Vec<u8> {
 	let (_, platform, mobile, _) = PLATFORM;
-	[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nsec-ch-ua: \"Google Chrome\";v=\"{CHROME}\", \"Chromium\";v=\"{CHROME}\", \"Not_A Brand\";v=\"24\"\r\nsec-ch-ua-platform: {platform}\r\nsec-ch-ua-mobile: {mobile}\r\n{}Content-Type: application/octet-stream\r\nAccept: */*\r\nOrigin: https://{host}\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\nReferer: https://{host}/\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n", body.len(), http::user_agent()).as_bytes(), body].concat()
+	// Google Chrome's brand list for its major version, from Chromium's GREASE algorithm (user_agent_utils.cc, seed = the major version): the permuted order and the "Not(A:Brand" name and version follow from 155. A Chromium build sends the same list without the first brand, which is how the capture was read.
+	[format!("POST {path}?{query} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nsec-ch-ua-platform: {platform}\r\n{}sec-ch-ua: \"Google Chrome\";v=\"{CHROME}\", \"Chromium\";v=\"{CHROME}\", \"Not(A:Brand\";v=\"24\"\r\nContent-Type: application/octet-stream\r\nsec-ch-ua-mobile: {mobile}\r\nAccept: */*\r\nOrigin: https://{host}\r\nSec-Fetch-Site: same-origin\r\nSec-Fetch-Mode: cors\r\nSec-Fetch-Dest: empty\r\nReferer: https://{host}/\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n", body.len(), http::user_agent()).as_bytes(), body].concat()
 }
 
 // Writes one request and reads its answer into `buf`, which then holds nothing else. `written` is set when the request has left whole. Where the body of a `200` lies and whether the answer ends its connection, or how the exchange stopped: by what the peer said, a `close_notify` included, or cut.
@@ -240,7 +241,7 @@ mod tests {
 		let request = post("/assets/sync.js", "token", "front.example", &[7; 40]);
 		let head = String::from_utf8_lossy(&request[..request.len() - 40]).into_owned();
 		let names: Vec<&str> = head.split("\r\n").skip(1).filter_map(|line| line.split_once(": ").map(|(name, _)| name)).collect();
-		assert_eq!(names, ["Host", "Connection", "Content-Length", "sec-ch-ua", "sec-ch-ua-platform", "sec-ch-ua-mobile", "User-Agent", "Content-Type", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language"], "{head}");
+		assert_eq!(names, ["Host", "Connection", "Content-Length", "sec-ch-ua-platform", "User-Agent", "sec-ch-ua", "Content-Type", "sec-ch-ua-mobile", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-Dest", "Referer", "Accept-Encoding", "Accept-Language"], "{head}");
 		assert!(head.contains(&format!("Chrome/{CHROME}.0.0.0 ")) && head.contains(&format!("sec-ch-ua: \"Google Chrome\";v=\"{CHROME}\"")), "{head}");
 		assert!(head.contains("Origin: https://front.example\r\n") && head.contains("Referer: https://front.example/\r\n"), "{head}");
 	}

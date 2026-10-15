@@ -12,7 +12,7 @@ use veilway_proto::websocket;
 pub const HEAD_MAX: usize = 16_384;
 
 /// The Chrome major version that `fingerprint.rs` imitates. Every header that names a version says this one.
-pub(crate) const CHROME: &str = "131";
+pub(crate) const CHROME: &str = "155";
 
 /// The client's own platform in a Chrome request: the part of the User-Agent in brackets, the client hint for the platform, the mobile hint, and the User-Agent's word for a phone. Chosen by the compile target, so a build claims only its own platform's browser.
 #[cfg(target_os = "windows")]
