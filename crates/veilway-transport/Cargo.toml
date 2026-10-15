@@ -12,7 +12,7 @@ tokio.workspace=true
 # The handshake of `tls`, `ws` and `fronted` is BoringSSL's, configured as Chrome's (`fingerprint.rs`). rustls stays for the certificate checks (`tls.rs`), which are the same as the node's and the subscription page's.
 boring={version="5.3", default-features=false}
 tokio-boring="5.3"
-# The ALPS setting has no safe call in `boring`, and Chrome's JA4 has the extension.
+# The library's reason codes (`tls.rs`), and `SSL_get_shutdown` on a shared reference (`fingerprint.rs`), which `boring` offers only on `&mut`.
 boring-sys="5.3"
 foreign-types="0.5"
 # A server may send its chain compressed, as Chrome offers.

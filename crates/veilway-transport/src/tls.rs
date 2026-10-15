@@ -6,7 +6,7 @@
 //! - Self-signed, only where the candidate's `self_signed` is true: the leaf's key must match a pin, TLS 1.3 is required, and the chain, the name and the dates are not looked at. The handshake's signature is still verified against that pinned key, by the library's own verification for TLS 1.3, so a server that shows the pinned certificate without holding its key fails. The root store plays no part.
 //!
 //! Nothing here can skip a check, and no failure is tried again with fewer. Validity is held against the system's clock, never against a clock offset: an offset comes from a `Date`, and a `Date` is read only behind a certificate that was accepted.
-//! The dial address, the server name and the `Host` of the request are three fields of a candidate and are used as that: the address is dialled as it is, with no lookup. The protocol offered is `http/1.1` alone. The hello is a browser's, made by BoringSSL (`fingerprint.rs`), and the checks below run on what it brought back.
+//! The dial address, the server name and the `Host` of the request are three fields of a candidate and are used as that: the address is dialled as it is, with no lookup. The protocol offered is `http/1.1` alone. The hello is a browser's, made by BoringSSL (`fingerprint.rs`), and the checks below run on what it brought back, the suite included: it must be key-agreed with an AEAD (`acceptable_cipher`).
 use crate::fingerprint::{self, Stream};
 use crate::{End, Ended, Front, Hook, Refuse, Unreachable};
 use boring::ssl::SslVersion;
@@ -20,6 +20,7 @@ use rustls::server::ParsedCertificate;
 use rustls::version::TLS13;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use socket2::SockRef;
+use std::error::Error;
 use std::io::ErrorKind;
 use std::sync::Arc;
 use tokio::net::TcpSocket;
@@ -27,6 +28,9 @@ use tokio::time::{timeout_at, Instant};
 use tokio_boring::SslStreamBuilder;
 
 const UNPINNED: rustls::Error = rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure);
+
+// The suites a handshake may end on: TLS 1.3's, which are all AEAD with a key agreement, and ECDHE with an AEAD. RSA key exchange and CBC are refused whatever the server picks.
+fn acceptable_cipher(name: &str) -> bool {name.starts_with("TLS_") || (name.starts_with("ECDHE-") && (name.contains("GCM") || name.contains("POLY1305")))}
 
 // The key of a leaf, when its SHA-256 is one of the pins.
 fn pinned_key(end_entity: &CertificateDer<'_>, pins: &[[u8; 32]]) -> Result<SubjectPublicKeyInfoDer<'static>, rustls::Error> {
@@ -74,7 +78,7 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 	// An empty root store was refused before this was called. Should one get here, it is no check passed.
 	let verifier = if candidate.self_signed && pinned {None} else {Some(WebPkiServerVerifier::builder_with_provider(roots.clone(), Arc::new(default_provider())).build().map_err(|_| Ended::Unreachable(Unreachable::Certificate))?)};
 	// "Empty means no server name is sent."
-	let ssl = fingerprint::connector().and_then(|connector| fingerprint::ssl(&connector, &name.to_str(), candidate.sni.is_some())).map_err(|_| tls())?;
+	let ssl = fingerprint::context().and_then(|context| fingerprint::ssl(context, &name.to_str(), candidate.sni.is_some())).map_err(|_| tls())?;
 	let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
 	if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
 	let stream = match timeout_at(deadline, socket.connect(candidate.address)).await {
@@ -86,12 +90,16 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 	let _ = stream.set_nodelay(true);
 	let stream = match timeout_at(deadline, SslStreamBuilder::new(ssl, stream).connect()).await {
 		Ok(Ok(stream)) => stream,
-		// A server that shows the pinned certificate without its key fails here, in the handshake's signature.
-		Ok(Err(error)) => return Err(if error.to_string().contains("BAD_SIGNATURE") {Ended::Unreachable(Unreachable::Certificate)} else {tls()}),
+		// A server that shows the pinned certificate without its key fails here, in the handshake's signature. The library's reason is read from its error stack.
+		Ok(Err(error)) => {
+			let bad_signature = error.source().and_then(|source| source.downcast_ref::<boring::ssl::Error>()).and_then(|cause| cause.ssl_error()).is_some_and(|stack| stack.errors().iter().any(|error| error.library_reason(boring_sys::ERR_LIB_SSL) == Some(boring_sys::SSL_R_BAD_SIGNATURE)));
+			return Err(if bad_signature {Ended::Unreachable(Unreachable::Certificate)} else {tls()})
+		}
 		Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
 	};
 	// "The client requires TLS 1.3 on a pinned candidate and accepts what the CDN negotiates otherwise." A self-signed candidate is a pinned one. The hello offers 1.2 as a browser's does, so a downgrade is refused here.
 	if pinned && stream.ssl().version2() != Some(SslVersion::TLS1_3) {return Err(tls())}
+	if !stream.ssl().current_cipher().is_some_and(|cipher| acceptable_cipher(cipher.name())) {return Err(tls())}
 	let ssl = stream.ssl();
 	let (Some(leaf), Some(chain)) = (ssl.peer_certificate().and_then(|leaf| leaf.to_der().ok()), ssl.peer_cert_chain()) else {return Err(Ended::Unreachable(Unreachable::Certificate))};
 	let leaf = CertificateDer::from(leaf);
@@ -106,5 +114,15 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 		Err(rustls::Error::InvalidCertificate(CertificateError::Expired | CertificateError::NotValidYet | CertificateError::ExpiredContext {..} | CertificateError::NotValidYetContext {..})) => Err(Ended::Unreachable(Unreachable::CertificateTime)),
 		Err(rustls::Error::InvalidCertificate(_)) => Err(Ended::Unreachable(Unreachable::Certificate)),
 		Err(_) => Err(tls()),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::acceptable_cipher;
+
+	#[test]
+	fn a_suite_is_accepted_only_with_key_agreement_and_an_aead() {
+		for (name, accepted) in [("TLS_AES_128_GCM_SHA256", true), ("TLS_CHACHA20_POLY1305_SHA256", true), ("ECDHE-ECDSA-AES128-GCM-SHA256", true), ("ECDHE-RSA-CHACHA20-POLY1305", true), ("ECDHE-RSA-AES128-SHA", false), ("ECDHE-RSA-AES256-SHA384", false), ("AES128-GCM-SHA256", false), ("DHE-RSA-AES128-GCM-SHA256", false)] {assert_eq!(acceptable_cipher(name), accepted, "{name}")}
 	}
 }

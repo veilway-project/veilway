@@ -1,13 +1,14 @@
 //! The ClientHello of `tls`, `ws` and `fronted`: a current Chrome's, made by BoringSSL, the library Chrome uses, so that a censor that reads the first flight sees a common browser and not the Rust TLS library's own (threat model, "Client TLS fingerprint").
 //! This module only decides how a handshake is sent. Who is trusted stays in `tls`: the handshake here runs with BoringSSL's own chain check off, and `tls::dial` holds the chain, the name, the dates and the pins to the same checks as before, with the same library, before a byte of application data is sent or read. The handshake's signature is still verified by BoringSSL against the leaf's key.
-//! What is matched: the cipher suites in Chrome's order, GREASE in every place Chrome puts it, extensions in a random order (as Chrome does since 110, so JA3 varies and JA4 does not), X25519MLKEM768 first among the groups with its key share next to X25519's, the signature algorithms in Chrome's order, status request, signed certificate timestamps, Brotli certificate compression, ALPS (the new codepoint), and ECH GREASE. The one thing that is not Chrome's is the ALPN: `http/1.1` alone, because this client speaks nothing else and a server that picked `h2` would break it. That is Chrome's own list for a WebSocket, and the `h1` in JA4 says so. A `fronted` session is an HTTP/1.1 client in a place where Chrome would say `h2`: that part is open.
-//! A browser's hello is right for one release. The values here are Chrome 131 and later (the ML-KEM group, the ALPS codepoint), and a new Chrome that changes them is a change in this file and its test.
+//! What is matched: the cipher suites in Chrome's order, GREASE in every place Chrome puts it, extensions in a random order (as Chrome does since 110, so JA3 varies and JA4 does not), X25519MLKEM768 first among the groups with its key share next to X25519's, the signature algorithms in Chrome's order, status request, signed certificate timestamps, Brotli certificate compression, and ECH GREASE. ALPS is not sent: Chrome sends it only for a protocol in its ALPN list, and this list is `http/1.1` alone. The one thing that is not Chrome's is the ALPN: `http/1.1` alone, because this client speaks nothing else and a server that picked `h2` would break it. That is Chrome's own list for a WebSocket, and the `h1` in JA4 says so. A `fronted` session is an HTTP/1.1 client in a place where Chrome would say `h2`: that part is open.
+//! A browser's hello is right for one release. The values here are Chrome 131 and later (the ML-KEM group), and a new Chrome that changes them is a change in this file and its test.
 #![allow(unsafe_code)]
 use boring::error::ErrorStack;
-use boring::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, Ssl, SslConnector, SslMethod, SslSignatureAlgorithm, SslVerifyMode, SslVersion};
+use boring::ssl::{CertificateCompressionAlgorithm, CertificateCompressor, Ssl, SslContext, SslContextBuilder, SslMethod, SslMode, SslOptions, SslSignatureAlgorithm, SslVerifyMode, SslVersion};
 use foreign_types::ForeignTypeRef;
 use std::io::{self, Read, Write};
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
@@ -25,9 +26,14 @@ impl CertificateCompressor for Brotli {
 	fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> io::Result<()> {io::copy(&mut brotli::Decompressor::new(input, 4096).take(LARGEST_CHAIN), output).map(|_| ())}
 }
 
-/// The context every handshake of this crate is made from. BoringSSL's own chain check is off: `tls::dial` does it afterwards.
-pub(crate) fn connector() -> Result<SslConnector, ErrorStack> {
-	let mut builder = SslConnector::builder(SslMethod::tls())?;
+static CONTEXT: OnceLock<SslContext> = OnceLock::new();
+
+/// The context every handshake of this crate is made from, built on first use. It has the settings of `SslConnector::builder` but not its default verify paths: BoringSSL's chain check is off, and `tls::dial` does the chain check afterwards from the roots it is given.
+pub(crate) fn context() -> Result<&'static SslContext, ErrorStack> {
+	if let Some(context) = CONTEXT.get() {return Ok(context)}
+	let mut builder = SslContextBuilder::new(SslMethod::tls())?;
+	builder.set_options((SslOptions::ALL | SslOptions::NO_COMPRESSION | SslOptions::NO_SSLV2 | SslOptions::NO_SSLV3 | SslOptions::SINGLE_DH_USE | SslOptions::SINGLE_ECDH_USE) & !SslOptions::DONT_INSERT_EMPTY_FRAGMENTS);
+	builder.set_mode(SslMode::AUTO_RETRY | SslMode::ACCEPT_MOVING_WRITE_BUFFER | SslMode::ENABLE_PARTIAL_WRITE | SslMode::RELEASE_BUFFERS);
 	builder.set_verify(SslVerifyMode::NONE);
 	builder.set_min_proto_version(Some(SslVersion::TLS1_2))?;
 	builder.set_max_proto_version(Some(SslVersion::TLS1_3))?;
@@ -39,21 +45,15 @@ pub(crate) fn connector() -> Result<SslConnector, ErrorStack> {
 	builder.enable_ocsp_stapling();
 	builder.enable_signed_cert_timestamps();
 	builder.add_certificate_compression_algorithm(Brotli)?;
-	builder.set_alpn_protos(b"\x08http/1.1")?;
-	Ok(builder.build())
+	Ok(CONTEXT.get_or_init(|| builder.build()))
 }
 
 /// One handshake's `Ssl`. `domain` is the server name when `sni` is set, and is sent as it is.
-pub(crate) fn ssl(connector: &SslConnector, domain: &str, sni: bool) -> Result<Ssl, ErrorStack> {
-	let ssl = connector.configure()?.use_server_name_indication(sni).verify_hostname(false).into_ssl(domain)?;
+pub(crate) fn ssl(context: &SslContext, domain: &str, sni: bool) -> Result<Ssl, ErrorStack> {
+	let mut ssl = Ssl::new(context)?;
+	if sni {ssl.set_hostname(domain)?}
+	ssl.set_alpn_protos(b"\x08http/1.1")?;
 	ssl.set_enable_ech_grease(true);
-	// ALPS is a setting the library has no safe call for. "h2" with no settings is what Chrome sends; it is only advertised, a server that answers it gets nothing back.
-	// SAFETY: `ssl` is a live SSL, and the pointers are valid for the lengths given for the time of the calls, which copy them.
-	let added = unsafe {
-		boring_sys::SSL_set_alps_use_new_codepoint(ssl.as_ptr(), 1);
-		boring_sys::SSL_add_application_settings(ssl.as_ptr(), b"h2".as_ptr(), 2, std::ptr::null(), 0)
-	};
-	if added != 1 {return Err(ErrorStack::get())}
 	Ok(ssl)
 }
 
