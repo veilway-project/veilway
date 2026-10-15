@@ -33,7 +33,7 @@ ring="0.17"
 ipnet={version="2", features=["serde"]}
 # Pictures are read in the unprivileged app, with size limits, and only to find a QR code in them.
 image={version="0.25", default-features=false, features=["png", "jpeg"]}
-rqrr="0.9"
+rqrr="0.11"
 
 # The platform layer runs in the helper, which is this same binary started with --helper and elevated once (see helper.rs).
 [target.'cfg(unix)'.dependencies]
