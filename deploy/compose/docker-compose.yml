@@ -1,0 +1,44 @@
+name: veilway
+
+# The node and the panel. The panel reaches the node's control API through the veilway-control volume, which holds the socket. See README.md in this folder.
+services:
+  node:
+    image: ghcr.io/veilway-project/veilway:latest
+    restart: unless-stopped
+    ports:
+      - "51820:51820/udp"
+      - "443:8443/tcp"
+    volumes:
+      - node-config:/etc/veilway
+      - node-data:/var/lib/veilway
+      - control:/run/veilway
+
+  panel:
+    image: ghcr.io/veilway-project/veilway-panel:latest
+    restart: unless-stopped
+    # The panel listens on 127.0.0.1 inside the container, which only the host network can reach. Its port is the one in panel.json, 8480 here.
+    network_mode: host
+    depends_on:
+      - node
+    volumes:
+      - panel-config:/etc/veilway-panel
+      - panel-data:/var/lib/veilway-panel
+      - control:/run/veilway
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "8480"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  node-config:
+    name: veilway-node-config
+  node-data:
+    name: veilway-node-data
+  panel-config:
+    name: veilway-panel-config
+  panel-data:
+    name: veilway-panel-data
+  control:
+    name: veilway-control

@@ -1,0 +1,17 @@
+.git
+.github
+.claude
+target
+**/target
+apps
+fuzz
+packages
+deploy
+**/node_modules
+*.local.md
+**/*.keys
+**/*.pem
+**/*.db
+config.json
+veilway-state.json
+veilway-replay
