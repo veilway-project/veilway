@@ -36,6 +36,7 @@ connected() { cli veilway status 2>/dev/null | grep -q "^State: Connected"; }
 down() { cli veilway status 2>/dev/null | grep -q "^State: .*\(Reconnecting\|Connecting\|lost\)"; }
 flows() { cli curl -sS --max-time 5 "http://$RESP:8000/" 2>/dev/null | grep -q "src=$SERVER\$"; }
 tunnelled() { cli curl -sS --max-time 8 "http://$RESP:8000/" 2>&1; }
+proxied() { cli curl -sS --max-time 10 --socks5-hostname 127.0.0.1:${2:-1080} "$1" 2>&1; }
 build_wait() { while docker ps --format '{{.Image}} {{.Names}}' | grep -E '^(rust|node)' | grep -v "$P" | grep -q .; do echo "another build runs, waiting"; sleep 20; done; }
 drive() { local cmd=$1; shift; docker run --rm --network $P-b --add-host $HOST:$SERVER -v "$WORK/state":/state -v "$WORK/tls/ca.pem":/ca.pem:ro -v "$HERE/drive.py":/drive.py:ro -e STATE=/state -e CA=/ca.pem -e PANEL_HOST=$HOST -e PANEL_PREFIX="$PREFIX" -e NODE_IP=$SERVER -e DNS_IP=$RESP -e ENDPOINT_PIN="$ENDPOINT_PIN" "$@" $P-tools python3 -I /drive.py "$cmd"; }
 count_drive() { local out rc lines; out="$(drive "$@" 2>&1)"; rc=$?; echo "$out"; lines=$(grep -c '^FAIL' <<<"$out"); [ "$lines" = 0 ] && [ "$rc" != 0 ] && lines=1; FAILS=$((FAILS + lines)); }
@@ -179,10 +180,10 @@ srv sh -c "test \"\$(wc -c </proc/$XPID/environ)\" = 0"; check $? "xray runs wit
 srv sh -c "grep -q '^CapEff:.0000000000000000\$' /proc/$XPID/status && grep -q '^CapAmb:.0000000000000000\$' /proc/$XPID/status"; check $? "xray holds no capability at all (CapEff and CapAmb are 0)" "$(srv grep -E '^Cap(Eff|Amb)' /proc/$XPID/status | tr '\n\t' '  ')"
 srv sh -c "grep -q '^NoNewPrivs:.1' /proc/$XPID/status"; check $? "xray cannot gain privileges (no_new_privs)"
 [ "$(srv stat -c %U /proc/$XPID)" = veilway-xray ] && [ "$(srv stat -c %U /proc/$(srv systemctl show -p MainPID --value veilway.service))" = veilway ]; check $? "xray runs as its own user, not the node's"
-srv sh -c "test -z \"\$(ls /proc/$XPID/root/etc/veilway/node /proc/$XPID/root/var/lib/veilway /proc/$XPID/root/run/veilway 2>/dev/null)\""; check $? "the node's config, state and control socket are out of xray's sight"
+srv nsenter -t $XPID -m setpriv --reuid veilway-xray --regid veilway-xray --clear-groups sh -c "! ls /etc/veilway/node >/dev/null 2>&1 && ! ls /var/lib/veilway >/dev/null 2>&1 && ! ls /run/veilway >/dev/null 2>&1"; check $? "the node's config, state and control socket are out of xray's sight (tried as its user, in its own mounts)"
 srv sh -c "! cat /proc/$XPID/root/var/lib/veilway/veilway-state.json >/dev/null 2>&1"; check $? "xray cannot read the node's usage state"
 srv sh -c "sed -n 's/^MemoryMax=//p' /etc/systemd/system/veilway-xray.service | grep -q ."; check $? "the host unit limits xray's memory"
-srv sh -c 'ls /var/lib/veilway /etc/veilway/node /run/veilway /run/veilway-xray 2>/dev/null | grep -qi "xray.*json\|config"'; [ $? != 0 ]; check $? "no xray config file is written anywhere"
+srv sh -c 'find /var/lib/veilway /etc/veilway /run/veilway /run/veilway-xray /tmp -type f \( -iname "*xray*" -o -iname "*.json" \) 2>/dev/null | grep -v "/etc/veilway/node/config.json\|/etc/veilway/panel.json\|/var/lib/veilway/veilway-state.json" | xargs -r grep -l "\"inbounds\"" 2>/dev/null | grep -q .'; [ $? != 0 ]; check $? "no xray config file is written anywhere"
 srv sh -c "grep -r -l 'BEGIN' /proc/$XPID/cmdline /proc/$XPID/environ 2>/dev/null"; [ $? != 0 ]; check $? "the certificate key is not on xray's command line or in its environment"
 echo "== 5. a stock Xray client uses the panel's link"
 docker run -d --name $P-client --network $P-a --ip $CLIENT $LIMITS --cap-add NET_ADMIN --add-host $HOST:$SERVER -v "$WORK/xrayc":/xc:ro -v "$WORK/tls/ca.pem":/ca.pem:ro $P-tools sleep infinity >/dev/null || die "client container"
@@ -203,7 +204,6 @@ OUTPUT="$(proxied http://$RESP:8000/ 1083)"
 grep -q "src=$SERVER\$" <<<"$OUTPUT"; check $? "Trojan carries a fetch through the node" "$OUTPUT"
 flows_x() { proxied "http://$RESP:8000/" | grep -q "src=$SERVER\$"; }
 blocked_x() { ! flows_x; }
-proxied() { cli curl -sS --max-time 10 --socks5-hostname 127.0.0.1:${2:-1080} "$1" 2>&1; }
 OUTPUT="$(proxied http://$RESP:8000/)"
 grep -q "src=$SERVER\$" <<<"$OUTPUT"; check $? "a web server behind the node sees the node's address, not the client's" "$OUTPUT"
 OUTPUT="$(proxied http://app.gate.test:8000/)"
