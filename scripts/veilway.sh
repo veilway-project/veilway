@@ -11,8 +11,13 @@
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
-# comment must read "veilway <tag> <asset>". Nothing is installed without that check.
-# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480), VEILWAY_PANEL_PUBKEY (default: the key below).
+# comment must read "veilway <tag> <asset>" for the node and "veilway-panel <tag> <asset>" for the panel.
+# Nothing is installed without that check.
+# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480).
+# For testing only, to run against a release server of your own (scripts/gate-alpha.sh does): VEILWAY_RELEASE_BASE
+# (default https://github.com, still https only), VEILWAY_RAW_BASE (default https://raw.githubusercontent.com),
+# VEILWAY_NODE_PUBKEY and VEILWAY_PANEL_PUBKEY (default: the key below). They change where a download comes from
+# and which key is trusted. The checks themselves are the same.
 set -euo pipefail
 umask 022
 
@@ -20,7 +25,10 @@ SCRIPT_VERSION="1.0.0"
 CORE_REPO="veilway-project/veilway"
 PANEL_REPO="veilway-project/veilway-panel"
 PUBKEY="RWQiodKlFCiJ3bkZD3ojKV7AYyTYf3F5x/XY8upWvpSFTVm3O2cNRbrV"
+NODE_PUBKEY="${VEILWAY_NODE_PUBKEY:-$PUBKEY}"
 PANEL_PUBKEY="${VEILWAY_PANEL_PUBKEY:-$PUBKEY}"
+RELEASE_BASE="${VEILWAY_RELEASE_BASE:-https://github.com}"
+RAW_BASE="${VEILWAY_RAW_BASE:-https://raw.githubusercontent.com}"
 PANEL_PORT="${VEILWAY_PANEL_PORT:-8480}"
 BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/veilway"
@@ -154,20 +162,20 @@ fetch() {
 
 latest_tag() {
 	local repo="$1" url
-	url="$(curl -fsSL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest")" || die "cannot reach GitHub"
+	url="$(curl -fsSL --proto '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' "$RELEASE_BASE/$repo/releases/latest")" || die "cannot reach GitHub"
 	case "$url" in */releases/tag/*) printf '%s' "${url##*/}" ;; *) die "$repo has no published release yet" ;; esac
 }
 
 # Downloads one asset with its signature into $TMP and refuses unless both the signature and the trusted comment match.
 download_verified() {
-	local repo="$1" key="$2" name="$3" tag="$4" base out comment
-	base="https://github.com/$repo/releases/download/$tag"
+	local repo="$1" key="$2" name="$3" tag="$4" product="$5" base out comment
+	base="$RELEASE_BASE/$repo/releases/download/$tag"
 	out="$TMP/$name"
 	fetch "$base/$name" "$out" "downloading $name $tag"
 	fetch "$base/$name.minisig" "$out.minisig" "downloading signature"
 	out="$(minisign -V -m "$TMP/$name" -x "$TMP/$name.minisig" -P "$key" 2>&1)" || die "signature check failed for $name: $out"
 	comment="$(printf '%s\n' "$out" | sed -n 's/^Trusted comment: //p' | head -n 1)"
-	[ "$comment" = "veilway $tag $name" ] || die "signature is for \"$comment\", expected \"veilway $tag $name\": refusing"
+	[ "$comment" = "$product $tag $name" ] || die "signature is for \"$comment\", expected \"$product $tag $name\": refusing"
 	step "signature verified ($name $tag)"
 }
 
@@ -180,17 +188,17 @@ install_binary() {
 }
 
 fetch_and_install() {
-	local which="$1" repo key name dest tag
-	if [ "$which" = node ]; then repo="$CORE_REPO"; key="$PUBKEY"; name="veilway-$TARGET"; dest="$BIN_DIR/veilway"
-	else repo="$PANEL_REPO"; key="$PANEL_PUBKEY"; name="veilway-panel-$TARGET"; dest="$BIN_DIR/veilway-panel"; fi
+	local which="$1" repo key name dest tag product
+	if [ "$which" = node ]; then repo="$CORE_REPO"; key="$NODE_PUBKEY"; product=veilway; name="veilway-$TARGET"; dest="$BIN_DIR/veilway"
+	else repo="$PANEL_REPO"; key="$PANEL_PUBKEY"; product=veilway-panel; name="veilway-panel-$TARGET"; dest="$BIN_DIR/veilway-panel"; fi
 	if [ "$DRY" = 1 ]; then
 		dry "resolve ${WANT_VERSION:-the latest tag} of $repo"
-		dry "download $name and $name.minisig, verify with minisign key ${key:0:12}..., match comment \"veilway <tag> $name\""
+		dry "download $name and $name.minisig, verify with minisign key ${key:0:12}..., match comment \"$product <tag> $name\""
 		dry "install -m 0755 $dest"
 		return 0
 	fi
 	tag="$(release_tag "$repo")"
-	download_verified "$repo" "$key" "$name" "$tag"
+	download_verified "$repo" "$key" "$name" "$tag" "$product"
 	install_binary "$TMP/$name" "$dest"
 	step "installed $dest ($tag)"
 	if [ "$which" = node ]; then printf '%s\n' "$tag" >"$STATE_DIR/node.version"; else printf '%s\n' "$tag" >"$PANEL_DIR/panel.version"; fi
@@ -246,7 +254,8 @@ NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 ProtectSystem=strict
-ReadWritePaths=$STATE_DIR
+# The node writes the config it applied through the control API and the key of a self-signed tls certificate next to it.
+ReadWritePaths=$STATE_DIR $CONF_DIR
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=false
@@ -315,26 +324,40 @@ install_node() {
 	step "node"
 	ensure_user veilway "$STATE_DIR"
 	act install -d -m 0750 -o veilway -g veilway "$STATE_DIR"
-	act install -d -m 0750 -o root -g veilway "$CONF_DIR"
+	act install -d -m 0770 -o root -g veilway "$CONF_DIR"
 	fetch_and_install node
 	node_unit
 	daemon_reload
-	if [ "$DRY" = 1 ] || [ ! -f "$CONF_DIR/config.json" ]; then
-		if [ "$DRY" != 1 ]; then
-			tag="$(cat "$STATE_DIR/node.version" 2>/dev/null || echo main)"
-			if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "https://raw.githubusercontent.com/$CORE_REPO/$tag/config.example.json" 2>/dev/null; then
-				step "wrote $CONF_DIR/config.example.json"
-			fi
-		else dry "write $CONF_DIR/config.example.json from the release tag"; fi
-		warn "no $CONF_DIR/config.json yet: the node is enabled but not started"
-		info "make keys with: veilway genkey"
-		info "copy config.example.json to config.json, edit it, then: sudo bash veilway.sh check"
-		svc enable veilway.service
+	if [ "$DRY" = 1 ]; then
+		dry "write $CONF_DIR/config.example.json from the release tag"
+		dry "write $CONF_DIR/config.json if there is none: no inbound and one direct exit, for the panel to fill in"
 	else
+		tag="$(cat "$STATE_DIR/node.version" 2>/dev/null || echo main)"
+		if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "$RAW_BASE/$CORE_REPO/$tag/config.example.json" 2>/dev/null; then
+			step "wrote $CONF_DIR/config.example.json"
+		fi
+		# A node needs a config to run, and the panel needs a running node to change it, so a fresh install starts with a node that has no inbound.
+		if [ ! -f "$CONF_DIR/config.json" ]; then
+			cat >"$CONF_DIR/config.json" <<'EOF'
+{
+	"version": 1,
+	"dns": {"servers": ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]},
+	"inbounds": [],
+	"users": [],
+	"outbounds": [{"tag": "plain", "type": "direct"}],
+	"exits": [{"tag": "main", "name": "This server", "backend": {"type": "netstack", "outbound": "plain"}}],
+	"routing": {"default": "main", "rules": [
+		{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"},
+		{"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}
+	]}
+}
+EOF
+			step "wrote $CONF_DIR/config.json: no inbound yet, add one in the panel"
+		fi
 		chown veilway:veilway "$CONF_DIR/config.json"
 		chmod 0600 "$CONF_DIR/config.json"
-		if run_check; then svc enable veilway.service; svc restart veilway.service; else warn "config has errors: the node was not restarted"; fi
 	fi
+	if run_check; then svc enable veilway.service; svc restart veilway.service; else warn "config has errors: the node was not restarted"; fi
 }
 
 install_panel() {
@@ -342,7 +365,7 @@ install_panel() {
 	ensure_user veilway "$STATE_DIR"
 	ensure_user veilway-panel "$PANEL_DIR"
 	act install -d -m 0750 -o veilway-panel -g veilway-panel "$PANEL_DIR"
-	act install -d -m 0750 -o root -g veilway "$CONF_DIR"
+	act install -d -m 0770 -o root -g veilway "$CONF_DIR"
 	fetch_and_install panel
 	panel_config
 	panel_unit
@@ -401,7 +424,7 @@ panel_summary() {
 		"            reverse_proxy $sub/* 127.0.0.1:$PANEL_PORT }" \
 		"" \
 		"Admin pages: https://your-domain$prefix/" \
-		"${token:+Setup token (one time): $token}${token:-Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'}" \
+		"$([ -n "$token" ] && echo "Setup token (one time): $token" || echo "Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'")" \
 		"Send it with a username and password to POST $prefix/api/setup."
 }
 
