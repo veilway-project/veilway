@@ -76,6 +76,8 @@ export const en = {
 	"import.added": "Subscription added",
 	"library.title": "Subscriptions",
 	"library.add": "Add",
+	"library.empty": "No subscriptions yet",
+	"library.emptyBody": "Add the link, file or QR picture your provider gave you.",
 	"library.standing.current": "Up to date",
 	"library.standing.out_of_date": "Needs a refresh",
 	"library.standing.stale": "Out of date",

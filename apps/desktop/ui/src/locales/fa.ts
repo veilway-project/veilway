@@ -77,6 +77,8 @@ export const fa: Record<DesktopKey, string> = {
 	"import.added": "اشتراک اضافه شد",
 	"library.title": "اشتراک‌ها",
 	"library.add": "افزودن",
+	"library.empty": "هنوز اشتراکی ندارید",
+	"library.emptyBody": "لینک، فایل یا تصویر QR که ارائه‌دهنده به شما داده را اضافه کنید.",
 	"library.standing.current": "به‌روز",
 	"library.standing.out_of_date": "به‌روزرسانی لازم است",
 	"library.standing.stale": "قدیمی",
