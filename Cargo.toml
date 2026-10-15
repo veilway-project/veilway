@@ -28,7 +28,7 @@ boringtun={version="0.7", default-features=false}
 ipstack="1"
 ipnet={version="2", features=["serde"]}
 base64="0.23"
-rand_core={version="0.6", features=["getrandom"]}
+rand_core={version="0.10", features=["getrandom"]}
 etherparse="0.21"
 wintun-bindings="0.7"
 windows-sys="0.61"
