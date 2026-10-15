@@ -93,8 +93,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 	if random(&mut nonce).is_err() {return End::Random.into()}
 	let (key, roots, hook, device, keepalive) = (STANDARD.encode(nonce), port.env.roots.clone(), port.env.socket.clone(), port.env.device.clone(), lone(&first));
 	let (host, agent) = (tls::host(candidate), http::user_agent());
-	// Chrome's order for a WebSocket upgrade over HTTP/1.1. `identity` as in `fronted`. No `Sec-WebSocket-Extensions`, since no extension is negotiated.
-	let request = format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: identity\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\n\r\n", proof.token);
+	// Chrome's order for a WebSocket upgrade over HTTP/1.1. No `Sec-WebSocket-Extensions`, since no extension is negotiated.
+	let request = format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\n\r\n", proof.token);
 	// The dial, the request and its answer. The 10 s for the answer and for the node's first chunk run from the moment the request is written: the node's own 10 s for a session it took run from about then.
 	let opening = async {
 		let (mut io, mut buf) = (tls::dial(candidate, &roots, &hook, dialled).await?, Vec::with_capacity(HEAD_MAX));

@@ -112,7 +112,7 @@ pub fn whole(bytes: &[u8]) -> Result<Option<usize>, Answer> {
 	let Some(end) = end(bytes).filter(|end| *end <= HEAD_MAX) else {return if bytes.len() >= HEAD_MAX {Err(Answer::NotHttp)} else {Ok(None)}};
 	let head = head(&bytes[..end]).ok_or(Answer::NotHttp)?;
 	if head.status != 200 || !head.current {return Err(Answer::Status(head.status))}
-	let length = head.one("content-length").filter(|digits| (1..=5).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) && head.values("transfer-encoding").next().is_none()).ok_or(Answer::Body)?;
+	let length = head.one("content-length").filter(|digits| (1..=5).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) && head.values("transfer-encoding").next().is_none() && head.values("content-encoding").all(|coding| coding.eq_ignore_ascii_case(b"identity"))).ok_or(Answer::Body)?;
 	let length = length.iter().fold(0usize, |length, digit| length * 10 + usize::from(digit - b'0'));
 	if (BODY_MIN..=BODY_MAX).contains(&length) {Ok(Some(end + length))} else {Err(Answer::Body)}
 }
