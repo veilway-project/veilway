@@ -11,6 +11,7 @@ use veilway_proto::subscription::Tag;
 
 /// "Refuses more than 512 by 512 pixels."
 const LOGO_SIDE: u32 = 512;
+const LOGO_BYTES_MAX: usize = 64 << 10;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct NoticeOut {pub severity: String, pub text: String}
@@ -86,6 +87,9 @@ pub enum CardOut {
 pub struct ProfileOut {pub id: String, pub name: String, pub exits: Vec<(String, String)>}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LogoOut {pub kind: String, pub data: String}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct SubscriptionOut {
 	pub id: String,
 	/// The provider's own claim, shown with the fingerprint of its key and never as a verified name.
@@ -98,11 +102,26 @@ pub struct SubscriptionOut {
 	pub cards: Vec<CardOut>,
 	pub notices: Vec<NoticeOut>,
 	pub support: Vec<(String, String)>,
-	/// `data:` URL of the logo, only when it passed the checks.
-	pub logo: Option<String>,
+	/// The logo's bytes as the provider sent them, within a size cap and not looked into. The helper never decodes a picture: the window checks it once with `brand` before it is shown.
+	pub logo: Option<LogoOut>,
 	/// `#rrggbb`
 	pub accent: Option<String>,
 	pub left_out: usize,
+}
+
+/// Replaces every `logo` of a library or a review (`{kind, data}` as the helper sent it) with a `data:` URL when the picture passes `logo_url`, and with null when it does not. Runs in the window, the process without rights.
+pub fn brand(value: &mut serde_json::Value) {
+	match value {
+		serde_json::Value::Array(items) => items.iter_mut().for_each(brand),
+		serde_json::Value::Object(map) => {
+			if let Some(logo) = map.get("logo").and_then(|logo| logo.as_object()) {
+				let url = logo.get("kind").and_then(|kind| kind.as_str()).and_then(|kind| match kind {"png" => Some(LogoKind::Png), "jpeg" => Some(LogoKind::Jpeg), _ => None}).zip(logo.get("data").and_then(|data| data.as_str()).and_then(|data| base64::engine::general_purpose::STANDARD.decode(data).ok())).and_then(|(kind, data)| logo_url(kind, &data));
+				map.insert("logo".into(), url.map_or(serde_json::Value::Null, serde_json::Value::String));
+			}
+			if let Some(preview) = map.get_mut("preview") {brand(preview)}
+		}
+		_ => {}
+	}
 }
 
 /// A logo is the provider's bytes. It is shown only when it decodes as the format it claims and is no larger than 512 by 512, so a hostile image is never handed to the webview's own decoder.
@@ -137,7 +156,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		}).collect(),
 		notices: subscription.notices.iter().map(|found| notice(found, languages)).collect(),
 		support: subscription.support.iter().map(|link| (link.label.pick(languages).0.into(), link.url.as_str().into())).collect(),
-		logo: subscription.logo.as_ref().and_then(|logo| logo_url(logo.kind, &logo.data)),
+		logo: subscription.logo.as_ref().filter(|logo| logo.data.len() <= LOGO_BYTES_MAX).map(|logo| LogoOut {kind: logo.kind.word().into(), data: base64::engine::general_purpose::STANDARD.encode(&logo.data)}),
 		accent: subscription.accent.map(|[red, green, blue]| format!("#{red:02x}{green:02x}{blue:02x}")),
 		left_out: subscription.left_out,
 	}
@@ -164,6 +183,16 @@ mod tests {
 		let text = serde_json::to_string(&status_view(&status(State::Connected {exit: Some("main".into())}), None)).unwrap().to_lowercase();
 		for word in ["protected", "detectable", "rating", "nocover", "obfs", "fronted", "websocket", "transport"] {assert!(!text.contains(word), "{word} in {text}")}
 		assert!(text.contains("\"exit\":\"main\""));
+	}
+
+	#[test]
+	fn the_window_turns_a_raw_logo_into_a_url_or_nothing() {
+		let mut png = Vec::new();
+		image::DynamicImage::new_rgb8(8, 8).write_to(&mut Cursor::new(&mut png), ImageFormat::Png).unwrap();
+		let mut value = serde_json::json!([{"logo": {"kind": "png", "data": base64::engine::general_purpose::STANDARD.encode(&png)}}, {"preview": {"logo": {"kind": "png", "data": "bm90IGFuIGltYWdl"}}}, {"logo": null}]);
+		brand(&mut value);
+		assert!(value[0]["logo"].as_str().unwrap().starts_with("data:image/png;base64,"));
+		assert!(value[1]["preview"]["logo"].is_null() && value[2]["logo"].is_null());
 	}
 
 	#[test]

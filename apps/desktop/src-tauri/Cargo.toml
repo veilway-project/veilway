@@ -36,17 +36,19 @@ rqrr="0.9"
 # The platform layer runs in the helper, which is this same binary started with --helper and elevated once (see helper.rs).
 [target.'cfg(unix)'.dependencies]
 libc="0.2.150"
+# The helper opens the one folder of the user's that it reads from with openat, never following a link.
+rustix={version="1", default-features=false, features=["std", "process", "fs"]}
 
 [target.'cfg(target_os = "linux")'.dependencies]
 veilway-linux={path="../../../crates/veilway-linux"}
-rustix={version="1", default-features=false, features=["std", "process"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
 veilway-macos={path="../../../crates/veilway-macos"}
-rustix={version="1", default-features=false, features=["std", "process"]}
 
 [target.'cfg(windows)'.dependencies]
 veilway-windows={path="../../../crates/veilway-windows"}
+# ShellExecuteExW with runas for the one elevation prompt, and the pipe's access list for the helper.
+windows-sys={version="0.61", features=["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_UI_Shell"]}
 
 [dev-dependencies]
 veilway-engine={path="../../../crates/veilway-engine", features=["unencrypted-vault", "testing"]}
