@@ -342,6 +342,10 @@ The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbo
 - **Downlink**: polled answers, as today, or one long-lived Server-Sent Events stream that the node writes to as soon as a packet is there. SSE is text, so its packets are base64 (about a third more bytes); `text/event-stream` is the type CDNs most reliably pass without buffering. A stream whose first events come late falls back to polling.
 - To settle in the spec: uplink requests can arrive out of order (sequence numbers, still no second retransmission layer), padding and timing jitter for every shape, reconnects of the stream at random lengths, and a panel check that a chosen shape passes the operator's actual CDN (custom methods and GET bodies are often refused or dropped).
 
+## Bonded connections (after the alpha, opt-in)
+
+Today parallel connections of `tls` and `ws` keep one inner flow on one connection, so a single download is never faster than one connection. Some networks throttle each TCP connection, not the user. A profile may allow a bonded mode, which the user turns on: datagrams of one flow are spread over the open connections with a sequence number, and the receiver, on both sides, keeps a small reorder window with a short timeout (about 50 ms) and lets go of what it holds when the timeout passes. Still no second retransmission layer: real loss is left to the inner TCP. Bounded memory per tunnel on the node. Measure it against flow hashing on throttled and lossy networks before it is offered; a stalled connection blocks every flow behind it, which can make it slower than one connection.
+
 ## Xray add-on
 
 Off by default, installed on request, removable.
