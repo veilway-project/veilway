@@ -347,6 +347,14 @@ The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbo
 
 Today parallel connections of `tls` and `ws` keep one inner flow on one connection, so a single download is never faster than one connection. Some networks throttle each TCP connection, not the user. A profile may allow a bonded mode, which the user turns on: datagrams of one flow are spread over the open connections with a sequence number, and the receiver, on both sides, keeps a small reorder window with a short timeout (about 50 ms) and lets go of what it holds when the timeout passes. Still no second retransmission layer: real loss is left to the inner TCP. Bounded memory per tunnel on the node. Measure it against flow hashing on throttled and lossy networks before it is offered; a stalled connection blocks every flow behind it, which can make it slower than one connection.
 
+## HTTP/2 on the stream transports (after the alpha)
+
+The client's TLS hello looks like Chrome's, but `fronted` and the WebSocket upgrade of `tls` and `ws` speak HTTP/1.1, where Chrome offers and uses `h2`. The owner asked for HTTP/2: ALPN `h2` in the hello, Chrome's SETTINGS, window sizes, priority and pseudo-header order, WebSocket over HTTP/2 (RFC 8441) where the server offers it, and `fronted` requests as HTTP/2 streams. The node side and the decoy handoff must answer HTTP/2 as well. Spec first.
+
+## Reality-style mode (after the alpha)
+
+`tls` shows the node's own certificate, which is why it is rated Detectable. The owner asked for a mode where the node presents a real site's handshake: a client that proves itself in its hello gets the tunnel, everyone else is relayed byte for byte to the real site and sees its genuine certificate. The hardest mode to get right (the proof in the hello, replay, active probes, the chosen site's own behavior), so it gets its own spec, its own threat model section and an outside review before it is offered. Never copy code from Xray (MPL).
+
 ## Xray add-on
 
 Off by default, installed on request, removable.
