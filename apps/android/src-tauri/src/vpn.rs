@@ -103,7 +103,7 @@ async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, mut on
 			changed = own_rx.changed() => {
 				changed?;
 				let Own {networks, description} = own_rx.borrow_and_update().clone();
-				tracing::info!(networks = networks.len(), %description, "the device's networks changed");
+				tracing::info!(networks = networks.len(), "the device's networks changed");
 				tunnel.moved(description, networks);
 			}
 			() = &mut stop => return Ok(()),

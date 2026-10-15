@@ -8,6 +8,7 @@ use jni::sys::{jboolean, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use socket2::SockRef;
 use std::os::fd::{AsRawFd, RawFd};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock, OnceLock};
 use tokio::sync::watch;
 use veilway_proto::subscription::payload::Network;
@@ -143,6 +144,12 @@ pub extern "system" fn Java_io_github_veilwayproject_app_Native_disconnect<'a>(m
 		None => Ok(serde_json::Value::Null),
 	};
 	answer(&mut env, result)
+}
+
+/// Whether the system's always-on VPN blocks the internet without the tunnel. Kotlin says it when the service starts.
+#[no_mangle]
+pub extern "system" fn Java_io_github_veilwayproject_app_Native_lockdown(_: JNIEnv, _: JClass, on: jboolean) {
+	host::LOCKDOWN.store(on == JNI_TRUE, Ordering::Relaxed);
 }
 
 /// The networks the device is on, as `address/prefix` strings: its addresses on networks that are not the VPN, and the gateway. The engine skips an address of the profile that lies inside one of them, and reconnects when the networks change.

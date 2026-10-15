@@ -4,7 +4,7 @@
 use crate::logs::{LogLayer, START};
 use crate::proto::{Call, Options, Out, Source};
 use crate::view::{library_view, status_view, subscription_view, tags, AppliedOut, SubscriptionOut};
-use crate::vault::AndroidVault;
+use crate::vault::{AndroidVault, KEY_LOST};
 use crate::vpn;
 use anyhow::Context;
 use base64::Engine;
@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing_subscriber::layer::SubscriberExt;
@@ -34,7 +35,7 @@ enum Pending {
 	Reviewed(Reviewed),
 }
 
-struct Running {subscription: String, stop: Arc<Notify>, answers: mpsc::UnboundedSender<bool>, done: watch::Receiver<bool>}
+struct Running {subscription: String, profile: String, stop: Arc<Notify>, answers: mpsc::UnboundedSender<bool>, done: watch::Receiver<bool>}
 
 pub struct Core {
 	library: AsyncMutex<Library>,
@@ -71,6 +72,7 @@ impl Core {
 	/// One request. The error is the text the window shows.
 	pub async fn call(self: &Arc<Self>, call: Call) -> Result<Value, String> {
 		let fetcher = || Fetcher::new(default_roots(), None);
+		if matches!(call, Call::ImportOpen {..} | Call::ImportProceed | Call::Refresh {..}) && LOCKDOWN.load(Ordering::Relaxed) && self.running.lock().unwrap().is_none() {return Err("Connect first. With Always-on VPN and lockdown, subscriptions are fetched only through the tunnel.".into())}
 		match call {
 			Call::Hello {..} | Call::Auth {..} => Ok(Value::Null),
 			Call::Library {languages} => {
@@ -184,8 +186,8 @@ impl Core {
 		if !held.subscription().profiles.iter().any(|candidate| candidate.id == profile) {return Err("That connection is not in the subscription.".into())}
 		let (stop, (answers, replies), (done_tx, done)) = (Arc::new(Notify::new()), mpsc::unbounded_channel(), watch::channel(false));
 		let mut running = self.running.lock().unwrap();
-		if running.is_some() {return Err("Already connected.".into())}
-		let (core, notify) = (self.clone(), stop.clone());
+		if let Some(current) = running.as_ref() {return if current.subscription == subscription && current.profile == profile {Ok(Value::Null)} else {Err("Already connected.".into())}}
+		let (core, notify, kept) = (self.clone(), stop.clone(), profile.clone());
 		// The engine and the platform layer are driven on a runtime of their own, on a thread of their own: their futures need not be Send, and nothing the window does can block them.
 		std::thread::Builder::new().name("tunnel".into()).spawn(move || {
 			let ended = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
@@ -200,7 +202,7 @@ impl Core {
 			crate::bridge::ended(error.as_deref());
 			let _ = done_tx.send(true);
 		}).map_err(|error| error.to_string())?;
-		*running = Some(Running {subscription, stop, answers, done});
+		*running = Some(Running {subscription, profile: kept, stop, answers, done});
 		Ok(Value::Null)
 	}
 
@@ -282,6 +284,8 @@ static HOST: OnceLock<Host> = OnceLock::new();
 static SINK: OnceLock<Box<dyn Fn(Out) + Send + Sync>> = OnceLock::new();
 static LOGS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 const LOG_KEEP: usize = 200;
+/// Set by Kotlin while the system's always-on VPN blocks the internet without the tunnel (`Native.lockdown`).
+pub static LOCKDOWN: AtomicBool = AtomicBool::new(false);
 
 #[link(name = "log")]
 extern "C" {
@@ -314,6 +318,7 @@ pub fn init(dir: &str) -> Result<&'static Host, String> {
 	let log = core.clone();
 	let _ = tracing_subscriber::registry().with(LogLayer {sink: move |line| log.send(Out::Log {line}), helper: true}).try_init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}
+	if KEY_LOST.load(Ordering::Relaxed) {tracing::warn!("the vault key is gone from the Android Keystore, so the stored subscriptions are not available and must be added again")}
 	let mut events = core.subscribe();
 	runtime.spawn(async move {
 		loop {
@@ -326,7 +331,9 @@ pub fn init(dir: &str) -> Result<&'static Host, String> {
 				let mut logs = LOGS.lock().unwrap();
 				while logs.len() >= LOG_KEEP {logs.pop_front();}
 				logs.push_back(line.clone());
-				if let Ok(text) = std::ffi::CString::new(line.as_str()) {
+				// The line's second word is its level. A release build sends warnings and errors to logcat; a debug build sends everything.
+				let level = line.split_whitespace().nth(1).unwrap_or_default();
+				if let Some(text) = std::ffi::CString::new(line.as_str()).ok().filter(|_| cfg!(debug_assertions) || matches!(level, "WARN" | "ERROR")) {
 					// SAFETY: both strings are NUL terminated and live for the call.
 					unsafe {__android_log_write(4, c"veilway".as_ptr(), text.as_ptr())};
 				}
