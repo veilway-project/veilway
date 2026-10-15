@@ -35,6 +35,8 @@ enum Command {
 		#[arg(long)] state: Option<PathBuf>,
 		/// Where the replay memory of the obfuscated transports is kept across restarts. Only a config with such a transport uses it, and is not started without a path the node can write. Never restore this file from a backup [default: veilway-replay next to the state file]
 		#[arg(long)] replay: Option<PathBuf>,
+		/// The folder the Xray add-on is installed in (scripts/veilway.sh addon xray install). It must not be writable by the user the node runs as
+		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
 		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -223,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state, replay, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+		Command::Run {config, allow_readable_config, state, replay, addons, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -242,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
 			// "In a file of its own, next to the usage state file and separate from it."
 			let state = state.unwrap_or_else(|| dir.join("veilway-state.json"));
 			let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
-			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), ..Options::new(dir)}).await?);
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), addons: Some(addons), ..Options::new(dir)}).await?);
 			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
 			#[cfg(unix)]
 			let (control, mut events) = (if no_api {None} else {

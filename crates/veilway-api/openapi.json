@@ -1,6 +1,17 @@
 {
   "components": {
     "schemas": {
+      "Addons": {
+        "properties": {
+          "xray": {
+            "$ref": "#/components/schemas/XrayAddon"
+          }
+        },
+        "required": [
+          "xray"
+        ],
+        "type": "object"
+      },
       "Applied": {
         "properties": {
           "diff": {
@@ -1512,6 +1523,9 @@
       },
       "Status": {
         "properties": {
+          "addons": {
+            "$ref": "#/components/schemas/Addons"
+          },
           "certificates": {
             "description": "The self-signed certificates the node made for its `tls` transports with `\"self_signed\": true`, one for each listen address. Empty for a node that has none.",
             "items": {
@@ -1576,7 +1590,8 @@
           "users",
           "flows",
           "certificates",
-          "public_addresses"
+          "public_addresses",
+          "addons"
         ],
         "type": "object"
       },
@@ -2496,6 +2511,23 @@
         "required": [
           "valid",
           "report"
+        ],
+        "type": "object"
+      },
+      "XrayAddon": {
+        "properties": {
+          "installed": {
+            "description": "Whether the add-on's executable is in the add-on folder.",
+            "type": "boolean"
+          },
+          "release": {
+            "description": "The release of Xray-core this node runs.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "installed",
+          "release"
         ],
         "type": "object"
       }

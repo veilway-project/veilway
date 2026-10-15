@@ -27,6 +27,7 @@ pub const MAX_FILE_BYTES: u64 = 64 << 20;
 /// JSON values (scalars, lists and objects) in one document. Each costs memory however short its text is, so the file size alone is no bound.
 pub const MAX_JSON_NODES: usize = 8_000_000;
 pub const MAX_INBOUNDS: usize = 64;
+pub const MAX_XRAY_INBOUNDS: usize = 16;
 pub const MAX_TRANSPORTS: usize = 8;
 pub const MAX_OUTBOUNDS: usize = 256;
 pub const MAX_EXITS: usize = 256;

@@ -21,6 +21,7 @@ pub mod resolver;
 pub mod route;
 pub mod stream;
 pub mod usage;
+pub mod xray;
 
 pub use control::ControlTotals;
 pub use obfs::ObfsTotals;
@@ -180,10 +181,12 @@ pub struct Options {
 	pub usage_push: RangeInclusive<u32>,
 	/// The certificates the TLS of a node link this node dials must lead to. None is the Mozilla root list, and tests give the root of the certificates they make.
 	pub roots: Option<Arc<RootCertStore>>,
+	/// The folder the Xray add-on is installed in, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
+	pub addons: Option<PathBuf>,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -361,7 +364,7 @@ impl Shared {
 }
 
 /// A running engine. Its tasks live until the process exits and go on serving the config they have, and `shutdown` takes back what an l3 exit set up on the host. Dropping it does so too, without waiting for the l3 tasks to end.
-pub struct Engine {shared: Arc<Shared>, store: Arc<Store>, host: Arc<tokio::sync::Mutex<Host>>, l3: Arc<Mutex<Option<host::Wired>>>, started: Instant, written: Arc<Mutex<u64>>}
+pub struct Engine {shared: Arc<Shared>, store: Arc<Store>, host: Arc<tokio::sync::Mutex<Host>>, l3: Arc<Mutex<Option<host::Wired>>>, started: Instant, written: Arc<Mutex<u64>>, addons: Option<PathBuf>}
 
 /// Says what became of a reload to whoever listens for events. `before` is the generation that ran when it began: bytes that already ran put nothing in force and are no event, and neither is a reload that was turned away for its base revision.
 fn announce(shared: &Shared, before: u64, result: &Result<Applied, ApplyError<anyhow::Error>>) {
@@ -461,6 +464,9 @@ impl Engine {
 
 	/// How long the engine has run.
 	pub fn uptime(&self) -> Duration {self.started.elapsed()}
+
+	/// Whether the Xray add-on's executable is in the add-on folder. Whether it is the pinned one is checked when it is started.
+	pub fn xray_installed(&self) -> bool {self.addons.as_deref().is_some_and(|addons| xray::binary(addons).is_file())}
 
 	/// Every device that may connect right now, once for each inbound it has an address in, with what its tunnel knows of it, inbound by inbound. The devices of a user who is denied are not peers and not in it.
 	/// With `only`, the devices of the user of that name, and nothing of any other device is looked at.
@@ -649,6 +655,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	anyhow::ensure!(report.errors.is_empty(), "the config has {} errors: validate it before it is started", report.errors.len() + report.more_errors);
 	let mut store = Store::new(config.clone(), options.revision.unwrap_or_else(|| Revision::of(&[])), report);
 	store.allow_readable = options.allow_readable;
+	let store = Arc::new(store);
 	// What the state file remembers goes in as the users of a plan that was never in force. The first plan takes each user's state from it by name, the way every later plan takes it from the one before, and a name the config no longer has is left behind.
 	// A path the node may not write to is no path from here on: usage then lives in memory, as it does without a state file.
 	let (remembered, chosen, state) = options.state.map_or((Vec::new(), Vec::new(), None), |path| {
@@ -659,6 +666,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots));
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
+	let dir = options.dir.clone();
 	let mut host = Host::new(options.dir);
 	let staged = match host.prepare(&shared, &store.current().config, &[]).await {
 		Ok(staged) => staged,
@@ -723,5 +731,6 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 			}
 		});
 	}
-	Ok(Engine {shared, store: Arc::new(store), host, l3, started: Instant::now(), written: Arc::default()})
+	tokio::spawn(xray::run(shared.clone(), store.clone(), dir, options.addons.clone()));
+	Ok(Engine {shared, store, host, l3, started: Instant::now(), written: Arc::default(), addons: options.addons})
 }

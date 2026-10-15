@@ -1895,6 +1895,111 @@
         "exits"
       ],
       "type": "object"
+    },
+    "Xray": {
+      "additionalProperties": false,
+      "description": "The Xray add-on's part of the config. Xray runs as a child of the node and only ever reaches the network through the node: its traffic is attributed to the user of the client, and the node's gate, rules, exits and quotas apply to it.",
+      "properties": {
+        "inbounds": {
+          "items": {
+            "$ref": "#/$defs/XrayInbound"
+          },
+          "maxItems": 16,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "inbounds"
+      ],
+      "type": "object"
+    },
+    "XrayClient": {
+      "additionalProperties": false,
+      "properties": {
+        "secret": {
+          "description": "A UUID for `vless`, otherwise a password of 8 to 128 characters from A-Z a-z 0-9 and _ - . + / =.",
+          "maxLength": 128,
+          "minLength": 8,
+          "type": "string"
+        },
+        "user": {
+          "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "user",
+        "secret"
+      ],
+      "type": "object"
+    },
+    "XrayInbound": {
+      "additionalProperties": false,
+      "properties": {
+        "clients": {
+          "description": "The users that may use this inbound, each with the credential they present to it.",
+          "items": {
+            "$ref": "#/$defs/XrayClient"
+          },
+          "maxItems": 65536,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "listen": {
+          "$ref": "#/$defs/Addr",
+          "description": "The public listener of Xray."
+        },
+        "protocol": {
+          "$ref": "#/$defs/XrayProtocol"
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "tls": {
+          "$ref": "#/$defs/Tls",
+          "description": "The certificate files of the listener. Required for `vless` and `trojan`, and not allowed for `shadowsocks`, which encrypts itself."
+        }
+      },
+      "required": [
+        "tag",
+        "protocol",
+        "listen",
+        "clients"
+      ],
+      "type": "object"
+    },
+    "XrayProtocol": {
+      "oneOf": [
+        {
+          "const": "vless",
+          "description": "Needs `tls`. The client secret is a UUID.",
+          "type": "string"
+        },
+        {
+          "const": "trojan",
+          "description": "Needs `tls`. The client secret is a password.",
+          "type": "string"
+        },
+        {
+          "const": "shadowsocks",
+          "description": "The cipher is chacha20-ietf-poly1305. The client secret is a password.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1990,6 +2095,10 @@
       "maximum": 1,
       "minimum": 1,
       "type": "integer"
+    },
+    "xray": {
+      "$ref": "#/$defs/Xray",
+      "description": "The Xray add-on: inbounds of Xray that carry the users listed in their `clients`. Off when the key is absent."
     }
   },
   "required": [

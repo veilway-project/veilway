@@ -128,7 +128,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 
 async fn status(State(api): State<Arc<Api>>) -> Response {
 	let (snapshot, plan) = (api.engine.snapshot(), api.engine.plan());
-	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), not_before: made.not_before, not_after: made.not_after}).collect(), public_addresses: snapshot.config.public_addresses.clone()})
+	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), not_before: made.not_before, not_after: made.not_after}).collect(), public_addresses: snapshot.config.public_addresses.clone(), addons: model::Addons {xray: model::XrayAddon {installed: api.engine.xray_installed(), release: veilway_core::engine::xray::RELEASE.to_string()}}})
 }
 
 async fn running(State(api): State<Arc<Api>>) -> Response {
