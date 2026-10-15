@@ -342,6 +342,8 @@ pub struct Network {address: IpAddr, prefix: u8}
 impl Network {
 	/// `None` for a prefix longer than the address.
 	pub fn new(address: IpAddr, prefix: u8) -> Option<Self> {(prefix <= if address.is_ipv4() {32} else {128}).then_some(Self {address, prefix})}
+	pub fn address(&self) -> IpAddr {self.address}
+	pub fn prefix(&self) -> u8 {self.prefix}
 	pub fn contains(&self, address: IpAddr) -> bool {
 		match (self.address, address) {
 			(IpAddr::V4(network), IpAddr::V4(address)) => u32::from(network) ^ u32::from(address) < 1u32.checked_shl(32 - u32::from(self.prefix)).unwrap_or(0) || self.prefix == 0,

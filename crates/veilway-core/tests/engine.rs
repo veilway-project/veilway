@@ -970,36 +970,23 @@ async fn an_answer_the_user_changes_while_the_tunnel_runs_takes_effect_at_once_a
 	again.tunnel.stop().await;
 }
 
-// "Skipped at each connect: an address inside one of the device's own networks."
+// "Skipped at each connect: an address inside one of the device's own networks", except a private one after the user's yes to a private address. The public one that stays skipped is a unit test of the engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_address_in_the_devices_own_network_is_not_dialled_at_the_start_nor_after_a_move() {
+async fn a_private_address_in_the_devices_own_network_is_dialled_after_the_yes_at_the_start_and_after_a_move() {
 	let time = time!();
 	let net = net("engine-own", time, |_| {}).await;
 	let library = library(&net, "own", &payload(time, vec![profile(&net, 0, &["tls"])])).await;
 	let own = veilway_proto::subscription::payload::Network::new([10, 99, 0, 0].into(), 24).unwrap();
-	// At the start: nothing is dialled, nothing takes a place of the budget, and the tunnel waits and says nothing false.
-	let waits = Waits::new(time);
 	let mut base = net.settings("own");
 	base.networks = vec![own];
-	let tunnel = start(&net, waits.settings(&base, false), &library, PRIVATE).unwrap();
-	waits.watch(&tunnel);
-	waits.count(2).await;
-	let counters = tunnel.status().counters;
-	assert_eq!((counters.attempts, counters.opened, counters.unreachable), (0, 0, 0), "{counters:?}");
-	tunnel.stop().await;
-	// After a move: the session to a candidate that is now in the device's own network is ended, nothing is dialled in it, and a move away from it dials again.
-	let mut run = Run::new(start(&net, net.settings("own2"), &library, PRIVATE).unwrap(), 0);
+	let mut run = Run::new(start(&net, base, &library, PRIVATE).unwrap(), 0);
 	run.connected().await;
 	assert!(run.ping(300, 1).await);
 	run.tunnel.moved("a cafe".into(), vec![own]);
-	run.until("the session to an own network went on", Duration::from_secs(5), |status| !matches!(status.state, State::Connected {..})).await;
 	tokio::time::sleep(Duration::from_secs(2)).await;
-	let counters = run.tunnel.status().counters;
-	assert_eq!((counters.attempts, counters.opened), (1, 1), "{counters:?}");
-	run.tunnel.moved("home".into(), Vec::new());
-	run.connected().await;
+	assert!(matches!(run.tunnel.status().state, State::Connected {..}));
 	assert!(run.ping(300, 2).await);
-	assert_eq!(run.tunnel.status().counters.opened, 2);
+	assert_eq!((run.tunnel.status().counters.attempts, run.tunnel.status().counters.opened), (1, 1));
 	run.tunnel.stop().await;
 }
 

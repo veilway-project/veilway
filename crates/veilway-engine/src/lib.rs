@@ -16,6 +16,7 @@ mod channel;
 #[cfg(feature = "fuzz")]
 pub use channel::{Event as ChannelEvent, Reader};
 mod engine;
+pub mod lan;
 pub mod import;
 /// Public with the `fuzz` feature, for the fuzz targets that feed it bytes.
 #[cfg(feature = "fuzz")]
@@ -119,7 +120,7 @@ pub fn default_roots() -> Arc<rustls::RootCertStore> {Arc::new(rustls::RootCertS
 /// What the user said yes to for this start. Each is asked of the user first, and a start without it does not happen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Agree {
-	/// "This profile connects to a private address", once per profile. An address inside the device's own networks counts as one, and with the yes it is dialled.
+	/// "This profile connects to a private address", once per profile. With the yes, such an address is dialled even when it is inside the device's own networks. A public address inside them is never dialled.
 	pub private: bool,
 	/// The plain warning for an Unsafe profile was shown and the user tapped once.
 	pub unsafe_profile: bool,
@@ -136,7 +137,7 @@ pub enum StartError {
 	NoKey,
 	/// The profile is Unsafe. The app shows its plain warning and starts again with `Agree::unsafe_profile`.
 	Unsafe,
-	/// The profile names a private address, or one inside the device's own networks. The app asks, and starts again with `Agree::private`.
+	/// The profile names a private address. The app asks, and starts again with `Agree::private`.
 	Private,
 	/// The classes of way of connecting the user was not yet asked about. The app asks in plain words (`ask_text`), stores the answer with `Store::agree` or `Store::decline`, and starts again.
 	Ask(Vec<Class>),
@@ -180,7 +181,7 @@ impl Tunnel {
 		let key = profile.device.private_key.clone().or_else(|| held.device().map(|device| device.private().clone())).ok_or(StartError::NoKey)?;
 		let link = Link::of(profile).ok_or(StartError::NoKey)?;
 		if profile.rating_cap == Some(RatingCap::Unsafe) && !agree.unsafe_profile {return Err(StartError::Unsafe)}
-		if !agree.private && profile.transports.iter().any(|transport| addresses(transport).iter().any(|address| address.private() || address.own(&settings.networks))) {return Err(StartError::Private)}
+		if !agree.private && profile.transports.iter().any(|transport| addresses(transport).iter().any(|address| address.private())) {return Err(StartError::Private)}
 		let (store_key, now) = (store::profile_key(held.id().as_str(), &profile.id), (settings.clock)());
 		let kept = settings.store.kept(&store_key);
 		let plan = choice::plan(&profile.transports, kept.stream_first.unwrap_or(profile.stream_first), &kept.network(&store::network_key(settings.store.seed(), &settings.network)), &kept.standing, now);

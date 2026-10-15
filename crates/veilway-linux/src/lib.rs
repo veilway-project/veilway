@@ -16,7 +16,7 @@ pub mod tun;
 pub mod vault;
 
 use dns::Pinned;
-use netlink::{Rt, Watch};
+use netlink::{Rt, Rule, Watch, TABLE_MAIN};
 use routes::Layout;
 pub use routes::Routes;
 use socket2::SockRef;
@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, sleep, Instant};
 use tun::Tun;
-use veilway_engine::{Agree, Settings, StartError, Status, Tunnel};
+use veilway_engine::{lan, Agree, Settings, StartError, Status, Tunnel};
 use veilway_proto::subscription::client::{Held, Permit};
 use veilway_proto::subscription::payload::{Profile, Transport};
 use veilway_transport::Hook;
@@ -50,7 +50,7 @@ pub struct Options {
 	pub routes: Routes,
 	/// The kill switch. On unless the user turned it off.
 	pub kill_switch: bool,
-	/// The LAN's ranges (private, link-local, local multicast) stay outside the tunnel and go the way they always did. On by default; off sends them through the tunnel (the user's choice per subscription).
+	/// Let apps reach devices on the networks the device is on outside the tunnel: the private subnets it is connected to, and the link-scope ranges (`veilway_engine::lan::local`), never a whole private range. Off by default, and then the local network goes through the tunnel like the rest.
 	pub allow_lan: bool,
 	/// With the LAN: let mDNS and LLMNR go too, so that local names resolve. Without it they are dropped, as every query for a name outside the tunnel is.
 	pub local_names: bool,
@@ -60,7 +60,7 @@ pub struct Options {
 }
 
 impl Default for Options {
-	fn default() -> Self {Self {interface: "vw0".into(), mark: MARK, table: MARK, routes: Routes::Full, kill_switch: true, allow_lan: true, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::STATE)}}
+	fn default() -> Self {Self {interface: "vw0".into(), mark: MARK, table: MARK, routes: Routes::Full, kill_switch: true, allow_lan: false, local_names: false, run_dir: PathBuf::from(state::DEFAULT), state_dir: PathBuf::from(state::STATE)}}
 }
 
 /// What is in force, once it is, for the app to show.
@@ -115,9 +115,11 @@ pub async fn run(options: &Options, _lock: &Lock, mut settings: Settings, held: 
 	if left > 0 || restored != dns::Restored::Nothing {tracing::info!(routes = left, resolver = ?restored, "removed what an earlier connection left behind")}
 	let gateways = profile.gateways.clone();
 	let (v4, v6) = (profile.device.addresses.iter().any(IpAddr::is_ipv4), profile.device.addresses.iter().any(IpAddr::is_ipv6));
-	let protected = Layout {mark: options.mark, table: options.table, tun: 0, routes: &options.routes, v4, v6, gateways: &gateways, lan: options.allow_lan}.protected();
+	let protected = Layout {mark: options.mark, table: options.table, tun: 0, routes: &options.routes, v4, v6, gateways: &gateways, lan: Vec::new()}.protected();
+	let own = networks::read(&mut rt, None).map_err(|error| before(error.into()))?;
+	let lan = if options.allow_lan {lan::local(&own.networks)} else {Vec::new()};
 	if options.kill_switch {
-		firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: endpoints(profile), protected, lan: options.allow_lan, local_names: options.local_names}).map_err(|error| before(error.into()))?;
+		firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: endpoints(profile), protected, lan: lan.clone(), local_names: options.local_names}).map_err(|error| before(error.into()))?;
 		tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device");
 	} else {
 		// A table an earlier client left would drop this client's own connections to nodes the old profile did not list, with the status saying the kill switch is off.
@@ -125,7 +127,7 @@ pub async fn run(options: &Options, _lock: &Lock, mut settings: Settings, held: 
 	}
 	settings.socket = Some(hook(options.mark));
 	let mut up = Up::default();
-	let outcome = up.carry(options, &mut rt, settings, held, profile, permit, agree, on_status, stop).await;
+	let outcome = up.carry(options, &mut rt, own, lan, settings, held, profile, permit, agree, on_status, stop).await;
 	match outcome {
 		Ok(()) => {
 			let problems = up.undo(options, &mut rt, true).await;
@@ -145,8 +147,7 @@ pub async fn run(options: &Options, _lock: &Lock, mut settings: Settings, held: 
 struct Up {tunnel: Option<Tunnel>, tun: Option<Tun>, dns: Option<Pinned>}
 
 impl Up {
-	async fn carry(&mut self, options: &Options, rt: &mut Rt, mut settings: Settings, held: &Held, profile: &Profile, permit: &Permit, agree: Agree, mut on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> anyhow::Result<()> {
-		let mut own = networks::read(rt, None)?;
+	async fn carry(&mut self, options: &Options, rt: &mut Rt, mut own: networks::Own, mut lan: Vec<(IpAddr, u8)>, mut settings: Settings, held: &Held, profile: &Profile, permit: &Permit, agree: Agree, mut on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> anyhow::Result<()> {
 		settings.networks = own.networks.clone();
 		settings.network = own.description.clone();
 		let tunnel = self.tunnel.insert(Tunnel::start(settings, held, &profile.id, permit, agree)?);
@@ -156,7 +157,7 @@ impl Up {
 		for ip in &profile.device.addresses {rt.add_address(tun.index, *ip, if ip.is_ipv4() {32} else {128})?}
 		rt.set_link(tun.index, Some(u32::from(mtu)))?;
 		let (v4, v6) = (profile.device.addresses.iter().any(IpAddr::is_ipv4), profile.device.addresses.iter().any(IpAddr::is_ipv6));
-		let layout = Layout {mark: options.mark, table: options.table, tun: tun.index, routes: &options.routes, v4, v6, gateways: &profile.gateways, lan: options.allow_lan};
+		let mut layout = Layout {mark: options.mark, table: options.table, tun: tun.index, routes: &options.routes, v4, v6, gateways: &profile.gateways, lan: lan.clone()};
 		let skipped = routes::apply(rt, &routes::plan(&layout))?;
 		if !skipped.is_empty() {tracing::info!(?skipped, "some routes or rules that this device or kernel may not have could not be made")}
 		let dns = self.dns.insert(Pinned::pin(&options.state_dir, &tun.name, &profile.gateways)?);
@@ -208,6 +209,16 @@ impl Up {
 						Ok(now) if !now.same(&own) => {
 							tracing::info!(before = %own.description, now = %now.description, networks = now.networks.len(), "the device's networks changed");
 							tunnel.moved(now.description.clone(), now.networks.clone());
+							// The subnets that go outside the tunnel are those of the network the device is on now: the firewall takes the new ones first, and the rules to the old subnets are replaced.
+							let moved_lan = if options.allow_lan {lan::local(&now.networks)} else {Vec::new()};
+							if moved_lan != lan {
+								lan = moved_lan;
+								layout.lan = lan.clone();
+								if options.kill_switch {firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: endpoints(profile), protected: layout.protected(), lan: lan.clone(), local_names: options.local_names})?}
+								for v6 in [false, true] {rt.delete_rule(&Rule {v6, priority: routes::PRIORITY_LAN, table: TABLE_MAIN, ..Rule::default()})?;}
+								let skipped = routes::apply(rt, &routes::plan(&layout).into_iter().filter(|step| matches!(&step.item, routes::Item::Rule(rule) if rule.priority == routes::PRIORITY_LAN)).collect::<Vec<_>>())?;
+								tracing::info!(subnets = lan.len(), ?skipped, "the subnets that stay outside the tunnel were replaced");
+							}
 							own = now;
 						}
 						Ok(_) => {}

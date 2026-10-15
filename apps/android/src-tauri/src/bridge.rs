@@ -18,14 +18,15 @@ const BRIDGE: &str = "io/github/veilwayproject/app/Bridge";
 static VM: OnceLock<JavaVM> = OnceLock::new();
 static CLASS: OnceLock<GlobalRef> = OnceLock::new();
 
-/// The device's own networks as the system last told, and a description of them that the engine hashes into its memory of what worked where.
+/// The device's own networks as the system last told, and a description of them that the engine hashes into its memory of what worked where. `cellular` is whether the network the phone's packets leave by is mobile data (or the system could not tell).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Own {
 	pub networks: Vec<Network>,
 	pub description: String,
+	pub cellular: bool,
 }
 
-static OWN: LazyLock<watch::Sender<Own>> = LazyLock::new(|| watch::channel(Own {networks: Vec::new(), description: "android:none".into()}).0);
+static OWN: LazyLock<watch::Sender<Own>> = LazyLock::new(|| watch::channel(Own {networks: Vec::new(), description: "android:none".into(), cellular: false}).0);
 
 pub fn own() -> watch::Receiver<Own> {OWN.subscribe()}
 
@@ -152,9 +153,9 @@ pub extern "system" fn Java_io_github_veilwayproject_app_Native_lockdown(_: JNIE
 	host::LOCKDOWN.store(on == JNI_TRUE, Ordering::Relaxed);
 }
 
-/// The networks the device is on, as `address/prefix` strings: its addresses on networks that are not the VPN, and the gateway. The engine skips an address of the profile that lies inside one of them, and reconnects when the networks change.
+/// The networks the device is on, as `address/prefix` strings: its addresses on networks that are not the VPN, and the gateway, and whether they are mobile data. The engine skips an address of the profile that lies inside one of them, and reconnects when the networks change.
 #[no_mangle]
-pub extern "system" fn Java_io_github_veilwayproject_app_Native_networkChanged<'a>(mut env: JNIEnv<'a>, _: JClass<'a>, description: JString<'a>, networks: JObjectArray<'a>) {
+pub extern "system" fn Java_io_github_veilwayproject_app_Native_networkChanged<'a>(mut env: JNIEnv<'a>, _: JClass<'a>, description: JString<'a>, networks: JObjectArray<'a>, cellular: jboolean) {
 	let description = text(&mut env, &description);
 	let count = env.get_array_length(&networks).unwrap_or(0);
 	let mut found = Vec::new();
@@ -165,7 +166,7 @@ pub extern "system" fn Java_io_github_veilwayproject_app_Native_networkChanged<'
 		if let Some(network) = ip.parse().ok().zip(prefix.parse().ok()).and_then(|(ip, prefix)| Network::new(ip, prefix)).filter(|network| !found.contains(network)) {found.push(network)}
 	}
 	OWN.send_if_modified(|own| {
-		let next = Own {networks: found, description};
+		let next = Own {networks: found, description, cellular: cellular == JNI_TRUE};
 		let changed = *own != next;
 		*own = next;
 		changed

@@ -6,6 +6,7 @@ use crate::networks::{self, Own};
 use crate::routes::{self, Layout, Routes, METRIC_TUNNEL};
 use crate::tun::{self, Tun};
 use crate::{ip, sock, state, watch::Watch};
+use ipnet::IpNet;
 use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
@@ -14,7 +15,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, sleep, Instant};
-use veilway_engine::{Agree, Settings, StartError, Status, Tunnel};
+use veilway_engine::{lan, Agree, Settings, StartError, Status, Tunnel};
 use veilway_proto::subscription::client::{Held, Permit};
 use veilway_proto::subscription::payload::{Profile, Transport};
 
@@ -29,7 +30,7 @@ pub struct Options {
 	pub routes: Routes,
 	/// The kill switch. On unless the user turned it off.
 	pub kill_switch: bool,
-	/// Let the LAN's ranges (private, link-local, local multicast) out outside the tunnel, as far as the kill switch goes. Whatever the physical network has on-link stays reachable by its own routes in any case.
+	/// Let apps reach devices on the networks the device is on outside the tunnel, as far as the kill switch goes: the private subnets it is connected to and the link-scope ranges (`veilway_engine::lan::local`), never a whole private range. Off by default, and then nothing of the local network is let out of the kill switch. Whatever the physical network has on-link stays reachable by its own routes in any case.
 	pub allow_lan: bool,
 	/// With the LAN: let mDNS and LLMNR go too, so that local names resolve. Without it they are dropped, as every query for a name outside the tunnel is.
 	pub local_names: bool,
@@ -37,7 +38,7 @@ pub struct Options {
 }
 
 impl Default for Options {
-	fn default() -> Self {Self {interface: "Veilway".into(), routes: Routes::Full, kill_switch: true, allow_lan: true, local_names: false, run_dir: state::default_dir()}}
+	fn default() -> Self {Self {interface: "Veilway".into(), routes: Routes::Full, kill_switch: true, allow_lan: false, local_names: false, run_dir: state::default_dir()}}
 }
 
 /// What is in force, once it is, for the app to show.
@@ -88,7 +89,7 @@ pub async fn run(options: &Options, _lock: &state::Lock, mut settings: Settings,
 	physical.store(own.interface.unwrap_or(0), Ordering::Relaxed);
 	let gateways = profile.gateways.clone();
 	let protected = Layout {routes: &options.routes, gateways: &gateways}.protected();
-	let rules = Rules {tun: None, nodes: endpoints(profile), protected, lan: options.allow_lan, local_names: options.local_names};
+	let rules = Rules {tun: None, nodes: endpoints(profile), protected, lan: if options.allow_lan {lan::local(&own.networks).into_iter().filter_map(|(ip, prefix)| IpNet::new(ip, prefix).ok()).collect()} else {Vec::new()}, local_names: options.local_names};
 	// With the kill switch off nothing is protected, but names still only go through the tunnel (port 53 is blocked elsewhere), and what an earlier client left is replaced, so that its filters do not drop this client's connections to nodes the old profile did not list.
 	firewall::install(&Rules {protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()}).map_err(|error| before(error.into()))?;
 	if options.kill_switch {tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device")}
@@ -130,7 +131,8 @@ impl Up {
 		for address in &profile.device.addresses {ip::add_address(tun.luid, *address, if address.is_ipv4() {32} else {128})?}
 		for (present, family6) in [(v4, false), (v6, true)] {if present {ip::set_interface(tun.luid, family6, Some(u32::from(mtu)), METRIC_TUNNEL)?}}
 		// The adapter is known now: from here the tunnel's traffic may leave by it, and the routes below may send it there.
-		firewall::install(&Rules {tun: Some(tun.luid), protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()})?;
+		let mut enforced = Rules {tun: Some(tun.luid), protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()};
+		firewall::install(&enforced)?;
 		let skipped = ip::apply(tun.luid, &routes::plan(&Layout {routes: &options.routes, gateways: &profile.gateways}))?;
 		if !skipped.is_empty() {tracing::info!(?skipped, "some routes that this device may not have could not be made")}
 		let dns = self.dns.insert(Pinned::pin(tun.index, &profile.gateways)?);
@@ -182,6 +184,11 @@ impl Up {
 							if !now.same(&own) {
 								tracing::info!(before = %own.description, now = %now.description, networks = now.networks.len(), "the device's networks changed");
 								tunnel.moved(now.description.clone(), now.networks.clone());
+								// The subnets that stay outside the tunnel are those of the network the device is on now.
+								if options.allow_lan {
+									enforced.lan = lan::local(&now.networks).into_iter().filter_map(|(ip, prefix)| IpNet::new(ip, prefix).ok()).collect();
+									if let Err(error) = firewall::install(&enforced) {tracing::error!(%error, "the subnets that stay outside the tunnel could not be replaced")}
+								}
 								own = now;
 							}
 						}

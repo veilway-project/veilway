@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc, watch};
-use veilway_proto::subscription::payload::{Network as OwnNetwork, Profile, Subscription, Transport, Usage};
+use veilway_proto::subscription::payload::{Dial, Network as OwnNetwork, Profile, Subscription, Transport, Usage};
 use veilway_proto::subscription::Secret;
 use veilway_transport::choice::{self, Network, Next, Pick, Standing, HOUR, STAGGER};
 use veilway_transport::{End, Ended, Env, Link, Refuse, Session, State as Opened, Target, Unreachable};
@@ -76,7 +76,7 @@ pub(crate) struct Core {
 	pub settings: Settings,
 	/// The device's own networks as they are now: the list of `Settings` at the start, and the one `Tunnel::moved` gave after.
 	pub networks: Vec<OwnNetwork>,
-	/// With the user's yes to a private address, an address inside the device's own networks is dialled like any other private one. Without it, it is skipped at every connect.
+	/// With the user's yes to a private address, a private address inside the device's own networks is dialled like any other private one. A public address inside them is skipped at every connect, yes or not: a network that claims a public address as its own is the TunnelCrack LocalNet attack.
 	pub consented: bool,
 	pub profile: Profile,
 	pub subscription: Arc<Subscription>,
@@ -139,6 +139,9 @@ fn say_of(ended: &Ended) -> Option<Say> {
 fn untracked(network: &mut Network, transport: usize, candidate: usize, added: &[usize]) {
 	if added.contains(&candidate) {network.tried.retain(|(at, tried, _)| (*at, *tried) != (transport, candidate))}
 }
+
+// Whether a candidate is passed for being inside the device's own networks. The user's yes to a private address covers a candidate that is private itself, and never a public one.
+fn skipped(consented: bool, address: &Dial, networks: &[OwnNetwork]) -> bool {address.own(networks) && !(consented && address.private())}
 
 impl Core {
 	pub(crate) fn new(parts: Parts) -> Self {
@@ -306,6 +309,7 @@ impl Core {
 				let (candidates, mut retry, mut added) = (count(&self.transports[transport]), Vec::new(), Vec::<usize>::new());
 				// "Skipped at each connect: an address inside one of the device's own networks", unless the user agreed to a private address for this profile. They are passed before a pick is made, so that they take no place of the hour's budget and no attempt is counted for them.
 				let mut passed: Vec<usize> = (0..candidates).filter(|candidate| self.own(transport, *candidate)).collect();
+				if self.consented && !passed.is_empty() {tracing::info!(transport, ?passed, "a public address inside the device's own networks is not dialled, even after the yes to a private address: the network claims it as its own")}
 				let unreachable = loop {
 					// A class the user withdrew since the last look is not used for the next attempt.
 					self.answers();
@@ -397,10 +401,9 @@ impl Core {
 		self.rest(wait).await
 	}
 	pub(crate) fn own(&self, transport: usize, candidate: usize) -> bool {
-		if self.consented {return false}
 		let found = match &self.transports[transport] {
-			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| dial.own(&self.networks)),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.get(candidate).map(|found| found.address.own(&self.networks)),
+			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| skipped(self.consented, dial, &self.networks)),
+			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
 		};
 		found.unwrap_or(false)
 	}
@@ -564,5 +567,15 @@ mod tests {
 		// The same number in another transport is another candidate.
 		untracked(&mut network, 0, 1, &[1]);
 		assert_eq!(network.tried, [(1, 1, 300)]);
+	}
+
+	#[test]
+	fn the_yes_to_a_private_address_dials_a_private_candidate_in_an_own_network_and_never_a_public_one() {
+		let own = vec![OwnNetwork::new("10.99.0.7".parse().unwrap(), 24).unwrap(), OwnNetwork::new("203.0.114.9".parse().unwrap(), 24).unwrap()];
+		let (private, public, elsewhere) = (Dial::parse("10.99.0.2:5002").unwrap(), Dial::parse("203.0.114.5:443").unwrap(), Dial::parse("10.50.0.2:5002").unwrap());
+		assert!(skipped(false, &private, &own) && skipped(false, &public, &own));
+		assert!(!skipped(true, &private, &own), "a private candidate in an own network is dialled after the yes");
+		assert!(skipped(true, &public, &own), "a public candidate the network claims as its own stays skipped");
+		assert!(!skipped(false, &elsewhere, &own) && !skipped(true, &elsewhere, &own));
 	}
 }

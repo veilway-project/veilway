@@ -42,9 +42,9 @@ impl Kept {
 	pub fn network(&self, key: &str) -> Network {self.networks.iter().find(|(found, _)| found == key).map(|(_, network)| network.clone()).unwrap_or_default()}
 }
 
-/// The whole file. `lan_tunnel` holds the ids of the subscriptions whose user chose to send the local network through the tunnel: absent is off, which is also what a file from before this setting says.
+/// The whole file. `lan_local` holds the ids of the subscriptions whose user let apps reach devices on the local network outside the tunnel: absent is off, which is also what a file from before this setting says. The first version of this setting was stored as `lan_tunnel` and is not read.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_tunnel: BTreeSet<String>}
+pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_local: BTreeSet<String>}
 
 /// Why a file was not taken as it is. Either way the client starts without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +92,7 @@ struct FileWire {
 	#[serde(default)] version: u64,
 	#[serde(default)] seed: u64,
 	#[serde(default)] profiles: BTreeMap<String, ProfileWire>,
-	#[serde(default)] lan_tunnel: Vec<String>,
+	#[serde(default)] lan_local: Vec<String>,
 }
 
 fn class_word(class: Class) -> &'static str {
@@ -139,7 +139,7 @@ pub fn parse(bytes: &[u8]) -> Result<Saved, Damaged> {
 	if bytes.len() > FILE_MAX {return Err(Damaged::Size)}
 	let wire: FileWire = serde_json::from_slice(bytes).map_err(|_| Damaged::Form)?;
 	if wire.version != VERSION {return Err(Damaged::Form)}
-	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_tunnel: wire.lan_tunnel.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect()};
+	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_local: wire.lan_local.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect()};
 	for (key, profile) in wire.profiles.into_iter().filter(|(key, _)| key_ok(key)).take(PROFILES_MAX) {
 		let mut kept = Kept {standing: read_standing(profile.standing), stream_first: profile.stream_first, declined: classes(&profile.declined), ..Kept::default()};
 		for (network, wire) in profile.networks.into_iter().filter(|(network, _)| key_ok(network)).take(NETWORKS_MAX) {kept.networks.push((network, read_network(wire)))}
@@ -162,7 +162,7 @@ pub fn encode(saved: &Saved) -> Vec<u8> {
 		})
 	}).collect();
 	// A map with string keys and plain numbers cannot fail to be written.
-	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_tunnel: saved.lan_tunnel.iter().cloned().collect()}).unwrap_or_default()
+	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_local: saved.lan_local.iter().cloned().collect()}).unwrap_or_default()
 }
 
 /// How a network is kept: the first eight bytes of the SHA-256 of the seed and the caller's description, in hex. The same network is the same key on this installation and an unrelated one on another.
@@ -271,12 +271,12 @@ impl Store {
 	}
 	/// The user's answers for a profile as they are now: the classes agreed to, the classes declined, and `stream_first`. A running tunnel asks this and not `kept`, which copies everything.
 	pub fn answers(&self, key: &str) -> (Vec<Class>, Vec<Class>, Option<bool>) {self.lock().0.profiles.get(key).map_or_else(Default::default, |kept| (kept.standing.consent.clone(), kept.declined.clone(), kept.stream_first))}
-	/// Whether the user chose to send the local network through the tunnel for this subscription. Off for one never seen.
-	pub fn lan_through_tunnel(&self, subscription: &str) -> bool {self.lock().0.lan_tunnel.contains(subscription)}
+	/// Whether the user let apps reach devices on the local network outside the tunnel for this subscription. Off for one never seen.
+	pub fn lan_local(&self, subscription: &str) -> bool {self.lock().0.lan_local.contains(subscription)}
 	/// Saves that choice. The next connect uses it. A key this crate could not have written, or one past `PROFILES_MAX` subscriptions, is not kept.
-	pub fn set_lan_through_tunnel(&self, subscription: &str, on: bool) {
+	pub fn set_lan_local(&self, subscription: &str, on: bool) {
 		let mut guard = self.lock();
-		let changed = if on {key_ok(subscription) && (guard.0.lan_tunnel.len() < PROFILES_MAX || guard.0.lan_tunnel.contains(subscription)) && guard.0.lan_tunnel.insert(subscription.to_owned())} else {guard.0.lan_tunnel.remove(subscription)};
+		let changed = if on {key_ok(subscription) && (guard.0.lan_local.len() < PROFILES_MAX || guard.0.lan_local.contains(subscription)) && guard.0.lan_local.insert(subscription.to_owned())} else {guard.0.lan_local.remove(subscription)};
 		guard.1 |= changed;
 	}
 	/// The user agrees to a class of transport for a profile.
@@ -332,11 +332,11 @@ mod tests {
 		(standing(), vec(("[a-f0-9]{16}", network()), 0..4), vec(("[a-f0-9]{16}", 0usize..256, any::<u16>(), any::<u64>()), 0..4), classes_strategy(), proptest::option::of(any::<bool>())).prop_map(|(standing, networks, mtus, declined, stream_first)| Kept {standing, networks, mtus: mtus.into_iter().map(|(network, transport, mtu, when)| Remembered {network, transport, mtu, when}).collect(), declined, stream_first})
 	}
 
-	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4)).prop_map(|(seed, profiles, lan_tunnel)| Saved {seed, profiles, lan_tunnel})}
+	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4)).prop_map(|(seed, profiles, lan_local)| Saved {seed, profiles, lan_local})}
 
 	// What every result of `parse` promises, whatever the bytes were.
 	fn bounded(saved: &Saved) -> bool {
-		saved.profiles.len() <= PROFILES_MAX && saved.lan_tunnel.len() <= PROFILES_MAX && saved.lan_tunnel.iter().all(|id| key_ok(id)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
+		saved.profiles.len() <= PROFILES_MAX && saved.lan_local.len() <= PROFILES_MAX && saved.lan_local.iter().all(|id| key_ok(id)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
 	}
 
 	proptest! {
@@ -420,17 +420,18 @@ mod tests {
 	}
 
 	#[test]
-	fn sending_the_lan_through_the_tunnel_is_off_unless_chosen_and_an_old_file_reads_as_off() {
+	fn reaching_the_local_network_outside_the_tunnel_is_off_unless_chosen_and_an_old_file_reads_as_off() {
 		let store = Store::volatile();
-		assert!(!store.lan_through_tunnel("sub-a"));
-		store.set_lan_through_tunnel("sub-a", true);
-		store.set_lan_through_tunnel("bad key", true);
-		assert!(store.lan_through_tunnel("sub-a") && !store.lan_through_tunnel("bad key"));
-		store.set_lan_through_tunnel("sub-a", false);
-		assert!(!store.lan_through_tunnel("sub-a"));
-		assert!(parse(br#"{"version":1,"seed":3,"profiles":{}}"#).unwrap().lan_tunnel.is_empty());
-		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_tunnel":["ok","no no",7]}"#).map(|saved| saved.lan_tunnel.len()), Err(Damaged::Form));
-		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_tunnel":["ok","no no"]}"#).unwrap().lan_tunnel.into_iter().collect::<Vec<_>>(), vec!["ok".to_owned()]);
+		assert!(!store.lan_local("sub-a"));
+		store.set_lan_local("sub-a", true);
+		store.set_lan_local("bad key", true);
+		assert!(store.lan_local("sub-a") && !store.lan_local("bad key"));
+		store.set_lan_local("sub-a", false);
+		assert!(!store.lan_local("sub-a"));
+		assert!(parse(br#"{"version":1,"seed":3,"profiles":{}}"#).unwrap().lan_local.is_empty());
+		assert!(parse(br#"{"version":1,"seed":3,"lan_tunnel":["ok"]}"#).unwrap().lan_local.is_empty());
+		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_local":["ok","no no",7]}"#).map(|saved| saved.lan_local.len()), Err(Damaged::Form));
+		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_local":["ok","no no"]}"#).unwrap().lan_local.into_iter().collect::<Vec<_>>(), vec!["ok".to_owned()]);
 	}
 
 	#[test]
