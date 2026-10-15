@@ -81,6 +81,10 @@ enum Command {
 	/// Show the connection in plain words. Exit status: 0 a connection runs, 3 none does
 	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 	Status,
+	/// Run by the LaunchDaemon at boot: put the kill switch back if a connection that did not stop left it to be restored
+	#[cfg(target_os = "macos")]
+	#[command(hide = true)]
+	Restore,
 	/// Print the JSON Schema of config version 1
 	Schema,
 	/// Print a fresh private key and its public key
@@ -411,6 +415,8 @@ async fn main() -> anyhow::Result<()> {
 		Command::Disconnect => client::disconnect().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Status => std::process::exit(client::show()),
+		#[cfg(target_os = "macos")]
+		Command::Restore => client::restore().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());
 			Ok(())

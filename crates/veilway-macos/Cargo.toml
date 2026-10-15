@@ -16,12 +16,14 @@ anyhow.workspace=true
 ipnet.workspace=true
 # The utun control socket, the routing socket and the interface list: the only `unsafe` in the platform layer, each with its reason.
 libc.workspace=true
-# The lock on the run directory, the owner checks and signals to the running client, all in safe code.
-rustix={workspace=true, features=["fs", "process"]}
 # The socket option behind the hook that keeps the engine's sockets on the physical interface (`all` for the interface binding).
 socket2={workspace=true, features=["all"]}
 # The AEAD of the vault file, and the random bytes of its key.
 ring.workspace=true
+
+[target.'cfg(unix)'.dependencies]
+# The lock on the run directory, the owner checks and signals to the running client, all in safe code.
+rustix={workspace=true, features=["fs", "process"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The system keychain, where the vault's key lives.

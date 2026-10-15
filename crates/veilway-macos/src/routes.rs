@@ -21,6 +21,8 @@ pub enum Routes {
 pub struct Layout<'a> {
 	pub routes: &'a Routes,
 	pub gateways: &'a [IpAddr],
+	/// The device's own addresses on the tunnel.
+	pub addresses: &'a [IpAddr],
 }
 
 /// A route on the tunnel's interface. `optional` is a route whose failure is told and not fatal: the system may not have the family.
@@ -33,7 +35,8 @@ impl Layout<'_> {
 	/// The destinations that go through the tunnel or nowhere: the routes' networks, and the gateways, which the DNS of the system is pointed at.
 	pub fn protected(&self) -> Vec<IpNet> {
 		let wanted: Vec<IpNet> = match self.routes {
-			Routes::Full => vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+			// Inside a full tunnel the tunnel's own addresses are protected too: with the LAN let out, a gateway such as 10.200.0.1 is inside 10.0.0.0/8 and would otherwise be sent to the physical network, which the route to the halves never sees.
+			Routes::Full => ["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()].into_iter().chain(self.gateways.iter().chain(self.addresses).copied().map(host)).collect(),
 			Routes::Split(nets) => nets.iter().map(IpNet::trunc).chain(self.gateways.iter().copied().map(host)).collect(),
 		};
 		let mut found: Vec<IpNet> = Vec::new();
@@ -65,7 +68,7 @@ mod tests {
 	#[test]
 	fn a_full_tunnel_is_two_halves_of_each_family() {
 		let gateways = gateways();
-		let steps = plan(&Layout {routes: &Routes::Full, gateways: &gateways});
+		let steps = plan(&Layout {routes: &Routes::Full, gateways: &gateways, addresses: &[]});
 		let nets: Vec<String> = steps.iter().map(|step| step.net.to_string()).collect();
 		assert_eq!(nets, ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1", "10.200.0.1/32", "fd00::1/128"]);
 		assert!(!steps[0].optional && !steps[1].optional && steps[2].optional && steps[3].optional);
@@ -74,7 +77,7 @@ mod tests {
 	#[test]
 	fn no_route_names_the_node() {
 		let gateways = gateways();
-		let steps = plan(&Layout {routes: &Routes::Full, gateways: &gateways});
+		let steps = plan(&Layout {routes: &Routes::Full, gateways: &gateways, addresses: &[]});
 		assert!(steps.iter().all(|step| step.net.prefix_len() < 32 || gateways.contains(&step.net.addr())));
 	}
 
@@ -82,7 +85,7 @@ mod tests {
 	fn a_split_tunnel_is_its_networks_and_the_gateways_once() {
 		let gateways = gateways();
 		let nets: Vec<IpNet> = vec!["203.0.113.5/24".parse().unwrap(), "10.200.0.1/32".parse().unwrap()];
-		let layout = Layout {routes: &Routes::Split(nets), gateways: &gateways};
+		let layout = Layout {routes: &Routes::Split(nets), gateways: &gateways, addresses: &[]};
 		let found: Vec<String> = layout.protected().iter().map(ToString::to_string).collect();
 		assert_eq!(found, ["203.0.113.0/24", "10.200.0.1/32", "fd00::1/128"]);
 		assert_eq!(plan(&layout).len(), 3);
@@ -90,8 +93,16 @@ mod tests {
 
 	#[test]
 	fn a_full_tunnel_protects_both_families() {
-		let found: Vec<String> = Layout {routes: &Routes::Full, gateways: &[]}.protected().iter().map(ToString::to_string).collect();
+		let found: Vec<String> = Layout {routes: &Routes::Full, gateways: &[], addresses: &[]}.protected().iter().map(ToString::to_string).collect();
 		assert_eq!(found, ["0.0.0.0/0", "::/0"]);
+	}
+
+	#[test]
+	fn a_full_tunnel_protects_its_gateways_and_addresses_too() {
+		let (gateways, addresses): (Vec<IpAddr>, Vec<IpAddr>) = (gateways(), vec!["10.200.0.2".parse().unwrap(), "10.200.0.1".parse().unwrap()]);
+		let found: Vec<String> = Layout {routes: &Routes::Full, gateways: &gateways, addresses: &addresses}.protected().iter().map(ToString::to_string).collect();
+		assert_eq!(found, ["0.0.0.0/0", "::/0", "10.200.0.1/32", "fd00::1/128", "10.200.0.2/32"]);
+		assert_eq!(plan(&Layout {routes: &Routes::Full, gateways: &gateways, addresses: &addresses}).len(), 6, "the routes are the halves and the gateways");
 	}
 
 	#[test]

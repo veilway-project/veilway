@@ -20,7 +20,9 @@ const NONCE: usize = 12;
 const TAG: usize = 16;
 const FILE_MAX: usize = 64 * BODY_MAX + 64;
 /// The keychain item: its service and account.
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "com.veilway.client";
+#[cfg(target_os = "macos")]
 const ACCOUNT: &str = "vault-key";
 #[cfg(target_os = "macos")]
 const SYSTEM_KEYCHAIN: &str = "/Library/Keychains/System.keychain";
@@ -103,6 +105,25 @@ impl Vault for SecretVault {
 	}
 }
 
+/// The team id in the output of `codesign -dv --verbose=2`. None for a build that is ad-hoc signed or not signed (`TeamIdentifier=not set`).
+pub fn team_id(output: &str) -> Option<String> {output.lines().find_map(|line| line.trim().strip_prefix("TeamIdentifier=")).map(str::trim).filter(|team| !team.is_empty() && *team != "not set").map(str::to_owned)}
+
+/// What a refusal of the keychain to give the item (`errSecAuthFailed`, `errSecInteractionNotAllowed`, `errSecNoAccessForItem`, `errSecUserCanceled`) means here. The item is trusted by the code requirement of the build that made it: for a build signed with a team id that is the team, which an update keeps, and for an ad-hoc build it is the build itself, which an update is not.
+pub fn access_explained(code: i32, team: Option<&str>) -> Option<String> {
+	if ![-25293, -25308, -25243, -128].contains(&code) {return None}
+	Some(match team {
+		Some(team) => format!("the keychain would not give this program the vault key. It was made by a build that is not signed by the team {team}, or by an unsigned one. The subscriptions in the vault must be imported again"),
+		None => "the keychain trusts only the exact build that made the vault key, and this build has no team id (it is ad-hoc signed or not signed), so after an update it cannot read the key. The subscriptions in the vault must be imported again; releases are to be signed with a team id so that an update keeps access".to_owned(),
+	})
+}
+
+// The team id this program is signed with, if `codesign` says one.
+#[cfg(target_os = "macos")]
+fn signing_team() -> Option<String> {
+	let output = std::process::Command::new(crate::state::program("codesign").ok()?).args(["-dv", "--verbose=2"]).arg(std::env::current_exe().ok()?).output().ok()?;
+	team_id(&String::from_utf8_lossy(&output.stderr))
+}
+
 /// The system keychain's item for the key.
 #[cfg(target_os = "macos")]
 pub struct Keychain;
@@ -123,10 +144,11 @@ impl Keys for Keychain {
 		match chain.find_generic_password(SERVICE, ACCOUNT) {
 			Ok((password, _item)) => <[u8; 32]>::try_from(&*password).map(Some).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "the keychain's item for the vault key is not 32 bytes")),
 			Err(error) if error.code() == NOT_FOUND => Ok(None),
-			Err(error) => Err(io::Error::other(error)),
+			Err(error) => Err(match access_explained(error.code(), signing_team().as_deref()) {Some(why) => io::Error::new(io::ErrorKind::PermissionDenied, why), None => io::Error::other(error)}),
 		}
 	}
 	fn create(&self, key: &[u8; 32]) -> io::Result<()> {
+		if signing_team().is_none() {tracing::warn!("this build is not signed with a team id, so the keychain will trust only this exact build with the vault key, and an update will need the subscriptions imported again")}
 		let (chain, _quiet) = Self::chain()?;
 		chain.set_generic_password(SERVICE, ACCOUNT, key).map_err(io::Error::other)
 	}
@@ -171,6 +193,23 @@ mod tests {
 		renamed[4] = 2;
 		assert!(open(&key, &renamed).is_err(), "the header is authenticated");
 		assert_ne!(seal(&key, b"secrets").unwrap(), file, "a fresh nonce at every write");
+	}
+
+	#[test]
+	fn the_team_id_is_read_from_codesign_and_an_adhoc_build_has_none() {
+		assert_eq!(team_id("Executable=/usr/local/bin/veilway\nIdentifier=veilway\nTeamIdentifier=AB12CD34EF\n").as_deref(), Some("AB12CD34EF"));
+		assert_eq!(team_id("Signature=adhoc\nTeamIdentifier=not set\n"), None);
+		assert_eq!(team_id("code object is not signed at all\n"), None);
+		assert_eq!(team_id("TeamIdentifier=\n"), None);
+	}
+
+	#[test]
+	fn a_refused_keychain_names_reimport_and_says_why_by_the_signature() {
+		let adhoc = access_explained(-25293, None).unwrap();
+		assert!(adhoc.contains("imported again") && adhoc.contains("no team id"), "{adhoc}");
+		let signed = access_explained(-25243, Some("AB12CD34EF")).unwrap();
+		assert!(signed.contains("imported again") && signed.contains("AB12CD34EF"));
+		assert!(access_explained(-25300, None).is_none() && access_explained(-50, Some("X")).is_none(), "other errors keep their own words");
 	}
 
 	#[test]

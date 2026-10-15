@@ -48,6 +48,19 @@ pub fn secure_dir_as(path: &Path, mode: u32, owner: u32) -> io::Result<()> {
 	}
 }
 
+/// The first folder of a chain (root down to the folder itself, each with its owner and mode) that someone other than `owner` could change the contents of, with what is wrong with it. A folder that others can write in lets them swap the next one for a link.
+pub fn chain_problem(chain: &[(PathBuf, u32, u32)], owner: u32) -> Option<String> {chain.iter().find_map(|(path, uid, mode)| folder_problem(true, *uid, *mode, owner).map(|problem| format!("{} {problem}", path.display())))}
+
+/// `secure_dir` for a folder a user may have named (`--data-dir`): after it is made or checked, the path is resolved, and every folder from `/` down to it must be `owner`'s and closed to others. The resolved path is returned and is the one to use: the links of the system itself (`/var` is `/private/var`) are followed, and a link in a folder that is not root's would have to be in a folder that fails the check.
+pub fn secure_tree_as(path: &Path, mode: u32, owner: u32) -> io::Result<PathBuf> {
+	secure_dir_as(path, mode, owner)?;
+	let real = fs::canonicalize(path)?;
+	let chain = real.ancestors().map(|folder| fs::metadata(folder).map(|meta| (folder.to_owned(), meta.uid(), meta.mode()))).collect::<io::Result<Vec<_>>>()?;
+	match chain_problem(&chain, owner) {None => Ok(real), Some(problem) => Err(io::Error::new(io::ErrorKind::PermissionDenied, problem))}
+}
+
+pub fn secure_tree(path: &Path, mode: u32) -> io::Result<PathBuf> {secure_tree_as(path, mode, 0)}
+
 fn open(dir: &Path, write: bool) -> io::Result<File> {OpenOptions::new().read(true).write(write).create(write).truncate(false).mode(0o644).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(dir.join(LOCK))}
 
 fn pid_in(file: &mut File) -> Option<u32> {
@@ -174,6 +187,23 @@ mod tests {
 		fs::create_dir(&loose).unwrap();
 		fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).unwrap();
 		assert!(secure_dir_as(&loose, 0o700, uid).is_err());
+	}
+
+	#[test]
+	fn a_chain_is_as_good_as_its_worst_folder() {
+		let folder = |path: &str, uid: u32, mode: u32| (PathBuf::from(path), uid, mode);
+		assert_eq!(chain_problem(&[folder("/Library/Application Support/Veilway/client", 0, 0o40700), folder("/Library/Application Support", 0, 0o40755), folder("/", 0, 0o40755)], 0), None);
+		let tmp = chain_problem(&[folder("/tmp/x", 0, 0o40700), folder("/tmp", 0, 0o41777), folder("/", 0, 0o40755)], 0).unwrap();
+		assert!(tmp.starts_with("/tmp ") && tmp.contains("written by others"), "{tmp}");
+		assert!(chain_problem(&[folder("/Users/me/data", 501, 0o40700), folder("/Users/me", 501, 0o40755)], 0).unwrap().contains("/Users/me/data"));
+		assert!(chain_problem(&[folder("/a", 0, 0o40775)], 0).is_some(), "group can write");
+	}
+
+	#[test]
+	fn a_tree_under_a_folder_others_can_write_in_is_refused() {
+		let (dir, uid) = (scratch("tree"), rustix::process::geteuid().as_raw());
+		let error = secure_tree_as(&dir.join("a").join("b"), 0o700, uid).unwrap_err();
+		assert!(error.kind() == io::ErrorKind::PermissionDenied, "the system's temporary folder is closed to nobody: {error}");
 	}
 
 	#[tokio::test]
