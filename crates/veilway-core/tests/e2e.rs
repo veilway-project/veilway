@@ -1305,7 +1305,6 @@ async fn ping_is_answered_by_the_node(){
 }
 
 /// Byte and packet counters per user, inbound and exit move in both directions, and only for whoever sent the traffic.
-#[cfg_attr(target_os = "macos", ignore = "fails now and then on loaded macOS runners for a reason not found yet; the counters are held on Linux and Windows")]
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn counters_move_for_the_user_the_inbound_and_the_exit(){
 	let (backend, _)=tcp_responder().await;
@@ -1316,6 +1315,8 @@ async fn counters_move_for_the_user_the_inbound_and_the_exit(){
 	assert_eq!(node.engine.user("a"), Some(Totals::default()));
 	handshake(&mut client, PUBLIC, 41150, 80).await;
 	assert_eq!(greeting(&mut client).await, GREETING);
+	// The node counts a packet after it has handed it on, so the greeting can arrive before the ACK is counted.
+	eventually("the ACK to be counted", || [node.engine.user("a"), node.engine.inbound("home"), node.engine.exit("main")].iter().all(|totals| totals.is_some_and(|totals| totals.up_packets>=2))).await;
 	let (user, home, exit)=(node.engine.user("a").unwrap(), node.engine.inbound("home").unwrap(), node.engine.exit("main").unwrap());
 	// Up: the SYN and the ACK, 40 bytes each. Down: at least the SYN/ACK and the segment with the greeting, and
 	// possibly its retransmission, since this client never acknowledges it.
