@@ -92,7 +92,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		{progress ? <span className="d-progress"><span>{t("update.installing")}</span>{progress.total ? <><span className="vw-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.downloaded}><span style={{inlineSize: Math.min(100, progress.downloaded / progress.total * 100) + "%"}}/></span><strong className="vw-num vw-small">{percent(progress.downloaded / progress.total)}</strong></> : null}</span> : update.notes.slice(0, 200)}
 	</Banner>;
 	const content = library === null ? (libraryError ? <StateBlock kind="error" title={t("library.loadFailed")} action={<Button onClick={loadLibrary}>{t("action.retry")}</Button>}>{t("library.loadFailedBody")}</StateBlock> : <StateBlock kind="loading" title={t("common.loading")}/>)
-		: adding || library.length === 0 ? <Importer first={library.length === 0} onCancel={() => setAdding(false)} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
+		: adding || (library.length === 0 && tab === "home") ? <Importer first={library.length === 0} onCancel={() => setAdding(false)} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
 		: tab === "subscriptions" ? <Library library={library} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
 		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
