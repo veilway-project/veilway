@@ -23,6 +23,10 @@ icons=$(mktemp -d)
 tauri icon -o "$icons" src-tauri/icons/icon.png
 [ -d "$icons/android" ] || { echo "tauri icon made no Android icons" >&2; exit 1; }
 cp -R "$icons/android/." src-tauri/gen/android/app/src/main/res/
+# the adaptive icon gets the mark alone on the tile's green, or the launcher's crop zooms into the tile
+tauri icon -o "$icons/fg" src-tauri/icons/foreground.svg
+for d in "$icons"/fg/android/mipmap-*dpi; do cp "$d/ic_launcher_foreground.png" "src-tauri/gen/android/app/src/main/res/${d##*/}/"; done
+printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n\t<color name="ic_launcher_background">#1B6A4F</color>\n</resources>\n' > src-tauri/gen/android/app/src/main/res/values/ic_launcher_background.xml
 rm -rf "$icons"
 tauri android build --apk --target aarch64 --ci
 unsigned=$(find src-tauri/gen/android/app/build/outputs/apk -name '*-unsigned.apk' | head -1)
