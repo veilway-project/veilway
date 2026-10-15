@@ -11,6 +11,25 @@ use veilway_proto::websocket;
 /// The bound of an answer's head, the one the node keeps for the request head of a user. The page gives the client none of its own.
 pub const HEAD_MAX: usize = 16_384;
 
+/// The Chrome major version that `fingerprint.rs` imitates. Every header that names a version says this one.
+pub(crate) const CHROME: &str = "131";
+
+/// The client's own platform in a Chrome request: the part of the User-Agent in brackets, the client hint for the platform, the mobile hint, and the User-Agent's word for a phone. Chosen by the compile target, so a build claims only its own platform's browser.
+#[cfg(target_os = "windows")]
+pub(crate) const PLATFORM: (&str, &str, &str, &str) = ("Windows NT 10.0; Win64; x64", "\"Windows\"", "?0", "");
+#[cfg(target_os = "macos")]
+pub(crate) const PLATFORM: (&str, &str, &str, &str) = ("Macintosh; Intel Mac OS X 10_15_7", "\"macOS\"", "?0", "");
+#[cfg(target_os = "android")]
+pub(crate) const PLATFORM: (&str, &str, &str, &str) = ("Linux; Android 10; K", "\"Android\"", "?1", "Mobile ");
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "android")))]
+pub(crate) const PLATFORM: (&str, &str, &str, &str) = ("X11; Linux x86_64", "\"Linux\"", "?0", "");
+
+/// The User-Agent line of a Chrome request on this platform.
+pub(crate) fn user_agent() -> String {
+	let (agent, _, _, mobile) = PLATFORM;
+	format!("User-Agent: Mozilla/5.0 ({agent}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{CHROME}.0.0.0 {mobile}Safari/537.36\r\n")
+}
+
 /// The head of an answer: its status and its field lines, which are read where one is asked for.
 #[derive(Debug, Clone, Copy)]
 pub struct Head<'a> {
