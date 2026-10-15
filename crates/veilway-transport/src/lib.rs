@@ -15,10 +15,13 @@
 //! - Which candidate and which transport come next, and after which wait, is decided by the functions of `choice` over state the caller keeps. Nothing here stores anything.
 //!
 //! Every byte from the network is hostile: a node, a front and the path are all in the threat model. Heads, frames and bodies are read inside fixed bounds of size and time, nothing is allocated by a length the peer chose, and no error holds a byte of input.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod choice;
+mod fingerprint;
 mod fronted;
+#[cfg(test)]
+mod hello_test;
 pub mod http;
 mod parallel;
 pub mod stream;

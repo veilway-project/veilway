@@ -6,8 +6,10 @@
 //! - Self-signed, only where the candidate's `self_signed` is true: the leaf's key must match a pin, TLS 1.3 is required, and the chain, the name and the dates are not looked at. The handshake's signature is still verified against that pinned key, by the library's own verification for TLS 1.3, so a server that shows the pinned certificate without holding its key fails. The root store plays no part.
 //!
 //! Nothing here can skip a check, and no failure is tried again with fewer. Validity is held against the system's clock, never against a clock offset: an offset comes from a `Date`, and a `Date` is read only behind a certificate that was accepted.
-//! The dial address, the server name and the `Host` of the request are three fields of a candidate and are used as that: the address is dialled as it is, with no lookup. The protocol offered is `http/1.1` alone, which is one more thing the handshake can be known by.
+//! The dial address, the server name and the `Host` of the request are three fields of a candidate and are used as that: the address is dialled as it is, with no lookup. The protocol offered is `http/1.1` alone. The hello is a browser's, made by BoringSSL (`fingerprint.rs`), and the checks below run on what it brought back.
+use crate::fingerprint::{self, Stream};
 use crate::{End, Ended, Front, Hook, Refuse, Unreachable};
+use boring::ssl::SslVersion;
 use ring::digest::{digest, SHA256};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
@@ -15,37 +17,22 @@ use rustls::crypto::ring::default_provider;
 use rustls::crypto::{verify_tls13_signature_with_raw_key, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 use rustls::server::ParsedCertificate;
-use rustls::version::{TLS12, TLS13};
+use rustls::version::TLS13;
 use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use socket2::SockRef;
 use std::io::ErrorKind;
 use std::sync::Arc;
-use tokio::net::{TcpSocket, TcpStream};
+use tokio::net::TcpSocket;
 use tokio::time::{timeout_at, Instant};
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::TlsConnector;
+use tokio_boring::SslStreamBuilder;
 
 const UNPINNED: rustls::Error = rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure);
 
 // The key of a leaf, when its SHA-256 is one of the pins.
-fn pinned(end_entity: &CertificateDer<'_>, pins: &[[u8; 32]]) -> Result<SubjectPublicKeyInfoDer<'static>, rustls::Error> {
+fn pinned_key(end_entity: &CertificateDer<'_>, pins: &[[u8; 32]]) -> Result<SubjectPublicKeyInfoDer<'static>, rustls::Error> {
 	let key = ParsedCertificate::try_from(end_entity)?.subject_public_key_info();
 	let hash = digest(&SHA256, key.as_ref());
 	if pins.iter().any(|pin| pin == hash.as_ref()) {Ok(key)} else {Err(UNPINNED)}
-}
-
-// The library's own verifier, and behind it the pins: a certificate it refuses is refused, and one it accepts is held against the pins.
-#[derive(Debug)]
-struct Pinned {inner: Arc<WebPkiServerVerifier>, pins: Vec<[u8; 32]>}
-
-impl ServerCertVerifier for Pinned {
-	fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server_name: &ServerName<'_>, ocsp_response: &[u8], now: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
-		let verified = self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
-		pinned(end_entity, &self.pins).map(|_| verified)
-	}
-	fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {self.inner.verify_tls12_signature(message, cert, dss)}
-	fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {self.inner.verify_tls13_signature(message, cert, dss)}
-	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {self.inner.supported_verify_schemes()}
 }
 
 // A self-signed candidate's check: the pins, and nothing of the chain, the name or the dates. The handshake's signature is verified against the pinned key itself, with the library's function for TLS 1.3 and the signature schemes of its provider. TLS 1.2 is never offered to such a candidate, and a signature of it is refused.
@@ -53,9 +40,9 @@ impl ServerCertVerifier for Pinned {
 struct Alone {pins: Vec<[u8; 32]>, algorithms: WebPkiSupportedAlgorithms}
 
 impl ServerCertVerifier for Alone {
-	fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {pinned(end_entity, &self.pins).map(|_| ServerCertVerified::assertion())}
+	fn verify_server_cert(&self, end_entity: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {pinned_key(end_entity, &self.pins).map(|_| ServerCertVerified::assertion())}
 	fn verify_tls12_signature(&self, _: &[u8], _: &CertificateDer<'_>, _: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {Err(UNPINNED)}
-	fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {verify_tls13_signature_with_raw_key(message, &pinned(cert, &self.pins)?, dss, &self.algorithms)}
+	fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {verify_tls13_signature_with_raw_key(message, &pinned_key(cert, &self.pins)?, dss, &self.algorithms)}
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {self.algorithms.supported_schemes()}
 }
 
@@ -81,20 +68,13 @@ pub(crate) fn host(candidate: &Front) -> String {if candidate.address.port() == 
 
 /// A TCP connection to the candidate's address and a TLS handshake on it, both before `deadline`. What comes back has passed every check of this module's head, or nothing comes back.
 /// A device that has no socket, no address or no route to dial with is `Offline`, and so is one whose `hook` refused the socket: neither says anything about the candidate.
-pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &Option<Hook>, deadline: Instant) -> Result<TlsStream<TcpStream>, Ended> {
-	let (name, provider, pinned) = (name(candidate).map_err(|_| Ended::Unreachable(Unreachable::Certificate))?, Arc::new(default_provider()), !candidate.pins.is_empty());
-	let algorithms = provider.signature_verification_algorithms;
-	// "The client requires TLS 1.3 on a pinned candidate and accepts what the CDN negotiates otherwise." A self-signed candidate is a pinned one.
-	let versions = if pinned {&[&TLS13][..]} else {&[&TLS13, &TLS12][..]};
-	let builder = ClientConfig::builder_with_provider(provider.clone()).with_protocol_versions(versions).map_err(|_| Ended::Unreachable(Unreachable::Tls))?;
-	// The library's `dangerous` door is used twice. With pins on a certificate from an authority it adds a check: the verifier is the library's own with the pins behind it. On a candidate the signed profile marks self-signed it puts the pins in the place of the chain, and only there: what the server sends never makes a candidate one of these.
-	let mut config = if candidate.self_signed && pinned {builder.dangerous().with_custom_certificate_verifier(Arc::new(Alone {pins: candidate.pins.clone(), algorithms})).with_no_client_auth()} else {
-		// An empty root store was refused before this was called. Should one get here, it is no check passed.
-		let verifier = WebPkiServerVerifier::builder_with_provider(roots.clone(), provider).build().map_err(|_| Ended::Unreachable(Unreachable::Certificate))?;
-		if pinned {builder.dangerous().with_custom_certificate_verifier(Arc::new(Pinned {inner: verifier, pins: candidate.pins.clone()})).with_no_client_auth()} else {builder.with_webpki_verifier(verifier).with_no_client_auth()}
-	};
+/// The handshake is a browser's (`fingerprint.rs`) and runs with the library's own chain check off. The checks run on what the server sent before this returns, so no byte of application data goes either way before they pass, and they are the same ones as ever: the chain, the name and the dates by rustls's verifier, the pins behind it, or for a self-signed candidate the pins alone.
+pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &Option<Hook>, deadline: Instant) -> Result<Stream, Ended> {
+	let (name, pinned, tls) = (name(candidate).map_err(|_| Ended::Unreachable(Unreachable::Certificate))?, !candidate.pins.is_empty(), || Ended::Unreachable(Unreachable::Tls));
+	// An empty root store was refused before this was called. Should one get here, it is no check passed.
+	let verifier = if candidate.self_signed && pinned {None} else {Some(WebPkiServerVerifier::builder_with_provider(roots.clone(), Arc::new(default_provider())).build().map_err(|_| Ended::Unreachable(Unreachable::Certificate))?)};
 	// "Empty means no server name is sent."
-	(config.enable_sni, config.alpn_protocols) = (candidate.sni.is_some(), vec![b"http/1.1".to_vec()]);
+	let ssl = fingerprint::connector().and_then(|connector| fingerprint::ssl(&connector, &name.to_str(), candidate.sni.is_some())).map_err(|_| tls())?;
 	let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
 	if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
 	let stream = match timeout_at(deadline, socket.connect(candidate.address)).await {
@@ -104,13 +84,27 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 		Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
 	};
 	let _ = stream.set_nodelay(true);
-	match timeout_at(deadline, TlsConnector::from(Arc::new(config)).connect(name, stream)).await {
-		Ok(Ok(stream)) => Ok(stream),
-		Ok(Err(error)) => Err(Ended::Unreachable(match error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()) {
-			Some(rustls::Error::InvalidCertificate(CertificateError::Expired | CertificateError::NotValidYet | CertificateError::ExpiredContext {..} | CertificateError::NotValidYetContext {..})) => Unreachable::CertificateTime,
-			Some(rustls::Error::InvalidCertificate(_)) => Unreachable::Certificate,
-			_ => Unreachable::Tls,
-		})),
-		Err(_) => Err(Ended::Unreachable(Unreachable::Timeout)),
+	let stream = match timeout_at(deadline, SslStreamBuilder::new(ssl, stream).connect()).await {
+		Ok(Ok(stream)) => stream,
+		// A server that shows the pinned certificate without its key fails here, in the handshake's signature.
+		Ok(Err(error)) => return Err(if error.to_string().contains("BAD_SIGNATURE") {Ended::Unreachable(Unreachable::Certificate)} else {tls()}),
+		Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
+	};
+	// "The client requires TLS 1.3 on a pinned candidate and accepts what the CDN negotiates otherwise." A self-signed candidate is a pinned one. The hello offers 1.2 as a browser's does, so a downgrade is refused here.
+	if pinned && stream.ssl().version2() != Some(SslVersion::TLS1_3) {return Err(tls())}
+	let ssl = stream.ssl();
+	let (Some(leaf), Some(chain)) = (ssl.peer_certificate().and_then(|leaf| leaf.to_der().ok()), ssl.peer_cert_chain()) else {return Err(Ended::Unreachable(Unreachable::Certificate))};
+	let leaf = CertificateDer::from(leaf);
+	let others = chain.iter().filter_map(|cert| cert.to_der().ok()).filter(|der| der.as_slice() != leaf.as_ref()).map(CertificateDer::from).collect::<Vec<_>>();
+	// The library's `dangerous` door is used once, and by `Alone`. With pins on a certificate from an authority the verifier's answer is held against the pins as well. On a candidate the signed profile marks self-signed the pins stand in place of the chain, and only there: what the server sends never makes a candidate one of these.
+	let verdict = match &verifier {
+		Some(verifier) => verifier.verify_server_cert(&leaf, &others, &name, &[], UnixTime::now()).and_then(|_| if pinned {pinned_key(&leaf, &candidate.pins).map(|_| ())} else {Ok(())}),
+		None => pinned_key(&leaf, &candidate.pins).map(|_| ()),
+	};
+	match verdict {
+		Ok(()) => Ok(Stream(stream)),
+		Err(rustls::Error::InvalidCertificate(CertificateError::Expired | CertificateError::NotValidYet | CertificateError::ExpiredContext {..} | CertificateError::NotValidYetContext {..})) => Err(Ended::Unreachable(Unreachable::CertificateTime)),
+		Err(rustls::Error::InvalidCertificate(_)) => Err(Ended::Unreachable(Unreachable::Certificate)),
+		Err(_) => Err(tls()),
 	}
 }
