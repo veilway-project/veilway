@@ -39,7 +39,8 @@ type Commands = {
 	set_settings: [{settings: Settings}, null],
 	open_link: [{url: string}, null],
 	get_autostart: [{}, boolean],
-	set_autostart: [{enabled: boolean}, null]
+	set_autostart: [{enabled: boolean}, null],
+	open_vpn_settings: [{}, null]
 };
 
 type Events = {status: StatusView, question: string, ended: Ended, log: string, "update-progress": Progress};
