@@ -1305,7 +1305,7 @@ async fn ping_is_answered_by_the_node(){
 }
 
 /// Byte and packet counters per user, inbound and exit move in both directions, and only for whoever sent the traffic.
-#[cfg_attr(target_os = "macos", ignore = "a loaded macOS runner counts a retransmitted packet now and then; the counters are held on Linux and Windows")]
+#[cfg_attr(target_os = "macos", ignore = "fails now and then on loaded macOS runners for a reason not found yet; the counters are held on Linux and Windows")]
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn counters_move_for_the_user_the_inbound_and_the_exit(){
 	let (backend, _)=tcp_responder().await;
