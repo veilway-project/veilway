@@ -66,7 +66,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				<Button icon="upload" disabled={busy} onClick={() => fileInput.current?.click()}>{t("import.file")}</Button>
 				<Button icon="upload" disabled={busy} onClick={() => qrInput.current?.click()}>{t("import.qr")}</Button>
 			</div>
-			<p className="vw-muted vw-small">{t("import.pasteHint")}</p>
+			{!matchMedia("(pointer: coarse)").matches && <p className="vw-muted vw-small">{t("import.pasteHint")}</p>}
 			<input ref={fileInput} type="file" hidden onChange={event => picked(event, "file")}/>
 			<input ref={qrInput} type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" hidden onChange={event => picked(event, "qr")}/>
 			{failure}
