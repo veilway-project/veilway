@@ -480,6 +480,28 @@ An `l3` exit is the one backend that touches the host: a TUN device, routes, an 
 
 **Testing:** the three tests in `crates/veilway-core/tests/l3.rs`, run by hand in a container with `CAP_NET_ADMIN` as the file header says. They are not part of CI, and the reviewer of the reload step read the `l3` reload paths without running them. Planned: a test with a second host on the node's network that uses the node as its next hop and aims packets at tunnel addresses, a test that a device cannot reach another device by way of the interface, and the character-set assertion of invariant 20a.
 
+### 5.12 The Xray add-on
+
+The add-on runs the pinned Xray-core as a child of a host process of its own. Xray listens on the public ports of its inbounds and reaches the network only through a SOCKS5 hop that the node serves on `127.0.0.1`. This is boundary B9 of section 4, applied to a public listener and a parser that the project does not write.
+
+**Capabilities:** anyone who reaches an Xray port can send Xray any bytes before any user is known. Whoever holds a user's Xray credential is that user at the hop, as with a tunnel.
+
+| Risk | Design response | Mechanism | Status |
+|---|---|---|---|
+| Xray gets the node's privileges, files or control socket | Its own system user `veilway-xray`, which cannot log in, under its own unit `veilway-xray.service`. The node reaches the host through a socket that only the node can open, and the node sends the document over it. `InaccessiblePaths` hides the node's folders. Xray gets an empty environment, `NoNewPrivileges`, and no capability unless a listener is below port 1024. Keys reach Xray in its document, never on a command line or in its environment. | `xray_units` in `scripts/veilway.sh`, `start` and `pre_exec` in `xray_host.rs`, `pem` and `generate` in `xray.rs` | Built. Gate checks Xray's user, capabilities, environment, reach and the absence of keys on its command line. |
+| The executable is replaced or is not the pinned release | The installer checks the archive against a pinned SHA-256. The host opens the file once with `O_NOFOLLOW`, requires root ownership and no write bit for others on it and its folder, hashes that same descriptor and runs it from the descriptor. The node checks its own pin before each start. | `open_pinned` in `xray_host.rs`, `xray_pin` in `scripts/veilway.sh`, `PIN` in `xray.rs` | Built. Gate refuses an archive and an executable that do not match, and logs both refusals. |
+| Users' traffic bypasses quota, gate, rules or exits | Xray's outbounds log in to the hop as the user. The hop answers CONNECT only and applies the node's gate, entitlement, quota, rules, exits and counters. | `session` and `accept` in `xray.rs` | Built. Gate checks quota, disabling, rotation, rules and counters. |
+| Another local process uses the hop | The hop listens on `127.0.0.1` and requires a secret made new for each run. | `accept` and `session` in `xray.rs` | Built. See residual risk 1. |
+| Xray logs client addresses | No access log, and the addresses in what it writes are masked. | `generate` in `xray.rs` | Built. Gate checks that no client address reaches the journal. |
+
+**Residual risks:**
+
+1. One hop secret per run. Every user's login to the hop carries the same secret, and the user name is not checked against anything else. Whoever learns the secret can act as any user until the node next starts. The secret is in Xray's document, which the host passes to Xray.
+2. Xray parses public input before any user is known: the TLS handshake, the VLESS, Trojan and Shadowsocks headers, and the path to the decoy. A bug in Xray-core is a bug in code this project does not own. The release is pinned, Xray runs without privileges, its only way out is the hop, and its memory and task count are capped. A remote code execution in Xray would still give the attacker the hop secret and so every user's flows.
+3. The shared address. Xray answers on the server's address next to the native profiles, so anyone who finds it can tell the server runs a proxy. Every native profile is capped at Detectable in the signed subscription document. Operators choose this when they add an inbound, and the panel says so.
+
+**Testing:** `scripts/gate-xray.sh`, run by hand in Docker containers with the pinned Xray-core release. It is not part of CI and has not run on a real server. The gate does not cover `veilway.sh addon xray remove`, what a stranger gets on a Shadowsocks port, or the parser rows of section 6 for Xray's input. Those rows are not written yet.
+
 ## 6. Parsers of untrusted input
 
 Every row needs a `cargo-fuzz` target that lands in the same change as the parser (`PLAN.md` "Security requirements" 3). A target must show: no panic, no allocation above a stated cap, no input that takes longer than a stated bound, and for every codec a round-trip property (`decode(encode(x)) == x`, and `encode(decode(b))` accepted). Corpora are committed. Three targets exist, under shorter names than the ones first planned here: `config`, `packet` and `dns` in `fuzz/fuzz_targets`, with seed corpora in `fuzz/corpus` for `config` and `dns`. They are run by hand in Docker as `fuzz/README.md` says, not in CI, and they assert properties of the output and no allocation cap or time bound. No other target in the table exists yet.
