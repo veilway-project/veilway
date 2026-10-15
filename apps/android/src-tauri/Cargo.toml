@@ -1,0 +1,47 @@
+[package]
+name="veilway-android"
+version="0.1.0"
+edition="2021"
+license="Apache-2.0"
+publish=false
+repository="https://github.com/veilway-project/veilway"
+description="Android client for Veilway"
+
+# Standalone like the desktop crate: the root workspace excludes this path so the Tauri crate keeps its own lockfile and profiles.
+[workspace]
+
+[lib]
+name="veilway_android_lib"
+crate-type= ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build= { version = "2", features = [] }
+
+[dependencies]
+veilway-engine= {path="../../../crates/veilway-engine"}
+veilway-proto= {path="../../../crates/veilway-proto"}
+veilway-transport= {path="../../../crates/veilway-transport"}
+socket2="0.6"
+tauri= { version = "2", features = [] }
+tauri-plugin-opener="2"
+serde= {version="1", features= ["derive"] }
+serde_json="1"
+tokio= {version="1", features= ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
+tracing="0.1"
+tracing-subscriber= {version="0.3", default-features=false, features= ["registry", "std"] }
+anyhow="1"
+base64="0.23"
+ring="0.17"
+ipnet= {version="2", features= ["serde"] }
+# Pictures are read with size limits, and only to find a QR code in them (same as the desktop app).
+image= {version="0.25", default-features=false, features= ["png", "jpeg"] }
+rqrr="0.9"
+# Calls into the Kotlin side (the VpnService, the Keystore) and the natives it calls back.
+jni="0.21"
+libc="0.2.150"
+
+[profile.release]
+opt-level="s"
+lto="thin"
+codegen-units=8
+strip=true

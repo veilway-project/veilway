@@ -4,6 +4,9 @@ import type {DesktopKey} from "./locales/en.ts";
 
 export const useD = () => useI18n<DesktopKey>();
 
+// The same window runs in the Android app (apps/android), which has no kill switch, start at login or updater of its own.
+export const ANDROID = /Android/i.test(navigator.userAgent);
+
 // What only this window remembers. The theme, the language and the kill switch also go to the app's settings file, which is what the native title bar and the helper read.
 export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[]};
 const PREFS = "veilway-desktop";

@@ -1,0 +1,53 @@
+"""Applies what the generated Gradle project (gen/android, made by `tauri android init`) does not have: the Kotlin sources of the VPN plugin, the service and receiver in the manifest, and their permissions. Run by build.sh after init, safe to run again."""
+import re
+import shutil
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+gen = root / "src-tauri" / "gen" / "android" / "app" / "src" / "main"
+target = gen / "java" / "io" / "github" / "veilwayproject" / "app"
+target.mkdir(parents=True, exist_ok=True)
+for source in (root / "kotlin").glob("*.kt"):
+    shutil.copy(source, target / source.name)
+manifest = gen / "AndroidManifest.xml"
+text = manifest.read_text()
+permissions = """
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SYSTEM_EXEMPTED" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />"""
+components = """
+        <service
+            android:name=".VeilwayVpnService"
+            android:exported="false"
+            android:foregroundServiceType="systemExempted"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <meta-data android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON" android:value="true" />
+        </service>
+        <receiver android:name=".BootReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+"""
+if "VeilwayVpnService" not in text:
+    text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + permissions, text, count=1)
+    text = text.replace("</application>", components + "    </application>", 1)
+    manifest.write_text(text)
+# The template targets the newest SDK; androidx needs at least 36 to compile, and the SDK volume has 35 and 36.
+gradle = root / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
+text = gradle.read_text()
+gradle.write_text(re.sub(r"(compileSdk|targetSdk) = \d+", r"\1 = 36", text))
+# Rust looks these up by name through JNI, and R8 renames members that only Kotlin code seems to use.
+(root / "src-tauri" / "gen" / "android" / "app" / "proguard-veilway.pro").write_text("-keep class io.github.veilwayproject.app.Native { *; }\n-keep class io.github.veilwayproject.app.Bridge { *; }\n")
+# The template runs the CLI as `node tauri ...`, which only works for a CLI installed in the project. The image has it on the PATH.
+task = next((root / "src-tauri" / "gen" / "android" / "buildSrc").rglob("BuildTask.kt"))
+text = task.read_text().replace('val executable = """node""";', 'val executable = """tauri""";').replace('listOf("tauri", "android", "android-studio-script")', 'listOf("android", "android-studio-script")')
+task.write_text(text)
+print("overlay applied")

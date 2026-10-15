@@ -1,0 +1,16 @@
+// Google's own Maven host (dl.google.com/dl/android/maven2) is not always reachable from the build machine; Aliyun mirrors it. Installed into Gradle's init.d by build.sh when VEILWAY_GOOGLE_MAVEN_MIRROR is set (the Docker build sets it, CI does not).
+def mirror = { repositories ->
+    repositories.all { repo ->
+        if (repo instanceof MavenArtifactRepository && repo.url.toString().contains("dl.google.com/dl/android/maven2")) {
+            repo.url = uri("https://maven.aliyun.com/repository/google/")
+        }
+    }
+}
+beforeSettings { settings ->
+    mirror(settings.pluginManagement.repositories)
+    mirror(settings.dependencyResolutionManagement.repositories)
+}
+allprojects {
+    mirror(buildscript.repositories)
+    mirror(repositories)
+}
