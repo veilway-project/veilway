@@ -1,6 +1,6 @@
 import {Banner, Button, Glass, List, ListRow, TextField} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
-import {base64, useD} from "./kit.tsx";
+import {base64, failureText, useD} from "./kit.tsx";
 import {asksPrivate, call, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
@@ -25,7 +25,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 		if (kind === "qr") return qr(file);
 		run(base64(file).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_open", {source: {kind: "file", data}})), setOffer);
 	};
-	const failure = error && <Banner tone="danger" title={t("import.failed")}>{error}</Banner>;
+	const failure = error && <Banner tone="danger" title={t("import.failed")}>{failureText(error, t)}</Banner>;
 	const key = (fingerprint: string) => <p className="d-key"><span className="vw-muted vw-small">{t("import.key")}</span><span className="vw-code" dir="ltr">{fingerprint}</span></p>;
 	if (review) {
 		const preview = review.preview;

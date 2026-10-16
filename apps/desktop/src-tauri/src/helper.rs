@@ -107,12 +107,12 @@ impl Core {
 			Call::ImportOpen {source} => {
 				let offer = match source {
 					Source::Link {text} => import::open(&text),
-					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "The file could not be read.".to_owned())?),
-				}.map_err(|error| error.text().to_owned())?;
+					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| import::Code::FileUnreadable.as_str().to_owned())?),
+				}.map_err(|error| error.code().as_str().to_owned())?;
 				let (out, pending) = match offer {
 					Offer::Native(offer) => (OfferOut {kind: "native", host: Some(offer.endpoint().host().to_owned()), fingerprint: offer.fingerprint().to_string(), pinned: offer.pin().is_some(), in_file: false}, Pending::Native(offer)),
 					Offer::Carried(offer) => (OfferOut {kind: "carried", host: None, fingerprint: offer.fingerprint().to_string(), pinned: false, in_file: offer.in_file()}, Pending::Carried(offer)),
-					Offer::Legacy(_) => return Err(import::ImportError::Legacy.text().to_owned()),
+					Offer::Legacy(_) => return Err(import::ImportError::Legacy.code().as_str().to_owned()),
 				};
 				*self.pending.lock().await = Some(pending);
 				to_value(out)
@@ -124,14 +124,14 @@ impl Core {
 				let library = self.library.lock().await;
 				let reviewed = match pending.take() {
 					Some(Pending::Native(offer)) => {
-						let fetching = import::proceed(offer, None).map_err(|error| error.text().to_owned())?;
+						let fetching = import::proceed(offer, None).map_err(|error| error.code().as_str().to_owned())?;
 						Self::fetch(&fetcher(), fetching, &library, &mut pending, &allowed).await?
 					}
 					Some(Pending::Fetching(fetching)) => Self::fetch(&fetcher(), fetching, &library, &mut pending, &allowed).await?,
-					Some(Pending::Carried(offer)) => Ok(import::proceed_carried(offer, now(), &library).map_err(|error| error.text().to_owned())?),
+					Some(Pending::Carried(offer)) => Ok(import::proceed_carried(offer, now(), &library).map_err(|error| error.code().as_str().to_owned())?),
 					other => {
 						*pending = other;
-						return Err("There is no import waiting for a yes.".into());
+						return Err(import::Code::NoImport.as_str().into());
 					}
 				};
 				// A private address the user has not said yes to: the step stays where it was and the window asks.
@@ -152,7 +152,7 @@ impl Core {
 				if keep {
 					let mut library = self.library.lock().await;
 					// A vault that could not be written says why: the user has to know that no safe place for the key was found.
-					fetcher().accept(reviewed, None, &mut library).await.map_err(|error| match &error {import::ImportError::Store(cause) => format!("{} {cause}", error.text()), _ => error.text().to_owned()})?;
+					fetcher().accept(reviewed, None, &mut library).await.map_err(|error| error.code().as_str().to_owned())?;
 				} else {fetcher().decline(reviewed).await}
 				self.library_value().await
 			}
@@ -172,7 +172,7 @@ impl Core {
 				if !allowed.is_empty() {library.allow_private(at, &allowed).map_err(|error| format!("The choice could not be saved: {error}"))?}
 				match fetcher().refresh(&mut library, at, now()).await {
 					Err(import::ImportError::PrivateEndpoint {host, addresses}) => return Ok(json!({"ask_private": {"host": host, "addresses": addresses}})),
-					other => other.map_err(|error| error.text().to_owned())?,
+					other => other.map_err(|error| error.code().as_str().to_owned())?,
 				};
 				drop(library);
 				self.library_value().await
@@ -221,7 +221,7 @@ impl Core {
 
 	/// Fetches go out as the system's own traffic, so while a tunnel runs they go through it. With none running and the kill switch left in force by an earlier connection they could only fail, or be the very leak the switch is there to stop, so they are refused with what to do.
 	fn fetch_gate(&self) -> Result<(), String> {
-		if self.running.lock().unwrap().is_none() && platform::firewall::present() == Some(true) {return Err("The kill switch is still in force from an earlier connection, so nothing can be fetched outside the tunnel. Connect first, or disconnect to lift the kill switch.".into())}
+		if self.running.lock().unwrap().is_none() && platform::firewall::present() == Some(true) {return Err(import::Code::KillSwitch.as_str().into())}
 		Ok(())
 	}
 
@@ -234,7 +234,7 @@ impl Core {
 				*pending = Some(Pending::Fetching(fetching));
 				match error {
 					import::ImportError::PrivateEndpoint {host, addresses} => Ok(Err(json!({"ask_private": {"host": host, "addresses": addresses}}))),
-					error => Err(error.text().to_owned()),
+					error => Err(error.code().as_str().to_owned()),
 				}
 			}
 		}
