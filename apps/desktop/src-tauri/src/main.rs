@@ -171,7 +171,7 @@ fn log_history()->Vec<String>{logbuf().lock().unwrap().iter().cloned().collect()
 #[tauri::command]
 fn open_link(app:AppHandle, url:String)->Result<(), String>{
 	let scheme=tauri::Url::parse(&url).map_err(|_| "The link is not valid.".to_string())?.scheme().to_string();
-	if !matches!(scheme.as_str(), "http"|"https"|"mailto") || (url!=view::PRIVACY_URL && !linkset().lock().unwrap().contains(&url)){return Err("This is not one of the provider's links.".into())}
+	if !matches!(scheme.as_str(), "http"|"https"|"mailto") || (!view::PRIVACY_URLS.contains(&url.as_str()) && !linkset().lock().unwrap().contains(&url)){return Err("This is not one of the provider's links.".into())}
 	app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 

@@ -143,8 +143,8 @@ pub struct SubscriptionOut {
 	pub hosts: Vec<HostOut>,
 }
 
-/// The privacy policy of the apps themselves, which `open_link` always opens.
-pub const PRIVACY_URL: &str = "https://veilway-project.github.io/veilway-docs/privacy/";
+/// The privacy policy of the apps themselves in English and Persian, which `open_link` always opens.
+pub const PRIVACY_URLS: [&str; 2] = ["https://veilway-project.github.io/veilway-docs/legal/app-privacy/", "https://veilway-project.github.io/veilway-docs/fa/legal/app-privacy/"];
 
 /// The links of one subscription as the window gets it (support links, link cards, terms and privacy policy): the only provider links `open_link` opens.
 pub fn provider_links(subscription: &serde_json::Value) -> Vec<String> {

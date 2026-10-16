@@ -29,7 +29,7 @@ export function SettingsPage({prefs, onPrefs, settings, onSettings, logs, onUpda
 			{checked && !checked.available && <Banner tone="success" title={t("settings.upToDate")}/>}
 			{checkError && <Banner tone="danger" title={t("settings.checkFailed")}>{checkError}</Banner>}
 		</Glass>}
-		<Glass className="d-panel"><div className="d-setting"><span className="vw-label">{t("settings.privacy")}</span><span className="vw-muted vw-small">{t("settings.privacyHint")}</span><Button icon="external" onClick={() => call("open_link", {url: "https://veilway-project.github.io/veilway-docs/privacy/"}).catch(error => toast({tone: "danger", title: t("settings.privacy"), body: error}))}>{t("terms.privacy")}</Button></div></Glass>
+		<Glass className="d-panel"><div className="d-setting"><span className="vw-label">{t("settings.privacy")}</span><span className="vw-muted vw-small">{t("settings.privacyHint")}</span><Button icon="external" onClick={() => call("open_link", {url: `https://veilway-project.github.io/veilway-docs/${settings.locale === "fa" ? "fa/" : ""}legal/app-privacy/`}).catch(error => toast({tone: "danger", title: t("settings.privacy"), body: error}))}>{t("terms.privacy")}</Button></div></Glass>
 		<Button variant="quiet" icon="activity" className="d-start" onClick={() => setShowLog(true)}>{t("settings.log")}</Button>
 	</div>;
 }
