@@ -278,8 +278,11 @@ impl Run {
 
 // No word of a rating or a class is in anything an app is given.
 fn plain_words(status: &Status) {
-	let shown = format!("{status:?} {}", status.say.map_or("", |say| say.text())).to_lowercase();
+	// The connection details name the transport on purpose, so transport words are looked for everywhere else and rating words everywhere.
+	let shown = format!("{:?} {}", Status {connection: None, ..status.clone()}, status.say.map_or("", |say| say.text())).to_lowercase();
 	for word in ["protected", "detectable", "unsafe", "rating", "nocover", "cover", "obfs", "tls", "fronted"] {assert!(!shown.contains(word), "{word} in {shown}")}
+	let details = format!("{:?}", status.connection).to_lowercase();
+	for word in ["protected", "detectable", "unsafe", "rating", "nocover", "cover"] {assert!(!details.contains(word), "{word} in {details}")}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

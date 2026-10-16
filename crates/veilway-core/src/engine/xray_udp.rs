@@ -400,6 +400,8 @@ mod tests {
 		addr
 	}
 
+	// The Xray add-on runs on Linux only, where the hop's sockets behave as this test expects.
+	#[cfg(target_os = "linux")]
 	#[tokio::test]
 	async fn an_association_carries_what_the_gate_and_the_rules_allow_and_nothing_else() {
 		let Some(own) = own_address() else {return};
