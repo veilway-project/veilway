@@ -1,7 +1,11 @@
 [package]
+publish=false
 name="veilway-ffi"
 version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Placeholder for the uniffi bindings of the Veilway client engine."
+readme="README.md"
+keywords=["vpn", "ffi", "uniffi", "veilway"]
+categories=["api-bindings"]
