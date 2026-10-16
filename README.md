@@ -340,6 +340,8 @@ The panel is in [veilway-panel](https://github.com/veilway-project/veilway-panel
 
 ## Contributing
 
+Questions and help with setup go to [GitHub Discussions](https://github.com/veilway-project/veilway/discussions), in English or Persian. Issues are for bugs and concrete feature requests.
+
 Changes are welcome, small ones included. [CONTRIBUTING.md](CONTRIBUTING.md) ([فارسی](CONTRIBUTING.fa.md)) explains how to build, test and send a change, and the code style. Two things to know up front: do not run `rustfmt`, `cargo fmt` or prettier on this code, and a first pull request asks you to sign the [CLA](CLA.md) once.
 
 ```
