@@ -113,6 +113,10 @@ async fn refresh(id: String, private: Option<Vec<String>>) -> Result<Value, Stri
 #[tauri::command]
 async fn remove(id: String) -> Result<Value, String> {call_branded(Call::Remove {subscription: id}).await}
 
+/// Confirms or declines a subscription's backup update hosts and gives the library back. Nothing is fetched from a host before its yes.
+#[tauri::command]
+async fn answer_hosts(id: String, allow: Vec<String>, decline: Vec<String>) -> Result<Value, String> {call_branded(Call::AnswerHosts {subscription: id, allow, decline}).await}
+
 /// Saves "Let apps reach devices on this network" for a subscription and gives the library back. It applies from the next connect.
 #[tauri::command]
 async fn set_lan(id: String, on: bool) -> Result<Value, String> {call_branded(Call::SetLan {subscription: id, on}).await}
@@ -243,7 +247,7 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

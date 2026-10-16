@@ -1,13 +1,13 @@
 // Development only: stands in for the Tauri side so the screens can run in a plain browser. main.tsx loads it only when Vite runs in "mock" mode, so a production build never contains it.
 // The address picks the scene and the display: ?scene=empty|question|connected&lang=en|fa&scheme=dark|light.
-import type {Running, StatusView, Subscription} from "./tauri.ts";
+import type {Host, Running, StatusView, Subscription} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
 try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: null, hidden: []})); } catch { /* private window */ }
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
-let lan = false;
+let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting"}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed"}];
 
 function subscription(fa: boolean): Subscription {
 	return {
@@ -15,7 +15,7 @@ function subscription(fa: boolean): Subscription {
 		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]]}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]]}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
-		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan
+		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan, hosts
 	};
 }
 
@@ -66,6 +66,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],
 	remove: () => { held = 0; return []; },
+	answer_hosts: args => { hosts = hosts.map(host => (args.allow as string[]).includes(host.key) ? {...host, state: "allowed"} : (args.decline as string[]).includes(host.key) ? {...host, state: "declined"} : host); return [subscription(languages[0] === "fa")]; },
 	set_lan: args => { lan = args.on === true; return [subscription(languages[0] === "fa")]; }
 };
 

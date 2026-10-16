@@ -91,6 +91,10 @@ pub enum CardOut {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ProfileOut {pub id: String, pub name: String, pub exits: Vec<(String, String)>}
 
+/// A backup update host of a subscription. `key` is what the user's answer names it by: the host and port with `#pinned` or `#static`, never a path or the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, and `static` for a static mirror, which never does. `state` is `waiting`, `allowed` or `declined`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct HostOut {pub key: String, pub host: String, pub kind: String, pub state: String}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LogoOut {pub kind: String, pub data: String}
 
@@ -115,6 +119,9 @@ pub struct SubscriptionOut {
 	/// The user's choice to let apps reach devices on the networks the device is on outside the tunnel, for this subscription. Off unless chosen.
 	#[serde(default)]
 	pub lan_local: bool,
+	/// The backup update hosts of a held subscription, empty in a review: the hosts on an import's screen are confirmed with it.
+	#[serde(default)]
+	pub hosts: Vec<HostOut>,
 }
 
 /// Replaces every `logo` of a library or a review (`{kind, data}` as the helper sent it) with a `data:` URL when the picture passes `logo_url`, and with null when it does not. Runs in the window, the process without rights.
@@ -168,11 +175,15 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		accent: subscription.accent.map(|[red, green, blue]| format!("#{red:02x}{green:02x}{blue:02x}")),
 		left_out: subscription.left_out,
 		lan_local,
+		hosts: Vec::new(),
 	}
 }
 
 pub fn library_view(library: &Library, store: &Store, languages: &[Tag], now: u64) -> Vec<SubscriptionOut> {
-	library.held().iter().map(|held| subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)).collect()
+	library.held().iter().map(|held| {
+		let hosts = held.waiting().into_iter().map(|key| (key, "waiting")).chain(held.confirmed().iter().map(|key| (key.clone(), "allowed"))).chain(held.declined().iter().map(|key| (key.clone(), "declined")));
+		SubscriptionOut {hosts: hosts.map(|(key, state)| HostOut {host: key.split('#').next().unwrap_or_default().into(), kind: (if key.ends_with("#static") {"static"} else {"update"}).into(), state: state.into(), key}).collect(), ..subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)}
+	}).collect()
 }
 
 pub fn tags(languages: &[String]) -> Vec<Tag> {languages.iter().take(8).filter_map(|text| Tag::read(&text.replace('_', "-"))).collect()}

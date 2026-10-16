@@ -187,6 +187,14 @@ impl Core {
 				let _ = self.store.flush();
 				self.library_value().await
 			}
+			Call::AnswerHosts {subscription: id, allow, decline} => {
+				let mut library = self.library.lock().await;
+				let at = library.held().iter().position(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?;
+				let (allow, decline): (Vec<&str>, Vec<&str>) = (allow.iter().take(16).map(String::as_str).collect(), decline.iter().take(16).map(String::as_str).collect());
+				library.answer_hosts(at, &allow, &decline).map_err(|error| format!("The choice could not be saved: {error}"))?;
+				drop(library);
+				self.library_value().await
+			}
 			Call::SetLan {subscription: id, on} => {
 				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
 				self.store.set_lan_local(&id, on);

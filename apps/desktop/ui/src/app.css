@@ -44,3 +44,14 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-details dd { margin: 0; text-align: start; overflow-wrap: anywhere; }
 .d-details-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-2) var(--s-3); padding: 0 var(--s-2) var(--s-3); }
 .d-details-foot p { margin: 0; }
+.d-row-notice { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: var(--s-1) var(--s-3); padding: var(--s-2) var(--s-3); }
+.d-row-notice > .vw-icon { margin-block-start: 0.15em; color: var(--c-text-muted); }
+.d-row-notice-text { display: grid; gap: 2px; }
+@container shell (max-width: 480px) {
+	.d-row-notice > .vw-button { grid-column: 2; justify-self: start; }
+}
+.d-hosts { display: grid; gap: var(--s-3); margin: 0; padding: 0; list-style: none; }
+.d-host { display: grid; gap: var(--s-1); }
+.d-host label { font-family: var(--font-mono); direction: ltr; unicode-bidi: isolate; overflow-wrap: anywhere; }
+.d-host-kind { display: flex; align-items: start; gap: var(--s-1); padding-inline-start: calc(20px + var(--s-2)); }
+.d-host-kind .vw-icon { flex: none; margin-block-start: 0.1em; }

@@ -491,7 +491,7 @@ pub trait Vault: Send + Sync {
 struct OriginWire {link: String, private: String, secret: String}
 
 #[derive(Serialize, Deserialize)]
-struct StoredWire {#[serde(default)] origin: Option<OriginWire>, keys: Vec<String>, document: String, #[serde(default)] hosts: Vec<String>, #[serde(default)] pins: Vec<String>, #[serde(default)] private: Vec<String>}
+struct StoredWire {#[serde(default)] origin: Option<OriginWire>, keys: Vec<String>, document: String, #[serde(default)] hosts: Vec<String>, #[serde(default)] declined: Vec<String>, #[serde(default)] pins: Vec<String>, #[serde(default)] private: Vec<String>}
 
 /// The most subscriptions a vault holds and the most it reads.
 pub const HELD_MAX: usize = 64;
@@ -504,7 +504,7 @@ fn from_wire(wire: StoredWire) -> Option<Stored> {
 		Some(origin) => Some((origin.link, Secret::new(array(&origin.private)?), DeviceSecret::new(array(&origin.secret)?))),
 		None => None,
 	};
-	Some(Stored {origin, keys: wire.keys.iter().map(|key| array(key)).collect::<Option<Vec<_>>>()?, document: wire.document, hosts: wire.hosts, pins: wire.pins.iter().map(|pin| array(pin)).collect::<Option<Vec<_>>>()?, private: wire.private.iter().filter_map(|address| address.parse().ok()).collect()})
+	Some(Stored {origin, keys: wire.keys.iter().map(|key| array(key)).collect::<Option<Vec<_>>>()?, document: wire.document, hosts: wire.hosts, declined: wire.declined, pins: wire.pins.iter().map(|pin| array(pin)).collect::<Option<Vec<_>>>()?, private: wire.private.iter().filter_map(|address| address.parse().ok()).collect()})
 }
 
 /// Reads a vault file. A file that is not one is an error, and an entry that is not one is left out.
@@ -516,7 +516,7 @@ pub fn read_vault(bytes: &[u8]) -> io::Result<Vec<Stored>> {
 
 /// The bytes of a vault file.
 pub fn write_vault(held: &[Stored]) -> Vec<u8> {
-	let wires: Vec<StoredWire> = held.iter().take(HELD_MAX).map(|stored| StoredWire {origin: stored.origin.as_ref().map(|(link, private, secret)| OriginWire {link: link.clone(), private: STANDARD.encode(private.expose()), secret: STANDARD.encode(secret.expose())}), keys: stored.keys.iter().map(|key| STANDARD.encode(key)).collect(), document: stored.document.clone(), hosts: stored.hosts.clone(), pins: stored.pins.iter().map(|pin| STANDARD.encode(pin)).collect(), private: stored.private.iter().map(ToString::to_string).collect()}).collect();
+	let wires: Vec<StoredWire> = held.iter().take(HELD_MAX).map(|stored| StoredWire {origin: stored.origin.as_ref().map(|(link, private, secret)| OriginWire {link: link.clone(), private: STANDARD.encode(private.expose()), secret: STANDARD.encode(secret.expose())}), keys: stored.keys.iter().map(|key| STANDARD.encode(key)).collect(), document: stored.document.clone(), hosts: stored.hosts.clone(), declined: stored.declined.clone(), pins: stored.pins.iter().map(|pin| STANDARD.encode(pin)).collect(), private: stored.private.iter().map(ToString::to_string).collect()}).collect();
 	serde_json::to_vec(&wires).unwrap_or_default()
 }
 
@@ -560,6 +560,14 @@ impl Library {
 		let Some(held) = self.held.get_mut(at) else {return Ok(())};
 		let before = held.clone();
 		held.allow_private(addresses);
+		self.save().inspect_err(|_| self.held[at] = before)
+	}
+	/// The user's answer about the update hosts of the subscription at `at`, each in the form `Held::waiting` and `Held::confirmed` give: `allow` are confirmed, `decline` are declined or lose their yes. A host in both is declined. The library is written; on a failed write nothing is kept.
+	pub fn answer_hosts(&mut self, at: usize, allow: &[&str], decline: &[&str]) -> io::Result<()> {
+		let Some(held) = self.held.get_mut(at) else {return Ok(())};
+		let before = held.clone();
+		held.confirm_hosts(allow);
+		held.decline_hosts(decline);
 		self.save().inspect_err(|_| self.held[at] = before)
 	}
 	/// Removes a subscription, with its link, its key and its secret: "Removing a subscription in the app deletes its key, secret and link."
@@ -746,17 +754,17 @@ mod tests {
 
 		#[test]
 		fn an_entry_that_is_written_reads_back_as_it_was(link in "[a-z0-9:/.#-]{0,40}", document in "[A-Za-z0-9._-]{0,60}", key in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), host in "[a-z0-9.]{1,20}:[0-9]{1,5}") {
-			let stored = Stored {origin: Some((link.clone(), Secret::new(key), DeviceSecret::new(secret))), keys: vec![key], document: document.clone(), hosts: vec![host.clone()], pins: vec![key], private: vec!["192.168.1.20".parse().unwrap()]};
+			let stored = Stored {origin: Some((link.clone(), Secret::new(key), DeviceSecret::new(secret))), keys: vec![key], document: document.clone(), hosts: vec![host.clone()], declined: vec![host.clone()], pins: vec![key], private: vec!["192.168.1.20".parse().unwrap()]};
 			let read = read_vault(&write_vault(&[stored])).unwrap();
 			prop_assert_eq!(read.len(), 1);
-			prop_assert!(read[0].private == vec!["192.168.1.20".parse::<IpAddr>().unwrap()] && read[0].keys == vec![key] && read[0].pins == vec![key] && read[0].document == document && read[0].hosts == vec![host] && read[0].origin.as_ref().is_some_and(|(found, private, device)| *found == link && private.expose() == &key && device.expose() == &secret));
+			prop_assert!(read[0].private == vec!["192.168.1.20".parse::<IpAddr>().unwrap()] && read[0].keys == vec![key] && read[0].pins == vec![key] && read[0].document == document && read[0].hosts == vec![host.clone()] && read[0].declined == vec![host] && read[0].origin.as_ref().is_some_and(|(found, private, device)| *found == link && private.expose() == &key && device.expose() == &secret));
 		}
 	}
 
 	#[test]
 	fn a_vault_that_is_not_one_is_an_error_and_an_entry_that_is_not_one_is_left_out() {
 		for bytes in [&b""[..], b"{}", b"[1]", b"[{\"keys\": 5}]", b"\xff"] {assert!(read_vault(bytes).is_err(), "{:?}", String::from_utf8_lossy(bytes))}
-		let good = write_vault(&[Stored {origin: None, keys: vec![[3; 32]], document: "d".into(), hosts: Vec::new(), pins: vec![[5; 32]], private: Vec::new()}]);
+		let good = write_vault(&[Stored {origin: None, keys: vec![[3; 32]], document: "d".into(), hosts: Vec::new(), declined: Vec::new(), pins: vec![[5; 32]], private: Vec::new()}]);
 		assert_eq!(read_vault(&good).unwrap().len(), 1);
 		let text = String::from_utf8(good).unwrap().replace(&STANDARD.encode([3u8; 32]), "not base64");
 		assert!(read_vault(text.as_bytes()).unwrap().is_empty());
@@ -1053,6 +1061,21 @@ mod tests {
 		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
 		let Err(failed) = run(&mut library, &fake) else {panic!("a refresh that failed")};
 		assert_eq!((failed.static_asked, fake.asked()), (0, vec!["POST sub.example.com".to_owned()]));
+	}
+
+	#[test]
+	fn a_no_or_a_yes_taken_back_is_saved_and_the_host_is_never_asked() {
+		let mut library = library("declined", imported());
+		let hosts = library.held[0].confirmed().to_vec();
+		let refs: Vec<&str> = hosts.iter().map(String::as_str).collect();
+		library.answer_hosts(0, &[], &refs).unwrap();
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("POST relay.example.net", ok(listed(2))), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
+		let Err(failed) = run(&mut library, &fake) else {panic!("a refresh that failed")};
+		assert_eq!((failed.static_asked, fake.asked()), (0, vec!["POST sub.example.com".to_owned()]));
+		let (mut reopened, _) = Library::open(Box::new(FileVault(std::env::temp_dir().join(format!("veilway-static-declined-{}", std::process::id()))))).unwrap();
+		assert_eq!((reopened.held[0].declined().len(), reopened.held[0].waiting().len(), reopened.held[0].confirmed().len()), (hosts.len(), 0, 0));
+		reopened.answer_hosts(0, &refs[..1], &[]).unwrap();
+		assert_eq!((reopened.held[0].confirmed(), reopened.held[0].declined().len()), (&hosts[..1], hosts.len() - 1));
 	}
 
 	#[test]

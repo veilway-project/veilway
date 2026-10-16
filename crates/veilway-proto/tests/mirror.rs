@@ -140,6 +140,34 @@ fn a_static_mirror_is_confirmed_as_a_kind_of_its_own_and_stays_confirmed_while_l
 }
 
 #[test]
+fn a_no_is_kept_while_documents_list_the_host_and_a_yes_can_be_taken_back() {
+	let mut held = held(&mirrors(&[BASE]));
+	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(&[("/serial", json!(2)), ("/refresh_urls", json!([])), ("/static_mirrors", json!([BASE, OTHER]))]).as_bytes(), NOW) else {panic!("a newer document")};
+	assert_eq!((changes.hosts, held.waiting()), (vec!["cdn.example.org:8443#static".to_owned()], vec!["cdn.example.org:8443#static".to_owned()]));
+	// A no to what the screen showed and to a host it did not: only the waiting one is taken, and it is not asked about again.
+	held.decline_hosts(&["cdn.example.org:8443#static", "other.example.net:443#static"]);
+	assert_eq!((held.waiting(), held.unconfirmed(), held.declined().to_vec(), held.static_targets(NOW).len()), (Vec::<String>::new(), vec!["cdn.example.org:8443#static".to_owned()], vec!["cdn.example.org:8443#static".to_owned()], 1));
+	// Kept through storage and through a document that still lists it, so the next refresh notes nothing.
+	let mut held = Held::restore(held.stored()).unwrap();
+	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(&[("/serial", json!(3)), ("/refresh_urls", json!([])), ("/static_mirrors", json!([BASE, OTHER]))]).as_bytes(), NOW) else {panic!("a newer document")};
+	assert!(changes.hosts.is_empty() && held.declined() == ["cdn.example.org:8443#static"]);
+	// A yes taken back: the host is no longer contacted, and is not asked about either.
+	held.decline_hosts(&[HOST]);
+	assert_eq!((held.confirmed().len(), held.static_targets(NOW).len(), held.waiting().len(), held.declined().len()), (0, 0, 0, 2));
+	// A later yes to a declined host is taken.
+	held.confirm_hosts(&[HOST]);
+	assert_eq!((held.confirmed().to_vec(), held.declined().to_vec(), held.static_targets(NOW).len()), (vec![HOST.to_owned()], vec!["cdn.example.org:8443#static".to_owned()], 1));
+	// Dropped by a document and listed again by the next, a declined host is asked about again.
+	held.refresh(issue(&[("/serial", json!(4)), ("/refresh_urls", json!([])), ("/static_mirrors", json!([BASE]))]).as_bytes(), NOW).unwrap();
+	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(&[("/serial", json!(5)), ("/refresh_urls", json!([])), ("/static_mirrors", json!([BASE, OTHER]))]).as_bytes(), NOW) else {panic!("a newer document")};
+	assert_eq!((changes.hosts, held.declined().len()), (vec!["cdn.example.org:8443#static".to_owned()], 0));
+	// What storage says was declined is read as untrusted: a host the document does not list, or one also confirmed, is not kept.
+	let mut stored = held.stored();
+	stored.declined = vec!["gone.example.org:443".into(), HOST.into(), "cdn.example.org:8443#static".into(), "cdn.example.org:8443#static".into()];
+	assert_eq!(Held::restore(stored).unwrap().declined(), ["cdn.example.org:8443#static"]);
+}
+
+#[test]
 fn a_static_mirror_may_not_be_the_host_of_the_endpoint_or_a_refresh_host() {
 	let endpoint = held(&[]).endpoints()[0].authority();
 	assert_eq!(endpoint, "sub.example.com:443");

@@ -319,16 +319,16 @@ impl Review {
 		if endpoint_changed != self.rechecked {return Err(Box::new(Declined {failure: Failure::Changed, release: Self::release(self.origin, self.key)}))}
 		let replaces = before.map(|_| Replaced {id: self.subscription.id.clone(), key: self.key});
 		let hosts = if self.origin.is_some() {self.subscription.host_keys().collect()} else {Vec::new()};
-		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, pins: self.pins, private: Vec::new()};
+		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, declined: Vec::new(), pins: self.pins, private: Vec::new()};
 		Ok(Accepted {confirm: held.request(Op::Confirm(name)), held, replaces, endpoint_changed})
 	}
 	/// The user declines. "The client sends `"release"`, so that the device place is freed, and keeps nothing: not the document, not the link, not the key it made." `None` for a whole document, which took no place.
 	pub fn decline(self) -> Option<Request> {Self::release(self.origin, self.key)}
 }
 
-/// What a client holds for one subscription: the link it came by and the device made for it, unless it came as a whole document, the last good document as it was delivered, the pins the link's endpoint is checked by, and the refresh hosts the user has confirmed, each with its port and whether it is pinned. The keys held, the id, the serial and the times are those of the last good document, so they cannot disagree with it.
+/// What a client holds for one subscription: the link it came by and the device made for it, unless it came as a whole document, the last good document as it was delivered, the pins the link's endpoint is checked by, and the refresh hosts the user has confirmed, each with its port and whether it is pinned, and those the user said no to. The keys held, the id, the serial and the times are those of the last good document, so they cannot disagree with it.
 #[derive(Clone, PartialEq)]
-pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>, pins: Vec<[u8; 32]>, private: Vec<IpAddr>}
+pub struct Held {origin: Option<(Native, Device)>, document: String, subscription: Subscription, hosts: Vec<String>, declined: Vec<String>, pins: Vec<[u8; 32]>, private: Vec<IpAddr>}
 
 // The document holds transport secrets, and with a provider-issued key the device's private key. None of it is printed, and neither is the link.
 impl fmt::Debug for Held {
@@ -430,6 +430,8 @@ pub struct Stored {
 	pub document: String,
 	/// The confirmed hosts, each as `host:port`, `host:port#pinned` for a pinned refresh host, or `host:port#static` for a static mirror.
 	pub hosts: Vec<String>,
+	/// The hosts the user said no to, in the same forms, so that the app does not ask about them again while documents list them. Missing in an older vault, which is no answer. Read as untrusted: `Held::restore` keeps only hosts the document lists that are not confirmed as well.
+	pub declined: Vec<String>,
 	/// The pins the link's endpoint is checked by: empty for a link with no pin, otherwise 1 or 2.
 	pub pins: Vec<[u8; 32]>,
 	/// The private addresses the user said yes to for this subscription's endpoints. Missing in an older vault, which is no yes. Read as untrusted: `Held::restore` keeps only addresses `Held::allow_private` would.
@@ -497,7 +499,20 @@ impl Held {
 	/// The user confirmed the hosts in `seen`, each as `unconfirmed` gave it: what the screen showed. Only hosts that wait are taken, so a host that a refresh added while the screen was up is not confirmed with it.
 	pub fn confirm_hosts(&mut self, seen: &[&str]) {
 		let confirmed: Vec<String> = self.unconfirmed().into_iter().filter(|host| seen.contains(&host.as_str())).collect();
+		self.declined.retain(|host| !confirmed.contains(host));
 		self.hosts.extend(confirmed);
+	}
+	/// The hosts of `unconfirmed` the user has not said no to: what the app asks about. A host the user declined is asked about again only once a document drops it and a later one lists it again.
+	pub fn waiting(&self) -> Vec<String> {self.unconfirmed().into_iter().filter(|host| !self.declined.contains(host)).collect()}
+	/// The refresh hosts and static mirrors the user has confirmed, in the forms of `unconfirmed`.
+	pub fn confirmed(&self) -> &[String] {&self.hosts}
+	/// The hosts the user said no to, in the forms of `unconfirmed`. They wait like any unconfirmed host, so `confirm_hosts` still takes them.
+	pub fn declined(&self) -> &[String] {&self.declined}
+	/// The user said no to the hosts in `seen`, each as `unconfirmed` or `confirmed` gave it: a waiting host is not asked about again, and a confirmed one loses its yes and is not contacted again. Only hosts the document lists are taken.
+	pub fn decline_hosts(&mut self, seen: &[&str]) {
+		let declined: Vec<String> = self.unconfirmed().into_iter().chain(self.hosts.iter().cloned()).filter(|host| seen.contains(&host.as_str()) && !self.declined.contains(host)).collect();
+		self.hosts.retain(|host| !declined.contains(host));
+		self.declined.extend(declined);
 	}
 	/// The body of the answer to a refresh, at the wall clock `now`. Every check of "What is checked, in order" runs, against the keys held and the last good document. On any failure nothing here changes, and the caller shows why, "and tries again as the table of numbers says".
 	pub fn refresh(&mut self, body: &[u8], now: u64) -> Result<Refreshed, Failure> {
@@ -527,7 +542,8 @@ impl Held {
 		// A host stays confirmed only while documents list it. One that a document dropped and a later one lists again is a host "a later document adds", and is asked about again.
 		let listed: Vec<String> = self.subscription.host_keys().collect();
 		self.hosts.retain(|host| listed.contains(host));
-		changes.hosts = self.unconfirmed();
+		self.declined.retain(|host| listed.contains(host));
+		changes.hosts = self.waiting();
 		Ok(Refreshed::Updated(changes))
 	}
 	// `k_name` and `k_mirror` from the link's token, the device's secret and its key: "The client holds everything it needs".
@@ -551,7 +567,7 @@ impl Held {
 		if self.standing(now) == Standing::Stale {Err(Stale(permit))} else {Ok(permit)}
 	}
 	/// The value to put in storage.
-	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone(), pins: self.pins.clone(), private: self.private.clone()}}
+	pub fn stored(&self) -> Stored {Stored {origin: self.origin.as_ref().map(|(link, device)| (link.veilway(), device.private.clone(), device.secret.clone())), keys: self.keys().iter().map(|key| *key.bytes()).collect(), document: self.document.clone(), hosts: self.hosts.clone(), declined: self.declined.clone(), pins: self.pins.clone(), private: self.private.clone()}}
 	/// The private addresses the user said yes to for this subscription's endpoints: "Fetching" asks once per address, and a name that comes to another private address asks again. A fetch may dial a private address only if it is in this list.
 	pub fn private_addresses(&self) -> &[IpAddr] {&self.private}
 	/// Remembers the user's yes to `addresses`, the ones the question showed. Only an address that is `private` and `dialable` is kept, so a yes can never reach a loopback, link-local or other refused address. At most `PRIVATE_MAX` are kept, the oldest dropped first.
@@ -559,7 +575,7 @@ impl Held {
 		for address in addresses.iter().filter(|address| payload::dialable(**address) && payload::private(**address)) {if !self.private.contains(address) {self.private.push(*address)}}
 		if self.private.len() > PRIVATE_MAX {self.private.drain(..self.private.len() - PRIVATE_MAX);}
 	}
-	/// A `Held` out of storage. The document is verified again under the stored keys and read again, so a `Held` never holds a document that would not pass today's reader. The clock is not asked: an old document is still the last good one. A confirmed host that is no `host:port`, or that the document does not list, is not kept, and the user is asked about it again.
+	/// A `Held` out of storage. The document is verified again under the stored keys and read again, so a `Held` never holds a document that would not pass today's reader. The clock is not asked: an old document is still the last good one. A confirmed host that is no `host:port`, or that the document does not list, is not kept, and the user is asked about it again. A declined host is kept on the same terms.
 	/// The stored device is not compared with the keys in the document, and the stored keys are not compared with anything: what is stored is trusted.
 	pub fn restore(stored: Stored) -> Result<Self, Damaged> {
 		let (Some(keys), Ok(origin)) = (stored.keys.iter().map(|key| SigningKey::new(*key)).collect::<Option<Vec<_>>>().filter(|keys| (1..=2).contains(&keys.len())), match stored.origin.as_ref().map(|(link, private, secret)| (Link::parse(link), Device::restore(private.clone(), secret.clone()))) {
@@ -575,7 +591,11 @@ impl Held {
 			// Every step that stores pins stores exactly the list of the document when it has one, so pins that differ from it are storage that does not hold together, and are not trusted for a recovery fetch.
 			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.is_some() && !subscription.endpoint_pins.is_empty() && stored.pins != subscription.endpoint_pins => Err(Damaged::Broken(stored.origin.map(Box::new))),
 			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.as_ref().is_none_or(|(link, _)| endpoint_ok(&subscription, link, &stored.pins).is_ok()) => {
-				let mut held = Self {hosts: stored.hosts.into_iter().filter(|host| subscription.host_keys().any(|listed| listed == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins, private: Vec::new()};
+				let hosts: Vec<String> = stored.hosts.into_iter().filter(|host| subscription.host_keys().any(|listed| listed == *host)).collect();
+				let mut declined: Vec<String> = stored.declined.into_iter().filter(|host| !hosts.contains(host) && subscription.host_keys().any(|listed| listed == *host)).collect();
+				declined.sort();
+				declined.dedup();
+				let mut held = Self {hosts, declined, origin, document: stored.document, subscription: *subscription, pins: stored.pins, private: Vec::new()};
 				held.allow_private(&stored.private);
 				Ok(held)
 			}

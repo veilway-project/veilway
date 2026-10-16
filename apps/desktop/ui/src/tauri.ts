@@ -9,7 +9,9 @@ export type Connection = {transport: string, address: string, host: string | nul
 export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, connection: Connection | null, applied: unknown};
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
 export type Profile = {id: string, name: string, exits: [string, string][]};
-export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], logo: string | null, accent: string | null, left_out: number, lan_local: boolean};
+// A backup update address of a subscription. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does.
+export type Host = {key: string, host: string, kind: "update" | "static", state: "waiting" | "allowed" | "declined"};
+export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], logo: string | null, accent: string | null, left_out: number, lan_local: boolean, hosts: Host[]};
 export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, in_file: boolean};
 export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, left_out: string[], preview: Subscription};
 // The question of an endpoint on a private address that the user has not said yes to yet. The answer to it is the same call again with `private` set to these addresses, exactly as shown.
@@ -31,6 +33,7 @@ type Commands = {
 	library: [{languages: string[]}, Subscription[]],
 	refresh: [{id: string, private?: string[]}, Subscription[] | PrivateAsk],
 	remove: [{id: string}, Subscription[]],
+	answer_hosts: [{id: string, allow: string[], decline: string[]}, Subscription[]],
 	set_lan: [{id: string, on: boolean}, Subscription[]],
 	connect: [{subscription: string, profile: string, options: Options}, null],
 	answer: [{yes: boolean}, null],
