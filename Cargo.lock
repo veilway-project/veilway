@@ -2740,6 +2740,7 @@ name = "veilway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "boringtun",
  "clap",
  "etherparse 0.21.0",
@@ -2748,9 +2749,12 @@ dependencies = [
  "rcgen",
  "ring",
  "rustix",
+ "rustls",
+ "serde",
  "serde_json",
  "time",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "veilway-api",
@@ -2761,6 +2765,7 @@ dependencies = [
  "veilway-proto",
  "veilway-wg",
  "veilway-windows",
+ "webpki-roots 1.0.9",
  "x509-parser",
 ]
 

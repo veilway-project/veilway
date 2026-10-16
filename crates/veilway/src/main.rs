@@ -2,6 +2,8 @@
 mod client;
 mod doctor;
 mod link;
+#[cfg(unix)]
+mod mirror;
 
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
@@ -96,6 +98,13 @@ enum Command {
 	#[cfg(target_os = "macos")]
 	#[command(hide = true)]
 	Restore,
+	/// Run a relay mirror of a subscription endpoint: it serves the endpoint's path on this server and forwards each request to the provider's panel over HTTPS, so apps can refresh through it while the main endpoint is blocked. It reads every token, so run it only on a server the provider controls. Behind the operator's own web server, which ends TLS
+	#[cfg(unix)]
+	Mirror {
+		#[arg(long, short, default_value = "mirror.json")] config: PathBuf,
+		/// Only validate the config and print every error and warning
+		#[arg(long)] check: bool,
+	},
 	/// Print the JSON Schema of config version 1
 	Schema,
 	/// Print a fresh private key and its public key
@@ -433,6 +442,8 @@ async fn main() -> anyhow::Result<()> {
 		Command::Status => std::process::exit(client::show()),
 		#[cfg(target_os = "macos")]
 		Command::Restore => client::restore().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
+		#[cfg(unix)]
+		Command::Mirror {config, check} => std::process::exit(mirror::run(&config, check).await),
 		Command::Schema => {
 			print!("{}", veilway_core::config::schema());
 			Ok(())
