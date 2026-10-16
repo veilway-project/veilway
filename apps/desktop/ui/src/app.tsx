@@ -92,7 +92,8 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		setQuestion(null);
 		call("answer", {yes}).catch(error => toast({tone: "danger", title: t("question.failed"), body: error}));
 	};
-	const install = () => { setProgress({downloaded: 0, total: null}); call("install_update").catch(error => { setProgress(null); toast({tone: "danger", title: t("update.failed"), body: error}); }); };
+	// The desktop restarts into the new version and never returns here; Android returns once the system's installer has the file, and the user may still cancel there.
+	const install = () => { setProgress({downloaded: 0, total: null}); call("install_update").then(() => setProgress(null), error => { setProgress(null); toast({tone: "danger", title: t("update.failed"), body: error}); }); };
 	const saveSettings = (next: Settings) => { onSettings(next); call("set_settings", {settings: next}).catch(error => toast({tone: "danger", title: t("settings.saveFailed"), body: error})); };
 	const kind = question === null ? null : QUESTIONS.find(([, words]) => question.includes(words))?.[0] ?? "other";
 	const updateBanner = update && <Banner tone="info" title={t("update.title", {version: update.version})} action={!progress && <Button size="sm" variant="primary" onClick={install}>{t("update.install")}</Button>}>

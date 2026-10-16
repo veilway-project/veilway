@@ -14,6 +14,7 @@ mod qr;
 mod view;
 mod bridge;
 mod host;
+mod update;
 mod vault;
 mod vpn;
 use base64::Engine;
@@ -21,6 +22,7 @@ use proto::{Call, Options, Out, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::plugin::{Builder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
@@ -41,7 +43,7 @@ struct UpdateInfo {available: bool, version: String, notes: String, current: Str
 struct Settings {auto_update: bool, theme: String, locale: String, kill_switch: bool}
 
 impl Default for Settings {
-	fn default() -> Self {Settings {auto_update: false, theme: "dark".into(), locale: "en".into(), kill_switch: false}}
+	fn default() -> Self {Settings {auto_update: true, theme: "dark".into(), locale: "en".into(), kill_switch: false}}
 }
 
 #[derive(Deserialize)]
@@ -163,15 +165,59 @@ fn get_autostart() -> bool {false}
 #[tauri::command]
 fn set_autostart(_enabled: bool) -> Result<(), String> {Err("Start at login is not a setting on Android. Turn on Always-on VPN in the system's VPN settings.".into())}
 
-/// Updates come through the store or the sideloaded file, never through the app.
+/// Looks for a newer signed release on GitHub. See `update.rs` for what is trusted and what is checked.
 #[tauri::command]
 async fn check_update(app: AppHandle) -> Result<UpdateInfo, String> {
 	let current = app.package_info().version.to_string();
-	Ok(UpdateInfo {available: false, version: current.clone(), notes: String::new(), current})
+	match update::latest(&current).await? {
+		Some(found) => {
+			tracing::info!("update {} available", found.tag);
+			Ok(UpdateInfo {available: true, version: found.version, notes: found.notes, current})
+		}
+		None => Ok(UpdateInfo {available: false, version: current.clone(), notes: String::new(), current}),
+	}
 }
 
+static UPDATING: AtomicBool = AtomicBool::new(false);
+
+/// Downloads the newest release, checks its signature, and only then hands it to the system's installer, which asks the user. The Kotlin side stops the connection right before, and it comes back after the update if it was on.
 #[tauri::command]
-async fn install_update() -> Result<(), String> {Err("Updates on Android come as a new APK or from the store.".into())}
+async fn install_update(app: AppHandle, vpn: State<'_, Arc<Vpn>>) -> Result<(), String> {
+	if UPDATING.swap(true, Ordering::SeqCst) {return Err("An update is already in progress.".into())}
+	let result = download_update(&app, &vpn).await;
+	UPDATING.store(false, Ordering::SeqCst);
+	result
+}
+
+async fn download_update(app: &AppHandle, vpn: &State<'_, Arc<Vpn>>) -> Result<(), String> {
+	let Granted {granted} = plugin(vpn, "canInstall", json!({})).await?;
+	if !granted {
+		plugin::<Value>(vpn, "allowInstalls", json!({})).await?;
+		return Err("Android has not allowed Veilway to install apps yet. Allow it in the screen that just opened, come back, and tap Update again.".into());
+	}
+	let found = update::latest(&app.package_info().version.to_string()).await?.ok_or("Already up to date.")?;
+	let signature = update::signature(&found).await?;
+	let folder = host::get().ok_or("Veilway is still starting.")?.dir.join("update");
+	let _ = std::fs::remove_dir_all(&folder);
+	std::fs::create_dir_all(&folder).map_err(|error| error.to_string())?;
+	let path = folder.join(update::APK);
+	tracing::info!("downloading update {}", found.tag);
+	let verified = async {
+		update::download(&found, &path, |downloaded, total| {let _ = app.emit("update-progress", json!({"downloaded": downloaded, "total": total}));}).await?;
+		let file = std::fs::File::open(&path).map_err(|error| error.to_string())?;
+		let tag = found.tag.clone();
+		tokio::task::spawn_blocking(move || update::verify(update::PUBKEY, &signature, &tag, file)).await.map_err(|error| error.to_string())?
+	}.await;
+	if let Err(error) = verified {
+		let _ = std::fs::remove_dir_all(&folder);
+		tracing::warn!("update {} refused: {error}", found.tag);
+		return Err(error);
+	}
+	tracing::info!("update {} verified, handing it to the installer", found.tag);
+	let handed = plugin::<Value>(vpn, "install", json!({"path": path.to_string_lossy()})).await;
+	if handed.is_err() {let _ = std::fs::remove_dir_all(&folder);}
+	handed.map(|_| ())
+}
 
 fn settings_path() -> Result<std::path::PathBuf, String> {Ok(host::get().ok_or("Veilway is still starting.")?.dir.join("settings.json"))}
 
