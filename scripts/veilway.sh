@@ -568,6 +568,8 @@ do_panel_update_request() {
 	if [ -f "$req" ] && [ ! -L "$req" ]; then word="$(timeout 5 head -c 16 -- "$req" 2>/dev/null | tr -d '\n' || true)"; fi
 	rm -f -- "$req"
 	[ "$word" = panel ] || { warn "the update request was not the word panel: ignored"; return 0; }
+	# A service has no terminal to answer a question on: the admin said yes in the panel.
+	ASSUME_YES=1
 	do_update panel
 }
 
