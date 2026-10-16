@@ -83,7 +83,8 @@ header() {
 box() {
 	local title="$1" w=62 line pad
 	shift
-	printf '  %s%s %s%s%s %s%s\n' "$D" "$TL" "$Z$B" "$title" "$Z$D" "$(rule $((w - ${#title} - 3)))" "$TR$Z"
+	for line in "$@"; do [ "${#line}" -gt "$w" ] && w=${#line}; done
+	printf '  %s%s %s%s%s %s%s\n' "$D" "$TL" "$Z$B" "$title" "$Z$D" "$(rule $((w - ${#title})))" "$TR$Z"
 	for line in "$@"; do
 		pad=$((w - ${#line}))
 		[ "$pad" -lt 0 ] && pad=0
@@ -736,9 +737,15 @@ panel_summary() {
 		"            reverse_proxy $prefix/* 127.0.0.1:$PANEL_PORT" \
 		"            reverse_proxy $sub/* 127.0.0.1:$PANEL_PORT }" \
 		"" \
+		"HTTPS is required: the panel signs in only over it." \
+		"  Caddy gets a certificate for your domain by itself." \
+		"  nginx: sudo apt install certbot python3-certbot-nginx" \
+		"         sudo certbot --nginx -d your-domain" \
+		"" \
 		"Admin pages: https://your-domain$prefix/" \
 		"$([ -n "$token" ] && echo "Setup token (one time): $token" || echo "Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'")" \
-		"Send it with a username and password to POST $prefix/api/setup."
+		"Open the admin pages in a browser and paste the token there." \
+		"It asks for your username, password and the terms."
 }
 
 # Moves the admin pages to a new path, a random one or the one given. The web server in front has to follow, so its new lines are printed; a panel that does not come back up gets the old path again.
