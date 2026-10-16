@@ -51,6 +51,8 @@ Save this as `panel.json`. Replace the prefix with a random path, for example th
   "database": "/var/lib/veilway-panel/panel.db",
   "keys": "/var/lib/veilway-panel/panel.keys",
   "signing": "/var/lib/veilway-panel/signing.keys",
+  "gateway": "/var/lib/veilway-panel/gateway.keys",
+  "gateway_next": "/var/lib/veilway-panel/gateway.next",
   "node_socket": "/run/veilway/veilway.sock",
   "trusted_proxies": ["127.0.0.1"]
 }

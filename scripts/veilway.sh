@@ -699,6 +699,8 @@ panel_config() {
 	"database": "$PANEL_DIR/panel.db",
 	"keys": "$PANEL_DIR/panel.keys",
 	"signing": "$PANEL_DIR/signing.keys",
+	"gateway": "$PANEL_DIR/gateway.keys",
+	"gateway_next": "$PANEL_DIR/gateway.next",
 	"node_socket": "/run/veilway/control.sock",
 	"trusted_proxies": ["127.0.0.1", "::1"],
 	"allowed_hosts": [],
