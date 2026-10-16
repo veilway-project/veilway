@@ -1,4 +1,4 @@
-//! What the UI is shown: plain data made from the engine's `Status` and from a stored subscription. It names no rating, class or transport, and no address of the provider's nodes: "Ratings and classes are words for operators". Texts of a signed payload are picked in the app's languages here, and a logo is checked (its size and that it is what it says it is) before it is handed over as a data URL.
+//! What the UI is shown: plain data made from the engine's `Status` and from a stored subscription. It names no rating or class. The one place that shows the candidate in use is `connection`, for the details the user asks to see: "Ratings and classes are words for operators". Texts of a signed payload are picked in the app's languages here, and a logo is checked (its size and that it is what it says it is) before it is handed over as a data URL.
 use base64::Engine;
 use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,9 @@ pub struct UsageOut {pub used_bytes: u64, pub quota_bytes: u64, pub period: Stri
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AppliedOut {pub interface: String, pub kill_switch: bool, pub dns: String, pub split: Option<Vec<String>>, pub allow_lan: bool}
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ConnectionOut {pub transport: String, pub address: String, pub host: Option<String>, pub front: Option<String>, pub server_name: Option<String>, pub check: Option<String>, pub since: Option<u64>}
+
 /// The state of the tunnel as the UI draws it. `state` is one of off, connecting, connected, reconnecting, stopped, failed; `say` is the plain-words reason when there is one, with a stable `say_code` for translation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StatusView {
@@ -41,6 +44,7 @@ pub struct StatusView {
 	pub received_bytes: u64,
 	pub mtu: u16,
 	pub out_of_date: bool,
+	pub connection: Option<ConnectionOut>,
 	pub applied: Option<AppliedOut>,
 }
 
@@ -70,6 +74,7 @@ pub fn status_view(status: &Status, applied: Option<AppliedOut>) -> StatusView {
 		received_bytes: status.counters.bytes_received,
 		mtu: status.mtu,
 		out_of_date: status.out_of_date,
+		connection: status.connection.as_ref().map(|found| ConnectionOut {transport: found.transport.into(), address: found.address.to_string(), host: found.host.clone(), front: found.front.clone(), server_name: found.server_name.clone(), check: found.check.map(|check| check.code().into()), since: found.since}),
 		applied,
 	}
 }
@@ -177,7 +182,7 @@ mod tests {
 	use super::*;
 	use veilway_engine::{Counters, Say, Stop};
 
-	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default()}}
+	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
 
 	#[test]
 	fn a_stopped_tunnel_says_why_in_plain_words_and_names_no_rating() {
@@ -187,6 +192,15 @@ mod tests {
 		let text = serde_json::to_string(&status_view(&status(State::Connected {exit: Some("main".into())}), None)).unwrap().to_lowercase();
 		for word in ["protected", "detectable", "rating", "nocover", "obfs", "fronted", "websocket", "transport"] {assert!(!text.contains(word), "{word} in {text}")}
 		assert!(text.contains("\"exit\":\"main\""));
+	}
+
+	#[test]
+	fn the_connection_in_use_is_given_as_text_and_has_no_secret() {
+		let mut found = status(State::Connected {exit: None});
+		found.connection = Some(veilway_engine::Connection {transport: "tls", address: "192.0.2.7:443".parse().unwrap(), host: Some("node.example".into()), front: None, server_name: Some("cdn.example".into()), check: Some(veilway_engine::Check::PublicAndPin), since: Some(5)});
+		let view = status_view(&found, None).connection.unwrap();
+		assert_eq!((view.transport.as_str(), view.address.as_str(), view.check.as_deref(), view.since), ("tls", "192.0.2.7:443", Some("public-and-pin"), Some(5)));
+		assert!(status_view(&status(State::Off), None).connection.is_none());
 	}
 
 	#[test]

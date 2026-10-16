@@ -11,7 +11,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown, CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
 use veilway_engine::import::{self, Fetcher, Library};
-use veilway_engine::{ask_text, default_roots, Agree, Retry, Settings, StartError, State, Status, Store};
+use veilway_engine::{ask_text, default_roots, Agree, Check, Retry, Settings, StartError, State, Status, Store};
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
 #[cfg(target_os = "macos")]
@@ -155,7 +155,7 @@ pub fn state_line(status: &Status, now: u64) -> String {
 	}
 }
 
-/// Everything `veilway status` shows, in plain words. It names no rating, class or transport.
+/// Everything `veilway status` shows, in plain words. It names no rating or class.
 pub fn render(status: &Status, applied: &Applied, now: u64) -> String {
 	let mut lines = vec![status.name.clone(), format!("State: {}", state_line(status, now))];
 	if let Some(say) = status.say {lines.push(format!("Note: {}", say.text()))}
@@ -168,6 +168,11 @@ pub fn render(status: &Status, applied: &Applied, now: u64) -> String {
 	lines.push(match &applied.split {None => "Routes: everything goes through the tunnel.".into(), Some(nets) => format!("Routes: only {} goes through the tunnel.", nets.join(", "))});
 	if applied.allow_lan {lines.push("Local network: devices on the subnets this device is connected to are reached outside the tunnel.".into())}
 	lines.push(format!("Device: {}, packet size {}.", applied.interface, status.mtu));
+	if let Some(found) = &status.connection {
+		let check = found.check.map(|check| match check {Check::Public => "public certificate", Check::PublicAndPin => "public certificate and pin", Check::PinnedSelfSigned => "pinned self-signed"});
+		let parts = [Some(format!("{}{}", found.address, found.host.as_ref().map_or_else(String::new, |host| format!(" ({host})")))), Some(found.transport.to_owned()), found.front.as_ref().map(|front| format!("front {front}")), found.server_name.as_ref().map(|name| format!("server name {name}")), check.map(str::to_owned), found.since.map(|since| format!("up {} s", now.saturating_sub(since)))];
+		lines.push(format!("Server: {}.", parts.into_iter().flatten().collect::<Vec<_>>().join(", ")));
+	}
 	let counters = status.counters;
 	lines.push(format!("Traffic: {} sent, {} received.", size(counters.bytes_sent), size(counters.bytes_received)));
 	if let Some(usage) = status.usage {lines.push(if usage.quota_bytes == 0 {format!("Usage: {} used, no limit.", size(usage.used_bytes))} else {format!("Usage: {} of {} used.", size(usage.used_bytes), size(usage.quota_bytes))})}
@@ -372,7 +377,7 @@ mod tests {
 	use super::*;
 	use veilway_engine::{Counters, Say, Stop};
 
-	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default()}}
+	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
 
 	fn applied() -> Applied {Applied {interface: "vw0".into(), kill_switch: true, dns: "/etc/resolv.conf", split: None, allow_lan: false}}
 
@@ -384,6 +389,14 @@ mod tests {
 		for word in ["protected", "detectable", "unsafe", "rating", "nocover", "cover", "obfs", "tls", "fronted", "websocket", "transport"] {assert!(!text.contains(word), "{word} in {text}")}
 		assert!(text.contains("connected, through the exit main.") && text.contains("kill switch: on") && text.contains("looked up only through the tunnel"));
 		assert!(!text.contains('\u{2014}'));
+	}
+
+	#[test]
+	fn the_server_line_gives_the_candidate_in_use_and_no_secret() {
+		let mut found = status(State::Connected {exit: None});
+		found.connection = Some(veilway_engine::Connection {transport: "fronted", address: "192.0.2.7:443".parse().unwrap(), host: None, front: Some("cdn.example".into()), server_name: Some("cdn.example".into()), check: Some(Check::Public), since: Some(40)});
+		let text = render(&found, &applied(), 100);
+		assert!(text.contains("Server: 192.0.2.7:443, fronted, front cdn.example, server name cdn.example, public certificate, up 60 s."), "{text}");
 	}
 
 	#[test]

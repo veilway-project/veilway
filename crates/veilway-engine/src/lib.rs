@@ -44,7 +44,7 @@ use veilway_proto::NoRandom;
 use veilway_transport::choice;
 use veilway_transport::{Hook, Link};
 
-pub use status::{Attempt, Counters, Event, ExitView, NoticeView, Retry, Say, State, Status, Stop, UsageView};
+pub use status::{Attempt, Check, Connection, Counters, Event, ExitView, NoticeView, Retry, Say, State, Status, Stop, UsageView};
 pub use store::Store;
 pub use veilway_transport::choice::Class;
 pub use veilway_transport::Clock;

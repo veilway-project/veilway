@@ -1,8 +1,10 @@
 //! What an app is given of a tunnel: states, the words for what went wrong, and counters.
 //!
 //! Nothing here names a rating or a class. "Ratings and classes are words for operators, used in the panel and these pages. An app does not show them, because a label scares some users and makes others too sure." An app shows the connection's name and the state. The one exception, an Unsafe profile, is not a state of a running tunnel: the engine refuses to start one until the app has shown its plain warning and passed `Agree::unsafe_profile` (see `StartError`).
-//! A candidate being tried is given by its place in the signed profile's lists and nothing else. The address, the name and the path of it are the provider's and are not an app's to show.
+//! A candidate being tried is given by its place in the signed profile's lists in `Attempt`. `Connection` is the one place that says what the user's own device is dialling, for the "Connection details" an app shows on request: the address, the names and how the certificate is checked, never a key, a pin's value, a token or a link, and never a rating.
+use std::net::SocketAddr;
 use veilway_proto::control::{ByeReason, ExitStatus, Load, Period, Severity};
+use veilway_proto::subscription::payload::Transport;
 
 /// The reason for a state, in plain words. `code` is a stable key an app translates by, `text` is the English wording: both are the engine's, never a node's or a provider's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +143,61 @@ pub enum Retry {
 	Asked,
 }
 
+/// How the certificate of a candidate is checked, as the user may be told. Never a pin's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Check {
+	/// The chain, the name and the date.
+	Public,
+	/// The chain, the name and the date, and a pin on top.
+	PublicAndPin,
+	/// A self-signed certificate trusted through its pin alone.
+	PinnedSelfSigned,
+}
+
+impl Check {
+	pub fn code(self) -> &'static str {
+		match self {
+			Self::Public => "public",
+			Self::PublicAndPin => "public-and-pin",
+			Self::PinnedSelfSigned => "pinned-self-signed",
+		}
+	}
+}
+
+/// The candidate in use, or the first one being tried, as the profile has it. `since` is the Unix time its session opened, and is `None` until one has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connection {
+	/// `udp`, `udp-obfs`, `tls`, `ws` or `fronted`.
+	pub transport: &'static str,
+	pub address: SocketAddr,
+	/// The host name of a candidate that has one. Not given for `fronted`, whose host is the hidden service behind the front.
+	pub host: Option<String>,
+	/// The name of the front, for `fronted`.
+	pub front: Option<String>,
+	/// The TLS server name sent, if any.
+	pub server_name: Option<String>,
+	pub check: Option<Check>,
+	pub since: Option<u64>,
+}
+
+impl Connection {
+	pub(crate) fn of(transport: &Transport, candidate: usize) -> Option<Self> {
+		let (name, stream) = match transport {
+			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => {
+				let address = endpoints.get(candidate)?.address();
+				return Some(Self {transport: if matches!(transport, Transport::Udp(_)) {"udp"} else {"udp-obfs"}, address, host: None, front: None, server_name: None, check: None, since: None});
+			}
+			Transport::Tls(stream) => ("tls", stream),
+			Transport::Ws(stream) => ("ws", stream),
+			Transport::Fronted(stream) => ("fronted", stream),
+		};
+		let found = stream.candidates.get(candidate)?;
+		let check = if found.self_signed {Check::PinnedSelfSigned} else if found.pins.is_empty() {Check::Public} else {Check::PublicAndPin};
+		let fronted = name == "fronted";
+		Some(Self {transport: name, address: found.address.address(), host: Some(found.host.clone()).filter(|host| !fronted && !host.is_empty()), front: found.sni.clone().filter(|_| fronted), server_name: found.sni.clone(), check: Some(check), since: None})
+	}
+}
+
 /// What the tunnel is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum State {
@@ -232,10 +289,12 @@ pub struct Status {
 	/// The node's addresses are not the profile's: the app refreshes the subscription.
 	pub out_of_date: bool,
 	pub counters: Counters,
+	/// The candidate in use, or being tried. `None` when nothing is chosen.
+	pub connection: Option<Connection>,
 }
 
 impl Status {
-	pub(crate) fn off(name: String, mtu: u16) -> Self {Self {state: State::Off, name, say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu, control: false, out_of_date: false, counters: Counters::default()}}
+	pub(crate) fn off(name: String, mtu: u16) -> Self {Self {state: State::Off, name, say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
 }
 
 /// Things that happen once, for an app that reacts to them. The state of a tunnel is in `Status`, and these are only what changed.
@@ -270,5 +329,21 @@ mod tests {
 			assert!(!text.contains('\u{2014}') && !text.contains(" - ") && text.ends_with('.'), "{say:?}");
 		}
 		for stop in [Stop::Quota, Stop::Expired, Stop::Disabled, Stop::NodeStopping] {assert!(Say::ALL.contains(&stop.say()))}
+	}
+
+	#[test]
+	fn the_connection_names_the_candidate_and_how_it_is_checked_and_nothing_secret() {
+		use veilway_proto::subscription::payload::{Candidate, Dial, Stream};
+		let candidate = |sni: Option<&str>, pins: Vec<[u8; 32]>, self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: sni.map(str::to_owned), host: "node.example".to_owned(), ech: None, pins, self_signed};
+		let stream = |candidates| Stream {path: "/aaaaaaaaaaaa".into(), candidates};
+		let tls = Connection::of(&Transport::Tls(stream(vec![candidate(Some("front.example"), vec![[7; 32]], true), candidate(Some("front.example"), vec![[7; 32]], false), candidate(None, Vec::new(), false)])), 0).unwrap();
+		assert_eq!((tls.transport, tls.address.to_string(), tls.host.as_deref(), tls.server_name.as_deref(), tls.check, tls.since), ("tls", "203.0.113.9:443".to_owned(), Some("node.example"), Some("front.example"), Some(Check::PinnedSelfSigned), None));
+		assert_eq!(Connection::of(&Transport::Ws(stream(vec![candidate(Some("a.example"), vec![[7; 32]], false)])), 0).unwrap().check, Some(Check::PublicAndPin));
+		let fronted = Connection::of(&Transport::Fronted(stream(vec![candidate(Some("front.example"), Vec::new(), false)])), 0).unwrap();
+		assert_eq!((fronted.transport, fronted.host.as_deref(), fronted.front.as_deref(), fronted.check), ("fronted", None, Some("front.example"), Some(Check::Public)));
+		let udp = Connection::of(&Transport::UdpObfs(vec![Dial::parse("203.0.113.9:5002").unwrap()]), 0).unwrap();
+		assert_eq!((udp.transport, udp.check, udp.server_name.as_deref()), ("udp-obfs", None, None));
+		assert!(Connection::of(&Transport::Udp(Vec::new()), 0).is_none());
+		for found in [&tls, &fronted, &udp] {assert!(!format!("{found:?}").contains("[7, 7"))}
 	}
 }

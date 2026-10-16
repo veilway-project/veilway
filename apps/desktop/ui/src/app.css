@@ -32,3 +32,15 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-brand { display: flex; align-items: center; gap: var(--s-3); }
 .d-brand svg { inline-size: 36px; block-size: 36px; flex: none; }
 .d-brand div { display: grid; line-height: var(--leading-tight); }
+.d-details { padding: 0 var(--s-2); }
+.d-details summary { display: flex; align-items: center; justify-content: space-between; gap: var(--s-3); min-block-size: 52px; padding: var(--s-2); border-radius: var(--r-2); cursor: pointer; list-style: none; }
+.d-details summary::-webkit-details-marker { display: none; }
+.d-details summary:focus-visible { outline: 2px solid var(--c-focus); outline-offset: 2px; }
+.d-details summary .vw-icon { color: var(--c-text-muted); transition: transform var(--dur-1) var(--ease); }
+.d-details[open] summary .vw-icon { transform: rotate(180deg); }
+.d-details dl { display: grid; gap: var(--s-2); margin: 0; padding: var(--s-1) var(--s-2) var(--s-3); }
+.d-details dl > div { display: grid; grid-template-columns: minmax(6rem, 10rem) minmax(0, 1fr); gap: var(--s-3); align-items: baseline; }
+.d-details dt { color: var(--c-text-muted); font-size: var(--text-2); }
+.d-details dd { margin: 0; text-align: start; overflow-wrap: anywhere; }
+.d-details-foot { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: var(--s-2) var(--s-3); padding: 0 var(--s-2) var(--s-3); }
+.d-details-foot p { margin: 0; }

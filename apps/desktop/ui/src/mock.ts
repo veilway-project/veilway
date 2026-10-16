@@ -19,6 +19,7 @@ function subscription(fa: boolean): Subscription {
 	};
 }
 
+const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened};
 let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty", selected: string | null = null;
 const status = (): StatusView => {
 	sent += 40000 + Math.random() * 90000;
@@ -27,7 +28,7 @@ const status = (): StatusView => {
 		state: scene === "question" ? "connecting" : "connected", name: "Main", exit: "fra", wait_until: null, say_code: null, say: null,
 		exits: [{tag: "fra", name: "Frankfurt", country: "de", selected: selected === "fra", configured: true, working: true, load: "low"}, {tag: "ams", name: "Amsterdam", country: "nl", selected: selected === "ams", configured: true, working: true, load: "medium"}, {tag: "hel", name: "Helsinki", country: "fi", selected: selected === "hel", configured: true, working: true, load: "high"}, {tag: "ist", name: "Istanbul", country: "tr", selected: false, configured: true, working: false, load: "unknown"}],
 		usage: {used_bytes: 31.4 * GB, quota_bytes: 50 * GB, period: "monthly", expires_at: now() + 23 * DAY, up_bytes: 2.1 * GB, down_bytes: 29.3 * GB},
-		notices: [], sent_bytes: sent, received_bytes: received, mtu: 1390, out_of_date: false, applied: null
+		notices: [], sent_bytes: sent, received_bytes: received, mtu: 1390, out_of_date: false, connection: scene === "question" ? {...connection, since: null} : connection, applied: null
 	};
 };
 
