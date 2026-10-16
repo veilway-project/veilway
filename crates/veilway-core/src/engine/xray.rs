@@ -1,11 +1,11 @@
 //! The Xray add-on. Xray does not run under the node: it runs as `xray_host` under a user of its own, which the node asks over a unix socket to start the executable the installer put in the add-on folder, which must be the one this build pins. Xray listens on the public ports of the `xray` section and reaches the network only through a SOCKS5 hop on 127.0.0.1 that this module serves.
 //! The node holds one connection to the host for each Xray it wants running: the document goes in over it, and closing it, or the node ending for any reason, stops Xray. So Xray never outlives the node, and has nothing of the node's: not its config, its state, its keys, nor its control socket.
 //! Xray sends each client's traffic out through an outbound of its own, and the outbound logs in to the hop as that client's user. So every connection is a flow of a known user: the hop applies the same gate, rules, exits, entitlement and quota as for a tunnel, and counts into the same per-user and per-exit counters.
-//! Only TCP is carried: the hop answers CONNECT and nothing else. Destinations that are names are resolved here, the way the tunnel's resolver does it: with the DNS servers of the user's set, through the exit the rules give that query.
-use super::plan::{Backend, Outbound, Plan};
+//! The hop answers CONNECT, and UDP ASSOCIATE for UDP (`xray_udp`). Destinations that are names are resolved here, the way the tunnel's resolver does it: with the DNS servers of the user's set, through the exit the rules give that query.
+use super::plan::{Action, Backend, Outbound, Plan};
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
-use super::{dns, flows, gate, Shared};
+use super::{dns, flows, gate, xray_udp, Shared};
 use crate::config::{Config, Store, XrayProtocol};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -77,7 +77,7 @@ fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret
 		let settings = match inbound.protocol {
 			XrayProtocol::Vless => json!({"clients": list, "decryption": "none", "fallbacks": fallbacks}),
 			XrayProtocol::Trojan => json!({"clients": list, "fallbacks": fallbacks}),
-			XrayProtocol::Shadowsocks => json!({"method": "2022-blake3-aes-256-gcm", "password": inbound.server_key.as_ref().map_or("", |key| key.expose().as_str()), "clients": list, "network": "tcp"}),
+			XrayProtocol::Shadowsocks => json!({"method": "2022-blake3-aes-256-gcm", "password": inbound.server_key.as_ref().map_or("", |key| key.expose().as_str()), "clients": list, "network": "tcp,udp"}),
 		};
 		// Only HTTP/1.1 is offered, because the web server behind the fallback is spoken to in the clear and takes no HTTP/2.
 		let stream = match &inbound.tls {
@@ -234,21 +234,21 @@ async fn start(socket: Option<&Path>, document: &str) -> anyhow::Result<(Link, u
 
 /// The connections of one user the hop holds, so that a user cannot hold more than a user may have flows.
 #[derive(Default)]
-struct Open(Mutex<HashMap<String, usize>>);
+pub(super) struct Open(Mutex<HashMap<String, usize>>);
 
-struct Slot<'a> {open: &'a Open, user: String}
+pub(super) struct Slot {open: Arc<Open>, user: String}
 
-impl Slot<'_> {
-	fn take<'a>(open: &'a Open, user: &str, cap: usize) -> Option<Slot<'a>> {
+impl Slot {
+	pub(super) fn take(open: &Arc<Open>, user: &str, cap: usize) -> Option<Slot> {
 		let mut held = open.0.lock().unwrap_or_else(|e| e.into_inner());
 		let count = held.entry(user.to_string()).or_default();
 		if *count >= cap {return None}
 		*count += 1;
-		Some(Slot {open, user: user.to_string()})
+		Some(Slot {open: open.clone(), user: user.to_string()})
 	}
 }
 
-impl Drop for Slot<'_> {
+impl Drop for Slot {
 	fn drop(&mut self) {
 		let mut held = self.open.0.lock().unwrap_or_else(|e| e.into_inner());
 		if let Some(count) = held.get_mut(&self.user) {
@@ -258,8 +258,8 @@ impl Drop for Slot<'_> {
 	}
 }
 
-async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String) {
-	let (open, handshakes, mut sessions) = (Arc::new(Open::default()), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
+pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String) {
+	let (open, limits, handshakes, mut sessions) = (Arc::new(Open::default()), Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS)), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
 	loop {
 		tokio::select! {
 			accepted = listener.accept() => {
@@ -267,9 +267,9 @@ async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String) {
 				// Only Xray has any business here.
 				if !from.ip().is_loopback() {continue}
 				let Ok(permit) = handshakes.clone().try_acquire_owned() else {continue};
-				let (shared, secret, open) = (shared.clone(), secret.clone(), open.clone());
+				let (shared, secret, open, limits) = (shared.clone(), secret.clone(), open.clone(), limits.clone());
 				sessions.spawn(async move {
-					if let Err(e) = session(&shared, stream, &secret, &open, permit).await {tracing::debug!("xray hop: {e:#}")}
+					if let Err(e) = session(&shared, stream, &secret, &open, &limits, permit).await {tracing::debug!("xray hop: {e:#}")}
 				});
 			}
 			Some(_) = sessions.join_next() => {}
@@ -278,13 +278,14 @@ async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String) {
 }
 
 /// The destination of a request: an address, or a name that is resolved here.
-enum Target {Address(SocketAddr), Name(String, u16)}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Target {Address(SocketAddr), Name(String, u16)}
 
-fn reply(code: u8) -> [u8; 10] {[5, code, 0, 1, 0, 0, 0, 0, 0, 0]}
+pub(super) fn reply(code: u8) -> [u8; 10] {[5, code, 0, 1, 0, 0, 0, 0, 0, 0]}
 
-async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Open, permit: tokio::sync::OwnedSemaphorePermit) -> anyhow::Result<()> {
+async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open: &Arc<Open>, limits: &Arc<xray_udp::Limits>, permit: tokio::sync::OwnedSemaphorePermit) -> anyhow::Result<()> {
 	let hop_key = hmac::Key::new(hmac::HMAC_SHA256, b"veilway xray hop");
-	let (user, target) = tokio::time::timeout(HANDSHAKE, async {
+	let (user, command, target) = tokio::time::timeout(HANDSHAKE, async {
 		let mut head = [0u8; 2];
 		client.read_exact(&mut head).await?;
 		anyhow::ensure!(head[0] == 5, "not socks5");
@@ -310,9 +311,9 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 		let mut request = [0u8; 4];
 		client.read_exact(&mut request).await?;
 		let user = String::from_utf8(user)?;
-		if request[0] != 5 || request[1] != 1 {
+		if request[0] != 5 || !matches!(request[1], 1 | 3) {
 			client.write_all(&reply(7)).await?;
-			anyhow::bail!("user {user}: only CONNECT is carried");
+			anyhow::bail!("user {user}: only CONNECT and UDP ASSOCIATE are carried");
 		}
 		let target = match request[3] {
 			1 => {
@@ -343,7 +344,7 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 				anyhow::bail!("user {user}: unknown address type");
 			}
 		};
-		Ok::<_, anyhow::Error>((user, target))
+		Ok::<_, anyhow::Error>((user, request[1], target))
 	}).await??;
 	drop(permit);
 	let plan = shared.plan();
@@ -359,6 +360,7 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 		refuse(&mut client, Reason::Entitlement, 2).await;
 		anyhow::bail!("user {user}: cut off");
 	}
+	if command == 3 {return xray_udp::associate(shared.clone(), client, user, target, limits.clone(), open.clone()).await}
 	let Some(_slot) = Slot::take(open, &user, plan.users[at].flows) else {
 		refuse(&mut client, Reason::FlowTableFull, 1).await;
 		anyhow::bail!("user {user}: too many connections");
@@ -375,28 +377,11 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 		anyhow::bail!("user {user}: {}: {}", plan.show(name.as_deref().unwrap_or("an address")), if found.is_empty() {"no address"} else {"refused by the gate"});
 	};
 	let (dst, shown) = (SocketAddr::new(ip, port), plan.show(name.clone().unwrap_or_else(|| ip.to_string())));
-	let action = route::evaluate(&plan, usize::MAX, at, ip, 6, port, None, &|patterns| name.as_deref().is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
-	let exit = match action {
-		super::plan::Action::Exit(exit) => *exit,
-		super::plan::Action::User => plan.users[at].exit.unwrap_or(plan.default_exit),
-		super::plan::Action::Block | super::plan::Action::Reject => {
-			refuse(&mut client, Reason::Rule, 2).await;
-			anyhow::bail!("user {user}: {shown}: refused by a rule");
-		}
-	};
-	if plan.users[at].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) {
-		refuse(&mut client, Reason::Entitlement, 2).await;
-		anyhow::bail!("user {user}: {shown}: exit {} is not in the user's exits", plan.exits[exit].tag);
-	}
-	let outbound = match &plan.exits[exit].backend {
-		Backend::Netstack {outbound, ..} => outbound,
-		Backend::Block => {
-			refuse(&mut client, Reason::BlockExit, 2).await;
-			anyhow::bail!("user {user}: {shown}: exit {} blocks", plan.exits[exit].tag);
-		}
-		_ => {
-			refuse(&mut client, Reason::Unsupported, 2).await;
-			anyhow::bail!("user {user}: {shown}: exit {} is not a netstack exit, which is all the add-on can use", plan.exits[exit].tag);
+	let (exit, outbound) = match exit_for(&plan, at, ip, 6, port, name.as_deref()) {
+		Ok(found) => found,
+		Err((reason, why)) => {
+			refuse(&mut client, reason, 2).await;
+			anyhow::bail!("user {user}: {shown}: {why}");
 		}
 	};
 	let dialled = match outbound {
@@ -452,8 +437,24 @@ async fn session(shared: &Shared, mut client: TcpStream, secret: &str, open: &Op
 	Ok(())
 }
 
+/// The exit the rules give a flow of user `at` to `ip` and `port` (`name` when it was asked for by name) and the outbound of that exit, which TCP and UDP both ask: the gate has already been through. An error is what to count and what to say.
+pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>) -> Result<(usize, &'a Outbound), (Reason, String)> {
+	let exit = match route::evaluate(plan, usize::MAX, at, ip, protocol, port, None, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name)))) {
+		Action::Exit(exit) => *exit,
+		Action::User => plan.users[at].exit.unwrap_or(plan.default_exit),
+		Action::Block | Action::Reject => return Err((Reason::Rule, "refused by a rule".to_string())),
+	};
+	let tag = plan.exits[exit].tag.as_str();
+	if plan.users[at].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) {return Err((Reason::Entitlement, format!("exit {tag} is not in the user's exits")))}
+	match &plan.exits[exit].backend {
+		Backend::Netstack {outbound, ..} => Ok((exit, outbound)),
+		Backend::Block => Err((Reason::BlockExit, format!("exit {tag} blocks"))),
+		_ => Err((Reason::Unsupported, format!("exit {tag} is not a netstack exit, which is all the add-on can use"))),
+	}
+}
+
 /// Every address of `name` that the DNS servers of the user's set give, IPv4 first, asked the way the tunnel's resolver asks (`resolver::ask`). The query counts for the user and for the exit it went through. Empty when none answers, when the rules or the gate turn the query away, and when the name is not one a resolver can be asked for.
-async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name: &str) -> Vec<IpAddr> {
+pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name: &str) -> Vec<IpAddr> {
 	if name.len() > 253 || name.split('.').any(|label| label.is_empty() || label.len() > 63) || !name.is_ascii() {return Vec::new()}
 	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {return Vec::new()};
 	let (list, fallback) = (plan.users[user].dns.unwrap_or(0).min(plan.dns.len() - 1), plan.users[user].exit.unwrap_or(plan.default_exit));
