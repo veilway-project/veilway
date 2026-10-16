@@ -3,9 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
 #   sudo bash veilway.sh                      interactive menu
-#   sudo bash veilway.sh install node|panel|both [--version vX.Y.Z]
-#   sudo bash veilway.sh update [node|panel|both]
-#   bash veilway.sh status | logs [node|panel] | restart [node|panel|both]
+#   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
+#   sudo bash veilway.sh update [node|panel|mirror|both]
+#   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
 #   sudo bash veilway.sh addon xray [install|remove|status]
@@ -40,6 +40,7 @@ BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/veilway"
 NODE_DIR="$CONF_DIR/node"
 STATE_DIR="/var/lib/veilway"
+MIRROR_DIR="/etc/veilway-mirror"
 ADDON_DIR="/usr/local/lib/veilway/addons"
 XRAY_RELEASE="v26.3.27"
 PANEL_DIR="/var/lib/veilway-panel"
@@ -343,6 +344,51 @@ WantedBy=multi-user.target
 EOF
 }
 
+# A relay mirror of the subscription endpoint: the node's binary, a user of its own, no capability, and no folder to write. It reads one config file with the secret it shares with the panel, which nobody else can open.
+mirror_unit() {
+	write_unit "$UNIT_DIR/veilway-mirror.service" <<EOF
+[Unit]
+Description=Veilway relay mirror
+Documentation=https://github.com/$CORE_REPO
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=veilway-mirror
+Group=veilway-mirror
+ExecStart=$BIN_DIR/veilway mirror --config $MIRROR_DIR/mirror.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=4096
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 # Xray runs under a user of its own, started by a small host process (`veilway xray-host`) that the node asks over a socket only the node can open. So Xray has no file, key, capability or socket of the node's: its folders are out of its sight, it holds no capability but the one to bind a low port, and it ends with the node.
 xray_units() {
 	write_unit "$UNIT_DIR/veilway-xray.socket" <<EOF
@@ -497,6 +543,51 @@ EOF
 		as_node_user chmod 0600 "$NODE_DIR/config.json"
 	fi
 	if run_check; then svc enable veilway.service; svc restart veilway.service; else warn "config has errors: the node was not restarted"; fi
+}
+
+# Written once, never over an existing file. The secret is made here and shown once at the end, for the panel's trusted_mirrors; the upstream is a placeholder the operator replaces, so the unit is enabled and not started until the config names a real panel.
+install_mirror() {
+	local f="$MIRROR_DIR/mirror.json" secret
+	step "mirror"
+	ensure_user veilway-mirror "$MIRROR_DIR"
+	act install -d -m 0700 -o veilway-mirror -g veilway-mirror "$MIRROR_DIR"
+	fetch_and_install node
+	mirror_unit
+	daemon_reload
+	if [ "$DRY" = 1 ]; then dry "write $f from a template with a new secret"; return 0; fi
+	if [ -f "$f" ]; then
+		info "kept existing $f"
+		if as_mirror mirror --check --config "$f"; then svc enable veilway-mirror.service; svc restart veilway-mirror.service; else warn "config has errors: the mirror was not restarted"; fi
+		return 0
+	fi
+	secret="$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+	( umask 077; as_mirror_user tee "$f" >/dev/null ) <<EOF
+{
+	"name": "mirror-1",
+	"listen": "127.0.0.1:8490",
+	"path": "/sub",
+	"upstream": "https://panel.example.org/sub",
+	"upstream_pins": [],
+	"trusted_proxies": ["127.0.0.1", "::1"],
+	"secret": "$secret"
+}
+EOF
+	step "wrote $f"
+	svc enable veilway-mirror.service
+	box "Relay mirror" \
+		"Edit $f: set upstream to your panel's endpoint URL, path to the" \
+		"path your web server gives this mirror, and name if you like." \
+		"Then: sudo bash veilway.sh restart mirror" \
+		"" \
+		"On the panel, add this to the \"trusted_mirrors\" of panel.json and restart it:" \
+		"  {\"name\": \"mirror-1\", \"secret\": \"$secret\"}" \
+		"" \
+		"nginx, in front of 127.0.0.1:8490 (599 hands unknown requests back to nginx):" \
+		"  location = /sub {" \
+		"    proxy_pass http://127.0.0.1:8490;" \
+		"    proxy_intercept_errors on;" \
+		"    error_page 599 = @unknown;" \
+		"    proxy_set_header X-Forwarded-For \$remote_addr; }"
 }
 
 # The root update service runs this copy, so what it runs is not a file the panel's user can reach. A piped run has no file of its own, so the same script is fetched from where it came from.
@@ -674,9 +765,9 @@ do_panel_prefix() {
 
 pick_component() {
 	case "${1:-}" in
-		node | panel | both) printf '%s' "$1" ;;
+		node | panel | both | mirror) printf '%s' "$1" ;;
 		"") printf '%s' "$(ask "Install node, panel, or both? [both]" both)" ;;
-		*) die "choose node, panel or both" ;;
+		*) die "choose node, panel, both or mirror" ;;
 	esac
 }
 
@@ -695,6 +786,7 @@ do_install() {
 		node) install_node ;;
 		panel) install_panel ;;
 		both) install_node; install_panel ;;
+		mirror) install_mirror ;;
 	esac
 	printf '\n'
 	step "done. Check the state any time with: sudo bash veilway.sh status"
@@ -716,8 +808,18 @@ do_update() {
 			node_unit
 			[ -f "$UNIT_DIR/veilway-xray.service" ] && xray_units
 			daemon_reload
+			[ -f "$UNIT_DIR/veilway-mirror.service" ] && svc restart veilway-mirror.service
 			svc restart veilway.service
 		else info "node is not installed, skipped"; fi
+	fi
+	if [ "$comp" = mirror ]; then
+		if [ -f "$UNIT_DIR/veilway-mirror.service" ] || [ "$DRY" = 1 ]; then
+			info "node binary is at $(installed_version node || true)"
+			fetch_and_install node
+			mirror_unit
+			daemon_reload
+			svc restart veilway-mirror.service
+		else info "mirror is not installed, skipped"; fi
 	fi
 	if [ "$comp" = panel ] || [ "$comp" = both ]; then
 		if [ -x "$BIN_DIR/veilway-panel" ] || [ "$DRY" = 1 ]; then
@@ -755,6 +857,7 @@ do_status() {
 	v="$(installed_version panel)"; v="${v:--}"
 	[ -x "$BIN_DIR/veilway-panel" ] || v="not installed"
 	printf '  %-14s %-34s %s\n' "panel" "$(unit_state veilway-panel.service)" "$v"
+	[ -f "$UNIT_DIR/veilway-mirror.service" ] && printf '  %-14s %-34s %s\n' "mirror" "$(unit_state veilway-mirror.service)" "$MIRROR_DIR/mirror.json"
 	printf '  %-14s %-34s %s\n' "config" "$([ -f "$NODE_DIR/config.json" ] && echo present || echo missing)" "$NODE_DIR/config.json"
 	printf '  %-14s %-34s %s\n' "state" "$([ -d "$STATE_DIR" ] && echo present || echo missing)" "$STATE_DIR"
 	printf '  %-14s %-34s %s\n' "backups" "$(find "$BACKUP_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files" "$BACKUP_DIR"
@@ -764,6 +867,7 @@ do_status() {
 do_logs() {
 	local unit="veilway.service"
 	[ "${1:-node}" = panel ] && unit="veilway-panel.service"
+	[ "${1:-node}" = mirror ] && unit="veilway-mirror.service"
 	has_systemd || die "logs come from journald, and systemd is not running here"
 	if [ "$DRY" = 1 ]; then dry "journalctl -u $unit -n 100 -f"; return 0; fi
 	exec journalctl -u "$unit" -n 100 -f --no-pager
@@ -772,11 +876,19 @@ do_logs() {
 do_restart() {
 	local comp="${1:-both}"
 	need_root
+	if [ "$comp" = mirror ]; then svc restart veilway-mirror.service; return 0; fi
 	[ "$comp" = panel ] || svc restart veilway.service
 	[ "$comp" = node ] || svc restart veilway-panel.service
 }
 
 node_flags() { printf '%s\n' --config "$NODE_DIR/config.json" --state "$STATE_DIR/veilway-state.json" --replay "$STATE_DIR/veilway-replay" --api /run/veilway/control.sock; }
+
+as_mirror_user() { setpriv --reuid veilway-mirror --regid veilway-mirror --clear-groups "$@"; }
+
+as_mirror() {
+	if [ "$(id -u)" = 0 ] && has setpriv; then as_mirror_user "$BIN_DIR/veilway" "$@"
+	else "$BIN_DIR/veilway" "$@"; fi
+}
 
 # Runs veilway as the service user so the file checks match what the service sees.
 as_node() {
@@ -799,7 +911,7 @@ do_doctor() {
 	as_node doctor "${flags[@]}"
 }
 
-backup_paths() { printf '%s\n' "${CONF_DIR#/}" "${STATE_DIR#/}/veilway-state.json" "${PANEL_DIR#/}"; }
+backup_paths() { printf '%s\n' "${CONF_DIR#/}" "${STATE_DIR#/}/veilway-state.json" "${PANEL_DIR#/}" "${MIRROR_DIR#/}"; }
 
 do_backup() {
 	local out="${1:-$BACKUP_DIR/veilway-$(date -u +%Y%m%dT%H%M%SZ).tar.gz}" p existing=()
@@ -854,16 +966,17 @@ do_uninstall() {
 	need_root
 	confirm "Remove Veilway binaries, units and users? Backups in $BACKUP_DIR stay." || die "cancelled"
 	do_backup || true
+	svc stop veilway-mirror.service || true; svc disable veilway-mirror.service || true
 	svc stop veilway.service || true; svc stop veilway-panel.service || true
 	svc disable veilway.service || true; svc disable veilway-panel.service || true; svc disable --now veilway-panel-update.path || true
 	svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true; svc disable veilway-xray.socket || true
-	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
-	if confirm "Also delete $CONF_DIR, $STATE_DIR and $PANEL_DIR? The backup above keeps a copy."; then
-		act rm -rf "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR"
-		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; act userdel veilway-xray 2>/dev/null || true; }
-		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; act deluser veilway-xray 2>/dev/null || true; }
+	if confirm "Also delete $CONF_DIR, $STATE_DIR, $PANEL_DIR and $MIRROR_DIR? The backup above keeps a copy."; then
+		act rm -rf "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR" "$MIRROR_DIR"
+		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; act userdel veilway-xray 2>/dev/null || true; act userdel veilway-mirror 2>/dev/null || true; }
+		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; act deluser veilway-xray 2>/dev/null || true; act deluser veilway-mirror 2>/dev/null || true; }
 	else info "config and data kept"; fi
 	step "uninstalled. Backups are in $BACKUP_DIR"
 }
@@ -889,7 +1002,7 @@ menu() {
 			1) do_install "" ;;
 			2) do_update both ;;
 			3) do_status ;;
-			4) do_logs "$(ask "Which, node or panel? [node]" node)" ;;
+			4) do_logs "$(ask "Which, node, panel or mirror? [node]" node)" ;;
 			5) do_restart both ;;
 			6) run_check ;;
 			7) do_doctor ;;
