@@ -5,6 +5,7 @@
 use super::plan::{Action, Backend, Outbound, Plan};
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
+use super::xray_owner::{self, Lookup};
 use super::{dns, flows, gate, xray_udp, Shared};
 use crate::config::{Config, Store, XrayProtocol};
 use ring::hmac;
@@ -132,7 +133,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 						let mut raw = [0u8; 24];
 						SystemRandom::new().fill(&mut raw).expect("the system has no random source");
 						let secret: String = raw.iter().map(|byte| format!("{byte:02x}")).collect();
-						hop = Some((tokio::spawn(accept(shared.clone(), listener, secret.clone())), port, secret));
+						hop = Some((tokio::spawn(accept(shared.clone(), listener, secret.clone(), Arc::new(xray_owner::lookup))), port, secret));
 					}
 					Err(e) => tracing::error!("xray: the local hop could not be opened ({}), so xray is not started", e.kind()),
 				}
@@ -258,8 +259,8 @@ impl Drop for Slot {
 	}
 }
 
-pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String) {
-	let (open, limits, handshakes, mut sessions) = (Arc::new(Open::default()), Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS)), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
+pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String, owner: Lookup) {
+	let (open, limits, handshakes, mut sessions) = (Arc::new(Open::default()), Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER, owner)), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
 	loop {
 		tokio::select! {
 			accepted = listener.accept() => {
@@ -427,7 +428,7 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 		let mut tick = tokio::time::interval(WATCH);
 		loop {
 			tick.tick().await;
-			if shared.plan().users.iter().find(|candidate| candidate.name == user).is_none_or(|now| now.denied.is_some()) {return}
+			if shared.plan().users.iter().find(|candidate| candidate.name == user && candidate.link.is_none()).is_none_or(|now| now.denied.is_some()) {return}
 		}
 	};
 	tokio::select! {
@@ -439,7 +440,8 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 
 /// The exit the rules give a flow of user `at` to `ip` and `port` (`name` when it was asked for by name) and the outbound of that exit, which TCP and UDP both ask: the gate has already been through. An error is what to count and what to say.
 pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>) -> Result<(usize, &'a Outbound), (Reason, String)> {
-	let exit = match route::evaluate(plan, usize::MAX, at, ip, protocol, port, None, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name)))) {
+	// A name asked for, or one the user resolved to this address through the node's resolver: an address alone is matched by domain rules the way the tunnel does it.
+	let exit = match route::evaluate(plan, usize::MAX, at, ip, protocol, port, None, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))) || plan.users[at].state.names().matches(ip, patterns, Instant::now())) {
 		Action::Exit(exit) => *exit,
 		Action::User => plan.users[at].exit.unwrap_or(plan.default_exit),
 		Action::Block | Action::Reject => return Err((Reason::Rule, "refused by a rule".to_string())),
