@@ -10,6 +10,8 @@ updates:
     directory: /packages/sdk
     schedule: {interval: weekly}
     groups: {npm: {patterns: ["*"]}}
+    # TypeScript 7 drops the JavaScript API openapi-typescript generates the API types with; revisit when it supports 7.
+    ignore: [{dependency-name: typescript, versions: [">=7"]}]
   - package-ecosystem: github-actions
     directory: /
     schedule: {interval: weekly}
