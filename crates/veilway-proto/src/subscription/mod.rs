@@ -1,4 +1,4 @@
-//! The subscription format (subscription format page): the link (`link`), the signed envelope (`envelope`), the payload (`payload`), the request and its body (`fetch`), what a client holds and decides (`client`) and the unsigned formats of other apps (`legacy`).
+//! The subscription format (subscription format page): the link (`link`), the signed envelope (`envelope`), the payload (`payload`), the sealed file (`sealed_file`), the request and its body (`fetch`), what a client holds and decides (`client`) and the unsigned formats of other apps (`legacy`).
 //!
 //! Everything here reads what a provider or whoever answers in its place wrote, so every reader checks a limit before it uses a byte, and no error carries any of the input. There is no socket, no clock and no storage: the body of an answer, the time and the random bytes are parameters, and what a client holds is a value the caller keeps.
 //!
@@ -17,6 +17,7 @@ pub mod legacy;
 pub mod link;
 pub mod mirror;
 pub mod payload;
+pub mod sealed_file;
 
 /// "Response body, and a document in a file: at most 1,048,576 bytes."
 pub const BODY_MAX: usize = 1_048_576;

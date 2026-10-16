@@ -51,4 +51,10 @@ subtle={version="2.6", default-features=false}
 x25519-dalek={version="3", default-features=false}
 # The Mozilla root certificates, which the TLS of a node link's dialler is validated against. `tokio-tungstenite` brings the same crate already.
 webpki-roots="1"
+# Argon2id for the sealed subscription file, as a plain function over bytes the caller drew. Pure Rust, no features beyond heap memory.
+argon2={version="0.5", default-features=false, features=["alloc"]}
 
+
+# Argon2 at 64 MiB and three passes is too slow unoptimized for the tests that open a sealed file.
+[profile.dev.package.argon2]
+opt-level=3

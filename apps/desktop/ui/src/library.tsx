@@ -1,6 +1,7 @@
 import {Banner, Button, Checkbox, ConfirmDialog, Dialog, Glass, Icon, IconButton, List, ListRow, StateBlock, useToast} from "@veilway/ui";
 import {Fragment, useState} from "react";
 import {fromUnix, useD, useLogo} from "./kit.tsx";
+import {ShareDialog} from "./share.tsx";
 import {call, type Subscription} from "./tauri.ts";
 
 function Logo({subscription}: {subscription: Subscription}) {
@@ -24,7 +25,7 @@ function Hosts({subscription, review, onClose, onChange}: {subscription: Subscri
 }
 
 export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: Subscription[], inUse: string | null, onAdd: () => void, onRefresh: (id: string) => Promise<void>, onChange: (library: Subscription[]) => void}) {
-	const {t, date, locale} = useD(), toast = useToast(), [removing, setRemoving] = useState<Subscription | null>(null), [refreshing, setRefreshing] = useState<string | null>(null), [hosts, setHosts] = useState<{id: string, review: boolean} | null>(null), reviewing = library.find(found => found.id === hosts?.id);
+	const {t, date, locale} = useD(), toast = useToast(), [removing, setRemoving] = useState<Subscription | null>(null), [refreshing, setRefreshing] = useState<string | null>(null), [hosts, setHosts] = useState<{id: string, review: boolean} | null>(null), [sharing, setSharing] = useState<Subscription | null>(null), reviewing = library.find(found => found.id === hosts?.id);
 	const remove = (subscription: Subscription) => call("remove", {id: subscription.id}).then(found => { onChange(found); toast({tone: "success", title: t("library.removed")}); }, error => toast({tone: "danger", title: t("library.removeFailed"), body: error}));
 	const setLan = (subscription: Subscription, on: boolean) => call("set_lan", {id: subscription.id, on}).then(onChange, error => toast({tone: "danger", title: t("library.lanFailed"), body: error}));
 	return <div className="d-page">
@@ -35,12 +36,14 @@ export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: 
 			detail={[t(`library.standing.${subscription.standing}`), t("library.ends", {date: date(fromUnix(subscription.expires_at))}), t("library.connections", {count: subscription.profiles.length})].join(locale === "fa" ? "، " : ", ")}
 			trailing={<span className="d-row-actions">
 				{subscription.can_refresh && <IconButton icon="refresh" label={t("library.refresh", {provider: subscription.provider})} disabled={refreshing === subscription.id} onClick={() => { setRefreshing(subscription.id); onRefresh(subscription.id).finally(() => setRefreshing(null)); }}/>}
+				{subscription.can_refresh && <Button size="sm" variant="quiet" icon="upload" onClick={() => setSharing(subscription)}>{t("library.share")}</Button>}
 				<Button size="sm" variant="quiet" disabled={inUse === subscription.id} onClick={() => setRemoving(subscription)}>{t("library.remove")}</Button>
 			</span>}/>
 			{subscription.hosts.some(host => host.state === "waiting") ? <li className="d-row-notice"><Icon name="info"/><span className="d-row-notice-text"><span>{t("library.hosts.notice")}</span><span className="vw-muted vw-small">{t("library.hosts.noticeBody")}</span></span><Button size="sm" onClick={() => setHosts({id: subscription.id, review: true})}>{t("library.hosts.review")}</Button></li>
 				: subscription.hosts.length > 0 && <li className="d-row-notice"><Icon name="globe"/><span className="d-row-notice-text"><span>{t("library.hosts.label")}</span><span className="vw-muted vw-small">{t("library.hosts.counts", {allowed: subscription.hosts.filter(host => host.state === "allowed").length, declined: subscription.hosts.filter(host => host.state === "declined").length})}</span></span><Button size="sm" variant="quiet" onClick={() => setHosts({id: subscription.id, review: false})}>{t("library.hosts.manage")}</Button></li>}
 			<li className="d-row-option"><Checkbox label={t("library.lan")} checked={subscription.lan_local} onChange={on => { setLan(subscription, on); }}/><span className="vw-muted vw-small">{t("library.lanHint")}</span></li>
 		</Fragment>)}</List></Glass>}
+		{sharing && <ShareDialog subscription={sharing} onClose={() => setSharing(null)}/>}
 		{hosts && reviewing && <Hosts key={`${hosts.id}-${hosts.review}`} subscription={reviewing} review={hosts.review} onClose={() => setHosts(null)} onChange={onChange}/>}
 		<ConfirmDialog open={removing !== null} onOpenChange={open => { if (!open) setRemoving(null); }} danger title={t("library.removeTitle", {provider: removing?.provider ?? ""})} body={t("library.removeBody")} confirmLabel={t("library.remove")} onConfirm={() => { if (removing) remove(removing); }}/>
 	</div>;

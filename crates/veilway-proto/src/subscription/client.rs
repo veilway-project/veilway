@@ -472,6 +472,8 @@ impl Held {
 	pub fn document(&self) -> &str {&self.document}
 	/// `None` for a subscription that came as a whole document.
 	pub fn device(&self) -> Option<&Device> {self.origin.as_ref().map(|(_, device)| device)}
+	/// The link this subscription was imported with, in the form providers hand out, or `None` for a whole document, which has no link. It holds the token: it goes only where the user sent it, as a share of the link and nothing else. The device's key and secret are not in it.
+	pub fn link(&self) -> Option<String> {self.origin.as_ref().map(|(link, _)| link.veilway())}
 	// A request of this subscription, which names the keys held.
 	fn request(&self, op: Op) -> Option<Request> {self.origin.as_ref().map(|(link, device)| Request::new(link.token().clone(), self.keys().iter().map(SigningKey::kid).collect(), device.public, device.secret.clone(), op))}
 	/// The request of a refresh, or `None` for a subscription that cannot refresh. When it goes out is the caller's, under "When a fetch happens".

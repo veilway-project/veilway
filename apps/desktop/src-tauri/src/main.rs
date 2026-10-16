@@ -12,7 +12,7 @@ use link::Backend;
 use logs::{LogLayer, START};
 use proto::{Call, Options, Out, Source};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -21,6 +21,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::layer::SubscriberExt;
@@ -98,6 +99,26 @@ async fn import_qr(backend:State<'_, Arc<Backend>>, data:String)->Result<Value, 
 	let bytes=base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| Code::PictureUnreadable.as_str().to_string())?;
 	let text=tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|e| e.to_string())?.map_err(|code| code.as_str().to_string())?;
 	ask(&backend, Call::ImportOpen{source:Source::Link{text}}).await
+}
+
+/// The link of a held subscription with its code, for the share dialog. Only the link: the device's keys and secrets stay in the helper.
+#[tauri::command]
+async fn share_link(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{
+	let mut value=ask(&backend, Call::ShareLink{subscription:id}).await?;
+	let qr=value["link"].as_str().map(qr::render).ok_or("The link could not be read.")?.map_err(|code| code.as_str().to_string())?;
+	value["qr"]=json!(qr);
+	Ok(value)
+}
+
+/// Seals the link under the password in the helper, then asks where to save the file. False is a dialog the user closed.
+#[tauri::command]
+async fn share_file(app:AppHandle, backend:State<'_, Arc<Backend>>, id:String, password:String)->Result<bool, String>{
+	let value=ask(&backend, Call::ShareFile{subscription:id, password}).await?;
+	let bytes=base64::engine::general_purpose::STANDARD.decode(value["data"].as_str().unwrap_or_default()).map_err(|e| e.to_string())?;
+	tokio::task::spawn_blocking(move || {
+		let Some(path)=app.dialog().file().set_file_name("veilway-subscription.vwsealed").add_filter("Veilway sealed subscription", &["vwsealed"]).blocking_save_file() else {return Ok(false)};
+		std::fs::write(path.into_path().map_err(|e| e.to_string())?, bytes).map(|_| true).map_err(|e| e.to_string())
+	}).await.map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -244,9 +265,10 @@ fn main(){
 		.plugin(tauri_plugin_process::init())
 		.plugin(tauri_plugin_autostart::Builder::new().build())
 		.plugin(tauri_plugin_opener::init())
+		.plugin(tauri_plugin_dialog::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));

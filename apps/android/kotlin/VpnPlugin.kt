@@ -10,6 +10,7 @@ import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.provider.Settings
+import android.util.Base64
 import android.webkit.WebView
 import androidx.activity.result.ActivityResult
 import androidx.core.content.ContextCompat
@@ -32,6 +33,17 @@ internal class StartArgs {
 	lateinit var subscription: String
 	lateinit var profile: String
 	var options: String = "{}"
+}
+
+@InvokeArg
+internal class SaveArgs {
+	lateinit var name: String
+	lateinit var data: String
+}
+
+@InvokeArg
+internal class ShareArgs {
+	lateinit var text: String
 }
 
 /** What the window may ask of Android: the VPN consent, starting and stopping the service, and the system's VPN settings. The tunnel itself is never here: the service and the engine run without this plugin or any window. */
@@ -77,6 +89,42 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 		} else {
 			activity.startService(Intent(activity, VeilwayVpnService::class.java).setAction(VeilwayVpnService.ACTION_STOP))
 		}
+		invoke.resolve()
+	}
+
+	private var fileToSave: ByteArray? = null
+
+	/** The system's save screen for a sealed subscription file, with a name suggested. The file is already encrypted under the user's password. Nothing is written unless the user picks a place. */
+	@Command
+	fun saveFile(invoke: Invoke) {
+		val args = invoke.parseArgs(SaveArgs::class.java)
+		fileToSave = Base64.decode(args.data, Base64.DEFAULT)
+		val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("application/octet-stream").putExtra(Intent.EXTRA_TITLE, args.name)
+		startActivityForResult(invoke, intent, "saveFileResult")
+	}
+
+	@ActivityCallback
+	fun saveFileResult(invoke: Invoke, result: ActivityResult) {
+		val bytes = fileToSave
+		fileToSave = null
+		val uri = result.data?.data
+		if (result.resultCode != Activity.RESULT_OK || uri == null || bytes == null) {
+			invoke.resolve(JSObject().put("saved", false))
+			return
+		}
+		try {
+			activity.contentResolver.openOutputStream(uri)?.use { it.write(bytes) } ?: throw java.io.IOException("no stream")
+			invoke.resolve(JSObject().put("saved", true))
+		} catch (e: java.io.IOException) {
+			invoke.reject("The file could not be saved.")
+		}
+	}
+
+	/** The system's share sheet with a piece of text, the link the user chose to pass on. */
+	@Command
+	fun shareText(invoke: Invoke) {
+		val send = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, invoke.parseArgs(ShareArgs::class.java).text)
+		activity.startActivity(Intent.createChooser(send, null).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
 		invoke.resolve()
 	}
 

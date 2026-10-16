@@ -22,6 +22,8 @@ tauri-plugin-updater="2"
 tauri-plugin-process="2"
 tauri-plugin-autostart="2"
 tauri-plugin-opener="2"
+# The save dialog for a sealed subscription file.
+tauri-plugin-dialog="2"
 serde={version="1", features=["derive"]}
 serde_json="1"
 tokio={version="1", features=["rt-multi-thread", "net", "io-util", "sync", "time", "macros"]}
@@ -34,6 +36,8 @@ ipnet={version="2", features=["serde"]}
 # Pictures are read in the unprivileged app, with size limits, and only to find a QR code in them.
 image={version="0.25", default-features=false, features=["png", "jpeg"]}
 rqrr="0.11"
+# The picture of a code for a link the user passes on.
+qrcode={version="0.14", default-features=false, features=["svg"]}
 
 # The platform layer runs in the helper, which is this same binary started with --helper and elevated once (see helper.rs).
 [target.'cfg(unix)'.dependencies]
@@ -54,7 +58,6 @@ windows-sys={version="0.61", features=["Win32_Foundation", "Win32_Security", "Wi
 
 [dev-dependencies]
 veilway-engine={path="../../../crates/veilway-engine", features=["unencrypted-vault", "testing"]}
-qrcode={version="0.14", default-features=false}
 
 [profile.release]
 opt-level="s"

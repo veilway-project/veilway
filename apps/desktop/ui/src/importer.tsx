@@ -1,16 +1,16 @@
-import {Banner, Button, Glass, List, ListRow, TextField} from "@veilway/ui";
+import {Banner, Button, Glass, List, ListRow, SecretField, TextField} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
 import {base64, failureText, useD} from "./kit.tsx";
 import {asksPrivate, call, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void}) {
-	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
+	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const qr = (picture: Blob) => run(base64(picture).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_qr", {data})), setOffer);
 	const proceed = (agreed?: string[]) => run(call("import_proceed", agreed ? {private: agreed} : {}), found => { if (asksPrivate(found)) { setAsked(found.ask_private); } else { setAsked(null); setReview(found); } });
-	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
+	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setSealed(null); setPassword(""); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
 	useEffect(() => {
 		if (offer || review) return;
 		const paste = (event: ClipboardEvent) => { const picture = Array.from(event.clipboardData?.files ?? []).find(f => f.type.startsWith("image/")); if (picture) { event.preventDefault(); qr(picture); } };
@@ -23,7 +23,8 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 		event.target.value = "";
 		if (!file) return;
 		if (kind === "qr") return qr(file);
-		run(base64(file).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_open", {source: {kind: "file", data}})), setOffer);
+		// A sealed file is told by its first bytes, and the password is asked for here. The file stays in this window only until it is opened or backed out of.
+		run(base64(file).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_open", {source: {kind: "file", data}}).catch(code => code === "needs_password" ? (setSealed(data), null) : Promise.reject(code))), found => { if (found) setOffer(found); });
 	};
 	const failure = error && <Banner tone="danger" title={t("import.failed")}>{failureText(error, t)}</Banner>;
 	const key = (fingerprint: string) => <p className="d-key"><span className="vw-muted vw-small">{t("import.key")}</span><span className="vw-code" dir="ltr">{fingerprint}</span></p>;
@@ -54,6 +55,17 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 			</Glass>
 		</div>;
 	}
+	if (sealed !== null && !offer) return <div className="d-page">
+		<Glass className="d-panel">
+			<h1 className="vw-h2">{t("sealed.title")}</h1>
+			<p>{t("sealed.body")}</p>
+			<form className="d-form" onSubmit={event => { event.preventDefault(); if (!password) return; run(call("import_open", {source: {kind: "sealed", data: sealed, password}}), found => { setSealed(null); setPassword(""); setOffer(found); }); }}>
+				<SecretField label={t("sealed.password")} value={password} onChange={setPassword} autoFocus/>
+				{failure}
+				<div className="d-actions"><Button type="button" onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button type="submit" variant="primary" disabled={busy || !password}>{t(busy ? "sealed.opening" : "sealed.open")}</Button></div>
+			</form>
+		</Glass>
+	</div>;
 	if (offer) {
 		const native = offer.kind === "native", host = offer.host ?? "";
 		return <div className="d-page">
