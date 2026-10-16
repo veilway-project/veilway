@@ -55,3 +55,6 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-host label { font-family: var(--font-mono); direction: ltr; unicode-bidi: isolate; overflow-wrap: anywhere; }
 .d-host-kind { display: flex; align-items: start; gap: var(--s-1); padding-inline-start: calc(20px + var(--s-2)); }
 .d-host-kind .vw-icon { flex: none; margin-block-start: 0.1em; }
+.d-share { display: grid; gap: var(--s-3); justify-items: start; }
+.d-share > .vw-field { inline-size: 100%; }
+.d-qr { inline-size: 240px; block-size: 240px; border-radius: var(--r-1); background: #fff; }

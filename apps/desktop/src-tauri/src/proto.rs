@@ -45,6 +45,8 @@ pub enum Source {
 	Link { text: String },
 	/// A subscription file, base64.
 	File { data: String },
+	/// A sealed subscription file, base64, and the password typed for it.
+	Sealed { data: String, password: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -72,6 +74,10 @@ pub enum Call {
 	/// The user's second answer, after seeing the provider and the connections.
 	ImportKeep { keep: bool },
 	ImportCancel,
+	/// The link of a held subscription, for the user to pass on as text or a code. Only the link, never the device's keys.
+	ShareLink { subscription: String },
+	/// The same link in a sealed file under a password, base64.
+	ShareFile { subscription: String, password: String },
 	/// `private` is as in `ImportProceed`, for a subscription that already is held: the yes is kept with it.
 	Refresh { subscription: String, #[serde(default)] private: Vec<String> },
 	Remove { subscription: String },
@@ -152,7 +158,7 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportCancel, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);

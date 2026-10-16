@@ -125,6 +125,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="fuzz_sub_sealed"
+path="fuzz_targets/fuzz_sub_sealed.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="fuzz_sub_envelope"
 path="fuzz_targets/fuzz_sub_envelope.rs"
 test=false

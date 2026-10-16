@@ -26,11 +26,14 @@ export type Ended = {error: string | null, kept: boolean};
 export type Progress = {downloaded: number, total: number | null};
 
 type Commands = {
-	import_open: [{source: {kind: "link", text: string} | {kind: "file", data: string}}, Offer],
+	import_open: [{source: {kind: "link", text: string} | {kind: "file", data: string} | {kind: "sealed", data: string, password: string}}, Offer],
 	import_qr: [{data: string}, Offer],
 	import_proceed: [{private?: string[]}, Review | PrivateAsk],
 	import_keep: [{keep: boolean}, Subscription[]],
 	import_cancel: [{}, null],
+	share_link: [{id: string}, {link: string, qr: string}],
+	share_text: [{text: string}, null],
+	share_file: [{id: string, password: string}, boolean],
 	library: [{languages: string[]}, Subscription[]],
 	refresh: [{id: string, private?: string[]}, Subscription[] | PrivateAsk],
 	remove: [{id: string}, Subscription[]],

@@ -84,8 +84,12 @@ impl Core {
 			Call::ImportOpen {source} => {
 				let offer = match source {
 					Source::Link {text} => import::open(&text),
-					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "The file could not be read.".to_owned())?),
-				}.map_err(|error| error.text().to_owned())?;
+					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| import::Code::FileUnreadable.as_str().to_owned())?),
+					Source::Sealed {data, password} => {
+						let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| import::Code::FileUnreadable.as_str().to_owned())?;
+						tokio::task::spawn_blocking(move || import::open_sealed(&bytes, &password)).await.map_err(|error| error.to_string())?
+					}
+				}.map_err(|error| error.code().as_str().to_owned())?;
 				let (out, pending) = match offer {
 					Offer::Native(offer) => (OfferOut {kind: "native", host: Some(offer.endpoint().host().to_owned()), fingerprint: offer.fingerprint().to_string(), pinned: offer.pin().is_some(), plain: offer.kind() == Kind::Plain, in_file: false}, Pending::Native(offer)),
 					Offer::Carried(offer) => (OfferOut {kind: "carried", host: None, fingerprint: offer.fingerprint().to_string(), pinned: false, plain: false, in_file: offer.in_file()}, Pending::Carried(offer)),
@@ -130,6 +134,16 @@ impl Core {
 					fetcher().accept(reviewed, None, &mut library).await.map_err(|error| match &error {import::ImportError::Store(cause) => format!("{} {cause}", error.text()), _ => error.text().to_owned()})?;
 				} else {fetcher().decline(reviewed).await}
 				self.library_value().await
+			}
+			Call::ShareLink {subscription: id} => {
+				let library = self.library.lock().await;
+				let held = library.held().iter().find(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?;
+				Ok(json!({"link": import::share_link(held).map_err(|error| error.code().as_str().to_owned())?}))
+			}
+			Call::ShareFile {subscription: id, password} => {
+				let link = import::share_link(self.library.lock().await.held().iter().find(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?).map_err(|error| error.code().as_str().to_owned())?;
+				let file = tokio::task::spawn_blocking(move || import::seal_link(&link, &password)).await.map_err(|error| error.to_string())?.map_err(|error| error.code().as_str().to_owned())?;
+				Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(file)}))
 			}
 			Call::ImportCancel => {
 				match self.pending.lock().await.take() {

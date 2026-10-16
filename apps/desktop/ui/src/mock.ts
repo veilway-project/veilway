@@ -5,6 +5,8 @@ import type {Host, Running, StatusView, Subscription} from "./tauri.ts";
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
 try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: null, hidden: []})); } catch { /* private window */ }
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
+// Not a real code: a pattern with the three finder squares, for the screenshots only.
+const QR = (() => { const n = 29, cells: string[] = []; for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { const finder = (x < 8 && y < 8) || (x >= n - 8 && y < 8) || (x < 8 && y >= n - 8), edge = (a: number, b: number) => a === 0 || a === 6 || b === 0 || b === 6 || (a >= 2 && a <= 4 && b >= 2 && b <= 4); const dark = finder ? (x < 8 && y < 8 ? edge(x, y) : x >= n - 8 && y < 8 ? edge(x - (n - 7), y) : edge(x, y - (n - 7))) && x % (n - 7) < 7 && y % (n - 7) < 7 || false : ((x * 7 + y * 13 + x * y) % 5 < 2); if (dark) cells.push(`<rect x="${x + 2}" y="${y + 2}" width="1" height="1"/>`); } return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n + 4} ${n + 4}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${cells.join("")}</g></svg>`; })();
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
 let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
@@ -59,7 +61,15 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	disconnect: () => { connected = false; return null; },
 	answer: () => null,
 	select_exit: args => { selected = (args.tag as string | null) ?? null; return null; },
-	import_open: () => ({kind: "native", host: "sub.harbor.example", fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: true, plain: false, in_file: false}),
+	import_open: args => {
+		const source = args.source as {kind: string, password?: string};
+		if (source.kind === "file" && query.has("sealed")) return Promise.reject("needs_password");
+		if (source.kind === "sealed" && source.password !== "correct horse battery") return Promise.reject("wrong_password");
+		return ({kind: "native", host: "sub.harbor.example", fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: true, plain: false, in_file: false});
+	},
+	share_link: () => ({link: "veilway://sub/sub.harbor.example/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.VVVVVVVVVVVVVVVVVVVVVQ", qr: QR}),
+	share_file: () => true,
+	share_text: () => null,
 	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, plain: false, in_file: false}),
 	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, moving: null, left_out: [], preview: subscription(languages[0] === "fa")}),
 	import_keep: args => { if (args.keep) held = 1; return held ? [subscription(languages[0] === "fa")] : []; },

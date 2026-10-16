@@ -49,6 +49,9 @@ impl Default for Settings {
 #[derive(Deserialize)]
 struct Granted {granted: bool}
 
+#[derive(Deserialize)]
+struct Saved {saved: bool}
+
 /// What the core says by itself becomes events for the window: `status`, `question` (a yes or no the engine needs, answered with `answer`), `ended` and `log`.
 fn forward(app: &AppHandle, out: Out) {
 	match out {
@@ -93,6 +96,27 @@ async fn import_qr(data: String) -> Result<Value, String> {
 	let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| veilway_engine::import::Code::PictureUnreadable.as_str().to_string())?;
 	let text = tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|error| error.to_string())?.map_err(|code| code.as_str().to_string())?;
 	host::call(Call::ImportOpen {source: Source::Link {text}}).await
+}
+
+/// The link of a held subscription with its code, for the share dialog. Only the link: the device's keys and secrets stay in the core.
+#[tauri::command]
+async fn share_link(id: String) -> Result<Value, String> {
+	let mut value = host::call(Call::ShareLink {subscription: id}).await?;
+	let qr = value["link"].as_str().map(qr::render).ok_or("The link could not be read.")?.map_err(|code| code.as_str().to_string())?;
+	value["qr"] = json!(qr);
+	Ok(value)
+}
+
+/// Opens the system's share sheet with the link as text.
+#[tauri::command]
+async fn share_text(vpn: State<'_, Arc<Vpn>>, text: String) -> Result<Value, String> {plugin(&vpn, "shareText", json!({"text": text})).await}
+
+/// Seals the link under the password, then lets the user pick where the file goes (the system's save screen, from which it can be shared). Saved is false when the user backed out.
+#[tauri::command]
+async fn share_file(vpn: State<'_, Arc<Vpn>>, id: String, password: String) -> Result<bool, String> {
+	let value = host::call(Call::ShareFile {subscription: id, password}).await?;
+	let Saved {saved} = plugin(&vpn, "saveFile", json!({"name": "veilway-subscription.vwsealed", "data": value["data"]})).await?;
+	Ok(saved)
 }
 
 #[tauri::command]
@@ -247,7 +271,7 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

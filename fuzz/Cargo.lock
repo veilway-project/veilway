@@ -71,6 +71,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bc62ac97cc33321f50863d514c3bc38a453947a8f9e781137e47c7401020aed"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -132,6 +144,12 @@ name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
+name = "base64ct"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bindgen"
@@ -849,19 +867,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ipstack"
-version = "1.0.1"
-dependencies = [
- "ahash",
- "etherparse 0.20.3",
- "log",
- "rand",
- "serde_json",
- "thiserror",
- "tokio",
-]
-
-[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1071,6 +1076,17 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]
@@ -1736,7 +1752,6 @@ dependencies = [
  "base64 0.23.1",
  "etherparse 0.21.0",
  "ipnet",
- "ipstack",
  "libc",
  "rcgen",
  "ring",
@@ -1750,6 +1765,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "veilway-ipstack",
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",
@@ -1794,6 +1810,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "veilway-ipstack"
+version = "1.0.1-veilway.1"
+dependencies = [
+ "ahash",
+ "etherparse 0.20.3",
+ "log",
+ "rand",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "veilway-linux"
 version = "0.1.0"
 dependencies = [
@@ -1816,6 +1845,7 @@ dependencies = [
 name = "veilway-proto"
 version = "0.1.0"
 dependencies = [
+ "argon2",
  "base64 0.23.1",
  "hpke",
  "ring",

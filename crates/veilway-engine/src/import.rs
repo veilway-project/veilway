@@ -25,6 +25,7 @@ use veilway_proto::subscription::envelope::EnvelopeError;
 use veilway_proto::subscription::exchange::{next_key, GatewayKey, REQUEST};
 use veilway_proto::subscription::fetch::{DeviceName, Request};
 use veilway_proto::subscription::link::{Carried, Link, LinkError};
+use veilway_proto::subscription::sealed_file::{self, OpenError, SealError};
 use veilway_proto::subscription::payload::{dialable, private, PayloadError, Reason};
 use veilway_proto::subscription::{DeviceSecret, Secret, Url, BODY_MAX};
 use veilway_transport::http;
@@ -131,6 +132,14 @@ pub enum ImportError {
 	Full,
 	/// The endpoint is on a private address and the user has not said yes to it. The app asks, in plain words, "This subscription is on a private address (192.168.1.20). Only continue if you run this server yourself, for example at home.", and goes on with these addresses as `allowed` (an import) or through `Library::allow_private` (a refresh). Nothing was sent.
 	PrivateEndpoint {host: String, addresses: Vec<IpAddr>},
+	/// A sealed file, opened without a password. The app asks for one and opens it again with `open_sealed`.
+	NeedsPassword,
+	/// A sealed file that did not open. A wrong password and a changed file are not told apart.
+	Sealed(OpenError),
+	/// A password for a file the user is making that `sealed_file::seal` refuses.
+	SealPassword,
+	/// The subscription has no link to share: it was imported as a whole document.
+	NoLink,
 }
 
 impl From<FetchError> for ImportError {
@@ -156,6 +165,13 @@ impl ImportError {
 			Self::Store(_) => Code::Store,
 			Self::Full => Code::Full,
 			Self::PrivateEndpoint {..} => Code::PrivateAddress,
+			Self::NeedsPassword => Code::NeedsPassword,
+			Self::Sealed(OpenError::Wrong) => Code::WrongPassword,
+			Self::Sealed(OpenError::Size) => Code::FileTooLarge,
+			Self::Sealed(OpenError::Version(version)) if *version > sealed_file::FORMAT => Code::UpdateApp,
+			Self::Sealed(_) => Code::NotAFile,
+			Self::SealPassword => Code::PasswordShort,
+			Self::NoLink => Code::NoLink,
 			Self::Subscription(failure) => match failure {
 				Failure::Refused(Reason::DeviceLimit) => Code::DeviceLimit,
 				Failure::Refused(Reason::Disabled) => Code::AccountDisabled,
@@ -240,6 +256,10 @@ pub enum Code {
 	NoQr,
 	NoImport,
 	KillSwitch,
+	NeedsPassword,
+	WrongPassword,
+	PasswordShort,
+	NoLink,
 }
 
 impl Code {
@@ -291,6 +311,10 @@ impl Code {
 			Self::NoQr => "no_qr",
 			Self::NoImport => "no_import",
 			Self::KillSwitch => "kill_switch",
+			Self::NeedsPassword => "needs_password",
+			Self::WrongPassword => "wrong_password",
+			Self::PasswordShort => "password_short",
+			Self::NoLink => "no_link",
 		}
 	}
 	/// The English words, for the command line.
@@ -341,6 +365,10 @@ impl Code {
 			Self::NoQr => "No QR code was found in the picture. Use a sharp picture of the whole code.",
 			Self::NoImport => "There is no import waiting. Start the import again.",
 			Self::KillSwitch => "The kill switch is still on from an earlier connection, so nothing can be fetched outside the tunnel. Connect first, or disconnect to turn the kill switch off.",
+			Self::NeedsPassword => "This file is locked with a password. Enter the password it was sent with.",
+			Self::WrongPassword => "The password is wrong, or the file is damaged. Check the password, or ask for the file again.",
+			Self::PasswordShort => "The password needs at least 10 characters, and at most 1,024 bytes.",
+			Self::NoLink => "This subscription was added from a file and has no link to share.",
 		}
 	}
 }
@@ -670,7 +698,23 @@ pub fn open(text: &str) -> Result<Offer, ImportError> {
 }
 
 /// Step 1 for the content of a file: `v1.<key>.<document>` and nothing else, bar one line end. A file is the only form that carries a document of any size, and it has no endpoint.
-pub fn open_file(content: &[u8]) -> Result<Offer, ImportError> {Carried::file(content).map(|carried| Offer::open(Link::Carried(carried))).map_err(ImportError::File)}
+pub fn open_file(content: &[u8]) -> Result<Offer, ImportError> {
+	if sealed_file::is_sealed(content) {return Err(ImportError::NeedsPassword)}
+	Carried::file(content).map(|carried| Offer::open(Link::Carried(carried))).map_err(ImportError::File)
+}
+
+/// Step 1 for a sealed file and the password typed for it. The hashing takes a moment and a lot of memory: a caller with a window runs this off its thread. What is inside is the text of a link and goes through `open` as any text does, so nothing that a link needs (the user's yes, every check of the signature) is skipped, and the password has added secrecy in transit and nothing else.
+pub fn open_sealed(content: &[u8], password: &str) -> Result<Offer, ImportError> {open(&sealed_file::open(password, content).map_err(ImportError::Sealed)?)}
+
+/// The link of a held subscription, as text to share. Only the link: the device's key and secret stay here, so whoever gets it joins as a new device and counts against the account's device limit.
+pub fn share_link(held: &Held) -> Result<String, ImportError> {held.link().ok_or(ImportError::NoLink)}
+
+/// Seals the link of `share_link` under a password. The salt and the nonce are drawn here. The hashing takes a moment and a lot of memory: a caller with a window runs this off its thread.
+pub fn seal_link(link: &str, password: &str) -> Result<Vec<u8>, ImportError> {
+	let (mut salt, mut nonce) = ([0u8; 16], [0u8; 12]);
+	crate::random(&mut salt).and_then(|_| crate::random(&mut nonce)).map_err(|_| ImportError::Random)?;
+	sealed_file::seal(password, link, salt, nonce).map_err(|error| match error {SealError::Password => ImportError::SealPassword, _ => ImportError::NoLink})
+}
 
 /// The user's yes to a native link. `device` is the stored device when the import is of a link for a subscription the app holds, so that it takes no new place. The key and the secret of a new device are drawn here and not before.
 pub fn proceed(offer: NativeOffer, device: Option<Device>) -> Result<Fetching, ImportError> {offer.proceed(device, &mut crate::random).map_err(|_| ImportError::Random)}
@@ -993,13 +1037,21 @@ mod tests {
 			(ImportError::Subscription(Failure::PrivateKey), Code::DeviceKey),
 			(ImportError::Subscription(Failure::HasLink), Code::HasLink),
 			(ImportError::Subscription(Failure::Pins), Code::EndpointChanged),
+			(ImportError::NeedsPassword, Code::NeedsPassword),
+			(ImportError::Sealed(OpenError::Wrong), Code::WrongPassword),
+			(ImportError::Sealed(OpenError::Size), Code::FileTooLarge),
+			(ImportError::Sealed(OpenError::Version(2)), Code::UpdateApp),
+			(ImportError::Sealed(OpenError::Cost), Code::NotAFile),
+			(ImportError::Sealed(OpenError::NotSealed), Code::NotAFile),
+			(ImportError::SealPassword, Code::PasswordShort),
+			(ImportError::NoLink, Code::NoLink),
 		];
 		for (error, code) in &cases {
 			assert_eq!(error.code(), *code, "{error:?}");
 			assert!(!error.text().is_empty() && error.text() == code.text(), "{error:?}");
 		}
 		let codes: std::collections::HashSet<&str> = cases.iter().map(|(_, code)| code.as_str()).collect();
-		assert_eq!(codes.len(), 37);
+		assert_eq!(codes.len(), 41);
 	}
 
 	#[test]
@@ -1044,6 +1096,8 @@ mod tests {
 		bytes.fill(if bytes.len() == 32 {0x33} else {0x44});
 		Ok(())
 	}
+
+	fn hex_of(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
 
 	fn imported() -> Held {
 		let Offer::Native(offer) = Offer::open(native()) else {panic!("a native link")};
@@ -1193,6 +1247,38 @@ mod tests {
 		let mut library = library("whole", offer.proceed(NOW, &[]).unwrap().accept(None, &[]).unwrap().held);
 		let fake = Fake::new(Vec::new());
 		assert!(matches!(run(&mut library, &fake), Err(RefreshFailed {error: ImportError::Legacy, static_asked: 0})) && fake.asked().is_empty());
+	}
+
+	#[test]
+	fn the_link_of_a_held_subscription_is_the_link_it_was_imported_with_and_nothing_of_the_device() {
+		let held = imported();
+		let link = share_link(&held).unwrap();
+		let Ok(Link::Native(parsed)) = Link::parse(&link) else {panic!("a native link")};
+		assert_eq!((parsed.veilway(), parsed.endpoint().host()), (link.clone(), "sub.example.com"));
+		let device = held.device().unwrap();
+		assert!(!link.contains(&STANDARD.encode(device.private().expose())) && !link.contains(&hex_of(device.secret().expose())));
+		let content: serde_json::Value = serde_json::from_slice(&corpus("fuzz_subscription/content")[1..]).unwrap();
+		let Offer::Carried(offer) = Offer::open(Link::Carried(Carried::file(format!("v1.{}.{}", &String::from_utf8(corpus("fuzz_deeplink/file")).unwrap()[3..46], sign(&content)).as_bytes()).unwrap())) else {panic!("a document in a file")};
+		let whole = offer.proceed(NOW, &[]).unwrap().accept(None, &[]).unwrap().held;
+		assert!(matches!(share_link(&whole), Err(ImportError::NoLink)) && matches!(share_link(&whole).and_then(|link| seal_link(&link, "a long enough password")), Err(ImportError::NoLink)));
+	}
+
+	#[test]
+	fn a_sealed_file_asks_for_a_password_and_opens_into_the_ordinary_import() {
+		let held = imported();
+		let link = share_link(&held).unwrap();
+		let file = seal_link(&link, "a long enough password").unwrap();
+		assert_eq!(open_file(&file).err().map(|error| error.code()), Some(Code::NeedsPassword));
+		assert_eq!(open_sealed(&file, "another long password").err().map(|error| error.code()), Some(Code::WrongPassword));
+		let mut changed = file.clone();
+		*changed.last_mut().unwrap() ^= 1;
+		assert_eq!(open_sealed(&changed, "a long enough password").err().map(|error| error.code()), Some(Code::WrongPassword));
+		let Ok(Offer::Native(offer)) = open_sealed(&file, "a long enough password") else {panic!("a native offer")};
+		let Ok(Offer::Native(direct)) = open(&link) else {panic!("a native offer")};
+		assert_eq!((offer.endpoint().as_str(), offer.fingerprint().to_string()), (direct.endpoint().as_str(), direct.fingerprint().to_string()));
+		assert_eq!(seal_link(&link, "too short").err().map(|error| error.code()), Some(Code::PasswordShort));
+		assert_ne!(seal_link(&link, "a long enough password").unwrap(), file, "a salt and a nonce are drawn for every file");
+		assert_eq!(open_sealed(b"hello", "a long enough password").err().map(|error| error.code()), Some(Code::NotAFile));
 	}
 
 	#[test]

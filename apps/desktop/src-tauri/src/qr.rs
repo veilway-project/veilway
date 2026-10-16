@@ -26,6 +26,9 @@ pub fn decode(bytes: &[u8]) -> Result<String, Code> {
 	Err(Code::NoQr)
 }
 
+/// The picture of a code for a link the user is about to pass on, as SVG text with its quiet zone. The window shows it as an image and never as markup.
+pub fn render(text: &str) -> Result<String, Code> {Ok(qrcode::QrCode::new(text.as_bytes()).map_err(|_| Code::LinkTooLong)?.render::<qrcode::render::svg::Color>().min_dimensions(256, 256).quiet_zone(true).build())}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -51,6 +54,14 @@ mod tests {
 	fn a_link_in_a_picture_comes_out_as_the_same_text() {
 		let link = "veilway://example.invalid/s/abcdefghijklmnop#token";
 		assert_eq!(decode(&picture(link)).unwrap(), link);
+	}
+
+	#[test]
+	fn a_link_goes_into_a_code_that_reads_back() {
+		let link = "veilway://sub/sub.example.com/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.VVVVVVVVVVVVVVVVVVVVVQ";
+		let svg = render(link).unwrap();
+		assert!(svg.starts_with("<?xml") && svg.contains("<svg") && !svg.contains("script"));
+		assert_eq!(render(&"a".repeat(9000)), Err(Code::LinkTooLong));
 	}
 
 	#[test]
