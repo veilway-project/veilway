@@ -336,6 +336,17 @@ A provider can add a few cards to the client's home screen through the signed su
 
 A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint and blur strength. Nothing else: no URLs, fonts, CSS strings or images. The app validates it against a schema, rejects anything over 16 KB, checks text contrast and refuses or auto-corrects unreadable combinations. Built-in editor, export and import in the clients. The panel uses the same token set.
 
+## After the alpha: releases
+
+`v0.1.x` updates, in this order, each raising the core version:
+
+- A signed APT and RPM repository on GitHub Pages, published by the release workflow, so Linux desktop and node packages update with the system's own updates.
+- The macOS desktop app as a `.dmg` (Apple Silicon and Intel), after a test on a real Mac; unsigned until a developer account exists.
+- The app asks about waiting update hosts and moves when the user starts a refresh, not only on the subscriptions page.
+- A separate 32-bit Arm (`armeabi-v7a`) APK, if users ask for it.
+- An AppImage of the Linux desktop app that connects: on first run it checks its own signature and installs its helper into a root-owned folder after one password prompt, and refreshes it after each self-update. A new privilege path, so it gets its own design and review before it is built.
+- A store build of the Android app with the updater and the install permission removed, for F-Droid first.
+
 ## Shapes of `fronted` (after the alpha)
 
 The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbound by the operator, written into the signed profile, and followed by the client. Spec change in `veilway-docs` first, then an adversarial review, then code.
