@@ -666,7 +666,12 @@ do_backup() {
 	if [ "$DRY" = 1 ]; then dry "tar czf $out ${existing[*]}"; return 0; fi
 	mkdir -p "$(dirname "$out")"
 	chmod 0700 "$(dirname "$out")" 2>/dev/null || true
-	(umask 077; tar -czf "$out" -C / "${existing[@]}")
+	# The panel's database is copied with the panel stopped, so the archive never holds a half-written database and its log.
+	local panel_up=0
+	has_systemd && systemctl is-active --quiet veilway-panel.service && panel_up=1
+	[ "$panel_up" = 1 ] && svc stop veilway-panel.service
+	(umask 077; tar -czf "$out" -C / "${existing[@]}") || { [ "$panel_up" = 1 ] && svc start veilway-panel.service; die "writing $out failed"; }
+	[ "$panel_up" = 1 ] && svc start veilway-panel.service
 	step "backup written to $out (holds keys: keep it private)"
 }
 
@@ -680,6 +685,7 @@ do_restore() {
 	if [ "$DRY" = 1 ]; then dry "stop services, save current files to $BACKUP_DIR, extract $file to /, fix owners, start services"; return 0; fi
 	grep -qE '(^/|(^|/)\.\.(/|$))' <<<"$(tar -tzf "$file")" && die "the archive has unsafe paths: refusing"
 	grep -q '^[lh]' <<<"$(tar -tvzf "$file")" && die "the archive has links: refusing"
+	grep -v -E "^(${CONF_DIR#/}|${STATE_DIR#/}/veilway-state\.json|${PANEL_DIR#/})(/|$)" <<<"$(tar -tzf "$file")" | grep -q . && die "the archive has files outside Veilway's folders: refusing"
 	do_backup "$BACKUP_DIR/pre-restore-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || true
 	svc stop veilway.service; svc stop veilway-panel.service
 	tar -xzf "$file" -C / --no-same-owner
