@@ -25,6 +25,7 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use veilway_engine::import::Code;
 
 static HANDLE:OnceLock<AppHandle>=OnceLock::new();
 static LOGS:OnceLock<Mutex<VecDeque<String>>>=OnceLock::new();
@@ -94,8 +95,8 @@ async fn import_open(backend:State<'_, Arc<Backend>>, source:Source)->Result<Val
 /// The same from a picture with a QR code in it (base64 of the file, as pasted or picked). The picture is read here, in the unprivileged process.
 #[tauri::command]
 async fn import_qr(backend:State<'_, Arc<Backend>>, data:String)->Result<Value, String>{
-	let bytes=base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "The picture could not be read.".to_string())?;
-	let text=tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|e| e.to_string())??;
+	let bytes=base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| Code::PictureUnreadable.as_str().to_string())?;
+	let text=tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|e| e.to_string())?.map_err(|code| code.as_str().to_string())?;
 	ask(&backend, Call::ImportOpen{source:Source::Link{text}}).await
 }
 
