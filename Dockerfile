@@ -3,13 +3,17 @@
 # BINARY=build compiles veilway from this checkout. BINARY=prebuilt copies bin/veilway from the build context instead: a musl build made beforehand, for example by the release workflow.
 ARG BINARY=build
 
-FROM rust:1-alpine AS build
-# hadolint ignore=DL3018
-RUN apk add --no-cache build-base cmake clang-dev linux-headers perl
+# A static musl build with zig as the C compiler, as the release workflow makes it: BoringSSL's build script needs libclang, which a musl host cannot load.
+# It runs on the build machine's platform and cross-compiles for the image's, so no stage runs under emulation.
+FROM --platform=$BUILDPLATFORM rust:1 AS build
+ARG TARGETARCH
+# hadolint ignore=DL3008,DL3013
+RUN apt-get update && apt-get install -y --no-install-recommends cmake clang libclang-dev perl python3-pip && rm -rf /var/lib/apt/lists/* \
+ && pip install --no-cache-dir --break-system-packages ziglang && cargo install --locked cargo-zigbuild
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
-    cargo build --release --locked -p veilway --bin veilway && cp target/release/veilway /veilway
+    target="$(case "$TARGETARCH" in arm64) echo aarch64;; *) echo x86_64;; esac)-unknown-linux-musl" && rustup target add "$target" && cargo zigbuild --release --locked --target "$target" -p veilway --bin veilway && cp "target/$target/release/veilway" /veilway
 
 FROM alpine:3.22 AS prebuilt
 COPY bin/veilway /veilway
