@@ -26,6 +26,8 @@ import java.util.concurrent.Executors
 class VeilwayVpnService : VpnService() {
 	companion object {
 		const val ACTION_STOP = "io.github.veilwayproject.app.STOP"
+		/** With [ACTION_STOP]: stop the connection but leave it wanted, so the boot receiver brings it back after an app update. */
+		const val EXTRA_KEEP_WANTED = "keepWanted"
 		const val EXTRA_SUBSCRIPTION = "subscription"
 		const val EXTRA_PROFILE = "profile"
 		const val EXTRA_OPTIONS = "options"
@@ -58,7 +60,7 @@ class VeilwayVpnService : VpnService() {
 		val wanted = Wanted(this)
 		Native.lockdown(Build.VERSION.SDK_INT >= 29 && isLockdownEnabled)
 		if (intent?.action == ACTION_STOP) {
-			wanted.wanted = false
+			if (!intent.getBooleanExtra(EXTRA_KEEP_WANTED, false)) wanted.wanted = false
 			startForegroundNow()
 			worker.execute { Native.disconnect(); finish(null) }
 			return START_NOT_STICKY
