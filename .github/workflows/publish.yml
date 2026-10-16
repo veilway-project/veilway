@@ -1,0 +1,53 @@
+name: publish
+# Started by hand only, from main. Publishing to crates.io and npm cannot be undone: a version, once up, stays taken.
+# The registry tokens are only in the steps that upload, never where a dependency's code runs: npm's install scripts are off, and the crates are built and verified in a step without the token, then uploaded with --no-verify.
+# Move both registries to trusted publishing (OIDC) after the first publish and delete the two tokens.
+on:
+  workflow_dispatch:
+    inputs:
+      what:
+        description: "What to publish"
+        required: true
+        type: choice
+        options: [sdk, crates, both]
+
+permissions:
+  contents: read
+
+jobs:
+  sdk:
+    if: github.ref == 'refs/heads/main' && (inputs.what == 'sdk' || inputs.what == 'both')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: packages/sdk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+      # A prerelease version gets the latest tag on purpose: it is the only version there is.
+      - run: npm publish --tag latest --ignore-scripts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  crates:
+    if: github.ref == 'refs/heads/main' && (inputs.what == 'crates' || inputs.what == 'both')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # BoringSSL in veilway-transport is built from source: cmake and clang come with the runner.
+      - name: Build and verify every package, without the token
+        run: cargo publish --locked --workspace --exclude veilway-client --dry-run
+      - name: Upload in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --workspace --exclude veilway-client --no-verify
