@@ -32,6 +32,7 @@ RELEASE_BASE="${VEILWAY_RELEASE_BASE:-https://github.com}"
 RAW_BASE="${VEILWAY_RAW_BASE:-https://raw.githubusercontent.com}"
 PANEL_PORT="${VEILWAY_PANEL_PORT:-8480}"
 TAG_RE='^v?[0-9A-Za-z._-]+$'
+SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z.-]+)?$'
 OVERRIDES=()
 for v in VEILWAY_RELEASE_BASE VEILWAY_RAW_BASE VEILWAY_NODE_PUBKEY VEILWAY_PANEL_PUBKEY; do if [ -n "${!v:-}" ]; then OVERRIDES+=("$v=${!v}"); fi; done
 BIN_DIR="/usr/local/bin"
@@ -220,6 +221,35 @@ install_binary() {
 	mv -f "$dest.new" "$dest"
 }
 
+# True when version $1 is lower than $2 by semver precedence, build metadata ignored. Anything that is not semver stops the run.
+semver_lower() {
+	local a="${1#v}" b="${2#v}" ca cb pa pb i
+	local -a x y
+	local LC_ALL=C
+	[[ "$a" =~ $SEMVER_RE && "$b" =~ $SEMVER_RE ]] || die "cannot compare $1 with $2 as versions: refusing"
+	a="${a%%+*}"; b="${b%%+*}"
+	ca="${a%%-*}"; cb="${b%%-*}"
+	pa="${a#"$ca"}"; pa="${pa#-}"; pb="${b#"$cb"}"; pb="${pb#-}"
+	IFS=. read -r -a x <<<"$ca"; IFS=. read -r -a y <<<"$cb"
+	for i in 0 1 2; do
+		[ "$((10#${x[i]}))" -eq "$((10#${y[i]}))" ] && continue
+		return "$((10#${x[i]} >= 10#${y[i]}))"
+	done
+	if [ -z "$pa" ]; then return 1; fi
+	if [ -z "$pb" ]; then return 0; fi
+	IFS=. read -r -a x <<<"$pa"; IFS=. read -r -a y <<<"$pb"
+	for ((i = 0; i < ${#x[@]} && i < ${#y[@]}; i++)); do
+		if [ "${x[i]}" = "${y[i]}" ]; then continue; fi
+		if [[ "${x[i]}" =~ ^[0-9]+$ && "${y[i]}" =~ ^[0-9]+$ ]]; then return "$((10#${x[i]} >= 10#${y[i]}))"; fi
+		if [[ "${x[i]}" =~ ^[0-9]+$ ]]; then return 0; fi
+		if [[ "${y[i]}" =~ ^[0-9]+$ ]]; then return 1; fi
+		if [[ "${x[i]}" < "${y[i]}" ]]; then return 0; fi
+		return 1
+	done
+	if [ "${#x[@]}" -lt "${#y[@]}" ]; then return 0; fi
+	return 1
+}
+
 fetch_and_install() {
 	local which="$1" repo key name dest tag product cur vf
 	if [ "$which" = node ]; then repo="$CORE_REPO"; key="$NODE_PUBKEY"; product=veilway; name="veilway-$TARGET"; dest="$BIN_DIR/veilway"
@@ -232,7 +262,7 @@ fetch_and_install() {
 	fi
 	tag="$(release_tag "$repo")"
 	cur="$(installed_version "$which")"
-	if [ -z "$WANT_VERSION" ] && [ -n "$cur" ] && [ "$cur" != "$tag" ] && [ "$(printf '%s\n%s\n' "$cur" "$tag" | sort -V | head -n 1)" = "$tag" ]; then
+	if [ -z "$WANT_VERSION" ] && [ -n "$cur" ] && [ "$cur" != "$tag" ] && semver_lower "$tag" "$cur"; then
 		die "$tag is older than the installed $cur: refusing a downgrade (pass --version $tag to do it on purpose)"
 	fi
 	download_verified "$repo" "$key" "$name" "$tag" "$product"
@@ -470,12 +500,13 @@ EOF
 
 # The root update service runs this copy, so what it runs is not a file the panel's user can reach. A piped run has no file of its own, so the same script is fetched from where it came from.
 install_self() {
-	local src="$0"
+	local src="$0" tag
 	if [ "$DRY" = 1 ]; then dry "install this script as $SELF"; return 0; fi
 	if [ -f "$src" ] && [ "$src" -ef "$SELF" ]; then return 0; fi
 	if ! { [ -f "$src" ] && head -n 2 "$src" | grep -q 'Veilway installer and manager'; }; then
+		tag="$(release_tag "$CORE_REPO")"
+		download_verified "$CORE_REPO" "$NODE_PUBKEY" veilway.sh "$tag" veilway
 		src="$TMP/veilway.sh"
-		fetch "$RAW_BASE/$CORE_REPO/main/scripts/veilway.sh" "$src" "fetching the installer script"
 		head -n 2 "$src" | grep -q 'Veilway installer and manager' || die "the fetched installer script is not the expected file"
 	fi
 	install -d -m 0755 "$(dirname "$SELF")"
@@ -487,6 +518,7 @@ install_self() {
 # The panel runs unprivileged and never updates itself. It writes the word "panel" to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
 updater_units() {
 	act install -d -m 0770 -o root -g veilway-panel "$UPDATE_DIR"
+	act install -d -m 0700 -o root -g root "$BACKUP_DIR"
 	write_unit "$UNIT_DIR/veilway-panel-update.path" <<EOF
 [Unit]
 Description=Veilway panel update request
@@ -512,7 +544,7 @@ TimeoutStartSec=15min
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
 ProtectSystem=strict
-ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -/var/backups -$UPDATE_DIR
+ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -$BACKUP_DIR -$UPDATE_DIR
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -599,6 +631,7 @@ panel_summary() {
 		"" \
 		"  nginx:  location ~ ^($prefix|$sub)(/|\$) {" \
 		"            proxy_pass http://127.0.0.1:$PANEL_PORT;" \
+		"            client_max_body_size 100m;" \
 		"            proxy_set_header Host \$host;" \
 		"            proxy_set_header X-Forwarded-For \$remote_addr; }" \
 		"" \
@@ -759,24 +792,34 @@ do_backup() {
 }
 
 do_restore() {
-	local file="${1:-}"
+	local file="${1:-}" names listing
 	need_root
 	refuse_links
 	[ -n "$file" ] || die "usage: veilway.sh restore <backup.tar.gz>"
 	[ -r "$file" ] || [ "$DRY" = 1 ] || die "cannot read $file"
 	confirm "Restore $file over $CONF_DIR, the usage state and the panel data?" || die "cancelled"
 	if [ "$DRY" = 1 ]; then dry "stop services, save current files to $BACKUP_DIR, extract $file to /, fix owners, start services"; return 0; fi
-	grep -qE '(^/|(^|/)\.\.(/|$))' <<<"$(tar -tzf "$file")" && die "the archive has unsafe paths: refusing"
-	grep -q '^[lh]' <<<"$(tar -tvzf "$file")" && die "the archive has links: refusing"
-	grep -v -E "^(${CONF_DIR#/}|${STATE_DIR#/}/veilway-state\.json|${PANEL_DIR#/})(/|$)" <<<"$(tar -tzf "$file")" | grep -q . && die "the archive has files outside Veilway's folders: refusing"
+	TMP="$(umask 077; mktemp -d)"
+	cp -- "$file" "$TMP/archive.tar.gz"
+	file="$TMP/archive.tar.gz"
+	names="$(tar -tzf "$file")" || die "$file is not a readable gzip archive: refusing, nothing was stopped"
+	listing="$(tar -tvzf "$file")" || die "$file cannot be listed: refusing, nothing was stopped"
+	[ -n "$names" ] || die "the archive is empty: refusing"
+	grep -qvE '^[-d]' <<<"$listing" && die "the archive has links, devices or pipes: refusing"
+	grep -qE '^.{3}[sS]|^.{6}[sS]' <<<"$listing" && die "the archive has setuid or setgid files: refusing"
+	grep -qE '(^/|(^|/)\.\.(/|$))' <<<"$names" && die "the archive has unsafe paths: refusing"
+	grep -qvE "^(${CONF_DIR#/}|${STATE_DIR#/}/veilway-state\.json|${PANEL_DIR#/})(/|$)" <<<"$names" && die "the archive has files outside Veilway's folders: refusing"
 	do_backup "$BACKUP_DIR/pre-restore-$(date -u +%Y%m%dT%H%M%SZ).tar.gz" || true
 	svc stop veilway.service; svc stop veilway-panel.service
-	tar -xzf "$file" -C / --no-same-owner
+	trap 'svc start veilway.service || true; svc start veilway-panel.service || true; die "restore failed: the services were started again"' ERR
+	rm -f -- "$PANEL_DIR/panel.db-wal" "$PANEL_DIR/panel.db-shm"
+	tar -xzf "$file" -C / --no-same-owner --no-same-permissions
 	id veilway >/dev/null 2>&1 && { chown root:veilway "$CONF_DIR"; chmod 0750 "$CONF_DIR"; prepare_node_dir; chown -h -R veilway:veilway "$NODE_DIR"; chown -h veilway:veilway "$STATE_DIR/veilway-state.json" 2>/dev/null || true; }
 	chown -h root:veilway-panel "$CONF_DIR/panel.json" 2>/dev/null || true
 	id veilway-panel >/dev/null 2>&1 && chown -h -R veilway-panel:veilway-panel "$PANEL_DIR"
+	trap - ERR
 	svc start veilway.service; svc start veilway-panel.service
-	step "restored from $file"
+	step "restored from $1"
 }
 
 do_uninstall() {

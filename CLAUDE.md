@@ -68,6 +68,7 @@ The code style applies to all first-party code, Rust included: spaces around ope
 - Never run `rustfmt`, `cargo fmt`, or prettier, and never add them to CI: they add blank lines and break one-liners.
 - Vendored third-party code keeps its upstream style. Mark every local change in it with a comment naming the patch.
 - Commit when a chunk is done. End commit messages with `Co-Authored-By: Claude <noreply@anthropic.com>` and nothing else.
+- Every release raises the core version (e.g. `v0.1.1-alpha` after `v0.1.0-alpha`): the apps report only the core version, and an equal core never counts as newer.
 - Frontend work: load the `frontend-preferences` skill first. No pill shapes, no uppercase eyebrow labels, no emoji, small consistent radii.
 - Verify UI visually (Playwright screenshots in dark and light, English and Persian) before calling it done.
 - Check current library APIs with context7 before writing against Tauri, axum, rustls, React or anything else that moves between versions.
