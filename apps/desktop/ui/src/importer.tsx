@@ -1,10 +1,10 @@
 import {Banner, Button, Glass, List, ListRow, SecretField, TextField} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
-import {base64, failureText, useD} from "./kit.tsx";
+import {agreement, base64, failureText, useD} from "./kit.tsx";
 import {asksPrivate, call, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
-export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void}) {
+export function Importer({first, onCancel, onDone, onAccept}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void}) {
 	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
@@ -29,7 +29,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 	const failure = error && <Banner tone="danger" title={t("import.failed")}>{failureText(error, t)}</Banner>;
 	const key = (fingerprint: string) => <p className="d-key"><span className="vw-muted vw-small">{t("import.key")}</span><span className="vw-code" dir="ltr">{fingerprint}</span></p>;
 	if (review) {
-		const preview = review.preview;
+		const preview = review.preview, terms = agreement(preview);
 		return <div className="d-page">
 			<Glass className="d-panel">
 				<h1 className="vw-h2">{t("import.review.title", {provider: preview.provider})}</h1>
@@ -40,8 +40,9 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				{review.moving && <Banner tone="warning" title={t("import.review.moveTitle")}>{t(review.moving.check === "plain" ? "import.review.movePlain" : review.moving.check === "pinned" ? "import.review.movePinned" : "import.review.move", {from: review.moving.from ?? "", host: review.moving.host})}</Banner>}
 				<List label={t("import.review.connections")}>{preview.profiles.map(profile => <ListRow key={profile.id} title={profile.name} detail={t("import.review.exits", {count: profile.exits.length})}/>)}</List>
 				{review.left_out.length > 0 && <p className="vw-muted vw-small">{t("import.review.leftOut", {count: review.left_out.length})}</p>}
+				{terms && <div className="d-terms"><p>{t("import.review.terms", {provider: preview.provider})}</p><div className="d-actions d-start">{([["terms.terms", preview.terms], ["terms.privacy", preview.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" icon="external" onClick={() => call("open_link", {url}).catch(setError)}>{t(label)}</Button>)}</div></div>}
 				{failure}
-				<div className="d-actions"><Button onClick={() => run(call("import_keep", {keep: false}), () => { setReview(null); setOffer(null); if (!first) onCancel(); })} disabled={busy}>{t("import.discard")}</Button><Button variant="primary" disabled={busy} onClick={() => run(call("import_keep", {keep: true}), onDone)}>{t("import.keep")}</Button></div>
+				<div className="d-actions"><Button onClick={() => run(call("import_keep", {keep: false}), () => { setReview(null); setOffer(null); if (!first) onCancel(); })} disabled={busy}>{t("import.discard")}</Button><Button variant="primary" disabled={busy} onClick={() => run(call("import_keep", {keep: true}), found => { if (terms) onAccept(preview.id, terms); onDone(found); })}>{t(terms ? "import.acceptKeep" : "import.keep")}</Button></div>
 			</Glass>
 		</div>;
 	}

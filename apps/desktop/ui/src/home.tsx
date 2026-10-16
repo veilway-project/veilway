@@ -1,6 +1,6 @@
 import {Banner, Button, ConnectSwitch, Dialog, Glass, Icon, List, ListRow, ProviderCard, SelectField, StatRow, StatTile, UsageBar, useToast, type ConnectState, type ProviderItem, type TrafficPoint} from "@veilway/ui";
 import {useEffect, useState} from "react";
-import {fromUnix, useD, useLogo, type Prefs} from "./kit.tsx";
+import {agreement, fromUnix, useD, useLogo, type Prefs} from "./kit.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {call, type Ended, type Exit, type Profile, type Running, type Subscription} from "./tauri.ts";
 
@@ -20,8 +20,11 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 	const items: ProviderItem[] = subscription ? [
 		...subscription.notices.map(n => ({type: "notice" as const, text: n.text, severity: n.severity === "warning" ? "warning" as const : n.severity === "critical" ? "critical" as const : "info" as const})),
 		...subscription.cards.map((card): ProviderItem => card.kind === "stat" ? {type: "stat", label: card.label, value: card.value, unit: card.unit ?? undefined} : card.kind === "progress" ? {type: "progress", label: card.label, used: card.used, total: card.total} : card.kind === "notice" ? {type: "notice", text: card.text, severity: card.severity === "warning" ? "warning" : card.severity === "critical" ? "critical" : "info"} : {type: "link", label: card.label, url: card.url}),
-		...subscription.support.map(([label, url]) => ({type: "link" as const, label, url}))
+		...subscription.support.map(([label, url]) => ({type: "link" as const, label, url})),
+		...([["terms.terms", subscription.terms], ["terms.privacy", subscription.privacy]] as const).flatMap(([label, url]) => url ? [{type: "link" as const, label: t(label), url}] : [])
 	] : [];
+	// Connecting waits for the user's yes to the provider's terms, asked again when a refresh changes either link.
+	const terms = subscription ? agreement(subscription) : null, accepted = subscription ? prefs.accepted[subscription.id] : undefined, pending = terms !== null && accepted !== terms;
 	const open = (url: string) => call("open_link", {url}).catch(error => toast({tone: "danger", title: t("home.openFailed"), body: error}));
 	const connection = status?.connection ?? null, since = connection?.since ?? null;
 	useEffect(() => {
@@ -43,9 +46,13 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
 			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{subscription.provider}</span>}</p>
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
-			<ConnectSwitch state={link} disabled={busy || !chosen} onToggle={link === "off" ? onConnect : onDisconnect}/>
+			<ConnectSwitch state={link} disabled={busy || !chosen || (pending && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>
 		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, detail: c.subscription.provider}))}/>}
+		{pending && subscription && <Banner tone="info" title={t("terms.title", {provider: subscription.provider})} action={<Button size="sm" variant="primary" onClick={() => onPrefs({accepted: {...prefs.accepted, [subscription.id]: terms ?? ""}})}>{t("terms.accept")}</Button>}>
+			{t(accepted === undefined ? "terms.body" : "terms.changed", {provider: subscription.provider})}
+			<span className="d-actions d-start">{([["terms.terms", subscription.terms], ["terms.privacy", subscription.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" variant="quiet" icon="external" onClick={() => open(url)}>{t(label)}</Button>)}</span>
+		</Banner>}
 		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error, kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}

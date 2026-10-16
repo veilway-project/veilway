@@ -18,6 +18,8 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-form { display: grid; gap: var(--s-3); justify-items: start; }
 .d-form > .vw-field { inline-size: 100%; }
 .d-key { display: grid; gap: 2px; margin: 0; }
+.d-terms { display: grid; gap: var(--s-2); }
+.d-terms p { margin: 0; }
 .d-key .vw-code { overflow-wrap: anywhere; }
 .d-setting { display: grid; gap: var(--s-2); justify-items: start; }
 .d-progress { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); }

@@ -71,15 +71,11 @@ async fn call_branded(call: Call) -> Result<Value, String> {
 	Ok(value)
 }
 
-/// The provider links the library shows are the only ones `open_link` opens. Each whole list the core sends replaces the last one.
+/// The provider links the library shows are the only ones `open_link` opens. Each whole list the core sends replaces the last one; an import's preview adds its own, so its terms open before the user keeps it.
 fn remember_links(value: &Value) {
+	if let Some(preview) = value.get("preview") {linkset().lock().unwrap().extend(view::provider_links(preview)); return}
 	let Some(list) = value.as_array() else {return};
-	let links: HashSet<String> = list.iter().flat_map(|subscription| {
-		let support = subscription["support"].as_array().into_iter().flatten().filter_map(|pair| pair.get(1)?.as_str());
-		let cards = subscription["cards"].as_array().into_iter().flatten().filter(|card| card["kind"] == "link").filter_map(|card| card["url"].as_str());
-		support.chain(cards).map(String::from).collect::<Vec<_>>()
-	}).collect();
-	*linkset().lock().unwrap() = links;
+	*linkset().lock().unwrap() = list.iter().flat_map(view::provider_links).collect();
 }
 
 /// Runs a command of the Kotlin plugin off the async threads, since the call waits for the answer.
@@ -179,7 +175,7 @@ fn log_history() -> Vec<String> {host::logs()}
 #[tauri::command]
 fn open_link(app: AppHandle, url: String) -> Result<(), String> {
 	let scheme = tauri::Url::parse(&url).map_err(|_| "The link is not valid.".to_string())?.scheme().to_string();
-	if !matches!(scheme.as_str(), "http" | "https" | "mailto") || !linkset().lock().unwrap().contains(&url) {return Err("This is not one of the provider's links.".into())}
+	if !matches!(scheme.as_str(), "http" | "https" | "mailto") || (url != view::PRIVACY_URL && !linkset().lock().unwrap().contains(&url)) {return Err("This is not one of the provider's links.".into())}
 	app.opener().open_url(url, None::<&str>).map_err(|error| error.to_string())
 }
 

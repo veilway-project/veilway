@@ -125,6 +125,11 @@ pub struct SubscriptionOut {
 	pub cards: Vec<CardOut>,
 	pub notices: Vec<NoticeOut>,
 	pub support: Vec<(String, String)>,
+	/// The provider's terms and privacy policy. The window asks the user to accept them before the first connection, and again when either link changes.
+	#[serde(default)]
+	pub terms: Option<String>,
+	#[serde(default)]
+	pub privacy: Option<String>,
 	/// The logo's bytes as the provider sent them, within a size cap and not looked into. The helper never decodes a picture: the window checks it once with `brand` before it is shown.
 	pub logo: Option<LogoOut>,
 	/// `#rrggbb`
@@ -136,6 +141,16 @@ pub struct SubscriptionOut {
 	/// The backup update hosts of a held subscription, empty in a review: the hosts on an import's screen are confirmed with it.
 	#[serde(default)]
 	pub hosts: Vec<HostOut>,
+}
+
+/// The privacy policy of the apps themselves, which `open_link` always opens.
+pub const PRIVACY_URL: &str = "https://veilway-project.github.io/veilway-docs/privacy/";
+
+/// The links of one subscription as the window gets it (support links, link cards, terms and privacy policy): the only provider links `open_link` opens.
+pub fn provider_links(subscription: &serde_json::Value) -> Vec<String> {
+	let support = subscription["support"].as_array().into_iter().flatten().filter_map(|pair| pair.get(1)?.as_str());
+	let cards = subscription["cards"].as_array().into_iter().flatten().filter(|card| card["kind"] == "link").filter_map(|card| card["url"].as_str());
+	support.chain(cards).chain(subscription["terms"].as_str()).chain(subscription["privacy"].as_str()).map(String::from).collect()
 }
 
 /// Replaces every `logo` of a library or a review (`{kind, data}` as the helper sent it) with a `data:` URL when the picture passes `logo_url`, and with null when it does not. Runs in the window, the process without rights.
@@ -185,6 +200,8 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		}).collect(),
 		notices: subscription.notices.iter().map(|found| notice(found, languages)).collect(),
 		support: subscription.support.iter().map(|link| (link.label.pick(languages).0.into(), link.url.as_str().into())).collect(),
+		terms: subscription.agreement.as_ref().and_then(|agreement| agreement.terms.as_ref()).map(|url| url.as_str().into()),
+		privacy: subscription.agreement.as_ref().and_then(|agreement| agreement.privacy.as_ref()).map(|url| url.as_str().into()),
 		logo: subscription.logo.as_ref().filter(|logo| logo.data.len() <= LOGO_BYTES_MAX).map(|logo| LogoOut {kind: logo.kind.word().into(), data: base64::engine::general_purpose::STANDARD.encode(&logo.data)}),
 		accent: subscription.accent.map(|[red, green, blue]| format!("#{red:02x}{green:02x}{blue:02x}")),
 		left_out: subscription.left_out,

@@ -213,6 +213,8 @@ pub struct Subscription {
 	/// "Information for the screen, as old as the document. It decides nothing."
 	pub usage: Option<Usage>,
 	pub support: Vec<SupportLink>,
+	/// The provider's terms and privacy policy, which the app asks the user to accept before the first connection and again when either link changes.
+	pub agreement: Option<Agreement>,
 	pub cards: Vec<Card>,
 	pub logo: Option<Logo>,
 	/// `accent` as red, green and blue. Adjusting it for contrast is the app's.
@@ -431,6 +433,10 @@ pub struct Usage {pub used_bytes: u64, pub quota_bytes: u64, pub period: Period,
 /// An entry of `support`. The URL "is opened only after the user confirms a screen that shows that host, in the system's browser".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportLink {pub label: Text, pub url: Url}
+
+/// `agreement`: at least one of `terms` and `privacy`. Opened like a support link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agreement {pub terms: Option<Url>, pub privacy: Option<Url>}
 
 /// An entry of `notices`, and a card of the type `notice`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -750,8 +756,11 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let support = kept(members, "support", SUPPORT_MAX, &mut left_out, |members| Some(SupportLink {label: text(members, "label", false, LABEL, 4 * LABEL).ok()??, url: url(members)?}))?;
 	let (cards, notices) = (kept(members, "cards", CARDS_MAX, &mut left_out, card)?, kept(members, "notices", NOTICES_MAX, &mut left_out, notice)?);
 	let (usage, logo) = (members.get("usage").map(usage), members.get("logo").map(logo));
-	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None));
+	// Like `usage`, a faulty `agreement` is left out, never a reason to refuse the document.
+	let agreement = members.get("agreement").map(|value| Members::of(value).and_then(|members| {let link = |name| match members.string(name, URL_MAX) {Ok(None) => Ok(None), Ok(Some(text)) => Url::parse(text, URL_MAX, true, true).map(Some).ok_or(()), Err(_) => Err(())}; let (terms, privacy) = (link("terms").ok()?, link("privacy").ok()?); (terms.is_some() || privacy.is_some()).then_some(Agreement {terms, privacy})}));
+	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None)) + usize::from(agreement == Some(None));
+	let agreement = agreement.flatten();
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;
-	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, gateway_keys: gateway_keys(members, "gateway_keys", false)?, main_endpoint, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
+	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, gateway_keys: gateway_keys(members, "gateway_keys", false)?, main_endpoint, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, agreement, cards, logo, accent, notices, left_out})))
 }

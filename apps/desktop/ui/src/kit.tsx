@@ -1,6 +1,7 @@
 import {useI18n} from "@veilway/ui";
 import {useEffect, useState} from "react";
 import {en, type DesktopKey} from "./locales/en.ts";
+import type {Subscription} from "./tauri.ts";
 
 export const useD = () => useI18n<DesktopKey>();
 
@@ -15,17 +16,20 @@ export const failureText = (text: string, t: (key: DesktopKey, params?: {minutes
 export const ANDROID = /Android/i.test(navigator.userAgent);
 
 // What only this window remembers. The theme, the language and the kill switch also go to the app's settings file, which is what the native title bar and the helper read.
-export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[]};
+export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[], accepted: Record<string, string>};
 const PREFS = "veilway-desktop";
 
 export function loadPrefs(): Prefs {
 	const stored = (() => { try { return JSON.parse(localStorage.getItem(PREFS) ?? "{}") as Partial<Prefs>; } catch { return {}; } })();
-	return {scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : []};
+	return {scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : [], accepted: typeof stored.accepted === "object" && stored.accepted !== null && !Array.isArray(stored.accepted) ? stored.accepted : {}};
 }
 
 export function savePrefs(prefs: Prefs) {
 	try { localStorage.setItem(PREFS, JSON.stringify(prefs)); } catch { /* the choice lasts until the window closes */ }
 }
+
+// What the user accepts of a subscription: its terms and privacy links together, so a change to either asks again. Null when it has neither.
+export const agreement = (subscription: Subscription) => subscription.terms || subscription.privacy ? (subscription.terms ?? "") + "\n" + (subscription.privacy ?? "") : null;
 
 // The design system shows a provider logo only from a blob: URL. The Rust side has already decoded and size-checked the picture before handing over this data: URL.
 export function useLogo(data: string | null): string | undefined {

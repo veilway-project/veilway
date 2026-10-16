@@ -78,15 +78,11 @@ async fn ask_branded(backend:&State<'_, Arc<Backend>>, call:Call)->Result<Value,
 	Ok(value)
 }
 
-/// The provider links the library shows are the only ones `open_link` opens. Each whole list the helper sends replaces the last one.
+/// The provider links the library shows are the only ones `open_link` opens. Each whole list the helper sends replaces the last one; an import's preview adds its own, so its terms open before the user keeps it.
 fn remember_links(value:&Value){
+	if let Some(preview)=value.get("preview"){linkset().lock().unwrap().extend(view::provider_links(preview)); return}
 	let Some(list)=value.as_array() else {return};
-	let links:HashSet<String>=list.iter().flat_map(|subscription| {
-		let support=subscription["support"].as_array().into_iter().flatten().filter_map(|pair| pair.get(1)?.as_str());
-		let cards=subscription["cards"].as_array().into_iter().flatten().filter(|card| card["kind"]=="link").filter_map(|card| card["url"].as_str());
-		support.chain(cards).map(String::from).collect::<Vec<_>>()
-	}).collect();
-	*linkset().lock().unwrap()=links;
+	*linkset().lock().unwrap()=list.iter().flat_map(view::provider_links).collect();
 }
 
 /// Step 1 of an import, from a link or a subscription file. Returns what the user is asked about first; nothing is sent anywhere until `import_proceed`.
@@ -175,7 +171,7 @@ fn log_history()->Vec<String>{logbuf().lock().unwrap().iter().cloned().collect()
 #[tauri::command]
 fn open_link(app:AppHandle, url:String)->Result<(), String>{
 	let scheme=tauri::Url::parse(&url).map_err(|_| "The link is not valid.".to_string())?.scheme().to_string();
-	if !matches!(scheme.as_str(), "http"|"https"|"mailto") || !linkset().lock().unwrap().contains(&url){return Err("This is not one of the provider's links.".into())}
+	if !matches!(scheme.as_str(), "http"|"https"|"mailto") || (url!=view::PRIVACY_URL && !linkset().lock().unwrap().contains(&url)){return Err("This is not one of the provider's links.".into())}
 	app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
 }
 
