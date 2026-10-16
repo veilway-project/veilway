@@ -37,7 +37,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				{key(review.fingerprint)}
 				{review.endpoint_changed && <Banner tone="warning" title={t("import.review.endpointTitle")}>{t("import.review.endpoint")}</Banner>}
 				{review.replaces && <Banner tone="info" title={t("import.review.replaces")}/>}
-				{review.moving && <Banner tone="warning" title={t("import.review.moveTitle")}>{t(review.moving.check === "plain" ? "import.review.movePlain" : "import.review.move", {from: review.moving.from ?? "", host: review.moving.host})}</Banner>}
+				{review.moving && <Banner tone="warning" title={t("import.review.moveTitle")}>{t(review.moving.check === "plain" ? "import.review.movePlain" : review.moving.check === "pinned" ? "import.review.movePinned" : "import.review.move", {from: review.moving.from ?? "", host: review.moving.host})}</Banner>}
 				<List label={t("import.review.connections")}>{preview.profiles.map(profile => <ListRow key={profile.id} title={profile.name} detail={t("import.review.exits", {count: profile.exits.length})}/>)}</List>
 				{review.left_out.length > 0 && <p className="vw-muted vw-small">{t("import.review.leftOut", {count: review.left_out.length})}</p>}
 				{failure}

@@ -244,3 +244,37 @@ fn the_second_key_is_tried_once_and_only_after_an_http_answer_that_did_not_open(
 	assert_eq!(next_key(&[first], &first, true), None);
 	assert_eq!(next_key(&[], &first, true), None);
 }
+
+#[test]
+fn a_full_memory_refuses_new_requests_and_records_nothing_until_some_expire() {
+	let at = |t: u64| {
+		let json = String::from_utf8(fetch()).unwrap().replace("\"t\":1700000100", &format!("\"t\":{t}"));
+		let mut ikm = ikm();
+		ikm[0] = t as u8;
+		let sealed = exchange::seal(&keys()[0], json.as_bytes(), &mut script(&[&ikm, &[0]])).unwrap();
+		sealed
+	};
+	let mut gateway = gateway(NOW - 100).capped(2);
+	let (first, second, third) = (at(NOW), at(NOW + 1), at(NOW + 2));
+	assert!(open(&mut gateway, first.bytes(), NOW).is_ok() && open(&mut gateway, second.bytes(), NOW).is_ok());
+	let mut asked = 0;
+	assert_eq!(gateway.open(third.bytes(), NOW, || {asked += 1; true}).err(), Some(Refusal::Full));
+	assert_eq!((gateway.remembered(), asked), (2, 0));
+	// A replay is still a replay, and entries that expired make room again.
+	assert_eq!(open(&mut gateway, first.bytes(), NOW).err(), Some(Refusal::Replay));
+	assert!(open(&mut gateway, at(NOW + WINDOW + 400).bytes(), NOW + WINDOW + 400).is_ok());
+	assert_eq!(gateway.remembered(), 1);
+}
+
+#[test]
+fn a_body_is_opened_without_the_gateway_and_admitted_by_the_gateway_whose_keys_opened_it() {
+	let request = sealed(0, &fetch());
+	let (mut gateway, mut other) = (gateway(NOW - 100), gateway(NOW - 100));
+	let unsealed = gateway.keyring().unseal(request.bytes()).unwrap();
+	assert_eq!(gateway.remembered(), 0);
+	assert_eq!(other.admit(unsealed, NOW, || true).err(), Some(Refusal::Key));
+	let unsealed = gateway.keyring().unseal(request.bytes()).unwrap();
+	assert!(gateway.admit(unsealed, NOW, || true).is_ok() && gateway.remembered() == 1);
+	let again = gateway.keyring().unseal(request.bytes()).unwrap();
+	assert_eq!(gateway.admit(again, NOW, || true).err(), Some(Refusal::Replay));
+}

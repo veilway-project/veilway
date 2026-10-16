@@ -1718,3 +1718,13 @@ fn what_is_stored_of_a_move_is_the_answer_to_it_and_the_endpoint_of_the_last_one
 }
 
 fn whole_held() -> Held {carried(&whole(&[]), &[]).unwrap().accept(None, &[]).unwrap().held}
+
+#[test]
+fn a_refresh_entry_reads_from_its_text_as_a_document_reads_it() {
+	use veilway_proto::subscription::payload::Refresh;
+	let pin = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+	assert_eq!(Refresh::parse("\"https://mirror.example.net/s\"").map(|entry| (entry.authority(), entry.pinned())), Some(("mirror.example.net:443".to_owned(), false)));
+	assert!(Refresh::parse("\"http://198.51.100.7/s\"").is_some_and(|entry| entry.url().is_plain()));
+	assert!(Refresh::parse(&format!("{{\"url\": \"https://203.0.113.9/s\", \"pins\": [\"{pin}\"]}}")).is_some_and(|entry| entry.pinned() && entry.pins().len() == 1));
+	for bad in ["\"ftp://x.example.net/s\"", "\"https://203.0.113.9/s\"", "{\"url\": \"https://a.example.net/s\"}", &format!("{{\"url\": \"https://a.example.net/s\", \"pins\": [\"{pin}\", \"{pin}\"]}}"), &format!("{{\"url\": \"https://a.example.net/s\", \"pins\": [\"{pin}\"], \"more\": 1}}"), "7", "null"] {assert!(Refresh::parse(bad).is_none(), "{bad}")}
+}

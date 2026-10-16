@@ -118,6 +118,12 @@ impl Id {
 pub struct Refresh {url: Url, pins: Vec<[u8; 32]>}
 
 impl Refresh {
+	// An entry as the reader of a document takes it: a URL string, or an object with exactly `url` and `pins`.
+	fn read(item: &Json) -> Option<Self> {
+		if let Json::Str(text) = item {Url::either(text, LINK_URL_MAX, true, false).map(|url| Self {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Self {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}
+	}
+	/// An entry from its JSON text, read by the rules a document's reader holds it to. A provider's panel uses this to refuse a setting that the apps would refuse in a signed document.
+	pub fn parse(text: &str) -> Option<Self> {json::parse(text.as_bytes()).ok().and_then(|item| Self::read(&item))}
 	pub fn url(&self) -> &Url {&self.url}
 	/// The 1 or 2 pins a pinned entry is trusted by, none twice. Empty for an entry whose certificate is validated by its chain.
 	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
@@ -711,7 +717,7 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let provider = need("name", text(need("provider", members.object("provider"))?, "name", true, NAME, 4 * NAME))?;
 	let update_interval = members.uint("update_interval", UPDATE_INTERVAL)?.map_or(UPDATE_DEFAULT, |seconds| seconds as u32);
 	// A refresh URL is fetched, so it is held to the limit of a subscription URL, 256 characters, and not to the 512 of a URL that is only opened.
-	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::either(text, LINK_URL_MAX, true, false).map(|url| Refresh {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Refresh {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
+	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| Refresh::read(item).ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
 	// "A document cannot move an entry from one kind to the other": entries with one host and port are of one kind. The link's endpoint is held to the same rule by `client`.
 	if refresh_urls.iter().enumerate().any(|(place, entry)| refresh_urls[..place].iter().any(|earlier| earlier.url.authority() == entry.url.authority() && earlier.kind() != entry.kind())) {return Err(PayloadError::Member("refresh_urls"))}
 	// A base URL is held to the rules of a URL the token is sent to, although the token never goes there: no query, no fragment, no IP literal and no pins. One host has one role, so it is not an entry of `refresh_urls` too.

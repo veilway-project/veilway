@@ -12,7 +12,7 @@ use super::{mirror, weak, fetch::{Received, RequestError}};
 use crate::{keys, proof::{Encapped, Private, Public, Source, BASE, SMALL_ORDER}, NoRandom, Random};
 use hpke::{aead::{AeadTag, ChaCha20Poly1305}, inout::InOutBuf, kdf::HkdfSha256, kem::X25519HkdfSha256, Deserializable, OpModeR, OpModeS, Serializable};
 use ring::aead;
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 /// "Encapsulated request: exactly 1,073 bytes: a 1-byte key id, a 32-byte `enc`, and 1,040 bytes of ciphertext with its tag."
 pub const REQUEST: usize = 1_073;
@@ -203,6 +203,8 @@ pub enum Refusal {
 	Replay,
 	/// The caller's limit for the source of the request is used up.
 	Source,
+	/// The memory of acted requests is at `SEEN_MAX`. Nothing new is taken until some of it expires, so that a flood can fill the memory but never grow it.
+	Full,
 }
 
 /// A request that opened, was in the window and was not seen before, and the means to answer it. The token is not looked at yet: that is the panel's, with one HMAC and one lookup.
@@ -216,11 +218,24 @@ impl fmt::Debug for Opened {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Opened({})", if self.request.is_ok() {"request"} else {"malformed"})}
 }
 
+/// Most requests the memory of a gateway holds. A request is recorded once it has opened and is in the window, before its token is looked at, so anyone who knows a gateway key can add entries: past this many the gateway refuses new requests (`Refusal::Full`) and the memory stops growing. A request lives 600 s in it at most, so the cap is a sustained rate of about 333 requests a second.
+pub const SEEN_MAX: usize = 200_000;
+
+/// The keys of a gateway and its dummy key, which need no state: a body is opened with them by `unseal` on any thread and without a lock, and only `Gateway::admit` needs the gateway's memory.
+pub struct Keyring {keys: Vec<(u8, Private)>, dummy: Private}
+
+/// A body that was opened (or was not) with the keys but is not yet judged by the clock and the memory. It is admitted only by the gateway whose keys opened it.
+pub struct Unsealed {keyring: Arc<Keyring>, sized: bool, slot: bool, opened: bool, shaped: bool, enc: [u8; 32], request: Result<Received, RequestError>, secret: [u8; 32]}
+
+impl fmt::Debug for Unsealed {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Unsealed({})", if self.opened && self.shaped {"opened"} else {"closed"})}
+}
+
 /// What a gateway holds to open requests: its keys, a dummy key, the time it started, the highest value its clock has shown and the memory of the requests it has acted on. The memory is in memory only.
-pub struct Gateway {keys: Vec<(u8, Private)>, dummy: Private, started: u64, clock: u64, purged: u64, steps: u64, seen: HashMap<[u8; 32], u64>}
+pub struct Gateway {keyring: Arc<Keyring>, started: u64, clock: u64, purged: u64, steps: u64, seen: HashMap<[u8; 32], u64>, cap: usize}
 
 impl fmt::Debug for Gateway {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Gateway({} keys, {} remembered)", self.keys.len(), self.seen.len())}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Gateway({} keys, {} remembered)", self.keyring.keys.len(), self.seen.len())}
 }
 
 /// A gateway was given no key, or one id twice ("The panel never holds or lists two keys with one id"), or a private key HPKE cannot use.
@@ -233,21 +248,9 @@ impl fmt::Display for GatewayKeys {
 
 impl std::error::Error for GatewayKeys {}
 
-impl Gateway {
-	/// `keys` are the private halves of the active key, the next one and the retired keys still kept, each with its id. `started` is the clock at the start, in Unix seconds: "After a start, any `t` earlier than the start is refused". `random` gives the dummy key that a request with an unknown key id is opened with.
-	pub fn new(keys: &[(u8, [u8; 32])], started: u64, random: &mut Random) -> Result<Self, GatewayKeys> {
-		if keys.is_empty() || keys.iter().enumerate().any(|(place, (id, _))| keys[..place].iter().any(|(earlier, _)| earlier == id)) {return Err(GatewayKeys)}
-		let mut dummy = [0; 32];
-		random(&mut dummy).map_err(|NoRandom| GatewayKeys)?;
-		Ok(Self {keys: keys.iter().map(|(id, key)| Private::from_bytes(key).map(|key| (*id, key)).map_err(|_| GatewayKeys)).collect::<Result<_, _>>()?, dummy: Private::from_bytes(&dummy).map_err(|_| GatewayKeys)?, started, clock: started, purged: started, steps: 0, seen: HashMap::new()})
-	}
-	/// How many times the clock stepped back since the start: "a step back is logged at warning level". The window never moves back with it.
-	pub fn steps_back(&self) -> u64 {self.steps}
-	/// How many requests the memory holds.
-	pub fn remembered(&self) -> usize {self.seen.len()}
-	/// "What the gateway does", steps 1 to 6, for a body read up to 1,073 bytes and no further, at the wall clock `now`. The work does not depend on what the body holds: a body of another length is replaced by a fixed request that never opens, an unknown key id by a fixed dummy key, an `enc` of small order by the base point, and a request that did not open by zeros, and the results are combined at the end.
-	/// `charge` is the caller's limit for the source of the request. It is called only for a request that opened, is in the window and is new, which is the one that is recorded, and says whether the source still has room.
-	pub fn open(&mut self, body: &[u8], now: u64, charge: impl FnOnce() -> bool) -> Result<Opened, Refusal> {
+impl Keyring {
+	/// "What the gateway does", steps 1 to 3, for a body read up to 1,073 bytes and no further. The work does not depend on what the body holds: a body of another length is replaced by a fixed request that never opens, an unknown key id by a fixed dummy key, an `enc` of small order by the base point, and a request that did not open by zeros, and the results are combined at the end. It reads and writes no state, so a caller opens bodies at the same time and takes the gateway's lock only for `Gateway::admit`.
+	pub fn unseal(self: &Arc<Self>, body: &[u8]) -> Result<Unsealed, Refusal> {
 		let sized = body.len() == REQUEST;
 		let mut request = [0; REQUEST];
 		request[1..33].copy_from_slice(&BASE);
@@ -274,6 +277,40 @@ impl Gateway {
 		// "The JSON is read": a request that did not open is replaced by a fixed one, so that the work is the same, and its result is thrown away.
 		let read = Received::read(if opened & shaped {&plain[2..2 + length]} else {DUMMY});
 		let request = if opened & shaped {read} else {Err(RequestError::Unreadable)};
+		Ok(Unsealed {keyring: self.clone(), sized, slot: slot.is_some(), opened, shaped, enc, request, secret})
+	}
+}
+
+impl Gateway {
+	/// `keys` are the private halves of the active key, the next one and the retired keys still kept, each with its id. `started` is the clock at the start, in Unix seconds: "After a start, any `t` earlier than the start is refused". `random` gives the dummy key that a request with an unknown key id is opened with.
+	pub fn new(keys: &[(u8, [u8; 32])], started: u64, random: &mut Random) -> Result<Self, GatewayKeys> {
+		if keys.is_empty() || keys.iter().enumerate().any(|(place, (id, _))| keys[..place].iter().any(|(earlier, _)| earlier == id)) {return Err(GatewayKeys)}
+		let mut dummy = [0; 32];
+		random(&mut dummy).map_err(|NoRandom| GatewayKeys)?;
+		let keyring = Keyring {keys: keys.iter().map(|(id, key)| Private::from_bytes(key).map(|key| (*id, key)).map_err(|_| GatewayKeys)).collect::<Result<_, _>>()?, dummy: Private::from_bytes(&dummy).map_err(|_| GatewayKeys)?};
+		Ok(Self {keyring: Arc::new(keyring), started, clock: started, purged: started, steps: 0, seen: HashMap::new(), cap: SEEN_MAX})
+	}
+	/// A gateway whose memory holds at most `cap` requests instead of `SEEN_MAX`, for a test of what happens at the cap.
+	pub fn capped(mut self, cap: usize) -> Self {
+		self.cap = cap;
+		self
+	}
+	/// How many times the clock stepped back since the start: "a step back is logged at warning level". The window never moves back with it.
+	pub fn steps_back(&self) -> u64 {self.steps}
+	/// How many requests the memory holds.
+	pub fn remembered(&self) -> usize {self.seen.len()}
+	/// The keys, to open bodies with outside the lock that guards this gateway. A body they open is admitted by this gateway only.
+	pub fn keyring(&self) -> Arc<Keyring> {self.keyring.clone()}
+	/// `Keyring::unseal` and `admit` in one step, for a caller that holds the gateway for both.
+	pub fn open(&mut self, body: &[u8], now: u64, charge: impl FnOnce() -> bool) -> Result<Opened, Refusal> {
+		let unsealed = self.keyring.unseal(body)?;
+		self.admit(unsealed, now, charge)
+	}
+	/// "What the gateway does", steps 4 to 6, at the wall clock `now`: the window, the memory and the cap on it. A body that another set of keys opened is an unknown key.
+	/// `charge` is the caller's limit for the source of the request. It is called only for a request that opened, is in the window and is new, which is the one that is recorded, and says whether the source still has room.
+	pub fn admit(&mut self, unsealed: Unsealed, now: u64, charge: impl FnOnce() -> bool) -> Result<Opened, Refusal> {
+		let Unsealed {keyring, sized, slot, opened, shaped, enc, request, secret} = unsealed;
+		if !Arc::ptr_eq(&keyring, &self.keyring) {return Err(Refusal::Key)}
 		let t = match &request {Ok(request) => Some(request.t()), Err(RequestError::Malformed(_, t)) => Some(*t), Err(RequestError::Unreadable) => None};
 		// "The clock it judges by is the highest value its clock has shown since it started."
 		self.steps += u64::from(now < self.clock);
@@ -284,7 +321,7 @@ impl Gateway {
 		}
 		let in_window = t.is_some_and(|t| t.abs_diff(self.clock) <= WINDOW && t >= self.started);
 		let fresh = !self.seen.contains_key(&enc);
-		let refusal = if !sized {Some(Refusal::Size)} else if slot.is_none() {Some(Refusal::Key)} else if !(opened && shaped) {Some(Refusal::Open)} else if t.is_none() {Some(Refusal::Request)} else if !in_window {Some(Refusal::Window)} else if !fresh {Some(Refusal::Replay)} else {None};
+		let refusal = if !sized {Some(Refusal::Size)} else if !slot {Some(Refusal::Key)} else if !(opened && shaped) {Some(Refusal::Open)} else if t.is_none() {Some(Refusal::Request)} else if !in_window {Some(Refusal::Window)} else if !fresh {Some(Refusal::Replay)} else if self.seen.len() >= self.cap {Some(Refusal::Full)} else {None};
 		if let Some(refusal) = refusal {return Err(refusal)}
 		// "A request that opened and is inside the window is recorded now, before the token is looked at."
 		if !charge() {return Err(Refusal::Source)}

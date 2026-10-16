@@ -49,7 +49,7 @@ pub struct Config {
 	pub listen: SocketAddr,
 	/// The public path the mirror serves, which is the path of the link's endpoint on the mirror's own domain.
 	pub path: String,
-	/// The panel's subscription endpoint, an `https` URL with a path.
+	/// The panel's subscription endpoint, an `https` URL with a path. The path names the endpoint the mirror stands for: the panel tells its named endpoints apart by path and never by the Host header, so a mirror of a panel with several endpoints forwards to the path of the one its link names.
 	pub upstream: String,
 	/// SHA-256 of the SubjectPublicKeyInfo of the upstream's certificate, in base64, as a second condition after the chain.
 	#[serde(default)]
@@ -454,6 +454,15 @@ mod tests {
 		let mut answer = Vec::new();
 		let _ = timeout(Duration::from_secs(10), stream.read_to_end(&mut answer)).await;
 		String::from_utf8_lossy(&answer).to_string()
+	}
+
+	#[tokio::test]
+	async fn the_path_of_the_upstream_names_the_endpoint_and_is_what_the_panel_is_asked_for() {
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
+		let named = format!("{}/main", upstream.url());
+		let mirror = start(&upstream, |config| config["upstream"] = json!(named)).await;
+		assert!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await.starts_with("HTTP/1.1 200 OK\r\n"));
+		assert!(upstream.seen.lock().unwrap()[0].starts_with("POST /panel/sub/main HTTP/1.0\r\n"));
 	}
 
 	#[tokio::test]
