@@ -41,6 +41,8 @@ STATE_DIR="/var/lib/veilway"
 ADDON_DIR="/usr/local/lib/veilway/addons"
 XRAY_RELEASE="v26.3.27"
 PANEL_DIR="/var/lib/veilway-panel"
+UPDATE_DIR="/var/lib/veilway-panel-update"
+SELF="/usr/local/sbin/veilway.sh"
 VER_DIR="/var/lib/veilway-installer"
 BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
@@ -383,7 +385,7 @@ NoNewPrivileges=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
-ReadWritePaths=$PANEL_DIR
+ReadWritePaths=$PANEL_DIR -$UPDATE_DIR
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -466,6 +468,77 @@ EOF
 	if run_check; then svc enable veilway.service; svc restart veilway.service; else warn "config has errors: the node was not restarted"; fi
 }
 
+# The root update service runs this copy, so what it runs is not a file the panel's user can reach. A piped run has no file of its own, so the same script is fetched from where it came from.
+install_self() {
+	local src="$0"
+	if [ "$DRY" = 1 ]; then dry "install this script as $SELF"; return 0; fi
+	if [ -f "$src" ] && [ "$src" -ef "$SELF" ]; then return 0; fi
+	if ! { [ -f "$src" ] && head -n 2 "$src" | grep -q 'Veilway installer and manager'; }; then
+		src="$TMP/veilway.sh"
+		fetch "$RAW_BASE/$CORE_REPO/main/scripts/veilway.sh" "$src" "fetching the installer script"
+		head -n 2 "$src" | grep -q 'Veilway installer and manager' || die "the fetched installer script is not the expected file"
+	fi
+	install -d -m 0755 "$(dirname "$SELF")"
+	install -m 0755 -o root -g root "$src" "$SELF.new"
+	mv -f "$SELF.new" "$SELF"
+	step "installed $SELF"
+}
+
+# The panel runs unprivileged and never updates itself. It writes the word "panel" to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
+updater_units() {
+	act install -d -m 0770 -o root -g veilway-panel "$UPDATE_DIR"
+	write_unit "$UNIT_DIR/veilway-panel-update.path" <<EOF
+[Unit]
+Description=Veilway panel update request
+
+[Path]
+PathExists=$UPDATE_DIR/request
+Unit=veilway-panel-update.service
+
+[Install]
+WantedBy=multi-user.target
+EOF
+	write_unit "$UNIT_DIR/veilway-panel-update.service" <<EOF
+[Unit]
+Description=Veilway panel update, started by a request from the panel
+Documentation=https://github.com/$PANEL_REPO
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$SELF panel-update-request
+TimeoutStartSec=15min
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
+ProtectSystem=strict
+ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -/var/backups -$UPDATE_DIR
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=true
+SystemCallArchitectures=native
+UMask=0022
+EOF
+}
+
+# Run by the root service. The request carries no input: only the exact word "panel" counts, and it is deleted before anything runs. No version, path or argument is taken from it.
+do_panel_update_request() {
+	local req="$UPDATE_DIR/request" word=""
+	need_root
+	if [ -f "$req" ] && [ ! -L "$req" ]; then word="$(timeout 5 head -c 16 -- "$req" 2>/dev/null | tr -d '\n' || true)"; fi
+	rm -f -- "$req"
+	[ "$word" = panel ] || { warn "the update request was not the word panel: ignored"; return 0; }
+	do_update panel
+}
+
 install_panel() {
 	step "panel"
 	ensure_user veilway "$STATE_DIR"
@@ -475,8 +548,12 @@ install_panel() {
 	fetch_and_install panel
 	panel_config
 	panel_unit
+	updater_units
+	install_self
 	daemon_reload
 	svc enable veilway-panel.service
+	svc enable veilway-panel-update.path
+	svc start veilway-panel-update.path
 	svc restart veilway-panel.service
 	panel_summary
 }
@@ -586,6 +663,12 @@ do_update() {
 			cur="$(installed_version panel)"
 			info "panel is at ${cur:-unknown}"
 			fetch_and_install panel
+			panel_unit
+			updater_units
+			install_self
+			daemon_reload
+			svc enable veilway-panel-update.path
+			svc start veilway-panel-update.path
 			svc restart veilway-panel.service
 		else info "panel is not installed, skipped"; fi
 	fi
@@ -701,9 +784,9 @@ do_uninstall() {
 	confirm "Remove Veilway binaries, units and users? Backups in $BACKUP_DIR stay." || die "cancelled"
 	do_backup || true
 	svc stop veilway.service || true; svc stop veilway-panel.service || true
-	svc disable veilway.service || true; svc disable veilway-panel.service || true
+	svc disable veilway.service || true; svc disable veilway-panel.service || true; svc disable --now veilway-panel-update.path || true
 	svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true; svc disable veilway-xray.socket || true
-	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR and $PANEL_DIR? The backup above keeps a copy."; then
@@ -845,6 +928,7 @@ main() {
 		"") menu ;;
 		install) header; do_install "${args[0]:-}" ;;
 		update) header; do_update "${args[0]:-both}" ;;
+		panel-update-request) do_panel_update_request ;;
 		status) do_status ;;
 		logs) do_logs "${args[0]:-node}" ;;
 		restart) do_restart "${args[0]:-both}" ;;
