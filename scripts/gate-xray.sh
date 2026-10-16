@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Xray add-on gate (PLAN.md, Phase 6): the node installs the pinned Xray-core with `veilway.sh addon xray install`, the panel makes a VLESS inbound for an existing user, and a stock Xray client uses the link the panel gives (VLESS, Trojan and Shadowsocks 2022) as a local SOCKS proxy to fetch through the node. The user's bytes show in the panel, the node's gate, rules and exits apply, and a user who is disabled or over quota loses the connection. Xray runs as a user of its own with no capability, sees nothing of the node's, answers a stranger with the decoy web server, ends with the node, and its credentials are made new on request. Everything runs in Docker containers on this machine.
+# The Xray add-on gate (PLAN.md, Phase 6): the node installs the pinned Xray-core with `veilway.sh addon xray install`, the panel makes a VLESS inbound for an existing user, and a stock Xray client uses the link the panel gives (VLESS, Trojan and Shadowsocks 2022) as a local SOCKS proxy to fetch through the node, over TCP and over UDP (a DNS query and an echo through the hop's UDP ASSOCIATE). The user's bytes show in the panel, the node's gate, rules and exits apply, and a user who is disabled or over quota loses the connection. Xray runs as a user of its own with no capability, sees nothing of the node's, answers a stranger with the decoy web server, ends with the node, and its credentials are made new on request. Everything runs in Docker containers on this machine.
 #   bash scripts/gate-xray.sh                run the whole gate
 #   SKIP_BUILD=1 bash scripts/gate-xray.sh  reuse the binaries of an earlier run (Docker volume veilway-alpha-rel)
 #   KEEP=1 bash scripts/gate-xray.sh        leave the containers running afterwards (names vwxray-*)
@@ -223,13 +223,40 @@ docker exec $P-resp grep -q "^dns nothere.gate.test type=1 from=$SERVER\$" /resp
 ! proxied http://127.0.0.1:8000/ >/dev/null; check $? "the destination gate holds: the node's own loopback is refused"
 ! proxied http://10.55.0.1:8000/ >/dev/null; check $? "the routing rules hold: private networks are refused"
 ! proxied http://$RESP:8000/ 1081 >/dev/null; check $? "a client with another user's id gets nothing"
+echo "== 5b. UDP through the same three links"
+docker cp "$HERE/udp.py" $P-client:/udp.py; docker cp "$HERE/echo.py" $P-resp:/echo.py
+docker exec -d $P-resp sh -c 'python3 -u /echo.py >/echo.log 2>&1'
+udp() { cli python3 -I /udp.py "$@" 2>&1; }
+udp_no() { cli env TRIES=1 WAIT=3 python3 -I /udp.py "$@" 2>&1; }
+dns_asked() { docker exec $P-resp grep -c "^dns app.gate.test type=1 from=$SERVER\$" /resp.log; }
+wait_for 10 udp 1083 echo $RESP 7007
+for pair in "VLESS 1080" "Trojan 1083" "Shadowsocks 2022 1082"; do
+	set -- $pair; kind="${*:1:$(($# - 1))}"; port="${*: -1}"
+	D1="$(dns_asked)"; UU1="$(node_api /v1/users/alice | grep -o '"used_bytes":[0-9]*')"; EE1="$(node_api /v1/exits)"
+	OUTPUT="$(udp $port dns $RESP 53 app.gate.test)"
+	[ "$OUTPUT" = "ok $RESP" ]; check $? "$kind: a DNS query over UDP is answered with the name's address" "$OUTPUT"
+	[ "$(dns_asked)" -gt "$D1" ]; check $? "$kind: and the node's resolver asked its DNS set, from the node's address"
+	OUTPUT="$(udp $port echo $RESP 7007)"
+	[ "$OUTPUT" = "ok echo" ]; check $? "$kind: a UDP echo comes back through the node" "$OUTPUT"
+	UU2="$(node_api /v1/users/alice | grep -o '"used_bytes":[0-9]*')"; EE2="$(node_api /v1/exits)"
+	[ -n "$UU1" ] && [ "$UU1" != "$UU2" ] && [ "$EE1" != "$EE2" ]; check $? "$kind: the UDP bytes count for the user and for the exit" "$UU1 -> $UU2"
+	! udp_no $port echo 127.0.0.1 7007 >/dev/null; check $? "$kind: the destination gate holds for UDP: the node's loopback is refused"
+	! udp_no $port echo 10.55.0.1 7007 >/dev/null; check $? "$kind: the routing rules hold for UDP: private networks are refused"
+done
+docker exec $P-resp grep -q "^echo src=$SERVER\$" /echo.log; check $? "the echo server saw the node's address"
+! docker exec $P-resp grep -q "src=$CLIENT" /echo.log; check $? "and never the client's own address"
 echo "== 6. the panel's view"
 count_drive usage -e NODE_IP=$SERVER
 echo "== 7. a quota and a disabled user take the access away"
 count_drive limit -e NODE_IP=$SERVER -e QUOTA=1
 wait_for 40 blocked_x; check $? "a user over quota loses the xray connection"
+for pair in "VLESS 1080" "Trojan 1083" "Shadowsocks 2022 1082"; do
+	set -- $pair; kind="${*:1:$(($# - 1))}"; port="${*: -1}"
+	! udp_no $port echo $RESP 7007 >/dev/null; check $? "$kind: a user over quota gets no UDP either"
+done
 count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120
 wait_for 60 flows_x; check $? "and gets it back when the quota is raised"
+wait_for 30 udp 1080 echo $RESP 7007; check $? "and UDP with it"
 count_drive limit -e NODE_IP=$SERVER -e QUOTA=5368709120 -e ENABLED=0
 wait_for 60 blocked_x; check $? "a disabled user loses it too"
 echo "== 8. new credentials, and xray ends with the node"

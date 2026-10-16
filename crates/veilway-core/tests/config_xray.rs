@@ -48,6 +48,7 @@ fn each_rule_of_the_section_holds() {
 	refused("xray.inbounds[1].clients[0].secret", |doc| doc["xray"]["inbounds"][1]["clients"][0]["secret"] = json!("short"));
 	refused("xray.inbounds[1].clients[0].secret", |doc| doc["xray"]["inbounds"][1]["clients"][0]["secret"] = json!("just-under-22-chars"));
 	refused("xray.inbounds[2].clients[0].secret", |doc| doc["xray"]["inbounds"][2]["clients"][0]["secret"] = json!("a-password-not-a-key-at-all-here"));
+	refused("xray.inbounds[2].listen", |doc| doc["inbounds"][0]["transports"][0]["listen"] = json!("0.0.0.0:8446"));
 	refused("xray.inbounds[2].server_key", |doc| doc["xray"]["inbounds"][2]["server_key"] = json!("c2hvcnQ="));
 	refused("xray.inbounds[2].server_key", |doc| {doc["xray"]["inbounds"][2].as_object_mut().unwrap().remove("server_key");});
 	refused("xray.inbounds[0].server_key", |doc| doc["xray"]["inbounds"][0]["server_key"] = json!(key(0x31)));

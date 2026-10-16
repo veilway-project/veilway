@@ -22,6 +22,7 @@ pub mod route;
 pub mod stream;
 pub mod usage;
 pub mod xray;
+mod xray_udp;
 #[cfg(target_os = "linux")]
 pub mod xray_host;
 

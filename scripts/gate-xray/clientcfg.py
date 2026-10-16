@@ -17,6 +17,6 @@ else:
 	outbound = {"protocol": "vless", "settings": {"vnext": [{"address": link.hostname, "port": link.port, "users": [{"id": uuid, "encryption": query.get("encryption", "none")}]}]}, "streamSettings": tls}
 print(json.dumps({
 	"log": {"loglevel": "warning"},
-	"inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": False}}],
+	"inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks", "settings": {"udp": True, "ip": "127.0.0.1"}}],
 	"outbounds": [outbound],
 }))
