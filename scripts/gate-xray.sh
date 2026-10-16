@@ -243,6 +243,16 @@ for pair in "VLESS 1080" "Trojan 1083" "Shadowsocks 2022 1082"; do
 	! udp_no $port echo 127.0.0.1 7007 >/dev/null; check $? "$kind: the destination gate holds for UDP: the node's loopback is refused"
 	! udp_no $port echo 10.55.0.1 7007 >/dev/null; check $? "$kind: the routing rules hold for UDP: private networks are refused"
 done
+# A third user on the node's machine sends a datagram to the relay of a live association (held open by a client that waits for an answer that never comes). The relay carries datagrams only from the user that owns the connection that asked for the association.
+cli env TRIES=1 WAIT=12 python3 -I /udp.py 1080 echo $RESP 7999 >/dev/null 2>&1 &
+sleep 3
+NODE_UID="$(srv id -u veilway)"; RELAYS="$(srv awk -v uid=$NODE_UID 'NR > 1 && $2 ~ /^0100007F:/ && $8 == uid {print substr($2, 10)}' /proc/net/udp)"
+[ -n "$RELAYS" ]; check $? "a live association has a relay socket of the node on loopback" "$(echo $RELAYS)"
+E1="$(docker exec $P-resp grep -c '^echo src=' /echo.log)"
+for hex in $RELAYS; do relay=$((16#$hex)); srv su -s /bin/bash nobody -c "printf '\\x00\\x00\\x00\\x01\\x0b\\x60\\x07\\x14\\x1b\\x5fprobe' > /dev/udp/127.0.0.1/$relay" 2>/dev/null; done
+sleep 2
+[ "$(docker exec $P-resp grep -c '^echo src=' /echo.log)" = "$E1" ]; check $? "a datagram sent to the relay by another user of the machine is not carried"
+wait
 docker exec $P-resp grep -q "^echo src=$SERVER\$" /echo.log; check $? "the echo server saw the node's address"
 ! docker exec $P-resp grep -q "src=$CLIENT" /echo.log; check $? "and never the client's own address"
 echo "== 6. the panel's view"

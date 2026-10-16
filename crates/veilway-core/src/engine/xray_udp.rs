@@ -6,6 +6,7 @@ use super::plan::{Backend, Outbound, Plan};
 use super::resolver::{self, Step, MAX_IN_FLIGHT};
 use super::route::{By, Decision, Reason};
 use super::xray::{exit_for, reply, resolve, Open, Slot, Target};
+use super::xray_owner::Lookup;
 use super::{dns, gate, Shared};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -18,11 +19,18 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 /// Associations one user may hold, and all users together.
-pub(super) const MAX_ASSOCIATIONS_PER_USER: usize = 256;
+pub(super) const MAX_ASSOCIATIONS_PER_USER: usize = 32;
 pub(super) const MAX_ASSOCIATIONS: usize = 4096;
-/// Flows in one association, and in all of them. A flow also counts against the user's `flows`, with their TCP connections.
+/// Flows in one association, of one user in all of theirs, and in all associations. A flow also counts against the user's `flows`, with their TCP connections.
 const MAX_FLOWS_PER_ASSOCIATION: usize = 64;
+pub(super) const MAX_FLOWS_PER_USER: usize = 256;
 pub(super) const MAX_FLOWS: usize = 16384;
+/// How long a cap that the hop as a whole has reached is not logged again.
+const FULL_LOG: Duration = Duration::from_secs(60);
+/// How long a destination that was refused stays refused without being decided again.
+const REFUSED_FOR: Duration = Duration::from_secs(8);
+/// Lookups of who owns a source socket that an association makes in a second, so that a local process sending from many ports cannot make the hop read the kernel's tables without end.
+const OWNER_CHECKS: usize = 20;
 /// How long an association may be quiet in both directions.
 const ASSOCIATION_IDLE: Duration = Duration::from_secs(120);
 const WATCH: Duration = Duration::from_secs(1);
@@ -30,22 +38,39 @@ const WATCH: Duration = Duration::from_secs(1);
 const QUEUE: usize = 64;
 /// The most one UDP datagram carries on IPv4, and the most a DNS answer is let to take of it.
 const MAX_PAYLOAD: usize = 65507;
+/// The mtu that a flow's exit is given: its replies are cut to what fits in one datagram with the longest header an address takes (22 bytes, for IPv6), so that none is counted and then found too big to send.
+const REPLY_MTU: u16 = (MAX_PAYLOAD - 22 + UDP_OVERHEAD) as u16;
 const DNS_ANSWER: usize = 1472;
 /// The largest datagram taken off the socket: a payload, the longest header (a 255 byte name) and a little over, so one that fills the buffer is known to be cut.
 const BUFFER: usize = MAX_PAYLOAD + 262 + 1;
 
-/// What the hop holds for UDP: the associations of each user and in all, and the flows in all.
-pub(super) struct Limits {per_user: usize, associations: Arc<Open>, total: Arc<Semaphore>, flows: Arc<Semaphore>}
+/// What the hop holds for UDP: the associations of each user and in all, the flows of each user and in all, and how the owner of a socket is told.
+pub(super) struct Limits {per_user: usize, associations: Arc<Open>, total: Arc<Semaphore>, flows: Arc<Semaphore>, per_user_flows: usize, user_flows: Arc<Open>, owner: Lookup, noted: Mutex<HashMap<&'static str, Instant>>}
 
 impl Limits {
-	pub(super) fn new(per_user: usize, total: usize, flows: usize) -> Limits {Limits {per_user, associations: Arc::default(), total: Arc::new(Semaphore::new(total)), flows: Arc::new(Semaphore::new(flows))}}
+	pub(super) fn new(per_user: usize, total: usize, flows: usize, per_user_flows: usize, owner: Lookup) -> Limits {Limits {per_user, associations: Arc::default(), total: Arc::new(Semaphore::new(total)), flows: Arc::new(Semaphore::new(flows)), per_user_flows, user_flows: Arc::default(), owner, noted: Mutex::default()}}
 
 	/// A place for one more association of `user`, held until it is dropped. None when the user or the hop is full.
 	fn take(&self, user: &str) -> Option<(Slot, OwnedSemaphorePermit)> {
 		let slot = Slot::take(&self.associations, user, self.per_user)?;
-		Some((slot, self.total.clone().try_acquire_owned().ok()?))
+		let Ok(permit) = self.total.clone().try_acquire_owned() else {
+			self.full("associations");
+			return None;
+		};
+		Some((slot, permit))
+	}
+
+	/// Says at info that the hop as a whole has no more room for `what`, and not again for a while: a user at their own cap is that user's doing, and the hop at its own is the operator's to know.
+	fn full(&self, what: &'static str) {
+		let mut noted = self.noted.lock().unwrap_or_else(|e| e.into_inner());
+		if noted.get(what).is_some_and(|at| at.elapsed() < FULL_LOG) {return}
+		noted.insert(what, Instant::now());
+		tracing::info!("xray hop: no room for more udp {what} in the hop, those that ask are refused until some end");
 	}
 }
+
+/// What an association holds for a destination: the sender of its live flow, or the reason it was refused and until when that holds.
+enum Held {Live(mpsc::Sender<Vec<u8>>), Refused(Reason, Instant)}
 
 /// Why a datagram from Xray was dropped.
 #[derive(Debug, PartialEq, Eq)]
@@ -93,29 +118,33 @@ impl Datagrams for Pipe {
 	}
 }
 
-/// What a flow does from its first datagram to its end: finds where it goes, decides it like a tunnel flow, and carries it. Returns without a word when the flow is refused, after counting why.
-async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, from: mpsc::Receiver<Vec<u8>>, back: mpsc::Sender<Vec<u8>>, user: String) {
+/// What a flow does from its first datagram to its end: finds where it goes, decides it like a tunnel flow, and carries it. Returns the reason, after counting it, when the flow is refused, and nothing when it ran.
+async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, from: mpsc::Receiver<Vec<u8>>, back: mpsc::Sender<Vec<u8>>, user: String) -> Option<Reason> {
 	let (name, port, found) = match &target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
 		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name).await),
 	};
 	let shown = plan.show(name.map_or_else(|| found.first().map_or_else(String::new, ToString::to_string), str::to_string));
 	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools) && !(shared.is_local)(*ip)) else {
-		shared.count(if found.is_empty() {Reason::Unreachable} else {Reason::Gate});
-		return tracing::debug!("xray hop: user {user}: udp to {shown}: {}", if found.is_empty() {"no address"} else {"refused by the gate"});
+		let reason = if found.is_empty() {Reason::Unreachable} else {Reason::Gate};
+		shared.count(reason);
+		tracing::debug!("xray hop: user {user}: udp to {shown}: {}", if found.is_empty() {"no address"} else {"refused by the gate"});
+		return Some(reason);
 	};
 	let (exit, outbound) = match exit_for(&plan, at, ip, 17, port, name) {
 		Ok(found) => found,
 		Err((reason, why)) => {
 			shared.count(reason);
-			return tracing::debug!("xray hop: user {user}: udp to {shown}: {why}");
+			tracing::debug!("xray hop: user {user}: udp to {shown}: {why}");
+			return Some(reason);
 		}
 	};
-	let Backend::Netstack {udp_idle, ..} = &plan.exits[exit].backend else {return};
+	let Backend::Netstack {udp_idle, ..} = &plan.exits[exit].backend else {return None};
 	// The tunnel refuses a destination of the other family than the exit's address the same way.
 	if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != ip.is_ipv4()) {
 		shared.count(Reason::Unsupported);
-		return tracing::debug!("xray hop: user {user}: udp to {shown}: the exit's address is of the other family");
+		tracing::debug!("xray hop: user {user}: udp to {shown}: the exit's address is of the other family");
+		return Some(Reason::Unsupported);
 	}
 	let (dst, seen, idle) = (SocketAddr::new(ip, port), Arc::new(Mutex::new(Instant::now())), if port == 53 {(*udp_idle).min(DNS_IDLE)} else {*udp_idle});
 	let pipe = Pipe {shared: shared.clone(), plan: plan.clone(), user: at, from, back, header: flows::udp_header(dst), seen: seen.clone(), overhead: if dst.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6}};
@@ -127,17 +156,22 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 			tokio::time::sleep_until(until.into()).await;
 		}
 	};
-	let carried = flows::udp_exit(&shared, &plan, at, exit, (outbound, exit, true), By::Backend, pipe, dst, u16::MAX, None, &|_| true);
+	let carried = flows::udp_exit(&shared, &plan, at, exit, (outbound, exit, true), By::Backend, pipe, dst, REPLY_MTU, None, &|_| true);
 	tokio::select! {
 		left = carried => {
 			// The exit's proxy has no UDP and its policy refuses, or hands the flow to an exit the add-on cannot use.
-			match left.map(|(_, decision)| decision) {
-				Some(Decision::Refuse {reason, ..}) => shared.count(reason),
-				Some(_) => shared.count(Reason::Unsupported),
-				None => {}
-			}
+			let reason = match left.map(|(_, decision)| decision) {
+				Some(Decision::Refuse {reason, ..}) => Some(reason),
+				Some(_) => Some(Reason::Unsupported),
+				None => None,
+			};
+			if let Some(reason) = reason {shared.count(reason)}
+			reason
 		}
-		_ = quiet => tracing::debug!("xray hop: user {user}: udp to {shown}: idle for {idle:?}"),
+		_ = quiet => {
+			tracing::debug!("xray hop: user {user}: udp to {shown}: idle for {idle:?}");
+			None
+		}
 	}
 }
 
@@ -148,10 +182,17 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 		let _ = control.write_all(&reply(1)).await;
 		anyhow::bail!("user {user}: too many udp associations");
 	};
+	// Xray's request names no source port, so what ties a datagram to this association is its sender's user: the same as the one that holds the control connection.
+	let (here, from, lookup) = (control.local_addr()?, control.peer_addr()?, limits.owner.clone());
+	let Some(uid) = tokio::task::spawn_blocking(move || lookup(false, from, Some(here))).await.ok().flatten() else {
+		shared.count(Reason::SpoofedSource);
+		let _ = control.write_all(&reply(1)).await;
+		anyhow::bail!("user {user}: could not tell who owns the connection that asked for a udp association");
+	};
 	let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
 	let port = socket.local_addr()?.port().to_be_bytes();
 	control.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, port[0], port[1]]).await?;
-	let from_ip = control.peer_addr()?.ip();
+	let from_ip = from.ip();
 	// Xray's side of the association: its address, whose port is the one in the request or else the one of the first datagram.
 	let mut peer = match hint {
 		Target::Address(addr) if addr.port() != 0 => Some(SocketAddr::new(from_ip, addr.port())),
@@ -159,9 +200,11 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 	};
 	tracing::debug!("xray hop: user {user}: udp association on {}", socket.local_addr()?);
 	let (mut buffer, mut sink, mut seen, mut tick) = (vec![0u8; BUFFER], [0u8; 1], Instant::now(), tokio::time::interval(WATCH));
+	// The source whose owner was found to be `uid`, and the lookups made in the second that began at the instant.
+	let (mut verified, mut checks) = (None::<SocketAddr>, (Instant::now(), 0usize));
 	let (back, mut replies) = mpsc::channel::<Vec<u8>>(QUEUE);
 	// A flow's sender, and the number of the flow, so that the end of an old flow never takes the place of a new one for the same destination.
-	let (mut flows, mut tasks, mut answers, mut next): (HashMap<Target, (u64, mpsc::Sender<Vec<u8>>)>, JoinSet<(Target, u64)>, JoinSet<(Vec<u8>, Option<Vec<u8>>)>, u64) = (HashMap::new(), JoinSet::new(), JoinSet::new(), 0);
+	let (mut flows, mut tasks, mut answers, mut next): (HashMap<Target, (u64, Held)>, JoinSet<(Target, u64, Option<Reason>)>, JoinSet<(Vec<u8>, Option<Vec<u8>>)>, u64) = (HashMap::new(), JoinSet::new(), JoinSet::new(), 0);
 	loop {
 		tokio::select! {
 			received = socket.recv_from(&mut buffer) => {
@@ -169,6 +212,16 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 				if source.ip() != from_ip || peer.is_some_and(|expected| expected != source) {
 					shared.count(Reason::SpoofedSource);
 					continue;
+				}
+				if verified != Some(source) {
+					if checks.0.elapsed() >= Duration::from_secs(1) {checks = (Instant::now(), 0)}
+					checks.1 += 1;
+					let lookup = limits.owner.clone();
+					if checks.1 > OWNER_CHECKS || tokio::task::spawn_blocking(move || lookup(true, source, None)).await.ok().flatten() != Some(uid) {
+						shared.count(Reason::SpoofedSource);
+						continue;
+					}
+					verified = Some(source);
 				}
 				let (target, data) = match parse(&buffer[..n.min(BUFFER - 1)]) {
 					Ok(_) if n >= BUFFER => {
@@ -191,78 +244,95 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 				let plan = shared.plan();
 				let Some(at) = plan.users.iter().position(|candidate| candidate.name == user && candidate.link.is_none()) else {break};
 				if plan.users[at].denied.is_some() {break}
-				if let (Target::Address(addr), true) = (&target, plan.hijack) {
-					if addr.port() == 53 {
-						if answers.len() >= MAX_IN_FLIGHT {
-							shared.resolver.throttled.fetch_add(1, Ordering::Relaxed);
-							continue;
-						}
-						let (shared, message, header) = (shared.clone(), data.to_vec(), flows::udp_header(*addr));
-						let overhead = if addr.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6};
-						answers.spawn(async move {
-							let (counted, resolver) = (&plan.users[at], &shared.resolver);
-							shared.spend(counted, true, message.len() + overhead);
-							let Some(query) = dns::query(&message) else {
-								resolver.malformed.fetch_add(1, Ordering::Relaxed);
-								return (header, None);
-							};
-							let Ok(_permit) = counted.state.in_flight.try_acquire() else {
-								resolver.throttled.fetch_add(1, Ordering::Relaxed);
-								return (header, Some(query.reply(dns::SERVFAIL)));
-							};
-							let (list, fallback) = (counted.dns.unwrap_or(0).min(plan.dns.len() - 1), counted.exit.unwrap_or(plan.default_exit));
-							let mut answer = None;
-							for server in 0..plan.dns[list].servers.len() {
-								match resolver::ask(&shared, &plan, usize::MAX, at, 17, fallback, list, server, &message, query.question.name.as_deref()).await {
-									Step::Refused(reason) => {
-										shared.count(reason);
-										resolver.refused.fetch_add(1, Ordering::Relaxed);
-										answer = Some(query.reply(dns::REFUSED));
-										break;
-									}
-									Step::Skipped | Step::Silent => continue,
-									Step::Answered(found, _) => {
-										resolver.answered.fetch_add(1, Ordering::Relaxed);
-										answer = Some(found);
-										break;
-									}
-								}
-							}
-							if answer.is_none() {resolver.failed.fetch_add(1, Ordering::Relaxed);}
-							let mut answer = answer.unwrap_or_else(|| query.reply(dns::SERVFAIL));
-							dns::clip(&mut answer, DNS_ANSWER);
-							shared.spend(counted, false, answer.len() + overhead);
-							(header, Some(answer))
-						});
+				// With hijack on, whatever is sent to port 53 is a query for the node's resolver, as in the tunnel. A name has no address to answer from, so the answer names it.
+				let hijacked = match (&target, plan.hijack) {
+					(Target::Address(addr), true) if addr.port() == 53 => Some((flows::udp_header(*addr), if addr.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6})),
+					(Target::Name(name, 53), true) => Some(([&[0, 0, 0, 3, name.len() as u8][..], name.as_bytes(), &[0, 53]].concat(), UDP_OVERHEAD)),
+					_ => None,
+				};
+				if let Some((header, overhead)) = hijacked {
+					if answers.len() >= MAX_IN_FLIGHT {
+						shared.resolver.throttled.fetch_add(1, Ordering::Relaxed);
 						continue;
 					}
+					let (shared, message) = (shared.clone(), data.to_vec());
+					answers.spawn(async move {
+						let (counted, resolver) = (&plan.users[at], &shared.resolver);
+						shared.spend(counted, true, message.len() + overhead);
+						let Some(query) = dns::query(&message) else {
+							resolver.malformed.fetch_add(1, Ordering::Relaxed);
+							return (header, None);
+						};
+						let Ok(_permit) = counted.state.in_flight.try_acquire() else {
+							resolver.throttled.fetch_add(1, Ordering::Relaxed);
+							return (header, Some(query.reply(dns::SERVFAIL)));
+						};
+						let (list, fallback) = (counted.dns.unwrap_or(0).min(plan.dns.len() - 1), counted.exit.unwrap_or(plan.default_exit));
+						let mut answer = None;
+						for server in 0..plan.dns[list].servers.len() {
+							match resolver::ask(&shared, &plan, usize::MAX, at, 17, fallback, list, server, &message, query.question.name.as_deref()).await {
+								Step::Refused(reason) => {
+									shared.count(reason);
+									resolver.refused.fetch_add(1, Ordering::Relaxed);
+									answer = Some(query.reply(dns::REFUSED));
+									break;
+								}
+								Step::Skipped | Step::Silent => continue,
+								Step::Answered(found, _) => {
+									resolver.answered.fetch_add(1, Ordering::Relaxed);
+									answer = Some(found);
+									break;
+								}
+							}
+						}
+						if answer.is_none() {resolver.failed.fetch_add(1, Ordering::Relaxed);}
+						let mut answer = answer.unwrap_or_else(|| query.reply(dns::SERVFAIL));
+						dns::clip(&mut answer, DNS_ANSWER);
+						shared.spend(counted, false, answer.len() + overhead);
+						(header, Some(answer))
+					});
+					continue;
 				}
-				match flows.get(&target).map(|(_, sender)| sender.try_send(data.to_vec())) {
-					Some(Ok(())) => continue,
-					Some(Err(mpsc::error::TrySendError::Full(_))) => {
+				match flows.get(&target).map(|(_, held)| match held {
+					Held::Live(sender) => Ok(sender.try_send(data.to_vec())),
+					Held::Refused(reason, until) => Err((*reason, *until)),
+				}) {
+					Some(Ok(Ok(()))) => continue,
+					Some(Ok(Err(mpsc::error::TrySendError::Full(_)))) => {
 						shared.count(Reason::QueueFull);
 						continue;
 					}
-					Some(Err(mpsc::error::TrySendError::Closed(_))) => drop(flows.remove(&target)),
+					Some(Ok(Err(mpsc::error::TrySendError::Closed(_)))) => drop(flows.remove(&target)),
+					Some(Err((reason, until))) if until > Instant::now() => {
+						shared.count(reason);
+						continue;
+					}
+					Some(Err(_)) => drop(flows.remove(&target)),
 					None => {}
+				}
+				if flows.len() >= MAX_FLOWS_PER_ASSOCIATION {
+					let now = Instant::now();
+					flows.retain(|_, (_, held)| !matches!(held, Held::Refused(_, until) if *until <= now));
 				}
 				if flows.len() >= MAX_FLOWS_PER_ASSOCIATION {
 					shared.count(Reason::FlowTableFull);
 					continue;
 				}
-				let (Some(place), Ok(room)) = (Slot::take(&open, &user, plan.users[at].flows), limits.flows.clone().try_acquire_owned()) else {
+				let room = limits.flows.clone().try_acquire_owned();
+				if room.is_err() {limits.full("flows")}
+				let (Some(place), Some(mine), Ok(room)) = (Slot::take(&open, &user, plan.users[at].flows), Slot::take(&limits.user_flows, &user, limits.per_user_flows), room) else {
 					shared.count(Reason::FlowTableFull);
 					continue;
 				};
 				next += 1;
 				let (sender, receiver) = mpsc::channel(QUEUE);
 				let _ = sender.try_send(data.to_vec());
-				flows.insert(target.clone(), (next, sender));
+				flows.insert(target.clone(), (next, Held::Live(sender)));
 				let (shared, back, user, number, key) = (shared.clone(), back.clone(), user.clone(), next, target.clone());
 				tasks.spawn(async move {
-					flow(shared, plan, at, target, receiver, back, user).await;
-					drop((place, room));
-					(key, number)
+					let refused = flow(shared, plan, at, target, receiver, back, user).await;
+					drop((place, mine, room));
+					(key, number, refused)
 				});
 			}
 			Some(wrapped) = replies.recv() => {
@@ -279,8 +349,13 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 					let _ = socket.send_to(&wrapped, peer).await;
 				}
 			}
-			Some(Ok((key, number))) = tasks.join_next() => {
-				if flows.get(&key).is_some_and(|(current, _)| *current == number) {flows.remove(&key);}
+			Some(Ok((key, number, refused))) = tasks.join_next() => {
+				if flows.get(&key).is_some_and(|(current, _)| *current == number) {
+					match refused {
+						Some(reason) => flows.insert(key, (number, Held::Refused(reason, Instant::now() + REFUSED_FOR))),
+						None => flows.remove(&key),
+					};
+				}
 			}
 			// The association belongs to the connection that asked for it: Xray closing it ends the association, and so does anything it sends on it.
 			_ = control.read(&mut sink) => break,
@@ -289,7 +364,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 					tracing::debug!("xray hop: user {user}: udp association ended, it was quiet for {ASSOCIATION_IDLE:?}");
 					break;
 				}
-				if shared.plan().users.iter().find(|candidate| candidate.name == user).is_none_or(|now| now.denied.is_some()) {
+				if shared.plan().users.iter().find(|candidate| candidate.name == user && candidate.link.is_none()).is_none_or(|now| now.denied.is_some()) {
 					tracing::debug!("xray hop: user {user}: udp association ended, the user was cut off");
 					break;
 				}
@@ -306,7 +381,9 @@ mod tests {
 	use crate::engine::inbound::{Peers, Tunnel};
 	use crate::engine::plan::Plan;
 	use crate::engine::xray::accept;
-	use serde_json::json;
+	use crate::engine::xray_owner;
+	use serde_json::{json, Value};
+	use std::sync::atomic::{AtomicU16, AtomicUsize};
 	use tokio::net::TcpStream as Dial;
 	use veilway_wg::Wg;
 
@@ -360,9 +437,12 @@ mod tests {
 		assert_eq!(parse(&v4(&vec![0u8; MAX_PAYLOAD + 1])), Err(Bad::Malformed), "an oversize datagram was accepted");
 	}
 
+	/// The lookup of a machine where every socket belongs to the user 7.
+	fn same_user() -> Lookup {Arc::new(|_, _, _| Some(7))}
+
 	#[test]
 	fn associations_are_held_to_the_cap_of_the_user_and_of_the_hop() {
-		let limits = Limits::new(2, 3, 1);
+		let limits = Limits::new(2, 3, 1, 2, same_user());
 		let (a1, a2) = (limits.take("alice").unwrap(), limits.take("alice").unwrap());
 		assert!(limits.take("alice").is_none(), "a third association of one user was let in");
 		let b1 = limits.take("bob").unwrap();
@@ -374,12 +454,18 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn flows_are_held_to_the_total() {
-		let limits = Limits::new(2, 3, 1);
+	async fn flows_are_held_to_the_cap_of_the_user_and_of_the_hop() {
+		let limits = Limits::new(2, 3, 1, 2, same_user());
 		let first = limits.flows.clone().try_acquire_owned().unwrap();
 		assert!(limits.flows.clone().try_acquire_owned().is_err(), "the hop took more flows than its total");
 		drop(first);
 		assert!(limits.flows.clone().try_acquire_owned().is_ok());
+		let (a1, _a2) = (Slot::take(&limits.user_flows, "alice", limits.per_user_flows).unwrap(), Slot::take(&limits.user_flows, "alice", limits.per_user_flows).unwrap());
+		assert!(Slot::take(&limits.user_flows, "alice", limits.per_user_flows).is_none(), "a third flow of one user was let in");
+		assert!(Slot::take(&limits.user_flows, "bob", limits.per_user_flows).is_some());
+		drop(a1);
+		assert!(Slot::take(&limits.user_flows, "alice", limits.per_user_flows).is_some());
+		assert_eq!((MAX_ASSOCIATIONS_PER_USER, MAX_FLOWS_PER_USER), (32, 256));
 	}
 
 	/// An address of this machine that is not loopback, which the gate lets a destination be.
@@ -400,17 +486,34 @@ mod tests {
 		addr
 	}
 
-	#[tokio::test]
-	async fn an_association_carries_what_the_gate_and_the_rules_allow_and_nothing_else() {
-		let Some(own) = own_address() else {return};
+	/// A DNS server that counts the queries it gets and answers every A query with 127.0.0.1, and the rest with nothing.
+	async fn dns_server(at: IpAddr) -> (SocketAddr, Arc<AtomicUsize>) {
+		let socket = UdpSocket::bind((at, 0)).await.unwrap();
+		let (addr, asked) = (socket.local_addr().unwrap(), Arc::new(AtomicUsize::new(0)));
+		let counted = asked.clone();
+		tokio::spawn(async move {
+			let mut buffer = vec![0u8; 2048];
+			while let Ok((n, from)) = socket.recv_from(&mut buffer).await {
+				counted.fetch_add(1, Ordering::Relaxed);
+				let address = buffer[n - 4..n - 2] == [0, 1];
+				let mut answer = [&buffer[..2], &[0x81, 0x80, 0, 1, 0, u8::from(address), 0, 0, 0, 0][..], &buffer[12..n]].concat();
+				if address {answer.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);}
+				let _ = socket.send_to(&answer, from).await;
+			}
+		});
+		(addr, asked)
+	}
+
+	/// A node with the user alice, whose DNS server is `dns` and whose rules are `rules`, and its hop that finds the owners of sockets with `owner`.
+	async fn hop(dns: &str, rules: Value, owner: Lookup) -> (Arc<Shared>, SocketAddr, tokio::task::JoinHandle<()>) {
 		let key = veilway_wg::encode_key(&[0x11; 32]);
 		let config = Config::parse(json!({
 			"version": 1,
-			"dns": {"servers": ["1.1.1.1:53"]},
+			"dns": {"servers": [dns]},
 			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": key, "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
 			"outbounds": [{"tag": "plain", "type": "direct"}],
 			"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}],
-			"routing": {"default": "main", "rules": [{"tag": "no-lan", "ip": ["10.55.0.0/16"], "action": "reject"}]},
+			"routing": {"default": "main", "rules": rules},
 			"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}]
 		}).to_string().as_bytes()).unwrap();
 		let inbound = &config.inbounds[0];
@@ -419,11 +522,14 @@ mod tests {
 		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel]).unwrap();
 		let shared = Arc::new(Shared::new(plan, |_| false, time::OffsetDateTime::now_utc, None, None, veilway_proto::control::USAGE_PUSH, Arc::new(rustls::RootCertStore::empty())));
 		let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-		let hop = listener.local_addr().unwrap();
-		let server = tokio::spawn(accept(shared.clone(), listener, "hop-secret".to_string()));
-		let (echoed, other) = (echo(own).await, echo(own).await);
-		// Xray's side of the hop. The test that scans the sources for dials of a user's traffic looks for the type's own name, and this is the client of a loopback listener.
-		let mut control = Dial::connect(hop).await.unwrap();
+		let at = listener.local_addr().unwrap();
+		let server = tokio::spawn(accept(shared.clone(), listener, "hop-secret".to_string(), owner));
+		(shared, at, server)
+	}
+
+	/// Xray's side of the hop up to the answer to UDP ASSOCIATE, which is returned with the control connection. The test that scans the sources for dials of a user's traffic looks for the type's own name, and this is the client of a loopback listener.
+	async fn request(at: SocketAddr) -> (Dial, [u8; 10]) {
+		let mut control = Dial::connect(at).await.unwrap();
 		control.write_all(&[5, 1, 2]).await.unwrap();
 		let mut answer = [0u8; 2];
 		control.read_exact(&mut answer).await.unwrap();
@@ -434,35 +540,172 @@ mod tests {
 		control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.unwrap();
 		let mut bound = [0u8; 10];
 		control.read_exact(&mut bound).await.unwrap();
+		(control, bound)
+	}
+
+	/// An association that was granted: the control connection and the relay's address.
+	async fn associate_with(at: SocketAddr) -> (Dial, SocketAddr) {
+		let (control, bound) = request(at).await;
 		assert_eq!(bound[..8], [5, 0, 0, 1, 127, 0, 0, 1], "the association was not granted on loopback");
-		let relay = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), u16::from_be_bytes([bound[8], bound[9]]));
+		(control, SocketAddr::new(Ipv4Addr::LOCALHOST.into(), u16::from_be_bytes([bound[8], bound[9]])))
+	}
+
+	/// Sends `datagram` from `socket` to `relay` and returns what comes back within `wait` milliseconds.
+	async fn ask(socket: &UdpSocket, relay: SocketAddr, datagram: Vec<u8>, wait: u64) -> Option<Vec<u8>> {
+		let mut buffer = vec![0u8; 2048];
+		socket.send_to(&datagram, relay).await.unwrap();
+		tokio::time::timeout(Duration::from_millis(wait), socket.recv_from(&mut buffer)).await.ok().map(|received| buffer[..received.unwrap().0].to_vec())
+	}
+
+	/// A datagram to a destination given by name.
+	fn named(name: &str, port: u16, data: &[u8]) -> Vec<u8> {[&[0, 0, 0, 3, name.len() as u8][..], name.as_bytes(), &port.to_be_bytes(), data].concat()}
+
+	fn dropped(shared: &Shared, reason: Reason) -> u64 {shared.drops[reason as usize].load(Ordering::Relaxed)}
+
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn an_association_carries_what_the_gate_and_the_rules_allow_and_nothing_else() {
+		let Some(own) = own_address() else {return};
+		let (shared, at, server) = hop("1.1.1.1:53", json!([{"tag": "no-lan", "ip": ["10.55.0.0/16"], "action": "reject"}]), Arc::new(xray_owner::lookup)).await;
+		let (echoed, other) = (echo(own).await, echo(own).await);
+		let (control, relay) = associate_with(at).await;
 		let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-		let ask = async |socket: &UdpSocket, datagram: Vec<u8>, wait: u64| {
-			let mut buffer = vec![0u8; 2048];
-			socket.send_to(&datagram, relay).await.unwrap();
-			tokio::time::timeout(Duration::from_millis(wait), socket.recv_from(&mut buffer)).await.ok().map(|received| buffer[..received.unwrap().0].to_vec())
-		};
-		let dropped = |reason: Reason| shared.drops[reason as usize].load(Ordering::Relaxed);
-		let reply = ask(&client, [flows::udp_header(echoed), b"hello".to_vec()].concat(), 3000).await.expect("no answer from the echo through the hop");
+		let dropped = |reason: Reason| dropped(&shared, reason);
+		let reply = ask(&client, relay, [flows::udp_header(echoed), b"hello".to_vec()].concat(), 3000).await.expect("no answer from the echo through the hop");
 		assert_eq!((&reply[..10], &reply[10..]), (&flows::udp_header(echoed)[..10], &b"hello"[..]), "the reply does not name the echo as its source");
 		assert!(shared.plan().users[0].state.used.load(Ordering::Relaxed) > 0 && shared.plan().exits[0].traffic.totals().up_bytes > 0, "the datagram was not counted for the user and the exit");
 		let (gate, rule) = (dropped(Reason::Gate), dropped(Reason::Rule));
-		assert!(ask(&client, [flows::udp_header("127.0.0.1:9".parse().unwrap()), b"x".to_vec()].concat(), 300).await.is_none());
-		assert!(ask(&client, [flows::udp_header("10.55.1.1:9".parse().unwrap()), b"x".to_vec()].concat(), 300).await.is_none());
+		assert!(ask(&client, relay, [flows::udp_header("127.0.0.1:9".parse().unwrap()), b"x".to_vec()].concat(), 300).await.is_none());
+		assert!(ask(&client, relay, [flows::udp_header("10.55.1.1:9".parse().unwrap()), b"x".to_vec()].concat(), 300).await.is_none());
 		assert_eq!((dropped(Reason::Gate), dropped(Reason::Rule)), (gate + 1, rule + 1), "a refused destination was not counted for what refused it");
 		let (cut, bad) = (dropped(Reason::Fragment), dropped(Reason::Unparsable));
 		let mut fragment = flows::udp_header(echoed);
 		fragment[2] = 1;
-		assert!(ask(&client, [fragment, b"x".to_vec()].concat(), 200).await.is_none() && ask(&client, vec![0, 0, 0, 9, 1, 2, 3], 200).await.is_none());
+		assert!(ask(&client, relay, [fragment, b"x".to_vec()].concat(), 200).await.is_none() && ask(&client, relay, vec![0, 0, 0, 9, 1, 2, 3], 200).await.is_none());
 		assert_eq!((dropped(Reason::Fragment), dropped(Reason::Unparsable)), (cut + 1, bad + 1), "a fragment and a malformed datagram were not counted");
 		let stranger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 		let spoofed = dropped(Reason::SpoofedSource);
-		assert!(ask(&stranger, [flows::udp_header(other), b"x".to_vec()].concat(), 300).await.is_none(), "a datagram from another socket was carried");
+		assert!(ask(&stranger, relay, [flows::udp_header(other), b"x".to_vec()].concat(), 300).await.is_none(), "a datagram from another socket was carried");
 		assert_eq!(dropped(Reason::SpoofedSource), spoofed + 1);
-		assert!(ask(&client, [flows::udp_header(other), b"again".to_vec()].concat(), 3000).await.is_some(), "the association stopped answering its own socket");
+		assert!(ask(&client, relay, [flows::udp_header(other), b"again".to_vec()].concat(), 3000).await.is_some(), "the association stopped answering its own socket");
 		drop(control);
 		tokio::time::sleep(Duration::from_millis(200)).await;
-		assert!(ask(&client, [flows::udp_header(echoed), b"late".to_vec()].concat(), 300).await.is_none(), "the association outlived its control connection");
+		assert!(ask(&client, relay, [flows::udp_header(echoed), b"late".to_vec()].concat(), 300).await.is_none(), "the association outlived its control connection");
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn a_socket_of_another_user_cannot_take_an_association() {
+		let Some(own) = own_address() else {return};
+		let echoed = echo(own).await;
+		let intruder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let other = Arc::new(AtomicU16::new(intruder.local_addr().unwrap().port()));
+		let owner: Lookup = {
+			let other = other.clone();
+			Arc::new(move |udp, local, _| Some(if udp && local.port() == other.load(Ordering::Relaxed) {8} else {7}))
+		};
+		let (shared, at, server) = hop("1.1.1.1:53", json!([]), owner).await;
+		let (_control, relay) = associate_with(at).await;
+		let spoofed = dropped(&shared, Reason::SpoofedSource);
+		let datagram = [flows::udp_header(echoed), b"x".to_vec()].concat();
+		assert!(ask(&intruder, relay, datagram.clone(), 300).await.is_none(), "a datagram from a socket of another user was carried");
+		assert!(ask(&intruder, relay, datagram.clone(), 300).await.is_none());
+		assert_eq!(dropped(&shared, Reason::SpoofedSource), spoofed + 2, "the refusals were not counted");
+		let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		assert!(ask(&client, relay, datagram.clone(), 3000).await.is_some(), "the association was not left to its own user after a refused try");
+		assert!(ask(&intruder, relay, datagram, 300).await.is_none(), "a locked association took a second source");
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn a_socket_with_no_owner_found_cannot_take_an_association() {
+		let Some(own) = own_address() else {return};
+		let echoed = echo(own).await;
+		let (shared, at, server) = hop("1.1.1.1:53", json!([]), Arc::new(|udp, _, _| (!udp).then_some(7))).await;
+		let (_control, relay) = associate_with(at).await;
+		let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let spoofed = dropped(&shared, Reason::SpoofedSource);
+		assert!(ask(&client, relay, [flows::udp_header(echoed), b"x".to_vec()].concat(), 300).await.is_none(), "a datagram from a socket nobody could place was carried");
+		assert_eq!(dropped(&shared, Reason::SpoofedSource), spoofed + 1);
+		server.abort();
+		let (shared, at, server) = hop("1.1.1.1:53", json!([]), Arc::new(|_, _, _| None)).await;
+		let (mut control, bound) = request(at).await;
+		assert_ne!(bound[1], 0, "an association was granted to a connection nobody could place");
+		assert_eq!(dropped(&shared, Reason::SpoofedSource), 1);
+		let mut rest = [0u8; 1];
+		assert_eq!(control.read(&mut rest).await.unwrap_or(0), 0, "the connection was kept");
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn a_source_that_asks_too_often_for_its_owner_is_dropped_without_a_lookup() {
+		let Some(own) = own_address() else {return};
+		let echoed = echo(own).await;
+		let asked = Arc::new(AtomicUsize::new(0));
+		let owner: Lookup = {
+			let asked = asked.clone();
+			Arc::new(move |udp, _, _| {
+				if udp {asked.fetch_add(1, Ordering::Relaxed);}
+				Some(if udp {8} else {7})
+			})
+		};
+		let (shared, at, server) = hop("1.1.1.1:53", json!([]), owner).await;
+		let (_control, relay) = associate_with(at).await;
+		let intruder = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let datagram = [flows::udp_header(echoed), b"x".to_vec()].concat();
+		for _ in 0..OWNER_CHECKS + 10 {intruder.send_to(&datagram, relay).await.unwrap();}
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		assert!(asked.load(Ordering::Relaxed) <= OWNER_CHECKS + OWNER_CHECKS / 2, "the hop looked up {} owners in a second", asked.load(Ordering::Relaxed));
+		assert!(dropped(&shared, Reason::SpoofedSource) >= (OWNER_CHECKS + 10) as u64);
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn a_destination_that_was_refused_is_not_decided_again_for_a_while() {
+		let Some(own) = own_address() else {return};
+		let (dns, queries) = dns_server(own).await;
+		let (shared, at, server) = hop(&dns.to_string(), json!([]), same_user()).await;
+		let (_control, relay) = associate_with(at).await;
+		let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let datagram = named("blocked.example", 9, b"x");
+		let gate = dropped(&shared, Reason::Gate);
+		assert!(ask(&client, relay, datagram.clone(), 300).await.is_none());
+		tokio::time::sleep(Duration::from_millis(300)).await;
+		let first = queries.load(Ordering::Relaxed);
+		assert!(first > 0 && dropped(&shared, Reason::Gate) == gate + 1, "the name was not resolved and refused by the gate: {first} queries");
+		for _ in 0..5 {assert!(ask(&client, relay, datagram.clone(), 50).await.is_none());}
+		assert_eq!(queries.load(Ordering::Relaxed), first, "a refused name was resolved again");
+		assert_eq!(dropped(&shared, Reason::Gate), gate + 6, "the repeats were not counted for what refused them");
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn what_is_sent_to_port_53_by_name_is_a_query_for_the_nodes_resolver() {
+		let Some(own) = own_address() else {return};
+		let (dns, queries) = dns_server(own).await;
+		let (_shared, at, server) = hop(&dns.to_string(), json!([]), same_user()).await;
+		let (_control, relay) = associate_with(at).await;
+		let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let mut query = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 3];
+		query.extend_from_slice(b"abc\x04test\x00\x00\x01\x00\x01");
+		let reply = ask(&client, relay, named("resolver.example", 53, &query), 3000).await.expect("a query to a name on port 53 got no answer");
+		let header = 4 + 1 + "resolver.example".len() + 2;
+		assert_eq!((&reply[..5], &reply[5..header - 2], &reply[header - 2..header]), (&[0, 0, 0, 3, 16][..], &b"resolver.example"[..], &[0, 53][..]), "the answer does not come from the name asked");
+		assert_eq!((&reply[header..header + 2], &reply[reply.len() - 4..]), (&[0x12, 0x34][..], &[127, 0, 0, 1][..]), "the answer is not the resolver's");
+		assert_eq!(queries.load(Ordering::Relaxed), 1, "the name itself was resolved");
+		server.abort();
+	}
+
+	#[tokio::test]
+	async fn an_address_is_matched_by_the_domain_rules_after_the_user_resolved_a_name_to_it() {
+		let (shared, _, server) = hop("1.1.1.1:53", json!([{"tag": "no-ads", "domain": ["ads.example.com", "*.tracker.example"], "action": "reject"}]), same_user()).await;
+		let (plan, ip) = (shared.plan(), "93.184.216.34".parse().unwrap());
+		assert!(exit_for(&plan, 0, ip, 17, 9, None).is_ok(), "an address nobody resolved was refused by a domain rule");
+		assert!(plan.users[0].state.names().record("ads.example.com", &[(ip, 300)], &plan.pools, Instant::now()));
+		assert_eq!(exit_for(&plan, 0, ip, 17, 9, None).map(|_| ()).map_err(|(reason, _)| reason), Err(Reason::Rule), "an address the user resolved from a listed name was let by");
+		assert_eq!(exit_for(&plan, 0, ip, 6, 443, None).map(|_| ()).map_err(|(reason, _)| reason), Err(Reason::Rule), "TCP was not matched the same way");
+		assert!(exit_for(&plan, 0, "93.184.216.35".parse().unwrap(), 17, 9, None).is_ok(), "another address was refused");
+		assert_eq!(exit_for(&plan, 0, "93.184.216.35".parse().unwrap(), 17, 9, Some("x.tracker.example")).map(|_| ()).map_err(|(reason, _)| reason), Err(Reason::Rule), "a name asked for was not matched");
 		server.abort();
 	}
 }
