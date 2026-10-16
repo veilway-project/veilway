@@ -47,7 +47,6 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	useEffect(() => {
 		call("status").then(setRunning, () => setRunning(IDLE));
 		call("log_history").then(setLogs, () => setLogs([]));
-		if (settings.auto_update) call("check_update").then(info => setUpdate(info.available ? info : null), () => setUpdate(null));
 		const offs = [on("status", status => setRunning(old => ({...old, connected: true, status}))), on("question", setQuestion), on("ended", done => {
 			setRunning({...IDLE, kill_switch_kept: done.kept});
 			setQuestion(null);
@@ -56,6 +55,14 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		}), on("log", line => setLogs(list => [...list.slice(-199), line])), on("update-progress", setProgress)];
 		return () => offs.forEach(off => off.then(stop => stop()));
 	}, []);
+	// At start, every six hours, and when the tunnel comes up or goes down, since a check made while the kill switch held could not reach the release.
+	useEffect(() => {
+		if (!settings.auto_update) return;
+		const check = () => call("check_update").then(info => setUpdate(info.available ? info : null), () => {});
+		check();
+		const timer = setInterval(check, 6 * 3600 * 1000);
+		return () => clearInterval(timer);
+	}, [settings.auto_update, running.connected]);
 	// Byte counters come with the status; the speed is their change over the second between two polls.
 	useEffect(() => {
 		if (!running.connected) { last.current = null; return; }
