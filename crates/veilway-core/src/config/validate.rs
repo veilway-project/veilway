@@ -802,6 +802,11 @@ impl Config {
 			for (i, inbound) in xray.inbounds.iter().enumerate().take(MAX_XRAY_INBOUNDS) {
 				let at = format!("xray.inbounds[{i}]");
 				let sealed = inbound.protocol == XrayProtocol::Shadowsocks;
+				// Shadowsocks carries UDP on the port it listens on for TCP, so a datagram transport of the node must not hold it.
+				let here = inbound.listen.0;
+				if let Some((other, _)) = listeners.iter().find(|(_, other)| sealed && other.datagram() && here.port() == other.listen().port() && here.is_ipv4() == other.listen().is_ipv4() && (here.ip() == other.listen().ip() || here.ip().is_unspecified() || other.listen().ip().is_unspecified())) {
+					r.error(format!("{at}.listen"), format!("conflicts with {other}: a shadowsocks inbound uses its port for UDP as well, and a udp or udp-obfs transport never shares an address and port with it"));
+				}
 				match (&inbound.tls, sealed) {
 					(None, false) => r.error(format!("{at}.tls"), "expected the certificate files of the listener: vless and trojan are never served in the clear"),
 					(Some(_), true) => r.error(format!("{at}.tls"), "expected no tls: shadowsocks encrypts itself"),
