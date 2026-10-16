@@ -5,8 +5,8 @@
 <h1 align="center">Veilway</h1>
 
 <p align="center">
-A WireGuard-based VPN core in Rust that is growing into a full platform:<br>
-one engine, a web panel and first-party clients.
+A WireGuard-based VPN core in Rust with a web panel<br>
+and first-party desktop and Android clients.
 </p>
 
 <p align="center">
@@ -25,7 +25,7 @@ one engine, a web panel and first-party clients.
 
 Veilway is a layer 3 VPN. A client gets a virtual network interface, whole IP packets travel inside an unchanged WireGuard tunnel, and the server decides where each flow leaves. The cryptography is WireGuard's own, through [boringtun](https://github.com/cloudflare/boringtun). What Veilway adds sits around the tunnel: transports that carry it across networks where plain UDP is blocked, strict isolation between peers, and control over the exit.
 
-The goal is one ecosystem that covers what today takes a proxy core, a separate panel and separate client apps: a core that is also a library, a web panel, desktop and Android clients, and documentation in English and Persian. The core, the panel, the clients and the docs are built for the alpha, which is not released yet. The Status section below says what works and what is tested.
+Around the core there is a web panel, desktop and Android clients, and documentation in English and Persian. The core is also a Rust library. The Status section below says what works and what is tested.
 
 ## Who it is for
 
@@ -35,9 +35,9 @@ The goal is one ecosystem that covers what today takes a proxy core, a separate 
 
 ## Status
 
-> **Alpha, not released.** `v0.1.0-alpha` is not tagged yet, and Veilway has had no outside security review. The tunnel encryption is WireGuard's, but nothing here has been measured against deep packet inspection or active probing. Every transport is rated Detectable: plain WireGuard over UDP is easy to fingerprint, and the other transports are harder to spot, not invisible. Do not rely on it where a failure would put you at risk.
+> **Alpha.** `v0.1.0-alpha` is the first release, and Veilway has had no outside security review. The tunnel encryption is WireGuard's, but nothing here has been measured against deep packet inspection or active probing. Every transport is rated Detectable: plain WireGuard over UDP is easy to fingerprint, and the other transports are harder to spot, not invisible. Do not rely on it where a failure would put you at risk.
 
-Subscription requests are moving to end-to-end encryption (Oblivious HTTP over HPKE), being finished for the alpha.
+Tested so far: the alpha gate (a fresh systemd server installed with the script, the panel, a client connecting) passes 55 checks, the Xray gate passes 119, and the Linux client passes a 70-point check in Docker against a real node. The Android app has been used on a real phone. The Windows client had a smoke test on a real Windows runner and has never connected to a node. The macOS client has never been run on a real Mac. The [alpha page](https://veilway-project.github.io/veilway-docs/alpha/) has the full table.
 
 ### Works today
 
@@ -52,20 +52,20 @@ Subscription requests are moving to end-to-end encryption (Oblivious HTTP over H
 | `veilway doctor` | Checks what a config needs of the host and the network (ports, certificates, DNS, every outbound, `l3`, the state and replay files, the control socket) and changes nothing. |
 | Native protocol, node side | A `veilway` inbound serves the control channel inside the tunnel (exit choice per device, usage, notices, MTU) and four native transports: `udp-obfs` (obfuscated UDP), `tls` (a direct TLS listener that hands every stranger to the operator's own web server), and `ws` and `fronted`, which arrive through the operator's own web server or a CDN. The apps reach a node over all five transports, `udp` included. The [alpha page](https://veilway-project.github.io/veilway-docs/alpha/) says what each has been tested on. |
 | Transport client library | `crates/veilway-transport` is the client side of the four native transports. Its tests run against the real node. The client engine uses it, and so do the apps. |
+| Panel | The web panel ([veilway-panel](https://github.com/veilway-project/veilway-panel)) runs a node through the control API: guided setup (an entry node, a reverse tunnel, relays), users, groups, inbounds, outbounds, exits, per-user and default exits, routing, notices, DNS and logs, admins, backup and restore, and an update button. It listens on loopback only, so a web server in front of it provides TLS. See the [panel manual](https://veilway-project.github.io/veilway-docs/manuals/panel/). |
+| Subscriptions | A subscription link carries the provider's gateway key. Requests and answers are encrypted end to end (Oblivious HTTP over HPKE), so a relay mirror sees nothing of the content. Endpoints are named, reached at `sub_path/<endpoint name>`, and assigned per user and per group; moves between endpoints are signed. Static mirrors and relay mirrors (`veilway mirror`) keep a subscription reachable when the main address is blocked, and the app asks before it uses backup update addresses. Plain `http://` endpoints work, with a warning. The format is in the [subscription page](https://veilway-project.github.io/veilway-docs/protocol/subscription-format/). |
+| Xray add-on | Optional. Lets stock VLESS and Trojan (with TLS) and Shadowsocks apps connect through a node, over TCP and UDP, with the same users, quotas, rules and exits. It runs the official `xray` binary, which `veilway.sh addon xray install` downloads and checks against a pinned SHA-256. VMess, Reality, and `l3` or `chain` exits for Xray users are not built. Veilway is a separate project, not a replacement for Xray. See the [Xray page](https://veilway-project.github.io/veilway-docs/manuals/xray/). |
 | Node links | Joins two nodes, so users connect to one and their traffic leaves from the other, in either direction. The panel guides both operators through it, or they pair with `veilway link offer` and `veilway link answer`, which exchange two codes and compare a fingerprint. |
 | Bridge (`veilway bridge`) | `client` gives a stock WireGuard app a local UDP endpoint and carries it over `wss://`. `relay` accepts WebSocket and forwards to any WireGuard UDP port. |
-| Desktop and Android apps | Subscriptions and single profiles, an exit picker, live stats, a kill switch and DNS pinned to the tunnel. The desktop app runs on Linux, macOS and Windows, and the Android app is an arm64 APK. See the [client manual](https://veilway-project.github.io/veilway-docs/manuals/client/) for each platform. |
+| Desktop and Android apps | Subscriptions (by link, by file, including a sealed `.vwsealed` file protected by a password, and by QR picture on desktop) and single profiles, "Share subscription" (the link only), an exit picker, live stats, connection details, a kill switch, DNS pinned to the tunnel and an in-app updater. The desktop app runs on Linux, macOS and Windows, and the Android app is an arm64 APK. See the [client manual](https://veilway-project.github.io/veilway-docs/manuals/client/) for each platform. |
 
 Known limits: every transport is rated Detectable. macOS has never connected to a node on a real Mac, and Windows has passed a smoke test on a real runner but has not connected to a real node. `fronted` speaks HTTP/1.1 only and has not run behind a real CDN. ICMP and other non-TCP/UDP protocols do not pass a SOCKS5 upstream (the node answers ping itself, and only an `l3` exit on Linux carries every IP protocol). The control API is local to the node, on a unix socket. The [alpha page](https://veilway-project.github.io/veilway-docs/alpha/) lists what each part has been tested on and what has not.
 
-## Next
+## Not built yet
 
-The full plan, with the gate for each phase, is in [PLAN.md](PLAN.md).
-
-- Tag `v0.1.0-alpha` after the alpha gate passes on a fresh server and one closing security review.
-- Test the desktop app on a real Mac and a real Windows PC, and `fronted` behind a real CDN.
-- Xray add-on: VMess, and `l3` and `chain` exits, which are not built yet.
-- After the alpha: HTTP/2 on the stream transports, more shapes of `fronted`, opt-in bonded connections and a Reality-style mode.
+- Desktop on a real Mac and a real Windows PC, and `fronted` behind a real CDN, are untested.
+- Xray add-on: VMess, Reality, and `l3` or `chain` exits for Xray users.
+- After the alpha: HTTP/2 on the stream transports, more shapes of `fronted`, and opt-in bonded connections.
 
 ## Install
 
@@ -75,11 +75,11 @@ On a Linux server with systemd (x86_64 or aarch64), the recommended way is the i
 curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
 ```
 
-With no arguments it shows a menu. The same actions work as commands: `install node|panel|both|mirror`, `update`, `status`, `logs`, `restart`, `check`, `doctor`, `backup`, `restore <file>`, `uninstall`, `version`, `addon xray` and `panel-prefix`. `--dry-run` prints what would happen and changes nothing. Read the script before you run it as root if you like: it is `scripts/veilway.sh`. The panel listens on loopback only, so put your own web server in front of it. There is no published release yet.
+With no arguments it shows a menu. The same actions work as commands: `install node|panel|both|mirror`, `update`, `status`, `logs`, `restart`, `check`, `doctor`, `backup [file]`, `restore <file>`, `uninstall`, `version`, `addon xray [install|remove|status]` and `panel-prefix [/new-path]`. `install mirror` sets up a relay mirror of the panel's subscription endpoint. `panel-prefix` moves the panel's admin pages to a new path (random when you give none). The flags are `--dry-run` (prints what would happen and changes nothing), `--yes` and `--version <tag>`. Read the script before you run it as root if you like: it is `scripts/veilway.sh`. The panel listens on loopback only, so put your own web server in front of it for TLS. The [getting started page](https://veilway-project.github.io/veilway-docs/getting-started/) walks through it.
 
 ## Quick start
 
-There is no published release yet, so build from source. You need a stable Rust toolchain. An upstream SOCKS5 proxy is optional: an exit can also leave directly from the server.
+To build from source you need a stable Rust toolchain. An upstream SOCKS5 proxy is optional: an exit can also leave directly from the server.
 
 ### 1. Build (~5 min)
 
@@ -202,9 +202,10 @@ An `l3` exit needs the TUN device and NET_ADMIN, and its process must run as roo
 | `notices` | Plain text the operator sends to every device on the control channel. Optional. |
 | `replay` | Where the obfuscated transports keep their replay memory. Optional. |
 | `links` | Node links to other nodes. Optional. |
-| `xray` | The optional Xray add-on: the official Xray-core, run as a managed child process. Optional. |
+| `public_addresses` | The host names or IP addresses that profiles of this node carry, with no port. Optional. |
+| `xray` | The optional Xray add-on: Xray inbounds that carry the users listed in their `clients`. Off when absent. Optional. |
 
-Every key, default and validation rule is in the [config reference](https://github.com/veilway-project/veilway-docs/blob/main/src/content/docs/reference/config.md). A full example is in [config.example.json](config.example.json).
+Every key, default and validation rule is in the [config reference](https://veilway-project.github.io/veilway-docs/reference/config/). A full example is in [config.example.json](config.example.json).
 
 ## WebSocket relay
 
@@ -228,7 +229,7 @@ veilway bridge relay --listen 127.0.0.1:8443 --path /wg --target 127.0.0.1:51820
 
 ## Desktop app
 
-`apps/desktop` is a Tauri 2 app for Linux, macOS and Windows. It imports a subscription or a single profile, and runs the tunnel in a privileged helper that needs administrator rights. The app uses the client engine in `crates/veilway-engine`. `apps/android` is the Android app.
+`apps/desktop` is a Tauri 2 app for Linux, macOS and Windows. It imports a subscription or a single profile, updates itself from the release, and runs the tunnel in a privileged helper that needs administrator rights. The app uses the client engine in `crates/veilway-engine`. `apps/android` is the Android app.
 
 <!-- SCREENSHOT SLOT 2: desktop client, profile list and disconnected state, dark mode, two images side by side. Produce them from the real UI. -->
 
@@ -272,7 +273,7 @@ flowchart LR
 
 It decrypts each packet, checks that the source address belongs to that device, and routes it by the rules. For a `netstack` exit the packet goes to a userspace TCP/IP stack, which opens one connection or association per flow through the exit's outbound, with no TUN device. For an `l3` exit it is written to a TUN device and the kernel forwards it. Flows are capped at 65536 in total, 1024 per user and 512 per device.
 
-The whole shape. The panel and the apps are built too, and the Xray sidecar is an optional add-on:
+The whole shape. The Xray sidecar is an optional add-on:
 
 ```mermaid
 flowchart TB
@@ -297,10 +298,10 @@ flowchart TB
 
 ```
 crates/
-  veilway             the only binary: run, check, schema, genkey, gensecret, doctor, usage, replay, link, bridge, mirror, and the client's connect, disconnect and status
+  veilway             the only binary: run, check, schema, genkey, gensecret, doctor, usage, replay, link, bridge, mirror, xray-host, and the client's connect, disconnect and status
   veilway-core        server engine: config v1 and reload, inbounds, routing rules, flow table, exits, quotas, the control channel, the native transports, node links
   veilway-wg          multi-peer WireGuard wrapper (handshake routing, cookies, timers, roaming) and the WebSocket relay
-  veilway-client      single-peer client engine and the Windows Wintun, route and DNS layer
+  veilway-client      older single-peer client library; the apps use veilway-engine instead
   veilway-engine      client engine without an OS layer
   veilway-linux       client layer for Linux
   veilway-macos       client layer for macOS
@@ -308,13 +309,15 @@ crates/
   veilway-proto       wire formats of the native protocol and the subscription format, no IO
   veilway-transport   client side of the native transports, as a library
   veilway-api         control API server and OpenAPI schema
-  veilway-xray        reserved for the Xray add-on (empty skeleton; the sidecar is in veilway-core for now)
+  veilway-xray        reserved for the Xray add-on (empty skeleton; the add-on's code is in veilway-core)
   veilway-ffi         uniffi bindings (empty skeleton)
 packages/
   sdk                 TypeScript client for the control API, generated from its schema
 apps/
   desktop             Tauri 2 desktop client, outside the cargo workspace
   android             Android client
+deploy/compose        Docker Compose for the node and the panel
+scripts/              the install script (veilway.sh) and the test gates
 fuzz/                 cargo-fuzz targets, outside the workspace
 vendor/
   ipstack             patched userspace TCP/IP stack
@@ -333,8 +336,7 @@ The panel is in [veilway-panel](https://github.com/veilway-project/veilway-panel
 ## Documentation
 
 - [The documentation site](https://veilway-project.github.io/veilway-docs/) ([source](https://github.com/veilway-project/veilway-docs)): protocol spec, config reference, control API reference and manuals, in English and Persian, with some Persian pages still stubs.
-- [PLAN.md](PLAN.md): design decisions and the phase plan.
-- [THREAT_MODEL.md](THREAT_MODEL.md): who Veilway defends against and what it does not cover.
+- [Threat model](https://veilway-project.github.io/veilway-docs/security/threat-model/): who Veilway defends against and what it does not cover.
 
 ## Contributing
 
