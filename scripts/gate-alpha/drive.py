@@ -157,7 +157,7 @@ def publish():
 	check(len(published["profiles"]) == 1, "the profile is published to the subscription")
 	_, created = panel.call("POST", "/users", {"name": "alice", "quota_bytes": 5 * 1024 ** 3, "quota_period": "monthly"})
 	link = (created.get("link") or {}).get("veilway", "")
-	check(link.startswith("veilway://sub/" + HOST + "/sub#v1."), "a user was made with a subscription link", created.get("link_error") or "")
+	check(link.startswith("veilway://sub/" + HOST + "/sub/main#v1."), "a user was made with a subscription link", created.get("link_error") or "")
 	check("<svg" in created["link"]["qr_svg"], "the link comes with a QR code")
 	_, shown = panel.call("POST", "/users/%d/subscription/show" % created["user"]["id"], {})
 	check(shown["veilway"] == link, "showing the link again gives the same link")
