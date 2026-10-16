@@ -117,7 +117,7 @@ def config():
 	panel.csrf = kept
 	panel.reauth(state)
 	_, settings = panel.call("GET", "/settings")
-	settings.update(provider_name="Gate Provider", endpoint_url="https://%s/sub" % HOST, endpoint_pins=[E["ENDPOINT_PIN"]], node_host=E["NODE_IP"], pool_v4="10.66.0.0/16", default_device_limit=3)
+	settings.update(provider_name="Gate Provider", endpoints=[{"name": "main", "url": "https://%s/sub/main" % HOST, "pins": [E["ENDPOINT_PIN"]]}], default_endpoint="main", node_host=E["NODE_IP"], pool_v4="10.66.0.0/16", default_device_limit=3)
 	panel.call("PUT", "/settings", settings)
 	_, node = panel.call("GET", "/node")
 	check(node.get("reachable", node.get("connected", True)) is not False, "the panel reaches the node's control socket", json.dumps(node)[:200])
