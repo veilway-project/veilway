@@ -347,6 +347,20 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 - An AppImage of the Linux desktop app that connects: on first run it checks its own signature and installs its helper into a root-owned folder after one password prompt, and refreshes it after each self-update. A new privilege path, so it gets its own design and review before it is built.
 - A store build of the Android app with the updater and the install permission removed, for F-Droid first.
 
+## v0.2.0: hiding and reach
+
+1. Reality-style mode (below): spec, review, build.
+2. HTTP/2 on `tls`, `ws` and `fronted` (below).
+3. The shapes of `fronted` (below), with Server-Sent Events downstream.
+4. A signed offline bundle: an app update and subscription documents in one file, for any one-way channel (a USB stick, Bluetooth, satellite datacasting), trusted by its signature only.
+5. Xray in the apps: VLESS, Trojan and Shadowsocks clients in the Veilway apps, with VMess and UDP.
+6. If there is room: `ws-plain` with the media appearance, bonded connections, the gateway's timing measurement the subscription format requires before it leaves draft, and a design for certificates from the panel (ACME) without a probe surface.
+7. Design only, no build: the `dns` transport (the table above), WebRTC carriers through allowed calling services, and domestic CDN pull zones as a documented setup.
+
+## v0.3.0: the first beta
+
+The clients tested on every platform they claim: the macOS app on a real Mac, Windows connected to a real node, the Linux desktop on a real desktop with systemd-resolved. Then the store builds (F-Droid first, the updater off), bonded connections and `ws-plain` if v0.2.0 did not take them, and the `dns` transport built if its design passed review.
+
 ## Shapes of `fronted` (after the alpha)
 
 The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbound by the operator, written into the signed profile, and followed by the client. Spec change in `veilway-docs` first, then an adversarial review, then code.
