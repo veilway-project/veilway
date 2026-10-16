@@ -4,10 +4,14 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Client side of the Veilway transports: udp-obfs, tls, ws and fronted, carrying WireGuard datagrams to a node."
+readme="README.md"
+keywords=["vpn", "wireguard", "tls", "obfuscation", "censorship"]
+categories=["network-programming", "cryptography"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [dependencies]
-veilway-proto={path="../veilway-proto"}
+veilway-proto={path="../veilway-proto", version="0.1.0"}
 tokio.workspace=true
 # The handshake of `tls`, `ws` and `fronted` is BoringSSL's, configured as Chrome's (`fingerprint.rs`). rustls stays for the certificate checks (`tls.rs`), which are the same as the node's and the subscription page's.
 boring={version="5.3", default-features=false}

@@ -4,11 +4,15 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Control API of a Veilway node: HTTP and JSON on a unix socket, with an OpenAPI document."
+readme="README.md"
+keywords=["vpn", "api", "openapi", "axum", "control"]
+categories=["network-programming", "web-programming"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 # The control API is served on a unix socket and nowhere else, so on other systems this crate is empty.
 [target.'cfg(unix)'.dependencies]
-veilway-core={path="../veilway-core"}
+veilway-core={path="../veilway-core", version="0.1.0"}
 tokio.workspace=true
 serde.workspace=true
 serde_json.workspace=true
@@ -23,8 +27,8 @@ hyper-util.workspace=true
 socket2.workspace=true
 
 [target.'cfg(unix)'.dev-dependencies]
-veilway-wg={path="../veilway-wg"}
-veilway-proto={path="../veilway-proto"}
+veilway-wg={path="../veilway-wg", version="0.1.0"}
+veilway-proto={path="../veilway-proto", version="0.1.0"}
 boringtun.workspace=true
 etherparse.workspace=true
 tracing-subscriber.workspace=true
