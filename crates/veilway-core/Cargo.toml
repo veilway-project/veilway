@@ -4,15 +4,19 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Veilway node engine: config v1, routing, quotas, userspace TCP/IP exits and the native transports."
+readme="README.md"
+keywords=["vpn", "wireguard", "proxy", "server", "censorship"]
+categories=["network-programming"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [features]
 # The stream listener over pipes in memory, for the fuzz target and the crate's own tests. No build of a node turns it on.
 bench=["veilway-proto/bench"]
 
 [dependencies]
-veilway-wg={path="../veilway-wg"}
-veilway-proto={path="../veilway-proto"}
+veilway-wg={path="../veilway-wg", version="0.1.0"}
+veilway-proto={path="../veilway-proto", version="0.1.0"}
 tokio.workspace=true
 anyhow.workspace=true
 serde.workspace=true
@@ -30,7 +34,7 @@ socket2.workspace=true
 tokio-rustls.workspace=true
 rustls.workspace=true
 # The client side of the native transports, which a node link this node dials is opened with, and the root certificates its TLS is validated against when no other roots are given.
-veilway-transport={path="../veilway-transport"}
+veilway-transport={path="../veilway-transport", version="0.1.0"}
 webpki-roots.workspace=true
 # The self-signed certificate of a `tls` transport with `self_signed`: made with rcgen, whose crates the tree already has, and read back with x509-parser, which the binary already links, for the name it keeps and the dates it is renewed by.
 rcgen.workspace=true

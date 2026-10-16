@@ -4,7 +4,10 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Multi-peer WireGuard layer over boringtun for Veilway: handshake routing, cookies, timers, roaming and a WebSocket relay."
+readme="README.md"
+keywords=["wireguard", "vpn", "websocket", "boringtun", "tunnel"]
+categories=["network-programming"]
 
 [dependencies]
 boringtun.workspace=true

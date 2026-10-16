@@ -1,7 +1,11 @@
 [package]
+publish=false
 name="veilway-xray"
 version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Placeholder for the optional Xray sidecar manager of Veilway."
+readme="README.md"
+keywords=["vpn", "xray", "veilway"]
+categories=["network-programming"]
