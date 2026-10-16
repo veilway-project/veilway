@@ -5,6 +5,7 @@ use veilway_proto::subscription::{link::Link, sealed_file::{self, OpenError, Sea
 const PASSWORD: &str = "correct horse battery";
 const SALT: [u8; 16] = [7; 16];
 const NONCE: [u8; 12] = [9; 12];
+const LINK: &str = "veilway://sub/sub.example.com/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.AXmmMe7eG_nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa.VVVVVVVVVVVVVVVVVVVVVQ";
 
 fn seed(name: &str) -> String {String::from_utf8(fs::read(format!("{}/../../fuzz/corpus/fuzz_deeplink/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()).unwrap()}
 
@@ -12,15 +13,15 @@ fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).c
 
 #[test]
 fn the_file_of_the_vector_is_these_bytes() {
-	let file = sealed_file::seal(PASSWORD, &seed("native-veilway"), SALT, NONCE).unwrap();
+	let file = sealed_file::seal(PASSWORD, LINK, SALT, NONCE).unwrap();
 	assert_eq!(hex(&file), VECTOR);
-	assert_eq!(sealed_file::open(PASSWORD, &file).unwrap(), seed("native-veilway"));
+	assert_eq!(sealed_file::open(PASSWORD, &file).unwrap(), LINK);
 }
 
 #[test]
 fn the_seed_of_the_fuzz_target_still_opens() {
 	let file = fs::read(format!("{}/../../fuzz/corpus/fuzz_sub_sealed/file", env!("CARGO_MANIFEST_DIR"))).unwrap();
-	assert_eq!(sealed_file::open(PASSWORD, &file).unwrap(), seed("native-veilway"));
+	assert_eq!(sealed_file::open(PASSWORD, &file).unwrap(), LINK);
 }
 
 #[test]
@@ -88,5 +89,5 @@ fn only_a_long_enough_password_and_a_subscription_link_are_sealed() {
 	assert_eq!(sealed_file::seal(PASSWORD, &format!("{}\n", seed("native-veilway")), SALT, NONCE), Err(SealError::Link));
 }
 
-// Made again with argon2-cffi and cryptography from the values of the spec: password "correct horse battery", salt of sixteen 0x07, nonce of twelve 0x09, the link of the seed "native-veilway".
-const VECTOR: &str = "5657535542534541010001000000000003000000010707070707070707070707070707070709090909090909090909090966802ab495a740c98ea383a9ccf97fc7ba1d350bf66efd7fe9855a54bba3f8b67fb1cf40753399b129afd10474cf22f319edd5132b8643d19ea37624d118f17c22517776e674d0d826e99bd7005a5c62fabed6a3bea14c440e54f6f0399e3b7dce3113dd6e796a8f3fd5d201e51425413cea3aeceb";
+// The vector of the subscription format page, "Sealed subscription file": the password, the salt and the nonce of the spec, and its link (the file is the seed of fuzz_sub_sealed).
+const VECTOR: &str = "5657535542534541010001000000000003000000010707070707070707070707070707070709090909090909090909090966802ab495a740c98ea383a9ccf97fc7ba1d350bf66efd7fe9855a54bba3f8b67fb1cf40753399b129afd10474cf22f319edd5132b8643d19ea37624d118f17c22517776e674d0d826e99bd7005a5c75f485edb88dc07f55076ceacc17812967d65131bb702ba09fb5655627fc1ed62eb71685b26814b0c51d64071710d1928c7858aab3d00aeefe581d3ac97ff9f55754e36b30216ffa881a21dd75e2e532e5f9ba";
