@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends cmake clang lib
  && pip install --no-cache-dir --break-system-packages ziglang && cargo install --locked cargo-zigbuild
 WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked --mount=type=cache,target=/src/target,sharing=locked \
     target="$(case "$TARGETARCH" in arm64) echo aarch64;; *) echo x86_64;; esac)-unknown-linux-musl" && rustup target add "$target" && cargo zigbuild --release --locked --target "$target" -p veilway --bin veilway && cp "target/$target/release/veilway" /veilway
 
 FROM alpine:3.22 AS prebuilt
