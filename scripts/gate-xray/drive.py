@@ -91,11 +91,11 @@ def setup():
 	_, data = panel.call("GET", "/status")
 	check("setup" in json.dumps(data).lower() and "true" in json.dumps(data).lower(), "the panel asks for first-run setup", json.dumps(data))
 	state.update(username="gate-admin", password="gate-admin-password-1")
-	_, data = panel.call("POST", "/setup", {"token": E["SETUP_TOKEN"], "username": state["username"], "password": state["password"]})
+	_, data = panel.call("POST", "/setup", {"accepted_terms": True, "token": E["SETUP_TOKEN"], "username": state["username"], "password": state["password"]})
 	state["totp_secret"] = data["totp_secret"]
 	save(state)
 	check(len(state["totp_secret"]) >= 16 and data["otpauth"].startswith("otpauth://"), "setup made the admin and showed the TOTP secret once")
-	status, _ = panel.call("POST", "/setup", {"token": E["SETUP_TOKEN"], "username": "second", "password": "second-password-12"}, expect=None)
+	status, _ = panel.call("POST", "/setup", {"accepted_terms": True, "token": E["SETUP_TOKEN"], "username": "second", "password": "second-password-12"}, expect=None)
 	check(status in (403, 409), "the setup token works once", "second try answered %d" % status)
 	status, _ = panel.call("GET", "/users", expect=None)
 	check(status == 401, "an API call without a session is refused", "answered %d" % status)
