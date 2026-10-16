@@ -100,7 +100,7 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 	}
 
 	/**
-	 * Hands an APK that Rust has already verified (signature and release tag) to the system's installer, which asks the user. Only the one file in the update folder is accepted. The connection is stopped first and stays wanted, so it comes back after the update. Android refuses an APK signed with another key than this app's, which is a second guard behind the one in Rust.
+	 * Hands an APK that Rust has already verified (signature and release tag) to the system's installer, which asks the user. Only the one file in the update folder is accepted, and only an update of this app can be installed. The connection stays up until Android replaces the app; it stays wanted, so BootReceiver brings it back after the update. Android refuses an APK signed with another key than this app's, which is a second guard behind the one in Rust.
 	 */
 	@Command
 	fun install(invoke: Invoke) {
@@ -109,17 +109,13 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 			invoke.reject("The update file is not where it should be.")
 			return
 		}
-		if (VeilwayVpnService.instance != null) {
-			activity.startService(Intent(activity, VeilwayVpnService::class.java).setAction(VeilwayVpnService.ACTION_STOP).putExtra(VeilwayVpnService.EXTRA_KEEP_WANTED, true))
-		}
 		Thread {
 			val installer = activity.packageManager.packageInstaller
 			var id = -1
 			try {
-				var waited = 0
-				while (VeilwayVpnService.instance != null && waited++ < 100) Thread.sleep(100)
 				val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL)
 				params.setSize(file.length())
+				params.setAppPackageName(activity.packageName)
 				id = installer.createSession(params)
 				installer.openSession(id).use { session ->
 					file.inputStream().use { input -> session.openWrite("veilway.apk", 0, file.length()).use { out -> input.copyTo(out); session.fsync(out) } }
