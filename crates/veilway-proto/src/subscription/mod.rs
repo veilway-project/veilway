@@ -15,6 +15,7 @@ pub mod fetch;
 pub(crate) mod json;
 pub mod legacy;
 pub mod link;
+pub mod mirror;
 pub mod payload;
 
 /// "Response body, and a document in a file: at most 1,048,576 bytes."
