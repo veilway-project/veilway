@@ -163,10 +163,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
+      - run: cp scripts/veilway.sh dist/veilway.sh
       # RELEASE_SIGNING_KEY holds the contents of an unencrypted minisign secret key file (minisign -G -W).
       # The trusted comment binds each signature to the tag and the asset name, so a signature cannot be reused for another file.
       - name: Sign assets

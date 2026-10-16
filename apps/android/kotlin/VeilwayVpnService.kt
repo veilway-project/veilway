@@ -26,17 +26,23 @@ import java.util.concurrent.Executors
 class VeilwayVpnService : VpnService() {
 	companion object {
 		const val ACTION_STOP = "io.github.veilwayproject.app.STOP"
-		/** With [ACTION_STOP]: stop the connection but leave it wanted, so the boot receiver brings it back after an app update. */
-		const val EXTRA_KEEP_WANTED = "keepWanted"
 		const val EXTRA_SUBSCRIPTION = "subscription"
 		const val EXTRA_PROFILE = "profile"
 		const val EXTRA_OPTIONS = "options"
-		private const val CHANNEL = "vpn"
+		internal const val CHANNEL = "vpn"
+		internal const val UPDATE_NOTICE = 3
 		private const val ONGOING = 1
 		private const val FAILED = 2
 		private const val RETRIES = 4
 
 		@Volatile var instance: VeilwayVpnService? = null
+
+		/** Also called by the install receiver, because the update notice can come before the service has ever run. */
+		fun ensureChannel(context: Context) {
+			context.getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL, label("Veilway VPN", "وی‌ال‌وی"), NotificationManager.IMPORTANCE_LOW))
+		}
+
+		internal fun label(english: String, persian: String) = if (Locale.getDefault().language == "fa") persian else english
 	}
 
 	private val worker = Executors.newSingleThreadExecutor()
@@ -53,14 +59,14 @@ class VeilwayVpnService : VpnService() {
 		super.onCreate()
 		instance = this
 		Native.init(filesDir.absolutePath)
-		getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel(CHANNEL, label("Veilway VPN", "وی‌ال‌وی"), NotificationManager.IMPORTANCE_LOW))
+		ensureChannel(this)
 	}
 
 	override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
 		val wanted = Wanted(this)
 		Native.lockdown(Build.VERSION.SDK_INT >= 29 && isLockdownEnabled)
 		if (intent?.action == ACTION_STOP) {
-			if (!intent.getBooleanExtra(EXTRA_KEEP_WANTED, false)) wanted.wanted = false
+			wanted.wanted = false
 			startForegroundNow()
 			worker.execute { Native.disconnect(); finish(null) }
 			return START_NOT_STICKY
@@ -184,8 +190,6 @@ class VeilwayVpnService : VpnService() {
 		worker.shutdown()
 		super.onDestroy()
 	}
-
-	private fun label(english: String, persian: String) = if (Locale.getDefault().language == "fa") persian else english
 
 	private fun ongoing(): Notification {
 		val text = when (state) {
