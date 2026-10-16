@@ -566,7 +566,7 @@ install_mirror() {
 	"name": "mirror-1",
 	"listen": "127.0.0.1:8490",
 	"path": "/sub",
-	"upstream": "https://panel.example.org/sub",
+	"upstream": "https://panel.invalid/sub",
 	"upstream_pins": [],
 	"trusted_proxies": ["127.0.0.1", "::1"],
 	"secret": "$secret"
@@ -585,6 +585,7 @@ EOF
 		"nginx, in front of 127.0.0.1:8490 (599 hands unknown requests back to nginx):" \
 		"  location = /sub {" \
 		"    proxy_pass http://127.0.0.1:8490;" \
+		"    proxy_http_version 1.1;" \
 		"    proxy_intercept_errors on;" \
 		"    error_page 599 = @unknown;" \
 		"    proxy_set_header X-Forwarded-For \$remote_addr; }"

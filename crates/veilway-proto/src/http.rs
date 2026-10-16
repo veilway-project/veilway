@@ -88,13 +88,16 @@ fn framing<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Option<(Option<u64>, b
 
 /// Reads the head of a request, which ends with its empty line. The method is read from whatever the head begins with, so that the answer to a head the node cannot read is still followed as far as it can be.
 /// "A request with both `Content-Length` and `Transfer-Encoding`, with more than one `Content-Length`, with a `Transfer-Encoding` other than exactly `chunked`" is one whose end cannot be told, and so is every head that is not written exactly as HTTP/1.1 writes it.
-pub fn request(head: &[u8]) -> Request {
+pub fn request(head: &[u8]) -> Request {request_as(head, b"HTTP/1.1")}
+
+/// `request` for a head whose request line ends in `expected` instead of `HTTP/1.1`. The caller has checked that the version is one it reads.
+pub fn request_as(head: &[u8], expected: &[u8]) -> Request {
 	let (line, method) = (head.windows(2).position(|window| window == b"\r\n").map_or(0, |at| at + 2), head.split(|byte| *byte == b' ').next().unwrap_or_default());
 	let (bodiless, tunnel) = (method == b"HEAD", method == b"CONNECT");
 	let body = lines(head).and_then(|mut lines| {
 		let mut parts = lines.next()?.split(|byte| *byte == b' ');
 		let (method, target, version) = (parts.next()?, parts.next()?, parts.next()?);
-		if parts.next().is_some() || tunnel || method.is_empty() || !method.iter().all(|byte| token(*byte)) || target.is_empty() || !target.iter().all(|byte| (0x21..=0x7e).contains(byte)) || version != b"HTTP/1.1" {return None}
+		if parts.next().is_some() || tunnel || method.is_empty() || !method.iter().all(|byte| token(*byte)) || target.is_empty() || !target.iter().all(|byte| (0x21..=0x7e).contains(byte)) || version != expected {return None}
 		Some(match framing(lines)? {
 			(Some(length), _) => Framing::Length(length),
 			(None, true) => Framing::Chunked,
