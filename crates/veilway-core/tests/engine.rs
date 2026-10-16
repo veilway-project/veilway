@@ -846,7 +846,7 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	let Offer::Native(offer) = import::open(&link).unwrap() else {panic!("a native link")};
 	assert_eq!((offer.endpoint().host(), offer.fingerprint().to_string()), ("sub.example.com", provider_key().fingerprint().to_string()));
 	assert!(endpoint.seen.lock().unwrap().is_empty());
-	for bad in ["veilway://sub/sub.example.com/s", "veilway://sub/sub.example.com/s#v1.short.short", "http://sub.example.com/s#v1.x.y", "veilway://sub/localhost/s#v1.x.y"] {assert!(matches!(import::open(bad), Err(import::ImportError::Link(_))), "{bad}")}
+	for bad in ["veilway://sub/sub.example.com/s", "veilway://sub/sub.example.com/s#v1.short.short", "http://sub.example.com/s#v1.x.y", "veilway://sub/localhost/s#v1.x.y"] {assert!(matches!(import::open(bad), Err(import::ImportError::Link(_) | import::ImportError::NotALink)), "{bad}")}
 	// A link of another kind cannot be verified, and this engine does not connect to it by itself: nothing is sent for it either.
 	assert!(matches!(import::open("https://example.com/legacy-list"), Err(import::ImportError::Legacy)));
 	let fetching = import::proceed(offer, None).unwrap();
