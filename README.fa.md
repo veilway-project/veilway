@@ -27,7 +27,7 @@
 
 Veilway یک VPN لایهٔ ۳ است. کلاینت یک کارت شبکهٔ مجازی می‌گیرد، بسته‌های IP به‌طور کامل درون یک تونل WireGuard دست‌نخورده جابه‌جا می‌شوند و سرور تصمیم می‌گیرد هر جریان از کجا خارج شود. رمزنگاری همان رمزنگاری WireGuard است و با [boringtun](https://github.com/cloudflare/boringtun) انجام می‌شود. آنچه Veilway اضافه می‌کند دور تونل قرار دارد: ترنسپورت‌هایی که تونل را از شبکه‌هایی عبور می‌دهند که UDP ساده در آن‌ها بسته است، جداسازی سخت‌گیرانه میان همتاها، و کنترل روی نقطهٔ خروج.
 
-هدف، یک مجموعهٔ یکپارچه است که کاری را انجام دهد که امروز به یک هستهٔ پروکسی، یک پنل جدا و برنامه‌های کلاینت جدا نیاز دارد: هسته‌ای که کتابخانه هم هست، یک پنل وب، کلاینت دسکتاپ و اندروید، و مستندات فارسی و انگلیسی. بیشتر این‌ها هنوز ساخته نشده است. بخش «وضعیت» دقیقاً می‌گوید چه چیزی آماده است.
+هدف، یک مجموعهٔ یکپارچه است که کاری را انجام دهد که امروز به یک هستهٔ پروکسی، یک پنل جدا و برنامه‌های کلاینت جدا نیاز دارد: هسته‌ای که کتابخانه هم هست، یک پنل وب، کلاینت دسکتاپ و اندروید، و مستندات فارسی و انگلیسی. هسته، پنل، کلاینت‌ها و مستندات برای آلفا ساخته شده‌اند، و آلفا هنوز منتشر نشده است. بخش «وضعیت» می‌گوید چه چیزی کار می‌کند و چه چیزی آزموده شده است.
 
 ## برای چه کسانی است
 
@@ -37,7 +37,9 @@ Veilway یک VPN لایهٔ ۳ است. کلاینت یک کارت شبکهٔ م�
 
 ## وضعیت
 
-> **آزمایشی.** Veilway نرم‌افزاری نوپاست و هیچ بازبینی امنیتی بیرونی نداشته است. رمزنگاری تونل از WireGuard است، اما هیچ بخشی از آن در برابر بازرسی عمیق بسته‌ها (DPI) یا کاوش فعال سنجیده نشده و WireGuard ساده روی UDP به‌آسانی قابل شناسایی است. نود از همین حالا چهار ترنسپورت بومی را ارائه می‌دهد که قرار است سخت‌تر شناسایی شوند، اما هنوز هیچ کلاینتی با آن‌ها کار نمی‌کند، و مشخصاتشان پیش‌نویسی است که فقط خود پروژه بازبینی‌اش کرده است. جایی که از کار افتادن آن شما را به خطر می‌اندازد به هیچ‌کدام از این‌ها تکیه نکنید.
+> **آلفا، منتشرنشده.** `v0.1.0-alpha` هنوز برچسب نخورده است و Veilway هیچ بازبینی امنیتی بیرونی نداشته است. رمزنگاری تونل از WireGuard است، اما هیچ بخشی از آن در برابر بازرسی عمیق بسته‌ها (DPI) یا کاوش فعال سنجیده نشده است. هر ترنسپورت در ردهٔ «قابل شناسایی» (Detectable) است: WireGuard ساده روی UDP به‌آسانی شناسایی می‌شود، و ترنسپورت‌های دیگر سخت‌تر دیده می‌شوند، نه نامرئی. جایی که از کار افتادن آن شما را به خطر می‌اندازد به آن تکیه نکنید.
+
+درخواست‌های اشتراک به سمت رمزنگاری سرتاسری (Oblivious HTTP روی HPKE) می‌روند که برای آلفا در حال تکمیل است.
 
 ### آنچه امروز کار می‌کند
 
@@ -50,29 +52,22 @@ Veilway یک VPN لایهٔ ۳ است. کلاینت یک کارت شبکهٔ م�
 | کاربران و سهمیه | سهمیهٔ هر کاربر در یک دورهٔ زمانی، شمارنده برای هر کاربر، ورودی و خروجی، و نگه‌داری مصرف در یک فایل وضعیت که با بارگذاری دوباره و راه‌اندازی دوباره از بین نمی‌رود. `veilway usage reset` شمارش یک کاربر را از نو شروع می‌کند. |
 | API کنترل | HTTP و JSON روی یک سوکت یونیکس روی نود، با اسکیمای OpenAPI: وضعیت، پیکربندی (خواندن، اعتبارسنجی، مقایسه، اعمال)، کاربران، آمار زنده، نشست‌ها، خروجی‌ها، لینک‌ها و جریان رویدادها. [packages/sdk](packages/sdk) یک کلاینت TypeScript است که از روی اسکیما ساخته می‌شود. هنوز دسترسی از راه دور ندارد. |
 | `veilway doctor` | بررسی می‌کند که پیکربندی از میزبان و شبکه چه نیازهایی دارد (پورت‌ها، گواهی‌ها، DNS، هر outbound، `l3`، فایل وضعیت و فایل replay، سوکت کنترل) و هیچ چیزی را تغییر نمی‌دهد. |
-| پروتکل بومی، سمت نود | یک ورودی `veilway` کانال کنترل را درون تونل ارائه می‌دهد (انتخاب خروجی برای هر دستگاه، مصرف، اطلاعیه‌ها، MTU) و چهار ترنسپورت بومی دارد: `udp-obfs` (UDP مبهم‌سازی‌شده)، `tls` (یک شنوندهٔ TLS مستقیم که هر غریبه‌ای را به وب‌سرور خود گرداننده می‌سپارد)، و `ws` و `fronted` که از راه وب‌سرور خود گرداننده یا یک CDN می‌رسند. همهٔ این‌ها فقط سمت نود است: هنوز هیچ کلاینتی با آن‌ها کار نمی‌کند. |
-| کتابخانهٔ کلاینت ترنسپورت | `crates/veilway-transport` سمت کلاینت چهار ترنسپورت بومی است. آزمون‌هایش روی نود واقعی اجرا می‌شوند، اما هنوز هیچ برنامه‌ای از آن استفاده نمی‌کند. |
-| لینک بین نودها | دو نود را به هم وصل می‌کند تا کاربران به یکی وصل شوند و ترافیکشان از دیگری خارج شود، در هر دو جهت. جفت کردن با `veilway link offer` و `veilway link answer` انجام می‌شود، با دو کد و یک اثر انگشت که هر دو گرداننده با هم مقایسه می‌کنند. |
+| پروتکل بومی، سمت نود | یک ورودی `veilway` کانال کنترل را درون تونل ارائه می‌دهد (انتخاب خروجی برای هر دستگاه، مصرف، اطلاعیه‌ها، MTU) و چهار ترنسپورت بومی: `udp-obfs` (UDP مبهم‌سازی‌شده)، `tls` (یک شنوندهٔ مستقیم TLS که هر غریبه را به وب‌سرور خود اپراتور می‌فرستد)، و `ws` و `fronted` که از راه وب‌سرور اپراتور یا یک CDN می‌رسند. برنامه‌ها از هر پنج ترنسپورت (شامل `udp`) به نود وصل می‌شوند. [صفحهٔ آلفا](https://veilway-project.github.io/veilway-docs/fa/alpha/) می‌گوید هر کدام روی چه چیزی آزموده شده‌اند. |
+| کتابخانهٔ کلاینت ترنسپورت | `crates/veilway-transport` سمت کلاینت چهار ترنسپورت بومی است. آزمون‌هایش روی نود واقعی اجرا می‌شوند. موتور کلاینت از آن استفاده می‌کند و برنامه‌ها هم همین‌طور. |
+| لینک بین نودها | دو نود را به هم وصل می‌کند تا کاربران به یکی وصل شوند و ترافیکشان از دیگری خارج شود، در هر دو جهت. پنل هر دو گرداننده را راهنمایی می‌کند، یا آن‌ها با `veilway link offer` و `veilway link answer` جفت می‌شوند که دو کد رد و بدل می‌کنند و یک اثرانگشت را مقایسه می‌کنند. |
 | پل (`veilway bridge`) | `client` به برنامهٔ معمولی WireGuard یک نقطهٔ UDP محلی می‌دهد و آن را روی `wss://` می‌برد. `relay` اتصال WebSocket می‌پذیرد و به هر پورت UDP WireGuard می‌فرستد. |
-| کلاینت دسکتاپ | فقط ویندوز. یک فایل `.conf` معمولی WireGuard می‌خواند، تونل را درون خود برنامه روی UDP یا WebSocket و با آداپتر Wintun اجرا می‌کند و مسیرها و DNS را طوری تنظیم می‌کند که از تونل بگذرند. هنوز با پروتکل بومی کار نمی‌کند. |
+| برنامه‌های دسکتاپ و اندروید | اشتراک‌ها و پروفایل‌های تکی، انتخاب خروجی، آمار زنده، کلید قطع (kill switch) و DNS سنجاق‌شده به تونل. برنامهٔ دسکتاپ روی لینوکس، مک و ویندوز اجرا می‌شود و برنامهٔ اندروید یک APK با معماری arm64 است. راهنمای هر پلتفرم را در [راهنمای کلاینت](https://veilway-project.github.io/veilway-docs/fa/manuals/client/) ببینید. |
 
-محدودیت‌های شناخته‌شده: کلاینت ویندوز فقط IPv4 دارد (IPv6 را به آداپتر می‌فرستد و همان‌جا دور می‌ریزد تا از کنار تونل نگذرد). ICMP و پروتکل‌های غیر از TCP و UDP از بالادست SOCKS5 رد نمی‌شوند (پینگ را خود نود پاسخ می‌دهد و فقط خروجی `l3` روی لینوکس همهٔ پروتکل‌های IP را عبور می‌دهد). API کنترل فقط روی خود نود و روی یک سوکت یونیکس در دسترس است. ترنسپورت‌های بومی و کانال کنترل هنوز کلاینتی ندارند. `tls`، `ws` و `fronted` در ردهٔ «قابل شناسایی» (Detectable) هستند، و `ws` و `fronted` پشت nginx و HAProxy آزمایش شده‌اند اما پشت یک CDN واقعی نه. هنوز پنلی وجود ندارد، و سیستم طراحی آن در [veilway-ui](https://github.com/veilway-project/veilway-ui) است و هنوز چیزی در این مخزن از آن استفاده نمی‌کند.
+محدودیت‌های شناخته‌شده: هر ترنسپورت در ردهٔ «قابل شناسایی» است. macOS هرگز به نودی روی یک مک واقعی وصل نشده است، و ویندوز یک آزمون دودی روی یک رانر واقعی گذرانده اما به یک نود واقعی وصل نشده است. `fronted` فقط HTTP/1.1 را می‌فهمد و پشت یک CDN واقعی اجرا نشده است. ICMP و پروتکل‌های غیر از TCP و UDP از بالادست SOCKS5 رد نمی‌شوند (پینگ را خود نود پاسخ می‌دهد و فقط خروجی `l3` روی لینوکس همهٔ پروتکل‌های IP را عبور می‌دهد). API کنترل فقط روی خود نود و روی یک سوکت یونیکس در دسترس است. [صفحهٔ آلفا](https://veilway-project.github.io/veilway-docs/fa/alpha/) می‌گوید هر بخش روی چه چیزی آزموده شده و چه چیزی نه.
 
-### برنامهٔ پیش رو
+## بعدی
 
 برنامهٔ کامل و معیار پایان هر فاز در [PLAN.md](PLAN.md) است.
 
-| فاز | چه چیزی تحویل می‌دهد |
-|---|---|
-| ۰، انجام شد | ساختار مخزن، مجوز و فایل‌های جامعه، CI، مدل تهدید |
-| ۱، انجام شد | موتور هسته: پیکربندی نسخه‌دار با بارگذاری دوبارهٔ زنده، چند ورودی، جدول جریان و مسیریاب، خروجی‌ها (پشتهٔ فضای کاربر، و TUN با NAT روی لینوکس برای همهٔ پروتکل‌های IP)، کاربران، سهمیه، آمار، API کنترل |
-| ۲، در حال انجام | پروتکل بومی: کانال کنترل درون تونل، ترنسپورت‌ها (TLS، UDP مبهم‌سازی‌شده، HTTP از پشت CDN، آزمایش اولیهٔ TLS جعلی)، لینک بین نودها، موتور کلاینت روی ویندوز، مک و لینوکس با IPv6. مشخصات، سمت نود، کتابخانهٔ ترنسپورت و لینک بین نودها ساخته شده‌اند؛ گام بعدی موتور کلاینت است |
-| ۳، انجام شد | سیستم طراحی مشترک برای پنل و کلاینت‌ها، پوسته‌ها. در [veilway-ui](https://github.com/veilway-project/veilway-ui) قرار دارد |
-| ۴ | پنل وب: کاربران، ورودی‌ها، خروجی‌ها، مسیریابی، اشتراک‌ها، آمار |
-| ۵ | کلاینت دسکتاپ روی ویندوز، مک و لینوکس با اشتراک و آمار زنده. این همان آلفای عمومی است |
-| ۶ | افزونهٔ اختیاری که باینری رسمی Xray را به شکل یک پردازهٔ جانبی مدیریت‌شده اجرا می‌کند |
-| ۷ | کلاینت اندروید |
-| ۸ | مستندات کامل به هر دو زبان، نمونه‌های SDK، فازینگ در CI، انتشارهای امضاشده |
+- برچسب `v0.1.0-alpha` پس از گذشتن آزمون آلفا روی یک سرور تازه و یک بازبینی امنیتی پایانی زده می‌شود.
+- برنامهٔ دسکتاپ روی یک مک واقعی و یک رایانهٔ ویندوزی واقعی آزموده شود، و `fronted` پشت یک CDN واقعی.
+- افزونهٔ Xray: VMess، و خروجی‌های `l3` و `chain`، که هنوز ساخته نشده‌اند.
+- بعد از آلفا: HTTP/2 روی ترنسپورت‌های جریانی، شکل‌های بیشتر `fronted`، اتصال‌های به‌هم‌پیوستهٔ اختیاری و یک حالت شبیه Reality.
 
 ## شروع سریع
 
@@ -217,6 +212,7 @@ veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
 | `notices` | متن ساده‌ای که گرداننده از راه کانال کنترل برای همهٔ دستگاه‌ها می‌فرستد. اختیاری. |
 | `replay` | جایی که ترنسپورت‌های مبهم‌سازی‌شده حافظهٔ replay خود را نگه می‌دارند. اختیاری. |
 | `links` | لینک‌ها به نودهای دیگر. اختیاری. |
+| `xray` | افزونهٔ اختیاری Xray: باینری رسمی Xray-core که به شکل یک پردازهٔ جانبی مدیریت‌شده اجرا می‌شود. اختیاری. |
 
 همهٔ کلیدها، پیش‌فرض‌ها و قواعد اعتبارسنجی در [مرجع پیکربندی](https://github.com/veilway-project/veilway-docs/blob/main/src/content/docs/reference/config.md) آمده است. یک نمونهٔ کامل در [config.example.json](config.example.json) هست.
 
@@ -248,9 +244,9 @@ veilway bridge relay --listen 127.0.0.1:8443 --path /wg --target 127.0.0.1:51820
 
 گزینهٔ `--max-conns` (پیش‌فرض 1024) سقف اتصال‌های هم‌زمان رله را تعیین می‌کند.
 
-## کلاینت دسکتاپ
+## برنامهٔ دسکتاپ
 
-`apps/desktop` یک برنامهٔ Tauri 2 است. امروز فقط روی ویندوز اجرا می‌شود و برای آداپتر Wintun و جدول مسیریابی به دسترسی مدیر نیاز دارد. یک فایل `.conf` WireGuard می‌گیرد که `Endpoint` آن `wss://`، `ws://` یا `host:port` باشد.
+`apps/desktop` یک برنامهٔ Tauri 2 برای لینوکس، مک و ویندوز است. اشتراک یا یک پروفایل تکی را وارد می‌کند و تونل را در یک کمکی ممتاز اجرا می‌کند که به دسترسی مدیر نیاز دارد. این برنامه از موتور کلاینت در `crates/veilway-engine` استفاده می‌کند. `apps/android` برنامهٔ اندروید است.
 
 </div>
 
@@ -277,7 +273,7 @@ cd apps/desktop/src-tauri && cargo check
 npx --yes @tauri-apps/cli@^2 build
 ```
 
-<!-- SCREENSHOT SLOT 3: web panel dashboard, dark mode, Persian UI, full width. The panel does not exist yet (Phase 4). Leave empty until it does. -->
+<!-- SCREENSHOT SLOT 3: web panel dashboard, dark mode, Persian UI, full width. The panel lives in veilway-panel. Add it here once it is captured from the real UI. -->
 
 <div dir="rtl">
 
@@ -310,7 +306,7 @@ flowchart LR
 
 سرور هر بسته را رمزگشایی می‌کند، بررسی می‌کند که نشانی مبدأ به همان دستگاه تعلق داشته باشد و آن را طبق قانون‌ها مسیریابی می‌کند. برای خروجی `netstack` بسته به یک پشتهٔ TCP/IP در فضای کاربر می‌رود که برای هر جریان یک اتصال یا association از راه outbound همان خروجی باز می‌کند و دستگاه TUN در کار نیست. برای خروجی `l3` بسته روی یک دستگاه TUN نوشته می‌شود و هسته آن را فوروارد می‌کند. سقف جریان‌ها 65536 در کل، 1024 برای هر کاربر و 512 برای هر دستگاه است.
 
-شکل برنامه‌ریزی‌شده. هستهٔ این نمودار دوم همراه با API کنترلش ساخته شده است، و خروجی‌های مستقیم، SOCKS5 و NAT و لینک به یک نود Veilway دیگر هم وجود دارند. پنل، کلاینت‌ها جز برنامهٔ دسکتاپ ویندوز، و پردازهٔ جانبی Xray هنوز وجود ندارند:
+شکل کامل. پنل و برنامه‌ها هم ساخته شده‌اند، و پردازهٔ جانبی Xray یک افزونهٔ اختیاری است:
 
 </div>
 
@@ -341,19 +337,24 @@ flowchart TB
 
 ```
 crates/
-  veilway             the only binary: run, check, schema, genkey, gensecret, doctor, usage, replay, link, bridge
+  veilway             the only binary: run, check, schema, genkey, gensecret, doctor, usage, replay, link, bridge, mirror, and the client's connect, disconnect and status
   veilway-core        server engine: config v1 and reload, inbounds, routing rules, flow table, exits, quotas, the control channel, the native transports, node links
   veilway-wg          multi-peer WireGuard wrapper (handshake routing, cookies, timers, roaming) and the WebSocket relay
   veilway-client      single-peer client engine and the Windows Wintun, route and DNS layer
+  veilway-engine      client engine without an OS layer
+  veilway-linux       client layer for Linux
+  veilway-macos       client layer for macOS
+  veilway-windows     client layer for Windows
   veilway-proto       wire formats of the native protocol and the subscription format, no IO
   veilway-transport   client side of the native transports, as a library
   veilway-api         control API server and OpenAPI schema
-  veilway-xray        optional Xray sidecar manager (empty skeleton)
+  veilway-xray        reserved for the Xray add-on (empty skeleton; the sidecar is in veilway-core for now)
   veilway-ffi         uniffi bindings (empty skeleton)
 packages/
   sdk                 TypeScript client for the control API, generated from its schema
 apps/
   desktop             Tauri 2 desktop client, outside the cargo workspace
+  android             Android client
 fuzz/                 cargo-fuzz targets, outside the workspace
 vendor/
   ipstack             patched userspace TCP/IP stack
@@ -361,17 +362,19 @@ vendor/
 
 <div dir="rtl">
 
-پوشه‌های `panel/` و `apps/android` در فازهای بعدی اضافه می‌شوند. سیستم طراحی و ترجمه‌ها در [veilway-ui](https://github.com/veilway-project/veilway-ui) هستند.
+پنل در [veilway-panel](https://github.com/veilway-project/veilway-panel) است. سیستم طراحی و ترجمه‌ها در [veilway-ui](https://github.com/veilway-project/veilway-ui) هستند.
 
 ## مخزن‌ها
 
 - [veilway](https://github.com/veilway-project/veilway): همین مخزن؛ هسته، API کنترل و SDK آن، و برنامهٔ دسکتاپ.
 - [veilway-ui](https://github.com/veilway-project/veilway-ui): سیستم طراحی و ترجمه‌های فارسی و انگلیسی برای پنل و برنامه‌ها.
+- [veilway-panel](https://github.com/veilway-project/veilway-panel): پنل وب برای اجرای یک نود.
+- [veilway-site](https://github.com/veilway-project/veilway-site): صفحهٔ معرفی در [veilway-project.github.io](https://veilway-project.github.io/).
 - [veilway-docs](https://github.com/veilway-project/veilway-docs): کد منبع سایت مستندات، [veilway-project.github.io/veilway-docs](https://veilway-project.github.io/veilway-docs/fa/).
 
 ## مستندات
 
-- [سایت مستندات](https://veilway-project.github.io/veilway-docs/fa/) ([کد منبع](https://github.com/veilway-project/veilway-docs)): مشخصات پروتکل، مرجع پیکربندی، مرجع API کنترل و راهنماها، به فارسی و انگلیسی. هم‌زمان با کد تکمیل می‌شود.
+- [سایت مستندات](https://veilway-project.github.io/veilway-docs/fa/) ([کد منبع](https://github.com/veilway-project/veilway-docs)): مشخصات پروتکل، مرجع پیکربندی، مرجع API کنترل و راهنماها، به فارسی و انگلیسی. برخی صفحه‌های فارسی هنوز جای‌نگه‌دارند.
 - [PLAN.md](PLAN.md): تصمیم‌های طراحی و برنامهٔ فازها (انگلیسی).
 - [THREAT_MODEL.md](THREAT_MODEL.md): اینکه Veilway در برابر چه کسانی دفاع می‌کند و چه چیزهایی را پوشش نمی‌دهد (انگلیسی).
 
