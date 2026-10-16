@@ -9,6 +9,7 @@
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
 #   sudo bash veilway.sh addon xray [install|remove|status]
+#   sudo bash veilway.sh panel-prefix [/new-path]   move the admin pages to a new path, random when none is given
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
@@ -646,6 +647,31 @@ panel_summary() {
 		"Send it with a username and password to POST $prefix/api/setup."
 }
 
+# Moves the admin pages to a new path, a random one or the one given. The web server in front has to follow, so its new lines are printed; a panel that does not come back up gets the old path again.
+do_panel_prefix() {
+	local f="$CONF_DIR/panel.json" new="${1:-}" old sub
+	need_root
+	[ -f "$f" ] || die "no panel is installed: $f is missing"
+	old="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"; sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
+	[ -n "$new" ] || new="/p-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	[[ "$new" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$new" != *//* && "$new" != *..* ]] || die "the path must start with /, end without one, and hold only letters, digits, -, _, . and /"
+	[[ "$new" != "$sub" && "$new/" != "$sub/"* && "$sub/" != "$new/"* ]] || die "the path must not be, sit inside or hold the subscription path $sub"
+	[ "$new" != "$old" ] || die "the admin pages are already at $new"
+	confirm "Move the admin pages from $old to $new? Bookmarks and your web server's config must follow." || die "cancelled"
+	if [ "$DRY" = 1 ]; then dry "set prefix to $new in $f and restart veilway-panel"; return 0; fi
+	backup_file "$f"
+	sed -i "s|\"prefix\": *\"[^\"]*\"|\"prefix\": \"$new\"|" "$f"
+	svc restart veilway-panel.service
+	sleep 2
+	if has_systemd && ! systemctl is-active --quiet veilway-panel.service; then
+		sed -i "s|\"prefix\": *\"[^\"]*\"|\"prefix\": \"$old\"|" "$f"
+		svc restart veilway-panel.service
+		die "the panel did not start with $new, so it is back at $old: see sudo journalctl -u veilway-panel"
+	fi
+	step "the admin pages are now at $new"
+	box "Panel path" "Change the path in your web server's config, then reload it:" "" "  nginx:  location ~ ^($new|$sub)(/|\$) {" "  Caddy:  reverse_proxy $new/* 127.0.0.1:$PANEL_PORT" "" "Admin pages: https://your-domain$new/"
+}
+
 pick_component() {
 	case "${1:-}" in
 		node | panel | both) printf '%s' "$1" ;;
@@ -984,7 +1010,8 @@ main() {
 		uninstall) header; do_uninstall ;;
 		version) do_version ;;
 		addon) header; do_addon "${args[0]:-}" "${args[1]:-install}" ;;
-		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, uninstall, version" ;;
+		panel-prefix) header; do_panel_prefix "${args[0]:-}" ;;
+		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, panel-prefix, uninstall, version" ;;
 	esac
 }
 
