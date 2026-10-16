@@ -22,6 +22,7 @@ ignore = [
 	{ id = "RUSTSEC-2025-0081", reason = "unic-char-property: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
 	{ id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
 	{ id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
+	{ crate = "zip@4.6.1", reason = "Yanked, no advisory. Required by tauri-plugin-updater 2.14.0 (the latest), desktop app only, and no other 4.x exists. Remove when the updater moves to a newer zip." },
 ]
 
 [licenses]

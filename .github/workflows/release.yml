@@ -84,13 +84,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      # The musl builds use zig as the C compiler: BoringSSL's build script needs libclang, which a musl host cannot load, and the GCC in cross's images crashes on BoringSSL.
       - uses: taiki-e/install-action@v2
         if: matrix.cross
         with:
-          tool: cross
+          tool: cargo-zigbuild
+      - if: matrix.cross
+        run: pip install --break-system-packages ziglang
       - name: Build
         shell: bash
-        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked --target ${{ matrix.target }} -p veilway --bin veilway
+        run: cargo ${{ matrix.cross && 'zigbuild' || 'build' }} --release --locked --target ${{ matrix.target }} -p veilway --bin veilway
       - name: Stage asset
         shell: bash
         env:
