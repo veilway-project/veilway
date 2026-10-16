@@ -22,7 +22,7 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-setting { display: grid; gap: var(--s-2); justify-items: start; }
 .d-progress { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s-2); }
 .d-progress .vw-meter { flex: 1 1 8rem; }
-.d-row-option { display: grid; gap: var(--s-1); padding: 0 var(--s-3) var(--s-3); }
+.d-row-option { display: grid; gap: var(--s-1); padding: var(--s-2) var(--s-3) var(--s-3); }
 .d-row-actions { display: inline-flex; align-items: center; gap: var(--s-1); }
 .d-logo { display: grid; place-items: center; inline-size: 32px; block-size: 32px; border-radius: var(--r-1); background: var(--c-sunken); font-weight: var(--weight-strong); object-fit: contain; }
 .d-log { margin: 0; max-block-size: 60vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--text-2); line-height: var(--leading); }
