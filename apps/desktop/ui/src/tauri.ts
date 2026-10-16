@@ -9,11 +9,12 @@ export type Connection = {transport: string, address: string, host: string | nul
 export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, connection: Connection | null, applied: unknown};
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
 export type Profile = {id: string, name: string, exits: [string, string][]};
-// A backup update address of a subscription. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does.
-export type Host = {key: string, host: string, kind: "update" | "static", state: "waiting" | "allowed" | "declined"};
+// A backup update address of a subscription, or the new main address a move asks for. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does, and a `move` would become the main one. Over `plain` the network can tell that the device uses this app. `from` is the address a move leaves.
+export type Host = {key: string, host: string, kind: "update" | "static" | "move", state: "waiting" | "allowed" | "declined", check: "chain" | "pinned" | "plain", from: string | null};
 export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], logo: string | null, accent: string | null, left_out: number, lan_local: boolean, hosts: Host[]};
-export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, in_file: boolean};
-export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, left_out: string[], preview: Subscription};
+export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, plain: boolean, in_file: boolean};
+export type Move = {host: string, check: "chain" | "pinned" | "plain", from: string | null};
+export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, moving: Move | null, left_out: string[], preview: Subscription};
 // The question of an endpoint on a private address that the user has not said yes to yet. The answer to it is the same call again with `private` set to these addresses, exactly as shown.
 export type PrivateAsk = {ask_private: {host: string, addresses: string[]}};
 export const asksPrivate = (value: unknown): value is PrivateAsk => typeof value === "object" && value !== null && "ask_private" in value;

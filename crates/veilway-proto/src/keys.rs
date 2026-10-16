@@ -267,6 +267,12 @@ fn expand<const N: usize>(prk: &hkdf::Prk, info: &[&[u8]]) -> [u8; N] {
 	out
 }
 
+/// The key and the nonce of an answer of the subscription endpoint (subscription format page, "Sealing an answer"): `prk = Extract(enc || response_nonce, secret)`, `key = Expand(prk, "key", 32)` and `nonce = Expand(prk, "nonce", 12)`, with the labels of RFC 9458 as ASCII with no zero byte. `enc` is the one HPKE made, with its top bit clear.
+pub(crate) fn answer(enc: &[u8; 32], response_nonce: &[u8; 32], secret: &[u8; 32]) -> (ChunkKey, [u8; 12]) {
+	let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &[&enc[..], &response_nonce[..]].concat()).extract(secret);
+	(ChunkKey::new(&expand(&prk, &[b"key"])), expand(&prk, &[b"nonce"]))
+}
+
 /// `k_name` and `k_mirror` of one device on a static mirror (subscription format page, "Keys of a static mirror"). The panel keeps both, sealed, after a request that carried the token and the device secret, and a client derives them from its own link, key and secret. Neither gives a way back to the token or the secret. `prk_m` is not kept.
 /// The bytes can be read for the one place that stores them sealed (`expose`) and for nothing else: the type prints nothing.
 #[derive(Clone, PartialEq, Eq)]

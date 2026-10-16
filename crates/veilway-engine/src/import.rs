@@ -2,7 +2,7 @@
 //!
 //! The rules the types of `veilway-proto` carry are not repeated or bypassed here. A link becomes an `Offer`, which can do nothing; the only way on is `NativeOffer::proceed`, the user's yes, and only then a request can exist. An answer becomes a `Review` only through the checks of `client`, and is kept only after `Review::accept`. What this module adds is the part with a network and a disk: one `POST` over `https` with the rules of "How a fetch is made", and a place to keep what was accepted.
 //!
-//! The rules of the fetch: `https` only; the chain validated against the roots it is given, TLS 1.2 or later, and no early data; no redirect followed; no `Accept-Language`, `Accept-Encoding: identity` and an answer with a `Content-Encoding` refused; ten seconds to connect and thirty in all; the body read to its limit and not past it; the name looked up once, and an address that is loopback, link-local, unspecified, multicast, broadcast or an IPv6 form that carries an IPv4 address refused, with the address that was checked being the one dialled. **A private address** (`private` of `veilway-proto`) is dialled only if the user said yes to that exact address, for this subscription (`Held::private_addresses`) or, on a first import, in the call (`allowed`). When the endpoint's host gives no address that may be dialled and at least one private one, the step stops with `ImportError::PrivateEndpoint` and the addresses to show, and nothing is sent. A yes is to addresses and never to the host name, so a name that comes to another private address asks again. The token is in the body of the request and nowhere else.
+//! The rules of the fetch: every native fetch is the encrypted exchange of the subscription format page, one `POST` of exactly 1,073 sealed bytes (`application/octet-stream`) that is answered by one of five sizes (`veilway-proto` `exchange`), over `https` or, for a plain link, a plain entry or a confirmed plain move, over plain `http` with no TLS at all; the chain validated against the roots it is given, TLS 1.2 or later, and no early data; no redirect followed; no `Accept-Language`, `Accept-Encoding: identity` and an answer with a `Content-Encoding` refused; ten seconds to connect and thirty in all; the body read to its limit and not past it; the name looked up once, and an address that is loopback, link-local, unspecified, multicast, broadcast or an IPv6 form that carries an IPv4 address refused, with the address that was checked being the one dialled. The status and the `Date` field of an answer that is not sealed tell nothing but a message about the clocks. **A private address** (`private` of `veilway-proto`) is dialled only if the user said yes to that exact address, for this subscription (`Held::private_addresses`) or, on a first import, in the call (`allowed`). When the endpoint's host gives no address that may be dialled and at least one private one, the step stops with `ImportError::PrivateEndpoint` and the addresses to show, and nothing is sent. A yes is to addresses and never to the host name, so a name that comes to another private address asks again. The token is in the body of the request and nowhere else.
 //! **A pinned endpoint** (the link's third field, a pinned entry of `refresh_urls`) is held to its pins alone, as the transport library holds a self-signed candidate (`veilway_transport::pin_only`): TLS 1.3 only, the SHA-256 of the leaf's SubjectPublicKeyInfo is one of the pins and the handshake is signed with that key, no chain, name or date, no early data and no resumed session. The request, with the token in its body, is written only after that check passed. A mismatch is `FetchError::Pin`, never a refusal of the endpoint. A pinned host that is an IP literal is dialled with no lookup and sent no server name. `Held::targets` and `Fetching::pins` say which pins each endpoint is checked by.
 //! **The vault is the platform's.** The subscriptions hold the link's token, the device's private key and the transport secrets, so they belong in the operating system's secret storage or in a file encrypted under a key kept there. `Vault` is the trait the platform implements for that. The only vault that ships in a build is none: `FileVault`, a mode-600 file with the secrets in plain base64, exists with the `unencrypted-vault` feature and in this crate's own tests, for tests.
 //! A fetch outside a tunnel is the caller's to allow ("When a fetch happens"): this module makes the request it is told to make and does not decide when. With the kill switch on, the platform's hook for the socket (`Fetcher::socket`) is where it can refuse.
@@ -14,14 +14,15 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket};
 use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::TlsConnector;
-use veilway_proto::subscription::client::{Accepted, CarriedOffer, Damaged, Declined, Device, Failure, Fetching, Held, NativeOffer, Offer, Refreshed, Review, Source, Stored, CONNECT_TIMEOUT, FETCH_TIMEOUT};
+use veilway_proto::subscription::client::{Accepted, CarriedOffer, Damaged, Declined, Device, Failure, Fetching, Held, NativeOffer, Offer, Refreshed, Review, Role, Source, Stored, StoredMove, CLOCK_TOLERANCE, CONNECT_TIMEOUT};
 use veilway_proto::subscription::mirror;
 use veilway_proto::subscription::envelope::EnvelopeError;
+use veilway_proto::subscription::exchange::{next_key, GatewayKey, REQUEST};
 use veilway_proto::subscription::fetch::{DeviceName, Request};
 use veilway_proto::subscription::link::{Carried, Link, LinkError};
 use veilway_proto::subscription::payload::{dialable, private, PayloadError, Reason};
@@ -80,18 +81,29 @@ pub enum FetchError {
 	Encoding,
 	/// A body over its limit, or a length that lies.
 	Body,
+	/// A 200 whose body is not an answer that opens to this request: not one of the five sizes, a tag that does not verify, a length out of range or padding that is not zero. "The endpoint did not answer as a subscription."
+	NotOpen,
+	/// An answer that is not sealed (the host's answer to a path it does not serve, or a body that does not open) whose `Date` field differs from this device's clock by more than the tolerance, about `minutes` minutes. "Over TLS it shows this as it is. Over plain HTTP, where anyone on the way can write the field, it marks the message unverified." It changes nothing else.
+	Clock {minutes: u64, unverified: bool},
+	/// The system's random source failed, so no request could be sealed. Nothing was sent.
+	Random,
 }
 
 impl FetchError {
+	/// "When an HTTP answer arrived and it was not a sealed answer that opens": a status, a redirect, a refused encoding, a body that lies, a body that does not open, or an answer that says the clocks differ. A timeout, a failed handshake or pin, a failed lookup and a refused connection are not, and they say nothing about the gateway key.
+	pub fn answered(&self) -> bool {matches!(self, Self::Status(_) | Self::Redirect | Self::Encoding | Self::Body | Self::NotOpen | Self::Clock {..})}
 	pub fn code(&self) -> Code {
 		match self {
+			Self::Clock {unverified: false, ..} => Code::ServerClock,
+			Self::Clock {unverified: true, ..} => Code::ServerClockUnverified,
+			Self::Random => Code::Random,
 			Self::Private {..} => Code::PrivateAddress,
 			Self::Resolve => Code::Resolve,
 			Self::Connect => Code::Unreachable,
 			Self::Certificate => Code::Certificate,
 			Self::Tls => Code::Tls,
 			Self::Timeout => Code::Timeout,
-			Self::NotHttp | Self::Redirect | Self::Status(_) | Self::Encoding | Self::Body => Code::NoSubscription,
+			Self::NotHttp | Self::Redirect | Self::Status(_) | Self::Encoding | Self::Body | Self::NotOpen => Code::NoSubscription,
 			Self::Pin => Code::Pin,
 		}
 	}
@@ -164,12 +176,20 @@ impl ImportError {
 				Failure::Future => Code::Clock,
 				Failure::DeviceKey | Failure::PrivateKey => Code::DeviceKey,
 				Failure::HasLink => Code::HasLink,
-				Failure::EndpointKind | Failure::Changed | Failure::Pins => Code::EndpointChanged,
+				Failure::EndpointKind | Failure::Changed | Failure::Pins | Failure::Move => Code::EndpointChanged,
+				Failure::Gateway => Code::BadDocument,
 			},
 		}
 	}
 	/// The English words, for the command line.
 	pub fn text(&self) -> &'static str {self.code().text()}
+	/// What an app is given for a failure: the code, and after a colon the number of minutes when the failure is about the clocks ("differ by about N minutes"), which the app's own words put in.
+	pub fn wire(&self) -> String {
+		match self {
+			Self::Fetch(FetchError::Clock {minutes, ..}) => format!("{}:{minutes}", self.code().as_str()),
+			_ => self.code().as_str().to_owned(),
+		}
+	}
 }
 
 /// Why an import failed, as a stable code. An app translates the code into its own language, so the words of `text` are only the English, for the command line.
@@ -188,6 +208,8 @@ pub enum Code {
 	Tls,
 	Pin,
 	NoSubscription,
+	ServerClock,
+	ServerClockUnverified,
 	PrivateAddress,
 	Random,
 	Store,
@@ -237,6 +259,8 @@ impl Code {
 			Self::Tls => "tls",
 			Self::Pin => "pin",
 			Self::NoSubscription => "no_subscription",
+			Self::ServerClock => "server_clock",
+			Self::ServerClockUnverified => "server_clock_unverified",
 			Self::PrivateAddress => "private_address",
 			Self::Random => "random",
 			Self::Store => "store",
@@ -285,6 +309,8 @@ impl Code {
 			Self::Tls => "A secure connection to the provider's server could not be made. Check your internet connection, then try again.",
 			Self::Pin => "The provider's server does not match this link. If your provider changed its server, ask for a new link. Otherwise, something between you and the provider may be answering.",
 			Self::NoSubscription => "The provider's address did not answer as a subscription server. The link may be cut off or out of date: ask the provider for a new one.",
+			Self::ServerClock => "The server's clock and this device's clock differ by several minutes. Check this device's time against a source you trust, then refresh.",
+			Self::ServerClockUnverified => "Unverified, since the connection is not encrypted: the server's clock and this device's clock seem to differ by several minutes. Check this device's time against a source you trust, then refresh.",
 			Self::PrivateAddress => "This subscription is on a private address. Only continue if you run this server yourself, for example at home.",
 			Self::Random => "This device could not make the keys it needs. Nothing was sent. Try again.",
 			Self::Store => "The subscription could not be saved on this device. Check that the system's secure storage works, then try again.",
@@ -326,18 +352,19 @@ pub struct Fetcher {pub roots: Arc<rustls::RootCertStore>, pub resolve: Resolve,
 impl Fetcher {
 	/// A fetcher with the system's resolver and the roots it is given.
 	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket}}
-	/// One `POST` of `body` to `url`, and the body of the answer. See the head of this module for what it does and refuses. `allowed` is the private addresses the user said yes to.
-	pub async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
-		timeout(FETCH_TIMEOUT, self.exchange(url, trust, Some(body), allowed)).await.unwrap_or(Err(FetchError::Timeout))
+	/// One `POST` of `body` to `url` (the 1,073 bytes of a sealed request, `application/octet-stream`), and the body of the answer. See the head of this module for what it does and refuses. `allowed` is the private addresses the user said yes to, and `now` the device's clock, which only a message about the clocks uses.
+	/// "A native answer and a static file take the time limit of their size", and the answer is read to the largest of the five sizes and not past it.
+	pub async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
+		timeout(mirror::time_limit(None), self.exchange(url, trust, Some(body), allowed, now)).await.unwrap_or(Err(FetchError::Timeout))
 	}
 	/// One plain `GET` of the file of a static mirror ("How a client fetches a static mirror"): no body, no token, no cookie, no `Referer`, no `Accept-Language`, no conditional field and no `Range`, and no `ETag` or `Last-Modified` is read or kept. Status 200 only, no redirect, the chain validated (the handshake is the one of a subscription fetch, with `http/1.1` as its ALPN, which the page states as a leak until the browser's fingerprint is used), the name looked up once, and at most 1,089,437 bytes read in the time of the size the `Content-Length` names (`mirror::time_limit`). Whether the body is a file is for `Held::refresh_static`.
 	pub async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
-		timeout(mirror::time_limit(None), self.exchange(url, &Trust::Chain, None, allowed)).await.unwrap_or(Err(FetchError::Timeout))
+		timeout(mirror::time_limit(None), self.exchange(url, &Trust::Chain, None, allowed, 0)).await.unwrap_or(Err(FetchError::Timeout)).map(|answer| answer.body)
 	}
 	// `body` is `Some` for the `POST` of a request and `None` for the `GET` of a static file.
-	async fn exchange(&self, url: &Url, trust: &Trust, body: Option<&[u8]>, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
+	async fn exchange(&self, url: &Url, trust: &Trust, body: Option<&[u8]>, allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
 		let started = Instant::now();
-		let (host, port, literal) = (url.host().to_owned(), url.port(), url.literal());
+		let (host, port, literal, plain) = (url.host().to_owned(), url.port(), url.literal(), url.is_plain());
 		// An IP literal is dialled as it is, with no lookup, and held to the same refusals as any address the system's resolver gives.
 		let addresses = match literal {
 			Some(ip) if dialable(ip) => vec![SocketAddr::new(ip, port)],
@@ -361,6 +388,18 @@ impl Fetcher {
 			}
 		}
 		let stream = stream.ok_or(FetchError::Connect)?;
+		let text = url.as_str();
+		let tail = &text[(if plain {7} else {8}) + url.host().len()..];
+		let tail = tail.strip_prefix(':').map_or(tail, |rest| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]);
+		let path = tail.split('#').next().filter(|path| !path.is_empty()).map(|path| if path.starts_with('/') {path.to_owned()} else {format!("/{path}")}).unwrap_or_else(|| "/".to_owned());
+		let authority = if port == if plain {80} else {443} {host.clone()} else {format!("{host}:{port}")};
+		// "Method and target: `POST` to the endpoint's path. No query." The fields are the page's table and nothing else: no cookie, no `Referer`, no `Accept-Language`.
+		let request = match body {
+			Some(body) => [format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nAccept-Encoding: identity\r\n\r\n", body.len()).as_bytes(), body].concat(),
+			None => format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n").into_bytes(),
+		};
+		let clock = body.map(|_| (now, plain));
+		if plain {return talk(stream, &request, started, clock).await}
 		let config = match trust {
 			Trust::Chain => {
 				let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().map_err(|_| FetchError::Tls)?.with_root_certificates(self.roots.clone()).with_no_client_auth();
@@ -374,26 +413,47 @@ impl Fetcher {
 			Some(ip) => rustls::pki_types::ServerName::IpAddress(ip.into()),
 			None => rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| FetchError::Tls)?,
 		};
-		let mut tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.map_err(|error| {
+		let tls = TlsConnector::from(Arc::new(config)).connect(name, stream).await.map_err(|error| {
 			if error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()).is_some_and(|inner| matches!(inner, rustls::Error::InvalidCertificate(_))) {if matches!(trust, Trust::Pinned(_)) {FetchError::Pin} else {FetchError::Certificate}} else if matches!(trust, Trust::Pinned(_)) && error.get_ref().and_then(|inner| inner.downcast_ref::<rustls::Error>()).is_some_and(|inner| matches!(inner, rustls::Error::PeerIncompatible(_) | rustls::Error::PeerMisbehaved(_))) {FetchError::Pin} else {FetchError::Tls}
 		})?;
-		let text = url.as_str();
-		let tail = &text[8 + url.host().len()..];
-		let tail = tail.strip_prefix(':').map_or(tail, |rest| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]);
-		let path = tail.split('#').next().filter(|path| !path.is_empty()).map(|path| if path.starts_with('/') {path.to_owned()} else {format!("/{path}")}).unwrap_or_else(|| "/".to_owned());
-		let authority = if port == 443 {host} else {format!("{host}:{port}")};
-		let request = match body {
-			Some(body) => [format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat(),
-			None => format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n").into_bytes(),
-		};
-		tls.write_all(&request).await.map_err(|_| FetchError::NotHttp)?;
-		tls.flush().await.map_err(|_| FetchError::NotHttp)?;
-		if body.is_some() {read_answer(&mut tls, BODY_MAX, started, |_| FETCH_TIMEOUT).await} else {read_answer(&mut tls, mirror::SIZES[4], started, mirror::time_limit).await}
+		talk(tls, &request, started, clock).await
 	}
 }
 
-// Reads the head of an answer and its body, inside the bounds of the page: at most `limit` bytes of body, in the time `time` gives for the length the head names, counted from `started`.
-async fn read_answer(io: &mut (impl AsyncRead + Unpin), limit: usize, started: Instant, time: fn(Option<usize>) -> Duration) -> Result<Vec<u8>, FetchError> {
+/// What a `POST` got back: the body of the answer and its `Date` field in Unix seconds, when it had one in the only form a server may write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {pub body: Vec<u8>, pub date: Option<u64>}
+
+// "Sun, 06 Nov 1994 08:49:37 GMT": the IMF-fixdate of RFC 9110, the one form read. Anything else is no date.
+fn http_date(text: &[u8]) -> Option<u64> {
+	let text = std::str::from_utf8(text).ok()?;
+	let (_, rest) = text.split_once(", ")?;
+	let mut parts = rest.split(' ');
+	let (day, month, year, time, zone) = (parts.next()?.parse::<u64>().ok()?, parts.next()?, parts.next()?.parse::<i64>().ok()?, parts.next()?, parts.next()?);
+	let month = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"].iter().position(|name| *name == month)? as i64 + 1;
+	let mut clock = time.split(':').map(|part| part.parse::<u64>().ok());
+	let (hours, minutes, seconds) = (clock.next()??, clock.next()??, clock.next()??);
+	if zone != "GMT" || parts.next().is_some() || clock.next().is_some() || !(1..=31).contains(&day) || hours > 23 || minutes > 59 || seconds > 60 || year < 1970 {return None}
+	// Days from the civil date (Howard Hinnant's algorithm).
+	let shifted = year - i64::from(month <= 2);
+	let (era, year_of_era) = (shifted.div_euclid(400), shifted.rem_euclid(400));
+	let day_of_year = (153 * (month + if month > 2 {-3} else {9}) + 2) / 5 + day as i64 - 1;
+	let days = era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468;
+	u64::try_from(days).ok()?.checked_mul(86_400)?.checked_add(hours * 3_600 + minutes * 60 + seconds)
+}
+
+// "When a fetch gets an answer that is not sealed and the answer's `Date` field differs from the device's clock by more than 300 s": the failure that tells the user how far apart the clocks are. `plain` is a fetch without TLS, where anyone on the way can write the field.
+fn clock_error(date: Option<u64>, now: u64, plain: bool) -> Option<FetchError> {date.map(|date| date.abs_diff(now)).filter(|apart| *apart > CLOCK_TOLERANCE).map(|apart| FetchError::Clock {minutes: (apart + 30) / 60, unverified: plain})}
+
+// Writes the request and reads the answer to it.
+async fn talk(mut io: impl AsyncRead + AsyncWrite + Unpin, request: &[u8], started: Instant, clock: Option<(u64, bool)>) -> Result<Answer, FetchError> {
+	io.write_all(request).await.map_err(|_| FetchError::NotHttp)?;
+	io.flush().await.map_err(|_| FetchError::NotHttp)?;
+	read_answer(&mut io, mirror::SIZES[4], started, mirror::time_limit, clock).await
+}
+
+// Reads the head of an answer and its body, inside the bounds of the page: at most `limit` bytes of body, in the time `time` gives for the length the head names, counted from `started`. `clock` is the device's clock and whether the fetch is plain, for a `POST`: an answer of another status than 200 may then be a message about the clocks.
+async fn read_answer(io: &mut (impl AsyncRead + Unpin), limit: usize, started: Instant, time: fn(Option<usize>) -> Duration, clock: Option<(u64, bool)>) -> Result<Answer, FetchError> {
 	let mut buffer = Vec::new();
 	let end = loop {
 		if let Some(end) = http::end(&buffer) {break end}
@@ -405,14 +465,16 @@ async fn read_answer(io: &mut (impl AsyncRead + Unpin), limit: usize, started: I
 		}
 	};
 	let head = http::head(&buffer[..end]).ok_or(FetchError::NotHttp)?;
-	if (300..400).contains(&head.status) {return Err(FetchError::Redirect)}
-	if head.status != 200 {return Err(FetchError::Status(head.status))}
-	if head.values("content-encoding").next().is_some() {return Err(FetchError::Encoding)}
+	let date = head.values("date").next().and_then(http_date);
+	let skewed = clock.and_then(|(now, plain)| clock_error(date, now, plain));
+	if (300..400).contains(&head.status) {return Err(skewed.unwrap_or(FetchError::Redirect))}
+	if head.status != 200 {return Err(skewed.unwrap_or(FetchError::Status(head.status)))}
+	if head.values("content-encoding").next().is_some() {return Err(skewed.unwrap_or(FetchError::Encoding))}
 	let (chunked, length) = (head.values("transfer-encoding").map(<[u8]>::to_vec).collect::<Vec<_>>(), head.values("content-length").map(<[u8]>::to_vec).collect::<Vec<_>>());
 	let mut rest = buffer.split_off(end);
 	if !chunked.is_empty() {
 		if !length.is_empty() || chunked.len() != 1 || !chunked[0].eq_ignore_ascii_case(b"chunked") {return Err(FetchError::Body)}
-		return timeout_at(started + time(None), unchunk(io, rest, limit)).await.unwrap_or(Err(FetchError::Timeout));
+		return timeout_at(started + time(None), unchunk(io, rest, limit)).await.unwrap_or(Err(FetchError::Timeout)).map(|body| Answer {body, date});
 	}
 	let wanted = match length.as_slice() {
 		[] => None,
@@ -436,7 +498,7 @@ async fn read_answer(io: &mut (impl AsyncRead + Unpin), limit: usize, started: I
 	timeout_at(started + time(wanted), read).await.unwrap_or(Err(FetchError::Timeout))?;
 	// A length that was promised is the length that came, and a body with no length ends where the connection does.
 	if wanted.is_some_and(|wanted| rest.len() != wanted) {return Err(FetchError::Body)}
-	Ok(rest)
+	Ok(Answer {body: rest, date})
 }
 
 // The body of a chunked answer, as strictly as the page's reader of a head is: a size of plain hexadecimal digits, no extension, no trailer.
@@ -491,7 +553,10 @@ pub trait Vault: Send + Sync {
 struct OriginWire {link: String, private: String, secret: String}
 
 #[derive(Serialize, Deserialize)]
-struct StoredWire {#[serde(default)] origin: Option<OriginWire>, keys: Vec<String>, document: String, #[serde(default)] hosts: Vec<String>, #[serde(default)] declined: Vec<String>, #[serde(default)] pins: Vec<String>, #[serde(default)] private: Vec<String>}
+struct MoveWire {key: String, confirmed: bool, declined: bool}
+
+#[derive(Serialize, Deserialize)]
+struct StoredWire {#[serde(default)] origin: Option<OriginWire>, keys: Vec<String>, document: String, #[serde(default)] hosts: Vec<String>, #[serde(default)] declined: Vec<String>, #[serde(default)] pins: Vec<String>, #[serde(default)] private: Vec<String>, #[serde(default)] endpoint: Option<String>, #[serde(default)] moving: Option<MoveWire>}
 
 /// The most subscriptions a vault holds and the most it reads.
 pub const HELD_MAX: usize = 64;
@@ -504,7 +569,7 @@ fn from_wire(wire: StoredWire) -> Option<Stored> {
 		Some(origin) => Some((origin.link, Secret::new(array(&origin.private)?), DeviceSecret::new(array(&origin.secret)?))),
 		None => None,
 	};
-	Some(Stored {origin, keys: wire.keys.iter().map(|key| array(key)).collect::<Option<Vec<_>>>()?, document: wire.document, hosts: wire.hosts, declined: wire.declined, pins: wire.pins.iter().map(|pin| array(pin)).collect::<Option<Vec<_>>>()?, private: wire.private.iter().filter_map(|address| address.parse().ok()).collect()})
+	Some(Stored {origin, keys: wire.keys.iter().map(|key| array(key)).collect::<Option<Vec<_>>>()?, document: wire.document, hosts: wire.hosts, declined: wire.declined, pins: wire.pins.iter().map(|pin| array(pin)).collect::<Option<Vec<_>>>()?, private: wire.private.iter().filter_map(|address| address.parse().ok()).collect(), endpoint: wire.endpoint, moving: wire.moving.map(|moving| StoredMove {key: moving.key, confirmed: moving.confirmed, declined: moving.declined})})
 }
 
 /// Reads a vault file. A file that is not one is an error, and an entry that is not one is left out.
@@ -516,7 +581,7 @@ pub fn read_vault(bytes: &[u8]) -> io::Result<Vec<Stored>> {
 
 /// The bytes of a vault file.
 pub fn write_vault(held: &[Stored]) -> Vec<u8> {
-	let wires: Vec<StoredWire> = held.iter().take(HELD_MAX).map(|stored| StoredWire {origin: stored.origin.as_ref().map(|(link, private, secret)| OriginWire {link: link.clone(), private: STANDARD.encode(private.expose()), secret: STANDARD.encode(secret.expose())}), keys: stored.keys.iter().map(|key| STANDARD.encode(key)).collect(), document: stored.document.clone(), hosts: stored.hosts.clone(), declined: stored.declined.clone(), pins: stored.pins.iter().map(|pin| STANDARD.encode(pin)).collect(), private: stored.private.iter().map(ToString::to_string).collect()}).collect();
+	let wires: Vec<StoredWire> = held.iter().take(HELD_MAX).map(|stored| StoredWire {origin: stored.origin.as_ref().map(|(link, private, secret)| OriginWire {link: link.clone(), private: STANDARD.encode(private.expose()), secret: STANDARD.encode(secret.expose())}), keys: stored.keys.iter().map(|key| STANDARD.encode(key)).collect(), document: stored.document.clone(), hosts: stored.hosts.clone(), declined: stored.declined.clone(), pins: stored.pins.iter().map(|pin| STANDARD.encode(pin)).collect(), private: stored.private.iter().map(ToString::to_string).collect(), endpoint: stored.endpoint.clone(), moving: stored.moving.as_ref().map(|moving| MoveWire {key: moving.key.clone(), confirmed: moving.confirmed, declined: moving.declined})}).collect();
 	serde_json::to_vec(&wires).unwrap_or_default()
 }
 
@@ -570,6 +635,13 @@ impl Library {
 		held.decline_hosts(decline);
 		self.save().inspect_err(|_| self.held[at] = before)
 	}
+	/// The user's answer about the move of the subscription at `at`, as `Move::key` named it on the screen: yes, which a refresh then tries first, or no, which keeps the main endpoint and leaves the move in the details. The library is written; on a failed write nothing is kept.
+	pub fn answer_move(&mut self, at: usize, seen: &str, yes: bool) -> io::Result<()> {
+		let Some(held) = self.held.get_mut(at) else {return Ok(())};
+		let before = held.clone();
+		if yes {held.confirm_move(seen)} else {held.decline_move(seen)}
+		self.save().inspect_err(|_| self.held[at] = before)
+	}
 	/// Removes a subscription, with its link, its key and its secret: "Removing a subscription in the app deletes its key, secret and link."
 	pub fn remove(&mut self, id: &veilway_proto::subscription::payload::Id) -> io::Result<bool> {
 		let before = self.held.len();
@@ -580,7 +652,7 @@ impl Library {
 }
 
 /// The review of an answer, with the endpoint it came from, which `release` and `confirm` go back to.
-pub struct Reviewed {pub review: Review, pub endpoint: Option<Url>, pub pins: Vec<[u8; 32]>, pub private: Vec<IpAddr>}
+pub struct Reviewed {pub review: Review, pub endpoint: Option<Url>, pub pins: Vec<[u8; 32]>, pub private: Vec<IpAddr>, pub keys: Vec<GatewayKey>}
 
 impl std::fmt::Debug for Reviewed {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {write!(f, "Reviewed({:?})", self.review)}
@@ -589,8 +661,9 @@ impl std::fmt::Debug for Reviewed {
 /// Step 1: reads a text as a link. Nothing is sent, generated or stored. White space around a pasted text is cut off here, since the grammar reads a text exactly as it is.
 pub fn open(text: &str) -> Result<Offer, ImportError> {
 	let text = text.trim();
-	if !text.starts_with("veilway://") && !text.starts_with("https://") {return Err(ImportError::NotALink)}
-	match Link::parse(text).map(Offer::open).map_err(ImportError::Link)? {
+	if !text.starts_with("veilway://") && !text.starts_with("https://") && !text.starts_with("http://") {return Err(ImportError::NotALink)}
+	// A legacy link is `https` only, so an `http` text with no native fragment is no subscription link at all.
+	match Link::parse(text).map(Offer::open).map_err(|error| if text.starts_with("http://") && !text.contains("#v") {ImportError::NotALink} else {ImportError::Link(error)})? {
 		Offer::Legacy(_) => Err(ImportError::Legacy),
 		offer => Ok(offer),
 	}
@@ -605,31 +678,53 @@ pub fn proceed(offer: NativeOffer, device: Option<Device>) -> Result<Fetching, I
 /// The user's yes to a whole document in a link or a file: there is nothing to fetch, and it is reviewed at once.
 pub fn proceed_carried(offer: CarriedOffer, now: u64, library: &Library) -> Result<Reviewed, ImportError> {
 	let stored: Vec<&Held> = library.held.iter().collect();
-	offer.proceed(now, &stored).map(|review| Reviewed {review, endpoint: None, pins: Vec::new(), private: Vec::new()}).map_err(ImportError::Subscription)
+	offer.proceed(now, &stored).map(|review| Reviewed {review, endpoint: None, pins: Vec::new(), private: Vec::new(), keys: Vec::new()}).map_err(ImportError::Subscription)
+}
+
+// The device's clock, in Unix seconds, for a request that has no `now` of a caller: `confirm` and `release`.
+fn clock() -> u64 {SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs())}
+
+/// One sealed request to one place, and the envelope its answer holds: `request` is sealed to the first of `keys` with a new ephemeral key, `t` is `now`, and the answer is opened with the context of that request and no other. "When an HTTP answer arrived and it was not a sealed answer that opens, it tries the second key once, in the same refresh, with a new request. A timeout, a failed TLS handshake or pin, or a failed lookup is no reason to try the second key. Never more than one retry." A failure that is an answer is first read as a message about the clocks: "when a fetch gets an answer that is not sealed and the answer's `Date` field differs from the device's clock by more than 300 s".
+pub async fn ask(wire: &impl Wire, request: &Request, url: &Url, trust: &Trust, keys: &[GatewayKey], allowed: &[IpAddr], now: u64) -> Result<Vec<u8>, FetchError> {
+	let mut key = *keys.first().ok_or(FetchError::NotOpen)?;
+	loop {
+		let sealed = request.seal(&key, now, &mut crate::random).map_err(|_| FetchError::Random)?;
+		debug_assert_eq!(sealed.bytes().len(), REQUEST);
+		let failure = match wire.post(url, trust, sealed.bytes(), allowed, now).await {
+			Ok(answer) => match sealed.open(&answer.body) {
+				Ok(envelope) => return Ok(envelope),
+				Err(_) => clock_error(answer.date, now, url.is_plain()).unwrap_or(FetchError::NotOpen),
+			},
+			Err(error) => error,
+		};
+		match next_key(keys, &key, failure.answered()) {
+			Some(next) => key = next,
+			None => return Err(failure),
+		}
+	}
 }
 
 impl Fetcher {
-	/// Step 2 of a native import, after the user's yes: the one request with `op` `"fetch"`. A failure leaves the step as it was, to try again or to `abandon`.
+	/// Step 2 of a native import, after the user's yes: the one request with `op` `"fetch"`, sealed to the link's gateway key. A failure leaves the step as it was, to try again or to `abandon`.
 	/// `allowed` is the private addresses the user said yes to for this import, as the question showed them, and nothing else: an app passes none the first time.
 	pub async fn fetch(&self, fetching: &Fetching, library: &Library, now: u64, allowed: &[IpAddr]) -> Result<Reviewed, ImportError> {
-		let body = self.post(fetching.endpoint(), &Trust::of(fetching.pins()), &fetching.request().body(), allowed).await?;
+		let envelope = ask(self, &fetching.request(), fetching.endpoint(), &Trust::of(fetching.pins()), fetching.gateway(), allowed, now).await?;
 		let stored: Vec<&Held> = library.held.iter().collect();
-		let review = fetching.answer(&body, now, &stored).map_err(ImportError::Subscription)?;
+		let review = fetching.answer(&envelope, now, &stored).map_err(ImportError::Subscription)?;
 		// `confirm` and `release` go to the endpoint the way the review says it is checked, which is the document's list of pins when it has one.
-		Ok(Reviewed {pins: review.pins().to_vec(), review, endpoint: Some(fetching.endpoint().clone()), private: allowed.to_vec()})
+		Ok(Reviewed {pins: review.pins().to_vec(), review, endpoint: Some(fetching.endpoint().clone()), private: allowed.to_vec(), keys: fetching.gateway().to_vec()})
 	}
 	/// The import is given up after the request went out and before an answer could be reviewed: the `release` request frees the pending place. Best effort.
 	pub async fn abandon(&self, fetching: Fetching, allowed: &[IpAddr]) {
-		let (endpoint, trust) = (fetching.endpoint().clone(), Trust::of(fetching.pins()));
-		let request = fetching.abandon();
-		if let Err(error) = self.post(&endpoint, &trust, &request.body(), allowed).await {tracing::info!(?error, "the pending device place could not be released");}
+		let (endpoint, trust, keys) = (fetching.endpoint().clone(), Trust::of(fetching.pins()), fetching.gateway().to_vec());
+		self.send(Some(&endpoint), &trust, &keys, Some(fetching.abandon()), allowed).await;
 	}
 	/// Step 3, the user accepts. The subscription is stored first, so that the device key is not lost with a failed `confirm`, and then the place is made permanent. A rule that no longer allows it releases the place and stores nothing. A subscription that is stored and whose `confirm` did not go out is not an error: the next refresh enrols it again.
 	pub async fn accept(&self, reviewed: Reviewed, name: Option<DeviceName>, library: &mut Library) -> Result<Accepted, ImportError> {
-		let Reviewed {review, endpoint, pins, private} = reviewed;
+		let Reviewed {review, endpoint, pins, private, keys} = reviewed;
 		// A subscription beyond what a vault holds is refused here and not dropped when the vault is written: the place the device took is given back.
 		if !review.replaces() && library.held.len() >= HELD_MAX {
-			self.send(endpoint.as_ref(), &pins, review.decline(), &private).await;
+			self.send(endpoint.as_ref(), &Trust::of(&pins), &keys, review.decline(), &private).await;
 			return Err(ImportError::Full);
 		}
 		let accepted = {
@@ -640,7 +735,7 @@ impl Fetcher {
 			Ok(accepted) => accepted,
 			Err(declined) => {
 				let Declined {failure, release} = *declined;
-				self.send(endpoint.as_ref(), &pins, release, &private).await;
+				self.send(endpoint.as_ref(), &Trust::of(&pins), &keys, release, &private).await;
 				return Err(ImportError::Subscription(failure));
 			}
 		};
@@ -658,20 +753,21 @@ impl Fetcher {
 			tracing::info!(?error, "the accepted subscription could not be saved");
 			return Err(ImportError::Store(error));
 		}
-		// The pins the endpoint is held to now are the ones the accepted document names.
-		let held_pins = accepted.held.targets().first().map(|(_, pins)| pins.to_vec()).unwrap_or(pins);
-		self.send(endpoint.as_ref(), &held_pins, accepted.confirm.clone(), &private).await;
+		// The pins and the gateway keys the endpoint is held to now are the ones the accepted document names. The place was taken at the main endpoint, which is where `confirm` goes, whatever move the document asks for.
+		let main = accepted.held.targets().into_iter().find(|target| target.role == Role::Main).map(|target| (target.pins.to_vec(), target.keys.to_vec()));
+		let (held_pins, held_keys) = main.unwrap_or((pins, keys));
+		self.send(endpoint.as_ref(), &Trust::of(&held_pins), &held_keys, accepted.confirm.clone(), &private).await;
 		Ok(accepted)
 	}
 	/// The user declines: the `release` request, and nothing kept.
 	pub async fn decline(&self, reviewed: Reviewed) {
-		let Reviewed {review, endpoint, pins, private} = reviewed;
-		self.send(endpoint.as_ref(), &pins, review.decline(), &private).await;
+		let Reviewed {review, endpoint, pins, private, keys} = reviewed;
+		self.send(endpoint.as_ref(), &Trust::of(&pins), &keys, review.decline(), &private).await;
 	}
 	// A request whose answer is not read: `confirm` and `release`. A failure is logged and is not the import's.
-	async fn send(&self, endpoint: Option<&Url>, pins: &[[u8; 32]], request: Option<Request>, allowed: &[IpAddr]) {
+	async fn send(&self, endpoint: Option<&Url>, trust: &Trust, keys: &[GatewayKey], request: Option<Request>, allowed: &[IpAddr]) {
 		let (Some(endpoint), Some(request)) = (endpoint, request) else {return};
-		if let Err(error) = self.post(endpoint, &Trust::of(pins), &request.body(), allowed).await {tracing::info!(?error, "a request of the import could not be sent");}
+		if let Err(error) = ask(self, &request, endpoint, trust, keys, allowed, clock()).await {tracing::info!(?error, "a request of the import could not be sent");}
 	}
 	/// Refreshes the subscription at `at` and says where the answer came from. The caller decides when ("When a fetch happens"). See `Library::refresh_over` for the order and what ends a refresh.
 	pub async fn refresh_from(&self, library: &mut Library, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {library.refresh_over(self, at, now).await}
@@ -679,15 +775,15 @@ impl Fetcher {
 	pub async fn refresh(&self, library: &mut Library, at: usize, now: u64) -> Result<Refreshed, ImportError> {self.refresh_from(library, at, now).await.map(|(refreshed, _)| refreshed).map_err(|failed| failed.error)}
 }
 
-/// What a refresh needs of the network: one `POST` to an endpoint and one `GET` of a static file. `Fetcher` is the one that ships, and a test puts its own in.
+/// What a refresh needs of the network: one `POST` of sealed bytes to an endpoint and one `GET` of a static file. `Fetcher` is the one that ships, and a test puts its own in.
 #[allow(async_fn_in_trait)]
 pub trait Wire {
-	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError>;
+	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError>;
 	async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError>;
 }
 
 impl Wire for Fetcher {
-	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {Fetcher::post(self, url, trust, body, allowed).await}
+	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {Fetcher::post(self, url, trust, body, allowed, now).await}
 	async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {Fetcher::get(self, url, allowed).await}
 }
 
@@ -700,18 +796,18 @@ impl From<ImportError> for RefreshFailed {
 }
 
 impl Library {
-	/// Refreshes the subscription at `at` through `wire`, trying the places in the order of "Order and rate": the endpoint of its link, then the confirmed `refresh_urls` in the document's order, then the confirmed static mirrors. A subscription that came as a whole document cannot refresh.
+	/// Refreshes the subscription at `at` through `wire`, trying the places in the order of "Order and rate": the endpoint of a confirmed move, the main endpoint, then the confirmed `refresh_urls` in the document's order, then the confirmed static mirrors. A subscription that came as a whole document cannot refresh. Each place gets a request of its own, sealed to the gateway keys it follows, and a document from the endpoint of a move is checked against the move (`Held::refresh_moved`).
 	/// The refresh ends at the first accepted answer from the endpoint or a relay mirror (a newer document or the same bytes again), at a newer document from a static mirror, or at a signed refusal that verifies, wherever it came from. Everything else is a failure of that place and the next is tried: from a static mirror that includes the held document again ("this mirror has nothing newer", no successful refresh), an older one, a 404 and a file that does not open, none of which is a revocation. The reason of a failed refresh is the endpoint's (the last place before the static mirrors), and a static mirror changes it only to ask about a private address.
 	pub async fn refresh_over(&mut self, wire: &impl Wire, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {
 		let Some(held) = self.held.get(at) else {return Err(ImportError::Subscription(Failure::HasLink).into())};
-		let (Some(request), targets) = (held.fetch(), held.targets().into_iter().map(|(url, pins)| (url.clone(), pins.to_vec())).collect::<Vec<_>>()) else {return Err(ImportError::Legacy.into())};
+		let (Some(request), targets) = (held.fetch(), held.targets().into_iter().map(|target| (target.role, target.url.clone(), target.pins.to_vec(), target.keys.to_vec())).collect::<Vec<_>>()) else {return Err(ImportError::Legacy.into())};
 		let (mut last, allowed) = (ImportError::Fetch(FetchError::Connect), self.held[at].private_addresses().to_vec());
-		for (place, (endpoint, pins)) in targets.into_iter().enumerate() {
-			match wire.post(&endpoint, &Trust::of(&pins), &request.body(), &allowed).await {
-				Ok(body) => match self.held[at].refresh(&body, now) {
+		for (role, endpoint, pins, keys) in targets {
+			match ask(wire, &request, &endpoint, &Trust::of(&pins), &keys, &allowed, now).await {
+				Ok(envelope) => match if role == Role::Move {self.held[at].refresh_moved(&envelope, now)} else {self.held[at].refresh(&envelope, now)} {
 					Ok(refreshed) => {
 						self.save().map_err(ImportError::Store)?;
-						return Ok((refreshed, if place == 0 {Source::Endpoint} else {Source::Relay}));
+						return Ok((refreshed, match role {Role::Move => Source::Moved, Role::Main => Source::Endpoint, Role::Relay => Source::Relay}));
 					}
 					Err(Failure::Refused(reason)) => return Err(ImportError::Subscription(Failure::Refused(reason)).into()),
 					Err(failure) => last = ImportError::Subscription(failure),
@@ -754,17 +850,17 @@ mod tests {
 
 		#[test]
 		fn an_entry_that_is_written_reads_back_as_it_was(link in "[a-z0-9:/.#-]{0,40}", document in "[A-Za-z0-9._-]{0,60}", key in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), host in "[a-z0-9.]{1,20}:[0-9]{1,5}") {
-			let stored = Stored {origin: Some((link.clone(), Secret::new(key), DeviceSecret::new(secret))), keys: vec![key], document: document.clone(), hosts: vec![host.clone()], declined: vec![host.clone()], pins: vec![key], private: vec!["192.168.1.20".parse().unwrap()]};
+			let stored = Stored {origin: Some((link.clone(), Secret::new(key), DeviceSecret::new(secret))), keys: vec![key], document: document.clone(), hosts: vec![host.clone()], declined: vec![host.clone()], pins: vec![key], private: vec!["192.168.1.20".parse().unwrap()], endpoint: Some("https://new.example.net/s".into()), moving: Some(StoredMove {key: "https://other.example.net/s#chain".into(), confirmed: true, declined: false})};
 			let read = read_vault(&write_vault(&[stored])).unwrap();
 			prop_assert_eq!(read.len(), 1);
-			prop_assert!(read[0].private == vec!["192.168.1.20".parse::<IpAddr>().unwrap()] && read[0].keys == vec![key] && read[0].pins == vec![key] && read[0].document == document && read[0].hosts == vec![host.clone()] && read[0].declined == vec![host] && read[0].origin.as_ref().is_some_and(|(found, private, device)| *found == link && private.expose() == &key && device.expose() == &secret));
+			prop_assert!(read[0].private == vec!["192.168.1.20".parse::<IpAddr>().unwrap()] && read[0].keys == vec![key] && read[0].pins == vec![key] && read[0].document == document && read[0].hosts == vec![host.clone()] && read[0].declined == vec![host] && read[0].endpoint.as_deref() == Some("https://new.example.net/s") && read[0].moving.as_ref().is_some_and(|moving| moving.confirmed && !moving.declined && moving.key == "https://other.example.net/s#chain") && read[0].origin.as_ref().is_some_and(|(found, private, device)| *found == link && private.expose() == &key && device.expose() == &secret));
 		}
 	}
 
 	#[test]
 	fn a_vault_that_is_not_one_is_an_error_and_an_entry_that_is_not_one_is_left_out() {
 		for bytes in [&b""[..], b"{}", b"[1]", b"[{\"keys\": 5}]", b"\xff"] {assert!(read_vault(bytes).is_err(), "{:?}", String::from_utf8_lossy(bytes))}
-		let good = write_vault(&[Stored {origin: None, keys: vec![[3; 32]], document: "d".into(), hosts: Vec::new(), declined: Vec::new(), pins: vec![[5; 32]], private: Vec::new()}]);
+		let good = write_vault(&[Stored {origin: None, keys: vec![[3; 32]], document: "d".into(), hosts: Vec::new(), declined: Vec::new(), pins: vec![[5; 32]], private: Vec::new(), endpoint: None, moving: None}]);
 		assert_eq!(read_vault(&good).unwrap().len(), 1);
 		let text = String::from_utf8(good).unwrap().replace(&STANDARD.encode([3u8; 32]), "not base64");
 		assert!(read_vault(text.as_bytes()).unwrap().is_empty());
@@ -785,7 +881,7 @@ mod tests {
 		let url = Url::pinned(url, 200, true, false).unwrap();
 		tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
 			// With a yes the dial goes on to the network, which a test does not wait for: all it needs to know is that the answer is no question.
-			timeout(std::time::Duration::from_secs(2), fetcher.post(&url, &Trust::Chain, b"{}", allowed)).await.unwrap_or(Err(FetchError::Timeout))
+			timeout(std::time::Duration::from_secs(2), fetcher.post(&url, &Trust::Chain, b"{}", allowed, 0)).await.unwrap_or(Err(FetchError::Timeout)).map(|answer| answer.body)
 		})
 	}
 
@@ -969,11 +1065,17 @@ mod tests {
 		mirror::seal(&keys, base, mirror::epoch(NOW), mirror::size_for(document.len()).unwrap(), document.as_bytes(), &mut |bytes: &mut [u8]| {bytes.fill(7); Ok(())}).unwrap()
 	}
 
-	// A network of canned answers by method and host, that remembers what it was asked and in which order.
-	struct Fake {answers: std::collections::HashMap<String, Result<Vec<u8>, FetchError>>, asked: std::sync::Mutex<Vec<String>>}
+	// The gateway of the vectors behind every host the fake answers for: the keys 1 and 2, whose private halves are 40..5f and 60..7f.
+	fn gateway() -> veilway_proto::subscription::exchange::Gateway {
+		let private = |fill: u8| -> [u8; 32] {std::array::from_fn(|index| fill + index as u8)};
+		veilway_proto::subscription::exchange::Gateway::new(&[(1, private(0x40)), (2, private(0x60))], 0, &mut |bytes: &mut [u8]| {bytes.fill(9); Ok(())}).unwrap()
+	}
+
+	// A network of canned answers by method and host, that remembers what it was asked and in which order. A `POST` is opened by a real gateway and answered with the canned envelope sealed to the request, and an answer that is an error is the error.
+	struct Fake {answers: std::collections::HashMap<String, Result<Vec<u8>, FetchError>>, asked: std::sync::Mutex<Vec<String>>, gateway: std::sync::Mutex<veilway_proto::subscription::exchange::Gateway>, posted: std::sync::Mutex<Vec<(String, usize)>>}
 
 	impl Fake {
-		fn new(answers: Vec<(&str, Result<Vec<u8>, FetchError>)>) -> Self {Self {answers: answers.into_iter().map(|(place, answer)| (place.to_owned(), answer)).collect(), asked: Default::default()}}
+		fn new(answers: Vec<(&str, Result<Vec<u8>, FetchError>)>) -> Self {Self {answers: answers.into_iter().map(|(place, answer)| (place.to_owned(), answer)).collect(), asked: Default::default(), gateway: std::sync::Mutex::new(gateway()), posted: Default::default()}}
 		fn answer(&self, method: &str, url: &Url) -> Result<Vec<u8>, FetchError> {
 			let place = format!("{method} {}", url.host());
 			self.asked.lock().unwrap().push(place.clone());
@@ -983,7 +1085,12 @@ mod tests {
 	}
 
 	impl Wire for Fake {
-		async fn post(&self, url: &Url, _: &Trust, _: &[u8], _: &[IpAddr]) -> Result<Vec<u8>, FetchError> {self.answer("POST", url)}
+		async fn post(&self, url: &Url, _: &Trust, body: &[u8], _: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
+			self.posted.lock().unwrap().push((url.host().to_owned(), body.len()));
+			let envelope = self.answer("POST", url)?;
+			let opened = self.gateway.lock().unwrap().open(body, now, || true).map_err(|_| FetchError::Status(404))?;
+			opened.reply.seal(&envelope, &mut crate::random).map(|body| Answer {body, date: None}).map_err(|_| FetchError::NotOpen)
+		}
 		async fn get(&self, url: &Url, _: &[IpAddr]) -> Result<Vec<u8>, FetchError> {self.answer("GET", url)}
 	}
 
@@ -1004,7 +1111,8 @@ mod tests {
 		let mut library = self::library("order", imported());
 		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Timeout)), ("POST relay.example.net", Err(FetchError::Status(500))), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
 		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Static))));
-		assert_eq!(fake.asked(), ["POST sub.example.com", "POST relay.example.net", "GET files.example.net"]);
+		// The relay answered with a status, which is an HTTP answer that did not open: the second gateway key is tried once, in the same refresh, and a timeout at the endpoint was no reason to.
+		assert_eq!(fake.asked(), ["POST sub.example.com", "POST relay.example.net", "POST relay.example.net", "GET files.example.net"]);
 		assert_eq!(library.held[0].document(), listed(2));
 		assert_eq!(read_vault(&write_vault(&library.held.iter().map(Held::stored).collect::<Vec<_>>())).unwrap()[0].document, listed(2));
 		// The same bytes from the relay again are a successful refresh, and no static mirror is asked.
@@ -1092,14 +1200,177 @@ mod tests {
 		assert_eq!([Source::Endpoint, Source::Relay, Source::Static].map(Source::as_str), ["endpoint", "relay", "static"]);
 	}
 
+	// The document of vectors.py at `serial` that asks for a move to `url`, behind the gateway key 2.
+	fn moving(serial: u64, url: &str) -> String {
+		let key = veilway_proto::subscription::envelope::SigningKey::new(ring::signature::KeyPair::public_key(&pair()).as_ref().try_into().unwrap()).unwrap();
+		let mut payload: serde_json::Value = serde_json::from_slice(veilway_proto::subscription::envelope::verify(&corpus("fuzz_sub_envelope/document")[1..], &[key], BODY_MAX).unwrap().payload()).unwrap();
+		payload["serial"] = serial.into();
+		payload["main_endpoint"] = serde_json::json!({"url": url, "gateway_keys": [payload["gateway_keys"][1].clone()]});
+		sign(&payload)
+	}
+
+	#[test]
+	fn the_second_gateway_key_is_tried_once_after_an_http_answer_that_did_not_open_and_for_nothing_else() {
+		let down = |error: FetchError| {
+			let mut library = library("keys", imported());
+			let fake = Fake::new(vec![("POST sub.example.com", Err(error))]);
+			let failed = run(&mut library, &fake).err().map(|failed| failed.error.code());
+			(failed, fake.asked().iter().filter(|place| place.starts_with("POST sub")).count())
+		};
+		// A status, a redirect, a body that lies and a refused encoding are HTTP answers: one more request, and no more.
+		for error in [FetchError::Status(404), FetchError::Redirect, FetchError::Body, FetchError::Encoding, FetchError::NotOpen] {assert_eq!(down(error.clone()).1, 2, "{error:?}")}
+		// A timeout, a refused connection, a failed lookup, a failed handshake or pin and anything that is no HTTP says nothing about the key.
+		for error in [FetchError::Timeout, FetchError::Connect, FetchError::Resolve, FetchError::Tls, FetchError::Certificate, FetchError::Pin, FetchError::NotHttp] {assert_eq!(down(error.clone()).1, 1, "{error:?}")}
+		// Every request is the 1,073 bytes of the page, a new one each time.
+		let mut library = library("keys", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Status(404))), ("POST relay.example.net", ok(listed(2)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Relay))));
+		assert_eq!(fake.posted.lock().unwrap().iter().map(|(_, size)| *size).collect::<Vec<_>>(), [REQUEST; 3]);
+		// A subscription with one gateway key has no second to try.
+		let mut stored = imported().stored();
+		stored.document = {
+			let key = veilway_proto::subscription::envelope::SigningKey::new(ring::signature::KeyPair::public_key(&pair()).as_ref().try_into().unwrap()).unwrap();
+			let mut payload: serde_json::Value = serde_json::from_slice(veilway_proto::subscription::envelope::verify(&corpus("fuzz_sub_envelope/document")[1..], &[key], BODY_MAX).unwrap().payload()).unwrap();
+			payload["gateway_keys"] = serde_json::json!([payload["gateway_keys"][0].clone()]);
+			sign(&payload)
+		};
+		let mut library = self::library("keys-one", Held::restore(stored).unwrap());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Status(404)))]);
+		assert!(run(&mut library, &fake).is_err());
+		assert_eq!(fake.asked(), ["POST sub.example.com"]);
+	}
+
+	#[test]
+	fn a_move_is_followed_only_after_the_yes_first_and_with_the_old_endpoint_as_the_fallback() {
+		let new = "https://new.example.net/s";
+		let mut library = library("move", imported());
+		// 1. The document that asks for it is taken, and nothing is sent to the new endpoint.
+		let fake = Fake::new(vec![("POST sub.example.com", ok(moving(2, new)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(changes), Source::Endpoint)) if changes.moving));
+		assert_eq!(fake.asked(), ["POST sub.example.com"]);
+		let key = library.held[0].asking().unwrap().key();
+		let fake = Fake::new(vec![("POST sub.example.com", ok(moving(3, new)))]);
+		assert!(run(&mut library, &fake).is_ok() && fake.asked() == ["POST sub.example.com"]);
+		// 2. After the yes, which is written down, the new endpoint comes first; when it fails the main endpoint is the fallback and the move waits.
+		library.answer_move(0, &key, true).unwrap();
+		let (reopened, _) = Library::open(Box::new(FileVault(std::env::temp_dir().join(format!("veilway-static-move-{}", std::process::id()))))).unwrap();
+		assert_eq!(reopened.held[0].moving().map(|moving| moving.confirmed()), Some(true));
+		let fake = Fake::new(vec![("POST new.example.net", Err(FetchError::Connect)), ("POST sub.example.com", ok(moving(4, new)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Endpoint))));
+		assert_eq!(fake.asked(), ["POST new.example.net", "POST sub.example.com"]);
+		// A document from the new endpoint that does not name it is a failure of that endpoint, and the main endpoint answers.
+		let fake = Fake::new(vec![("POST new.example.net", ok(listed(5))), ("POST sub.example.com", ok(moving(5, new)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Endpoint))));
+		assert_eq!(fake.asked(), ["POST new.example.net", "POST sub.example.com"]);
+		// 3. A document from the new endpoint that names it completes the move: it is the main endpoint, and the old one is dropped.
+		let fake = Fake::new(vec![("POST new.example.net", ok(moving(6, new)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(changes), Source::Moved)) if changes.moved));
+		assert_eq!((library.held[0].endpoint().map(Url::as_str), library.held[0].moving().is_none(), fake.asked()), (Some(new), true, vec!["POST new.example.net".to_owned()]));
+		let fake = Fake::new(vec![("POST new.example.net", ok(listed(7))), ("POST sub.example.com", ok(listed(7)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Endpoint))));
+		assert_eq!(fake.asked(), ["POST new.example.net"]);
+		// What the vault holds comes back with the new endpoint.
+		let (reopened, _) = Library::open(Box::new(FileVault(std::env::temp_dir().join(format!("veilway-static-move-{}", std::process::id()))))).unwrap();
+		assert_eq!(reopened.held[0].endpoint().map(Url::as_str), Some(new));
+	}
+
+	#[test]
+	fn a_date_is_read_in_the_one_form_a_server_may_write_and_the_clocks_are_told_apart_by_more_than_the_tolerance() {
+		for (text, unix) in [("Sun, 06 Nov 1994 08:49:37 GMT", Some(784_111_777)), ("Tue, 14 Nov 2023 22:13:20 GMT", Some(1_700_000_000)), ("Thu, 01 Jan 1970 00:00:00 GMT", Some(0)), ("Sat, 29 Feb 2020 12:00:00 GMT", Some(1_582_977_600)), ("Sunday, 06-Nov-94 08:49:37 GMT", None), ("Sun Nov  6 08:49:37 1994", None), ("Sun, 06 Nov 1994 08:49:37 UTC", None), ("Sun, 06 Nov 1994 25:49:37 GMT", None), ("Sun, 32 Nov 1994 08:49:37 GMT", None), ("Sun, 06 Nov 1969 08:49:37 GMT", None), ("Sun, 06 Nov 1994 08:49:37 GMT x", None), ("Sun, 06 Xxx 1994 08:49:37 GMT", None), ("", None), ("\u{ff}", None)] {assert_eq!(http_date(text.as_bytes()), unix, "{text}")}
+		assert_eq!(http_date(b"\xff\xfe"), None);
+		// "More than 300 s" either way, in minutes rounded to the nearest, and unverified over plain HTTP.
+		assert_eq!([clock_error(Some(NOW), NOW, false), clock_error(Some(NOW + 300), NOW, false), clock_error(Some(NOW - 300), NOW, true), clock_error(None, NOW, false)], [None, None, None, None]);
+		assert_eq!((clock_error(Some(NOW + 301), NOW, false), clock_error(Some(NOW - 3_500), NOW, true), clock_error(Some(NOW + 86_400), NOW, false)), (Some(FetchError::Clock {minutes: 5, unverified: false}), Some(FetchError::Clock {minutes: 58, unverified: true}), Some(FetchError::Clock {minutes: 1_440, unverified: false})));
+		assert_eq!((ImportError::Fetch(FetchError::Clock {minutes: 58, unverified: true}).wire(), ImportError::Fetch(FetchError::Clock {minutes: 58, unverified: false}).code(), ImportError::Fetch(FetchError::Status(404)).wire()), ("server_clock_unverified:58".to_owned(), Code::ServerClock, "no_subscription".to_owned()));
+	}
+
+	// A plain server on the loopback address that reads the requests it gets, with their bytes, and answers each as `answer` says: it is given the 1,073 bytes of the request.
+	fn serve(answer: impl Fn(&[u8]) -> Vec<u8> + Send + 'static) -> (u16, std::sync::mpsc::Receiver<Vec<u8>>) {
+		let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+		let (port, (sender, receiver)) = (listener.local_addr().unwrap().port(), std::sync::mpsc::channel());
+		std::thread::spawn(move || {
+			use std::io::{Read, Write};
+			for stream in listener.incoming() {
+				let mut stream = stream.unwrap();
+				let mut seen = Vec::new();
+				while !(seen.windows(4).any(|end| end == b"\r\n\r\n") && seen.len() >= seen.windows(4).position(|end| end == b"\r\n\r\n").unwrap() + 4 + 1_073) {
+					let mut chunk = [0; 2048];
+					match stream.read(&mut chunk) {Ok(0) | Err(_) => break, Ok(count) => seen.extend_from_slice(&chunk[..count])}
+				}
+				sender.send(seen.clone()).unwrap();
+				let _ = stream.write_all(&answer(&seen[seen.len().saturating_sub(1_073)..]));
+			}
+		});
+		(port, receiver)
+	}
+
+	// A fetcher whose resolver sends every name to the loopback address, which the system's refuses.
+	fn loopback() -> Fetcher {
+		let mut fetcher = Fetcher::new(Arc::new(rustls::RootCertStore::empty()), None);
+		fetcher.resolve = Arc::new(|_, port| Box::pin(async move {Ok(vec![SocketAddr::new(ip("127.0.0.1"), port)])}));
+		fetcher
+	}
+
+	fn plain_request() -> Request {
+		let Link::Native(link) = Link::parse(&String::from_utf8(corpus("fuzz_deeplink/native-plain-http")).unwrap()).unwrap() else {panic!("a native link")};
+		let Offer::Native(offer) = Offer::open(Link::Native(link)) else {panic!("a native link")};
+		offer.proceed(None, &mut fixed).unwrap().request()
+	}
+
+	fn keys() -> Vec<GatewayKey> {
+		let private = |fill: u8| -> [u8; 32] {std::array::from_fn(|index| fill + index as u8)};
+		vec![GatewayKey::new(1, veilway_proto::proof::public_key(&private(0x40))).unwrap(), GatewayKey::new(2, veilway_proto::proof::public_key(&private(0x60))).unwrap()]
+	}
+
+	#[test]
+	fn a_plain_endpoint_gets_the_exact_request_of_the_page_with_no_tls_and_answers_in_a_seal() {
+		let gateway = std::sync::Mutex::new(gateway());
+		let (port, seen) = serve(move |body| {
+			let reply = gateway.lock().unwrap().open(body, clock(), || true).unwrap().reply;
+			let answer = reply.seal(b"an envelope", &mut crate::random).unwrap();
+			[format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\r\n", answer.len()).as_bytes(), &answer].concat()
+		});
+		let url = Url::plain(&format!("http://plain.example.test:{port}/s"), 256, false, false).unwrap();
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		let envelope = runtime.block_on(ask(&loopback(), &plain_request(), &url, &Trust::Chain, &keys(), &[], clock()));
+		assert_eq!(envelope, Ok(b"an envelope".to_vec()));
+		// "Method and target, `Host`, `Content-Type`, `Content-Length`, `Accept-Encoding`": these fields and no other, in the bytes of a request.
+		let request = seen.recv().unwrap();
+		let head = format!("POST /s HTTP/1.1\r\nHost: plain.example.test:{port}\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073\r\nAccept-Encoding: identity\r\n\r\n");
+		assert_eq!((&request[..head.len()], request.len()), (head.as_bytes(), head.len() + 1_073));
+		assert!(!request.windows(5).any(|part| part.eq_ignore_ascii_case(b"token")));
+	}
+
+	#[test]
+	fn an_answer_that_is_not_sealed_with_another_clock_tells_the_clocks_and_the_second_key_is_tried_first() {
+		let date = |unix_text: &str| format!("HTTP/1.1 404 Not Found\r\nDate: {unix_text}\r\nContent-Length: 0\r\n\r\n").into_bytes();
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		// 58 minutes ahead, over plain HTTP, where anyone on the way can write the field: the message says so. The second key was tried first, as after any answer that is not sealed.
+		let (port, seen) = serve(move |_| date("Tue, 14 Nov 2023 23:13:20 GMT"));
+		let url = Url::plain(&format!("http://plain.example.test:{port}/s"), 256, false, false).unwrap();
+		assert_eq!(runtime.block_on(ask(&loopback(), &plain_request(), &url, &Trust::Chain, &keys(), &[], NOW)), Err(FetchError::Clock {minutes: 58, unverified: true}));
+		assert_eq!((seen.recv().is_ok(), seen.recv().is_ok(), seen.recv_timeout(std::time::Duration::from_millis(200)).is_err()), (true, true, true));
+		// The same date within the tolerance is the host's answer to a path it does not serve.
+		let (port, _seen) = serve(move |_| date("Tue, 14 Nov 2023 22:15:00 GMT"));
+		let url = Url::plain(&format!("http://plain.example.test:{port}/s"), 256, false, false).unwrap();
+		assert_eq!(runtime.block_on(ask(&loopback(), &plain_request(), &url, &Trust::Chain, &keys(), &[], NOW)), Err(FetchError::Status(404)));
+		// A 200 whose body does not open is no subscription either, and says the same about the clocks.
+		let (port, _seen) = serve(move |_| [&b"HTTP/1.1 200 OK\r\nDate: Tue, 14 Nov 2023 23:13:20 GMT\r\nContent-Length: 9413\r\n\r\n"[..], &vec![7; 9_413]].concat());
+		let url = Url::plain(&format!("http://plain.example.test:{port}/s"), 256, false, false).unwrap();
+		assert_eq!(runtime.block_on(ask(&loopback(), &plain_request(), &url, &Trust::Chain, &keys(), &[], NOW)), Err(FetchError::Clock {minutes: 58, unverified: true}));
+		let (port, _seen) = serve(move |_| [&b"HTTP/1.1 200 OK\r\nContent-Length: 9413\r\n\r\n"[..], &vec![7; 9_413]].concat());
+		let url = Url::plain(&format!("http://plain.example.test:{port}/s"), 256, false, false).unwrap();
+		assert_eq!(runtime.block_on(ask(&loopback(), &plain_request(), &url, &Trust::Chain, &keys(), &[], NOW)), Err(FetchError::NotOpen));
+	}
+
 	async fn answer(head: &str, body: &[u8], limit: usize, time: fn(Option<usize>) -> Duration) -> Result<Vec<u8>, FetchError> {
 		let (mut near, mut far) = tokio::io::duplex(1 << 21);
 		far.write_all(head.as_bytes()).await.unwrap();
 		far.write_all(body).await.unwrap();
 		let held_open = far;
-		let read = read_answer(&mut near, limit, Instant::now(), time).await;
+		let read = read_answer(&mut near, limit, Instant::now(), time, None).await;
 		drop(held_open);
-		read
+		read.map(|answer| answer.body)
 	}
 
 	#[test]

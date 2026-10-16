@@ -1,8 +1,8 @@
 //! `veilway mirror`: a relay mirror of a subscription endpoint (subscription format page, "When nothing works", `refresh_urls`).
-//! It serves the endpoint's path on another address and forwards each native request to the provider's panel over HTTPS. Every document is signed, so the mirror cannot change one, but it reads every token: it is meant for servers the provider controls.
-//! It sits behind the operator's own web server, which ends TLS and limits sources. A request that is not a `POST` of at most 1,024 bytes of `application/json` to exactly the path is not read further and not forwarded: the mirror hands it back to the web server with status 599, which the web server turns into the answer it gives on any path it does not serve (nginx: `proxy_intercept_errors on; error_page 599 = @unknown;`). A peer that is no trusted proxy gets no answer at all. The same holds when the upstream fails or answers anything but a document, so that the mirror says nothing about the state of the panel.
-//! The panel is sent the real address of the client in `X-Veilway-Mirror: v1;name;address;timestamp;nonce;mac`. The mac is HMAC-SHA-256 under the secret shared with the panel over `veilway mirror v1`, then name, address, timestamp, nonce and the SHA-256 of the body, each after a line feed. The nonce is 16 random bytes, and the nonce, the body's hash and the mac are unpadded base64url. The panel checks the age and refuses a nonce it has seen.
-//! Nothing of a request or answer is kept past the request, and no token is written to a log: the log holds the state of the upstream and nothing from a body.
+//! It serves the endpoint's path on another address and forwards each native request to the provider's panel over HTTPS. Every request is sealed to the panel's gateway and every answer to the request it answers, so the mirror reads no token, no device secret and no document, and cannot change or replay anything: it carries sealed bytes.
+//! It sits behind the operator's own web server, which ends TLS and limits sources. A request that is not a `POST` of exactly 1,073 bytes of `application/octet-stream` to exactly the path is not read further and not forwarded: the mirror hands it back to the web server with status 599, which the web server turns into the answer it gives on any path it does not serve (nginx: `proxy_intercept_errors on; error_page 599 = @unknown;`). A peer that is no trusted proxy gets no answer at all. The upstream hop is `https`, always. To a request that carries a valid mirror header the panel's gateway answers anything it would answer as an unknown path with status 599, and the mirror passes on only a 200 whose body is one of the five sizes of an answer. Everything else it hands back to its own web server too, so that the mirror says nothing about the state of the panel.
+//! The panel is sent the real address of the client in `X-Veilway-Mirror: v1;name;address;timestamp;nonce;mac`. The mac is HMAC-SHA-256 under the secret shared with the panel over `veilway mirror v1`, then name, address, timestamp, nonce and the SHA-256 of the sealed body, each after a line feed. The nonce is 16 random bytes, and the nonce, the body's hash and the mac are unpadded base64url. The panel checks the age and refuses a nonce it has seen.
+//! Nothing of a request or answer is kept past the request, and nothing from a body is written to a log: the log holds the state of the upstream.
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -29,7 +29,7 @@ use tokio::sync::Semaphore;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use veilway_proto::http::{self, Framing};
-use veilway_proto::subscription::{fetch, BODY_MAX};
+use veilway_proto::subscription::{exchange::REQUEST, mirror::SIZES};
 
 const HEAD_MAX: usize = 16_384;
 const CONNECTIONS: usize = 256;
@@ -126,7 +126,7 @@ fn length(head: &[u8]) -> Option<u64> {
 	Some(length)
 }
 
-/// The length of the body of a request the mirror forwards, and None for every other request.
+/// The length of the body of a request the mirror forwards, which is the 1,073 bytes of a sealed request, and None for every other request.
 fn wanted(head: &[u8], path: &str) -> Option<usize> {
 	let mut lines = head.split(|byte| *byte == b'\n').map(|line| line.strip_suffix(b"\r").unwrap_or(line));
 	let mut parts = lines.next()?.split(|byte| *byte == b' ');
@@ -134,7 +134,7 @@ fn wanted(head: &[u8], path: &str) -> Option<usize> {
 	let length = length(head)?;
 	let mut kinds = lines.filter_map(|line| line.iter().position(|byte| *byte == b':').map(|at| (&line[..at], &line[at + 1..]))).filter(|(name, _)| name.eq_ignore_ascii_case(b"content-type"));
 	let (Some((_, kind)), None) = (kinds.next(), kinds.next()) else {return None};
-	(kind.trim_ascii().eq_ignore_ascii_case(b"application/json") && length <= fetch::BODY_MAX as u64).then_some(length as usize)
+	(kind.trim_ascii().eq_ignore_ascii_case(b"application/octet-stream") && length == REQUEST as u64).then_some(length as usize)
 }
 
 /// The upstream's chain is always validated, and its pins are a second condition behind it.
@@ -165,14 +165,14 @@ impl Shared {
 	}
 }
 
-/// The panel's document, or None when anything about getting it failed or the panel answered anything but a 200 document.
+/// The panel's sealed answer, or None when anything about getting it failed or the panel answered anything but a 200 with a body of one of the five sizes of an answer.
 async fn relay(shared: &Shared, body: &[u8], client: IpAddr) -> Option<Vec<u8>> {
 	let (upstream, nonce) = (&shared.checked.upstream, {let mut bytes = [0u8; 16]; SystemRandom::new().fill(&mut bytes).ok()?; URL_SAFE_NO_PAD.encode(bytes)});
 	let at = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
 	let signed = header(&shared.checked.secret, &shared.checked.config.name, client, at, &nonce, body);
 	let host = if upstream.port == 443 {upstream.host.clone()} else {format!("{}:{}", upstream.host, upstream.port)};
 	// HTTP/1.0 so that the answer is never chunked and ends at the length or at the close.
-	let mut request = format!("POST {} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Veilway-Mirror: {signed}\r\nConnection: close\r\n\r\n", upstream.path, body.len()).into_bytes();
+	let mut request = format!("POST {} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nX-Veilway-Mirror: {signed}\r\nConnection: close\r\n\r\n", upstream.path, body.len()).into_bytes();
 	request.extend_from_slice(body);
 	let exchange = async {
 		let mut stream = None;
@@ -186,7 +186,7 @@ async fn relay(shared: &Shared, body: &[u8], client: IpAddr) -> Option<Vec<u8>> 
 			let read = match stream.read(&mut chunk).await {Ok(read) => read, Err(error) if error.kind() == ErrorKind::UnexpectedEof => 0, Err(error) => return Err(error)};
 			if read == 0 {break}
 			raw.extend_from_slice(&chunk[..read]);
-			if raw.len() > HEAD_MAX + BODY_MAX {return Err(ErrorKind::InvalidData.into())}
+			if raw.len() > HEAD_MAX + SIZES[4] {return Err(ErrorKind::InvalidData.into())}
 		}
 		Ok::<_, std::io::Error>(raw)
 	};
@@ -196,18 +196,17 @@ async fn relay(shared: &Shared, body: &[u8], client: IpAddr) -> Option<Vec<u8>> 
 	let mut lines = text.split("\r\n");
 	let mut status = lines.next()?.split(' ');
 	let (version, code) = (status.next()?, status.next()?);
-	let (mut kind, mut length) = (None, None);
+	let mut length = None;
 	for line in lines.filter(|line| !line.is_empty()) {
 		let (name, value) = line.split_once(':')?;
 		match name.to_ascii_lowercase().as_str() {
 			"transfer-encoding" => return None,
-			"content-type" => kind = Some(value.trim()),
-			"content-length" => length = Some(value.trim().parse::<usize>().ok()?),
+						"content-length" => length = Some(value.trim().parse::<usize>().ok()?),
 			_ => {}
 		}
 	}
 	let body = raw[head.len()..].to_vec();
-	if !version.starts_with("HTTP/1.") || code != "200" || !kind.is_some_and(|kind| kind.eq_ignore_ascii_case("application/jose")) || length.is_some_and(|length| length != body.len()) || body.len() > BODY_MAX {return None}
+	if !version.starts_with("HTTP/1.") || code != "200" || length.is_some_and(|length| length != body.len()) || !SIZES.contains(&body.len()) {return None}
 	Some(body)
 }
 
@@ -247,7 +246,7 @@ async fn connection(mut stream: TcpStream, from: IpAddr, shared: Arc<Shared>) {
 		return;
 	};
 	if shared.failing.swap(false, Ordering::Relaxed) {tracing::info!("the upstream answers again")}
-	let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/jose\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
+	let mut answer = format!("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).into_bytes();
 	answer.extend_from_slice(&body);
 	let _ = timeout(READ_TIMEOUT, stream.write_all(&answer)).await;
 }
@@ -364,28 +363,33 @@ mod tests {
 		assert!(!load(Path::new("/nonexistent/mirror.json")).1.is_empty());
 	}
 
+	// What a sealed request is to the mirror: 1,073 bytes it does not read. And the five sizes of an answer.
+	fn sealed() -> String {"s".repeat(REQUEST)}
+
+	fn answer(size: usize) -> String {"a".repeat(size)}
+
 	#[test]
-	fn only_a_post_of_json_to_the_path_is_forwarded() {
-		let body = "{\"v\":1}";
+	fn only_a_post_of_a_sealed_request_to_the_path_is_forwarded() {
+		let kind = "application/octet-stream";
 		let ask = |request: String| {let end = http::head_end(request.as_bytes()).unwrap(); wanted(&request.as_bytes()[..end], "/sub")};
-		assert_eq!(ask(post("/sub", "application/json", body)), Some(body.len()));
-		assert_eq!(ask(post("/sub", "Application/JSON", body)), Some(body.len()));
-		assert_eq!(ask(post("/sub", "text/plain", body)), None, "wrong type");
-		assert_eq!(ask(post("/sub", "application/json; charset=utf-8", body)), None, "a parameter is not the type");
-		assert_eq!(ask(post("/other", "application/json", body)), None, "wrong path");
-		assert_eq!(ask(post("/sub?x=1", "application/json", body)), None, "a query");
-		assert_eq!(ask(post("/sub/", "application/json", body)), None, "a trailing slash");
-		assert_eq!(ask(post("/sub", "application/json", &"x".repeat(1025))), None, "oversize");
-		assert_eq!(ask(post("/sub", "application/json", &"x".repeat(1024))), Some(1024));
-		assert_eq!(ask(post("/sub", "application/json", body).replacen("POST", "GET", 1)), None, "a GET");
-		assert_eq!(ask(post("/sub", "application/json", body).replacen("POST", "PUT", 1)), None, "a PUT");
-		assert_eq!(ask(post("/sub", "application/json", body).replacen("Content-Type: application/json", "Content-Type: application/json\r\nContent-Type: application/json", 1)), None, "two types");
-		assert_eq!(ask(post("/sub", "application/json", body).replacen("Content-Type: application/json\r\n", "", 1)), None, "no type");
-		assert_eq!(ask("POST /sub HTTP/1.1\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".into()), None, "chunked");
-		assert_eq!(ask("POST /sub HTTP/1.1\r\nContent-Type: application/json\r\n\r\n".into()), None, "no length");
-		assert_eq!(ask("POST /sub HTTP/1.0\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n".into()), Some(2), "HTTP/1.0 with a length");
-	assert_eq!(ask("POST /sub HTTP/1.0\r\nContent-Type: application/json\r\n\r\n".into()), None, "HTTP/1.0 with no length");
-	assert_eq!(ask("POST /sub HTTP/2.0\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n".into()), None, "another version");
+		assert_eq!(ask(post("/sub", kind, &sealed())), Some(REQUEST));
+		assert_eq!(ask(post("/sub", "Application/Octet-Stream", &sealed())), Some(REQUEST));
+		assert_eq!(ask(post("/sub", "application/json", &sealed())), None, "the type of an earlier draft");
+		assert_eq!(ask(post("/sub", "text/plain", &sealed())), None, "wrong type");
+		assert_eq!(ask(post("/sub", "application/octet-stream; charset=utf-8", &sealed())), None, "a parameter is not the type");
+		assert_eq!(ask(post("/other", kind, &sealed())), None, "wrong path");
+		assert_eq!(ask(post("/sub?x=1", kind, &sealed())), None, "a query");
+		assert_eq!(ask(post("/sub/", kind, &sealed())), None, "a trailing slash");
+		for size in [0, 1, 1_024, 1_072, 1_074, 2_000, 65_536] {assert_eq!(ask(post("/sub", kind, &"x".repeat(size))), None, "{size} bytes")}
+		assert_eq!(ask(post("/sub", kind, &sealed()).replacen("POST", "GET", 1)), None, "a GET");
+		assert_eq!(ask(post("/sub", kind, &sealed()).replacen("POST", "PUT", 1)), None, "a PUT");
+		assert_eq!(ask(post("/sub", kind, &sealed()).replacen("Content-Type: application/octet-stream", "Content-Type: application/octet-stream\r\nContent-Type: application/octet-stream", 1)), None, "two types");
+		assert_eq!(ask(post("/sub", kind, &sealed()).replacen("Content-Type: application/octet-stream\r\n", "", 1)), None, "no type");
+		assert_eq!(ask("POST /sub HTTP/1.1\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n".into()), None, "chunked");
+		assert_eq!(ask("POST /sub HTTP/1.1\r\nContent-Type: application/octet-stream\r\n\r\n".into()), None, "no length");
+		assert_eq!(ask("POST /sub HTTP/1.0\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073\r\n\r\n".into()), Some(REQUEST), "HTTP/1.0 with a length");
+		assert_eq!(ask("POST /sub HTTP/1.0\r\nContent-Type: application/octet-stream\r\n\r\n".into()), None, "HTTP/1.0 with no length");
+		assert_eq!(ask("POST /sub HTTP/2.0\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073\r\n\r\n".into()), None, "another version");
 	}
 
 	struct Fake {address: SocketAddr, cert: CertificateDer<'static>, seen: Arc<Mutex<Vec<String>>>}
@@ -400,7 +404,7 @@ mod tests {
 		fn url(&self) -> String {format!("https://localhost:{}/panel/sub", self.address.port())}
 	}
 
-	async fn fake(status: u16, kind: &'static str, body: &'static str) -> Fake {
+	async fn fake(status: u16, kind: &'static str, body: String) -> Fake {
 		let rcgen::CertifiedKey {cert, signing_key} = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
 		let (der, seen) = (cert.der().clone(), Arc::new(Mutex::new(Vec::new())));
 		let server = rustls::ServerConfig::builder_with_provider(Arc::new(default_provider())).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![der.clone()], PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into()).unwrap();
@@ -410,7 +414,7 @@ mod tests {
 		tokio::spawn(async move {
 			loop {
 				let (stream, _) = listener.accept().await.unwrap();
-				let (acceptor, recorded) = (acceptor.clone(), recorded.clone());
+				let (acceptor, recorded, body) = (acceptor.clone(), recorded.clone(), body.clone());
 				tokio::spawn(async move {
 					let Ok(mut stream) = acceptor.accept(stream).await else {return};
 					let (mut buffer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -453,54 +457,60 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_request_is_forwarded_with_the_clients_address_signed() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+	async fn a_request_is_forwarded_unchanged_with_the_clients_address_signed() {
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |_| {}).await;
-		let answer = raw(mirror, &post("/sub", "application/json", "{\"v\":1}")).await;
-		assert!(answer.starts_with("HTTP/1.1 200 OK\r\n"), "{answer}");
-		assert!(answer.contains("Content-Type: application/jose\r\n") && answer.contains("Cache-Control: no-store\r\n"));
-		assert!(answer.ends_with("\r\n\r\nsigned-document"));
+		let request = post("/sub", "application/octet-stream", &sealed());
+		let reply = raw(mirror, &request).await;
+		assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+		assert!(reply.contains("Content-Type: application/octet-stream\r\n") && reply.contains("Cache-Control: no-store\r\n") && reply.contains("Content-Length: 9413\r\n"));
+		assert!(reply.ends_with(&format!("\r\n\r\n{}", answer(9_413))), "the sealed answer is handed back unchanged");
 		let seen = upstream.seen.lock().unwrap().clone();
 		assert_eq!(seen.len(), 1);
-		assert!(seen[0].starts_with("POST /panel/sub HTTP/1.0\r\nHost: localhost:"));
-		assert!(seen[0].ends_with("\r\n\r\n{\"v\":1}"));
+		assert!(seen[0].starts_with("POST /panel/sub HTTP/1.0\r\nHost: localhost:") && seen[0].contains("Content-Type: application/octet-stream\r\nContent-Length: 1073\r\n"));
+		assert!(seen[0].ends_with(&format!("\r\n\r\n{}", sealed())), "the sealed bytes go on as they came");
 		assert!(!seen[0].contains("X-Forwarded-For") && !seen[0].contains("198.51.100.5\r\n"), "nothing of the visitor's headers goes on");
 		let signed = seen[0].lines().find_map(|line| line.strip_prefix("X-Veilway-Mirror: ")).unwrap();
 		let fields: Vec<&str> = signed.split(';').collect();
 		assert_eq!(&fields[..3], &["v1", "relay", "198.51.100.5"]);
 		assert!(fields[3].parse::<u64>().unwrap().abs_diff(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()) < 30);
-		assert_eq!(signed, header(&SECRET, "relay", "198.51.100.5".parse().unwrap(), fields[3].parse().unwrap(), fields[4], b"{\"v\":1}"));
-		raw(mirror, &post("/sub", "application/json", "{\"v\":1}")).await;
+		assert_eq!(signed, header(&SECRET, "relay", "198.51.100.5".parse().unwrap(), fields[3].parse().unwrap(), fields[4], sealed().as_bytes()), "the header covers the hash of the sealed body");
+		raw(mirror, &request).await;
 		let again = upstream.seen.lock().unwrap().clone();
 		assert_ne!(again[0].split("X-Veilway-Mirror: ").nth(1).unwrap().split(';').nth(4), again[1].split("X-Veilway-Mirror: ").nth(1).unwrap().split(';').nth(4), "a new nonce each time");
 	}
 
 	#[tokio::test]
-	async fn only_a_200_document_is_passed_on() {
-		let signed_refusal = fake(200, "application/jose", "signed refusal").await;
-		let mirror = start(&signed_refusal, |_| {}).await;
-		assert!(raw(mirror, &post("/sub", "application/json", "{}")).await.ends_with("\r\n\r\nsigned refusal"), "a signed refusal is a document");
-		for (status, kind) in [(404, "application/jose"), (500, "application/jose"), (200, "text/html"), (200, "application/json"), (200, "text/plain")] {
-			let upstream = fake(status, kind, "panel says no").await;
+	async fn only_a_200_with_a_body_of_an_answers_size_is_passed_on() {
+		// The five sizes, whatever the type says: the panel's answer is `application/octet-stream`, and the mirror does not read the body.
+		for size in SIZES {
+			let upstream = fake(200, "application/octet-stream", answer(size)).await;
 			let mirror = start(&upstream, |_| {}).await;
-			assert_eq!(raw(mirror, &post("/sub", "application/json", "{}")).await, HAND_BACK_ANSWER, "{status} {kind}");
+			let reply = raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await;
+			assert!(reply.starts_with("HTTP/1.1 200 OK\r\n") && reply.ends_with(&format!("\r\n\r\n{}", answer(size))), "{size}");
+		}
+		// "To a request that carries a valid mirror header, the gateway answers anything it would answer as an unknown path with status 599": that, any other status, and a 200 of another size are handed back.
+		for (status, size) in [(599, 0), (599, 9_413), (404, 9_413), (500, 9_413), (302, 9_413), (200, 0), (200, 100), (200, 9_412), (200, 9_414), (200, 36_978), (200, 1_089_438)] {
+			let upstream = fake(status, "application/octet-stream", answer(size)).await;
+			let mirror = start(&upstream, |_| {}).await;
+			assert_eq!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await, HAND_BACK_ANSWER, "{status} with {size} bytes");
 			assert_eq!(upstream.seen.lock().unwrap().len(), 1);
 		}
 	}
 
 	#[tokio::test]
 	async fn an_http_1_0_request_with_a_length_is_forwarded() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |_| {}).await;
-		let answer = raw(mirror, &post("/sub", "application/json", "{\"v\":1}").replacen("HTTP/1.1", "HTTP/1.0", 1)).await;
-		assert!(answer.starts_with("HTTP/1.1 200 OK\r\n") && answer.ends_with("\r\n\r\nsigned-document"), "{answer}");
+		let reply = raw(mirror, &post("/sub", "application/octet-stream", &sealed()).replacen("HTTP/1.1", "HTTP/1.0", 1)).await;
+		assert!(reply.starts_with("HTTP/1.1 200 OK\r\n") && reply.ends_with(&answer(9_413)), "{}", &reply[..80]);
 	}
 
 	#[tokio::test]
 	async fn everything_else_is_handed_back_and_never_forwarded() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |_| {}).await;
-		for request in [post("/sub", "application/json", "{}").replacen("POST", "GET", 1), post("/elsewhere", "application/json", "{}"), post("/sub", "text/plain", "{}"), post("/sub", "application/json", &"x".repeat(1025)), "garbage\r\n\r\n".into()] {
+		for request in [post("/sub", "application/octet-stream", &sealed()).replacen("POST", "GET", 1), post("/elsewhere", "application/octet-stream", &sealed()), post("/sub", "text/plain", &sealed()), post("/sub", "application/octet-stream", &"x".repeat(1_074)), "garbage\r\n\r\n".into()] {
 			let answer = raw(mirror, &request).await;
 			assert_eq!(answer, "HTTP/1.1 599 Hand Back\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "{request:?}");
 		}
@@ -509,57 +519,57 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_refused_body_is_read_so_that_its_answer_arrives() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |_| {}).await;
 		assert_eq!(raw(mirror, &post("/sub", "text/plain", &"x".repeat(8000))).await, HAND_BACK_ANSWER);
 	}
 
 	#[tokio::test]
 	async fn a_full_table_is_answered_and_nothing_is_relayed() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |_| {}).await;
 		let mut held = Vec::new();
 		for _ in 0..CONNECTIONS {held.push(TcpStream::connect(mirror).await.unwrap())}
-		assert_eq!(raw(mirror, &post("/sub", "application/json", "{}")).await, HAND_BACK_ANSWER);
+		assert_eq!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await, HAND_BACK_ANSWER);
 		assert!(upstream.seen.lock().unwrap().is_empty());
 		drop(held);
 	}
 
 	#[tokio::test]
 	async fn a_peer_that_is_no_trusted_proxy_gets_nothing() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |config| config["trusted_proxies"] = json!(["10.0.0.0/8"])).await;
-		assert_eq!(raw(mirror, &post("/sub", "application/json", "{}")).await, "");
+		assert_eq!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await, "");
 		assert!(upstream.seen.lock().unwrap().is_empty());
 	}
 
 	#[tokio::test]
 	async fn without_a_web_server_the_mirror_answers_for_itself() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |config| config["trusted_proxies"] = json!([])).await;
 		assert!(raw(mirror, "GET / HTTP/1.1\r\nHost: m.test\r\n\r\n").await.starts_with("HTTP/1.1 404 Not Found\r\n"));
-		assert!(raw(mirror, &post("/sub", "application/json", "{}")).await.ends_with("signed-document"));
+		assert!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await.ends_with(&answer(9_413)));
 		assert!(upstream.seen.lock().unwrap()[0].contains("X-Veilway-Mirror: v1;relay;127.0.0.1;"), "the peer is the client when no proxy is trusted");
 	}
 
 	#[tokio::test]
 	async fn the_upstream_is_held_to_its_chain_and_its_pins() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let pinned = start(&upstream, |config| config["upstream_pins"] = json!([upstream.pin()])).await;
-		assert!(raw(pinned, &post("/sub", "application/json", "{}")).await.ends_with("signed-document"), "a pin that matches");
+		assert!(raw(pinned, &post("/sub", "application/octet-stream", &sealed())).await.ends_with(&answer(9_413)), "a pin that matches");
 		let mismatch = start(&upstream, |config| config["upstream_pins"] = json!([STANDARD.encode([0u8; 32])])).await;
-		assert!(raw(mismatch, &post("/sub", "application/json", "{}")).await.starts_with("HTTP/1.1 599"), "a pin that does not match");
-		let (stranger, count) = (fake(200, "application/jose", "x").await, upstream.seen.lock().unwrap().len());
+		assert!(raw(mismatch, &post("/sub", "application/octet-stream", &sealed())).await.starts_with("HTTP/1.1 599"), "a pin that does not match");
+		let (stranger, count) = (fake(200, "application/octet-stream", answer(9_413)).await, upstream.seen.lock().unwrap().len());
 		let unknown = start(&upstream, |config| config["upstream"] = json!(stranger.url())).await;
-		assert!(raw(unknown, &post("/sub", "application/json", "{}")).await.starts_with("HTTP/1.1 599"), "a chain that leads to no root held");
+		assert!(raw(unknown, &post("/sub", "application/octet-stream", &sealed())).await.starts_with("HTTP/1.1 599"), "a chain that leads to no root held");
 		assert_eq!(upstream.seen.lock().unwrap().len(), count);
 		assert!(stranger.seen.lock().unwrap().is_empty(), "no byte of a request goes to a server that failed the check");
 	}
 
 	#[tokio::test]
 	async fn an_upstream_that_is_down_is_handed_back() {
-		let upstream = fake(200, "application/jose", "signed-document").await;
+		let upstream = fake(200, "application/octet-stream", answer(9_413)).await;
 		let mirror = start(&upstream, |config| config["upstream"] = json!("https://localhost:1/panel/sub")).await;
-		assert!(raw(mirror, &post("/sub", "application/json", "{}")).await.starts_with("HTTP/1.1 599"));
+		assert!(raw(mirror, &post("/sub", "application/octet-stream", &sealed())).await.starts_with("HTTP/1.1 599"));
 	}
 }

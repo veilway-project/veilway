@@ -240,12 +240,19 @@ def jws(seed, payload, header=None):
     signed = b64(header or jws_header(ed_public(seed)[1])) + b"." + b64(payload)
     return signed + b"." + b64(ed_sign(seed, signed))
 issued = 1_700_000_000
+# The gateway keys ("Gateway keys"): the active key has id 1 and the private key 40..5f, the next one id 2 and 60..7f. The link carries the active key as the byte 01 and its X25519 public key.
+gw_sk, gw2_sk = bytes(range(0x40, 0x60)), bytes(range(0x60, 0x80))
+gw_pk, gw2_pk = x25519(gw_sk, BASE), x25519(gw2_sk, BASE)
+gateway_link = bytes([1]) + gw_pk
+gateway_keys_of_document = [{"id": 1, "key": key64(gw_pk)}, {"id": 2, "key": key64(gw2_pk)}]
 # A document of one profile with one datagram and one stream transport. With `private` the provider issued the device's key, which is what a whole document in a link carries.
 def payload(serial, keys, private=False, at=issued, of_profile=None, **more):
     keys_of_device = {"public_key": key64(device_public), "addresses": ["10.7.0.2", "fd00::2"], "transport_secrets": [key64(secret)]}
     if private: keys_of_device["private_key"] = key64(device_private)
     profile = {"id": "main", "name": "Example", "type": "veilway", "inbound_public_key": key64(inbound), "device": keys_of_device, "gateways": ["10.7.0.1", "fd00::1"], "mtu": 1420, "transport_public_key": key64(node_pk), "transports": [{"type": "udp-obfs", "endpoints": ["192.0.2.10:51820", "[2001:db8::10]:51820"]}, {"type": "tls", "path": "/a-path-of-a-transport", "candidates": [{"address": "192.0.2.10:443", "sni": "node.example.com", "host": "node.example.com", "pins": [key64(hashlib.sha256(b"pin").digest())]}]}], "exits": [{"tag": "de", "name": "Berlin", "country": "DE", "full_ip": True}]}
     document = {"v": 1, "subscription_id": "example-account-0001", "serial": serial, "issued_at": at, "expires_at": at + 30 * 86400, "signing_keys": [key64(key) for key in keys], "provider": {"name": "Example Provider"}, "profiles": [profile], "devices": [{"name": "phone", "enrolled_at": at, "this": True}]}
+    # A document that has an endpoint lists its gateway keys; a whole document has none to list, and the room is a link's.
+    if not private: document["gateway_keys"] = gateway_keys_of_document
     profile.update(of_profile or {})
     document.update(more)
     return json.dumps(document, separators=(",", ":"), ensure_ascii=False).encode()
@@ -262,11 +269,12 @@ payload_first, payload_carried = payload(1, [sub_pk1]), payload(1, [sub_pk1], pr
 payload_both, payload_second = payload(2, [sub_pk1, sub_pk2]), payload(3, [sub_pk2])
 payload_refusal = json.dumps({"v": 1, "subscription_id": "example-account-0001", "issued_at": issued, "refusal": "device_limit"}, separators=(",", ":")).encode()
 document_first, document_carried, document_refusal = jws(seed1, payload_first), jws(seed1, payload_carried), jws(seed1, payload_refusal)
-fragment = b"#v1." + b64(sub_pk1) + b"." + b64(link_token)
+fragment = b"#v1." + b64(sub_pk1) + b"." + b64(gateway_link) + b"." + b64(link_token)
 link_veilway, link_https = b"veilway://sub/sub.example.com/s" + fragment, b"https://sub.example.com/s" + fragment
 link_file = b"v1." + b64(sub_pk1) + b"." + document_carried
-def request(op, name=None):
-    body = {"v": 1, "token": b64(link_token).decode(), "kids": [kid(sub_pk1).decode()], "device_public_key": key64(device_public), "device_secret": b64(device_secret).decode(), "op": op}
+request_t = issued + 100
+def request(op, name=None, t=request_t):
+    body = {"v": 1, "t": t, "token": b64(link_token).decode(), "kids": [kid(sub_pk1).decode()], "device_public_key": key64(device_public), "device_secret": b64(device_secret).decode(), "op": op}
     if name is not None: body["device_name"] = name
     return json.dumps(body, separators=(",", ":"), ensure_ascii=False).encode()
 fingerprint = hashlib.sha256(sub_pk1).hexdigest()[:32]
@@ -371,6 +379,102 @@ subscription_seeds.update({
     "fuzz_pairing/offer-object": b"\x02" + link_object,
     "fuzz_pairing/answer": b"\x01" + link_answer_code,
     "fuzz_pairing/answer-bytes": b"\x03" + link_answer,
+})
+
+# The encrypted exchange (subscription format page, "The encrypted exchange"): a request sealed to the gateway key above, and the answer to it. The HPKE is the one written out above, with the info `"veilway v1 sub request" || 00 || hdr`; the answer is RFC 9458's key schedule over the exporter secret.
+ANSWER_SIZES = [9413, 36979, 140867, 538201, 1089437]
+def seal_request(body, ikm, top, key_id=1, pk=gw_pk, plain=None):
+    hdr = bytes([key_id]) + struct.pack(">HHH", 0x20, 1, 3)
+    enc, _, key, nonce, exporter = sender(pk, b"veilway v1 sub request\0" + hdr, ikm)
+    if plain is None:
+        plain = struct.pack(">H", len(body)) + body
+        plain += bytes(1024 - len(plain))
+    wire_enc = enc[:31] + bytes([enc[31] | 0x80 if top else enc[31]])
+    return bytes([key_id]) + wire_enc + seal(key, nonce, b"", plain), enc, export(exporter, b"veilway v1 sub response", 32)
+def seal_answer(envelope, enc, secret, nonce_bytes, size=None, tamper=None):
+    size = size or next(size for size in ANSWER_SIZES if len(envelope) <= min(size - 52, 1048576))
+    prk = extract(enc + nonce_bytes, secret)
+    plain = struct.pack(">I", len(envelope)) + envelope
+    plain += bytes(size - 48 - len(plain))
+    if tamper: plain = tamper(plain)
+    return nonce_bytes + seal(expand(prk, b"key", 32), expand(prk, b"nonce", 12), b"", plain)
+ikm_e, answer_nonce = bytes(range(0xa0, 0xc0)), bytes(range(0xc0, 0xe0))
+answer_envelope = b"veilway subscription answer test vector"
+sealed_request, request_enc, request_secret = seal_request(request("fetch"), ikm_e, True)
+sealed_request_clear = seal_request(request("fetch"), ikm_e, False)[0]
+assert len(sealed_request) == 1073 and len(request("fetch")) <= 1022
+assert sealed_request[:32] == sealed_request_clear[:32] and sealed_request[33:] == sealed_request_clear[33:] and sealed_request[32] ^ sealed_request_clear[32] == 0x80 and request_enc[31] < 0x80
+sealed_answer = seal_answer(answer_envelope, request_enc, request_secret, answer_nonce)
+assert len(sealed_answer) == 9413
+print("gateway_public", gw_pk.hex(), "link_field", b64(gateway_link).decode())
+print("request_json", request("fetch").decode())
+print("request_enc", request_enc.hex(), "wire", sealed_request[1:33].hex())
+print("request_head", sealed_request[:48].hex(), "tag", sealed_request[-16:].hex(), "sha256", hashlib.sha256(sealed_request).hexdigest(), "sha256_top_clear", hashlib.sha256(sealed_request_clear).hexdigest())
+print("request_secret", request_secret.hex())
+answer_prk = extract(request_enc + answer_nonce, request_secret)
+print("answer_key", expand(answer_prk, b"key", 32).hex(), "nonce", expand(answer_prk, b"nonce", 12).hex())
+print("answer_head", sealed_answer[:48].hex(), "tag", sealed_answer[-16:].hex(), "sha256", hashlib.sha256(sealed_answer).hexdigest())
+gateway_body = lambda body, **more: seal_request(body, ikm_e, False, **more)[0]
+def with_plain(plain): return seal_request(None, ikm_e, False, plain=plain)[0]
+fetch_json = request("fetch")
+padded = lambda body, extra=b"": struct.pack(">H", len(body)) + body + extra + bytes(1024 - 2 - len(body) - len(extra))
+bad_member = json.dumps({**json.loads(fetch_json), "extra": 1}, separators=(",", ":")).encode()
+flipped = bytearray(sealed_request_clear)
+flipped[100] ^= 1
+subscription_seeds.update({
+    # The body of a request, after one byte of settings (see the head of fuzz_sub_gateway.rs).
+    "fuzz_sub_gateway/fetch": b"\x00" + sealed_request_clear,
+    "fuzz_sub_gateway/fetch-top-bit": b"\x00" + sealed_request,
+    "fuzz_sub_gateway/fetch-twice": b"\x02" + sealed_request_clear,
+    "fuzz_sub_gateway/fetch-source-full": b"\x01" + sealed_request_clear,
+    "fuzz_sub_gateway/fetch-late": b"\x04" + sealed_request_clear,
+    "fuzz_sub_gateway/fetch-early": b"\x08" + sealed_request_clear,
+    "fuzz_sub_gateway/fetch-clock-steps-back": b"\x0c" + sealed_request_clear,
+    "fuzz_sub_gateway/confirm-with-a-name": b"\x00" + gateway_body(request("confirm", "phone")),
+    "fuzz_sub_gateway/stale-t": b"\x00" + gateway_body(request("fetch", t=request_t - 1000)),
+    "fuzz_sub_gateway/before-the-start": b"\x00" + gateway_body(request("fetch", t=request_t - 200)),
+    "fuzz_sub_gateway/second-key": b"\x00" + seal_request(fetch_json, ikm_e, False, key_id=2, pk=gw2_pk)[0],
+    "fuzz_sub_gateway/unknown-key-id": b"\x00" + bytes([9]) + sealed_request_clear[1:],
+    "fuzz_sub_gateway/key-of-another": b"\x00" + bytes([2]) + sealed_request_clear[1:],
+    "fuzz_sub_gateway/one-byte-short": b"\x00" + sealed_request_clear[:-1],
+    "fuzz_sub_gateway/one-byte-long": b"\x00" + sealed_request_clear + b"\x00",
+    "fuzz_sub_gateway/empty": b"\x00",
+    "fuzz_sub_gateway/changed-ciphertext": b"\x00" + bytes(flipped),
+    "fuzz_sub_gateway/changed-tag": b"\x00" + sealed_request_clear[:-1] + bytes([sealed_request_clear[-1] ^ 1]),
+    "fuzz_sub_gateway/zero-enc": b"\x00" + sealed_request_clear[:1] + bytes(32) + sealed_request_clear[33:],
+    "fuzz_sub_gateway/small-order-enc": b"\x00" + sealed_request_clear[:1] + small_order[2] + sealed_request_clear[33:],
+    "fuzz_sub_gateway/small-order-enc-top-bit": b"\x00" + sealed_request_clear[:1] + small_order[3][:31] + bytes([small_order[3][31] | 0x80]) + sealed_request_clear[33:],
+    "fuzz_sub_gateway/member-it-does-not-know": b"\x00" + with_plain(padded(bad_member)),
+    "fuzz_sub_gateway/not-json": b"\x00" + with_plain(padded(b"not a request")),
+    "fuzz_sub_gateway/length-zero": b"\x00" + with_plain(bytes(1024)),
+    "fuzz_sub_gateway/length-past-the-end": b"\x00" + with_plain(struct.pack(">H", 1023) + fetch_json + bytes(1024 - 2 - len(fetch_json))),
+    "fuzz_sub_gateway/padding-not-zero": b"\x00" + with_plain(padded(fetch_json, b"\x01")),
+    "fuzz_sub_gateway/length-too-long": b"\x00" + with_plain(struct.pack(">H", 1023) + (b" " * 1023)),
+    # An answer to the request above, after one byte of settings (see the head of fuzz_sub_answer.rs): a newer document, the same one, a rotation, a refusal, and answers that do not open.
+    "fuzz_sub_answer/newer": b"\x00" + seal_answer(jws(seed1, payload(2, [sub_pk1], at=issued + 60)), request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/same": b"\x00" + seal_answer(document_first, request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/rotation": b"\x00" + seal_answer(jws(seed1, payload(2, [sub_pk1, sub_pk2], at=issued + 60)), request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/refusal": b"\x00" + seal_answer(document_refusal, request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/other-keys": b"\x00" + seal_answer(jws(seed1, payload(2, [sub_pk1], at=issued + 60, gateway_keys=[{"id": 5, "key": key64(gw2_pk)}])), request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/move": b"\x00" + seal_answer(jws(seed1, payload(2, [sub_pk1], at=issued + 60, main_endpoint={"url": "https://new.example.net/s", "gateway_keys": [{"id": 3, "key": key64(gw2_pk)}]})), request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/second-size": b"\x00" + seal_answer(jws(seed1, payload(2, [sub_pk1], at=issued + 60)), request_enc, request_secret, answer_nonce, size=36979),
+    "fuzz_sub_answer/not-a-document": b"\x00" + seal_answer(answer_envelope, request_enc, request_secret, answer_nonce),
+    "fuzz_sub_answer/envelope-too-long": b"\x00" + seal_answer(answer_envelope, request_enc, request_secret, answer_nonce, tamper=lambda plain: struct.pack(">I", 9362) + plain[4:]),
+    "fuzz_sub_answer/length-zero": b"\x00" + seal_answer(answer_envelope, request_enc, request_secret, answer_nonce, tamper=lambda plain: bytes(4) + plain[4:]),
+    "fuzz_sub_answer/padding-not-zero": b"\x00" + seal_answer(document_first, request_enc, request_secret, answer_nonce, tamper=lambda plain: plain[:-1] + b"\x01"),
+    "fuzz_sub_answer/for-another-request": b"\x00" + seal_answer(document_first, request_enc, request_secret, answer_nonce)[:-17] + bytes(17),
+    "fuzz_sub_answer/not-a-size": b"\x00" + seal_answer(document_first, request_enc, request_secret, answer_nonce)[:-1],
+    "fuzz_sub_answer/too-small": b"\x00" + bytes(9412),
+    # The links of the other forms, and documents that name a move.
+    "fuzz_deeplink/native-plain-veilway": b"veilway://sub-plain/sub.example.com/s" + fragment,
+    "fuzz_deeplink/native-plain-http": b"http://sub.example.com/s" + fragment,
+    "fuzz_deeplink/native-plain-address": b"veilway://sub-plain/203.0.113.7:8080/s" + fragment,
+    "fuzz_deeplink/plain-with-a-pin": b"veilway://sub-plain/sub.example.com/s" + pinned_fragment,
+    "fuzz_deeplink/gateway-key-of-small-order": b"veilway://sub/sub.example.com/s#v1." + b64(sub_pk1) + b"." + b64(bytes([1]) + small_order[2]) + b"." + b64(link_token),
+    "fuzz_deeplink/old-fragment-without-a-gateway-key": b"veilway://sub/sub.example.com/s#v1." + b64(sub_pk1) + b"." + b64(link_token),
+    "fuzz_subscription/move-with-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, main_endpoint={"url": "https://new.example.net/s", "gateway_keys": [{"id": 3, "key": key64(gw2_pk)}]}),
+    "fuzz_subscription/move-to-plain-with-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, main_endpoint={"url": "http://203.0.113.9:8080/s", "gateway_keys": [{"id": 3, "key": key64(gw2_pk)}]}),
+    "fuzz_subscription/move-to-pinned-with-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, main_endpoint={"url": "https://203.0.113.9:8443/s", "pins": [key64(pin_mirror)], "gateway_keys": [{"id": 3, "key": key64(gw2_pk)}]}, refresh_urls=["http://203.0.113.7:8080/s", "http://mirror.example.net/s"]),
 })
 
 # A static mirror (subscription format page, "Static mirrors"): the keys of one device on one base URL, the name of the file for one period, and one sealed file of the smallest size. The envelope is a few plain bytes, because opening and sealing never read it.

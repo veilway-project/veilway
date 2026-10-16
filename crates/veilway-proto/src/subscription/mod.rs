@@ -11,6 +11,7 @@ use subtle::ConstantTimeEq;
 
 pub mod client;
 pub mod envelope;
+pub mod exchange;
 pub mod fetch;
 pub(crate) mod json;
 pub mod legacy;
@@ -48,6 +49,10 @@ impl<const N: usize> Eq for Secret<N> {}
 impl<const N: usize> fmt::Debug for Secret<N> {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {f.write_str("Secret(..)")}
 }
+
+/// How an endpoint is reached ("The link decides how the endpoint is reached"): by the chain of its certificate, by the pins it was given alone, or over plain HTTP. No answer and no setting moves an endpoint from one to another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {Chain, Pinned, Plain}
 
 /// "Link token: 16 bytes, 22 base64url characters." Whoever has it is that user to the provider.
 pub type Token = Secret<16>;
@@ -154,15 +159,18 @@ const SMALL_ORDER: [[u8; 32]; 7] = [
 	[0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
 ];
 
-// A public key of X25519 as a document or a request writes it: 44 characters, not all zero and no point of small order, under which every private key gives the same shared secret.
-pub(crate) fn public(text: &str) -> Option<[u8; 32]> {key(text).filter(|key| !SMALL_ORDER.iter().any(|point| key[..31] == point[..31] && key[31] & 0x7f == point[31]))}
+// Whether a public key of X25519 is all zero or a point of small order, under which every private key gives the same shared secret.
+pub(crate) fn weak(key: &[u8; 32]) -> bool {*key == [0; 32] || SMALL_ORDER.iter().any(|point| key[..31] == point[..31] && key[31] & 0x7f == point[31])}
+
+// A public key of X25519 as a document or a request writes it: 44 characters, not all zero and no point of small order.
+pub(crate) fn public(text: &str) -> Option<[u8; 32]> {key(text).filter(|key| !weak(key))}
 
 /// Whether `name` is a host name: "lowercase ASCII, at most 253 bytes, by the domain rule of the config reference, without the wildcard". Labels of 1 to 63 letters, digits and inner hyphens, and a last label that is neither all digits nor `0x` and hex digits, so that the name is no address in any spelling.
 pub fn is_host(name: &str) -> bool {
 	name.len() <= 253 && name.split('.').all(|label| (1..=63).contains(&label.len()) && label.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-') && !label.starts_with('-') && !label.ends_with('-')) && !name.rsplit('.').next().is_some_and(|last| last.bytes().all(|byte| byte.is_ascii_digit()) || last.strip_prefix("0x").is_some_and(|hex| hex.bytes().all(|byte| byte.is_ascii_hexdigit())))
 }
 
-/// An `https` URL "with a host name, no user or password part", kept exactly as it was written: nothing is normalised, so what is shown is what is opened or fetched.
+/// An `https` URL, or an `http` URL for a plain endpoint ("The link"), "with a host name, no user or password part", kept exactly as it was written: nothing is normalised, so what is shown is what is opened or fetched.
 /// The page gives no grammar beyond that. This one is the narrow reading: after the host an optional port of 1 to 65535 without a leading zero, then only the characters RFC 3986 allows in a path, a query and a fragment, every `%` followed by two hexadecimal digits, and no path segment that is `.` or `..` in any spelling, because whatever fetches or opens the URL would rewrite such a path.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Url {text: String, host: usize}
@@ -174,11 +182,15 @@ impl fmt::Debug for Url {
 
 impl Url {
 	/// `limit` is the longest text, `query` and `fragment` say whether the URL may have those parts.
-	pub fn parse(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, false)}
+	pub fn parse(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, false, false)}
+	/// `pinned` for an `http` URL, the endpoint of a plain link: it has no certificate to name, so its host may be an IP literal in the one spelling as well. Held to the same refusals of `dialable`.
+	pub fn plain(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, true, true)}
+	/// `parse` for an `https` URL and `plain` for an `http` one: the URL of a refresh entry given as a string or of a move, which a plain endpoint may be.
+	pub fn either(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {if text.starts_with("http://") {Self::plain(text, limit, query, fragment)} else {Self::parse(text, limit, query, fragment)}}
 	/// `parse` for the URL of a pinned endpoint ("A pinned endpoint"), whose host may also be an IP literal: a dotted IPv4 address or an IPv6 address in brackets, in the one spelling Rust prints (so lowercase, no zone, no leading zeros), that is `dialable`. A pinned endpoint has no certificate that names it, so an address is all a provider with no domain has to put here.
-	pub fn pinned(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, true)}
-	fn read(text: &str, limit: usize, query: bool, fragment: bool, literal: bool) -> Option<Self> {
-		let rest = text.strip_prefix("https://").filter(|_| text.len() <= limit)?;
+	pub fn pinned(text: &str, limit: usize, query: bool, fragment: bool) -> Option<Self> {Self::read(text, limit, query, fragment, true, false)}
+	fn read(text: &str, limit: usize, query: bool, fragment: bool, literal: bool, plain: bool) -> Option<Self> {
+		let rest = text.strip_prefix(if plain {"http://"} else {"https://"}).filter(|_| text.len() <= limit)?;
 		let (authority, tail) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
 		let (host, port) = if authority.starts_with('[') {
 			let (host, rest) = authority.split_at(authority.find(']')? + 1);
@@ -195,16 +207,20 @@ impl Url {
 		if !fragment && (after.windows(3).any(|escape| escape[0] == b'%' && std::str::from_utf8(&escape[1..]).ok().and_then(|digits| u8::from_str_radix(digits, 16).ok()).is_some_and(|byte| byte < 0x20 || matches!(byte, 0x7f | 0x2f | 0x5c))) || path.split('/').any(|segment| matches!(segment.split(';').next().unwrap_or_default().to_ascii_lowercase().replace("%2e", ".").as_str(), "." | ".."))) {return None}
 		Some(Self {text: text.to_owned(), host: host.len()})
 	}
-	/// The host and the port, as `host:port`, with 443 when the URL names none: what a user confirms when a document adds a refresh host.
+	/// The host and the port, as `host:port`, with 443 (80 for `http`) when the URL names none: what a user confirms when a document adds a refresh host.
 	pub fn authority(&self) -> String {format!("{}:{}", self.host(), self.port())}
+	/// Whether this is an `http` URL: a plain endpoint, which nothing hides from the network.
+	pub fn is_plain(&self) -> bool {self.text.starts_with("http://")}
+	// The length of the scheme and `://`.
+	fn start(&self) -> usize {if self.is_plain() {7} else {8}}
 	/// The whole URL as it was written.
 	pub fn as_str(&self) -> &str {&self.text}
 	/// The host name, which is ASCII by the rule of `is_host`, or an IP literal as written (with its brackets when it is IPv6) in a URL that was read with `pinned`. It is what a screen shows before the URL is opened or fetched.
-	pub fn host(&self) -> &str {&self.text[8..8 + self.host]}
-	/// The address when the host is an IP literal, which only a pinned endpoint's can be: it is dialled with no lookup and sent no server name.
+	pub fn host(&self) -> &str {&self.text[self.start()..self.start() + self.host]}
+	/// The address when the host is an IP literal, which only a pinned or a plain endpoint's can be: it is dialled with no lookup and sent no server name.
 	pub fn literal(&self) -> Option<IpAddr> {address(self.host())}
-	/// The port, 443 when the URL names none.
-	pub fn port(&self) -> u16 {self.text[8 + self.host..].strip_prefix(':').and_then(|rest| rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].parse().ok()).unwrap_or(443)}
+	/// The port, 443 when an `https` URL names none and 80 when an `http` one does not.
+	pub fn port(&self) -> u16 {self.text[self.start() + self.host..].strip_prefix(':').and_then(|rest| rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].parse().ok()).unwrap_or(if self.is_plain() {80} else {443})}
 }
 
 // An IP literal in its one spelling, as a URL host: `1.2.3.4` or `[::1]`. One spelling, so that two spellings of an address cannot be two hosts to the rules that compare `authority`.

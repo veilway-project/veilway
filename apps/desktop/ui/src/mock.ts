@@ -7,7 +7,7 @@ try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get(
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
-let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting"}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed"}];
+let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
 
 function subscription(fa: boolean): Subscription {
 	return {
@@ -59,9 +59,9 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	disconnect: () => { connected = false; return null; },
 	answer: () => null,
 	select_exit: args => { selected = (args.tag as string | null) ?? null; return null; },
-	import_open: () => ({kind: "native", host: "sub.harbor.example", fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: true, in_file: false}),
-	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, in_file: false}),
-	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, left_out: [], preview: subscription(languages[0] === "fa")}),
+	import_open: () => ({kind: "native", host: "sub.harbor.example", fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: true, plain: false, in_file: false}),
+	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, plain: false, in_file: false}),
+	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, moving: null, left_out: [], preview: subscription(languages[0] === "fa")}),
 	import_keep: args => { if (args.keep) held = 1; return held ? [subscription(languages[0] === "fa")] : []; },
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],

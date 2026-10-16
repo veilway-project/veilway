@@ -3,7 +3,7 @@
 //! `parse` takes an `envelope::Verified` and nothing else, so what it reads was signed by a key that was held. That makes the input a provider's and not a stranger's. It does not make it friendly: every count, length and range is checked, nothing is clamped, and three kinds of unknown value are never guessed at ("Unknown members").
 //!
 //! What refuses what ("Wrong type, out of range, missing"): a fault in a top-level member refuses the document, a fault inside a profile refuses that profile, and a faulty card, notice, support link, listed device, exit or logo is left out. Display text is the stated exception: it is filtered and cut, never refused, except where it must not be empty. A text may come in several languages ("Text in several languages"), and a translation that does not read is dropped by itself: only `default` can make a text wrong.
-use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, mirror, public, visible, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
+use super::{envelope::{SigningKey, Verified}, exchange::{GatewayKey, KEYS_MAX}, hash, is_host, json::{self, Json, Members, Named}, key, mirror, public, visible, Kind, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
 use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::{Deref, RangeInclusive}};
@@ -113,7 +113,7 @@ impl Id {
 	pub fn as_str(&self) -> &str {&self.0}
 }
 
-/// An entry of `refresh_urls`: "a URL string, for an endpoint whose certificate is validated by its chain, or an object with exactly `url` and `pins`" for a pinned one. It derefs to its `Url`.
+/// An entry of `refresh_urls`: "a URL string, for an endpoint whose certificate is validated by its chain" or a plain `http` one, "or an object with exactly `url` and `pins`" for a pinned one. It derefs to its `Url`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refresh {url: Url, pins: Vec<[u8; 32]>}
 
@@ -122,8 +122,31 @@ impl Refresh {
 	/// The 1 or 2 pins a pinned entry is trusted by, none twice. Empty for an entry whose certificate is validated by its chain.
 	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
 	pub fn pinned(&self) -> bool {!self.pins.is_empty()}
-	/// What a user confirms, as `host:port`, and for a pinned entry `host:port#pinned`: "a host and port together, with whether it is pinned".
-	pub fn key(&self) -> String {if self.pinned() {format!("{}#pinned", self.url.authority())} else {self.url.authority()}}
+	/// "Checked by chain, pinned, or plain."
+	pub fn kind(&self) -> Kind {kind(&self.url, &self.pins)}
+	/// What a user confirms, as `host:port`, for a pinned entry `host:port#pinned` and for a plain one `host:port#plain`: "a host and port together, with its kind".
+	pub fn key(&self) -> String {
+		match self.kind() {
+			Kind::Chain => self.url.authority(),
+			Kind::Pinned => format!("{}#pinned", self.url.authority()),
+			Kind::Plain => format!("{}#plain", self.url.authority()),
+		}
+	}
+}
+
+// How an endpoint of this URL and these pins is reached.
+fn kind(url: &Url, pins: &[[u8; 32]]) -> Kind {if url.is_plain() {Kind::Plain} else if pins.is_empty() {Kind::Chain} else {Kind::Pinned}}
+
+/// `main_endpoint`: "the endpoint the provider wants this subscription to use". Naming the one the client holds asks for nothing, and naming another asks for a move ("Moving the main endpoint").
+#[derive(Clone, PartialEq, Eq)]
+pub struct MainEndpoint {pub url: Url, pub pins: Vec<[u8; 32]>, pub gateway_keys: Vec<GatewayKey>}
+
+impl MainEndpoint {
+	pub fn kind(&self) -> Kind {kind(&self.url, &self.pins)}
+}
+
+impl fmt::Debug for MainEndpoint {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "MainEndpoint({}, {:?}, {} keys)", self.url.host(), self.kind(), self.gateway_keys.len())}
 }
 
 impl Deref for Refresh {
@@ -168,6 +191,10 @@ pub struct Subscription {
 	/// Seconds between automatic refreshes.
 	pub update_interval: u32,
 	pub refresh_urls: Vec<Refresh>,
+	/// "The gateway keys of the main endpoint, the active one first and the next one second", 1 or 2, none twice by id or by key, or empty when the document has none. Whether it may have none is for `client`: a document that has an endpoint must.
+	pub gateway_keys: Vec<GatewayKey>,
+	/// "The endpoint the provider wants this subscription to use." Whether it asks for a move is for `client`, which has the endpoint it holds.
+	pub main_endpoint: Option<MainEndpoint>,
 	/// "Base URLs of static mirrors": `https`, a host name, no pins, ending in `/`, none twice, none with the host and port of an entry of `refresh_urls`. That none has the link's endpoint's is for `client`. A static mirror receives no secret, and the user confirms it as a kind of its own (`Subscription::host_keys`).
 	pub static_mirrors: Vec<Url>,
 	/// "The pins of the link's endpoint", 1 or 2, none twice, or empty when the document has none. Whether it is allowed, and whether it holds a pin the client has, is for `client`: this document alone cannot say.
@@ -490,6 +517,23 @@ fn pin_list(pins: &[Json]) -> Option<Vec<[u8; 32]>> {
 	(!pins.is_empty() && pins.len() <= 2 && (pins.len() == 1 || pins[0] != pins[1])).then_some(pins)
 }
 
+// "The gateway keys of an endpoint": 1 or 2 objects with exactly `id`, an integer from 0 to 255, and `key`, an X25519 public key in the form of "Keys", none of small order and none twice by id or by key.
+fn gateway_keys(members: Members, error: &'static str, required: bool) -> Named<Vec<GatewayKey>> {
+	let Some(list) = members.list("gateway_keys", 1..=KEYS_MAX).map_err(|_| error)? else {return if required {Err(error)} else {Ok(Vec::new())}};
+	let keys = list.iter().map(|item| Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| GatewayKey::new(u8::try_from(entry.uint("id", 0..=255).ok()??).ok()?, public(entry.string("key", 44).ok()??)?)).ok_or(error)).collect::<Named<Vec<_>>>()?;
+	if keys.len() == 2 && (keys[0].id() == keys[1].id() || keys[0].public() == keys[1].public()) {return Err(error)}
+	Ok(keys)
+}
+
+// `main_endpoint`: `url` of an `https` or an `http` endpoint, `pins` only for `https` and then the way to an IP literal, and the gateway keys behind it. A fault anywhere refuses the document.
+fn main_endpoint(members: Members) -> Named<Option<MainEndpoint>> {
+	let Some(entry) = members.object("main_endpoint")? else {return Ok(None)};
+	let text = entry.string("url", LINK_URL_MAX).map_err(|_| "main_endpoint")?.ok_or("main_endpoint")?;
+	let pins = entry.list("pins", 1..=2).map_err(|_| "main_endpoint")?.map(|pins| pin_list(pins).ok_or("main_endpoint")).transpose()?.unwrap_or_default();
+	let url = (if pins.is_empty() {Url::either(text, LINK_URL_MAX, false, false)} else {Url::pinned(text, LINK_URL_MAX, false, false)}).ok_or("main_endpoint")?;
+	Ok(Some(MainEndpoint {url, pins, gateway_keys: gateway_keys(entry, "main_endpoint", true)?}))
+}
+
 fn severity(members: Members) -> Option<Severity> {
 	match members.string("severity", STRING_MAX) {
 		Ok(Some("info")) => Some(Severity::Information),
@@ -667,12 +711,15 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let provider = need("name", text(need("provider", members.object("provider"))?, "name", true, NAME, 4 * NAME))?;
 	let update_interval = members.uint("update_interval", UPDATE_INTERVAL)?.map_or(UPDATE_DEFAULT, |seconds| seconds as u32);
 	// A refresh URL is fetched, so it is held to the limit of a subscription URL, 256 characters, and not to the 512 of a URL that is only opened.
-	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, LINK_URL_MAX, true, false).map(|url| Refresh {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Refresh {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
+	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::either(text, LINK_URL_MAX, true, false).map(|url| Refresh {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Refresh {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
 	// "A document cannot move an entry from one kind to the other": entries with one host and port are of one kind. The link's endpoint is held to the same rule by `client`.
-	if refresh_urls.iter().enumerate().any(|(place, entry)| refresh_urls[..place].iter().any(|earlier| earlier.url.authority() == entry.url.authority() && earlier.pinned() != entry.pinned())) {return Err(PayloadError::Member("refresh_urls"))}
+	if refresh_urls.iter().enumerate().any(|(place, entry)| refresh_urls[..place].iter().any(|earlier| earlier.url.authority() == entry.url.authority() && earlier.kind() != entry.kind())) {return Err(PayloadError::Member("refresh_urls"))}
 	// A base URL is held to the rules of a URL the token is sent to, although the token never goes there: no query, no fragment, no IP literal and no pins. One host has one role, so it is not an entry of `refresh_urls` too.
 	let static_mirrors = members.list("static_mirrors", 0..=mirror::MIRRORS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, mirror::BASE_MAX, false, false).filter(|_| text.ends_with('/'))} else {None}.ok_or("static_mirrors")).collect::<Named<Vec<_>>>()?;
 	if static_mirrors.iter().enumerate().any(|(place, base)| static_mirrors[..place].contains(base) || refresh_urls.iter().any(|entry| entry.authority() == base.authority())) {return Err(PayloadError::Member("static_mirrors"))}
+	let main_endpoint = main_endpoint(members)?;
+	// "One host, one role": the endpoint of a move is not the host of a static mirror, and may be the host and port of an entry of `refresh_urls` only of the same kind.
+	if main_endpoint.as_ref().is_some_and(|main| static_mirrors.iter().any(|base| base.authority() == main.url.authority()) || refresh_urls.iter().any(|entry| entry.authority() == main.url.authority() && entry.kind() != main.kind())) {return Err(PayloadError::Member("main_endpoint"))}
 	let endpoint_pins = members.list("endpoint_pins", 1..=2)?.map(|pins| pin_list(pins).ok_or("endpoint_pins")).transpose()?.unwrap_or_default();
 	let (mut profiles, mut refused) = (Vec::new(), Vec::new());
 	for (position, item) in need("profiles", members.list("profiles", 1..=PROFILES_MAX))?.iter().enumerate() {
@@ -700,5 +747,5 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None));
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;
-	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
+	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, gateway_keys: gateway_keys(members, "gateway_keys", false)?, main_endpoint, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
 }

@@ -5,9 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use veilway_engine::import::Library;
 use veilway_engine::{Retry, State, Status, Store};
-use veilway_proto::subscription::client::Standing;
-use veilway_proto::subscription::payload::{Card, LogoKind, Notice, Subscription};
-use veilway_proto::subscription::Tag;
+use veilway_proto::subscription::client::{Held, Standing};
+use veilway_proto::subscription::payload::{Card, LogoKind, MainEndpoint, Notice, Subscription};
+use veilway_proto::subscription::{Kind, Tag, Url};
 
 /// "Refuses more than 512 by 512 pixels."
 const LOGO_SIDE: u32 = 512;
@@ -91,9 +91,23 @@ pub enum CardOut {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ProfileOut {pub id: String, pub name: String, pub exits: Vec<(String, String)>}
 
-/// A backup update host of a subscription. `key` is what the user's answer names it by: the host and port with `#pinned` or `#static`, never a path or the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, and `static` for a static mirror, which never does. `state` is `waiting`, `allowed` or `declined`.
+/// A backup update host of a subscription, or the endpoint a move asks for. `key` is what the user's answer names it by: the host and port with `#pinned`, `#plain` or `#static`, or for a move its URL and kind, never the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, `static` for a static mirror, which never does, and `move` for the endpoint of a move, which would become the main one. `state` is `waiting`, `allowed` or `declined`. `check` is how the host is reached: `chain`, `pinned` or `plain`, and over `plain` the network can tell that the device uses this app. `from` is the main endpoint a move leaves.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct HostOut {pub key: String, pub host: String, pub kind: String, pub state: String}
+pub struct HostOut {pub key: String, pub host: String, pub kind: String, pub state: String, #[serde(default)] pub check: String, #[serde(default)] pub from: Option<String>}
+
+/// The move a document asks for, as an import's confirmation shows it: the new host, how it is reached, and the host it leaves.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct MoveOut {pub host: String, pub check: String, pub from: Option<String>}
+
+fn check(kind: Kind) -> String {
+	match kind {
+		Kind::Chain => "chain",
+		Kind::Pinned => "pinned",
+		Kind::Plain => "plain",
+	}.into()
+}
+
+pub fn move_view(main: &MainEndpoint, from: Option<&Url>) -> MoveOut {MoveOut {host: main.url.authority(), check: check(main.kind()), from: from.map(Url::authority)}}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct LogoOut {pub kind: String, pub data: String}
@@ -179,11 +193,15 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 	}
 }
 
+/// The backup update hosts of a held subscription, then the move it is asked about if there is one. A move is neither a host nor a static mirror: its answer is the one `Library::answer_move` takes.
+pub fn hosts_view(held: &Held) -> Vec<HostOut> {
+	let hosts = held.waiting().into_iter().map(|key| (key, "waiting")).chain(held.confirmed().iter().map(|key| (key.clone(), "allowed"))).chain(held.declined().iter().map(|key| (key.clone(), "declined")));
+	let moving = held.moving().map(|moving| HostOut {key: moving.key(), host: moving.endpoint().url.authority(), kind: "move".into(), state: (if moving.confirmed() {"allowed"} else if moving.declined() {"declined"} else {"waiting"}).into(), check: check(moving.endpoint().kind()), from: held.endpoint().map(Url::authority)});
+	hosts.map(|(key, state)| HostOut {host: key.split('#').next().unwrap_or_default().into(), kind: (if key.ends_with("#static") {"static"} else {"update"}).into(), state: state.into(), check: (if key.ends_with("#plain") {"plain"} else if key.ends_with("#pinned") {"pinned"} else {"chain"}).into(), from: None, key}).chain(moving).collect()
+}
+
 pub fn library_view(library: &Library, store: &Store, languages: &[Tag], now: u64) -> Vec<SubscriptionOut> {
-	library.held().iter().map(|held| {
-		let hosts = held.waiting().into_iter().map(|key| (key, "waiting")).chain(held.confirmed().iter().map(|key| (key.clone(), "allowed"))).chain(held.declined().iter().map(|key| (key.clone(), "declined")));
-		SubscriptionOut {hosts: hosts.map(|(key, state)| HostOut {host: key.split('#').next().unwrap_or_default().into(), kind: (if key.ends_with("#static") {"static"} else {"update"}).into(), state: state.into(), key}).collect(), ..subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)}
-	}).collect()
+	library.held().iter().map(|held| SubscriptionOut {hosts: hosts_view(held), ..subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)}).collect()
 }
 
 pub fn tags(languages: &[String]) -> Vec<Tag> {languages.iter().take(8).filter_map(|text| Tag::read(&text.replace('_', "-"))).collect()}

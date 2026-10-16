@@ -17,7 +17,8 @@ function Hosts({subscription, review, onClose, onChange}: {subscription: Subscri
 	</> : <><Button disabled={busy} onClick={onClose}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => save([...ticked])}>{t("library.hosts.save")}</Button></>}>
 		<ul className="d-hosts" aria-label={t("library.hosts.list")}>{shown.map(host => <li key={host.key} className="d-host">
 			<Checkbox label={host.host} checked={ticked.has(host.key)} onChange={on => setTicked(found => { const next = new Set(found); if (on) next.add(host.key); else next.delete(host.key); return next; })}/>
-			<span className="d-host-kind vw-muted vw-small" data-kind={host.kind}><Icon name={host.kind === "static" ? "lock" : "eye"}/>{t(`library.hosts.${host.kind}`)}</span>
+			<span className="d-host-kind vw-muted vw-small" data-kind={host.kind}><Icon name={host.kind === "static" ? "lock" : "eye"}/>{t(`library.hosts.${host.kind}`, {from: host.from ?? ""})}</span>
+			{host.check === "plain" && <span className="d-host-kind vw-muted vw-small" data-kind="plain"><Icon name="eye"/>{t("library.hosts.plain")}</span>}
 		</li>)}</ul>
 		{error && <Banner tone="danger" title={t("library.hosts.failed")}>{error}</Banner>}
 	</Dialog>;
@@ -37,7 +38,7 @@ export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: 
 				{subscription.can_refresh && <IconButton icon="refresh" label={t("library.refresh", {provider: subscription.provider})} disabled={refreshing === subscription.id} onClick={() => { setRefreshing(subscription.id); onRefresh(subscription.id).finally(() => setRefreshing(null)); }}/>}
 				<Button size="sm" variant="quiet" disabled={inUse === subscription.id} onClick={() => setRemoving(subscription)}>{t("library.remove")}</Button>
 			</span>}/>
-			{subscription.hosts.some(host => host.state === "waiting") ? <li className="d-row-notice"><Icon name="info"/><span className="d-row-notice-text"><span>{t("library.hosts.notice")}</span><span className="vw-muted vw-small">{t("library.hosts.noticeBody")}</span></span><Button size="sm" onClick={() => setHosts({id: subscription.id, review: true})}>{t("library.hosts.review")}</Button></li>
+			{subscription.hosts.some(host => host.state === "waiting") ? <li className="d-row-notice"><Icon name="info"/><span className="d-row-notice-text"><span>{t(subscription.hosts.some(host => host.state === "waiting" && host.kind === "move") ? "library.hosts.noticeMove" : "library.hosts.notice")}</span><span className="vw-muted vw-small">{t("library.hosts.noticeBody")}</span></span><Button size="sm" onClick={() => setHosts({id: subscription.id, review: true})}>{t("library.hosts.review")}</Button></li>
 				: subscription.hosts.length > 0 && <li className="d-row-notice"><Icon name="globe"/><span className="d-row-notice-text"><span>{t("library.hosts.label")}</span><span className="vw-muted vw-small">{t("library.hosts.counts", {allowed: subscription.hosts.filter(host => host.state === "allowed").length, declined: subscription.hosts.filter(host => host.state === "declined").length})}</span></span><Button size="sm" variant="quiet" onClick={() => setHosts({id: subscription.id, review: false})}>{t("library.hosts.manage")}</Button></li>}
 			<li className="d-row-option"><Checkbox label={t("library.lan")} checked={subscription.lan_local} onChange={on => { setLan(subscription, on); }}/><span className="vw-muted vw-small">{t("library.lanHint")}</span></li>
 		</Fragment>)}</List></Glass>}

@@ -26,6 +26,8 @@ serde_json.workspace=true
 
 [dev-dependencies]
 proptest.workspace=true
+# The tests seal what no client or gateway would, which `bench` allows.
+veilway-proto={path=".", features=["bench"]}
 
 # cargo-fuzz builds with this cfg. `proof` and `udp_obfs` then offer a way to seal what no client would, so that a fuzzer reaches the code behind their cryptographic checks.
 [lints.rust]

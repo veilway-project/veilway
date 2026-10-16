@@ -1,13 +1,14 @@
 //! The link (subscription format page, "The link" and "Import"): the two forms of a native link, a whole document in a link or a file, and a legacy link.
 //!
 //! "The form of the link decides what it is." The three kinds are three types, and nothing turns one into another: there is no function from a `Legacy` to a `Native` or back, and no answer of a server is an argument of anything here. A text is read exactly as it is. Cutting white space off a pasted text is the caller's, before it calls.
-use super::{envelope::SigningKey, sealed, unsealed, Token, Url, BODY_MAX, CARRIED_MAX, LINK_URL_MAX};
+use super::{envelope::SigningKey, exchange::GatewayKey, sealed, unsealed, Kind, Token, Url, BODY_MAX, CARRIED_MAX, LINK_URL_MAX};
 use std::fmt;
 
-// "The fragment is 70 characters with its `#`": `v1.`, 43 characters of key, a dot and 22 characters of token. A pinned link adds a dot and 43 characters of pin: 113 without the `#`.
-const FRAGMENT: usize = 69;
-const PINNED: usize = 113;
+// "The fragment is exactly 114 or exactly 158 characters": `v1.`, 43 characters of key, a dot, 44 of gateway key, a dot and 22 of token, and for a pinned link a dot and 43 of pin.
+const FRAGMENT: usize = 114;
+const PINNED: usize = 158;
 const KEY: usize = 43;
+const GATEWAY: usize = 44;
 
 /// Why a text is no link. A link that is refused shows nothing and causes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,9 +35,9 @@ pub enum Link {
 	Legacy(Legacy),
 }
 
-/// A native subscription link: the provider's endpoint, the provider's key and the user's token, and the pin of the endpoint's own certificate when it has no certificate from an authority.
+/// A native subscription link: the provider's endpoint, the provider's key, the key of its gateway and the user's token, and the pin of the endpoint's own certificate when it has no certificate from an authority. A plain link names an `http` endpoint and never has a pin.
 #[derive(Clone, PartialEq, Eq)]
-pub struct Native {endpoint: Url, key: SigningKey, token: Token, pin: Option<[u8; 32]>}
+pub struct Native {endpoint: Url, key: SigningKey, gateway: GatewayKey, token: Token, pin: Option<[u8; 32]>}
 
 /// "A whole document in a link, a code or a file": the provider's key and a document that has yet to be verified under it. "It has no endpoint, so it cannot refresh."
 #[derive(Clone, PartialEq, Eq)]
@@ -55,67 +56,74 @@ fn keyed(content: &str) -> Result<(SigningKey, &str), LinkError> {
 impl Link {
 	/// Reads a link by "the exact grammar, which the client checks before it does anything else".
 	///
-	/// - `veilway://sub/`, a host name with an optional port, `/` and a path, `#v1.`, the key, a dot and the token: native. With a dot and a pin after the token it is a pinned link, and only a pinned link may have an IP literal for a host.
-	/// - The same with `https://`: native.
+	/// - `veilway://sub/`, a host name with an optional port, `/` and a path, `#v1.`, the key, a dot, the gateway key, a dot and the token: native. With a dot and a pin after the token it is a pinned link. Only a pinned or a plain link may have an IP literal for a host.
+	/// - The same with `https://`: native. The same with `veilway://sub-plain/` or `http://`: a plain link, which never has a pin.
 	/// - `veilway://doc#v1.`, the key, a dot and a document of at most `CARRIED_MAX` bytes: a whole document.
 	/// - "Anything that begins with `veilway://` and matches none of these is refused at once."
 	/// - Any other `https` URL: legacy. Its fragment, if it has one, is not kept, as no request carries one.
 	///
-	/// An `https` text that holds `v1.`, 43 characters of base64url, a dot and 22 more anywhere is refused and is never a legacy link.
-	/// An `https` URL whose fragment is `v`, digits and then a dot or the end is held to the native grammar and refused when it does not fit. The page says only that a link with a `v1` fragment is native and every other is legacy. Read to the letter, a native link whose key lost a character on the way would become a legacy link to the provider's endpoint, and a later form `v2` would be fetched as a legacy list by a client that does not know it.
+	/// An `https` or `http` text that holds `v1.`, 43 characters of base64url, a dot and 44 more anywhere is refused and is never a legacy link, and a legacy link is `https` only.
+	/// An `https` or `http` URL whose fragment is `v`, digits and then a dot or the end is held to the native grammar and refused when it does not fit. The page says only that a link with a `v1` fragment is native and every other is legacy. Read to the letter, a native link whose key lost a character on the way would become a legacy link to the provider's endpoint, and a later form `v2` would be fetched as a legacy list by a client that does not know it.
 	pub fn parse(text: &str) -> Result<Self, LinkError> {
 		if let Some(rest) = text.strip_prefix("veilway://") {
-			return match (rest.strip_prefix("doc#"), rest.strip_prefix("sub/")) {
-				(Some(content), _) => Carried::read(content, CARRIED_MAX, false).map(Self::Carried),
-				(_, Some(rest)) => Native::read(rest).map(Self::Native),
+			return match (rest.strip_prefix("doc#"), rest.strip_prefix("sub/"), rest.strip_prefix("sub-plain/")) {
+				(Some(content), ..) => Carried::read(content, CARRIED_MAX, false).map(Self::Carried),
+				(_, Some(rest), _) => Native::read(rest, false).map(Self::Native),
+				(.., Some(rest)) => Native::read(rest, true).map(Self::Native),
 				_ => Err(LinkError::Form),
 			};
 		}
-		let rest = text.strip_prefix("https://").ok_or(LinkError::Form)?;
+		let (rest, plain) = if let Some(rest) = text.strip_prefix("https://") {(rest, false)} else {(text.strip_prefix("http://").ok_or(LinkError::Form)?, true)};
 		let fragment = rest.split_once('#').map(|(_, fragment)| fragment);
-		if fragment.is_some_and(|fragment| fragment.strip_prefix('v').is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()) && rest.trim_start_matches(|c: char| c.is_ascii_digit()).chars().next().is_none_or(|c| c == '.'))) {return Native::read(rest).map(Self::Native)}
+		if fragment.is_some_and(|fragment| fragment.strip_prefix('v').is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()) && rest.trim_start_matches(|c: char| c.is_ascii_digit()).chars().next().is_none_or(|c| c == '.'))) {return Native::read(rest, plain).map(Self::Native)}
 		let fetched = &text[..text.len() - fragment.map_or(0, |fragment| fragment.len() + 1)];
 		// A native link that lost its `#`, or had it changed or something put behind it on the way, would be a legacy URL with the key and the token in its path or query, and a `GET` would send both in the request line. A text that holds what a native fragment holds, anywhere, is refused.
 		let letter = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_';
-		if text.as_bytes().windows(FRAGMENT).any(|part| part.starts_with(b"v1.") && part[3..3 + KEY].iter().all(letter) && part[3 + KEY] == b'.' && part[4 + KEY..].iter().all(letter)) {return Err(LinkError::Form)}
+		if text.as_bytes().windows(4 + KEY + GATEWAY).any(|part| part.starts_with(b"v1.") && part[3..3 + KEY].iter().all(letter) && part[3 + KEY] == b'.' && part[4 + KEY..].iter().all(letter)) {return Err(LinkError::Form)}
+		if plain {return Err(LinkError::Form)}
 		if fetched.len() > LINK_URL_MAX {return Err(LinkError::Size)}
 		Url::parse(fetched, LINK_URL_MAX, true, false).map(|url| Self::Legacy(Legacy {url})).ok_or(LinkError::Form)
 	}
 }
 
 impl Native {
-	// What follows `veilway://sub/` or `https://`.
-	fn read(rest: &str) -> Result<Self, LinkError> {
+	// What follows `veilway://sub/`, `veilway://sub-plain/`, `https://` or `http://`.
+	fn read(rest: &str, plain: bool) -> Result<Self, LinkError> {
 		let (endpoint, fragment) = rest.split_once('#').ok_or(LinkError::Form)?;
-		// The limit is counted on the `https` form, which is the URL the client requests.
-		if endpoint.len() + 8 > LINK_URL_MAX {return Err(LinkError::Size)}
+		// The limit is counted on the `https` form for both TLS forms and on the `http` form for both plain ones, which is the URL the client requests.
+		if endpoint.len() + if plain {7} else {8} > LINK_URL_MAX {return Err(LinkError::Size)}
 		if fragment.len() != FRAGMENT && fragment.len() != PINNED {return Err(LinkError::Form)}
 		let (key, rest) = keyed(fragment)?;
+		if rest.as_bytes().get(GATEWAY) != Some(&b'.') || !rest.is_char_boundary(GATEWAY) {return Err(LinkError::Form)}
+		let gateway = GatewayKey::from_link(&unsealed(&rest[..GATEWAY]).ok_or(LinkError::Form)?).ok_or(LinkError::Key)?;
 		// The length above and the exact length of each part leave one split: 22, a dot and 43, or 22 alone.
-		let (token, pin) = rest.split_once('.').map_or((rest, None), |(token, pin)| (token, Some(pin)));
+		let (token, pin) = rest[GATEWAY + 1..].split_once('.').map_or((&rest[GATEWAY + 1..], None), |(token, pin)| (token, Some(pin)));
 		let pin = pin.map(|pin| unsealed(pin).ok_or(LinkError::Form)).transpose()?;
-		if pin.is_some() != (fragment.len() == PINNED) {return Err(LinkError::Form)}
-		let address = format!("https://{endpoint}");
-		let endpoint = (if pin.is_some() {Url::pinned(&address, LINK_URL_MAX, false, false)} else {Url::parse(&address, LINK_URL_MAX, false, false)}).filter(|_| endpoint.contains('/')).ok_or(LinkError::Form)?;
-		Ok(Self {endpoint, key, token: Token::new(unsealed(token).ok_or(LinkError::Form)?), pin})
+		if pin.is_some() != (fragment.len() == PINNED) || (plain && pin.is_some()) {return Err(LinkError::Form)}
+		let endpoint = (if plain {Url::plain(&format!("http://{endpoint}"), LINK_URL_MAX, false, false)} else if pin.is_some() {Url::pinned(&format!("https://{endpoint}"), LINK_URL_MAX, false, false)} else {Url::parse(&format!("https://{endpoint}"), LINK_URL_MAX, false, false)}).filter(|_| endpoint.contains('/')).ok_or(LinkError::Form)?;
+		Ok(Self {endpoint, key, gateway, token: Token::new(unsealed(token).ok_or(LinkError::Form)?), pin})
 	}
-	/// The provider's subscription endpoint as the URL a fetch goes to: `https`, a host, an optional port and a path. "It is the same for all of a provider's users and holds no secret."
+	/// The provider's subscription endpoint as the URL a fetch goes to: `https` or for a plain link `http`, a host, an optional port and a path. "It is the same for all of a provider's users and holds no secret."
 	pub fn endpoint(&self) -> &Url {&self.endpoint}
 	/// The key every document of this subscription is verified against until a document names others.
 	pub fn key(&self) -> SigningKey {self.key}
 	pub fn token(&self) -> &Token {&self.token}
+	/// The provider's gateway key: every request is sealed to it until a document names others. It "cannot come from a server".
+	pub fn gateway(&self) -> GatewayKey {self.gateway}
+	/// "The link decides how the endpoint is reached": by its chain, by its pin, or over plain HTTP.
+	pub fn kind(&self) -> Kind {if self.endpoint.is_plain() {Kind::Plain} else if self.pin.is_some() {Kind::Pinned} else {Kind::Chain}}
 	/// "The link alone decides whether the endpoint is pinned": the SHA-256 of the SubjectPublicKeyInfo of the endpoint's certificate, which is then trusted alone with no chain, or `None` for an endpoint whose certificate is validated by its chain.
 	pub fn pin(&self) -> Option<&[u8; 32]> {self.pin.as_ref()}
-	fn fragment(&self) -> String {format!("#v1.{}.{}{}", sealed(self.key.bytes()), sealed(self.token.expose()), self.pin.map_or_else(String::new, |pin| format!(".{}", sealed(&pin))))}
+	fn fragment(&self) -> String {format!("#v1.{}.{}.{}{}", sealed(self.key.bytes()), sealed(&self.gateway.link()), sealed(self.token.expose()), self.pin.map_or_else(String::new, |pin| format!(".{}", sealed(&pin))))}
 	/// The link in the form providers hand out. It holds the token: it goes to the secret storage and to the screen the user asked for it on, and nowhere else.
-	pub fn veilway(&self) -> String {format!("veilway://sub/{}{}", &self.endpoint.as_str()[8..], self.fragment())}
-	/// The link in its `https` form, under the same care.
+	pub fn veilway(&self) -> String {format!("veilway://{}/{}{}", if self.endpoint.is_plain() {"sub-plain"} else {"sub"}, &self.endpoint.as_str()[self.endpoint.start()..], self.fragment())}
+	/// The link in its `https` form, or `http` for a plain link, under the same care.
 	pub fn https(&self) -> String {format!("{}{}", self.endpoint.as_str(), self.fragment())}
 }
 
 // The token is the account.
 impl fmt::Debug for Native {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Native({}, {:?}, {}..)", self.endpoint.host(), self.key, if self.pin.is_some() {"pinned, "} else {""})}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Native({}, {:?}, {:?}, {}..)", self.endpoint.host(), self.key, self.gateway, if self.pin.is_some() {"pinned, "} else {""})}
 }
 
 impl Carried {

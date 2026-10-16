@@ -36,6 +36,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				{key(review.fingerprint)}
 				{review.endpoint_changed && <Banner tone="warning" title={t("import.review.endpointTitle")}>{t("import.review.endpoint")}</Banner>}
 				{review.replaces && <Banner tone="info" title={t("import.review.replaces")}/>}
+				{review.moving && <Banner tone="warning" title={t("import.review.moveTitle")}>{t(review.moving.check === "plain" ? "import.review.movePlain" : "import.review.move", {from: review.moving.from ?? "", host: review.moving.host})}</Banner>}
 				<List label={t("import.review.connections")}>{preview.profiles.map(profile => <ListRow key={profile.id} title={profile.name} detail={t("import.review.exits", {count: profile.exits.length})}/>)}</List>
 				{review.left_out.length > 0 && <p className="vw-muted vw-small">{t("import.review.leftOut", {count: review.left_out.length})}</p>}
 				{failure}
@@ -62,6 +63,7 @@ export function Importer({first, onCancel, onDone}: {first: boolean, onCancel: (
 				<p>{native ? t("import.native.body", {host}) : t(offer.in_file ? "import.carried.bodyFile" : "import.carried.body")}</p>
 				{key(offer.fingerprint)}
 				{native && offer.pinned && <p className="vw-muted vw-small">{t("import.pinned")}</p>}
+				{native && offer.plain && <Banner tone="warning" title={t("import.plain")}/>}
 				{failure}
 				<div className="d-actions"><Button onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => proceed()}>{native ? t("import.native.yes", {host}) : t("import.carried.yes")}</Button></div>
 			</Glass>

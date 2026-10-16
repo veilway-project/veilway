@@ -160,6 +160,20 @@ doc=false
 bench=false
 
 [[bin]]
+name="fuzz_sub_gateway"
+path="fuzz_targets/fuzz_sub_gateway.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="fuzz_sub_answer"
+path="fuzz_targets/fuzz_sub_answer.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="fuzz_pairing"
 path="fuzz_targets/fuzz_pairing.rs"
 test=false

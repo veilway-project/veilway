@@ -29,6 +29,9 @@ use veilway_engine::{Agree, Class, Event, Pause, Redirect, Retry, Say, Settings,
 use veilway_proto::control::ExitStatus;
 use veilway_proto::subscription::client::Offer;
 use veilway_proto::subscription::envelope::{self, SigningKey};
+use veilway_proto::subscription::exchange::{Gateway, GatewayKey};
+use veilway_proto::subscription::fetch::{Op, Received};
+use veilway_proto::NoRandom;
 
 const TLS_PATH: &str = "/assets/app-3f9c2e71.js";
 const OBFS: &str = "10.99.0.1:5001";
@@ -39,6 +42,16 @@ const SLOW_TLS: &str = "10.99.0.5:5005";
 const STOP: Duration = Duration::from_secs(60);
 const PLAIN: &str = "10.99.0.4:5004";
 const ID: &str = "test-subscription-0001";
+
+/// The gateway key of the provider of every document of the tests: the id 1 and the private key 40..5f.
+fn gateway_private() -> [u8; 32] {std::array::from_fn(|index| 0x40 + index as u8)}
+
+fn gateway_key() -> GatewayKey {GatewayKey::new(1, veilway_proto::proof::public_key(&gateway_private())).unwrap()}
+
+/// The gateway the endpoints of the tests open requests with.
+fn gateway() -> Arc<Mutex<Gateway>> {Arc::new(Mutex::new(Gateway::new(&[(1, gateway_private())], 0, &mut entropy).unwrap()))}
+
+fn entropy(bytes: &mut [u8]) -> Result<(), NoRandom> {ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), bytes).map_err(|_| NoRandom)}
 
 fn b64(bytes: &[u8]) -> String {base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}
 
@@ -194,6 +207,7 @@ fn payload(time: Time, profiles: Vec<Value>) -> Value {
 	json!({
 		"v": 1, "subscription_id": ID, "serial": 1, "issued_at": time.secs() - 10, "expires_at": time.secs() + 30 * 86_400,
 		"signing_keys": [b64(provider_key().bytes())], "provider": {"name": "Test provider"}, "profiles": profiles,
+		"gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}],
 	})
 }
 
@@ -791,17 +805,20 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	let net = net("engine-import", time, |_| {}).await;
 	let (roots, _, config) = certify("sub.example.com", None);
 	let (mode, enrolled, numbers, issued) = (Arc::new(Mutex::new(Mode::Normal)), Arc::new(AtomicU64::new(0)), Arc::new(Mutex::new(Vec::<([u8; 32], u64)>::new())), time.secs() - 10);
+	let (gateway, requests) = (gateway(), Arc::new(Mutex::new(Vec::<Received>::new())));
 	let transports = vec![transport("udp-obfs", &net), transport("tls", &net)];
 	let (engine, doc) = (net.engine.clone(), net.doc.clone());
 	let endpoint = endpoint(config, Arc::new({
-		let (mode, enrolled, numbers) = (mode.clone(), enrolled.clone(), numbers.clone());
+		let (mode, enrolled, numbers, gateway, requests) = (mode.clone(), enrolled.clone(), numbers.clone(), gateway.clone(), requests.clone());
 		move |body| {
-			let (mode, enrolled, numbers, transports, engine, doc) = (mode.clone(), enrolled.clone(), numbers.clone(), transports.clone(), engine.clone(), doc.clone());
+			let (mode, enrolled, numbers, transports, engine, doc, gateway, requests) = (mode.clone(), enrolled.clone(), numbers.clone(), transports.clone(), engine.clone(), doc.clone(), gateway.clone(), requests.clone());
 			Box::pin(async move {
-				use veilway_proto::subscription::fetch::{Op, Received};
-				let received = Received::read(&body).expect("the client wrote a request the endpoint cannot read");
+				let opened = gateway.lock().unwrap().open(&body, issued + 10, || true).expect("the client sealed a request the gateway cannot open");
+				let (received, reply) = (opened.request.expect("the client wrote a request the gateway cannot read"), opened.reply);
+				requests.lock().unwrap().push(received.clone());
+				let seal = |envelope: &str| reply.seal(envelope.as_bytes(), &mut entropy).unwrap();
 				let key = provider_key();
-				let released = || http("200 OK", &[], sign(&json!({"v": 1, "subscription_id": ID, "issued_at": issued, "refusal": "released"})).as_bytes());
+				let released = || http("200 OK", &[("Content-Type", "application/octet-stream")], &seal(&sign(&json!({"v": 1, "subscription_id": ID, "issued_at": issued, "refusal": "released"}))));
 				if matches!(received.op(), Op::Release) {return released()}
 				// The device is enrolled at the node on its first request, with a place of its own in the node's config.
 				let known = numbers.lock().unwrap().iter().find(|(public, _)| public == received.device_public_key()).map(|(_, number)| *number);
@@ -820,18 +837,18 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 					"gateways": ["10.7.0.1"], "mtu": 1390, "transport_public_key": text(&veilway_proto::proof::public_key(&TRANSPORT)), "transports": transports,
 					"exits": [{"tag": "main", "name": "Main exit"}],
 				});
-				let document = json!({"v": 1, "subscription_id": ID, "serial": 1, "issued_at": issued, "expires_at": issued + 30 * 86_400, "signing_keys": [b64(key.bytes())], "provider": {"name": "Test provider"}, "profiles": [imported]});
+				let document = json!({"v": 1, "subscription_id": ID, "serial": 1, "issued_at": issued, "expires_at": issued + 30 * 86_400, "signing_keys": [b64(key.bytes())], "provider": {"name": "Test provider"}, "profiles": [imported], "gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}]});
 				let current = *mode.lock().unwrap();
 				match current {
-					Mode::Normal => http("200 OK", &[("Content-Type", "application/json")], sign(&document).as_bytes()),
-					Mode::Chunked => http("200 OK", &[("Transfer-Encoding", "chunked")], &chunked(sign(&document).as_bytes())),
+					Mode::Normal => http("200 OK", &[("Content-Type", "application/octet-stream"), ("Cache-Control", "no-store")], &seal(&sign(&document))),
+					Mode::Chunked => http("200 OK", &[("Transfer-Encoding", "chunked")], &chunked(&seal(&sign(&document)))),
 					Mode::Redirect => http("302 Found", &[("Location", "https://elsewhere.example.com/")], b""),
 					Mode::Missing => http("404 Not Found", &[], b"nothing here\n"),
-					Mode::Encoded => http("200 OK", &[("Content-Encoding", "gzip")], sign(&document).as_bytes()),
+					Mode::Encoded => http("200 OK", &[("Content-Encoding", "gzip")], &seal(&sign(&document))),
 					Mode::Foreign => {
 						let other = Ed25519KeyPair::from_seed_unchecked(&[0x22; 32]).unwrap();
 						let signer = SigningKey::new(other.public_key().as_ref().try_into().unwrap()).unwrap();
-						http("200 OK", &[], envelope::seal(&signer, &serde_json::to_vec(&document).unwrap(), |signed| other.sign(signed).as_ref().try_into().unwrap()).as_bytes())
+						http("200 OK", &[], &seal(&envelope::seal(&signer, &serde_json::to_vec(&document).unwrap(), |signed| other.sign(signed).as_ref().try_into().unwrap())))
 					}
 				}
 			})
@@ -843,13 +860,13 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 		assert_eq!((host.as_str(), port), ("sub.example.com", 443));
 		Ok(vec![at])
 	}));
-	let link = format!("  veilway://sub/sub.example.com/s#v1.{}.{}\n", b64url(provider_key().bytes()), b64url(&[0x55; 16]));
+	let link = format!("  veilway://sub/sub.example.com/s#v1.{}.{}.{}\n", b64url(provider_key().bytes()), b64url(&gateway_key().link()), b64url(&[0x55; 16]));
 	let (mut library, _) = Library::open(Box::new(FileVault(net.dir.join("import.vault")))).unwrap();
 	// Step 1 shows what the link alone says and nothing is sent: not by opening it, and not by the user's yes to it either until the request is made.
 	let Offer::Native(offer) = import::open(&link).unwrap() else {panic!("a native link")};
 	assert_eq!((offer.endpoint().host(), offer.fingerprint().to_string()), ("sub.example.com", provider_key().fingerprint().to_string()));
 	assert!(endpoint.seen.lock().unwrap().is_empty());
-	for bad in ["veilway://sub/sub.example.com/s", "veilway://sub/sub.example.com/s#v1.short.short", "http://sub.example.com/s#v1.x.y", "veilway://sub/localhost/s#v1.x.y"] {assert!(matches!(import::open(bad), Err(import::ImportError::Link(_) | import::ImportError::NotALink)), "{bad}")}
+	for bad in ["veilway://sub/sub.example.com/s", "veilway://sub/sub.example.com/s#v1.short.short.short", "http://sub.example.com/s#v1.x.y.z", "veilway://sub/localhost/s#v1.x.y"] {assert!(matches!(import::open(bad), Err(import::ImportError::Link(_) | import::ImportError::NotALink)), "{bad}")}
 	// A link of another kind cannot be verified, and this engine does not connect to it by itself: nothing is sent for it either.
 	assert!(matches!(import::open("https://example.com/legacy-list"), Err(import::ImportError::Legacy)));
 	let fetching = import::proceed(offer, None).unwrap();
@@ -869,7 +886,7 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	let (other, _, _) = certify("other.example.com", None);
 	assert!(matches!(Fetcher {roots: other, ..fetcher.clone()}.fetch(&fetching, &library, time.secs(), &[]).await, Err(import::ImportError::Fetch(import::FetchError::Certificate))));
 	let before = endpoint.seen.lock().unwrap().len();
-	assert_eq!(fetcher.post(fetching.endpoint(), &import::Trust::Pinned(vec![[1; 32]]), b"{}", &[]).await, Err(import::FetchError::Pin));
+	assert_eq!(fetcher.post(fetching.endpoint(), &import::Trust::Pinned(vec![[1; 32]]), &[0; 1_073], &[], time.secs()).await, Err(import::FetchError::Pin));
 	assert_eq!(endpoint.seen.lock().unwrap().len(), before);
 	// The answer that passes, once with a body that comes in chunks. Nothing is stored before the second yes.
 	*mode.lock().unwrap() = Mode::Chunked;
@@ -880,19 +897,18 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	assert!(library.held().is_empty() && !net.dir.join("import.vault").exists());
 	let review = &reviewed.review;
 	assert_eq!((review.subscription().profiles[0].id.as_str(), review.origin(), review.replaces(), review.refreshes(), review.fingerprint().to_string()), ("home", veilway_proto::subscription::payload::KeyOrigin::Device, false, true, provider_key().fingerprint().to_string()));
-	// The request: the token in the body and nowhere else, and none of the header fields a client leaves out.
+	// The request: exactly the fields of the page, a body of exactly 1,073 sealed bytes, and the token inside the seal and nowhere else.
 	let (head, body) = endpoint.seen.lock().unwrap().last().cloned().unwrap();
 	let lower = head.to_ascii_lowercase();
-	assert!(head.starts_with("POST /s HTTP/1.1\r\n") && head.contains("Host: sub.example.com\r\n") && head.contains("Content-Type: application/json\r\n") && lower.contains("accept-encoding: identity\r\n"), "{head}");
-	assert!(!lower.contains("accept-language") && !lower.contains("cookie") && !lower.contains("authorization") && !lower.contains("user-agent") && !head.contains("VVVVVVVV"), "{head}");
-	let request: Value = serde_json::from_slice(&body).unwrap();
-	assert_eq!((request["op"].as_str(), request["token"].as_str(), request["v"].as_u64()), (Some("fetch"), Some("VVVVVVVVVVVVVVVVVVVVVQ"), Some(1)));
+	assert_eq!(head, "POST /s HTTP/1.1\r\nHost: sub.example.com\r\nContent-Type: application/octet-stream\r\nContent-Length: 1073\r\nAccept-Encoding: identity\r\n\r\n");
+	assert!(!lower.contains("accept-language") && !lower.contains("cookie") && !lower.contains("authorization") && !lower.contains("user-agent") && !head.contains("VVVVVVVV") && body.len() == 1_073 && !body.windows(22).any(|part| part == b"VVVVVVVVVVVVVVVVVVVVVQ"), "{head}");
+	let request = requests.lock().unwrap().last().cloned().unwrap();
+	assert_eq!((request.op(), request.token().expose(), request.t().abs_diff(time.secs()) <= 1), (&Op::Fetch, &[0x55; 16], true));
 	// The second yes, with a name: stored, and the place made permanent.
 	let name = veilway_proto::subscription::fetch::DeviceName::typed("my phone");
 	fetcher.accept(reviewed, name, &mut library).await.unwrap();
 	assert_eq!(library.held().len(), 1);
-	let confirm: Value = serde_json::from_slice(&endpoint.seen.lock().unwrap().last().unwrap().1).unwrap();
-	assert_eq!((confirm["op"].as_str(), confirm["device_name"].as_str()), (Some("confirm"), Some("my phone")));
+	assert_eq!(requests.lock().unwrap().last().unwrap().op(), &Op::Confirm(veilway_proto::subscription::fetch::DeviceName::typed("my phone")));
 	#[cfg(unix)]
 	assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(net.dir.join("import.vault")).unwrap().permissions()) & 0o777, 0o600);
 	let (restored, damaged) = Library::open(Box::new(FileVault(net.dir.join("import.vault")))).unwrap();
@@ -918,8 +934,7 @@ async fn a_link_is_imported_in_three_steps_after_two_yeses_and_the_device_it_mad
 	let fetching = import::proceed(offer, None).unwrap();
 	let reviewed = fetcher.fetch(&fetching, &other_library, time.secs(), &[]).await.unwrap();
 	fetcher.decline(reviewed).await;
-	let release: Value = serde_json::from_slice(&endpoint.seen.lock().unwrap().last().unwrap().1).unwrap();
-	assert_eq!(release["op"].as_str(), Some("release"));
+	assert_eq!(requests.lock().unwrap().last().unwrap().op(), &Op::Release);
 	assert!(other_library.held().is_empty());
 	assert!(logged("tunnel state"));
 }
@@ -1035,16 +1050,19 @@ async fn a_pinned_endpoint_is_trusted_by_its_pin_alone_and_nothing_is_sent_to_on
 	let time = time!();
 	let net = net("engine-pinned", time, |_| {}).await;
 	let (_, pin, config) = certify("some-other-name.example.org", None);
-	let document = sign(&payload(time, vec![profile(&net, 0, &["tls"])]));
-	let endpoint = endpoint(config, Arc::new(move |_| {
-		let document = document.clone();
-		Box::pin(async move { http("200 OK", &[], document.as_bytes()) })
+	let (document, gateway, now) = (sign(&payload(time, vec![profile(&net, 0, &["tls"])])), gateway(), time.secs());
+	let endpoint = endpoint(config, Arc::new(move |body| {
+		let (document, gateway) = (document.clone(), gateway.clone());
+		Box::pin(async move {
+			let reply = gateway.lock().unwrap().open(&body, now, || true).expect("the client sealed a request the gateway cannot open").reply;
+			http("200 OK", &[("Content-Type", "application/octet-stream")], &reply.seal(document.as_bytes(), &mut entropy).unwrap())
+		})
 	})).await;
 	let at = endpoint.addr;
 	// No root is held at all, and the name on the certificate is not the link's: only the pin can pass it.
 	let mut fetcher = Fetcher::new(Arc::new(RootCertStore::empty()), None);
 	fetcher.resolve = Arc::new(move |_, _| Box::pin(async move { Ok(vec![at]) }));
-	let link = |pin: &[u8; 32]| format!("veilway://sub/sub.example.com/s#v1.{}.{}.{}", b64url(provider_key().bytes()), b64url(&[0x55; 16]), b64url(pin));
+	let link = |pin: &[u8; 32]| format!("veilway://sub/sub.example.com/s#v1.{}.{}.{}.{}", b64url(provider_key().bytes()), b64url(&gateway_key().link()), b64url(&[0x55; 16]), b64url(pin));
 	let (mut library, _) = Library::open(Box::new(FileVault(net.dir.join("pinned.vault")))).unwrap();
 	let Offer::Native(offer) = import::open(&link(&pin)).unwrap() else {panic!("a native link")};
 	assert_eq!(offer.pin(), Some(&pin));
@@ -1059,10 +1077,10 @@ async fn a_pinned_endpoint_is_trusted_by_its_pin_alone_and_nothing_is_sent_to_on
 	let reviewed = fetcher.fetch(&fetching, &library, time.secs(), &[]).await.unwrap();
 	assert_eq!(reviewed.pins, [pin]);
 	fetcher.accept(reviewed, None, &mut library).await.unwrap();
-	assert_eq!(library.held()[0].targets().first().map(|(_, pins)| pins.to_vec()), Some(vec![pin]));
+	assert_eq!(library.held()[0].targets().first().map(|target| target.pins.to_vec()), Some(vec![pin]));
 	assert_eq!(endpoint.seen.lock().unwrap().len(), 2, "the fetch and the confirmation");
 	let (restored, _) = Library::open(Box::new(FileVault(net.dir.join("pinned.vault")))).unwrap();
-	assert_eq!(restored.held()[0].targets().first().map(|(_, pins)| pins.to_vec()), Some(vec![pin]));
+	assert_eq!(restored.held()[0].targets().first().map(|target| target.pins.to_vec()), Some(vec![pin]));
 	// A refresh goes to the endpoint by the same pin, and an endpoint whose certificate changed is refused, not trusted by its chain.
 	assert!(matches!(fetcher.refresh(&mut library, 0, time.secs()).await, Ok(veilway_proto::subscription::client::Refreshed::Unchanged)));
 	let (_, _, moved) = certify("sub.example.com", None);

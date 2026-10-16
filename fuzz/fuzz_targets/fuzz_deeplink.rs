@@ -16,14 +16,14 @@ fuzz_target!(|data: &[u8]| {
 		Link::Native(native) => {
 			assert!(text == native.veilway() || text == native.https(), "a native link was read as another text than it is");
 			assert!(Link::parse(&native.veilway()).as_ref() == Ok(&link) && Link::parse(&native.https()).as_ref() == Ok(&link), "the two forms of a native link read as two links");
-			// The link alone decides whether the endpoint is pinned: 113 characters of fragment with a pin and 69 without, and only a pinned link has an address for a host, one that is dialable and in its one spelling.
+			// The link alone decides whether the endpoint is pinned: 158 characters of fragment with a pin and 114 without, a plain link never has a pin, and only a pinned or a plain link has an address for a host, one that is dialable and in its one spelling.
 			let fragment = text.split_once('#').map_or("", |(_, fragment)| fragment);
-			assert!(native.pin().is_some() == (fragment.len() == 113) && (native.pin().is_some() || fragment.len() == 69), "a pin and the length of the fragment disagree");
-			assert!(native.endpoint().as_str().len() <= LINK_URL_MAX && !native.endpoint().as_str().contains(['#', '?']) && if let Some(address) = native.endpoint().literal() {native.pin().is_some() && dialable(address) && !is_host(native.endpoint().host()) && native.endpoint().host() == match address {std::net::IpAddr::V4(ip) => ip.to_string(), std::net::IpAddr::V6(ip) => format!("[{ip}]")}} else {is_host(native.endpoint().host())});
+			assert!(native.pin().is_some() == (fragment.len() == 158) && (native.pin().is_some() || fragment.len() == 114) && (native.pin().is_none() || !native.endpoint().is_plain()), "a pin and the length of the fragment disagree");
+			assert!(native.endpoint().as_str().len() <= LINK_URL_MAX && !native.endpoint().as_str().contains(['#', '?']) && if let Some(address) = native.endpoint().literal() {(native.pin().is_some() || native.endpoint().is_plain()) && dialable(address) && !is_host(native.endpoint().host()) && native.endpoint().host() == match address {std::net::IpAddr::V4(ip) => ip.to_string(), std::net::IpAddr::V6(ip) => format!("[{ip}]")}} else {is_host(native.endpoint().host())});
 			// The endpoint is no secret and is printed. A path may hold the same characters as the token, so it is taken out first.
 			let printed = format!("{native:?}").replace(native.endpoint().as_str(), "");
-			assert!(!printed.contains(&fragment[47..69]), "a native link printed its token");
-			assert!(native.pin().is_none() || !printed.contains(&fragment[70..]), "a native link printed its pin");
+			assert!(!printed.contains(&fragment[92..114]), "a native link printed its token");
+			assert!(native.pin().is_none() || !printed.contains(&fragment[115..]), "a native link printed its pin");
 		}
 		Link::Carried(carried) => {
 			assert_eq!(carried.veilway().as_deref(), Some(text), "a document in a link was read as another text than it is");

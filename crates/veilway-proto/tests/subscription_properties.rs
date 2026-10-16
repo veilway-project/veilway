@@ -3,7 +3,7 @@ use proptest::{collection::vec, option, prelude::*, sample::{select, Index}};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs};
-use veilway_proto::{control, proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, Tag, Text, BODY_MAX, TRANSLATIONS_MAX}, NoRandom};
+use veilway_proto::{control, proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, exchange::GatewayKey, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, Tag, Text, BODY_MAX, TRANSLATIONS_MAX}, NoRandom};
 
 const ISSUED: u64 = 1_700_000_000;
 
@@ -66,6 +66,8 @@ fn neighbours(text: &str) -> Vec<String> {
 		CHANGES.into_iter().flat_map(move |c| [(at < chars.len() && chars[at] != c).then(|| chars.iter().enumerate().map(|(index, old)| if index == at {c} else {*old}).collect::<String>()), Some(chars[..at].iter().chain([&c]).chain(&chars[at..]).collect())]).flatten().chain(removed)
 	}).collect()
 }
+
+fn gateway_bytes() -> impl Strategy<Value = [u8; 33]> {any::<[u8; 33]>().prop_filter("a gateway key of full order", |bytes| GatewayKey::from_link(bytes).is_some())}
 
 fn signing_key() -> impl Strategy<Value = [u8; 32]> {any::<[u8; 32]>().prop_filter("a key a client may hold", |key| SigningKey::new(*key).is_some())}
 
@@ -145,8 +147,8 @@ fn replacement() -> impl Strategy<Value = Value> {
 
 proptest! {
 	#[test]
-	fn a_native_link_reads_back_and_no_changed_character_passes_for_it(endpoint in endpoint(), key in signing_key(), token in any::<[u8; 16]>()) {
-		let fragment = format!("#v1.{}.{}", url_base64(&key), url_base64(&token));
+	fn a_native_link_reads_back_and_no_changed_character_passes_for_it(endpoint in endpoint(), key in signing_key(), gateway in gateway_bytes(), token in any::<[u8; 16]>()) {
+		let fragment = format!("#v1.{}.{}.{}", url_base64(&key), url_base64(&gateway), url_base64(&token));
 		let (veilway, https) = (format!("veilway://sub/{endpoint}{fragment}"), format!("https://{endpoint}{fragment}"));
 		let (Ok(Link::Native(native)), Ok(Link::Native(other))) = (Link::parse(&veilway), Link::parse(&https)) else {panic!("{veilway}")};
 		prop_assert_eq!((native.veilway(), native.https(), *native.key().bytes(), *native.token().expose(), &other), (veilway.clone(), https.clone(), key, token, &native));
@@ -168,8 +170,8 @@ proptest! {
 
 	// "The link alone decides whether the endpoint is pinned": a pinned link reads back with its pin, no changed character makes it a link without one, and no changed character makes a link without a pin a pinned one.
 	#[test]
-	fn a_pinned_link_reads_back_and_no_changed_character_moves_it_between_the_two_kinds(endpoint in pinned_endpoint(), key in signing_key(), token in any::<[u8; 16]>(), pin in any::<[u8; 32]>()) {
-		let (bare, with) = (format!("#v1.{}.{}", url_base64(&key), url_base64(&token)), format!("#v1.{}.{}.{}", url_base64(&key), url_base64(&token), url_base64(&pin)));
+	fn a_pinned_link_reads_back_and_no_changed_character_moves_it_between_the_two_kinds(endpoint in pinned_endpoint(), key in signing_key(), gateway in gateway_bytes(), token in any::<[u8; 16]>(), pin in any::<[u8; 32]>()) {
+		let (bare, with) = (format!("#v1.{}.{}.{}", url_base64(&key), url_base64(&gateway), url_base64(&token)), format!("#v1.{}.{}.{}.{}", url_base64(&key), url_base64(&gateway), url_base64(&token), url_base64(&pin)));
 		let (veilway, https) = (format!("veilway://sub/{endpoint}{with}"), format!("https://{endpoint}{with}"));
 		let (Ok(Link::Native(native)), Ok(Link::Native(other))) = (Link::parse(&veilway), Link::parse(&https)) else {panic!("{veilway}")};
 		prop_assert_eq!((native.veilway(), native.https(), native.pin().copied(), &other), (veilway.clone(), https.clone(), Some(pin), &native));
@@ -179,7 +181,7 @@ proptest! {
 			for changed in neighbours(text) {
 				match Link::parse(&changed) {
 					Err(_) => {}
-					// A pinned link has 113 characters of fragment and an unpinned one 69: one changed character cannot be the other.
+					// A pinned link has 158 characters of fragment and an unpinned one 114: one changed character cannot be the other.
 					Ok(Link::Native(read)) => prop_assert!(read.pin().is_some() && read != native && changed == if form {read.veilway()} else {read.https()}, "{changed}"),
 					Ok(Link::Legacy(read)) => prop_assert!(!form && changed.starts_with(read.url().as_str()) && !read.url().as_str().contains(&url_base64(&token)) && !read.url().as_str().contains(&url_base64(&pin)) && read.url().literal().is_none(), "{changed}"),
 					Ok(Link::Carried(_)) => prop_assert!(false, "{changed}"),
@@ -235,12 +237,12 @@ proptest! {
 	}
 
 	#[test]
-	fn a_request_reads_back_as_it_was_written(token in any::<[u8; 16]>(), kids in vec(any::<[u8; 8]>(), 1..=2), device in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), op in 0..3usize, name in option::of(any::<String>()), at in any::<Index>(), byte in any::<u8>()) {
+	fn a_request_reads_back_as_it_was_written(t in 0..9_007_199_254_740_992u64, token in any::<[u8; 16]>(), kids in vec(any::<[u8; 8]>(), 1..=2), device in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), op in 0..3usize, name in option::of(any::<String>()), at in any::<Index>(), byte in any::<u8>()) {
 		prop_assume!(kids.len() == 1 || kids[0] != kids[1]);
 		let (device, name) = (public_key(&device), name.and_then(|name| DeviceName::typed(&name)).filter(|_| op == 1));
-		let body = format!("{{\"v\":1,\"token\":\"{}\",\"kids\":[{}],\"device_public_key\":\"{}\",\"device_secret\":\"{}\",\"op\":\"{}\"{}}}", url_base64(&token), kids.iter().map(|kid| format!("\"{}\"", url_base64(kid))).collect::<Vec<_>>().join(","), std_base64(&device), url_base64(&secret), ["fetch", "confirm", "release"][op], name.as_ref().map_or(String::new(), |name| format!(",\"device_name\":{}", serde_json::to_string(name.as_str()).unwrap())));
+		let body = format!("{{\"v\":1,\"t\":{t},\"token\":\"{}\",\"kids\":[{}],\"device_public_key\":\"{}\",\"device_secret\":\"{}\",\"op\":\"{}\"{}}}", url_base64(&token), kids.iter().map(|kid| format!("\"{}\"", url_base64(kid))).collect::<Vec<_>>().join(","), std_base64(&device), url_base64(&secret), ["fetch", "confirm", "release"][op], name.as_ref().map_or(String::new(), |name| format!(",\"device_name\":{}", serde_json::to_string(name.as_str()).unwrap())));
 		let request = Received::read(body.as_bytes()).unwrap();
-		prop_assert_eq!((String::from_utf8(request.canonical()).unwrap(), request.token().expose(), request.device_public_key(), request.device_secret().expose(), request.kids().iter().map(|kid| kid.bytes()).collect::<Vec<_>>()), (body.clone(), &token, &device, &secret, kids));
+		prop_assert_eq!((String::from_utf8(request.canonical()).unwrap(), request.t(), request.token().expose(), request.device_public_key(), request.device_secret().expose(), request.kids().iter().map(|kid| kid.bytes()).collect::<Vec<_>>()), (body.clone(), t, &token, &device, &secret, kids));
 		// One byte changed: refused, or another request that is written back as it reads.
 		let mut changed = body.into_bytes();
 		let at = at.index(changed.len());

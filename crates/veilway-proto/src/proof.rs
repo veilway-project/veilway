@@ -14,9 +14,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hpke::{aead::{AeadTag, ChaCha20Poly1305}, inout::InOutBuf, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::{TryCryptoRng, TryRng}, Deserializable, HpkeError, Kem, OpModeR, OpModeS, Serializable};
 use std::{convert::Infallible, fmt, ops::RangeInclusive};
 
-type Private = <X25519HkdfSha256 as Kem>::PrivateKey;
-type Public = <X25519HkdfSha256 as Kem>::PublicKey;
-type Encapped = <X25519HkdfSha256 as Kem>::EncappedKey;
+pub(crate) type Private = <X25519HkdfSha256 as Kem>::PrivateKey;
+pub(crate) type Public = <X25519HkdfSha256 as Kem>::PublicKey;
+pub(crate) type Encapped = <X25519HkdfSha256 as Kem>::EncappedKey;
 
 /// The one proof version this crate speaks. "A node treats any other version exactly as an invalid proof."
 pub const VERSION: u8 = 1;
@@ -38,7 +38,7 @@ const DUMMIES: u16 = 8192;
 const HEAD: usize = 28;
 const TAG: usize = 16;
 // The u-coordinates for which X25519 gives zero for every private key: the points of small order, in each encoding of 255 bits. RFC 9180 makes HPKE stop at such an `enc`, before its key schedule, which would be less work than for any other token. A node therefore swaps such an `enc` for the base point, and refuses the token at the end.
-const SMALL_ORDER: [[u8; 32]; 7] = [
+pub(crate) const SMALL_ORDER: [[u8; 32]; 7] = [
 	[0; 32],
 	[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 	[0xe0, 0xeb, 0x7a, 0x7c, 0x3b, 0x41, 0xb8, 0xae, 0x16, 0x56, 0xe3, 0xfa, 0xf1, 0x9f, 0xc4, 0x6a, 0xda, 0x09, 0x8d, 0xeb, 0x9c, 0x32, 0xb1, 0xfd, 0x86, 0x62, 0x05, 0x16, 0x5f, 0x49, 0xb8, 0x00],
@@ -48,7 +48,7 @@ const SMALL_ORDER: [[u8; 32]; 7] = [
 	[0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f],
 ];
 // The base point of X25519, which is not of small order.
-const BASE: [u8; 32] = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const BASE: [u8; 32] = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
 /// The transport a proof is made for. Its name is part of the HPKE `info`, "so a proof made for one transport is not valid on another".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub fn public_key(transport_key: &[u8; 32]) -> [u8; 32] {
 }
 
 // The caller's random source as the generator HPKE draws its ephemeral key from. That generator has no way to fail, so a failure is remembered here and the context it led to is thrown away.
-struct Source<'a, 'b> {random: &'a mut Random<'b>, failed: bool}
+pub(crate) struct Source<'a, 'b> {pub(crate) random: &'a mut Random<'b>, pub(crate) failed: bool}
 
 impl TryRng for Source<'_, '_> {
 	type Error = Infallible;

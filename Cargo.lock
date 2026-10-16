@@ -2939,6 +2939,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subtle",
+ "veilway-proto",
  "x25519-dalek 3.0.0",
 ]
 

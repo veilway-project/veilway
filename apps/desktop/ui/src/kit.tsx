@@ -5,7 +5,11 @@ import {en, type DesktopKey} from "./locales/en.ts";
 export const useD = () => useI18n<DesktopKey>();
 
 // The helper answers an import failure with its code, which is said in the window's language. Any other text is shown as it is.
-export const failureText = (text: string, t: (key: DesktopKey) => string) => `import.error.${text}` in en ? t(`import.error.${text}` as DesktopKey) : text;
+// A failure about the clocks carries the minutes after a colon, as `server_clock:12`.
+export const failureText = (text: string, t: (key: DesktopKey, params?: {minutes: number}) => string) => {
+	const [code = "", minutes] = text.split(":");
+	return `import.error.${code}` in en ? t(`import.error.${code}` as DesktopKey, {minutes: Number(minutes) || 0}) : text;
+};
 
 // The same window runs in the Android app (apps/android), which has no kill switch, start at login or updater of its own.
 export const ANDROID = /Android/i.test(navigator.userAgent);

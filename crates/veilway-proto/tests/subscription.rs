@@ -2,7 +2,7 @@
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
 use std::fs;
-use veilway_proto::{control::{self, Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Offer, Refreshed, Replaced, Review, Standing, GRACE}, direction, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Direction, Secret, Tag, Text, Translation, BODY_MAX, CARRIED_MAX}, NoRandom};
+use veilway_proto::{control::{self, Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Move, Offer, Refreshed, Replaced, Review, Role, Standing, GRACE}, direction, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Direction, Kind, Secret, Tag, Text, Translation, Url, BODY_MAX, CARRIED_MAX}, NoRandom};
 
 // The clock of every test: 100 s after the documents of vectors.py were issued.
 const ISSUED: u64 = 1_700_000_000;
@@ -102,18 +102,22 @@ fn a_signed_document_and_a_signed_refusal_byte_for_byte() {
 	}
 	let Ok(Payload::Refusal(refusal)) = payload::parse(&envelope::verify(&seed("fuzz_sub_envelope/refusal")[1..], &[key(0x11)], BODY_MAX).unwrap()) else {panic!("a refusal")};
 	assert_eq!((refusal.subscription_id.as_str(), refusal.issued_at, refusal.reason), ("example-account-0001", ISSUED, Reason::DeviceLimit));
-	assert_eq!(seed("fuzz_sub_envelope/document").len() - 1, 1570);
+	assert_eq!(seed("fuzz_sub_envelope/document").len() - 1, 1758);
 }
 
 #[test]
 fn every_link_form_byte_for_byte() {
 	let (veilway, https) = (text("fuzz_deeplink/native-veilway"), text("fuzz_deeplink/native-https"));
-	assert_eq!(veilway, "veilway://sub/sub.example.com/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.VVVVVVVVVVVVVVVVVVVVVQ");
+	assert_eq!(veilway, "veilway://sub/sub.example.com/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.AXmmMe7eG_nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa.VVVVVVVVVVVVVVVVVVVVVQ");
 	let (Link::Native(native), Link::Native(other)) = (Link::parse(&veilway).unwrap(), Link::parse(&https).unwrap()) else {panic!("native links")};
 	assert_eq!((native.veilway(), native.https(), native == other), (veilway.clone(), https, true));
-	assert_eq!((native.endpoint().as_str(), native.endpoint().host(), native.key(), native.token().expose()), ("https://sub.example.com/s", "sub.example.com", key(0x11), &[0x55; 16]));
-	// "The fragment is 70 characters with its `#`", and neither the token nor the link is printed.
-	assert_eq!((veilway.len() - veilway.find('#').unwrap(), format!("{native:?}").contains("VVVV")), (70, false));
+	assert_eq!((native.endpoint().as_str(), native.endpoint().host(), native.key(), native.token().expose(), native.gateway().id(), native.kind()), ("https://sub.example.com/s", "sub.example.com", key(0x11), &[0x55; 16], 1, Kind::Chain));
+	// "The fragment is 115 characters with its `#`", and neither the token nor the link is printed.
+	assert_eq!((veilway.len() - veilway.find('#').unwrap(), format!("{native:?}").contains("VVVV")), (115, false));
+	// The two plain forms are one link: `http` for the one `https` is for, and the same fragment.
+	let (plain, plain_http) = (text("fuzz_deeplink/native-plain-veilway"), text("fuzz_deeplink/native-plain-http"));
+	let (Link::Native(from_veilway), Link::Native(from_http)) = (Link::parse(&plain).unwrap(), Link::parse(&plain_http).unwrap()) else {panic!("plain links")};
+	assert_eq!((from_veilway.veilway(), from_veilway.https(), from_veilway == from_http, from_veilway.endpoint().as_str(), from_veilway.endpoint().port(), from_veilway.kind(), from_veilway.pin()), (plain, plain_http, true, "http://sub.example.com/s", 80, Kind::Plain, None));
 	let (Link::Carried(carried), in_file) = (Link::parse(&text("fuzz_deeplink/document")).unwrap(), Carried::file(&seed("fuzz_deeplink/file")).unwrap()) else {panic!("a document in a link")};
 	assert_eq!((carried.veilway(), in_file.file_content().into_bytes(), carried.document(), carried.in_file(), in_file.in_file()), (Some(text("fuzz_deeplink/document")), seed("fuzz_deeplink/file"), &seed("fuzz_sub_envelope/carried")[1..], false, true));
 	assert!(envelope::verify(carried.document(), &[carried.key()], CARRIED_MAX).is_ok() && !format!("{carried:?}").contains("eyJ"));
@@ -123,13 +127,13 @@ fn every_link_form_byte_for_byte() {
 
 #[test]
 fn what_is_no_link() {
-	let (key, token) = ("0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc", "VVVVVVVVVVVVVVVVVVVVVQ");
+	let (key, gateway, token) = ("0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc", "AXmmMe7eG_nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa", "VVVVVVVVVVVVVVVVVVVVVQ");
 	let native = |front: &str, back: &str| Link::parse(&format!("{front}#{back}"));
-	let good = format!("v1.{key}.{token}");
-	assert!(matches!(native("veilway://sub/sub.example.com:8443/a/b", &good), Ok(Link::Native(_))) && matches!(native("https://sub.example.com/", &good), Ok(Link::Native(_))));
-	for front in ["veilway://sub/sub.example.com", "veilway://sub/sub.example.com/s?x=1", "veilway://sub//s", "veilway://sub/Sub.example.com/s", "veilway://sub/192.0.2.1/s", "veilway://sub/[2001:db8::1]/s", "veilway://sub/user@sub.example.com/s", "veilway://sub/sub.example.com:0/s", "veilway://sub/sub.example.com:99999/s", "veilway://sub/sub.example.com/a/../s", "veilway://sub/sub.example.com/s s", "veilway://Sub/sub.example.com/s", "veilway://sub.example.com/s", "veilway://subs/sub.example.com/s", "veilway:/sub/sub.example.com/s", "VEILWAY://sub/sub.example.com/s", "https://sub.example.com", "https://sub.example.com/s?x=1", "http://sub.example.com/s", "veilway://sub/https://sub.example.com/s", " veilway://sub/sub.example.com/s"] {assert_eq!(native(front, &good), Err(LinkError::Form), "{front}")}
+	let good = format!("v1.{key}.{gateway}.{token}");
+	assert!(matches!(native("veilway://sub/sub.example.com:8443/a/b", &good), Ok(Link::Native(_))) && matches!(native("https://sub.example.com/", &good), Ok(Link::Native(_))) && matches!(native("veilway://sub-plain/sub.example.com:8080/a/b", &good), Ok(Link::Native(_))) && matches!(native("http://sub.example.com/", &good), Ok(Link::Native(_))));
+	for front in ["veilway://sub/sub.example.com", "veilway://sub/sub.example.com/s?x=1", "veilway://sub//s", "veilway://sub/Sub.example.com/s", "veilway://sub/192.0.2.1/s", "veilway://sub/[2001:db8::1]/s", "veilway://sub/user@sub.example.com/s", "veilway://sub/sub.example.com:0/s", "veilway://sub/sub.example.com:99999/s", "veilway://sub/sub.example.com/a/../s", "veilway://sub/sub.example.com/s s", "veilway://Sub/sub.example.com/s", "veilway://sub.example.com/s", "veilway://subs/sub.example.com/s", "veilway:/sub/sub.example.com/s", "VEILWAY://sub/sub.example.com/s", "https://sub.example.com", "https://sub.example.com/s?x=1", "http://sub.example.com/s?x=1", "veilway://sub-plain/sub.example.com", "veilway://sub-plain/Sub.example.com/s", "veilway://sub-plain//s", "veilway://sub-plain/user@sub.example.com/s", "veilway://sub-plain/http://sub.example.com/s", "veilway://sub/https://sub.example.com/s", " veilway://sub/sub.example.com/s"] {assert_eq!(native(front, &good), Err(LinkError::Form), "{front}")}
 	// The token ends in a character whose unused bits are set, the key is one character short, has padding, is in the other alphabet, and so on.
-	for back in [format!("v1.{key}.VVVVVVVVVVVVVVVVVVVVVR"), format!("v1.{key}.{}", &token[..21]), format!("v1.{key}.{token}A"), format!("v1.{}.{token}", &key[..42]), format!("v1.{key}={token}"), format!("v1.{key}.{token}="), format!("v1.{key}.{token}#x"), format!("v1.{key}.{token}\n"), format!("v1.{}.{token}", key.replace('0', "+")), format!("v1.{key}d.{token}"), format!("v2.{key}.{token}"), format!("V1.{key}.{token}"), format!("v1{key}.{token}"), format!("v1.{key}.{token}.x"), format!("v01.{key}.{token}"), "v1".to_owned(), "v1.".to_owned(), "v12.x".to_owned(), String::new()] {
+	for back in [format!("v1.{key}.{gateway}.VVVVVVVVVVVVVVVVVVVVVR"), format!("v1.{key}.{gateway}.{}", &token[..21]), format!("v1.{key}.{gateway}.{token}A"), format!("v1.{}.{gateway}.{token}", &key[..42]), format!("v1.{key}={gateway}.{token}"), format!("v1.{key}.{gateway}={token}"), format!("v1.{key}.{gateway}.{token}="), format!("v1.{key}.{gateway}.{token}#x"), format!("v1.{key}.{gateway}.{token}\n"), format!("v1.{}.{gateway}.{token}", key.replace('0', "+")), format!("v1.{key}d.{gateway}.{token}"), format!("v2.{key}.{gateway}.{token}"), format!("V1.{key}.{gateway}.{token}"), format!("v1{key}.{gateway}.{token}"), format!("v1.{key}.{gateway}.{token}.x"), format!("v01.{key}.{gateway}.{token}"), format!("v1.{key}.{token}"), format!("v1.{key}.{}.{token}", &gateway[..43]), format!("v1.{key}.{gateway}x.{token}"), format!("v1.{key}.{}.{token}", gateway.replace('A', "+")), format!("v1.{key}.{gateway}"), format!("v1.{key}.{gateway}.{gateway}"), "v1".to_owned(), "v1.".to_owned(), "v12.x".to_owned(), String::new()] {
 		assert_eq!(native("veilway://sub/sub.example.com/s", &back), Err(LinkError::Form), "{back}");
 		// On an `https` URL a fragment that is not of the form `v`, digits, dot is no native fragment, and the link is a legacy one. Every other is refused.
 		let legacy = back.is_empty() || back.starts_with('V') || back.starts_with("v10E");
@@ -141,13 +145,20 @@ fn what_is_no_link() {
 	assert!(matches!(Link::parse(&format!("https://sub.example.com/s#V1{}", &good[2..])), Ok(Link::Legacy(legacy)) if legacy.url().as_str() == "https://sub.example.com/s"));
 	// "A key of small order is also refused in a link": the neutral element, and the same in the encoding that is not canonical.
 	for small in [base64(&std::array::from_fn::<u8, 32, _>(|index| u8::from(index == 0))), base64(&std::array::from_fn::<u8, 32, _>(|index| if index == 0 {0xee} else if index == 31 {0x7f} else {0xff})), base64(&[0; 32])] {
-		assert_eq!(native("veilway://sub/sub.example.com/s", &format!("v1.{small}.{token}")), Err(LinkError::Key), "{small}");
+		assert_eq!(native("veilway://sub/sub.example.com/s", &format!("v1.{small}.{gateway}.{token}")), Err(LinkError::Key), "{small}");
 		assert_eq!(Link::parse(&format!("veilway://doc#v1.{small}.a.b.c")), Err(LinkError::Key));
 	}
-	// "Subscription URL without its fragment: at most 256 characters", counted on the URL that is requested.
+	// "A key that is all zero, or one of the encodings of a point of small order" refuses the link, for a gateway key too, whatever its id is.
+	for small in [[0u8; 32], std::array::from_fn(|index| u8::from(index == 0)), std::array::from_fn(|index| if index == 0 {0xee} else if index == 31 {0x7f} else {0xff}), std::array::from_fn(|index| if index == 31 {0x80} else {0})] {
+		assert_eq!(native("veilway://sub/sub.example.com/s", &format!("v1.{key}.{}.{token}", base64(&[&[7u8][..], &small].concat()))), Err(LinkError::Key), "{small:?}");
+	}
+	// "Subscription URL without its fragment: at most 256 characters", counted on the `https` form for both TLS forms and on the `http` form for both plain forms.
 	let path = "a".repeat(256 - "https://sub.example.com/".len());
 	assert!(native(&format!("veilway://sub/sub.example.com/{path}"), &good).is_ok() && native(&format!("https://sub.example.com/{path}"), &good).is_ok());
 	assert_eq!((native(&format!("veilway://sub/sub.example.com/{path}a"), &good), native(&format!("https://sub.example.com/{path}a"), &good), Link::parse(&format!("https://sub.example.com/{path}a"))), (Err(LinkError::Size), Err(LinkError::Size), Err(LinkError::Size)));
+	let plain_path = "a".repeat(256 - "http://sub.example.com/".len());
+	assert!(native(&format!("veilway://sub-plain/sub.example.com/{plain_path}"), &good).is_ok() && native(&format!("http://sub.example.com/{plain_path}"), &good).is_ok());
+	assert_eq!((native(&format!("veilway://sub-plain/sub.example.com/{plain_path}a"), &good), native(&format!("http://sub.example.com/{plain_path}a"), &good)), (Err(LinkError::Size), Err(LinkError::Size)));
 	// A whole document: at most 2,048 bytes in a link and 1,048,576 in a file, only the characters a document has, and nothing around it.
 	let document = |size: usize| format!("v1.{key}.{}", "a".repeat(size));
 	assert!(Link::parse(&format!("veilway://doc#{}", document(CARRIED_MAX))).is_ok() && Carried::file(document(BODY_MAX).as_bytes()).is_ok_and(|carried| carried.veilway().is_none()));
@@ -159,7 +170,7 @@ fn what_is_no_link() {
 	assert!(Carried::file(format!("{}\n", document(8)).as_bytes()).is_ok() && Carried::file(format!("{}\r\n", document(8)).as_bytes()).is_ok() && Link::parse(&format!("veilway://doc#{}\n", document(8))).is_err());
 	assert_eq!((Link::parse(&format!("veilway://doc/#{}", document(8))), Link::parse(&format!("veilway://doc?#{}", document(8))), Carried::file(b"v1.\xff")), (Err(LinkError::Form), Err(LinkError::Form), Err(LinkError::Form)));
 	// A legacy link "must be `https`".
-	for other in ["http://example.com/list", "ftp://example.com/list", "example.com/list", "https://user:pass@example.com/list", "https://192.0.2.1/list", "vless://example.com", ""] {assert_eq!(Link::parse(other), Err(LinkError::Form), "{other}")}
+	for other in ["http://example.com/list", "http://example.com/list#x", "ftp://example.com/list", "example.com/list", "https://user:pass@example.com/list", "https://192.0.2.1/list", "vless://example.com", ""] {assert_eq!(Link::parse(other), Err(LinkError::Form), "{other}")}
 }
 
 // The public edge cases of Ed25519 verification (Chalkias, Garillot and Nikolaenko, "Taming the many EdDSAs", the 12 vectors of ed25519-speccheck), as message, public key and signature. For each: whether this crate holds the key at all, and what `ring` says of the signature by itself.
@@ -354,7 +365,7 @@ fn a_hostile_document_for_every_limit_and_rule() {
 		// The provider's name: display text of 1 to 64 characters, cut and never refused for its length.
 		("/provider", None, member("provider")), ("/provider", Some(json!("Example")), member("provider")), ("/provider/name", None, member("name")), ("/provider/name", Some(json!("")), member("name")), ("/provider/name", Some(json!("\u{200b}\u{202e}\u{7}")), member("name")), ("/provider/name", Some(json!(7)), member("name")), ("/provider/name", Some(json!(long(5_000))), Fine), ("/provider/logo", Some(json!("ignored")), Fine),
 		("/update_interval", Some(json!(899)), member("update_interval")), ("/update_interval", Some(json!(900)), Fine), ("/update_interval", Some(json!(604_800)), Fine), ("/update_interval", Some(json!(604_801)), member("update_interval")), ("/update_interval", Some(json!("3600")), member("update_interval")),
-		("/refresh_urls", Some(list(json!("https://mirror.example.net/s"), 4)), Fine), ("/refresh_urls", Some(list(json!("https://mirror.example.net/s"), 5)), member("refresh_urls")), ("/refresh_urls/0", Some(json!("http://mirror.example.net/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://mirror.example.net/s#v1")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://192.0.2.1/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://user@mirror.example.net/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!(format!("https://mirror.example.net/{}", long(229)))), Fine), ("/refresh_urls/0", Some(json!(format!("https://mirror.example.net/{}", long(230)))), member("refresh_urls")), ("/refresh_urls/0", Some(json!(1)), member("refresh_urls")), ("/refresh_urls", Some(json!("https://mirror.example.net/s")), member("refresh_urls")),
+		("/refresh_urls", Some(list(json!("https://mirror.example.net/s"), 4)), Fine), ("/refresh_urls", Some(list(json!("https://mirror.example.net/s"), 5)), member("refresh_urls")), ("/refresh_urls/0", Some(json!("http://mirror.example.net/s")), Fine), ("/refresh_urls/0", Some(json!("http://203.0.113.7:8080/s")), Fine), ("/refresh_urls/0", Some(json!("http://203.0.113.7:08080/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("http://127.0.0.1/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://203.0.113.7/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://mirror.example.net/s#v1")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://192.0.2.1/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!("https://user@mirror.example.net/s")), member("refresh_urls")), ("/refresh_urls/0", Some(json!(format!("https://mirror.example.net/{}", long(229)))), Fine), ("/refresh_urls/0", Some(json!(format!("https://mirror.example.net/{}", long(230)))), member("refresh_urls")), ("/refresh_urls/0", Some(json!(1)), member("refresh_urls")), ("/refresh_urls", Some(json!("https://mirror.example.net/s")), member("refresh_urls")),
 		// A pinned entry of `refresh_urls` is an object with exactly `url` and 1 or 2 different `pins`, and its host may be an IP literal in the one spelling.
 		("/refresh_urls", Some(json!([{"url": "https://mirror.example.net/s", "pins": [pa]}])), Fine), ("/refresh_urls", Some(json!([{"url": "https://mirror.example.net/s", "pins": [pa, pb]}])), Fine), ("/refresh_urls", Some(json!([{"url": "https://203.0.113.7:8443/s", "pins": [pa]}, {"url": "https://[2001:db8::1]/s?a=b", "pins": [pa, pb]}])), Fine), ("/refresh_urls", Some(json!(["https://a.example.net/s", {"url": "https://b.example.net/s", "pins": [pa]}, {"url": "https://a.example.net:8443/s", "pins": [pb]}])), Fine),
 		("/refresh_urls", Some(json!(["https://a.example.net/s", "https://a.example.net/other"])), Fine), ("/refresh_urls", Some(json!([{"url": "https://a.example.net/s", "pins": [pa]}, {"url": "https://a.example.net/other", "pins": [pb]}])), Fine),
@@ -743,13 +754,13 @@ fn the_request_byte_for_byte_and_what_an_endpoint_refuses() {
 	let Offer::Native(offer) = Offer::open(Link::parse(&text("fuzz_deeplink/native-https")).unwrap()) else {panic!("a native link")};
 	assert_eq!((offer.endpoint().host(), offer.fingerprint().to_string()), ("sub.example.com", "10ba 682c 8ad1 3513 971e 8b56 881a ab8b".to_owned()));
 	let fetching = offer.proceed(None, &mut fixed).unwrap();
-	assert_eq!((fetching.request().body(), fetching.endpoint().as_str()), (seed("fuzz_sub_request/fetch"), "https://sub.example.com/s"));
+	assert_eq!((fetching.request().body(NOW), fetching.endpoint().as_str()), (seed("fuzz_sub_request/fetch"), "https://sub.example.com/s"));
 	let review = fetching.answer(&seed("fuzz_sub_envelope/document")[1..], NOW, &[]).unwrap();
 	assert_eq!((review.fingerprint(), review.replaces(), review.origin(), review.refreshes(), review.subscription().provider.as_str()), (key(0x11).fingerprint(), false, KeyOrigin::Device, true, "Example Provider"));
 	let Accepted {held, replaces, confirm, ..} = review.accept(DeviceName::typed("phone\u{200b}"), &[]).unwrap();
-	assert_eq!((confirm.unwrap().body(), replaces, held.fetch().unwrap().body(), held.rename(None).unwrap().op().clone()), (seed("fuzz_sub_request/confirm"), None, seed("fuzz_sub_request/fetch"), Op::Confirm(None)));
+	assert_eq!((confirm.unwrap().body(NOW), replaces, held.fetch().unwrap().body(NOW), held.rename(None).unwrap().op().clone()), (seed("fuzz_sub_request/confirm"), None, seed("fuzz_sub_request/fetch"), Op::Confirm(None)));
 	// Declining, and giving up before an answer: the same `release`.
-	assert_eq!((self::review(&seed("fuzz_sub_envelope/document")[1..], &[]).unwrap().decline().unwrap().body(), fetching.abandon().body()), (seed("fuzz_sub_request/release"), seed("fuzz_sub_request/release")));
+	assert_eq!((self::review(&seed("fuzz_sub_envelope/document")[1..], &[]).unwrap().decline().unwrap().body(NOW), fetching.abandon().body(NOW)), (seed("fuzz_sub_request/release"), seed("fuzz_sub_request/release")));
 	// The endpoint's side reads what a client writes, as another type than the one a client sends, and knows the one body it has.
 	for name in ["fetch", "confirm", "release"] {
 		let request = Received::read(&seed(&format!("fuzz_sub_request/{name}"))).unwrap();
@@ -762,7 +773,7 @@ fn the_request_byte_for_byte_and_what_an_endpoint_refuses() {
 	assert_eq!((Received::read(&seed("fuzz_sub_request/confirm")).unwrap().op().clone(),DeviceName::typed("\u{200b}\u{7}"), DeviceName::typed(&"n".repeat(40)).map(|name| name.as_str().len())), (Op::Confirm(DeviceName::typed("phone")), None, Some(32)));
 	let fetch: Value = serde_json::from_slice(&seed("fuzz_sub_request/fetch")).unwrap();
 	let read = |request: &Value| Received::read(request.to_string().as_bytes()).map(|request| request.op().clone());
-	let malformed = Err(RequestError::Malformed(Secret::new([0x55; 16])));
+	let malformed = Err(RequestError::Malformed(Secret::new([0x55; 16]), NOW));
 	// A member that is missing, of another type or not in its one form, an unknown member, a name without `confirm` or one of which nothing is left, and a device key that is zero or of small order.
 	for (pointer, value) in [("/v", None), ("/v", Some(json!(2))), ("/v", Some(json!("1"))), ("/kids", None), ("/kids", Some(json!([]))), ("/kids", Some(json!(["ELpoLIrRNRM", "ELpoLIrRNRM"]))), ("/kids", Some(json!(["ELpoLIrRNRM", "AAAAAAAAAAA", "AAAAAAAAAAB"]))), ("/kids", Some(json!(["ELpoLIrRNRN"]))), ("/kids", Some(json!("ELpoLIrRNRM"))), ("/device_public_key", None), ("/device_public_key", Some(json!(std_base64(&[0; 32])))), ("/device_public_key", Some(json!(std_base64(&unhex("0100000000000000000000000000000000000000000000000000000000000000"))))), ("/device_public_key", Some(json!(std_base64(&unhex("0100000000000000000000000000000000000000000000000000000000000080"))))), ("/device_public_key", Some(json!(std_base64(&unhex("edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))))), ("/device_public_key", Some(json!(std_base64(&unhex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"))))), ("/device_public_key", Some(json!(std_base64(&[7; 31])))), ("/device_secret", None), ("/device_secret", Some(json!("RERERERERERERERERERERB"))), ("/device_secret", Some(json!("RERERERERERERERERERERA=="))), ("/op", None), ("/op", Some(json!("remove"))), ("/op", Some(json!("Fetch"))), ("/device_name", Some(json!("phone"))), ("/later", Some(json!(1)))] {
 		let mut request = fetch.clone();
@@ -772,13 +783,13 @@ fn the_request_byte_for_byte_and_what_an_endpoint_refuses() {
 	assert_eq!((read(&with(fetch.clone(), &[("/op", json!("confirm")), ("/device_name", json!("\u{200b}"))])), read(&with(fetch.clone(), &[("/op", json!("confirm")), ("/device_name", json!(5))])), read(&with(fetch.clone(), &[("/op", json!("release")), ("/device_name", json!("x"))]))), (malformed.clone(), malformed.clone(), malformed.clone()));
 	assert_eq!((read(&with(fetch.clone(), &[("/kids", json!(["ELpoLIrRNRM", "AAAAAAAAAAA"]))])), read(&with(fetch.clone(), &[("/op", json!("confirm")), ("/device_name", json!("a\u{202e}b"))]))), (Ok(Op::Fetch), Ok(Op::Confirm(DeviceName::typed("ab")))));
 	// Without a token that reads there is nothing to answer to.
-	for (pointer, value) in [("/token", None), ("/token", Some(json!("VVVVVVVVVVVVVVVVVVVVVR"))), ("/token", Some(json!("VVVVVVVVVVVVVVVVVVVVV"))), ("/token", Some(json!(5)))] {
+	for (pointer, value) in [("/t", None), ("/t", Some(json!("1700000100"))), ("/t", Some(json!(-1))), ("/token", None), ("/token", Some(json!("VVVVVVVVVVVVVVVVVVVVVR"))), ("/token", Some(json!("VVVVVVVVVVVVVVVVVVVVV"))), ("/token", Some(json!(5)))] {
 		let mut request = fetch.clone();
 		put(&mut request, pointer, value);
 		assert_eq!(read(&request), Err(RequestError::Unreadable), "{pointer}");
 	}
 	for body in [&b""[..], b"[]", b"null", b"{\"token\":\"VVVVVVVVVVVVVVVVVVVVVQ\",\"token\":\"VVVVVVVVVVVVVVVVVVVVVQ\"}", &[b' '; 2_000], format!("{{\"v\":1,\"token\":\"VVVVVVVVVVVVVVVVVVVVVQ\",\"x\":\"{}\"}}", "a".repeat(990)).as_bytes(), b"{\"Token\":\"VVVVVVVVVVVVVVVVVVVVVQ\"}"] {assert_eq!(Received::read(body).err(), Some(RequestError::Unreadable))}
-	assert_eq!(Received::read(b"{\"v\":1,\"token\":\"VVVVVVVVVVVVVVVVVVVVVQ\"}").err(), Some(RequestError::Malformed(Secret::new([0x55; 16]))));
+	assert_eq!(Received::read(b"{\"v\":1,\"t\":1700000100,\"token\":\"VVVVVVVVVVVVVVVVVVVVVQ\"}").err(), Some(RequestError::Malformed(Secret::new([0x55; 16]), NOW)));
 	assert!(!format!("{malformed:?}").contains("85"));
 }
 
@@ -914,7 +925,7 @@ fn an_import_goes_through_its_three_steps() {
 	let (mut current, stale) = (held(), review(issue(0x11, &[("/serial", json!(2)), ("/issued_at", json!(ISSUED + 10))]).as_bytes(), &[&stored]).unwrap());
 	current.refresh(issue(0x11, &[("/serial", json!(9)), ("/issued_at", json!(ISSUED + 50))]).as_bytes(), NOW).unwrap();
 	let declined = stale.accept(None, &[&other, &current]).unwrap_err();
-	assert_eq!((declined.failure, declined.release.map(|request| request.body())), (Failure::NotNewer, Some(seed("fuzz_sub_request/release"))));
+	assert_eq!((declined.failure, declined.release.map(|request| request.body(NOW))), (Failure::NotNewer, Some(seed("fuzz_sub_request/release"))));
 	// With the stored subscription gone in the meantime, the same review adds a new one.
 	assert!(review(issue(0x11, &[("/serial", json!(2)), ("/issued_at", json!(ISSUED + 10))]).as_bytes(), &[&stored]).unwrap().accept(None, &[&other]).is_ok_and(|accepted| accepted.replaces.is_none()));
 	// A whole document: verified under the key it came with, no request at any step, and no refresh.
@@ -1168,7 +1179,7 @@ fn what_is_held_goes_to_storage_and_back() {
 	unread[2].keys.push(*key(0x22).bytes());
 	for (index, stored) in unread.into_iter().enumerate() {
 		let Err(Damaged::Unread(Some(fetching))) = Held::restore(stored) else {panic!("{index}")};
-		assert_eq!((fetching.request().body() == seed("fuzz_sub_request/fetch"), fetching.endpoint().as_str()), (index < 2, "https://sub.example.com/s"), "{index}");
+		assert_eq!((fetching.request().body(NOW) == seed("fuzz_sub_request/fetch"), fetching.endpoint().as_str()), (index < 2, "https://sub.example.com/s"), "{index}");
 		assert!(fetching.answer(issue(0x11, &[("/serial", json!(3))]).as_bytes(), NOW, &[]).unwrap().accept(None, &[]).is_ok_and(|accepted| accepted.held.device() == held.device() && accepted.held.subscription().serial == 3), "{index}");
 	}
 	assert!(matches!(Held::restore(veilway_proto::subscription::client::Stored {document: sign(0x11, &with(payload("import"), &[("/v", json!(2))])), ..whole.stored()}), Err(Damaged::Unread(None))));
@@ -1206,46 +1217,46 @@ fn the_wait_between_refreshes() {
 
 #[test]
 fn a_pinned_link_names_the_certificate_and_nothing_makes_a_link_pinned_or_unpinned() {
-	let (k, token, pin) = (base64(key(0x11).bytes()), "VVVVVVVVVVVVVVVVVVVVVQ", base64(&[7; 32]));
-	let good = format!("v1.{k}.{token}.{pin}");
+	let (k, g, token, pin) = (base64(key(0x11).bytes()), "AXmmMe7eG_nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa", "VVVVVVVVVVVVVVVVVVVVVQ", base64(&[7; 32]));
+	let good = format!("v1.{k}.{g}.{token}.{pin}");
 	for front in ["sub.example.com/s", "sub.example.com:8443/a/b", "203.0.113.7/s", "203.0.113.7:8443/s", "[2001:db8::1]/s", "[2001:db8::1]:8443/a"] {
 		let (veilway, https) = (format!("veilway://sub/{front}#{good}"), format!("https://{front}#{good}"));
 		let (Ok(Link::Native(from_veilway)), Ok(Link::Native(from_https))) = (Link::parse(&veilway), Link::parse(&https)) else {panic!("{front}")};
-		// Both forms read the same and write back what was read, pin included. The fragment is 113 characters, 114 with its `#`.
-		assert_eq!((from_veilway.pin(), from_veilway == from_https, from_veilway.veilway(), from_veilway.https(), from_https.veilway(), veilway.len() - veilway.find('#').unwrap()), (Some(&[7; 32]), true, veilway.clone(), https, veilway.clone(), 114), "{front}");
+		// Both forms read the same and write back what was read, pin included. The fragment is 158 characters, 159 with its `#`.
+		assert_eq!((from_veilway.pin(), from_veilway == from_https, from_veilway.veilway(), from_veilway.https(), from_https.veilway(), veilway.len() - veilway.find('#').unwrap()), (Some(&[7; 32]), true, veilway.clone(), https, veilway.clone(), 159), "{front}");
 		assert!(!format!("{from_veilway:?}").contains(&pin[..8]) && !format!("{from_veilway:?}").contains("VVVV"), "{front}");
 		// The same link without its pin is a link only to a host name, and then it is one without a pin.
 		let literal = front.starts_with(|c: char| c.is_ascii_digit() || c == '[');
-		for bare in [format!("veilway://sub/{front}#v1.{k}.{token}"), format!("https://{front}#v1.{k}.{token}")] {assert_eq!(Link::parse(&bare).map(|link| matches!(link, Link::Native(native) if native.pin().is_none())), if literal {Err(LinkError::Form)} else {Ok(true)}, "{bare}")}
+		for bare in [format!("veilway://sub/{front}#v1.{k}.{g}.{token}"), format!("https://{front}#v1.{k}.{g}.{token}")] {assert_eq!(Link::parse(&bare).map(|link| matches!(link, Link::Native(native) if native.pin().is_none())), if literal {Err(LinkError::Form)} else {Ok(true)}, "{bare}")}
 	}
 	let tail = "A".repeat(42);
-	for back in [format!("{good}A"), good[..good.len() - 1].to_owned(), format!("{good}."), format!("v1.{k}.{token}."), format!("v1.{k}.{token}..{pin}"), format!("v1.{k}.{token}.{pin}.{pin}"), format!("v1.{k}.{token}.{pin}#x"), format!("{good}\n"), format!("{good} "), format!("v1.{k}.{token}.{}", pin.replace(|c: char| c.is_ascii_alphanumeric(), "+")), format!("v1.{k}.{token}.{}=", &pin[..43]), format!("v1.{k}.{token}.{}", base64(&[0xfb; 32]).replace('-', "+")), format!("v1.{k}.{token}.{tail}B"), format!("v1.{k}.{token}.{tail}C"), format!("v1.{k}.{token}.{tail}"), format!("v1.{k}.{pin}"), format!("v1.{k}.{token}x.{pin}"), format!("v1.{k}.{}.{pin}", &token[..21]), format!("v1.{k}.{token}.?{}", &pin[1..]), format!("v2.{k}.{token}.{pin}"), format!("v1.{k}.{token}:{pin}")] {
+	for back in [format!("{good}A"), good[..good.len() - 1].to_owned(), format!("{good}."), format!("v1.{k}.{g}.{token}."), format!("v1.{k}.{g}.{token}..{pin}"), format!("v1.{k}.{g}.{token}.{pin}.{pin}"), format!("v1.{k}.{g}.{token}.{pin}#x"), format!("{good}\n"), format!("{good} "), format!("v1.{k}.{g}.{token}.{}", pin.replace(|c: char| c.is_ascii_alphanumeric(), "+")), format!("v1.{k}.{g}.{token}.{}=", &pin[..43]), format!("v1.{k}.{g}.{token}.{}", base64(&[0xfb; 32]).replace('-', "+")), format!("v1.{k}.{g}.{token}.{tail}B"), format!("v1.{k}.{g}.{token}.{tail}C"), format!("v1.{k}.{g}.{token}.{tail}"), format!("v1.{k}.{g}.{pin}"), format!("v1.{k}.{g}.{token}x.{pin}"), format!("v1.{k}.{g}.{}.{pin}", &token[..21]), format!("v1.{k}.{g}.{token}.?{}", &pin[1..]), format!("v2.{k}.{token}.{pin}"), format!("v1.{k}.{g}.{token}:{pin}")] {
 		assert_eq!((Link::parse(&format!("veilway://sub/sub.example.com/s#{back}")), Link::parse(&format!("https://sub.example.com/s#{back}"))), (Err(LinkError::Form), Err(LinkError::Form)), "{back}");
 	}
 	// The last character of a pin holds two bits that are not the hash's: they are zero, or the link is refused.
-	assert!(matches!(Link::parse(&format!("veilway://sub/sub.example.com/s#v1.{k}.{token}.{tail}A")), Ok(Link::Native(native)) if native.pin() == Some(&[0; 32])));
+	assert!(matches!(Link::parse(&format!("veilway://sub/sub.example.com/s#v1.{k}.{g}.{token}.{tail}A")), Ok(Link::Native(native)) if native.pin() == Some(&[0; 32])));
 	// A pinned link that lost its `#`, had its pin cut, or something put behind it, is no legacy link and is never read as one without a pin.
 	for damaged in [format!("https://sub.example.com/s{good}"), format!("https://sub.example.com/s?{good}"), format!("https://sub.example.com/s/{good}"), format!("https://sub.example.com/s%23{good}"), format!("https://sub.example.com/s?k={good}&utm=1"), format!("https://sub.example.com/s#{}", &good[..good.len() - 1]), format!("https://sub.example.com/s#v1.{k}.{token}.{}", &pin[..20]), format!("https://sub.example.com/s#{good}x"), format!("https://sub.example.com/s#{good}#x"), format!("https://203.0.113.7/s{good}"), format!("https://sub.example.com/s#v1.{k}.{token}.{pin}.x"), format!("veilway://sub/sub.example.com/s{good}"), format!("veilway://sub/sub.example.com/s?{good}")] {assert_eq!(Link::parse(&damaged), Err(LinkError::Form), "{damaged}")}
 	// A pin cut off a link by a messenger leaves a link without one, which is a link to a host name only and fails closed at its fetch.
-	assert!(matches!(Link::parse(&format!("https://sub.example.com/s#v1.{k}.{token}")), Ok(Link::Native(native)) if native.pin().is_none()) && Link::parse(&format!("https://203.0.113.7/s#v1.{k}.{token}")) == Err(LinkError::Form));
+	assert!(matches!(Link::parse(&format!("https://sub.example.com/s#v1.{k}.{g}.{token}")), Ok(Link::Native(native)) if native.pin().is_none()) && Link::parse(&format!("https://203.0.113.7/s#v1.{k}.{g}.{token}")) == Err(LinkError::Form));
 	// An IP literal is held to the refusals of a dial address, in its one spelling, and a host name to the rule of a host name.
 	for host in ["127.0.0.1", "[::1]", "0.0.0.0", "169.254.1.1", "224.0.0.1", "255.255.255.255", "[::ffff:203.0.113.7]", "[fe80::1]", "[::]", "[2001:DB8::1]", "[2001:db8:0:0:0:0:0:1]", "[2001:db8::1%25eth0]", "203.000.113.007", "203.0.113", "203.0.113.7.", "3405803783", "0xcb007107", "[2001:db8::1", "[2001:db8::1]x", "[2001:db8::1]:", "[2001:db8::1]:0", "[2001:db8::1]:99999", "[]", "2001:db8::1", "203.0.113.7:0", "203.0.113.7:", "Sub.example.com", "user@203.0.113.7", "user:pw@sub.example.com", "-sub.example.com", "sub..example.com", "sub.example.com.", ""] {
 		for scheme in ["veilway://sub/", "https://"] {assert_eq!(Link::parse(&format!("{scheme}{host}/s#{good}")), Err(LinkError::Form), "{scheme}{host}")}
 	}
-	// `http` is refused whatever a pin says, and a legacy link has no pin and cannot name an address.
-	for other in [format!("http://sub.example.com/s#{good}"), format!("http://203.0.113.7/s#{good}"), format!("veilway://sub/http://sub.example.com/s#{good}"), format!("HTTPS://sub.example.com/s#{good}"), "https://203.0.113.7/list".to_owned(), "https://[2001:db8::1]/list".to_owned(), "https://203.0.113.7/list#x".to_owned()] {assert_eq!(Link::parse(&other), Err(LinkError::Form), "{other}")}
+	// A plain link never has a pin, whatever its host is, and a legacy link is `https` only, has no pin and cannot name an address.
+	for other in [format!("http://sub.example.com/s#{good}"), format!("http://203.0.113.7/s#{good}"), format!("veilway://sub-plain/203.0.113.7/s#{good}"), format!("veilway://sub-plain/sub.example.com/s#{good}"), format!("veilway://sub/http://sub.example.com/s#{good}"), format!("HTTPS://sub.example.com/s#{good}"), "https://203.0.113.7/list".to_owned(), "https://[2001:db8::1]/list".to_owned(), "https://203.0.113.7/list#x".to_owned()] {assert_eq!(Link::parse(&other), Err(LinkError::Form), "{other}")}
 	assert!(matches!(Link::parse(&format!("https://sub.example.com/list#{pin}")), Ok(Link::Legacy(legacy)) if legacy.url().as_str() == "https://sub.example.com/list"));
 	// "Subscription URL without its fragment: at most 256 characters" holds for a pinned link too.
 	let path = "a".repeat(256 - "https://203.0.113.7/".len());
 	assert!(Link::parse(&format!("veilway://sub/203.0.113.7/{path}#{good}")).is_ok() && Link::parse(&format!("https://203.0.113.7/{path}#{good}")).is_ok());
 	assert_eq!((Link::parse(&format!("veilway://sub/203.0.113.7/{path}a#{good}")), Link::parse(&format!("https://203.0.113.7/{path}a#{good}"))), (Err(LinkError::Size), Err(LinkError::Size)));
 	// The key of a pinned link is held to the same rule as any other.
-	assert_eq!(Link::parse(&format!("veilway://sub/sub.example.com/s#v1.{}.{token}.{pin}", base64(&[0; 32]))), Err(LinkError::Key));
+	assert_eq!(Link::parse(&format!("veilway://sub/sub.example.com/s#v1.{}.{g}.{token}.{pin}", base64(&[0; 32]))), Err(LinkError::Key));
 }
 
 // The link of the vectors with a pin and a host, imported through its first step.
 fn pinned_review(host: &str, pin: u8, document: &[u8], stored: &[&Held]) -> Result<Review, Failure> {
-	let Offer::Native(offer) = Offer::open(Link::parse(&format!("veilway://sub/{host}/s#v1.{}.VVVVVVVVVVVVVVVVVVVVVQ.{}", base64(key(0x11).bytes()), base64(&[pin; 32]))).unwrap()) else {panic!("a native link")};
+	let Offer::Native(offer) = Offer::open(Link::parse(&format!("veilway://sub/{host}/s#v1.{}.AXmmMe7eG_nJjxIDLN6t0OegeTmPx4a4jMhG7ImvhaUa.VVVVVVVVVVVVVVVVVVVVVQ.{}", base64(key(0x11).bytes()), base64(&[pin; 32]))).unwrap()) else {panic!("a native link")};
 	assert_eq!(offer.pin(), Some(&[pin; 32]));
 	let fetching = offer.proceed(None, &mut fixed).unwrap();
 	assert_eq!(fetching.pins(), [[pin; 32]]);
@@ -1264,9 +1275,9 @@ fn a_pinned_endpoint_is_checked_by_the_pins_held_and_a_list_must_include_one() {
 	let (a, b, c) = ([1; 32], [2; 32], [3; 32]);
 	// A first import: the link's pin, or the document's list when it holds that pin.
 	let literal = pinned("203.0.113.7:8443", 1, &[("/endpoint_pins", pins(&[1, 2]))]);
-	assert_eq!(literal.targets().iter().map(|(url, pins)| (url.as_str(), pins.to_vec())).collect::<Vec<_>>(), vec![("https://203.0.113.7:8443/s", vec![a, b])]);
+	assert_eq!(literal.targets().iter().map(|target| (target.url.as_str(), target.pins.to_vec())).collect::<Vec<_>>(), vec![("https://203.0.113.7:8443/s", vec![a, b])]);
 	assert_eq!((literal.endpoints().len(), literal.stored().pins, literal.datagram_addresses().contains(&"203.0.113.7".parse().unwrap())), (1, vec![a, b], true));
-	assert_eq!(pinned("203.0.113.7", 1, &[]).targets()[0].1, [a]);
+	assert_eq!(pinned("203.0.113.7", 1, &[]).targets()[0].pins, [a]);
 	assert_eq!(Held::restore(literal.stored()).unwrap(), literal);
 	let mut held = pinned("sub.example.com:8443", 1, &[("/endpoint_pins", pins(&[1, 2]))]);
 	for (document, failure) in [
@@ -1283,7 +1294,7 @@ fn a_pinned_endpoint_is_checked_by_the_pins_held_and_a_list_must_include_one() {
 	assert_eq!(review(issue(0x11, &[("/refresh_urls", json!([{"url": "https://sub.example.com/other", "pins": pins(&[1])}]))]).as_bytes(), &[]).err(), Some(Failure::EndpointKind));
 	assert!(review(issue(0x11, &[("/refresh_urls", json!([{"url": "https://sub.example.com:8443/other", "pins": pins(&[1])}]))]).as_bytes(), &[]).is_ok());
 	let mut plain = self::held();
-	assert_eq!((plain.targets().iter().map(|(_, pins)| pins.len()).collect::<Vec<_>>(), plain.stored().pins, plain.datagram_addresses().contains(&"203.0.113.7".parse().unwrap())), (vec![0], Vec::new(), false));
+	assert_eq!((plain.targets().iter().map(|target| target.pins.len()).collect::<Vec<_>>(), plain.stored().pins, plain.datagram_addresses().contains(&"203.0.113.7".parse().unwrap())), (vec![0], Vec::new(), false));
 	// A refresh holds the same rules against the pins held, and a document that fails any of them changes nothing.
 	let before = held.clone();
 	for (document, failure) in [
@@ -1295,10 +1306,10 @@ fn a_pinned_endpoint_is_checked_by_the_pins_held_and_a_list_must_include_one() {
 	}
 	// The switch: the list holds the former standby, and the client holds exactly the new list. It is noted, and the user is asked nothing.
 	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(0x11, &[("/serial", json!(2)), ("/endpoint_pins", pins(&[2, 3]))]).as_bytes(), NOW) else {panic!("a switch")};
-	assert_eq!((changes.renewed, changes.hosts, held.targets()[0].1.to_vec(), held.stored().pins), (true, Vec::new(), vec![b, c], vec![b, c]));
+	assert_eq!((changes.renewed, changes.hosts, held.targets()[0].pins.to_vec(), held.stored().pins), (true, Vec::new(), vec![b, c], vec![b, c]));
 	// A document without a list changes nothing.
 	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(0x11, &[("/serial", json!(3))]).as_bytes(), NOW) else {panic!("a document without a list")};
-	assert_eq!((changes.renewed, held.targets()[0].1.to_vec()), (false, vec![b, c]));
+	assert_eq!((changes.renewed, held.targets()[0].pins.to_vec()), (false, vec![b, c]));
 	held.refresh(issue(0x11, &[("/serial", json!(4)), ("/endpoint_pins", pins(&[3, 2]))]).as_bytes(), NOW).unwrap();
 	// The former active pin is no longer held, so a list that holds only it is refused.
 	assert_eq!(held.refresh(issue(0x11, &[("/serial", json!(5)), ("/endpoint_pins", pins(&[1, 4]))]).as_bytes(), NOW), Err(Failure::Pins));
@@ -1320,26 +1331,26 @@ fn a_refresh_entry_is_confirmed_pinned_or_not_and_its_pins_follow_the_same_rule(
 	let mut held = pinned("203.0.113.7:8443", 1, &[("/refresh_urls", json!([entry("https://mirror.example.net/s", &[3])]))]);
 	// The hosts on the confirmation are confirmed with it, pinned as they were shown.
 	assert_eq!((held.unconfirmed(), held.endpoints().len(), held.stored().hosts), (Vec::<String>::new(), 2, vec!["mirror.example.net:443#pinned".to_owned()]));
-	assert_eq!(held.targets().iter().map(|(_, pins)| pins.to_vec()).collect::<Vec<_>>(), vec![vec![a], vec![c]]);
+	assert_eq!(held.targets().iter().map(|target| target.pins.to_vec()).collect::<Vec<_>>(), vec![vec![a], vec![c]]);
 	// A change of its pins is not asked about, and the list must include a pin held for the host.
 	assert_eq!(held.refresh(issue(0x11, &[("/serial", json!(2)), ("/refresh_urls", json!([entry("https://mirror.example.net/s", &[4])]))]).as_bytes(), NOW), Err(Failure::Pins));
 	assert_eq!(held.refresh(issue(0x11, &[("/serial", json!(2)), ("/refresh_urls", json!([entry("https://mirror.example.net/s", &[4, 1])]))]).as_bytes(), NOW), Err(Failure::Pins));
 	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(0x11, &[("/serial", json!(2)), ("/refresh_urls", json!([entry("https://mirror.example.net/s", &[4, 3])]))]).as_bytes(), NOW) else {panic!("a switch of an entry")};
-	assert_eq!((changes.hosts, held.endpoints().len(), held.targets()[1].1.to_vec()), (Vec::<String>::new(), 2, vec![d, c]));
+	assert_eq!((changes.hosts, held.endpoints().len(), held.targets()[1].pins.to_vec()), (Vec::<String>::new(), 2, vec![d, c]));
 	// Listed unpinned after it was confirmed pinned: the host is asked about again, and nothing is sent to it until the user says.
 	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(0x11, &[("/serial", json!(3)), ("/refresh_urls", json!(["https://mirror.example.net/s"]))]).as_bytes(), NOW) else {panic!("an entry that lost its pins")};
 	assert_eq!((changes.hosts.clone(), held.endpoints().len(), held.unconfirmed()), (vec!["mirror.example.net:443".to_owned()], 1, vec!["mirror.example.net:443".to_owned()]));
 	held.confirm_hosts(&["mirror.example.net:443#pinned"]);
 	assert_eq!(held.endpoints().len(), 1);
 	held.confirm_hosts(&["mirror.example.net:443"]);
-	assert_eq!((held.endpoints().len(), held.targets()[1].1.len()), (2, 0));
+	assert_eq!((held.endpoints().len(), held.targets()[1].pins.len()), (2, 0));
 	// And the reverse: confirmed unpinned, then pinned. The pins it brings have nothing to include, and are taken with the user's confirmation of the host.
 	let Ok(Refreshed::Updated(changes)) = held.refresh(issue(0x11, &[("/serial", json!(4)), ("/refresh_urls", json!([entry("https://mirror.example.net/s", &[2])]))]).as_bytes(), NOW) else {panic!("an entry that gained pins")};
 	assert_eq!((changes.hosts, held.endpoints().len()), (vec!["mirror.example.net:443#pinned".to_owned()], 1));
 	held.confirm_hosts(&["mirror.example.net:443"]);
 	assert_eq!(held.endpoints().len(), 1);
 	held.confirm_hosts(&["mirror.example.net:443#pinned"]);
-	assert_eq!((held.endpoints().len(), held.targets()[1].1.to_vec()), (2, vec![b]));
+	assert_eq!((held.endpoints().len(), held.targets()[1].pins.to_vec()), (2, vec![b]));
 	// What is confirmed goes to storage and back, also the pinned kind, and a host that is not listed in that kind is not kept.
 	let restored = Held::restore(held.stored()).unwrap();
 	assert_eq!((&restored, restored.endpoints().len()), (&held, 2));
@@ -1455,3 +1466,255 @@ fn what_is_stored_of_the_pins_holds_together_or_is_given_back() {
 	assert_eq!(Held::restore(stored).unwrap(), held);
 	assert!(!format!("{held:?}").contains("AQEB") && !format!("{:?}", held.stored()).contains("AQEB"));
 }
+
+// A gateway key of a document: the id and the public half of the private key `fill` repeated.
+fn gateway_key(id: u64, fill: u8) -> Value {json!({"id": id, "key": std_base64(&veilway_proto::proof::public_key(&[fill; 32]))})}
+
+fn endpoint_to(url: &str, keys: Value) -> Value {json!({"url": url, "gateway_keys": keys})}
+
+#[test]
+fn the_gateway_keys_of_a_document_are_one_or_two_and_a_document_with_an_endpoint_needs_them() {
+	let small = json!({"id": 1, "key": std_base64(&[0xee, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f])});
+	for (name, value) in [("none", json!([])), ("three", json!([gateway_key(1, 1), gateway_key(2, 2), gateway_key(3, 3)])), ("one id twice", json!([gateway_key(1, 1), gateway_key(1, 2)])), ("one key twice", json!([gateway_key(1, 1), gateway_key(2, 1)])), ("an id of 256", json!([gateway_key(256, 1)])), ("a negative id", json!([{"id": -1, "key": std_base64(&[7; 32])}])), ("an id as text", json!([{"id": "1", "key": std_base64(&[7; 32])}])), ("a member more", json!([{"id": 1, "key": std_base64(&[7; 32]), "x": 1}])), ("no key", json!([{"id": 1}])), ("no id", json!([{"key": std_base64(&[7; 32])}])), ("a key of zero", json!([{"id": 1, "key": std_base64(&[0; 32])}])), ("a key of small order", json!([small])), ("a key that is short", json!([{"id": 1, "key": "AAAA"}])), ("an object", json!({})), ("text", json!("x")), ("a number as an entry", json!([1]))] {
+		assert_eq!(read(&with(first(), &[("/gateway_keys", value)])).map(|_| ()), Err(PayloadError::Member("gateway_keys")), "{name}");
+	}
+	for (count, value) in [(1, json!([gateway_key(0, 1)])), (2, json!([gateway_key(255, 1), gateway_key(0, 2)]))] {assert_eq!(subscription(&with(first(), &[("/gateway_keys", value)])).gateway_keys.len(), count)}
+	let listed = subscription(&first());
+	assert_eq!(listed.gateway_keys.iter().map(|key| key.id()).collect::<Vec<_>>(), [1, 2]);
+	// Every document that has an endpoint lists them: an import, a refresh, and the file of a static mirror, which goes through the same refresh. A whole document has no endpoint and needs none.
+	let mut without = first();
+	put(&mut without, "/gateway_keys", None);
+	assert!(read(&without).is_ok());
+	assert_eq!(review(sign(0x11, &without).as_bytes(), &[]).err(), Some(Failure::Gateway));
+	let mut held = held();
+	let before = held.clone();
+	put(&mut without, "/serial", Some(json!(2)));
+	assert_eq!((held.refresh(sign(0x11, &without).as_bytes(), NOW), held == before), (Err(Failure::Gateway), true));
+	assert!(carried(&whole(&[]), &[]).is_ok());
+	// The gateway keys of the last document are the ones a request to the main endpoint is sealed to, and to a refresh entry.
+	assert_eq!(held.targets().iter().map(|target| target.keys.iter().map(|key| key.id()).collect::<Vec<_>>()).collect::<Vec<_>>(), [vec![1, 2]]);
+	assert!(held.refresh(issue(0x11, &[("/serial", json!(3)), ("/gateway_keys", json!([gateway_key(2, 0x60), gateway_key(3, 0x61)])), ("/refresh_urls", json!(["https://sub.example.com/other"]))]).as_bytes(), NOW).is_ok());
+	assert_eq!(held.targets().iter().map(|target| target.keys.iter().map(|key| key.id()).collect::<Vec<_>>()).collect::<Vec<_>>(), [vec![2, 3], vec![2, 3]]);
+}
+
+#[test]
+fn a_main_endpoint_is_a_url_of_a_kind_with_the_gateway_keys_behind_it() {
+	let (a, b) = (pins(&[1]), pins(&[1, 2]));
+	let keys = || json!([gateway_key(3, 0x50)]);
+	let fine = [("an https url", endpoint_to("https://new.example.net/s", keys())), ("an http url", endpoint_to("http://new.example.net:8080/s", keys())), ("an http address", endpoint_to("http://203.0.113.9/s", keys())), ("an http address in brackets", endpoint_to("http://[2001:db8::9]:81/s", keys())), ("a pinned address", json!({"url": "https://203.0.113.9:8443/s", "pins": a, "gateway_keys": keys()})), ("two pins", json!({"url": "https://new.example.net/s", "pins": b, "gateway_keys": keys()})), ("two keys", endpoint_to("https://new.example.net/s", json!([gateway_key(3, 0x50), gateway_key(4, 0x51)]))), ("a member it does not know", json!({"url": "https://new.example.net/s", "gateway_keys": keys(), "later": 1}))];
+	for (name, value) in fine {
+		let read = subscription(&with(first(), &[("/main_endpoint", value)]));
+		assert!(read.main_endpoint.is_some(), "{name}");
+		assert!(!format!("{:?}", read.main_endpoint).contains("new.example.net/s"), "{name}");
+	}
+	let long = format!("https://new.example.net/{}", "a".repeat(240));
+	let refused = [("no gateway keys", json!({"url": "https://new.example.net/s"})), ("no keys listed", endpoint_to("https://new.example.net/s", json!([]))), ("three keys", endpoint_to("https://new.example.net/s", json!([gateway_key(1, 1), gateway_key(2, 2), gateway_key(3, 3)]))), ("a key twice", endpoint_to("https://new.example.net/s", json!([gateway_key(1, 1), gateway_key(1, 2)]))), ("no url", json!({"gateway_keys": keys()})), ("a url that is a number", endpoint_to("x", keys()).as_object().map(|_| json!({"url": 5, "gateway_keys": keys()})).unwrap()), ("pins with http", json!({"url": "http://new.example.net/s", "pins": a, "gateway_keys": keys()})), ("an https address without pins", endpoint_to("https://203.0.113.9/s", keys())), ("empty pins", json!({"url": "https://new.example.net/s", "pins": [], "gateway_keys": keys()})), ("three pins", json!({"url": "https://new.example.net/s", "pins": pins(&[1, 2, 3]), "gateway_keys": keys()})), ("one pin twice", json!({"url": "https://new.example.net/s", "pins": pins(&[1, 1]), "gateway_keys": keys()})), ("a fragment", endpoint_to("https://new.example.net/s#x", keys())), ("a query", endpoint_to("https://new.example.net/s?x=1", keys())), ("a url of 257 characters", endpoint_to(&format!("{long}aaaaaaaaaaaaaaaaaaaaaaaaaaaa"), keys())), ("another scheme", endpoint_to("ftp://new.example.net/s", keys())), ("a dot segment", endpoint_to("https://new.example.net/a/../s", keys())), ("an encoded slash", endpoint_to("https://new.example.net/a%2fb", keys())), ("loopback", endpoint_to("http://127.0.0.1/s", keys())), ("an address with a leading zero", endpoint_to("http://203.0.113.09/s", keys())), ("a user", endpoint_to("https://user@new.example.net/s", keys())), ("an object that is a text", json!("https://new.example.net/s"))];
+	for (name, value) in refused {assert_eq!(read(&with(first(), &[("/main_endpoint", value)])).map(|_| ()), Err(PayloadError::Member("main_endpoint")), "{name}")}
+	// "One host, one role": the endpoint of a move is not the host of a static mirror, and an entry of `refresh_urls` on its host and port is of its kind.
+	let moved = endpoint_to("https://new.example.net/s", keys());
+	assert!(read(&with(first(), &[("/main_endpoint", moved.clone()), ("/refresh_urls", json!(["https://new.example.net/other"]))])).is_ok());
+	for (name, changes) in [("a static mirror on the host", vec![("/static_mirrors", json!(["https://new.example.net/files/"]))]), ("an entry of another kind", vec![("/refresh_urls", json!(["http://new.example.net:443/s"]))]), ("a pinned entry", vec![("/refresh_urls", json!([{"url": "https://new.example.net/s", "pins": a}]))])] {
+		let mut changes = changes;
+		changes.push(("/main_endpoint", moved.clone()));
+		assert_eq!(read(&with(first(), &changes)).map(|_| ()), Err(PayloadError::Member("main_endpoint")), "{name}");
+	}
+	// A signed refusal is read before anything but `v`, `subscription_id` and `issued_at`, so what it carries beyond them is not.
+	assert!(matches!(read(&json!({"v": 1, "subscription_id": "example-account-0001", "issued_at": ISSUED, "refusal": "disabled", "main_endpoint": "nonsense", "gateway_keys": 5})), Ok(Payload::Refusal(_))));
+	// Plain entries of `refresh_urls` are confirmed as a kind of their own.
+	let plain = subscription(&with(first(), &[("/refresh_urls", json!(["http://203.0.113.7:8080/s", "http://mirror.example.net/s"]))]));
+	assert_eq!((plain.refresh_urls.iter().map(|entry| entry.key()).collect::<Vec<_>>(), plain.refresh_urls.iter().map(|entry| entry.kind()).collect::<Vec<_>>()), (vec!["203.0.113.7:8080#plain".to_owned(), "mirror.example.net:80#plain".to_owned()], vec![Kind::Plain, Kind::Plain]));
+}
+
+// The state of a move, step by step ("Moving the main endpoint").
+#[test]
+fn a_move_is_asked_about_once_tried_first_after_the_yes_and_completed_only_by_the_new_endpoint() {
+	let new = "https://new.example.net/s";
+	let named = |serial: u64, url: &str| issue(0x11, &[("/serial", json!(serial)), ("/main_endpoint", endpoint_to(url, json!([gateway_key(3, 0x50)])))]);
+	let mut held = held();
+	let urls = |held: &Held| held.targets().iter().map(|target| (target.role, target.url.as_str().to_owned())).collect::<Vec<_>>();
+	assert_eq!((held.moving().is_none(), held.asking().is_none(), held.kind(), urls(&held)), (true, true, Some(Kind::Chain), vec![(Role::Main, "https://sub.example.com/s".to_owned())]));
+	// A document that names the endpoint the client holds asks for nothing, with its URL and its kind.
+	assert!(matches!(held.refresh(issue(0x11, &[("/serial", json!(2)), ("/main_endpoint", endpoint_to("https://sub.example.com/s", json!([gateway_key(1, 0x40)])))]).as_bytes(), NOW), Ok(Refreshed::Updated(changes)) if !changes.moving) && held.moving().is_none());
+	// 1. A document that asks for a move: held as pending, noted, and nothing is sent to its endpoint.
+	let Ok(Refreshed::Updated(changes)) = held.refresh(named(3, new).as_bytes(), NOW) else {panic!("a newer document")};
+	assert_eq!((changes.moving, changes.moved, held.asking().map(|moving| moving.endpoint().url.as_str()), held.moving().map(Move::confirmed), urls(&held)), (true, false, Some(new), Some(false), vec![(Role::Main, "https://sub.example.com/s".to_owned())]));
+	assert!(held.datagram_addresses().iter().all(|address| address.to_string() != "203.0.113.9"));
+	let waiting = held.asking().unwrap().key();
+	assert_eq!(waiting, format!("{new}#chain"));
+	// 2. A no keeps the main endpoint and the move stays; the same move named again keeps the answer, and another replaces it and is asked about anew.
+	held.decline_move("https://other.example.net/s#chain");
+	assert!(held.asking().is_some());
+	held.decline_move(&waiting);
+	assert_eq!((held.asking().is_none(), held.moving().map(Move::declined), urls(&held).len()), (true, Some(true), 1));
+	assert!(matches!(held.refresh(named(4, new).as_bytes(), NOW), Ok(Refreshed::Updated(changes)) if !changes.moving) && held.asking().is_none() && held.moving().is_some_and(Move::declined));
+	assert!(matches!(held.refresh(named(5, "https://other.example.net/s").as_bytes(), NOW), Ok(Refreshed::Updated(changes)) if changes.moving) && held.asking().is_some_and(|moving| moving.endpoint().url.host() == "other.example.net"));
+	// "One that names the main endpoint or leaves the member out cancels it", and "an older document can neither undo a completed move nor bring back a cancelled one".
+	assert!(matches!(held.refresh(issue(0x11, &[("/serial", json!(6))]).as_bytes(), NOW), Ok(Refreshed::Updated(_))) && held.moving().is_none());
+	assert_eq!((held.refresh(named(5, new).as_bytes(), NOW), held.moving().is_none()), (Err(Failure::Rollback), true));
+	assert!(held.refresh(named(7, new).as_bytes(), NOW).is_ok() && held.asking().is_some());
+	// A yes for a move that a refresh replaced while the screen was up confirms nothing.
+	held.confirm_move("https://other.example.net/s#chain");
+	assert!(held.asking().is_some());
+	held.confirm_move(&format!("{new}#plain"));
+	assert!(held.asking().is_some());
+	held.confirm_move(&format!("{new}#chain"));
+	// 3. "A refresh goes first to the new endpoint, sealed to the move's `gateway_keys`, then to the main endpoint as a fallback."
+	assert_eq!((held.asking().is_none(), held.moving().map(Move::confirmed), urls(&held), held.targets()[0].keys.iter().map(|key| key.id()).collect::<Vec<_>>(), held.targets()[1].keys.iter().map(|key| key.id()).collect::<Vec<_>>()), (true, Some(true), vec![(Role::Move, new.to_owned()), (Role::Main, "https://sub.example.com/s".to_owned())], vec![3], vec![1, 2]));
+	assert_eq!(held.endpoints().iter().map(|url| url.as_str()).collect::<Vec<_>>(), [new, "https://sub.example.com/s"]);
+	// A document of the main endpoint decides the move again, and keeps the yes for the same move.
+	assert!(held.refresh(named(8, new).as_bytes(), NOW).is_ok() && held.moving().is_some_and(Move::confirmed));
+	// 4. A document from the new endpoint is checked against the move: each way it can fail is a failure of that endpoint and changes nothing.
+	let before = held.clone();
+	let serial = held.subscription().serial;
+	let main = |url: &str| endpoint_to(url, json!([gateway_key(3, 0x50)]));
+	let moved = |serial: u64, changes: &[(&str, Value)]| {
+		let mut all = vec![("/serial", json!(serial)), ("/main_endpoint", main(new)), ("/gateway_keys", json!([gateway_key(3, 0x50), gateway_key(4, 0x51)]))];
+		all.extend(changes.iter().cloned());
+		issue(0x11, &all)
+	};
+	for (name, document, failure) in [
+		("it does not name the move", issue(0x11, &[("/serial", json!(serial + 1)), ("/gateway_keys", json!([gateway_key(3, 0x50)]))]), Failure::Move),
+		("it names another endpoint", moved(serial + 1, &[("/main_endpoint", main("https://other.example.net/s"))]), Failure::Move),
+		("it names the endpoint with another kind", moved(serial + 1, &[("/main_endpoint", main("http://new.example.net:443/s"))]), Failure::Move),
+		("its keys leave out the move's", moved(serial + 1, &[("/gateway_keys", json!([gateway_key(1, 0x40), gateway_key(2, 0x60)]))]), Failure::Move),
+		("one of its keys has the id of the move's and another key", moved(serial + 1, &[("/gateway_keys", json!([gateway_key(3, 0x99)]))]), Failure::Move),
+		("it lists no keys", moved(serial + 1, &[("/gateway_keys", Value::Null)]), Failure::Payload(PayloadError::Member("gateway_keys"))),
+		("the same serial", moved(serial, &[]), Failure::Move),
+		("an older serial", moved(serial - 1, &[]), Failure::Rollback),
+		("another account", moved(serial + 1, &[("/subscription_id", json!("example-account-0002"))]), Failure::OtherSubscription),
+		("a key not held", sign(0x99, &with(first(), &[("/serial", json!(serial + 1))])), Failure::Envelope(EnvelopeError::UnknownKey)),
+		("pins of an endpoint that has none", moved(serial + 1, &[("/endpoint_pins", pins(&[1, 2]))]), Failure::Pins),
+	] {
+		assert_eq!(held.refresh_moved(document.as_bytes(), NOW), Err(failure), "{name}");
+		assert_eq!(held, before, "{name} changed what is held");
+	}
+	// A move the user has not said yes to is not followed whatever the endpoint answers.
+	let mut unasked = self::held();
+	let mut waiting_for = held_with_move(new, false);
+	assert_eq!((waiting_for.refresh_moved(moved(20, &[]).as_bytes(), NOW), unasked.refresh_moved(moved(20, &[]).as_bytes(), NOW)), (Err(Failure::Move), Err(Failure::Move)));
+	// 5. A document that passes completes the move before any later one is checked.
+	let Ok(Refreshed::Updated(changes)) = held.refresh_moved(moved(serial + 1, &[]).as_bytes(), NOW) else {panic!("a document from the new endpoint")};
+	assert_eq!((changes.moved, changes.moving, held.endpoint().map(Url::as_str), held.kind(), held.moving().is_none(), urls(&held), held.targets()[0].keys.iter().map(|key| key.id()).collect::<Vec<_>>()), (true, false, Some(new), Some(Kind::Chain), true, vec![(Role::Main, new.to_owned())], vec![3, 4]));
+	assert_eq!(held.stored().endpoint.as_deref(), Some(new));
+	assert!(Held::restore(held.stored()).is_ok_and(|restored| restored == held));
+	// The fallback is gone with the old endpoint, and an old document naming the move again is refused by its serial.
+	assert_eq!(held.refresh(named(serial, new).as_bytes(), NOW), Err(Failure::Rollback));
+	// 6. "Chains of moves": the new main endpoint's own document may name a further one, which waits for its yes.
+	let further = issue(0x11, &[("/serial", json!(serial + 2)), ("/main_endpoint", endpoint_to("http://203.0.113.9:8080/s", json!([gateway_key(5, 0x52)]))), ("/gateway_keys", json!([gateway_key(3, 0x50), gateway_key(4, 0x51)]))]);
+	assert!(matches!(held.refresh(further.as_bytes(), NOW), Ok(Refreshed::Updated(changes)) if changes.moving && !changes.moved));
+	assert_eq!((held.asking().map(|moving| moving.endpoint().kind()), urls(&held)), (Some(Kind::Plain), vec![(Role::Main, new.to_owned())]));
+	let key = held.asking().unwrap().key();
+	held.confirm_move(&key);
+	let plain_document = |serial: u64, changes: &[(&str, Value)]| {
+		let mut all = vec![("/serial", json!(serial)), ("/main_endpoint", endpoint_to("http://203.0.113.9:8080/s", json!([gateway_key(5, 0x52)]))), ("/gateway_keys", json!([gateway_key(5, 0x52)]))];
+		all.extend(changes.iter().cloned());
+		issue(0x11, &all)
+	};
+	// A plain endpoint has no pins, so a list of them in a document from it is refused, and TLS gives way to plain HTTP only through the yes.
+	let before = held.clone();
+	assert_eq!((held.refresh_moved(plain_document(serial + 3, &[("/endpoint_pins", pins(&[1, 2]))]).as_bytes(), NOW), held == before), (Err(Failure::Pins), true));
+	let Ok(Refreshed::Updated(changes)) = held.refresh_moved(plain_document(serial + 3, &[]).as_bytes(), NOW) else {panic!("a document from the plain endpoint")};
+	assert_eq!((changes.moved, held.kind(), held.endpoint().map(Url::as_str), held.targets()[0].pins.len(), held.stored().pins.len(), held.datagram_addresses().iter().any(|address| address.to_string() == "203.0.113.9")), (true, Some(Kind::Plain), Some("http://203.0.113.9:8080/s"), 0, 0, true));
+	assert!(Held::restore(held.stored()).is_ok_and(|restored| restored == held));
+}
+
+// A held subscription with a move to `url`, confirmed or not.
+fn held_with_move(url: &str, confirmed: bool) -> Held {
+	let mut held = held();
+	assert!(held.refresh(issue(0x11, &[("/serial", json!(2)), ("/main_endpoint", endpoint_to(url, json!([gateway_key(3, 0x50)])))]).as_bytes(), NOW).is_ok());
+	if confirmed {
+		let key = held.asking().unwrap().key();
+		held.confirm_move(&key);
+	}
+	held
+}
+
+#[test]
+fn a_move_to_a_pinned_endpoint_completes_only_with_a_pin_of_the_move_and_pins_become_the_lists() {
+	let url = "https://203.0.113.9:8443/s";
+	let mut held = held();
+	let ask = issue(0x11, &[("/serial", json!(2)), ("/main_endpoint", json!({"url": url, "pins": pins(&[1, 2]), "gateway_keys": [gateway_key(3, 0x50)]}))]);
+	assert!(held.refresh(ask.as_bytes(), NOW).is_ok());
+	let key = held.asking().unwrap().key();
+	assert_eq!(key, format!("{url}#pinned"));
+	held.confirm_move(&key);
+	// The move's pins are what its endpoint is checked by, and the main endpoint's stay what they were.
+	assert_eq!(held.targets().iter().map(|target| (target.role, target.pins.len())).collect::<Vec<_>>(), [(Role::Move, 2), (Role::Main, 0)]);
+	let document = |serial: u64, list: Option<Value>| {
+		let mut all = vec![("/serial", json!(serial)), ("/main_endpoint", json!({"url": url, "pins": pins(&[1, 2]), "gateway_keys": [gateway_key(3, 0x50)]})), ("/gateway_keys", json!([gateway_key(3, 0x50)]))];
+		if let Some(list) = list {all.push(("/endpoint_pins", list))}
+		issue(0x11, &all)
+	};
+	let before = held.clone();
+	// "Its `endpoint_pins`, when the endpoint is pinned, must include a pin of the move's `pins`."
+	for (name, list) in [("none", None), ("others", Some(pins(&[7, 8]))), ("one other", Some(pins(&[9])))] {
+		assert_eq!((held.refresh_moved(document(3, list).as_bytes(), NOW), held == before), (Err(Failure::Move), true), "{name}");
+	}
+	let Ok(Refreshed::Updated(changes)) = held.refresh_moved(document(3, Some(pins(&[2, 7]))).as_bytes(), NOW) else {panic!("a document from the new endpoint")};
+	// "From then on `endpoint_pins` describes the new endpoint": the client holds exactly the list.
+	assert_eq!((changes.moved, held.kind(), held.stored().pins, held.endpoint().map(Url::as_str), held.targets()[0].pins.len()), (true, Some(Kind::Pinned), vec![[2; 32], [7; 32]], Some(url), 2));
+	assert!(Held::restore(held.stored()).is_ok_and(|restored| restored == held));
+	// The next document from it is held to the pins it holds now.
+	assert_eq!(held.refresh(document(4, Some(pins(&[5, 6]))).as_bytes(), NOW), Err(Failure::Pins));
+	assert!(held.refresh(document(4, Some(pins(&[7, 6]))).as_bytes(), NOW).is_ok_and(|refreshed| matches!(refreshed, Refreshed::Updated(changes) if changes.renewed)));
+}
+
+#[test]
+fn an_import_sets_the_main_endpoint_back_and_its_yes_covers_the_move() {
+	let new = "https://new.example.net/s";
+	let mut moved = held_with_move(new, true);
+	let key = moved.moving().unwrap().key();
+	let serial = moved.subscription().serial;
+	let complete = issue(0x11, &[("/serial", json!(serial + 1)), ("/main_endpoint", endpoint_to(new, json!([gateway_key(3, 0x50)]))), ("/gateway_keys", json!([gateway_key(3, 0x50)]))]);
+	assert!(moved.refresh_moved(complete.as_bytes(), NOW).is_ok() && moved.endpoint().map(Url::as_str) == Some(new));
+	assert_eq!(key, format!("{new}#chain"));
+	// The link names the old endpoint: the import says the endpoint is checked another way, and the document that asks for the move is part of its confirmation.
+	let document = issue(0x11, &[("/serial", json!(2)), ("/issued_at", json!(ISSUED + 1)), ("/main_endpoint", endpoint_to(new, json!([gateway_key(3, 0x50)])))]);
+	let review = review(document.as_bytes(), &[&moved]).unwrap();
+	assert_eq!((review.replaces(), review.endpoint_changed(), review.moving().map(|main| main.url.as_str()), review.endpoint().map(Url::as_str)), (true, true, Some(new), Some("https://sub.example.com/s")));
+	let accepted = review.accept(None, &[&moved]).unwrap();
+	assert_eq!((accepted.held.endpoint().map(Url::as_str), accepted.held.moving().map(Move::confirmed), accepted.held.asking().is_none(), accepted.held.targets().iter().map(|target| target.role).collect::<Vec<_>>()), (Some("https://sub.example.com/s"), Some(true), true, vec![Role::Move, Role::Main]));
+	// A document that names the main endpoint asks for nothing on an import.
+	let plain = review_of(issue(0x11, &[("/serial", json!(2)), ("/issued_at", json!(ISSUED + 1))]).as_bytes(), &[&moved]);
+	assert_eq!((plain.moving().is_none(), plain.endpoint_changed()), (true, true));
+	// Where the link and the endpoint held are the same, nothing changed.
+	let same = held();
+	assert!(!review_of(issue(0x11, &[("/serial", json!(2)), ("/issued_at", json!(ISSUED + 1))]).as_bytes(), &[&same]).endpoint_changed());
+}
+
+fn review_of(document: &[u8], stored: &[&Held]) -> Review {review(document, stored).unwrap()}
+
+#[test]
+fn what_is_stored_of_a_move_is_the_answer_to_it_and_the_endpoint_of_the_last_one_that_completed() {
+	let new = "https://new.example.net/s";
+	let mut held = held_with_move(new, true);
+	let stored = held.stored();
+	assert!(stored.moving.as_ref().is_some_and(|moving| moving.confirmed && !moving.declined && moving.key == format!("{new}#chain")) && stored.endpoint.is_none());
+	assert!(Held::restore(stored.clone()).is_ok_and(|restored| restored == held && restored.moving().is_some_and(Move::confirmed)));
+	// An answer that was given to another move is not given to this one, and one that says yes and no is none.
+	let mut other = stored.clone();
+	other.moving = other.moving.map(|mut moving| {moving.key = "https://other.example.net/s#chain".into(); moving});
+	assert!(Held::restore(other).is_ok_and(|restored| restored.moving().is_some_and(|moving| !moving.confirmed() && !moving.declined())));
+	let mut both = stored.clone();
+	both.moving = both.moving.map(|mut moving| {moving.declined = true; moving});
+	assert!(Held::restore(both).is_ok_and(|restored| restored.moving().is_some_and(|moving| !moving.confirmed() && !moving.declined())));
+	// A main endpoint that is stored and is no endpoint is storage that does not hold together, and so is a plain one with pins.
+	let complete = issue(0x11, &[("/serial", json!(3)), ("/main_endpoint", endpoint_to(new, json!([gateway_key(3, 0x50)]))), ("/gateway_keys", json!([gateway_key(3, 0x50)]))]);
+	assert!(held.refresh_moved(complete.as_bytes(), NOW).is_ok());
+	let stored = held.stored();
+	assert_eq!(stored.endpoint.as_deref(), Some(new));
+	for text in ["ftp://new.example.net/s", "https://new.example.net/s#x", "https://user@new.example.net/s", "", "https://203.0.113.9/s"] {
+		let mut broken = stored.clone();
+		broken.endpoint = Some(text.to_owned());
+		assert!(matches!(Held::restore(broken), Err(Damaged::Broken(_))), "{text}");
+	}
+	let mut plain = stored.clone();
+	(plain.endpoint, plain.pins) = (Some("http://new.example.net/s".to_owned()), vec![[1; 32]]);
+	assert!(matches!(Held::restore(plain), Err(Damaged::Broken(_))));
+	// A whole document keeps no endpoint, and one that is stored for it is not read.
+	let mut whole_stored = whole_held().stored();
+	whole_stored.endpoint = Some(new.to_owned());
+	assert!(Held::restore(whole_stored).is_ok_and(|restored| restored.endpoint().is_none() && restored.targets().is_empty()));
+}
+
+fn whole_held() -> Held {carried(&whole(&[]), &[]).unwrap().accept(None, &[]).unwrap().held}

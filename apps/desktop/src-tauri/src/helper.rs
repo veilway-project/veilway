@@ -10,7 +10,7 @@
 use crate::logs::{LogLayer, START};
 use crate::ipc::{self, Conn, Server};
 use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
-use crate::view::{library_view, status_view, subscription_view, tags, AppliedOut, SubscriptionOut};
+use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, SubscriptionOut};
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
 use serde::Serialize;
@@ -27,6 +27,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use veilway_engine::import::{self, Fetcher, Library, Reviewed};
 use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store};
 use veilway_proto::subscription::client::{Fetching, Standing, Offer, NativeOffer, CarriedOffer};
+use veilway_proto::subscription::Kind;
 use veilway_proto::subscription::payload::Id;
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
@@ -73,10 +74,10 @@ pub struct Core {
 }
 
 #[derive(Serialize)]
-struct OfferOut {kind: &'static str, host: Option<String>, fingerprint: String, pinned: bool, in_file: bool}
+struct OfferOut {kind: &'static str, host: Option<String>, fingerprint: String, pinned: bool, plain: bool, in_file: bool}
 
 #[derive(Serialize)]
-struct ReviewOut {fingerprint: String, replaces: bool, endpoint_changed: bool, left_out: Vec<String>, preview: SubscriptionOut}
+struct ReviewOut {fingerprint: String, replaces: bool, endpoint_changed: bool, moving: Option<MoveOut>, left_out: Vec<String>, preview: SubscriptionOut}
 
 fn to_value<T: Serialize>(value: T) -> Result<Value, String> {serde_json::to_value(value).map_err(|error| error.to_string())}
 
@@ -110,8 +111,8 @@ impl Core {
 					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| import::Code::FileUnreadable.as_str().to_owned())?),
 				}.map_err(|error| error.code().as_str().to_owned())?;
 				let (out, pending) = match offer {
-					Offer::Native(offer) => (OfferOut {kind: "native", host: Some(offer.endpoint().host().to_owned()), fingerprint: offer.fingerprint().to_string(), pinned: offer.pin().is_some(), in_file: false}, Pending::Native(offer)),
-					Offer::Carried(offer) => (OfferOut {kind: "carried", host: None, fingerprint: offer.fingerprint().to_string(), pinned: false, in_file: offer.in_file()}, Pending::Carried(offer)),
+					Offer::Native(offer) => (OfferOut {kind: "native", host: Some(offer.endpoint().host().to_owned()), fingerprint: offer.fingerprint().to_string(), pinned: offer.pin().is_some(), plain: offer.kind() == Kind::Plain, in_file: false}, Pending::Native(offer)),
+					Offer::Carried(offer) => (OfferOut {kind: "carried", host: None, fingerprint: offer.fingerprint().to_string(), pinned: false, plain: false, in_file: offer.in_file()}, Pending::Carried(offer)),
 					Offer::Legacy(_) => return Err(import::ImportError::Legacy.code().as_str().to_owned()),
 				};
 				*self.pending.lock().await = Some(pending);
@@ -140,7 +141,7 @@ impl Core {
 					Err(question) => return Ok(question),
 				};
 				let subscription = reviewed.review.subscription();
-				let out = ReviewOut {fingerprint: reviewed.review.fingerprint().to_string(), replaces: reviewed.review.replaces(), endpoint_changed: reviewed.review.endpoint_changed(), left_out: subscription.refused.iter().map(|refused| format!("{refused:?}")).collect(), preview: subscription_view(subscription, Standing::Current, reviewed.review.refreshes(), false, &self.tags())};
+				let out = ReviewOut {fingerprint: reviewed.review.fingerprint().to_string(), replaces: reviewed.review.replaces(), endpoint_changed: reviewed.review.endpoint_changed(), moving: reviewed.review.moving().map(|main| move_view(main, reviewed.review.endpoint())), left_out: subscription.refused.iter().map(|refused| format!("{refused:?}")).collect(), preview: subscription_view(subscription, Standing::Current, reviewed.review.refreshes(), false, &self.tags())};
 				*pending = Some(Pending::Reviewed(reviewed));
 				to_value(out)
 			}
@@ -172,7 +173,7 @@ impl Core {
 				if !allowed.is_empty() {library.allow_private(at, &allowed).map_err(|error| format!("The choice could not be saved: {error}"))?}
 				match fetcher().refresh(&mut library, at, now()).await {
 					Err(import::ImportError::PrivateEndpoint {host, addresses}) => return Ok(json!({"ask_private": {"host": host, "addresses": addresses}})),
-					other => other.map_err(|error| error.code().as_str().to_owned())?,
+					other => other.map_err(|error| error.wire())?,
 				};
 				drop(library);
 				self.library_value().await
@@ -191,6 +192,11 @@ impl Core {
 				let mut library = self.library.lock().await;
 				let at = library.held().iter().position(|held| held.id().as_str() == id).ok_or("That subscription is not held.")?;
 				let (allow, decline): (Vec<&str>, Vec<&str>) = (allow.iter().take(16).map(String::as_str).collect(), decline.iter().take(16).map(String::as_str).collect());
+				// The endpoint of a move is answered apart from the hosts: its yes puts it first in the next refresh, and a no keeps the main endpoint.
+				let moving = library.held()[at].moving().map(|moving| moving.key());
+				for (yes, answered) in [(true, &allow), (false, &decline)] {
+					if let Some(key) = moving.as_deref().filter(|key| answered.contains(key)) {library.answer_move(at, key, yes).map_err(|error| format!("The choice could not be saved: {error}"))?}
+				}
 				library.answer_hosts(at, &allow, &decline).map_err(|error| format!("The choice could not be saved: {error}"))?;
 				drop(library);
 				self.library_value().await
@@ -242,7 +248,7 @@ impl Core {
 				*pending = Some(Pending::Fetching(fetching));
 				match error {
 					import::ImportError::PrivateEndpoint {host, addresses} => Ok(Err(json!({"ask_private": {"host": host, "addresses": addresses}}))),
-					error => Err(error.code().as_str().to_owned()),
+					error => Err(error.wire()),
 				}
 			}
 		}
