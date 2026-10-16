@@ -1,3 +1,18 @@
+veilway-ipstack
+===============
+
+This is a patched fork of [ipstack](https://github.com/narrowlink/ipstack) 1.0.1 by Narrowlink (Apache-2.0, see `LICENSE`), published for [Veilway](https://github.com/veilway-project/veilway) so that the node can depend on it from crates.io. The library name is still `ipstack`, so the code below works unchanged: depend on it as `ipstack = { package = "veilway-ipstack", version = "1.0.1-veilway.1" }`. If you do not need these patches, use the upstream crate instead.
+
+The patches are marked with `veilway patch` comments in the source:
+
+- After the peer's FIN, the read side reports EOF. Upstream never did, so a relay hung until the idle timeout.
+- Dropping a TCP stream no longer blocks the thread until its task has ended. Upstream could keep a process with open flows from ever exiting at shutdown, and panicked on a current-thread runtime.
+- Segments never exceed the MSS the peer announced in its SYN, a FIN waits for the ACKs of in-flight data and is woken when they arrive, and data written before the SYN/ACK is on its way waits instead of leaving under the wrong sequence number.
+- `TcpSendState` and `IpStackTcpStream::send_state` give a read-only handle on a connection's sequence numbers, for writing its last segment without the stream.
+- The upstream build script is turned off, because it only copies `wintun.dll` for the examples.
+
+What follows is upstream's README.
+
 IpStack
 =======
 

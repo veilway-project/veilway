@@ -4,7 +4,11 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Veilway client engine without an OS layer: candidate race, session carrying, subscription import and status."
+readme="README.md"
+keywords=["vpn", "wireguard", "client", "censorship", "proxy"]
+categories=["network-programming"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [features]
 # Hooks that exist for tests: where a dial goes after its checks, and how a wait is made. No build that ships turns it on.
@@ -18,8 +22,8 @@ fuzz=[]
 unexpected_cfgs={level="warn", check-cfg=["cfg(fuzzing)", "cfg(veilway_release_tests)"]}
 
 [dependencies]
-veilway-proto={path="../veilway-proto"}
-veilway-transport={path="../veilway-transport"}
+veilway-proto={path="../veilway-proto", version="0.1.0"}
+veilway-transport={path="../veilway-transport", version="0.1.0"}
 tokio.workspace=true
 tracing.workspace=true
 # WireGuard itself, unchanged: one `Tunn` for the one node a tunnel talks to.

@@ -11,8 +11,8 @@
 
 [package]
 edition = "2024"
-name = "ipstack"
-version = "1.0.1"
+name = "veilway-ipstack"
+version = "1.0.1-veilway.1"
 authors = ["Narrowlink <opensource@narrowlink.com>"]
 # veilway patch: the upstream build script only copies wintun.dll for its own examples, and on Windows it runs
 # `cargo metadata` in this directory, which fails inside another workspace. The examples are not built here.
@@ -22,11 +22,14 @@ autobins = false
 autoexamples = false
 autotests = false
 autobenches = false
-description = "Asynchronous lightweight userspace implementation of TCP/IP stack for Tun device"
+description = "Patched fork of ipstack, the userspace TCP/IP stack for a TUN device, as used by Veilway"
 homepage = "https://narrowlink.com"
 readme = "README.md"
 license = "Apache-2.0"
-repository = "https://github.com/narrowlink/ipstack"
+repository = "https://github.com/veilway-project/veilway"
+keywords = ["tcp", "ip", "tun", "userspace", "network"]
+categories = ["network-programming", "asynchronous"]
+exclude = ["scripts/", "rustfmt.toml", ".github/", "Cargo.toml.orig"]
 
 [lib]
 name = "ipstack"
@@ -109,23 +112,3 @@ version = "1"
 [target.'cfg(target_os = "windows")'.dev-dependencies.wintun]
 version = "0.5"
 default-features = false
-
-[profile.bench]
-opt-level = 3
-lto = false
-codegen-units = 16
-debug = 2
-incremental = true
-strip = "none"
-
-[profile.release]
-opt-level = "s"
-lto = true
-codegen-units = 1
-debug = 0
-debug-assertions = false
-rpath = false
-panic = "abort"
-overflow-checks = false
-incremental = false
-strip = true

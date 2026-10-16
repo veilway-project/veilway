@@ -4,7 +4,11 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Wire formats of the Veilway native protocol: keys, chunks, control channel, subscriptions. Pure code, no IO."
+readme="README.md"
+keywords=["vpn", "protocol", "wireguard", "censorship", "proxy"]
+categories=["network-programming", "cryptography", "encoding"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [features]
 # A way to seal a chunk no client would send, for the tests of what a receiver does with one. No build of a node turns it on.

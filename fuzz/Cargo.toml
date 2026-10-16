@@ -252,7 +252,3 @@ bench=false
 
 # Not part of the main workspace.
 [workspace]
-
-# Same patch as the root manifest, so the fuzzed build matches the real one.
-[patch.crates-io]
-ipstack={path="../vendor/ipstack"}

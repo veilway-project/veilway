@@ -4,17 +4,21 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-publish.workspace=true
+description="Veilway command line: run a node, check configs, diagnose, and connect as a client."
+readme="README.md"
+keywords=["vpn", "wireguard", "proxy", "cli", "censorship"]
+categories=["command-line-utilities", "network-programming"]
+exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [[bin]]
 name="veilway"
 path="src/main.rs"
 
 [dependencies]
-veilway-core={path="../veilway-core"}
-veilway-wg={path="../veilway-wg"}
+veilway-core={path="../veilway-core", version="0.1.0"}
+veilway-wg={path="../veilway-wg", version="0.1.0"}
 # The window and the step of the replay rule, which `doctor` holds a replay file against.
-veilway-proto={path="../veilway-proto"}
+veilway-proto={path="../veilway-proto", version="0.1.0"}
 tokio.workspace=true
 anyhow.workspace=true
 clap.workspace=true
@@ -25,27 +29,27 @@ serde_json.workspace=true
 x509-parser.workspace=true
 
 [target.'cfg(unix)'.dependencies]
-veilway-api={path="../veilway-api"}
+veilway-api={path="../veilway-api", version="0.1.0"}
 # The one `access` call `doctor` asks the system with whether a directory can be written.
 libc.workspace=true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `connect`, `disconnect` and `status`: the client engine and its Linux layer.
-veilway-linux={path="../veilway-linux"}
+veilway-linux={path="../veilway-linux", version="0.1.0"}
 # Whether the client runs as root, which decides where it keeps its files.
 rustix={workspace=true, features=["process"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The same commands on macOS: the engine and its macOS layer, which only root can run.
-veilway-macos={path="../veilway-macos"}
+veilway-macos={path="../veilway-macos", version="0.1.0"}
 rustix={workspace=true, features=["process"]}
 
 [target.'cfg(windows)'.dependencies]
 # The same commands on Windows: the engine and its Windows layer.
-veilway-windows={path="../veilway-windows"}
+veilway-windows={path="../veilway-windows", version="0.1.0"}
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
-veilway-engine={path="../veilway-engine"}
+veilway-engine={path="../veilway-engine", version="0.1.0"}
 ipnet.workspace=true
 
 [dev-dependencies]

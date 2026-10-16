@@ -7,7 +7,6 @@ exclude=["apps/desktop/src-tauri", "fuzz"]
 version="0.1.0"
 edition="2021"
 license="Apache-2.0"
-publish=false
 repository="https://github.com/veilway-project/veilway"
 
 [workspace.dependencies]
@@ -25,7 +24,7 @@ rustls={version="0.23", default-features=false, features=["ring", "std", "tls12"
 rcgen="0.14"
 x509-parser="0.18"
 boringtun={version="0.7", default-features=false}
-ipstack="1"
+ipstack={package="veilway-ipstack", version="1.0.1-veilway.1", path="vendor/ipstack"}
 ipnet={version="2", features=["serde"]}
 base64="0.23"
 rand_core={version="0.6", features=["getrandom"]}
@@ -53,7 +52,3 @@ x25519-dalek={version="3", default-features=false}
 # The Mozilla root certificates, which the TLS of a node link's dialler is validated against. `tokio-tungstenite` brings the same crate already.
 webpki-roots="1"
 
-
-# ipstack 1.0.1 never reports EOF after the peer FIN, so relays hang until the idle timeout, and it blocks in the Drop of a TCP stream, which kept a node with open flows from ever exiting. See vendor/ipstack ("veilway patch").
-[patch.crates-io]
-ipstack={path="vendor/ipstack"}
