@@ -553,7 +553,7 @@ mod tests {
 		let link = link(&socket, &token()).await.unwrap();
 		assert_eq!(link.call(Call::Library {languages: vec!["en".into()]}).await.unwrap(), json!([]));
 		assert!(link.call(Call::ImportOpen {source: Source::Link {text: "not a link".into()}}).await.is_err());
-		assert_eq!(link.call(Call::ImportProceed {private: Vec::new()}).await.unwrap_err(), "There is no import waiting for a yes.");
+		assert_eq!(link.call(Call::ImportProceed {private: Vec::new()}).await.unwrap_err(), "no_import");
 		assert_eq!(link.call(Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await.unwrap_err(), "That subscription is not held.");
 		assert_eq!(link.call(Call::Answer {yes: true}).await.unwrap_err(), "There is no question waiting.");
 		assert_eq!(link.call(Call::SelectExit {tag: None}).await.unwrap_err(), "There is no running tunnel to change the exit of.");
