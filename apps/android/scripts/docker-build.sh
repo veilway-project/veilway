@@ -4,9 +4,9 @@
 set -eu
 here=$(cd "$(dirname "$0")/../../.." && pwd)
 ui=${VEILWAY_UI:-$HOME/veilway-ui}
-if [ -n "$(docker ps -q)" ]; then echo "another container is running, wait for it" >&2; exit 1; fi
+if [ -n "$(docker ps -q --filter label=veilway-heavy)" ]; then echo "another build is running, wait for it" >&2; exit 1; fi
 docker build -t veilway-android-build -f "$here/apps/android/docker/Dockerfile" "$here/apps/android/docker"
-exec docker run --rm --cpus 2 --memory 3g --name veilway-android \
+exec docker run --rm --label veilway-heavy=1 --cpus 2 --memory 3g --name veilway-android \
 	-v veilway-android-sdk:/opt/android-sdk -v veilway-cargo:/opt/cargo-cache -v veilway-android-target:/opt/target -v veilway-android-ui-nm:/work/apps/desktop/ui/node_modules \
 	-e CARGO_TARGET_DIR=/opt/target -e CARGO_HOME_CACHE=/opt/cargo-cache -e VEILWAY_GOOGLE_MAVEN_MIRROR=1 \
 	-v "$here":/work -v "$ui":/veilway-ui veilway-android-build sh /work/apps/android/scripts/build.sh
