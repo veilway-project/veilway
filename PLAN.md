@@ -354,8 +354,9 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 3. The shapes of `fronted` (below), with Server-Sent Events downstream.
 4. A signed offline bundle: an app update and subscription documents in one file, for any one-way channel (a USB stick, Bluetooth, satellite datacasting), trusted by its signature only.
 5. Xray in the apps: VLESS, Trojan and Shadowsocks clients in the Veilway apps, with VMess and UDP.
-6. If there is room: `ws-plain` with the media appearance, bonded connections, the gateway's timing measurement the subscription format requires before it leaves draft, and a design for certificates from the panel (ACME) without a probe surface.
-7. Design only, no build: the `dns` transport (the table above), WebRTC carriers through allowed calling services, and domestic CDN pull zones as a documented setup.
+6. A panel SDK: `@veilway/panel-sdk`, a typed TypeScript client for the panel's admin API (users, devices, subscriptions, exits, stats), generated from the panel's `openapi.json` like the node's SDK and published with each panel release, for integrations that use API tokens.
+7. If there is room: `ws-plain` with the media appearance, bonded connections, the gateway's timing measurement the subscription format requires before it leaves draft, and a design for certificates from the panel (ACME) without a probe surface.
+8. Design only, no build: the `dns` transport (the table above), WebRTC carriers through allowed calling services, and domestic CDN pull zones as a documented setup.
 
 ## v0.3.0: the first beta
 
