@@ -19,9 +19,10 @@ use tokio::net::{lookup_host, TcpSocket};
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 use veilway_proto::subscription::client::{Accepted, CarriedOffer, Damaged, Declined, Device, Failure, Fetching, Held, NativeOffer, Offer, Refreshed, Review, Stored, CONNECT_TIMEOUT, FETCH_TIMEOUT};
+use veilway_proto::subscription::envelope::EnvelopeError;
 use veilway_proto::subscription::fetch::{DeviceName, Request};
 use veilway_proto::subscription::link::{Carried, Link, LinkError};
-use veilway_proto::subscription::payload::{dialable, private, Reason};
+use veilway_proto::subscription::payload::{dialable, private, PayloadError, Reason};
 use veilway_proto::subscription::{DeviceSecret, Secret, Url, BODY_MAX};
 use veilway_transport::http;
 use veilway_transport::Hook;
@@ -80,17 +81,16 @@ pub enum FetchError {
 }
 
 impl FetchError {
-	/// The words an app shows.
-	pub fn text(&self) -> &'static str {
+	pub fn code(&self) -> Code {
 		match self {
-			Self::Private {..} => "This subscription is on a private address. Only continue if you run this server yourself, for example at home.",
-			Self::Resolve => "The subscription server's name could not be looked up, or it points somewhere this app will not connect to.",
-			Self::Connect => "Could not connect to the subscription server.",
-			Self::Certificate => "The subscription server's certificate is not valid. If your provider uses its own certificate, part of the link may have been lost on the way.",
-			Self::Tls => "The connection to the subscription server could not be made secure.",
-			Self::Timeout => "The subscription server took too long to answer.",
-			Self::NotHttp | Self::Redirect | Self::Status(_) | Self::Encoding | Self::Body => "The endpoint did not answer as a subscription: the link may have been reset, or something else answered in its place.",
-			Self::Pin => "The subscription server's certificate does not match this link. If your provider has changed it, ask for a new link. If not, something between you and your provider answered in its place.",
+			Self::Private {..} => Code::PrivateAddress,
+			Self::Resolve => Code::Resolve,
+			Self::Connect => Code::Unreachable,
+			Self::Certificate => Code::Certificate,
+			Self::Tls => Code::Tls,
+			Self::Timeout => Code::Timeout,
+			Self::NotHttp | Self::Redirect | Self::Status(_) | Self::Encoding | Self::Body => Code::NoSubscription,
+			Self::Pin => Code::Pin,
 		}
 	}
 }
@@ -98,8 +98,12 @@ impl FetchError {
 /// Why an import step did not go through. Nothing was stored, and what was held is as it was.
 #[derive(Debug)]
 pub enum ImportError {
-	/// The text is no link.
+	/// The text begins with neither `veilway://` nor `https://`.
+	NotALink,
+	/// The text begins as a link does and does not read: cut off, mistyped or changed.
 	Link(LinkError),
+	/// The content of a file that is no subscription file, or is over its limit.
+	File(LinkError),
 	/// A legacy link: it needs the compatibility add-on, which is not part of this engine.
 	Legacy,
 	Fetch(FetchError),
@@ -125,31 +129,190 @@ impl From<FetchError> for ImportError {
 }
 
 impl ImportError {
-	/// The words an app shows.
-	pub fn text(&self) -> &'static str {
+	pub fn code(&self) -> Code {
 		match self {
-			Self::Link(_) => "This is not a link this app can use.",
-			Self::Legacy => "This is a link of another kind. It cannot be verified, and this app does not connect to it by itself.",
-			Self::Fetch(error) => error.text(),
-			Self::Random => "The system could not give the app random numbers. Nothing was sent.",
-			Self::Store(_) => "The subscription could not be saved on this device.",
-			Self::Full => "This app holds as many subscriptions as it can. Remove one first.",
-			Self::PrivateEndpoint {..} => "This subscription is on a private address. Only continue if you run this server yourself, for example at home.",
-			Self::Subscription(Failure::Refused(reason)) => match reason {
-				Reason::DeviceLimit => "Every device place of this account is taken. Remove a device in the provider's panel, or ask the provider to reset the link.",
-				Reason::Disabled => "The provider has switched the account off.",
-				Reason::Expired => "The account has expired.",
-				Reason::RateLimited => "This device has asked too often. Try again later.",
-				Reason::DeviceMismatch => "This device has to be enrolled again: import the link again.",
-				Reason::KeyRetired => "The provider has renewed its key. A new link is needed.",
-				Reason::Released | Reason::BadRequest => "The request could not be completed. This is a fault in the app.",
+			Self::NotALink => Code::NotALink,
+			Self::Link(LinkError::Size) => Code::LinkTooLong,
+			Self::Link(_) => Code::LinkDamaged,
+			Self::File(LinkError::Size) => Code::FileTooLarge,
+			Self::File(_) => Code::NotAFile,
+			Self::Legacy => Code::Legacy,
+			Self::Fetch(error) => error.code(),
+			Self::Random => Code::Random,
+			Self::Store(_) => Code::Store,
+			Self::Full => Code::Full,
+			Self::PrivateEndpoint {..} => Code::PrivateAddress,
+			Self::Subscription(failure) => match failure {
+				Failure::Refused(Reason::DeviceLimit) => Code::DeviceLimit,
+				Failure::Refused(Reason::Disabled) => Code::AccountDisabled,
+				Failure::Refused(Reason::Expired) => Code::AccountExpired,
+				Failure::Refused(Reason::RateLimited) => Code::RateLimited,
+				Failure::Refused(Reason::DeviceMismatch) => Code::DeviceMismatch,
+				Failure::Refused(Reason::KeyRetired) => Code::KeyRetired,
+				Failure::Refused(Reason::Released | Reason::BadRequest) => Code::BadRequest,
+				Failure::Envelope(EnvelopeError::Size | EnvelopeError::Parts | EnvelopeError::Encoding) => Code::BadAnswer,
+				Failure::Envelope(EnvelopeError::UnknownKey | EnvelopeError::Signature) => Code::Signature,
+				Failure::Payload(PayloadError::Version | PayloadError::Critical) => Code::UpdateApp,
+				Failure::Payload(_) => Code::BadDocument,
+				Failure::StaleRefusal => Code::StaleRefusal,
+				Failure::OtherSubscription => Code::OtherSubscription,
+				Failure::Rollback | Failure::Backdated | Failure::NotNewer => Code::Older,
+				Failure::Fork => Code::Different,
+				Failure::Expired => Code::Expired,
+				Failure::Future => Code::Clock,
+				Failure::DeviceKey | Failure::PrivateKey => Code::DeviceKey,
+				Failure::HasLink => Code::HasLink,
+				Failure::EndpointKind | Failure::Changed | Failure::Pins => Code::EndpointChanged,
 			},
-			Self::Subscription(Failure::Envelope(_)) => "The answer was not signed by this provider's key.",
-			Self::Subscription(Failure::Rollback | Failure::Fork | Failure::Backdated | Failure::NotNewer) => "The answer is older than, or different from, the subscription this app already holds.",
-			Self::Subscription(Failure::Expired | Failure::Future) => "The subscription's dates are wrong. Check the date and time on this device.",
-			Self::Subscription(Failure::Pins | Failure::EndpointKind | Failure::Changed) => "The answer changes how the subscription server is checked in a way that is not allowed without a new link. If your provider has changed it, ask for a new link.",
-			Self::Subscription(Failure::HasLink) => "This subscription was imported with a link. Remove it first to replace it with a whole document.",
-			Self::Subscription(_) => "The answer could not be accepted.",
+		}
+	}
+	/// The English words, for the command line.
+	pub fn text(&self) -> &'static str {self.code().text()}
+}
+
+/// Why an import failed, as a stable code. An app translates the code into its own language, so the words of `text` are only the English, for the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Code {
+	NotALink,
+	LinkDamaged,
+	LinkTooLong,
+	NotAFile,
+	FileTooLarge,
+	Legacy,
+	Resolve,
+	Unreachable,
+	Timeout,
+	Certificate,
+	Tls,
+	Pin,
+	NoSubscription,
+	PrivateAddress,
+	Random,
+	Store,
+	Full,
+	DeviceLimit,
+	AccountDisabled,
+	AccountExpired,
+	RateLimited,
+	DeviceMismatch,
+	KeyRetired,
+	BadRequest,
+	Signature,
+	BadAnswer,
+	UpdateApp,
+	BadDocument,
+	StaleRefusal,
+	OtherSubscription,
+	Older,
+	Different,
+	Expired,
+	Clock,
+	DeviceKey,
+	HasLink,
+	EndpointChanged,
+	FileUnreadable,
+	PictureUnreadable,
+	PictureLarge,
+	NoQr,
+	NoImport,
+	KillSwitch,
+}
+
+impl Code {
+	/// The code the apps look up, in the translations of their locale files.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::NotALink => "not_a_link",
+			Self::LinkDamaged => "link_damaged",
+			Self::LinkTooLong => "link_too_long",
+			Self::NotAFile => "not_a_file",
+			Self::FileTooLarge => "file_too_large",
+			Self::Legacy => "legacy",
+			Self::Resolve => "resolve",
+			Self::Unreachable => "unreachable",
+			Self::Timeout => "timeout",
+			Self::Certificate => "certificate",
+			Self::Tls => "tls",
+			Self::Pin => "pin",
+			Self::NoSubscription => "no_subscription",
+			Self::PrivateAddress => "private_address",
+			Self::Random => "random",
+			Self::Store => "store",
+			Self::Full => "full",
+			Self::DeviceLimit => "device_limit",
+			Self::AccountDisabled => "account_disabled",
+			Self::AccountExpired => "account_expired",
+			Self::RateLimited => "rate_limited",
+			Self::DeviceMismatch => "device_mismatch",
+			Self::KeyRetired => "key_retired",
+			Self::BadRequest => "bad_request",
+			Self::Signature => "signature",
+			Self::BadAnswer => "bad_answer",
+			Self::UpdateApp => "update_app",
+			Self::BadDocument => "bad_document",
+			Self::StaleRefusal => "stale_refusal",
+			Self::OtherSubscription => "other_subscription",
+			Self::Older => "older",
+			Self::Different => "different",
+			Self::Expired => "expired",
+			Self::Clock => "clock",
+			Self::DeviceKey => "device_key",
+			Self::HasLink => "has_link",
+			Self::EndpointChanged => "endpoint_changed",
+			Self::FileUnreadable => "file_unreadable",
+			Self::PictureUnreadable => "picture_unreadable",
+			Self::PictureLarge => "picture_large",
+			Self::NoQr => "no_qr",
+			Self::NoImport => "no_import",
+			Self::KillSwitch => "kill_switch",
+		}
+	}
+	/// The English words, for the command line.
+	pub fn text(self) -> &'static str {
+		match self {
+			Self::NotALink => "This is not a Veilway subscription link. Check that you copied the link your provider sent.",
+			Self::LinkDamaged => "This link is cut off or mistyped. Copy it again, or ask the provider for a new one.",
+			Self::LinkTooLong => "This link is too long to be a subscription link. Check that nothing else was pasted with it.",
+			Self::NotAFile => "This is not a Veilway subscription file, or it is damaged. Ask the provider for the file again.",
+			Self::FileTooLarge => "This file is too large to be a subscription file. Ask the provider for the file again.",
+			Self::Legacy => "This is a link of another kind, which cannot be checked with a key, and this app cannot import it. Ask the provider for a Veilway subscription link.",
+			Self::Resolve => "The provider's server name could not be found, or it points to an address this app does not connect to. Check your internet connection, or try again later.",
+			Self::Unreachable => "Could not connect to the provider's server. Check your internet connection, or try again later.",
+			Self::Timeout => "The provider's server took too long to answer. Check your internet connection, then try again.",
+			Self::Certificate => "The provider's server certificate is not valid. If your provider uses its own certificate, part of the link may have been lost: copy the link again.",
+			Self::Tls => "A secure connection to the provider's server could not be made. Check your internet connection, then try again.",
+			Self::Pin => "The provider's server does not match this link. If your provider changed its server, ask for a new link. Otherwise, something between you and the provider may be answering.",
+			Self::NoSubscription => "The provider's address did not answer as a subscription server. The link may be cut off or out of date: ask the provider for a new one.",
+			Self::PrivateAddress => "This subscription is on a private address. Only continue if you run this server yourself, for example at home.",
+			Self::Random => "This device could not make the keys it needs. Nothing was sent. Try again.",
+			Self::Store => "The subscription could not be saved on this device. Check that the system's secure storage works, then try again.",
+			Self::Full => "This app already holds as many subscriptions as it can. Remove one first.",
+			Self::DeviceLimit => "Every device place on this account is taken. Remove a device in the provider's panel, or ask the provider to reset the link.",
+			Self::AccountDisabled => "The provider has switched this account off. Contact the provider.",
+			Self::AccountExpired => "This account has expired. Renew it with the provider.",
+			Self::RateLimited => "This device has asked too often. Wait a few minutes, then try again.",
+			Self::DeviceMismatch => "This device has to be enrolled again. Import the link again.",
+			Self::KeyRetired => "The provider has renewed its key. Ask the provider for a new link.",
+			Self::BadRequest => "The provider could not process this request. Update the app and try again. If it keeps failing, contact the provider.",
+			Self::Signature => "The provider's answer is not signed with the key in this link. The link may be old or tampered with. Ask the provider for a new link.",
+			Self::BadAnswer => "The provider's server sent an answer this app cannot read. Try again. If it keeps failing, ask the provider for a new link.",
+			Self::UpdateApp => "This subscription needs a newer version of this app. Update the app, then try again.",
+			Self::BadDocument => "The provider's subscription is not one this app can read. Ask the provider to check it.",
+			Self::StaleRefusal => "The provider's refusal is too old to use. Try again, and check the date and time on this device.",
+			Self::OtherSubscription => "The answer is for a different subscription from this link. Check that you have the link you meant.",
+			Self::Older => "The provider's answer is older than the subscription this app already holds. Try again later, or ask the provider for a new link.",
+			Self::Different => "The provider's answer conflicts with the subscription this app already holds. Ask the provider for a new link.",
+			Self::Expired => "This subscription has already expired. Check the date and time on this device. If they are right, ask the provider to renew it.",
+			Self::Clock => "The provider's answer is dated later than this device's clock. Check the date and time on this device.",
+			Self::DeviceKey => "The provider's answer does not match this device's key. Import the link again.",
+			Self::HasLink => "This subscription was imported with a link. Remove it first to replace it with a whole document.",
+			Self::EndpointChanged => "The provider's answer changes how its server is checked, which is not allowed without a new link. Ask the provider for a new link.",
+			Self::FileUnreadable => "The file could not be read.",
+			Self::PictureUnreadable => "The picture could not be read. Use a clear picture of the QR code.",
+			Self::PictureLarge => "The picture is too large. Use a smaller picture or a screenshot of the QR code.",
+			Self::NoQr => "No QR code was found in the picture. Use a sharp picture of the whole code.",
+			Self::NoImport => "There is no import waiting. Start the import again.",
+			Self::KillSwitch => "The kill switch is still on from an earlier connection, so nothing can be fetched outside the tunnel. Connect first, or disconnect to turn the kill switch off.",
 		}
 	}
 }
@@ -402,14 +565,16 @@ impl std::fmt::Debug for Reviewed {
 
 /// Step 1: reads a text as a link. Nothing is sent, generated or stored. White space around a pasted text is cut off here, since the grammar reads a text exactly as it is.
 pub fn open(text: &str) -> Result<Offer, ImportError> {
-	match Link::parse(text.trim()).map(Offer::open).map_err(ImportError::Link)? {
+	let text = text.trim();
+	if !text.starts_with("veilway://") && !text.starts_with("https://") {return Err(ImportError::NotALink)}
+	match Link::parse(text).map(Offer::open).map_err(ImportError::Link)? {
 		Offer::Legacy(_) => Err(ImportError::Legacy),
 		offer => Ok(offer),
 	}
 }
 
 /// Step 1 for the content of a file: `v1.<key>.<document>` and nothing else, bar one line end. A file is the only form that carries a document of any size, and it has no endpoint.
-pub fn open_file(content: &[u8]) -> Result<Offer, ImportError> {Carried::file(content).map(|carried| Offer::open(Link::Carried(carried))).map_err(ImportError::Link)}
+pub fn open_file(content: &[u8]) -> Result<Offer, ImportError> {Carried::file(content).map(|carried| Offer::open(Link::Carried(carried))).map_err(ImportError::File)}
 
 /// The user's yes to a native link. `device` is the stored device when the import is of a link for a subscription the app holds, so that it takes no new place. The key and the secret of a new device are drawn here and not before.
 pub fn proceed(offer: NativeOffer, device: Option<Device>) -> Result<Fetching, ImportError> {offer.proceed(device, &mut crate::random).map_err(|_| ImportError::Random)}
@@ -467,6 +632,7 @@ impl Fetcher {
 		// A subscription that could not be written is not held. Its pending device place lapses by itself, "or when the time in the table of numbers passes", since the request that frees it is not available once an import is accepted.
 		if let Err(error) = library.save() {
 			library.held = before;
+			tracing::info!(?error, "the accepted subscription could not be saved");
 			return Err(ImportError::Store(error));
 		}
 		// The pins the endpoint is held to now are the ones the accepted document names.
@@ -615,5 +781,69 @@ mod tests {
 		assert_eq!(run(b"2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"), Ok(b"abcde".to_vec()));
 		// An extension, a size that is no hexadecimal, a trailer, a missing end and a body over its limit.
 		for bytes in [&b"5;x=1\r\nhello\r\n0\r\n\r\n"[..], b"zz\r\nhello\r\n0\r\n\r\n", b"5\r\nhello\r\n0\r\nTrailer: x\r\n\r\n", b"5\r\nhello\r\n", b"5\r\nhelloXX0\r\n\r\n", b"fffffff\r\n"] {assert!(run(bytes).is_err(), "{:?}", String::from_utf8_lossy(bytes))}
+	}
+
+	#[test]
+	fn every_failure_has_a_code_and_words_of_its_own() {
+		let cases = [
+			(ImportError::NotALink, Code::NotALink),
+			(ImportError::Link(LinkError::Form), Code::LinkDamaged),
+			(ImportError::Link(LinkError::Key), Code::LinkDamaged),
+			(ImportError::Link(LinkError::Size), Code::LinkTooLong),
+			(ImportError::File(LinkError::Form), Code::NotAFile),
+			(ImportError::File(LinkError::Size), Code::FileTooLarge),
+			(ImportError::Legacy, Code::Legacy),
+			(ImportError::Fetch(FetchError::Resolve), Code::Resolve),
+			(ImportError::Fetch(FetchError::Connect), Code::Unreachable),
+			(ImportError::Fetch(FetchError::Timeout), Code::Timeout),
+			(ImportError::Fetch(FetchError::Certificate), Code::Certificate),
+			(ImportError::Fetch(FetchError::Tls), Code::Tls),
+			(ImportError::Fetch(FetchError::Pin), Code::Pin),
+			(ImportError::Fetch(FetchError::NotHttp), Code::NoSubscription),
+			(ImportError::Fetch(FetchError::Status(404)), Code::NoSubscription),
+			(ImportError::Fetch(FetchError::Body), Code::NoSubscription),
+			(ImportError::PrivateEndpoint {host: "192.168.1.20".into(), addresses: Vec::new()}, Code::PrivateAddress),
+			(ImportError::Random, Code::Random),
+			(ImportError::Store(io::Error::other("the keychain refused")), Code::Store),
+			(ImportError::Full, Code::Full),
+			(ImportError::Subscription(Failure::Refused(Reason::DeviceLimit)), Code::DeviceLimit),
+			(ImportError::Subscription(Failure::Refused(Reason::Disabled)), Code::AccountDisabled),
+			(ImportError::Subscription(Failure::Refused(Reason::Expired)), Code::AccountExpired),
+			(ImportError::Subscription(Failure::Refused(Reason::RateLimited)), Code::RateLimited),
+			(ImportError::Subscription(Failure::Refused(Reason::DeviceMismatch)), Code::DeviceMismatch),
+			(ImportError::Subscription(Failure::Refused(Reason::KeyRetired)), Code::KeyRetired),
+			(ImportError::Subscription(Failure::Refused(Reason::BadRequest)), Code::BadRequest),
+			(ImportError::Subscription(Failure::Envelope(EnvelopeError::UnknownKey)), Code::Signature),
+			(ImportError::Subscription(Failure::Envelope(EnvelopeError::Signature)), Code::Signature),
+			(ImportError::Subscription(Failure::Envelope(EnvelopeError::Encoding)), Code::BadAnswer),
+			(ImportError::Subscription(Failure::Payload(PayloadError::Version)), Code::UpdateApp),
+			(ImportError::Subscription(Failure::Payload(PayloadError::Object)), Code::BadDocument),
+			(ImportError::Subscription(Failure::StaleRefusal), Code::StaleRefusal),
+			(ImportError::Subscription(Failure::OtherSubscription), Code::OtherSubscription),
+			(ImportError::Subscription(Failure::Rollback), Code::Older),
+			(ImportError::Subscription(Failure::Backdated), Code::Older),
+			(ImportError::Subscription(Failure::NotNewer), Code::Older),
+			(ImportError::Subscription(Failure::Fork), Code::Different),
+			(ImportError::Subscription(Failure::Expired), Code::Expired),
+			(ImportError::Subscription(Failure::Future), Code::Clock),
+			(ImportError::Subscription(Failure::PrivateKey), Code::DeviceKey),
+			(ImportError::Subscription(Failure::HasLink), Code::HasLink),
+			(ImportError::Subscription(Failure::Pins), Code::EndpointChanged),
+		];
+		for (error, code) in &cases {
+			assert_eq!(error.code(), *code, "{error:?}");
+			assert!(!error.text().is_empty() && error.text() == code.text(), "{error:?}");
+		}
+		let codes: std::collections::HashSet<&str> = cases.iter().map(|(_, code)| code.as_str()).collect();
+		assert_eq!(codes.len(), 37);
+	}
+
+	#[test]
+	fn the_link_that_is_not_one_and_the_file_that_is_not_one_are_told_apart() {
+		assert_eq!(open("http://example.com/list").err().map(|error| error.code()), Some(Code::NotALink));
+		assert_eq!(open("  ftp://example.com/list").err().map(|error| error.code()), Some(Code::NotALink));
+		assert_eq!(open("veilway://sub/sub.example.com/s#short").err().map(|error| error.code()), Some(Code::LinkDamaged));
+		assert_eq!(open_file(b"hello").err().map(|error| error.code()), Some(Code::NotAFile));
+		assert_eq!(open_file(&vec![b'a'; BODY_MAX + 100]).err().map(|error| error.code()), Some(Code::FileTooLarge));
 	}
 }

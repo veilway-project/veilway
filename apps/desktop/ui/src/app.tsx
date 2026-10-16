@@ -2,7 +2,7 @@ import {Backdrop, Banner, Button, ConfirmDialog, DEFAULT_SETTINGS, Dialog, Nav, 
 import {useEffect, useMemo, useRef, useState} from "react";
 import {Home} from "./home.tsx";
 import {Importer} from "./importer.tsx";
-import {loadPrefs, savePrefs, useD, type Prefs} from "./kit.tsx";
+import {failureText, loadPrefs, savePrefs, useD, type Prefs} from "./kit.tsx";
 import {Library} from "./library.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {fa} from "./locales/fa.ts";
@@ -87,7 +87,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		setBusy(true);
 		call("disconnect").then(() => { setRunning(IDLE); setEnded(null); setPoints([]); }, error => toast({tone: "danger", title: t("home.ended"), body: error})).finally(() => setBusy(false));
 	};
-	const refresh = (id: string, agreed?: string[]) => call("refresh", agreed ? {id, private: agreed} : {id}).then(found => { if (asksPrivate(found)) return setPrivateAsk({id, addresses: found.ask_private.addresses}); setLibrary(found); toast({tone: "success", title: t("library.refreshed")}); }, error => toast({tone: "danger", title: t("library.refreshFailed"), body: error}));
+	const refresh = (id: string, agreed?: string[]) => call("refresh", agreed ? {id, private: agreed} : {id}).then(found => { if (asksPrivate(found)) return setPrivateAsk({id, addresses: found.ask_private.addresses}); setLibrary(found); toast({tone: "success", title: t("library.refreshed")}); }, error => toast({tone: "danger", title: t("library.refreshFailed"), body: failureText(error, t)}));
 	const answer = (yes: boolean) => {
 		setQuestion(null);
 		call("answer", {yes}).catch(error => toast({tone: "danger", title: t("question.failed"), body: error}));
