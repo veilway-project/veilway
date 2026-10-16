@@ -90,8 +90,8 @@ async fn import_open(source: Source) -> Result<Value, String> {host::call(Call::
 
 #[tauri::command]
 async fn import_qr(data: String) -> Result<Value, String> {
-	let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| "The picture could not be read.".to_string())?;
-	let text = tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|error| error.to_string())??;
+	let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| veilway_engine::import::Code::PictureUnreadable.as_str().to_string())?;
+	let text = tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|error| error.to_string())?.map_err(|code| code.as_str().to_string())?;
 	host::call(Call::ImportOpen {source: Source::Link {text}}).await
 }
 
