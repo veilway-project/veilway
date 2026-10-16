@@ -33,6 +33,13 @@ const LINK_SECRET: &[u8] = b"veilway v1 link secret\0";
 // The two values of a pairing's fingerprint: the one the listener's panel shows and the dialler's accepts, and the other way round.
 const LINK_LISTENER: &[u8] = b"veilway v1 link listener\0";
 const LINK_DIALLER: &[u8] = b"veilway v1 link dialler\0";
+// A static mirror (subscription format page, "Keys of a static mirror"): the salt of `prk_m`, the four info labels and the label of the file's associated data. Used nowhere else.
+const MIRROR: &[u8] = b"veilway v1 sub mirror\0";
+const MIRROR_NAME: &[u8] = b"veilway v1 sub mirror name\0";
+const MIRROR_KEY: &[u8] = b"veilway v1 sub mirror key\0";
+const MIRROR_ID: &[u8] = b"veilway v1 sub mirror id\0";
+const MIRROR_SEAL: &[u8] = b"veilway v1 sub mirror seal\0";
+pub(crate) const MIRROR_FILE: &[u8] = b"veilway v1 sub mirror file\0";
 
 // `prk` = HKDF-Extract(salt `"veilway v1 device secret"`, ikm `S`): "Deriving the four keys below, nothing else".
 fn prk(secret: &[u8; 32]) -> hkdf::Prk {hkdf::Salt::new(hkdf::HKDF_SHA256, DEVICE_SECRET).extract(secret)}
@@ -245,6 +252,44 @@ impl<V> fmt::Debug for Table<V> {
 impl<T, V: Borrow<Device<T>>> Tags<T> for Table<V> {
 	fn find_device(&self, tag: &[u8; 16]) -> Option<&Device<T>> {self.devices.get(tag).map(Borrow::borrow)}
 	fn find_epoch(&self, tag: &[u8; 16]) -> Option<&Device<T>> {self.epochs.get(tag).map(Borrow::borrow)}
+}
+
+// An HKDF-Expand output of `N` bytes, for the one derivation that is not 32 long.
+struct Output<const N: usize>;
+
+impl<const N: usize> hkdf::KeyType for Output<N> {
+	fn len(&self) -> usize {N}
+}
+
+fn expand<const N: usize>(prk: &hkdf::Prk, info: &[&[u8]]) -> [u8; N] {
+	let mut out = [0; N];
+	prk.expand(info, Output::<N>).and_then(|okm| okm.fill(&mut out)).expect("up to 32 bytes are within the output limit of HKDF-SHA-256");
+	out
+}
+
+/// `k_name` and `k_mirror` of one device on a static mirror (subscription format page, "Keys of a static mirror"). The panel keeps both, sealed, after a request that carried the token and the device secret, and a client derives them from its own link, key and secret. Neither gives a way back to the token or the secret. `prk_m` is not kept.
+/// The bytes can be read for the one place that stores them sealed (`expose`) and for nothing else: the type prints nothing.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MirrorKeys {name: [u8; 32], key: [u8; 32]}
+
+impl MirrorKeys {
+	/// `prk_m` = HKDF-Extract(salt `"veilway v1 sub mirror"`, ikm `token_bytes || secret_bytes`), then `k_name` and `k_mirror` = HKDF-Expand(`prk_m`, label `|| device_pub`, 32). `device_pub` is the `device_public_key` of the device's requests.
+	pub fn derive(token: &[u8; 16], secret: &[u8; 16], device_pub: &[u8; 32]) -> Self {
+		let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, MIRROR).extract(&[&token[..], &secret[..]].concat());
+		Self {name: expand(&prk, &[MIRROR_NAME, device_pub]), key: expand(&prk, &[MIRROR_KEY, device_pub])}
+	}
+	/// The two keys out of the panel's sealed storage.
+	pub fn restore(name: [u8; 32], key: [u8; 32]) -> Self {Self {name, key}}
+	/// `k_name` and `k_mirror`, in that order, for the storage that seals them.
+	pub fn expose(&self) -> (&[u8; 32], &[u8; 32]) {(&self.name, &self.key)}
+	/// `mirror_id` = HKDF-Expand(`k_name`, `"veilway v1 sub mirror id" || be64(epoch) || base_url`, 16): the name of the device's file for that period on the static mirror of `base_url`, exactly as the document's string holds it.
+	pub fn id(&self, epoch: u64, base_url: &str) -> [u8; 16] {expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.name), &[MIRROR_ID, &epoch.to_be_bytes(), base_url.as_bytes()])}
+	/// `k_file` = HKDF-Expand(`k_mirror`, `"veilway v1 sub mirror seal" || salt`, 32): the key of one write of a file, used once.
+	pub(crate) fn file(&self, salt: &[u8; 32]) -> ChunkKey {ChunkKey::new(&expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.key), &[MIRROR_SEAL, salt]))}
+}
+
+impl fmt::Debug for MirrorKeys {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {f.write_str("MirrorKeys(..)")}
 }
 
 #[cfg(test)]

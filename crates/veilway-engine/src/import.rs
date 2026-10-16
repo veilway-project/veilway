@@ -14,11 +14,13 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpSocket};
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 use tokio_rustls::TlsConnector;
-use veilway_proto::subscription::client::{Accepted, CarriedOffer, Damaged, Declined, Device, Failure, Fetching, Held, NativeOffer, Offer, Refreshed, Review, Stored, CONNECT_TIMEOUT, FETCH_TIMEOUT};
+use veilway_proto::subscription::client::{Accepted, CarriedOffer, Damaged, Declined, Device, Failure, Fetching, Held, NativeOffer, Offer, Refreshed, Review, Source, Stored, CONNECT_TIMEOUT, FETCH_TIMEOUT};
+use veilway_proto::subscription::mirror;
 use veilway_proto::subscription::envelope::EnvelopeError;
 use veilway_proto::subscription::fetch::{DeviceName, Request};
 use veilway_proto::subscription::link::{Carried, Link, LinkError};
@@ -150,10 +152,10 @@ impl ImportError {
 				Failure::Refused(Reason::DeviceMismatch) => Code::DeviceMismatch,
 				Failure::Refused(Reason::KeyRetired) => Code::KeyRetired,
 				Failure::Refused(Reason::Released | Reason::BadRequest) => Code::BadRequest,
-				Failure::Envelope(EnvelopeError::Size | EnvelopeError::Parts | EnvelopeError::Encoding) => Code::BadAnswer,
+				Failure::Envelope(EnvelopeError::Size | EnvelopeError::Parts | EnvelopeError::Encoding) | Failure::Mirror(_) => Code::BadAnswer,
 				Failure::Envelope(EnvelopeError::UnknownKey | EnvelopeError::Signature) => Code::Signature,
 				Failure::Payload(PayloadError::Version | PayloadError::Critical) => Code::UpdateApp,
-				Failure::Payload(_) => Code::BadDocument,
+				Failure::Payload(_) | Failure::MirrorHost => Code::BadDocument,
 				Failure::StaleRefusal => Code::StaleRefusal,
 				Failure::OtherSubscription => Code::OtherSubscription,
 				Failure::Rollback | Failure::Backdated | Failure::NotNewer => Code::Older,
@@ -326,9 +328,15 @@ impl Fetcher {
 	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket}}
 	/// One `POST` of `body` to `url`, and the body of the answer. See the head of this module for what it does and refuses. `allowed` is the private addresses the user said yes to.
 	pub async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
-		timeout(FETCH_TIMEOUT, self.exchange(url, trust, body, allowed)).await.unwrap_or(Err(FetchError::Timeout))
+		timeout(FETCH_TIMEOUT, self.exchange(url, trust, Some(body), allowed)).await.unwrap_or(Err(FetchError::Timeout))
 	}
-	async fn exchange(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
+	/// One plain `GET` of the file of a static mirror ("How a client fetches a static mirror"): no body, no token, no cookie, no `Referer`, no `Accept-Language`, no conditional field and no `Range`, and no `ETag` or `Last-Modified` is read or kept. Status 200 only, no redirect, the chain validated (the handshake is the one of a subscription fetch, with `http/1.1` as its ALPN, which the page states as a leak until the browser's fingerprint is used), the name looked up once, and at most 1,089,437 bytes read in the time of the size the `Content-Length` names (`mirror::time_limit`). Whether the body is a file is for `Held::refresh_static`.
+	pub async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
+		timeout(mirror::time_limit(None), self.exchange(url, &Trust::Chain, None, allowed)).await.unwrap_or(Err(FetchError::Timeout))
+	}
+	// `body` is `Some` for the `POST` of a request and `None` for the `GET` of a static file.
+	async fn exchange(&self, url: &Url, trust: &Trust, body: Option<&[u8]>, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {
+		let started = Instant::now();
 		let (host, port, literal) = (url.host().to_owned(), url.port(), url.literal());
 		// An IP literal is dialled as it is, with no lookup, and held to the same refusals as any address the system's resolver gives.
 		let addresses = match literal {
@@ -374,15 +382,18 @@ impl Fetcher {
 		let tail = tail.strip_prefix(':').map_or(tail, |rest| &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..]);
 		let path = tail.split('#').next().filter(|path| !path.is_empty()).map(|path| if path.starts_with('/') {path.to_owned()} else {format!("/{path}")}).unwrap_or_else(|| "/".to_owned());
 		let authority = if port == 443 {host} else {format!("{host}:{port}")};
-		let request = [format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat();
+		let request = match body {
+			Some(body) => [format!("POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n", body.len()).as_bytes(), body].concat(),
+			None => format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n").into_bytes(),
+		};
 		tls.write_all(&request).await.map_err(|_| FetchError::NotHttp)?;
 		tls.flush().await.map_err(|_| FetchError::NotHttp)?;
-		read_answer(&mut tls).await
+		if body.is_some() {read_answer(&mut tls, BODY_MAX, started, |_| FETCH_TIMEOUT).await} else {read_answer(&mut tls, mirror::SIZES[4], started, mirror::time_limit).await}
 	}
 }
 
-// Reads the head of an answer and its body, inside the bounds of the page.
-async fn read_answer(io: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, FetchError> {
+// Reads the head of an answer and its body, inside the bounds of the page: at most `limit` bytes of body, in the time `time` gives for the length the head names, counted from `started`.
+async fn read_answer(io: &mut (impl AsyncRead + Unpin), limit: usize, started: Instant, time: fn(Option<usize>) -> Duration) -> Result<Vec<u8>, FetchError> {
 	let mut buffer = Vec::new();
 	let end = loop {
 		if let Some(end) = http::end(&buffer) {break end}
@@ -401,31 +412,35 @@ async fn read_answer(io: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, Fetch
 	let mut rest = buffer.split_off(end);
 	if !chunked.is_empty() {
 		if !length.is_empty() || chunked.len() != 1 || !chunked[0].eq_ignore_ascii_case(b"chunked") {return Err(FetchError::Body)}
-		return unchunk(io, rest).await;
+		return timeout_at(started + time(None), unchunk(io, rest, limit)).await.unwrap_or(Err(FetchError::Timeout));
 	}
 	let wanted = match length.as_slice() {
 		[] => None,
 		[digits] if (1..=7).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) => Some(digits.iter().fold(0usize, |number, digit| number * 10 + usize::from(digit - b'0'))),
 		_ => return Err(FetchError::Body),
 	};
-	if wanted.is_some_and(|wanted| wanted > BODY_MAX) {return Err(FetchError::Body)}
-	loop {
-		if wanted.is_some_and(|wanted| rest.len() >= wanted) {break}
-		if rest.len() > BODY_MAX {return Err(FetchError::Body)}
-		let mut chunk = [0u8; 8192];
-		match io.read(&mut chunk).await {
-			Ok(0) => break,
-			Ok(count) => rest.extend_from_slice(&chunk[..count]),
-			Err(_) => return Err(FetchError::NotHttp),
+	if wanted.is_some_and(|wanted| wanted > limit) {return Err(FetchError::Body)}
+	let read = async {
+		loop {
+			if wanted.is_some_and(|wanted| rest.len() >= wanted) {break}
+			if rest.len() > limit {return Err(FetchError::Body)}
+			let mut chunk = [0u8; 8192];
+			match io.read(&mut chunk).await {
+				Ok(0) => break,
+				Ok(count) => rest.extend_from_slice(&chunk[..count]),
+				Err(_) => return Err(FetchError::NotHttp),
+			}
 		}
-	}
+		Ok(())
+	};
+	timeout_at(started + time(wanted), read).await.unwrap_or(Err(FetchError::Timeout))?;
 	// A length that was promised is the length that came, and a body with no length ends where the connection does.
 	if wanted.is_some_and(|wanted| rest.len() != wanted) {return Err(FetchError::Body)}
 	Ok(rest)
 }
 
 // The body of a chunked answer, as strictly as the page's reader of a head is: a size of plain hexadecimal digits, no extension, no trailer.
-async fn unchunk(io: &mut (impl AsyncRead + Unpin), mut buffer: Vec<u8>) -> Result<Vec<u8>, FetchError> {
+async fn unchunk(io: &mut (impl AsyncRead + Unpin), mut buffer: Vec<u8>, limit: usize) -> Result<Vec<u8>, FetchError> {
 	let mut body = Vec::new();
 	loop {
 		let line = loop {
@@ -452,7 +467,7 @@ async fn unchunk(io: &mut (impl AsyncRead + Unpin), mut buffer: Vec<u8>) -> Resu
 			}
 			return if buffer == b"\r\n" {Ok(body)} else {Err(FetchError::Body)};
 		}
-		if body.len() + size > BODY_MAX {return Err(FetchError::Body)}
+		if body.len() + size > limit {return Err(FetchError::Body)}
 		while buffer.len() < size + 2 {
 			let mut chunk = [0u8; 8192];
 			match io.read(&mut chunk).await {
@@ -650,25 +665,70 @@ impl Fetcher {
 		let (Some(endpoint), Some(request)) = (endpoint, request) else {return};
 		if let Err(error) = self.post(endpoint, &Trust::of(pins), &request.body(), allowed).await {tracing::info!(?error, "a request of the import could not be sent");}
 	}
-	/// Refreshes the subscription at `at`: the endpoint of its link and then the confirmed `refresh_urls`, in order, until an answer passes every check ("goes on to the next entry of the list of endpoints"). A subscription that came as a whole document cannot refresh. The caller decides when ("When a fetch happens").
-	pub async fn refresh(&self, library: &mut Library, at: usize, now: u64) -> Result<Refreshed, ImportError> {
-		let Some(held) = library.held.get(at) else {return Err(ImportError::Subscription(Failure::HasLink))};
-		let (Some(request), targets) = (held.fetch(), held.targets().into_iter().map(|(url, pins)| (url.clone(), pins.to_vec())).collect::<Vec<_>>()) else {return Err(ImportError::Legacy)};
-		let (mut last, allowed) = (ImportError::Fetch(FetchError::Connect), library.held[at].private_addresses().to_vec());
-		for (endpoint, pins) in targets {
-			match self.post(&endpoint, &Trust::of(&pins), &request.body(), &allowed).await {
-				Ok(body) => match library.held[at].refresh(&body, now) {
+	/// Refreshes the subscription at `at` and says where the answer came from. The caller decides when ("When a fetch happens"). See `Library::refresh_over` for the order and what ends a refresh.
+	pub async fn refresh_from(&self, library: &mut Library, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {library.refresh_over(self, at, now).await}
+	/// `refresh_from` for a caller that does not show where the answer came from.
+	pub async fn refresh(&self, library: &mut Library, at: usize, now: u64) -> Result<Refreshed, ImportError> {self.refresh_from(library, at, now).await.map(|(refreshed, _)| refreshed).map_err(|failed| failed.error)}
+}
+
+/// What a refresh needs of the network: one `POST` to an endpoint and one `GET` of a static file. `Fetcher` is the one that ships, and a test puts its own in.
+#[allow(async_fn_in_trait)]
+pub trait Wire {
+	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError>;
+	async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError>;
+}
+
+impl Wire for Fetcher {
+	async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {Fetcher::post(self, url, trust, body, allowed).await}
+	async fn get(&self, url: &Url, allowed: &[IpAddr]) -> Result<Vec<u8>, FetchError> {Fetcher::get(self, url, allowed).await}
+}
+
+/// Why a refresh failed, for the app to show: the reason the places before the static mirrors failed, which is the one a static mirror never replaces, and how many static mirrors were asked. When that is more than none, "no mirror had a newer document" is shown beside the reason.
+#[derive(Debug)]
+pub struct RefreshFailed {pub error: ImportError, pub static_asked: usize}
+
+impl From<ImportError> for RefreshFailed {
+	fn from(error: ImportError) -> Self {Self {error, static_asked: 0}}
+}
+
+impl Library {
+	/// Refreshes the subscription at `at` through `wire`, trying the places in the order of "Order and rate": the endpoint of its link, then the confirmed `refresh_urls` in the document's order, then the confirmed static mirrors. A subscription that came as a whole document cannot refresh.
+	/// The refresh ends at the first accepted answer from the endpoint or a relay mirror (a newer document or the same bytes again), at a newer document from a static mirror, or at a signed refusal that verifies, wherever it came from. Everything else is a failure of that place and the next is tried: from a static mirror that includes the held document again ("this mirror has nothing newer", no successful refresh), an older one, a 404 and a file that does not open, none of which is a revocation. The reason of a failed refresh is the endpoint's (the last place before the static mirrors), and a static mirror changes it only to ask about a private address.
+	pub async fn refresh_over(&mut self, wire: &impl Wire, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {
+		let Some(held) = self.held.get(at) else {return Err(ImportError::Subscription(Failure::HasLink).into())};
+		let (Some(request), targets) = (held.fetch(), held.targets().into_iter().map(|(url, pins)| (url.clone(), pins.to_vec())).collect::<Vec<_>>()) else {return Err(ImportError::Legacy.into())};
+		let (mut last, allowed) = (ImportError::Fetch(FetchError::Connect), self.held[at].private_addresses().to_vec());
+		for (place, (endpoint, pins)) in targets.into_iter().enumerate() {
+			match wire.post(&endpoint, &Trust::of(&pins), &request.body(), &allowed).await {
+				Ok(body) => match self.held[at].refresh(&body, now) {
 					Ok(refreshed) => {
-						library.save().map_err(ImportError::Store)?;
-						return Ok(refreshed);
+						self.save().map_err(ImportError::Store)?;
+						return Ok((refreshed, if place == 0 {Source::Endpoint} else {Source::Relay}));
 					}
+					Err(Failure::Refused(reason)) => return Err(ImportError::Subscription(Failure::Refused(reason)).into()),
 					Err(failure) => last = ImportError::Subscription(failure),
 				},
 				// A question that waits for the user is not hidden by a later endpoint that only failed.
 				Err(error) => if !matches!(last, ImportError::PrivateEndpoint {..}) {last = error.into()},
 			}
 		}
-		Err(last)
+		let mut asked = 0;
+		for target in self.held[at].static_targets(now) {
+			asked += 1;
+			match wire.get(target.url(), &allowed).await {
+				Ok(body) => match self.held[at].refresh_static(&target, &body, now) {
+					Ok(Refreshed::Updated(changes)) => {
+						self.save().map_err(ImportError::Store)?;
+						return Ok((Refreshed::Updated(changes), Source::Static));
+					}
+					Err(Failure::Refused(reason)) => return Err(RefreshFailed {error: ImportError::Subscription(Failure::Refused(reason)), static_asked: asked}),
+					Ok(Refreshed::Unchanged) | Err(_) => {}
+				},
+				Err(error @ FetchError::Private {..}) => if !matches!(last, ImportError::PrivateEndpoint {..}) {last = error.into()},
+				Err(_) => {}
+			}
+		}
+		Err(RefreshFailed {error: last, static_asked: asked})
 	}
 }
 
@@ -775,7 +835,7 @@ mod tests {
 			let (mut near, mut far) = tokio::io::duplex(1 << 16);
 			far.write_all(bytes).await.unwrap();
 			drop(far);
-			unchunk(&mut near, Vec::new()).await
+			unchunk(&mut near, Vec::new(), BODY_MAX).await
 		});
 		assert_eq!(run(b"5\r\nhello\r\n0\r\n\r\n"), Ok(b"hello".to_vec()));
 		assert_eq!(run(b"2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n"), Ok(b"abcde".to_vec()));
@@ -845,5 +905,205 @@ mod tests {
 		assert_eq!(open("veilway://sub/sub.example.com/s#short").err().map(|error| error.code()), Some(Code::LinkDamaged));
 		assert_eq!(open_file(b"hello").err().map(|error| error.code()), Some(Code::NotAFile));
 		assert_eq!(open_file(&vec![b'a'; BODY_MAX + 100]).err().map(|error| error.code()), Some(Code::FileTooLarge));
+	}
+
+	const BASE: &str = "https://files.example.net/vw/";
+	const OTHER: &str = "https://cdn.example.org/a/";
+	// 100 s after the documents of vectors.py were issued.
+	const NOW: u64 = 1_700_000_100;
+
+	fn corpus(name: &str) -> Vec<u8> {std::fs::read(format!("{}/../../fuzz/corpus/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()}
+
+	fn pair() -> ring::signature::Ed25519KeyPair {ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x11; 32]).unwrap()}
+
+	fn sign(payload: &serde_json::Value) -> String {
+		let key = veilway_proto::subscription::envelope::SigningKey::new(ring::signature::KeyPair::public_key(&pair()).as_ref().try_into().unwrap()).unwrap();
+		veilway_proto::subscription::envelope::seal(&key, &serde_json::to_vec(payload).unwrap(), |signed| pair().sign(signed).as_ref().try_into().unwrap())
+	}
+
+	// The document of vectors.py at `serial`, listing a relay mirror and two static mirrors.
+	fn listed(serial: u64) -> String {
+		let key = veilway_proto::subscription::envelope::SigningKey::new(ring::signature::KeyPair::public_key(&pair()).as_ref().try_into().unwrap()).unwrap();
+		let mut payload: serde_json::Value = serde_json::from_slice(veilway_proto::subscription::envelope::verify(&corpus("fuzz_sub_envelope/document")[1..], &[key], BODY_MAX).unwrap().payload()).unwrap();
+		payload["serial"] = serial.into();
+		payload["refresh_urls"] = serde_json::json!(["https://relay.example.net/s"]);
+		payload["static_mirrors"] = serde_json::json!([BASE, OTHER]);
+		sign(&payload)
+	}
+
+	fn disabled() -> String {sign(&serde_json::json!({"v": 1, "subscription_id": "example-account-0001", "issued_at": NOW - 10, "refusal": "disabled"}))}
+
+	fn native() -> Link {Link::parse(&String::from_utf8(corpus("fuzz_deeplink/native-veilway")).unwrap()).unwrap()}
+
+	// The client of vectors.py: device key 33..33 and device secret 44..44.
+	fn fixed(bytes: &mut [u8]) -> Result<(), veilway_proto::NoRandom> {
+		bytes.fill(if bytes.len() == 32 {0x33} else {0x44});
+		Ok(())
+	}
+
+	fn imported() -> Held {
+		let Offer::Native(offer) = Offer::open(native()) else {panic!("a native link")};
+		offer.proceed(None, &mut fixed).unwrap().answer(listed(1).as_bytes(), NOW, &[]).unwrap().accept(None, &[]).unwrap().held
+	}
+
+	fn library(name: &str, held: Held) -> Library {
+		let path = std::env::temp_dir().join(format!("veilway-static-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_file(&path);
+		let (mut library, _) = Library::open(Box::new(FileVault(path))).unwrap();
+		library.held.push(held);
+		library
+	}
+
+	// The file a panel writes for `document` on the static mirror of `base`, in the period of `NOW`.
+	fn file(base: &str, document: &str) -> Vec<u8> {
+		let Link::Native(link) = native() else {panic!("a native link")};
+		let keys = veilway_proto::keys::MirrorKeys::derive(link.token().expose(), &[0x44; 16], &veilway_proto::proof::public_key(&[0x33; 32]));
+		mirror::seal(&keys, base, mirror::epoch(NOW), mirror::size_for(document.len()).unwrap(), document.as_bytes(), &mut |bytes: &mut [u8]| {bytes.fill(7); Ok(())}).unwrap()
+	}
+
+	// A network of canned answers by method and host, that remembers what it was asked and in which order.
+	struct Fake {answers: std::collections::HashMap<String, Result<Vec<u8>, FetchError>>, asked: std::sync::Mutex<Vec<String>>}
+
+	impl Fake {
+		fn new(answers: Vec<(&str, Result<Vec<u8>, FetchError>)>) -> Self {Self {answers: answers.into_iter().map(|(place, answer)| (place.to_owned(), answer)).collect(), asked: Default::default()}}
+		fn answer(&self, method: &str, url: &Url) -> Result<Vec<u8>, FetchError> {
+			let place = format!("{method} {}", url.host());
+			self.asked.lock().unwrap().push(place.clone());
+			self.answers.get(&place).cloned().unwrap_or(Err(FetchError::Connect))
+		}
+		fn asked(&self) -> Vec<String> {self.asked.lock().unwrap().clone()}
+	}
+
+	impl Wire for Fake {
+		async fn post(&self, url: &Url, _: &Trust, _: &[u8], _: &[IpAddr]) -> Result<Vec<u8>, FetchError> {self.answer("POST", url)}
+		async fn get(&self, url: &Url, _: &[IpAddr]) -> Result<Vec<u8>, FetchError> {self.answer("GET", url)}
+	}
+
+	fn run(library: &mut Library, fake: &Fake) -> Result<(Refreshed, Source), RefreshFailed> {tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(library.refresh_over(fake, 0, NOW))}
+
+	fn ok(document: String) -> Result<Vec<u8>, FetchError> {Ok(document.into_bytes())}
+
+	#[test]
+	fn the_endpoint_comes_first_then_the_relay_mirrors_and_a_static_mirror_only_after_both_failed() {
+		let mut library = library("order", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", ok(listed(2)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Endpoint))));
+		assert_eq!(fake.asked(), ["POST sub.example.com"]);
+		let mut library = self::library("order", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("POST relay.example.net", ok(listed(2)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Relay))));
+		assert_eq!(fake.asked(), ["POST sub.example.com", "POST relay.example.net"]);
+		let mut library = self::library("order", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Timeout)), ("POST relay.example.net", Err(FetchError::Status(500))), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Static))));
+		assert_eq!(fake.asked(), ["POST sub.example.com", "POST relay.example.net", "GET files.example.net"]);
+		assert_eq!(library.held[0].document(), listed(2));
+		assert_eq!(read_vault(&write_vault(&library.held.iter().map(Held::stored).collect::<Vec<_>>())).unwrap()[0].document, listed(2));
+		// The same bytes from the relay again are a successful refresh, and no static mirror is asked.
+		let mut library = self::library("order", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("POST relay.example.net", ok(listed(1)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Unchanged, Source::Relay))));
+		assert_eq!(fake.asked().len(), 2);
+	}
+
+	#[test]
+	fn a_static_answer_that_is_not_a_newer_document_is_no_refresh_and_keeps_the_reason_of_the_endpoint() {
+		let down = || vec![("POST sub.example.com", Err(FetchError::Timeout)), ("POST relay.example.net", Err(FetchError::Timeout))];
+		// The held document again, from both mirrors: nothing newer, the endpoint's reason, and nothing changed.
+		let mut library = library("nothing-newer", imported());
+		let fake = Fake::new([down(), vec![("GET files.example.net", Ok(file(BASE, &listed(1)))), ("GET cdn.example.org", Ok(file(OTHER, &listed(1))))]].concat());
+		let Err(failed) = run(&mut library, &fake) else {panic!("a refresh that failed")};
+		assert_eq!((failed.error.code(), failed.static_asked, fake.asked().len()), (Code::Timeout, 2, 4));
+		assert_eq!(library.held[0].document(), listed(1));
+		// A missing file, a stale cache, a file of the wrong size, one that does not open and one with a bad signature are each a failure of that mirror: nothing is removed, and the endpoint's reason stands.
+		let mut library = self::library("nothing-newer", imported());
+		let bad = Fake::new([down(), vec![("GET files.example.net", Err(FetchError::Status(404))), ("GET cdn.example.org", Ok(file(OTHER, &listed(0))))]].concat());
+		let Err(failed) = run(&mut library, &bad) else {panic!("a refresh that failed")};
+		assert_eq!((failed.error.code(), failed.static_asked, library.held.len(), library.held[0].document() == listed(1)), (Code::Timeout, 2, 1, true));
+		for body in [vec![0; 9_413], vec![0; 100], Vec::new(), file(BASE, &listed(2))[1..].to_vec(), file(OTHER, &listed(2))] {
+			let fake = Fake::new([down(), vec![("GET files.example.net", Ok(body))]].concat());
+			assert!(matches!(run(&mut library, &fake), Err(RefreshFailed {static_asked: 2, ..})));
+			assert_eq!(library.held[0].document(), listed(1));
+		}
+		// The first mirror has nothing newer and the second does: the remaining mirrors are tried.
+		let fake = Fake::new([down(), vec![("GET files.example.net", Ok(file(BASE, &listed(1)))), ("GET cdn.example.org", Ok(file(OTHER, &listed(2))))]].concat());
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Static))));
+		assert_eq!(fake.asked().len(), 4);
+		assert_eq!(library.held[0].document(), listed(2));
+	}
+
+	#[test]
+	fn a_signed_refusal_ends_the_refresh_from_wherever_it_comes_and_nothing_else_does() {
+		let mut library = library("refusal", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", ok(disabled())), ("POST relay.example.net", ok(listed(2))), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
+		let Err(failed) = run(&mut library, &fake) else {panic!("a refusal")};
+		assert_eq!((failed.error.code(), failed.static_asked, fake.asked()), (Code::AccountDisabled, 0, vec!["POST sub.example.com".to_owned()]));
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("POST relay.example.net", Err(FetchError::Connect)), ("GET files.example.net", Ok(file(BASE, &disabled()))), ("GET cdn.example.org", Ok(file(OTHER, &listed(2))))]);
+		let Err(failed) = run(&mut library, &fake) else {panic!("a refusal")};
+		assert_eq!((failed.error.code(), failed.static_asked, fake.asked().len()), (Code::AccountDisabled, 1, 3));
+		// A refusal is not stored as a document: what was held is held.
+		assert_eq!(library.held[0].document(), listed(1));
+	}
+
+	#[test]
+	fn a_static_mirror_the_user_has_not_confirmed_is_never_asked() {
+		let mut stored = imported().stored();
+		stored.hosts.clear();
+		let mut library = library("unconfirmed", Held::restore(stored).unwrap());
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("GET files.example.net", Ok(file(BASE, &listed(2))))]);
+		let Err(failed) = run(&mut library, &fake) else {panic!("a refresh that failed")};
+		assert_eq!((failed.static_asked, fake.asked()), (0, vec!["POST sub.example.com".to_owned()]));
+	}
+
+	#[test]
+	fn a_whole_document_has_nothing_to_refresh_by() {
+		let content: serde_json::Value = serde_json::from_slice(&corpus("fuzz_subscription/content")[1..]).unwrap();
+		let Offer::Carried(offer) = Offer::open(Link::Carried(Carried::file(format!("v1.{}.{}", &String::from_utf8(corpus("fuzz_deeplink/file")).unwrap()[3..46], sign(&content)).as_bytes()).unwrap())) else {panic!("a document in a file")};
+		let mut library = library("whole", offer.proceed(NOW, &[]).unwrap().accept(None, &[]).unwrap().held);
+		let fake = Fake::new(Vec::new());
+		assert!(matches!(run(&mut library, &fake), Err(RefreshFailed {error: ImportError::Legacy, static_asked: 0})) && fake.asked().is_empty());
+	}
+
+	#[test]
+	fn the_source_of_a_refresh_has_a_code_of_its_own() {
+		assert_eq!([Source::Endpoint, Source::Relay, Source::Static].map(Source::as_str), ["endpoint", "relay", "static"]);
+	}
+
+	async fn answer(head: &str, body: &[u8], limit: usize, time: fn(Option<usize>) -> Duration) -> Result<Vec<u8>, FetchError> {
+		let (mut near, mut far) = tokio::io::duplex(1 << 21);
+		far.write_all(head.as_bytes()).await.unwrap();
+		far.write_all(body).await.unwrap();
+		let held_open = far;
+		let read = read_answer(&mut near, limit, Instant::now(), time).await;
+		drop(held_open);
+		read
+	}
+
+	#[test]
+	fn a_static_answer_is_read_to_its_own_limit_in_the_time_of_its_size() {
+		let run = |head: &str, body: &[u8]| tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap().block_on(answer(head, body, mirror::SIZES[4], mirror::time_limit));
+		let largest = vec![5; mirror::SIZES[4]];
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Length: 1089437\r\n\r\n", &largest).map(|body| body.len()), Ok(1_089_437));
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Length: 1089438\r\n\r\n", &largest), Err(FetchError::Body));
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Length: 9413\r\n\r\n", &largest[..9_413]).map(|body| body.len()), Ok(9_413));
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Length: 9413\r\n\r\n", &largest[..9_414]), Err(FetchError::Body));
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Length: 9413\r\n\r\n", &largest[..9_000]), Err(FetchError::Timeout));
+		assert_eq!(run("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", b""), Err(FetchError::Status(404)));
+		assert_eq!(run("HTTP/1.1 301 Moved\r\nLocation: https://elsewhere.example/\r\n\r\n", b""), Err(FetchError::Redirect));
+		assert_eq!(run("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 9413\r\n\r\n", &largest[..9_413]), Err(FetchError::Encoding));
+		// Without a length the body ends where the connection does, and is cut at the limit.
+		assert_eq!(run("HTTP/1.1 200 OK\r\n\r\n", &vec![1; 1_089_438]), Err(FetchError::Body));
+	}
+
+	#[test]
+	fn the_time_allowed_follows_the_size_the_length_names() {
+		for (length, seconds) in [("9413", 30), ("36979", 30), ("140867", 60), ("538201", 120), ("1089437", 240), ("1000", 240)] {
+			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+			let (read, waited) = runtime.block_on(async {
+				let started = Instant::now();
+				(answer(&format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n"), b"", mirror::SIZES[4], mirror::time_limit).await, started.elapsed().as_secs())
+			});
+			assert_eq!((read, waited), (Err(FetchError::Timeout), seconds), "{length}");
+		}
 	}
 }

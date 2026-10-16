@@ -153,6 +153,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="fuzz_sub_mirror"
+path="fuzz_targets/fuzz_sub_mirror.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="fuzz_pairing"
 path="fuzz_targets/fuzz_pairing.rs"
 test=false

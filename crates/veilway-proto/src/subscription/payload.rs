@@ -3,7 +3,7 @@
 //! `parse` takes an `envelope::Verified` and nothing else, so what it reads was signed by a key that was held. That makes the input a provider's and not a stranger's. It does not make it friendly: every count, length and range is checked, nothing is clamped, and three kinds of unknown value are never guessed at ("Unknown members").
 //!
 //! What refuses what ("Wrong type, out of range, missing"): a fault in a top-level member refuses the document, a fault inside a profile refuses that profile, and a faulty card, notice, support link, listed device, exit or logo is left out. Display text is the stated exception: it is filtered and cut, never refused, except where it must not be empty. A text may come in several languages ("Text in several languages"), and a translation that does not read is dropped by itself: only `default` can make a text wrong.
-use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, public, visible, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
+use super::{envelope::{SigningKey, Verified}, hash, is_host, json::{self, Json, Members, Named}, key, mirror, public, visible, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
 use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::{Deref, RangeInclusive}};
@@ -168,6 +168,8 @@ pub struct Subscription {
 	/// Seconds between automatic refreshes.
 	pub update_interval: u32,
 	pub refresh_urls: Vec<Refresh>,
+	/// "Base URLs of static mirrors": `https`, a host name, no pins, ending in `/`, none twice, none with the host and port of an entry of `refresh_urls`. That none has the link's endpoint's is for `client`. A static mirror receives no secret, and the user confirms it as a kind of its own (`Subscription::host_keys`).
+	pub static_mirrors: Vec<Url>,
 	/// "The pins of the link's endpoint", 1 or 2, none twice, or empty when the document has none. Whether it is allowed, and whether it holds a pin the client has, is for `client`: this document alone cannot say.
 	pub endpoint_pins: Vec<[u8; 32]>,
 	/// The profiles that read, in the provider's order.
@@ -191,6 +193,8 @@ impl Subscription {
 	/// The text of this subscription for a notice the node of `profile` sent ("Languages" on the control channel page): the notice whose `default` is byte for byte the text the node sent, looked for "first in the `notices` of the profile it is connected through and then in the subscription's own `notices`". The app then shows `Text::pick` of it, and `None` means it shows `sent.shown_text()`.
 	/// The severity is not given: it "is always the one the node sent". The number is the place in `notices` of this subscription when the match is one of its own, which is then the same notice on the screen, "not two".
 	pub fn notice_text<'a>(&'a self, profile: &'a Profile, sent: &control::Notice) -> Option<(&'a Text, Option<usize>)> {profile.notices.iter().find(|notice| notice.text.is(&sent.text)).map(|notice| (&notice.text, None)).or_else(|| self.notices.iter().position(|notice| notice.text.is(&sent.text)).map(|place| (&self.notices[place].text, Some(place))))}
+	/// What a user confirms for this document, as `Held` keeps it: every `Refresh::key`, then every static mirror as `mirror::host_key`.
+	pub fn host_keys(&self) -> impl Iterator<Item = String> + '_ {self.refresh_urls.iter().map(Refresh::key).chain(self.static_mirrors.iter().map(mirror::host_key))}
 	/// `Provider` when any profile carries a private key.
 	pub fn origin(&self) -> KeyOrigin {if self.profiles.iter().any(|profile| profile.device.private_key.is_some()) {KeyOrigin::Provider} else {KeyOrigin::Device}}
 	/// The addresses of every `udp` and `udp-obfs` endpoint of every profile. "A cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable": the core, which computes ratings, compares each candidate's address with this set.
@@ -666,6 +670,9 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let refresh_urls = members.list("refresh_urls", 0..=REFRESH_URLS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, LINK_URL_MAX, true, false).map(|url| Refresh {url, pins: Vec::new()})} else {Members::of(item).filter(|entry| entry.0.len() == 2).and_then(|entry| Some(Refresh {url: Url::pinned(entry.string("url", LINK_URL_MAX).ok()??, LINK_URL_MAX, true, false)?, pins: pin_list(entry.list("pins", 1..=2).ok()??)?}))}.ok_or("refresh_urls")).collect::<Named<Vec<_>>>()?;
 	// "A document cannot move an entry from one kind to the other": entries with one host and port are of one kind. The link's endpoint is held to the same rule by `client`.
 	if refresh_urls.iter().enumerate().any(|(place, entry)| refresh_urls[..place].iter().any(|earlier| earlier.url.authority() == entry.url.authority() && earlier.pinned() != entry.pinned())) {return Err(PayloadError::Member("refresh_urls"))}
+	// A base URL is held to the rules of a URL the token is sent to, although the token never goes there: no query, no fragment, no IP literal and no pins. One host has one role, so it is not an entry of `refresh_urls` too.
+	let static_mirrors = members.list("static_mirrors", 0..=mirror::MIRRORS_MAX)?.unwrap_or_default().iter().map(|item| if let Json::Str(text) = item {Url::parse(text, mirror::BASE_MAX, false, false).filter(|_| text.ends_with('/'))} else {None}.ok_or("static_mirrors")).collect::<Named<Vec<_>>>()?;
+	if static_mirrors.iter().enumerate().any(|(place, base)| static_mirrors[..place].contains(base) || refresh_urls.iter().any(|entry| entry.authority() == base.authority())) {return Err(PayloadError::Member("static_mirrors"))}
 	let endpoint_pins = members.list("endpoint_pins", 1..=2)?.map(|pins| pin_list(pins).ok_or("endpoint_pins")).transpose()?.unwrap_or_default();
 	let (mut profiles, mut refused) = (Vec::new(), Vec::new());
 	for (position, item) in need("profiles", members.list("profiles", 1..=PROFILES_MAX))?.iter().enumerate() {
@@ -693,5 +700,5 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	left_out += usize::from(usage == Some(None)) + usize::from(logo == Some(None));
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;
-	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
+	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, cards, logo, accent, notices, left_out})))
 }

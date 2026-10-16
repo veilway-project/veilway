@@ -11,8 +11,8 @@
 //! What stays the caller's: asking the user, choosing how a request travels ("When a fetch happens"), sending a request to nothing but `Held::endpoints`, never following a redirect, and keeping a `Stored` where the platform keeps secrets.
 //!
 //! **What is stored is trusted as the link is.** A `Stored` holds the keys a subscription is verified under, so whoever can write the client's storage chooses the keys, the document and where the token goes. `Held::restore` checks that a stored value holds together. It cannot check that it is the one that was stored.
-use super::{envelope::{self, EnvelopeError, Fingerprint, SigningKey}, fetch::{DeviceName, Op, Request}, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, payload::{self, Fault, Id, KeyOrigin, Payload, PayloadError, Reason, Refresh, Refusal, Subscription}, DeviceSecret, Secret, Url, BODY_MAX, CARRIED_MAX};
-use crate::{proof, uniform, NoRandom, Random};
+use super::{envelope::{self, EnvelopeError, Fingerprint, SigningKey}, fetch::{DeviceName, Op, Request}, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, mirror::{self, OpenError}, payload::{self, Fault, Id, KeyOrigin, Payload, PayloadError, Reason, Refresh, Refusal, Subscription}, DeviceSecret, Secret, Url, BODY_MAX, CARRIED_MAX, LINK_URL_MAX};
+use crate::{keys::MirrorKeys, proof, uniform, NoRandom, Random};
 use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 
 /// "Clock tolerance for `issued_at`: 300 s into the future."
@@ -66,6 +66,10 @@ pub enum Failure {
 	EndpointKind,
 	/// An import accepted on a screen that said the endpoint is checked the way the stored one is (or another way), when what is stored moved while the screen was up and that is no longer true. Nothing is stored; the import is shown again.
 	Changed,
+	/// A static mirror with the host and port of the link's endpoint: "One host has one role." The rest of the rule, against `refresh_urls`, is the document's own.
+	MirrorHost,
+	/// A static mirror's file that did not open ("How the client opens a file", steps 1 to 3). A failure of that mirror and never a revocation.
+	Mirror(OpenError),
 	/// `endpoint_pins` in a document whose link's endpoint is not pinned, or a list of pins, of the endpoint or of a pinned refresh entry the user has confirmed, that holds none of the pins the client holds for it: "a pin set cannot jump to keys the client has no tie to".
 	Pins,
 }
@@ -224,6 +228,7 @@ fn endpoint_ok(subscription: &Subscription, link: &Native, held: &[[u8; 32]]) ->
 	if subscription.refresh_urls.iter().any(|entry| entry.authority() == link.endpoint().authority() && entry.pinned() != link.pin().is_some()) {return Err(Failure::EndpointKind)}
 	// A pinned entry on the link's host and port is confirmed with the link, so it is trusted by the pins held for the endpoint and by none it names itself.
 	if subscription.refresh_urls.iter().any(|entry| entry.pinned() && entry.authority() == link.endpoint().authority() && !entry.pins().iter().any(|pin| held.contains(pin))) {return Err(Failure::Pins)}
+	if subscription.static_mirrors.iter().any(|base| base.authority() == link.endpoint().authority()) {return Err(Failure::MirrorHost)}
 	if !subscription.endpoint_pins.is_empty() && (link.pin().is_none() || !subscription.endpoint_pins.iter().any(|pin| held.contains(pin))) {return Err(Failure::Pins)}
 	Ok(())
 }
@@ -303,7 +308,7 @@ impl Review {
 	/// Whether the subscription can refresh. A whole document cannot, "and the app says so".
 	pub fn refreshes(&self) -> bool {self.origin.is_some()}
 	fn release(origin: Option<(Native, Device)>, key: SigningKey) -> Option<Request> {origin.map(|(link, device)| Request::new(link.token().clone(), vec![key.kid()], device.public, device.secret, Op::Release))}
-	/// The user accepts. `stored` is every subscription the app holds now: the rule of a fresh import is asked again, because the confirmation may have been on the screen while a refresh ran. "The client stores the subscription and sends `"confirm"`, with the name if one was typed." The hosts of `refresh_urls` were on the screen, so they are confirmed with it, unless the subscription has no link to refresh by.
+	/// The user accepts. `stored` is every subscription the app holds now: the rule of a fresh import is asked again, because the confirmation may have been on the screen while a refresh ran. "The client stores the subscription and sends `"confirm"`, with the name if one was typed." The hosts of `refresh_urls` and of `static_mirrors` were on the screen, so they are confirmed with it, each as its own kind, unless the subscription has no link to refresh by.
 	pub fn accept(self, name: Option<DeviceName>, stored: &[&Held]) -> Result<Accepted, Box<Declined>> {
 		let before = match replaced(&self.subscription, &self.document, &self.key, self.origin.is_some(), stored) {
 			Ok(before) => before,
@@ -313,7 +318,7 @@ impl Review {
 		// The screen said whether the endpoint is checked another way. If what is stored moved since, the user's yes was to something else, and the import must be shown again.
 		if endpoint_changed != self.rechecked {return Err(Box::new(Declined {failure: Failure::Changed, release: Self::release(self.origin, self.key)}))}
 		let replaces = before.map(|_| Replaced {id: self.subscription.id.clone(), key: self.key});
-		let hosts = if self.origin.is_some() {self.subscription.refresh_urls.iter().map(Refresh::key).collect()} else {Vec::new()};
+		let hosts = if self.origin.is_some() {self.subscription.host_keys().collect()} else {Vec::new()};
 		let held = Held {origin: self.origin, document: self.document, subscription: self.subscription, hosts, pins: self.pins, private: Vec::new()};
 		Ok(Accepted {confirm: held.request(Op::Confirm(name)), held, replaces, endpoint_changed})
 	}
@@ -337,12 +342,42 @@ pub struct Changes {
 	pub rotated: bool,
 	/// The pins of the link's endpoint changed: "the provider renewed the certificate of its subscription server", noted with the date. The user is asked nothing.
 	pub renewed: bool,
-	/// Refresh hosts, as `host:port` and for a pinned entry `host:port#pinned`, the user has not confirmed: "the provider added a refresh host". They are not in `Held::endpoints` until `Held::confirm_hosts`.
+	/// Refresh hosts, as `host:port` and for a pinned entry `host:port#pinned`, and static mirrors as `host:port#static`, the user has not confirmed: "the provider added a refresh host". They are not in `Held::endpoints` until `Held::confirm_hosts`.
 	pub hosts: Vec<String>,
 	/// Profiles the client had that the new document leaves out, or holds in a form that was refused, by `id` and with the fault if there is one.
 	pub dropped: Vec<(String, Option<Fault>)>,
 	/// The list names a device that the list before it did not, by name and time of enrolment: "a device the user does not know is a sign that the link has leaked, and the app says so when the list grows". A list that is no longer has grown too when one device took the place of another.
 	pub devices_grew: bool,
+}
+
+/// Where a refresh that was taken came from, for the app to show and for nothing else: the link's endpoint, an entry of `refresh_urls` (a relay mirror), or a static mirror.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+	Endpoint,
+	Relay,
+	Static,
+}
+
+impl Source {
+	/// The code the apps look up, in the translations of their locale files.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Endpoint => "endpoint",
+			Self::Relay => "relay",
+			Self::Static => "static",
+		}
+	}
+}
+
+/// One file of one static mirror to ask for: what `Held::static_targets` gives and `Held::refresh_static` takes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticTarget {url: Url, base: Url, epoch: u64}
+
+impl StaticTarget {
+	/// The file URL: the base URL followed by the file name. The only thing a static fetch sends is a `GET` of it.
+	pub fn url(&self) -> &Url {&self.url}
+	/// The base URL the file's name and seal are bound to.
+	pub fn base(&self) -> &Url {&self.base}
 }
 
 /// What a refresh did.
@@ -393,7 +428,7 @@ pub struct Stored {
 	pub keys: Vec<[u8; 32]>,
 	/// The last good document.
 	pub document: String,
-	/// The confirmed refresh hosts, each as `host:port`, or `host:port#pinned`.
+	/// The confirmed hosts, each as `host:port`, `host:port#pinned` for a pinned refresh host, or `host:port#static` for a static mirror.
 	pub hosts: Vec<String>,
 	/// The pins the link's endpoint is checked by: empty for a link with no pin, otherwise 1 or 2.
 	pub pins: Vec<[u8; 32]>,
@@ -452,10 +487,11 @@ impl Held {
 	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {addresses(&self.subscription, self.origin.as_ref().map(|(link, _)| link))}
 	// Whether a link that replaces this one checks its endpoint another way: pinned or not, or by a pin this does not hold.
 	fn rechecked(&self, link: &Native) -> bool {self.origin.is_some() && link.pin().map_or(!self.pins.is_empty(), |pin| !self.pins.contains(pin))}
-	/// The refresh hosts of the last good document that wait for the user, each as `host:port`, or `host:port#pinned` for a pinned entry: the app "asks at the next refresh the user starts. Until then the client uses the hosts it already had."
+	/// The refresh hosts of the last good document that wait for the user, each as `host:port`, `host:port#pinned` for a pinned entry, or `host:port#static` for a static mirror: the app "asks at the next refresh the user starts. Until then the client uses the hosts it already had."
 	pub fn unconfirmed(&self) -> Vec<String> {
 		let mut hosts = Vec::new();
-		for host in self.listed().filter(|(_, confirmed)| !confirmed).map(|(entry, _)| entry.key()) {if !hosts.contains(&host) {hosts.push(host)}}
+		let waiting = self.listed().filter(|(_, confirmed)| !confirmed).map(|(entry, _)| entry.key()).chain(self.origin.iter().flat_map(|_| self.subscription.static_mirrors.iter().map(mirror::host_key)).filter(|host| !self.hosts.contains(host)));
+		for host in waiting {if !hosts.contains(&host) {hosts.push(host)}}
 		hosts
 	}
 	/// The user confirmed the hosts in `seen`, each as `unconfirmed` gave it: what the screen showed. Only hosts that wait are taken, so a host that a refresh added while the screen was up is not confirmed with it.
@@ -489,10 +525,24 @@ impl Held {
 		let mut changes = Changes {rotated: new.signing_keys != self.subscription.signing_keys, renewed: pins.len() != self.pins.len() || pins.iter().any(|pin| !self.pins.contains(pin)), hosts: Vec::new(), dropped: self.subscription.profiles.iter().filter(|old| !new.profiles.iter().any(|profile| profile.id == old.id)).map(|old| (old.id.clone(), new.refused.iter().find(|refused| refused.id.as_deref() == Some(&old.id)).map(|refused| refused.fault))).collect(), devices_grew: new.devices.iter().any(|device| !self.subscription.devices.iter().any(|old| old.name == device.name && old.enrolled_at == device.enrolled_at))};
 		(self.document, self.subscription, self.pins) = (String::from_utf8(body.to_vec()).map_err(|_| Failure::Envelope(EnvelopeError::Encoding))?, new, pins);
 		// A host stays confirmed only while documents list it. One that a document dropped and a later one lists again is a host "a later document adds", and is asked about again.
-		let listed = &self.subscription.refresh_urls;
-		self.hosts.retain(|host| listed.iter().any(|entry| entry.key() == *host));
+		let listed: Vec<String> = self.subscription.host_keys().collect();
+		self.hosts.retain(|host| listed.contains(host));
 		changes.hosts = self.unconfirmed();
 		Ok(Refreshed::Updated(changes))
+	}
+	// `k_name` and `k_mirror` from the link's token, the device's secret and its key: "The client holds everything it needs".
+	fn mirror_keys(&self) -> Option<MirrorKeys> {self.origin.as_ref().map(|(link, device)| MirrorKeys::derive(link.token().expose(), device.secret.expose(), &device.public))}
+	/// The static mirrors of the last good document that the user has confirmed as static mirrors, in the document's order, each with the URL of the one file to ask it for: the name for the period of `now`, and no other ("Periods and clocks"). Empty for a subscription that came as a whole document. The caller tries them only after `targets` all failed in the same refresh, never for an import, `confirm`, `release` or a name, and sends nothing but a `GET` of the URL ("How a client fetches a static mirror").
+	pub fn static_targets(&self, now: u64) -> Vec<StaticTarget> {
+		let Some(keys) = self.mirror_keys() else {return Vec::new()};
+		let epoch = mirror::epoch(now);
+		self.subscription.static_mirrors.iter().filter(|base| self.hosts.contains(&mirror::host_key(base))).filter_map(|base| Url::parse(&format!("{}{}", base.as_str(), mirror::file_name(&keys, base.as_str(), epoch)), LINK_URL_MAX, false, false).map(|url| StaticTarget {url, base: base.clone(), epoch})).collect()
+	}
+	/// The body of the answer of a static mirror for `target`: opened, and then its envelope goes through `refresh`, the one path of an answer from the endpoint. Nothing about where it came from is passed on or trusted. `Unchanged` is "this mirror has nothing newer", and the caller tries the next static mirror and does not count a refresh as made. Every `Err` is a failure of that mirror and never a revocation, except `Failure::Refused`, a signed refusal that verified.
+	pub fn refresh_static(&mut self, target: &StaticTarget, body: &[u8], now: u64) -> Result<Refreshed, Failure> {
+		let keys = self.mirror_keys().ok_or(Failure::Mirror(OpenError::Seal))?;
+		let envelope = mirror::open(&keys, target.base.as_str(), target.epoch, body).map_err(Failure::Mirror)?;
+		self.refresh(&envelope, now)
 	}
 	pub fn standing(&self, now: u64) -> Standing {if now < self.subscription.expires_at {Standing::Current} else if now - self.subscription.expires_at <= GRACE {Standing::OutOfDate} else {Standing::Stale}}
 	/// Asked at every connect with a profile of this subscription, also by "a device set to connect when it starts", which "stays disconnected until the user has confirmed".
@@ -525,7 +575,7 @@ impl Held {
 			// Every step that stores pins stores exactly the list of the document when it has one, so pins that differ from it are storage that does not hold together, and are not trusted for a recovery fetch.
 			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.is_some() && !subscription.endpoint_pins.is_empty() && stored.pins != subscription.endpoint_pins => Err(Damaged::Broken(stored.origin.map(Box::new))),
 			Ok(Payload::Subscription(subscription)) if subscription.signing_keys == keys && origin.as_ref().is_none_or(|(link, _)| endpoint_ok(&subscription, link, &stored.pins).is_ok()) => {
-				let mut held = Self {hosts: stored.hosts.into_iter().filter(|host| subscription.refresh_urls.iter().any(|entry| entry.key() == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins, private: Vec::new()};
+				let mut held = Self {hosts: stored.hosts.into_iter().filter(|host| subscription.host_keys().any(|listed| listed == *host)).collect(), origin, document: stored.document, subscription: *subscription, pins: stored.pins, private: Vec::new()};
 				held.allow_private(&stored.private);
 				Ok(held)
 			}

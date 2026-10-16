@@ -373,6 +373,31 @@ subscription_seeds.update({
     "fuzz_pairing/answer-bytes": b"\x03" + link_answer,
 })
 
+# A static mirror (subscription format page, "Static mirrors"): the keys of one device on one base URL, the name of the file for one period, and one sealed file of the smallest size. The envelope is a few plain bytes, because opening and sealing never read it.
+m_token, m_secret, m_pub = bytes(range(1, 17)), bytes(range(0x21, 0x31)), bytes(range(0x41, 0x61))
+m_base, m_epoch, m_salt = b"https://files.example.net/vw/", 2000, bytes(range(0x80, 0xa0))
+m_prk = extract(b"veilway v1 sub mirror\0", m_token + m_secret)
+k_name = expand(m_prk, b"veilway v1 sub mirror name\0" + m_pub, 32)
+k_mirror = expand(m_prk, b"veilway v1 sub mirror key\0" + m_pub, 32)
+def mirror_id(e, base): return expand(k_name, b"veilway v1 sub mirror id\0" + struct.pack(">Q", e) + base, 16)
+def mirror_file(envelope, size, e=m_epoch, base=m_base, salt=m_salt, pad=b"\x00"):
+    k_file = expand(k_mirror, b"veilway v1 sub mirror seal\0" + salt, 32)
+    plain = struct.pack(">I", len(envelope)) + envelope
+    plain += pad * (size - 48 - len(plain))
+    return salt + seal(k_file, bytes(12), b"veilway v1 sub mirror file\0" + mirror_id(e, base), plain)
+m_envelope = b"veilway static mirror test vector"
+m_file = mirror_file(m_envelope, 9413)
+assert len(m_file) == 9413
+print("mirror_k_name", k_name.hex())
+print("mirror_k_mirror", k_mirror.hex())
+print("mirror_id", mirror_id(m_epoch, m_base).hex(), mirror_id(m_epoch, m_base).hex() + ".bin")
+print("mirror_id_next_period", mirror_id(m_epoch + 1, m_base).hex())
+print("mirror_id_other_base", mirror_id(m_epoch, b"https://files.example.net/vx/").hex())
+print("mirror_k_file", expand(k_mirror, b"veilway v1 sub mirror seal\0" + m_salt, 32).hex())
+print("mirror_file_head", m_file[:48].hex())
+print("mirror_file_tag", m_file[-16:].hex())
+print("mirror_file_sha256", hashlib.sha256(m_file).hexdigest())
+
 if len(sys.argv) > 1:
     root = sys.argv[1]
     auth = h("002102") + client_mac
@@ -483,6 +508,15 @@ if len(sys.argv) > 1:
         # Never a body sealed under the target's own key: the target takes this mode as bytes no client made.
         "fronted_body/stranger": h("01 00 00 00") + sized(b"\x5a" * 21) + sized(b"\xa5" * 16),
         "fronted_body/stranger-short": h("01 01 00 00") + b"\x00\x10" + bytes(15),
+        # The whole input is the body of a static mirror's answer, opened with the keys, base URL and period of the vector above.
+        "fuzz_sub_mirror/file": m_file,
+        "fuzz_sub_mirror/file-other-period": mirror_file(m_envelope, 9413, e=m_epoch + 1),
+        "fuzz_sub_mirror/nonzero-padding": mirror_file(m_envelope, 9413, pad=b"\x01"),
+        "fuzz_sub_mirror/biggest-envelope": mirror_file(b"e" * 9361, 9413),
+        "fuzz_sub_mirror/empty-envelope": mirror_file(b"", 9413),
+        "fuzz_sub_mirror/one-byte-short": m_file[:-1],
+        "fuzz_sub_mirror/tag-changed": m_file[:-1] + bytes([m_file[-1] ^ 1]),
+        "fuzz_sub_mirror/second-size": mirror_file(m_envelope, 36979),
     })
     for name, data in {**files, **subscription_seeds}.items():
         os.makedirs(os.path.dirname(os.path.join(root, name)), exist_ok=True)
