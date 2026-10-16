@@ -3,7 +3,7 @@
 //! The choices themselves are `choice`'s, over state this task owns and writes to the store after every change of consequence. What this loop adds is the order of things around them: a race of two candidates 250 ms apart with one WireGuard datagram for both, the waits that each outcome asks for (interrupted by the user), the bye of the node that stops the loop until its reason is gone, and the account of every state change in the log.
 //! No failure is latched for ever. A candidate that is set aside comes back within the hour, a refusal is tried again after its wait, a transport that was set aside is tried again after an hour, and the loop never ends by itself while the user wants the connection. Every state change is logged at info with the places in the profile it concerns and never an address or a name.
 use crate::carry::Carrier;
-use crate::status::{Attempt, Counters, Event, Retry, Say, State, Status, Stop};
+use crate::status::{Attempt, Connection, Counters, Event, Retry, Say, State, Status, Stop};
 use crate::store::{Kept, Store};
 use crate::wire::{Shared, Wire};
 use crate::{random, Settings};
@@ -175,6 +175,11 @@ impl Core {
 	/// Moves the tunnel to a state and says so at info.
 	pub(crate) fn change(&mut self, state: State, reason: Option<Say>) {
 		if self.status.state != state || self.reason != reason {tracing::info!(?state, ?reason, "tunnel state");}
+		match &state {
+			State::Off | State::Failed | State::Stopped {..} => self.status.connection = None,
+			State::Connecting {..} | State::Reconnecting {..} => if let Some(connection) = &mut self.status.connection {connection.since = None},
+			State::Connected {..} => {}
+		}
 		self.status.state = state;
 		self.reason = reason;
 		self.publish();
@@ -460,6 +465,7 @@ impl Core {
 	// One attempt: one candidate, or two raced. A candidate that wins is carried for as long as its session lasts.
 	async fn attempt(&mut self, transport: usize, picks: Vec<usize>, added: &[usize]) -> Done {
 		let state = self.connecting(Some(Attempt {transport, candidates: picks.clone()}), None);
+		self.status.connection = Connection::of(&self.transports[transport], picks[0]);
 		self.change(state, self.reason);
 		if matches!(self.transports[transport], Transport::Udp(_)) {
 			// One socket and one session: a second pick is not tried, and takes no place of the hour's budget.

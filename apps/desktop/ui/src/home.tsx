@@ -1,5 +1,5 @@
 import {Banner, Button, ConnectSwitch, Dialog, Glass, Icon, List, ListRow, ProviderCard, SelectField, StatRow, StatTile, UsageBar, useToast, type ConnectState, type ProviderItem, type TrafficPoint} from "@veilway/ui";
-import {useState} from "react";
+import {useEffect, useState} from "react";
 import {fromUnix, useD, useLogo, type Prefs} from "./kit.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {call, type Ended, type Exit, type Profile, type Running, type Subscription} from "./tauri.ts";
@@ -7,7 +7,7 @@ import {call, type Ended, type Exit, type Profile, type Running, type Subscripti
 type Choice = {subscription: Subscription, profile: Profile};
 
 export function Home({running, busy, ended, points, choices, chosen, prefs, onPrefs, onConnect, onDisconnect, onRefresh}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void}) {
-	const {t, rate, time, date, locale} = useD(), toast = useToast(), [picking, setPicking] = useState(false);
+	const {t, rate, time, date, locale, number} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
 	const status = running.status, state = running.connected ? status?.state ?? "connecting" : "off", subscription = chosen?.subscription, logo = useLogo(subscription?.logo ?? null);
 	const link: ConnectState = state === "connected" ? "on" : state === "off" || state === "failed" ? "off" : "connecting";
 	const heading = state === "connected" ? t("state.connected") : state === "connecting" ? t("state.connecting") : state === "reconnecting" ? t("state.reconnecting") : state === "stopped" ? t("state.stopped") : state === "failed" ? t("state.failed") : t("state.disconnected");
@@ -23,6 +23,20 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		...subscription.support.map(([label, url]) => ({type: "link" as const, label, url}))
 	] : [];
 	const open = (url: string) => call("open_link", {url}).catch(error => toast({tone: "danger", title: t("home.openFailed"), body: error}));
+	const connection = status?.connection ?? null, since = connection?.since ?? null;
+	useEffect(() => {
+		if (since === null) return;
+		setTick(Date.now());
+		const timer = setInterval(() => setTick(Date.now()), 1000);
+		return () => clearInterval(timer);
+	}, [since]);
+	const up = since === null ? null : Math.max(0, Math.floor(tick / 1000) - since), clock = up === null ? null : [Math.floor(up / 3600), Math.floor(up / 60) % 60, up % 60].map((n, i) => String(n).padStart(i ? 2 : 1, "0")).join(":");
+	const check = connection?.check && ("details.check." + connection.check) in en ? ("details.check." + connection.check) as DesktopKey : null;
+	const rows = connection ? [
+		{key: "details.server", shown: connection.address, code: true}, {key: "details.host", shown: connection.host, code: true}, {key: "details.transport", shown: connection.transport, code: true}, {key: "details.front", shown: connection.front, code: true}, {key: "details.serverName", shown: connection.server_name, code: true},
+		{key: "details.check", shown: check && t(check), plain: check && en[check], code: false}, {key: "details.mtu", shown: number(status?.mtu ?? 0), plain: String(status?.mtu), code: true}, {key: "details.uptime", shown: clock && clock.split(":").map((part, i) => i ? number(Number(part), {minimumIntegerDigits: 2}) : number(Number(part))).join(":"), plain: clock, code: true}
+	].flatMap(row => row.shown ? [{...row, key: row.key as DesktopKey, plain: row.plain ?? row.shown}] : []) : [];
+	const copyDetails = () => navigator.clipboard.writeText(en["details.title"] + "\n" + rows.map(row => en[row.key] + ": " + row.plain).join("\n")).then(() => toast({tone: "success", title: t("details.copied")}), () => toast({tone: "danger", title: t("details.copyFailed")}));
 	const kept = ended?.kept || (!running.connected && running.kill_switch_kept);
 	return <div className="d-page">
 		<div className="d-hero">
@@ -36,6 +50,11 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}
 		{exits.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={exits.find(e => e.selected)?.name ?? t("home.exitAuto")} trailing={<Icon name="chevronForward"/>}/></List></Glass>}
+		{connection && <Glass className="d-details"><details>
+			<summary><span>{t("details.title")}</span><Icon name="chevronDown"/></summary>
+			<dl>{rows.map(row => <div key={row.key}><dt>{t(row.key)}</dt><dd>{row.code ? <span className="vw-code" dir="ltr">{row.shown}</span> : row.shown}</dd></div>)}</dl>
+			<div className="d-details-foot">{state !== "connected" && <p className="vw-muted vw-small">{t("details.trying")}</p>}<Button size="sm" icon="copy" onClick={copyDetails}>{t("details.copy")}</Button></div>
+		</details></Glass>}
 		{state === "connected" && <Glass className="d-panel">
 			<StatRow>
 				<StatTile label={t("chart.download")} value={rate(now?.down ?? 0).value} unit={rate(now?.down ?? 0).unit} trend={points.slice(-12).map(p => p.down)}/>

@@ -4,7 +4,7 @@
 use crate::channel::{Channel, Event as Heard, Failure};
 use crate::engine::{Core, Done, Hold, Reaction, Why};
 use crate::mtu::{self, Outcome, Walk};
-use crate::status::{Event, ExitView, NoticeView, Say, Stop, UsageView};
+use crate::status::{Connection, Event, ExitView, NoticeView, Say, Stop, UsageView};
 use crate::wire::BUFFER;
 use crate::{ip, random};
 use boringtun::noise::errors::WireGuardError;
@@ -129,6 +129,7 @@ impl Core {
 		self.connected_once = true;
 		self.wire.lock().settle();
 		c.opened = true;
+		if let Some(connection) = &mut self.status.connection {connection.since = Some(now)}
 		let exit = self.status.exits.iter().find(|exit| exit.selected).or_else(|| self.status.exits.iter().find(|exit| exit.configured)).map(|exit| exit.tag.clone());
 		self.change(crate::status::State::Connected {exit}, None);
 		let _ = self.events.send(Event::Opened);
@@ -139,6 +140,7 @@ impl Core {
 		let (now, local) = (Instant::now(), self.profile.device.addresses.first().copied().zip(self.profile.gateways.first().copied()));
 		let channel = local.map(|(local, gateway)| Channel::new(self.link.secret.clone(), self.link.inbound, self.link.device, self.profile.min_control_version, local, gateway, now));
 		let mut c = Carry {transport, candidate, datagrams: veilway_transport::udp::DONT_FRAGMENT && matches!(self.transports[transport], Transport::Udp(_) | Transport::UdpObfs(_)), channel, armed: false, control_at: None, failures: 0, dead: false, catalogue: false, walk: None, walk_at: None, confirm_at: None, tokens: f64::from(SET_EXIT_BURST), refilled: now, asked: None, bye: false, replan: false, broken: None, say: None, opened: false, began: now, shown: now, seen_dropped: 0, buffer: vec![0u8; BUFFER]};
+		self.status.connection = Connection::of(&self.transports[transport], candidate);
 		// What the node said over an earlier session's channel is not shown as this session's: the catalogue comes again with the snapshot.
 		(self.warn, self.status.out_of_date, self.status.exits) = (None, false, Vec::new());
 		// A size found or lowered by an earlier session or another transport is not this session's, unless it was found for this transport on this network not long ago: then the session starts at that size, and the walk confirms it. Otherwise it starts from the profile's.
