@@ -133,7 +133,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: apps/android/src-tauri
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
           packages: "platforms;android-35 build-tools;35.0.0 ndk;27.2.12479018"
       - run: npm install -g @tauri-apps/cli@2
