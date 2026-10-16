@@ -264,6 +264,9 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        Addons: {
+            xray: components["schemas"]["XrayAddon"];
+        };
         Applied: {
             diff: components["schemas"]["Diff"];
             /** Format: uint64 */
@@ -818,6 +821,7 @@ export interface components {
             ws_stalled: number;
         };
         Status: {
+            addons: components["schemas"]["Addons"];
             /** @description The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none. */
             certificates: components["schemas"]["SelfSigned"][];
             /** Format: uint */
@@ -1234,6 +1238,12 @@ export interface components {
         Validation: {
             report: components["schemas"]["Report"];
             valid: boolean;
+        };
+        XrayAddon: {
+            /** @description Whether the add-on's executable is in the add-on folder. */
+            installed: boolean;
+            /** @description The release of Xray-core this node runs. */
+            release: string;
         };
     };
     responses: never;

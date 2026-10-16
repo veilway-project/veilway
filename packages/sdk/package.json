@@ -1,9 +1,19 @@
 {
 	"name": "@veilway/sdk",
-	"version": "0.1.0",
-	"private": true,
+	"version": "0.1.0-alpha",
 	"description": "Typed client for the Veilway control API",
 	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/veilway-project/veilway.git",
+		"directory": "packages/sdk"
+	},
+	"homepage": "https://github.com/veilway-project/veilway/tree/main/packages/sdk",
+	"keywords": ["veilway", "vpn", "wireguard", "control-api"],
+	"publishConfig": {
+		"access": "public",
+		"provenance": true
+	},
 	"type": "module",
 	"main": "dist/src/index.js",
 	"types": "dist/src/index.d.ts",
