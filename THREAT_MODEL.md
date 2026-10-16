@@ -502,6 +502,36 @@ The add-on runs the pinned Xray-core as a child of a host process of its own. Xr
 
 **Testing:** `scripts/gate-xray.sh`, run by hand in Docker containers with the pinned Xray-core release. It is not part of CI and has not run on a real server. The gate does not cover `veilway.sh addon xray remove`, what a stranger gets on a Shadowsocks port, or the parser rows of section 6 for Xray's input. Those rows are not written yet.
 
+### 5.13 Static mirror host
+
+A provider may publish each device's signed document, sealed, on plain file hosting (subscription format page, "Static mirrors"), and the client fetches it with a plain `GET` when the endpoint and the relay mirrors have failed. The host is anyone the provider rents files from: a cloud storage service, a content delivery network, a code host, someone's web server. It runs no Veilway code and is not trusted with anything.
+
+**Assets:** AS6 (it must never see a token), the documents of the devices, and the users' addresses and the times they fetch.
+
+**Capabilities:** stores, lists and serves the files, keeps every version of every file for as long as it likes, and logs every fetch with its source address and time. It can delete files, serve old versions, serve any bytes, refuse to serve, or take the whole folder down. On a public host, everyone can list the files and read their history.
+
+| Risk | Design response | Mechanism | Status |
+|---|---|---|---|
+| The host reads documents or the token | A static fetch is a `GET` of a file name and carries no token, device secret, device key, cookie or conditional field. A file is sealed with ChaCha20-Poly1305 under a key derived from the token and the device secret, and has no magic, no version and no length in the clear. | "Keys of a static mirror", "The file" | Planned |
+| The host serves a forged, swapped or old document | The opened envelope goes through the same checks as an answer from the endpoint: signature under a key held, identity, serial, expiry. The file's name, which holds its period and base URL, is in the associated data. An old document is refused by its serial or is no newer document, and a static answer is never a successful refresh unless a newer document is accepted. | "How the client opens a file", "Order and rate" | Planned |
+| A missing file is read as a revocation | A 404 or any failure of a static mirror is a failure of that mirror, and the client tries the next place. Only a signed refusal says an account is off. | "How a client fetches a static mirror" | Planned |
+| The host follows one device over time by its file name | A file name holds for one period of 604,800 s, and every name of a folder changes in the same round. Names differ per base URL, so two hosts cannot match files by name. | "Periods and clocks" | Planned |
+| The file list counts users or marks a reset | One size per folder, every file rewritten in every round into a directory swapped in whole, and decoys per period and folder, born and dying independently within a range. | "Publishing" | Planned |
+| A later leak opens the history a host keeps | Published documents carry no `usage`. Every host is taken to keep every version. | "Which files exist", "What the host keeps" | Planned |
+| The client fetches more often or from more places | A static host is confirmed by the user before it is contacted, a refresh makes at most one `GET` per static mirror, and the rules for when a fetch happens are unchanged. | "Order and rate" | Planned |
+
+**Not defended:**
+
+- Within one period, the host's logs tie every fetch of a device to one name, with the address it came from: the device's own address outside a tunnel, the provider's exit through one. Across periods, the host can still follow a device by its address or its habits of time. Per-period names limit the record to a week and a reset of the link ends it. Fetching through a tunnel hides the device's address and shows the host the provider's exits instead.
+- The host keeps every sealed version. `k_mirror` is fixed for the life of a token, so whoever later holds the link and the device secret (a copy of the device's storage, or whoever ends TLS for the endpoint or a relay mirror) opens every version kept, with the transport secrets, profiles and device names of their time. Leaving `usage` out limits what that gives. A key that moves forward per period is an open question in the spec.
+- A burst of fetches tells the host that the provider's endpoint is failing for many users, and from where.
+- Decoys hide nothing from the host itself: its logs show that no client fetches them.
+- A host name that only the provider uses (its own domain, `name.github.io`, a bucket under its own name) is blocked at no collateral cost. Only a shared host name with the folder in the path costs the censor something. The panel warns about every base URL whose host is not on its list of shared names.
+- Until the client's TLS offers `h2` and a browser's HTTP/2 settings (G61), and while the subscription fetch has the gaps of G63, a static fetch's handshake is not a browser's, and that separates it from other traffic to a shared host.
+- A folder of random names of one size, all rewritten on a schedule, is a pattern a host can scan for and ban.
+
+**Testing (planned):** the tests of the subscription format page for static mirrors, the fuzz target `fuzz_sub_mirror` (section 6, row 57), and vectors for the derivation and one sealed file computed apart from the implementation.
+
 ## 6. Parsers of untrusted input
 
 Every row needs a `cargo-fuzz` target that lands in the same change as the parser (`PLAN.md` "Security requirements" 3). A target must show: no panic, no allocation above a stated cap, no input that takes longer than a stated bound, and for every codec a round-trip property (`decode(encode(x)) == x`, and `encode(decode(b))` accepted). Corpora are committed. Three targets exist, under shorter names than the ones first planned here: `config`, `packet` and `dns` in `fuzz/fuzz_targets`, with seed corpora in `fuzz/corpus` for `config` and `dns`. They are run by hand in Docker as `fuzz/README.md` says, not in CI, and they assert properties of the output and no allocation cap or time bound. No other target in the table exists yet.
@@ -564,6 +594,7 @@ Every row needs a `cargo-fuzz` target that lands in the same change as the parse
 | 54 | Encrypted Client Hello configuration of a candidate, at most 1,024 bytes, as it is handed to the TLS library | Provider, through a signed subscription | Client TLS library, through our entry | none named yet | Planned |
 | 55 | Pairing offer and answer codes of a node link: prefix, base64url, checksum, then the offer's strict JSON or the answer's fixed bytes, at most 2,048 characters | Pasted by an operator, copied from another operator over any channel | `veilway_proto::pairing::Offer::parse`, `Answer::parse` | `fuzz_pairing` | Built: length, shape and checksum are checked before any JSON is read, unknown members and small-order keys are refused |
 | 56 | Key and certificate files of a `tls` transport with `self_signed`, read at start, at every reload, at each renewal and by `veilway doctor` | Local files the node wrote next to the config, possibly replaced or damaged | `engine::certificate` in `veilway-core` (`rcgen` `KeyPair::from_pem`, `x509-parser`) | none yet | Built: a key file that is not a key of ECDSA on P-256 refuses the start and is never written over, and a certificate file that does not read or is not of the kept key is made anew (test `the_key_is_made_once_and_the_certificate_again_when_it_is_due`) |
+| 57 | Static mirror file: exactly one of five sizes, a 32-byte salt, the ChaCha20-Poly1305 open under a key derived from it, the 4-byte length and the zero padding after the envelope, then the envelope through row 19 | Static host, its cache or content delivery network, path | `veilway-proto` (subscription), driven by the client engine's fetch | `fuzz_sub_mirror` | Planned |
 
 Rows 2, 8, 13, 23, 36, 37, 39, 40, 49 and 54 lean on third-party parsers. The fuzz target drives them through Veilway's own entry point, so the limits Veilway sets (frame size, MTU, timeouts) are part of what is fuzzed. The PROXY protocol header (version 2) that a stream listener may send to the decoy origin is written by the node and never parsed by it, so it has no row.
 
