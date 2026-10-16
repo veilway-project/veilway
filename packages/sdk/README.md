@@ -8,7 +8,7 @@ A typed client for the control API of a Veilway node. The node serves the API on
 import {Agent, fetch as undiciFetch} from "undici";
 import {Client, VeilwayError, type Fetch} from "@veilway/sdk";
 
-const dispatcher = new Agent({connect: {socketPath: "/run/veilway/veilway.sock"}});
+const dispatcher = new Agent({connect: {socketPath: "/run/veilway/control.sock"}});
 const fetch: Fetch = (url, init) => undiciFetch(url, {...init, dispatcher}) as unknown as ReturnType<Fetch>;
 const client = new Client(fetch, "http://veilway");
 console.log(await client.status());
