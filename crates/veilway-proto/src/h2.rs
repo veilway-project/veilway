@@ -45,6 +45,8 @@ pub const FRAME_MAX: usize = 16_384;
 /// The window of RFC 9113 (section 6.9.2) before anyone has said otherwise, and the largest a window can be.
 pub const WINDOW_DEFAULT: u32 = 65_535;
 pub const WINDOW_MAX: u32 = 0x7fff_ffff;
+/// The largest header list a peer may send, as `SETTINGS_MAX_HEADER_LIST_SIZE` announces it. A request needs far less.
+pub const HEADER_LIST: usize = 16_384;
 
 /// The nine bytes in front of every frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +95,7 @@ pub fn field_size(name: &[u8], value: &[u8]) -> usize {name.len() + value.len() 
 /// The decoding half of HPACK for one connection. Its dynamic table never grows past what the owner announced.
 pub struct Decoder(Hpack<'static>);
 
-/// A header block that does not decode ends the connection, because the table is shared by every stream (RFC 9113, section 4.3).
+/// A header block that does not decode, or that is over the list's bound, ends the connection, because the table is shared by every stream (RFC 9113, section 4.3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Compression;
 
@@ -104,14 +106,16 @@ impl Decoder {
 		hpack.set_max_allowed_table_size(table);
 		Decoder(hpack)
 	}
-	/// Decodes a whole block. A list over `cap` (each field as `field_size` counts it) is decoded to its end all the same, so that the table stays in step with the peer's, and then gives `Ok(None)`: nothing of it is kept.
-	pub fn decode(&mut self, block: &[u8], cap: usize) -> Result<Option<Fields>, Compression> {
+	/// Decodes a whole block. A list over `cap` (each field as `field_size` counts it) stops the decoding at the field that passes it: the table is then out of step with the peer's, so the connection ends with it.
+	pub fn decode(&mut self, block: &[u8], cap: usize) -> Result<Fields, Compression> {
 		let (mut fields, mut size) = (Fields::new(), 0usize);
 		self.0.decode_with_cb(block, |name, value| {
 			size = size.saturating_add(field_size(&name, &value));
-			if size <= cap {fields.push((name.into_owned(), value.into_owned()))}
+			if size > cap {return false}
+			fields.push((name.into_owned(), value.into_owned()));
+			true
 		}).map_err(|_| Compression)?;
-		Ok(if size <= cap {Some(fields)} else {None})
+		Ok(fields)
 	}
 }
 
@@ -182,14 +186,14 @@ mod tests {
 	}
 
 	#[test]
-	fn hpack_round_trips_and_a_list_over_the_cap_is_decoded_and_dropped() {
+	fn hpack_round_trips_and_a_list_over_the_cap_ends_the_decoding() {
 		let (mut encoder, mut decoder) = (Encoder::new(), Decoder::new(4_096));
 		let block = encoder.encode(&[(b":method", b"GET"), (b":path", b"/a"), (b"x-long", &[b'v'; 300])]);
-		assert_eq!(decoder.decode(&block, 65_536).unwrap().unwrap().len(), 3);
+		assert_eq!(decoder.decode(&block, HEADER_LIST).unwrap().len(), 3);
 		let block = encoder.encode(&[(b":method", b"GET"), (b"x-long", &[b'v'; 300])]);
-		assert_eq!(decoder.decode(&block, 100), Ok(None));
+		assert_eq!(decoder.decode(&block, 100), Err(Compression));
 		let block = encoder.encode(&[(b":method", b"POST")]);
-		assert_eq!(decoder.decode(&block, 100).unwrap().unwrap(), vec![(b":method".to_vec(), b"POST".to_vec())]);
+		assert_eq!(decoder.decode(&block, 100).unwrap(), vec![(b":method".to_vec(), b"POST".to_vec())]);
 		assert_eq!(decoder.decode(&[0xff, 0xff, 0xff], 100), Err(Compression));
 	}
 

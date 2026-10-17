@@ -234,8 +234,8 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
 
 	/// Whether the server announced extended CONNECT. Meaningful after `settle`.
 
-	// The fields of one header block, from a HEADERS frame to its END_HEADERS. None when its decoded list passes the client's bound.
-	async fn block(&mut self, header: Header, payload: Vec<u8>) -> Result<Option<Fields>, Fail> {
+	// The fields of one header block, from a HEADERS frame to its END_HEADERS. A list over the client's bound ends the connection.
+	async fn block(&mut self, header: Header, payload: Vec<u8>) -> Result<Fields, Fail> {
 		let mut bytes = frames::unpad(header.flags, &payload, true).ok_or(Fail::Fault)?.to_vec();
 		let mut done = header.flags & frames::END_HEADERS != 0;
 		while !done {
@@ -246,6 +246,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
 			done = next.flags & frames::END_HEADERS != 0;
 		}
 		self.decoder.decode(&bytes, FIELDS_MAX).map_err(|_| Fail::Fault)
+	}
+
+	// A HEADERS frame of a stream that is not the one being read, closed or never opened: its block is decoded all the same, because the table is shared, and the stream is reset as closed.
+	async fn stray(&mut self, header: Header, payload: Vec<u8>) -> Result<(), Fail> {
+		self.block(header, payload).await?;
+		frames::rst_stream(header.stream, frames::STREAM_CLOSED, &mut self.out);
+		self.flush().await
 	}
 
 	// A stream: HEADERS with this list, and the body in DATA frames within the windows, with END_STREAM on the last when `end`.
@@ -328,12 +335,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Conn<T> {
 			};
 			if header.stream != id {
 				if header.kind == frames::DATA {self.credit(0, bytes.len()).await.map_err(stop)?}
+				if header.kind == frames::HEADERS {self.stray(header, bytes).await.map_err(stop)?}
 				continue;
 			}
 			match header.kind {
 				frames::HEADERS => {
 					let end = header.flags & frames::END_STREAM != 0;
-					let Some(list) = self.block(header, bytes).await.map_err(stop)? else {return Err(Stop::Said(Answer::NotHttp))};
+					let list = self.block(header, bytes).await.map_err(stop)?;
 					if status.is_none() {
 						let (pseudo, rest): (Vec<_>, Vec<_>) = list.into_iter().partition(|(name, _)| name.first() == Some(&b':'));
 						if pseudo.len() != 1 || pseudo[0].0 != b":status" {return Err(Stop::Said(Answer::NotHttp))}
@@ -430,10 +438,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Conn<T> {
 				self.flush().await?;
 				continue;
 			};
-			if header.stream != id {continue}
+			if header.stream != id {
+				if header.kind == frames::HEADERS {self.stray(header, payload).await?}
+				continue;
+			}
 			match header.kind {
 				frames::HEADERS => {
-					let Some(list) = self.block(header, payload).await? else {return Err(Fail::Fault)};
+					let list = self.block(header, payload).await?;
 					let pseudo: Vec<_> = list.into_iter().filter(|(name, _)| name.first() == Some(&b':')).collect();
 					if pseudo.len() != 1 || pseudo[0].0 != b":status" {return Err(Fail::Fault)}
 					let status = String::from_utf8(pseudo[0].1.clone()).ok().and_then(|text| text.parse::<u16>().ok()).ok_or(Fail::Fault)?;
@@ -490,8 +501,21 @@ async fn pump<T: AsyncRead + AsyncWrite + Unpin + Send>(mut conn: Conn<T>, id: u
 					}
 					continue;
 				};
-				if header.stream != id {continue}
+				if header.stream != id {
+					if header.kind == frames::HEADERS && conn.stray(header, payload).await.is_err() {
+						broken = true;
+						break;
+					}
+					continue;
+				}
 				match header.kind {
+					// Trailers: decoded to keep the table in step, and dropped.
+					frames::HEADERS => {
+						if conn.block(header, payload).await.is_err() {
+							broken = true;
+							break;
+						}
+					}
 					frames::DATA => {
 						let Some(data) = frames::unpad(header.flags, &payload, false) else {
 							broken = true;
@@ -624,7 +648,7 @@ mod tests {
 		assert_eq!((window.kind, window.stream, payload.as_slice()), (frames::WINDOW_UPDATE, 0, &15_663_105u32.to_be_bytes()[..]));
 		let (headers, block) = frame(io).await;
 		assert_eq!((headers.kind, headers.stream, headers.flags & frames::END_STREAM), (frames::HEADERS, 1, frames::END_STREAM));
-		(entries, Decoder::new(4_096).decode(&block, 65_536).unwrap().unwrap())
+		(entries, Decoder::new(4_096).decode(&block, 65_536).unwrap())
 	}
 
 	// The kind of every frame in `bytes`, in order.
@@ -687,7 +711,7 @@ mod tests {
 			let (_, _) = frame(&mut server).await;
 			let (headers, block) = frame(&mut server).await;
 			let (data, body) = frame(&mut server).await;
-			let list = Decoder::new(4_096).decode(&block, 65_536).unwrap().unwrap();
+			let list = Decoder::new(4_096).decode(&block, 65_536).unwrap();
 			assert_eq!((headers.kind, headers.stream, headers.flags & frames::END_STREAM), (frames::HEADERS, 1, 0));
 			assert_eq!((data.kind, data.stream, data.flags & frames::END_STREAM, body.as_slice()), (frames::DATA, 1, frames::END_STREAM, &b"abc"[..]));
 			let mut out = Vec::new();

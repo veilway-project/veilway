@@ -16,7 +16,7 @@ pub struct Request {
 	pub length: Option<u64>,
 	/// No length and a body that may follow: the body goes to the origin in chunks the node sizes itself.
 	pub chunked: bool,
-	/// An extended CONNECT for `websocket`, sent as an HTTP/1.1 upgrade with a key the node drew.
+	/// An extended CONNECT for `websocket`, sent as an HTTP/1.1 upgrade with a key the node drew. Its DATA is held until the origin answers 101.
 	pub upgrade: bool,
 	/// The method is `HEAD`, so the answer has no body whatever its head says.
 	pub bodiless: bool,
@@ -129,14 +129,17 @@ pub struct Answer {
 	pub fields: Fields,
 	/// Where the body ends. An interim answer (1xx but 101) has none and is skipped by the caller.
 	pub framing: Framing,
+	/// The origin switched protocols for the upgrade the node asked for, and the connection is the body from here.
+	pub switched: bool,
 }
 
-/// Reads the head of an answer, which ends with its empty line, as strictly as `http::Response` reads it, and turns it into the fields of a HEADERS frame. A `101` for an upgrade the node asked for becomes `200`, loses its `sec-websocket-accept` (RFC 8441, section 5) and has the connection itself as its body. `None` for a head that is not read: a bad status line, a field that is no field, two ways of saying the length, or a `101` nobody asked for.
+/// Reads the head of an answer, which ends with its empty line, as strictly as `http::Response` reads it, and turns it into the fields of a HEADERS frame. A `101` for an upgrade the node asked for becomes `200`, loses its `sec-websocket-accept` (RFC 8441, section 5) and has the connection itself as its body. `None` for a head that is not read: a bad status line or a status outside 100 to 599, a field that is no field, two ways of saying the length, or a `101` nobody asked for.
 pub fn response(head: &[u8], bodiless: bool, upgraded: bool) -> Option<Answer> {
 	let mut lines = lines(head)?;
 	let status = lines.next()?;
 	let rest = status.strip_prefix(b"HTTP/1.1 ").or_else(|| status.strip_prefix(b"HTTP/1.0 ")).filter(|rest| rest.len() >= 3 && rest[..3].iter().all(u8::is_ascii_digit) && matches!(rest.get(3), None | Some(b' ')))?;
 	let code = rest[..3].iter().fold(0u16, |code, digit| code * 10 + u16::from(digit - b'0'));
+	if !(100..=599).contains(&code) {return None}
 	let all: Vec<&[u8]> = lines.collect();
 	let said = framing(all.iter().copied())?;
 	if code == 101 && !upgraded {return None}
@@ -155,7 +158,7 @@ pub fn response(head: &[u8], bodiless: bool, upgraded: bool) -> Option<Answer> {
 		(_, (None, true)) => Framing::Chunked,
 		(_, (None, false)) => Framing::Close,
 	};
-	Some(Answer {status: if code == 101 {200} else {code}, fields, framing})
+	Some(Answer {status: if code == 101 {200} else {code}, fields, framing, switched: code == 101})
 }
 
 enum Step {Size, Extension, SizeLf, Data(u64), DataCr, DataLf, Trailer(usize), TrailerLf(bool), Done}
@@ -295,7 +298,7 @@ mod tests {
 		assert_eq!(response(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", true, false).unwrap().framing, Framing::None);
 		assert_eq!(response(b"HTTP/1.1 304 Not Modified\r\n\r\n", false, false).unwrap().framing, Framing::None);
 		assert_eq!(response(b"HTTP/1.1 100 Continue\r\n\r\n", false, false).unwrap().framing, Framing::None);
-		for bad in ["HTTP/2 200 OK\r\n\r\n", "HTTP/1.1 20 OK\r\n\r\n", "HTTP/1.1 200 OK\n\r\n", "HTTP/1.1 200 OK\r\nBad Field: 1\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 101 Switching\r\n\r\n"] {assert!(response(bad.as_bytes(), false, false).is_none(), "{bad:?}")}
+		for bad in ["HTTP/2 200 OK\r\n\r\n", "HTTP/1.1 20 OK\r\n\r\n", "HTTP/1.1 200 OK\n\r\n", "HTTP/1.1 200 OK\r\nBad Field: 1\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 101 Switching\r\n\r\n", "HTTP/1.1 600 Unknown\r\n\r\n", "HTTP/1.1 099 Early\r\n\r\n"] {assert!(response(bad.as_bytes(), false, false).is_none(), "{bad:?}")}
 		let upgraded = response(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: x\r\nServer: s\r\n\r\n", false, true).unwrap();
 		assert_eq!((upgraded.status, upgraded.framing, upgraded.fields), (200, Framing::Close, list(&[("server", "s")])));
 	}

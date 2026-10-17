@@ -77,7 +77,7 @@ impl Drop for Origin {
 	fn drop(&mut self) {self.task.abort()}
 }
 
-/// An origin that reads one request head (and the body its `Content-Length` or chunking names) on each connection, records the bytes, and answers by the path: `/chunked` with a chunked body of three chunks and a trailer, `/big/<n>` with `n` bytes and a length, `/close` with no length and a close, `/head` as a `HEAD` is answered, `/hold` with nothing at all, `/two` with a `100 Continue` first, and anything else with a short page and `Connection: close`.
+/// An origin that reads one request head (and the body its `Content-Length` or chunking names) on each connection, records the bytes, and answers by the path: `/chunked` with a chunked body of three chunks and a trailer, `/big/<n>` with `n` bytes and a length, `/close` with no length and a close, `/head` as a `HEAD` is answered, `/hold` with nothing at all, `/two` with a `100 Continue` first, `/missing` with a `404`, and anything else with a short page and `Connection: close`.
 async fn origin() -> Origin {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let (addr, heads, connections) = (listener.local_addr().unwrap(), Arc::new(std::sync::Mutex::new(Vec::new())), Arc::new(AtomicUsize::new(0)));
@@ -131,6 +131,7 @@ async fn origin() -> Origin {
 						Some("close") => drop(stream.write_all(b"HTTP/1.1 200 OK\r\nServer: raw\r\n\r\nuntil the end").await),
 						Some("head") => drop(stream.write_all(b"HTTP/1.1 200 OK\r\nServer: raw\r\nContent-Length: 12345\r\nConnection: close\r\n\r\n").await),
 						Some("hold") => tokio::time::sleep(Duration::from_secs(30)).await,
+						Some("missing") => drop(stream.write_all(b"HTTP/1.1 404 Not Found\r\nServer: raw\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await),
 						Some("two") => drop(stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nServer: raw\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await),
 						_ => drop(stream.write_all(b"HTTP/1.1 200 OK\r\nServer: raw\r\nContent-Length: 4\r\nConnection: close\r\n\r\nraw!").await),
 					}
@@ -332,11 +333,9 @@ impl Client {
 			}
 			match header.kind {
 				frames::HEADERS => {
-					if let Some(list) = self.decoder.decode(frames::unpad(header.flags, &payload, true).unwrap(), 65536).unwrap() {
-						for (name, value) in list {
-							let (name, value) = (String::from_utf8(name).unwrap(), String::from_utf8(value).unwrap());
-							if name == ":status" {status = value} else {fields.push((name, value))}
-						}
+					for (name, value) in self.decoder.decode(frames::unpad(header.flags, &payload, true).unwrap(), 65536).unwrap() {
+						let (name, value) = (String::from_utf8(name).unwrap(), String::from_utf8(value).unwrap());
+						if name == ":status" {status = value} else {fields.push((name, value))}
 					}
 					if header.flags & frames::END_STREAM != 0 {return Ok((status, fields, body))}
 				}
@@ -379,7 +378,7 @@ async fn a_stranger_gets_the_origins_answer_through_an_http_2_stream_and_the_nod
 	let node = Node::launch("stranger", Some("on"), None).await;
 	let mut client = node.client().await;
 	// The same SETTINGS for everyone: the three limits and extended CONNECT, and no window, so the defaults hold.
-	assert_eq!(client.settings, [(frames::HEADER_TABLE_SIZE, 4096), (frames::MAX_CONCURRENT_STREAMS, 100), (frames::MAX_HEADER_LIST_SIZE, 65536), (frames::ENABLE_CONNECT_PROTOCOL, 1)]);
+	assert_eq!(client.settings, [(frames::HEADER_TABLE_SIZE, 4096), (frames::MAX_CONCURRENT_STREAMS, 100), (frames::MAX_HEADER_LIST_SIZE, 16384), (frames::ENABLE_CONNECT_PROTOCOL, 1)]);
 	let id = client.get("/").await;
 	let (status, fields, body) = client.answer(id, Duration::from_secs(3), true).await.unwrap();
 	assert_eq!((status.as_str(), String::from_utf8(body).unwrap()), ("200", PAGE.to_string()));
@@ -552,6 +551,45 @@ async fn a_flood_of_frames_that_carry_nothing_trips_a_limit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_zero_length_data_flood_trips_the_limit() {
+	let node = Node::launch("empty-data", Some("on"), Some(origin().await)).await;
+	let mut client = node.client().await;
+	let id = client.open(&[(":method", "POST"), (":authority", "node.test"), (":scheme", "https"), (":path", "/hold")], false).await;
+	let mut out = Vec::new();
+	for _ in 0..1100 {frames::frame(frames::DATA, 0, id, &[], &mut out)}
+	client.send(&out).await;
+	assert_eq!(client.closed(Duration::from_secs(3)).await, Some(frames::ENHANCE_YOUR_CALM));
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_header_block_that_is_truncated_ends_the_connection_and_the_node_keeps_running() {
+	let node = Node::launch("hpack", Some("on"), Some(origin().await)).await;
+	let mut client = node.client().await;
+	let mut out = Vec::new();
+	frames::frame(frames::HEADERS, frames::END_HEADERS | frames::END_STREAM, 1, &[0x3f], &mut out);
+	client.send(&out).await;
+	assert_eq!(client.closed(Duration::from_secs(3)).await, Some(frames::COMPRESSION_ERROR));
+	let mut client = node.client().await;
+	let id = client.get("/").await;
+	assert_eq!(client.answer(id, Duration::from_secs(3), true).await.unwrap().0, "200");
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upgrade_answered_404_is_reset_and_its_held_data_never_reaches_the_origin() {
+	let node = Node::launch("upgrade", Some("on"), Some(origin().await)).await;
+	let mut client = node.client().await;
+	let id = client.open(&[(":method", "CONNECT"), (":protocol", "websocket"), (":authority", "node.test"), (":scheme", "https"), (":path", "/missing"), ("sec-websocket-version", "13"), ("origin", "https://node.test")], false).await;
+	client.data(id, b"held-by-the-node", true).await;
+	assert_eq!(client.answer(id, Duration::from_secs(3), true).await.unwrap_err(), frames::CANCEL);
+	let heads = node.origin.as_ref().unwrap().heads.lock().unwrap().clone();
+	assert_eq!(heads.len(), 1);
+	assert!(!heads[0].windows(16).any(|window| window == b"held-by-the-node"));
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_header_block_the_first_headers_and_the_preface_are_held_to_their_bounds() {
 	let node = Node::launch("bounds", Some("on"), Some(origin().await)).await;
 	// A header block over 65,536 bytes of CONTINUATION frames ends the connection.
@@ -561,12 +599,13 @@ async fn the_header_block_the_first_headers_and_the_preface_are_held_to_their_bo
 	for _ in 0..5 {frames::frame(frames::CONTINUATION, 0, 1, &vec![0x82; 16384], &mut out)}
 	client.send(&out).await;
 	assert_eq!(client.closed(Duration::from_secs(3)).await, Some(frames::ENHANCE_YOUR_CALM));
-	// A decoded list over the bound resets the stream, and the table stays in step for the next.
+	// A decoded list over the bound ends the connection, since the table cannot be kept in step past it.
 	let mut client = node.client().await;
 	let long = "v".repeat(4000);
 	let many: Vec<(&str, &str)> = [(":method", "GET"), (":authority", "node.test"), (":scheme", "https"), (":path", "/")].into_iter().chain(std::iter::repeat_n(("x-long", long.as_str()), 20)).collect();
-	let id = client.open(&many, true).await;
-	assert_eq!(client.answer(id, Duration::from_secs(3), true).await.unwrap_err(), frames::REFUSED_STREAM);
+	client.open(&many, true).await;
+	assert_eq!(client.closed(Duration::from_secs(3)).await, Some(frames::COMPRESSION_ERROR));
+	let mut client = node.client().await;
 	let id = client.get("/").await;
 	assert_eq!(client.answer(id, Duration::from_secs(3), true).await.unwrap().0, "200");
 	// HTTP/1.1 after choosing h2 gets a GOAWAY with PROTOCOL_ERROR.
@@ -659,7 +698,7 @@ async fn a_user_gets_the_tunnel_in_both_directions_over_an_extended_connect_and_
 		if frame.0.kind == frames::HEADERS && frame.0.stream == id {break frame}
 	};
 	assert_eq!(header.flags & frames::END_STREAM, 0);
-	let list = client.decoder.decode(&payload, 65536).unwrap().unwrap();
+	let list = client.decoder.decode(&payload, 65536).unwrap();
 	let fields: Vec<(String, String)> = list.into_iter().map(|(name, value)| (String::from_utf8(name).unwrap(), String::from_utf8(value).unwrap())).collect();
 	assert_eq!(fields[0], (":status".to_string(), "200".to_string()));
 	assert!(field(&fields, "set-cookie")[0].starts_with("sid="), "{fields:?}");

@@ -9,7 +9,6 @@ use veilway_proto::h2::{self as frames, gateway, Decoder, Encoder, Fields, Heade
 use veilway_proto::http::{head_end, Framing, ANSWER_HEAD_MAX};
 
 const STREAMS_MAX: usize = 100;
-const HEADER_LIST: usize = 65_536;
 const HEADER_TABLE: u32 = 4_096;
 const FIRST_HEADERS: Duration = Duration::from_secs(10);
 const BLOCK_TIME: Duration = Duration::from_secs(10);
@@ -307,7 +306,7 @@ async fn writer(mut wr: WriteHalf<Stream>, mut out: mpsc::Receiver<Out>, owed: A
 struct Block {stream: u32, bytes: Vec<u8>, ended: bool, since: Instant}
 
 // A stream the reader keeps while its task runs: the way to the task, and what the reader needs to hold the peer to its windows.
-struct Open {tx: Option<mpsc::Sender<Vec<u8>>>, cancel: watch::Sender<bool>, recv: Arc<Recv>, answered: Arc<AtomicBool>}
+struct Open {tx: Option<mpsc::Sender<Vec<u8>>>, cancel: watch::Sender<bool>, recv: Arc<Recv>, answered: Arc<AtomicBool>, reset: bool}
 
 fn goaway(last: u32, code: u32) -> Vec<u8> {
 	let mut bytes = Vec::new();
@@ -331,7 +330,7 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 	let writing = tokio::spawn(writer(wr, out_rx, owed));
 	// The node's SETTINGS at once, the same for everyone: the defaults for the windows, so none of them is sent.
 	let mut greeting = Vec::new();
-	frames::settings(&[(frames::HEADER_TABLE_SIZE, HEADER_TABLE), (frames::MAX_CONCURRENT_STREAMS, STREAMS_MAX as u32), (frames::MAX_HEADER_LIST_SIZE, HEADER_LIST as u32), (frames::ENABLE_CONNECT_PROTOCOL, 1)], &mut greeting);
+	frames::settings(&[(frames::HEADER_TABLE_SIZE, HEADER_TABLE), (frames::MAX_CONCURRENT_STREAMS, STREAMS_MAX as u32), (frames::MAX_HEADER_LIST_SIZE, frames::HEADER_LIST as u32), (frames::ENABLE_CONNECT_PROTOCOL, 1)], &mut greeting);
 	wire.queue(Out::Raw(greeting)).await;
 	let (bump, kill, ip, cid) = (place.bump.clone(), Arc::new(Notify::new()), peer.ip(), listener.ids.fetch_add(1, Ordering::Relaxed));
 	{
@@ -366,11 +365,11 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 	let reading = tokio::spawn(reader(rd, frames_tx));
 	let ctx = Arc::new(Ctx {shared, listener, served, wire: wire.clone(), peer, local, upstream: Arc::new(Semaphore::new(UPSTREAM)), modern});
 	let (mut decoder, mut streams, mut tasks, mut block, mut last) = (Decoder::new(HEADER_TABLE as usize), HashMap::<u32, Open>::new(), JoinSet::new(), None::<Block>, 0u32);
-	let (mut undecided, mut relayed, mut first, mut quiet) = (true, None::<(Relaying<'_>, Arc<Relayed>)>, false, Instant::now());
+	let (mut undecided, mut relayed, mut quiet) = (true, None::<(Relaying<'_>, Arc<Relayed>)>, Instant::now());
 	let mut peer_initial = i64::from(frames::WINDOW_DEFAULT);
 	let mut tick = tokio::time::interval(Duration::from_secs(1));
 	let code = loop {
-		let due = [(!first).then_some(started + FIRST_HEADERS), block.as_ref().map(|block| block.since + BLOCK_TIME), (streams.is_empty() && block.is_none()).then_some(quiet + IDLE)].into_iter().flatten().min();
+		let due = [undecided.then_some(started + FIRST_HEADERS), block.as_ref().map(|block| block.since + BLOCK_TIME), (streams.is_empty() && block.is_none()).then_some(quiet + IDLE)].into_iter().flatten().min();
 		tokio::select! {
 			biased;
 			_ = bump.notified(), if undecided => break frames::NO_ERROR,
@@ -379,7 +378,8 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 			_ = tripped.changed() => break (*tripped.borrow()).unwrap_or(frames::INTERNAL_ERROR),
 			_ = tick.tick() => if ctx.listener.closed.load(Ordering::Acquire) {break frames::NO_ERROR},
 			_ = async {match due {Some(due) => sleep_until(due).await, None => std::future::pending().await}} => {
-				if !first || streams.is_empty() && block.is_none() {break frames::NO_ERROR}
+				if undecided && started.elapsed() >= FIRST_HEADERS {break frames::NO_ERROR}
+				if streams.is_empty() && block.is_none() && quiet.elapsed() >= IDLE {break frames::NO_ERROR}
 				if block.as_ref().is_some_and(|block| block.since.elapsed() >= BLOCK_TIME) {break frames::ENHANCE_YOUR_CALM}
 			}
 			event = events_rx.recv() => match event {
@@ -421,19 +421,21 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 						return;
 					}
 				};
-				first |= header.kind == frames::HEADERS;
+				// Frames that carry nothing, and any frame on a stream that is over, count against the empty-frame limit.
+				if header.stream != 0 && header.stream <= last && !streams.contains_key(&header.stream) {ctx.wire.empty()}
+				if payload.is_empty() && matches!(header.kind, frames::DATA | frames::CONTINUATION | frames::RST_STREAM) {ctx.wire.empty()}
 				if let Some((_, slot)) = &relayed {slot.last.store(Clock::of((ctx.shared.now)()).ms, Ordering::Relaxed)}
 				if block.is_some() && header.kind != frames::CONTINUATION {break frames::PROTOCOL_ERROR}
 				match header.kind {
 					frames::HEADERS => {
 						if header.stream == 0 || header.stream % 2 == 0 {break frames::PROTOCOL_ERROR}
 						let Some(fragment) = frames::unpad(header.flags, &payload, true) else {break frames::PROTOCOL_ERROR};
-						if fragment.len() > HEADER_LIST {break frames::ENHANCE_YOUR_CALM}
+						if fragment.len() > frames::HEADER_LIST {break frames::ENHANCE_YOUR_CALM}
 						block = Some(Block {stream: header.stream, bytes: fragment.to_vec(), ended: header.flags & frames::END_STREAM != 0, since: Instant::now()});
 					}
 					frames::CONTINUATION => {
 						let Some(open) = block.as_mut().filter(|open| open.stream == header.stream) else {break frames::PROTOCOL_ERROR};
-						if open.bytes.len() + payload.len() > HEADER_LIST {break frames::ENHANCE_YOUR_CALM}
+						if open.bytes.len() + payload.len() > frames::HEADER_LIST {break frames::ENHANCE_YOUR_CALM}
 						open.bytes.extend_from_slice(&payload);
 					}
 					frames::DATA => {
@@ -451,16 +453,19 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 						if open.recv.window.fetch_sub(size, Ordering::Relaxed) < size {break frames::FLOW_CONTROL_ERROR}
 						if padding > 0 {ctx.wire.credit(header.stream, Some(&open.recv), padding).await}
 						let ended = header.flags & frames::END_STREAM != 0;
-						if data.is_empty() && !ended {ctx.wire.empty()}
 						match open.tx.as_ref() {
 							None => {
-								ctx.wire.reset(header.stream, frames::STREAM_CLOSED).await;
+								if !open.reset {
+									open.reset = true;
+									ctx.wire.reset(header.stream, frames::STREAM_CLOSED).await;
+								}
 								ctx.wire.credit(header.stream, Some(&open.recv), data.len()).await;
 							}
 							Some(tx) => {
 								if !data.is_empty() && tx.try_send(data.to_vec()).is_err() {
 									open.tx = None;
 									open.cancel.send_replace(true);
+									open.reset = true;
 									ctx.wire.reset(header.stream, frames::ENHANCE_YOUR_CALM).await;
 									ctx.wire.early();
 								} else if ended {open.tx = None}
@@ -497,6 +502,7 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 									let delta = i64::from(value) - peer_initial;
 									peer_initial = i64::from(value);
 									for window in windows.streams.values_mut() {*window += delta}
+									if windows.streams.values().any(|window| *window > i64::from(frames::WINDOW_MAX)) {code = Some(frames::FLOW_CONTROL_ERROR)}
 									drop(windows);
 									ctx.wire.wake.notify_waiters();
 								}
@@ -528,7 +534,12 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 						if header.stream > last {break frames::PROTOCOL_ERROR}
 						if increment == 0 {
 							if header.stream == 0 {break frames::PROTOCOL_ERROR}
-							if streams.contains_key(&header.stream) {ctx.wire.reset(header.stream, frames::PROTOCOL_ERROR).await}
+							if let Some(open) = streams.get_mut(&header.stream) {
+								if !open.reset {
+									open.reset = true;
+									ctx.wire.reset(header.stream, frames::PROTOCOL_ERROR).await;
+								}
+							}
 							continue;
 						}
 						let mut over = false;
@@ -560,7 +571,7 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 				if header.kind == frames::HEADERS || header.kind == frames::CONTINUATION {
 					if header.flags & frames::END_HEADERS == 0 {continue}
 					let Some(done) = block.take() else {continue};
-					let Ok(list) = decoder.decode(&done.bytes, HEADER_LIST) else {break frames::COMPRESSION_ERROR};
+					let Ok(fields) = decoder.decode(&done.bytes, frames::HEADER_LIST) else {break frames::COMPRESSION_ERROR};
 					if let Some(open) = streams.get_mut(&done.stream) {
 						// Trailers: counted against the header limit by the decoder, and dropped. They must end the stream.
 						if !done.ended || open.tx.is_none() {
@@ -570,25 +581,19 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 						} else {open.tx = None}
 						continue;
 					}
-					if done.stream <= last {break frames::PROTOCOL_ERROR}
+					if done.stream <= last {
+						ctx.wire.reset(done.stream, frames::STREAM_CLOSED).await;
+						continue;
+					}
 					last = done.stream;
 					if ctx.wire.opened.lock().unwrap_or_else(|e| e.into_inner()).hit() {break frames::ENHANCE_YOUR_CALM}
-					let fields = match list {
-						// A list over its bound was decoded and dropped, and one with no fields has no pseudo-header to decide by.
-						None => {
-							ctx.listener.counters.count(Count::H2Refused);
-							ctx.wire.reset(done.stream, frames::REFUSED_STREAM).await;
-							ctx.wire.early();
-							continue;
-						}
-						Some(fields) if fields.is_empty() => {
-							ctx.listener.counters.count(Count::H2Refused);
-							ctx.wire.reset(done.stream, frames::PROTOCOL_ERROR).await;
-							ctx.wire.empty();
-							continue;
-						}
-						Some(fields) => fields,
-					};
+					// A list with no fields has no pseudo-header to decide by.
+					if fields.is_empty() {
+						ctx.listener.counters.count(Count::H2Refused);
+						ctx.wire.reset(done.stream, frames::PROTOCOL_ERROR).await;
+						ctx.wire.empty();
+						continue;
+					}
 					if streams.len() >= STREAMS_MAX || ctx.listener.h2.held.load(Ordering::Relaxed) >= HELD_LISTENER {
 						ctx.wire.reset(done.stream, frames::REFUSED_STREAM).await;
 						ctx.wire.early();
@@ -598,7 +603,7 @@ pub(super) async fn serve(shared: Arc<Shared>, listener: Arc<Listener>, served: 
 					let (cancel, cancelled) = watch::channel(false);
 					let (recv, answered) = (Arc::new(Recv::new(ctx.wire.initial.load(Ordering::Relaxed))), Arc::new(AtomicBool::new(false)));
 					ctx.wire.windows().streams.insert(done.stream, peer_initial);
-					streams.insert(done.stream, Open {tx: if done.ended {None} else {Some(tx)}, cancel, recv: recv.clone(), answered: answered.clone()});
+					streams.insert(done.stream, Open {tx: if done.ended {None} else {Some(tx)}, cancel, recv: recv.clone(), answered: answered.clone(), reset: false});
 					let place = pending.take();
 					tasks.spawn(task(ctx.clone(), done.stream, fields, done.ended, rx, cancelled, recv, answered, place));
 				}
@@ -794,7 +799,7 @@ async fn stranger(ctx: &Arc<Ctx>, id: u32, fields: &Fields, ended: bool, mut rx:
 		wire.reset(id, frames::CANCEL).await;
 		return Outcome::Aborted;
 	}
-	let (mut seen, mut open, mut head, mut read, mut framing, mut chunks, mut left) = (0u64, !ended, Vec::new(), vec![0u8; READ], None::<Framing>, gateway::Chunked::new(), 0u64);
+	let (mut seen, mut open, mut ready, mut head, mut read, mut framing, mut chunks, mut left) = (0u64, !ended, !request.upgrade, Vec::new(), vec![0u8; READ], None::<Framing>, gateway::Chunked::new(), 0u64);
 	loop {
 		let reading = async {
 			// Before the answer head is whole, a read is the origin's own head and takes no room. After it, a read takes what the windows and the bounds allow, and waits for them.
@@ -805,7 +810,8 @@ async fn stranger(ctx: &Arc<Ctx>, id: u32, fields: &Fields, ended: bool, mut rx:
 		tokio::select! {
 			biased;
 			_ = gone(cancel) => return Outcome::Cancelled,
-			item = rx.recv(), if open => match item {
+			// An extended CONNECT's DATA waits for the origin's 101.
+			item = rx.recv(), if open && ready => match item {
 				Some(data) => {
 					seen += data.len() as u64;
 					if request.length.is_some_and(|length| seen > length) {
@@ -853,6 +859,11 @@ async fn stranger(ctx: &Arc<Ctx>, id: u32, fields: &Fields, ended: bool, mut rx:
 							wire.reset(id, frames::CANCEL).await;
 							return Outcome::Aborted;
 						};
+						if request.upgrade && answer.status >= 200 && !answer.switched {
+							wire.reset(id, frames::CANCEL).await;
+							return Outcome::Aborted;
+						}
+						ready |= answer.switched;
 						if answer.status < 200 {
 							head.drain(..end);
 							continue;
