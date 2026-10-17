@@ -218,7 +218,7 @@ impl Shared {
 		// A flow of ICMP is known by its type and code, which stand where the ports of another flow do.
 		let icmp = (key.protocol == Protocol::ICMP || key.protocol == Protocol::ICMPV6).then_some((key.sport as u8, key.dport as u8));
 		let dport = if icmp.is_some() {0} else {key.dport};
-		// A gateway answers DNS, the control channel on a `veilway` inbound, and nothing else. With hijack on, every UDP and TCP port 53 flow is DNS for the node wherever it was sent.
+		// A gateway answers DNS, ping (in `ingress`), the control channel on a `veilway` inbound, and nothing else. With hijack on, every UDP and TCP port 53 flow is DNS for the node wherever it was sent.
 		// "`dns.hijack` does not apply to a link. Its DNS traffic was already answered by the entry's resolver, which chose its own servers, and it is routed like any other flow."
 		let dns = linked.is_none() && dport == 53 && transport && (gateway || plan.hijack);
 		let local = !dns && !gateway && plan.pool_of(key.dst).is_some();
@@ -290,6 +290,11 @@ impl Shared {
 		let control = linked.is_none() && transport && packet.dport == PORT && plan.control(at, packet.dst);
 		if control && packet.protocol == Protocol::UDP {return self.probed(plan, from, &raw, &packet)}
 		if control {self.own(&plan.users[user], raw.len())}
+		// The gateway of the inbound a device came in through answers its ping itself, before any rule or exit, so an app can tell that its tunnel carries packets with no exit at all. A link has no gateway to ping.
+		if gateway && linked.is_none() && packet.echo_request() && plan.inbounds[at].pools.iter().any(|pool| pool.addr() == packet.dst) {
+			match netstack::echo_reply(&raw, &packet) {Some(reply) => {self.send(plan, from, &reply).await;}, None => self.count(Reason::Unparsable)}
+			return;
+		}
 		// The gate is asked for every packet, so what it refuses takes no place in the flow table. A link address is never a destination, and what is always refused for a link is refused here too.
 		if !control && ((gateway && !dns) || (!dns && !local && gate::refused(packet.dst, &plan.pools)) || plan.linked.contains(&packet.dst) || linked.is_some_and(|link| plan.barred(link, packet.dst))) {
 			if let Some(link) = linked {plan.links[link].state.dropped.fetch_add(1, Ordering::Relaxed);}

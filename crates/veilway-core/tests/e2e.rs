@@ -1219,7 +1219,7 @@ async fn two_inbounds_share_one_ws_address_with_different_paths(){
 	assert!(home.up_packets>0 && home.down_packets>0 && office.up_packets>0 && office.down_packets>0, "both tunnels carried traffic: {home:?} {office:?}");
 }
 
-/// A gateway address answers DNS even when hijack is off, through the exit the rules choose, and nothing else.
+/// A gateway address answers DNS even when hijack is off, through the exit the rules choose, and ping, and nothing else.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn the_gateway_answers_dns_and_nothing_else(){
 	let (backend, _)=tcp_responder().await;
@@ -1235,8 +1235,14 @@ async fn the_gateway_answers_dns_and_nothing_else(){
 	let PayloadSlice::Udp(payload)=parsed.payload else{panic!("not udp")};
 	assert_eq!(payload, DNS_ANSWER);
 	assert_eq!(seen.lock().unwrap().as_slice(), ["1.1.1.1:53"], "the query did not go to the configured resolver");
+	client.send_ip(&echo_request(PEER_A, GATEWAY, 9, 3, b"abcdefgh")).await;
+	let reply=client.recv_ip(Duration::from_secs(3)).await.expect("the gateway did not answer a ping");
+	let parsed=PacketHeaders::from_ip_slice(&reply).unwrap();
+	let NetHeaders::Ipv4(ip, _)=parsed.net.unwrap() else{panic!("not ipv4")};
+	assert_eq!((ip.source, ip.destination), (GATEWAY, PEER_A));
+	assert!(matches!(parsed.transport, Some(TransportHeader::Icmpv4(icmp)) if matches!(icmp.icmp_type, Icmpv4Type::EchoReply(echo) if echo.id == 9 && echo.seq == 3)), "the gateway's answer to a ping is not its echo reply");
 	refused_with(&mut client, &ip_udp(PEER_A, GATEWAY, 41131, 9999, b"ping"), PROHIBITED).await;
-	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "the gateway answered something that is not dns");
+	assert!(client.recv_ip(Duration::from_millis(500)).await.is_none(), "the gateway answered something that is not dns or ping");
 	assert_eq!(node.engine.dropped(Reason::Gate), 1);
 	assert_eq!(udp_hits.load(Ordering::SeqCst), 0);
 }

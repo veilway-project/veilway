@@ -646,7 +646,7 @@ pub struct DnsSet {
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundType {
-	/// Plain WireGuard. Its gateway answers DNS and nothing else.
+	/// Plain WireGuard. Its gateway answers DNS and ping, and nothing else.
 	Wireguard,
 	/// The same tunnel with the control channel at its gateway address. Every device with an address in it has a transport secret.
 	Veilway,
