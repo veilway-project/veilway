@@ -537,13 +537,13 @@ fn run(dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
 	if text.len() != TOKEN_LEN || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {bail!("the token is not what the app writes")}
 	let data = data_dir()?;
 	#[cfg(unix)]
-	let owner = uid;
+	let account = uid;
 	#[cfg(windows)]
-	let owner = 0;
-	bundle::wipe(dir, &data, owner);
+	let account = 0;
+	bundle::wipe(dir, &data, account);
 	let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
 	let (library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
-	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir, dir.to_path_buf(), data.clone(), owner);
+	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir, dir.to_path_buf(), data.clone(), account);
 	let sink = core.push.clone();
 	tracing_subscriber::registry().with(LogLayer {sink: move |line| {let _ = sink.send(Out::Log {line});}, helper: true}).init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}
