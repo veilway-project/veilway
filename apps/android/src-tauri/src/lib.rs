@@ -12,16 +12,21 @@ mod proto;
 mod qr;
 #[path = "../../../desktop/src-tauri/src/view.rs"]
 mod view;
+#[path = "../../../desktop/src-tauri/src/bundle_store.rs"]
+mod bundle_store;
 mod bridge;
+mod bundle;
 mod host;
 mod update;
 mod vault;
 mod vpn;
 use base64::Engine;
+use ring::digest::{Context, SHA256};
 use proto::{Call, Options, Out, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::plugin::{Builder, TauriPlugin};
@@ -48,6 +53,9 @@ impl Default for Settings {
 
 #[derive(Deserialize)]
 struct Granted {granted: bool}
+
+#[derive(Deserialize)]
+struct Picked {picked: bool}
 
 #[derive(Deserialize)]
 struct Saved {saved: bool}
@@ -243,6 +251,68 @@ async fn download_update(app: &AppHandle, vpn: &State<'_, Arc<Vpn>>) -> Result<(
 	handed.map(|_| ())
 }
 
+/// Copies the bundle the system's picker gave into the app's folder and reviews it. None is a picker the user closed.
+#[tauri::command]
+async fn bundle_pick(vpn: State<'_, Arc<Vpn>>) -> Result<Option<Value>, String> {
+	if !plugin::<Picked>(&vpn, "pickBundle", json!({})).await?.picked {return Ok(None)}
+	host::call(Call::BundleReview).await.map(Some)
+}
+
+#[tauri::command]
+async fn bundle_document(id: String) -> Result<Value, String> {call_branded(Call::BundleDocument {subscription: id}).await}
+
+#[tauri::command]
+async fn bundle_notices() -> Result<Value, String> {host::call(Call::BundleNotices).await}
+
+#[tauri::command]
+async fn bundle_close() -> Result<Value, String> {host::call(Call::BundleClose).await}
+
+/// Hands the app part of the open bundle to the system's installer. Its bytes are copied out of the bundle, checked against the hash the review made, and checked by the same minisign check as an online update, under the release tag. Refused while a connection is being set up. The installer asks the user.
+#[tauri::command]
+async fn bundle_install(vpn: State<'_, Arc<Vpn>>) -> Result<(), String> {
+	let status = host::call(Call::Status).await?;
+	if status["status"]["state"].as_str() == Some("connecting") {return Err("tunnel_starting".into())}
+	let staged = host::call(Call::BundleApp).await?;
+	let dir = host::get().ok_or("Veilway is still starting.")?.dir.clone();
+	let copy = dir.join(bundle::FOLDER).join(bundle_store::COPY);
+	let update = dir.join("update");
+	let _ = std::fs::remove_dir_all(&update);
+	std::fs::create_dir_all(&update).map_err(|error| error.to_string())?;
+	let apk = update.join(update::APK);
+	let (version, signature) = (staged["version"].as_str().unwrap_or_default().to_owned(), staged["signature"].as_str().unwrap_or_default().to_owned());
+	let (offset, size, expected) = (staged["offset"].as_u64().unwrap_or_default(), staged["size"].as_u64().unwrap_or_default(), staged["sha256"].as_str().unwrap_or_default().to_owned());
+	let (target, tag) = (apk.clone(), format!("v{version}"));
+	let checked = tokio::task::spawn_blocking(move || -> Result<(), String> {
+		let mut source = std::fs::File::open(&copy).map_err(|error| error.to_string())?;
+		source.seek(SeekFrom::Start(offset)).map_err(|error| error.to_string())?;
+		let mut out = std::fs::File::create(&target).map_err(|error| error.to_string())?;
+		let mut hash = Context::new(&SHA256);
+		let mut buffer = vec![0; 1 << 16];
+		let mut left = size;
+		while left > 0 {
+			let want = left.min(buffer.len() as u64) as usize;
+			let read = source.read(&mut buffer[..want]).map_err(|error| error.to_string())?;
+			if read == 0 {return Err("app_short".into())}
+			hash.update(&buffer[..read]);
+			out.write_all(&buffer[..read]).map_err(|error| error.to_string())?;
+			left -= read as u64;
+		}
+		out.sync_all().map_err(|error| error.to_string())?;
+		if proto::hex(hash.finish().as_ref()) != expected {return Err("app_mismatch".into())}
+		update::verify(update::PUBKEY, &signature, &tag, std::fs::File::open(&target).map_err(|error| error.to_string())?)
+	}).await.map_err(|error| error.to_string())?;
+	if let Err(error) = checked {
+		let _ = std::fs::remove_dir_all(&update);
+		return Err(error);
+	}
+	tracing::info!("app part {} from a bundle verified, handing it to the installer", version);
+	let handed = plugin::<Value>(&vpn, "install", json!({"path": apk.to_string_lossy()})).await;
+	if handed.is_err() {let _ = std::fs::remove_dir_all(&update);}
+	handed?;
+	let _ = host::call(Call::BundleClose).await;
+	Ok(())
+}
+
 fn settings_path() -> Result<std::path::PathBuf, String> {Ok(host::get().ok_or("Veilway is still starting.")?.dir.join("settings.json"))}
 
 #[tauri::command]
@@ -267,7 +337,7 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

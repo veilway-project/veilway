@@ -11,7 +11,7 @@ export type Card = {kind: "stat", label: string, value: string, unit: string | n
 export type Profile = {id: string, name: string, exits: [string, string][]};
 // A backup update address of a subscription, or the new main address a move asks for. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does, and a `move` would become the main one. Over `plain` the network can tell that the device uses this app. `from` is the address a move leaves.
 export type Host = {key: string, host: string, kind: "update" | "static" | "move", state: "waiting" | "allowed" | "declined", check: "chain" | "pinned" | "plain", from: string | null};
-export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, lan_local: boolean, hosts: Host[]};
+export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, lan_local: boolean, hosts: Host[], bundle_notices?: {severity: string, text: string, issued_at: number}[]};
 export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, plain: boolean, in_file: boolean};
 export type Move = {host: string, check: "chain" | "pinned" | "plain", from: string | null};
 export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: boolean, moving: Move | null, left_out: string[], preview: Subscription};
@@ -24,6 +24,11 @@ export type UpdateInfo = {available: boolean, version: string, notes: string, cu
 export type Options = {local_names: boolean, routes: string[]};
 export type Ended = {error: string | null, kept: boolean};
 export type Progress = {downloaded: number, total: number | null};
+// A bundle as the helper reviewed it (src-tauri/src/bundle.rs). `signer` is the provider's name when `release` is false. `subscription` is set where a newer document can be applied.
+export type BundleApp = {platform: string, version: string, size: number, newer: boolean, installable: boolean};
+export type BundleFound = {provider: string, subscription: string | null, serial: number | null, expires_at: number | null, code: "same" | "refused" | null};
+export type BundleNotice = {providers: string[], severity: string, text: string};
+export type BundleReview = {fingerprint: string, created_at: number, old: boolean, future: boolean, release: boolean, signer: string | null, apps: BundleApp[], found: BundleFound[], notices: BundleNotice[], dropped: {part: number, code: string}[]};
 
 type Commands = {
 	import_open: [{source: {kind: "link", text: string} | {kind: "file", data: string} | {kind: "sealed", data: string, password: string}}, Offer],
@@ -34,6 +39,11 @@ type Commands = {
 	share_link: [{id: string}, {link: string, qr: string}],
 	share_text: [{text: string}, null],
 	share_file: [{id: string, password: string}, boolean],
+	bundle_pick: [{}, BundleReview | null],
+	bundle_document: [{id: string}, Subscription[]],
+	bundle_install: [{}, null],
+	bundle_notices: [{}, null],
+	bundle_close: [{}, null],
 	library: [{languages: string[]}, Subscription[]],
 	refresh: [{id: string, private?: string[]}, Subscription[] | PrivateAsk],
 	remove: [{id: string}, Subscription[]],

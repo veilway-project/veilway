@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem="windows")]
 //! Tauri shell around `veilway-engine` and the platform layer. The window is unprivileged and never holds a key: the engine, the vault and the system changes live in a helper (`helper.rs`, this same executable started with `--helper` and raised once through the system's prompt), and the commands below pass the UI's asks to it over `link.rs`. The UI is static HTML in ../ui.
+mod bundle;
+mod bundle_store;
 mod helper;
 mod ipc;
 mod link;
@@ -32,6 +34,8 @@ static HANDLE:OnceLock<AppHandle>=OnceLock::new();
 static LOGS:OnceLock<Mutex<VecDeque<String>>>=OnceLock::new();
 static LINKS:OnceLock<Mutex<HashSet<String>>>=OnceLock::new();
 const LOG_KEEP:usize=200;
+/// The largest bundle the window stages: the file cap of the offline bundle format.
+const BUNDLE_MAX:u64=1<<30;
 
 fn logbuf()->&'static Mutex<VecDeque<String>>{LOGS.get_or_init(|| Mutex::new(VecDeque::new()))}
 
@@ -115,6 +119,65 @@ async fn share_file(app:AppHandle, backend:State<'_, Arc<Backend>>, id:String, p
 		let Some(path)=app.dialog().file().set_file_name("veilway-subscription.vwsealed").add_filter("Veilway sealed subscription", &["vwsealed"]).blocking_save_file() else {return Ok(false)};
 		std::fs::write(path.into_path().map_err(|e| e.to_string())?, bytes).map(|_| true).map_err(|e| e.to_string())
 	}).await.map_err(|e| e.to_string())?
+}
+
+/// Copies the bundle the user picked into the window's folder, where the helper reviews it. The picker runs here, so the window never names a path. None is a dialog the user closed.
+#[tauri::command]
+async fn bundle_pick(app:AppHandle, backend:State<'_, Arc<Backend>>)->Result<Option<Value>, String>{
+	let folder=app.path().app_config_dir().map_err(|e| e.to_string())?.join("helper");
+	let staged=tokio::task::spawn_blocking(move || -> Result<bool, String> {
+		let Some(path)=app.dialog().file().add_filter("Veilway bundle", &["vwbundle"]).blocking_pick_file() else {return Ok(false)};
+		let mut source=std::fs::File::open(path.into_path().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+		std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+		let staging=folder.join(bundle::INCOMING);
+		let mut target=std::fs::File::create(&staging).map_err(|e| e.to_string())?;
+		let copied=std::io::copy(&mut std::io::Read::take(&mut source, BUNDLE_MAX + 1), &mut target);
+		let fits=matches!(copied, Ok(n) if n <= BUNDLE_MAX);
+		if !fits {
+			let _ = std::fs::remove_file(&staging);
+			return Err(if copied.is_err() {"bundle_copy"} else {"bundle_larger"}.into());
+		}
+		Ok(true)
+	}).await.map_err(|e| e.to_string())??;
+	if !staged {return Ok(None)}
+	ask(&backend, Call::BundleReview).await.map(Some)
+}
+
+#[tauri::command]
+async fn bundle_document(backend:State<'_, Arc<Backend>>, id:String)->Result<Value, String>{ask_branded(&backend, Call::BundleDocument{subscription:id}).await}
+
+#[tauri::command]
+async fn bundle_notices(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::BundleNotices).await}
+
+#[tauri::command]
+async fn bundle_close(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::BundleClose).await}
+
+/// Installs the app part of the open bundle. The bytes come from the helper in pieces and are checked against its hash, then the updater checks them against their signature. A connection being set up blocks it. The helper goes only right before the installer runs, since that step cannot be undone, and the app restarts into the new version.
+#[tauri::command]
+async fn bundle_install(app:AppHandle, backend:State<'_, Arc<Backend>>)->Result<(), String>{
+	let status=ask(&backend, Call::Status).await?;
+	if status["status"]["state"].as_str()==Some("connecting") {return Err("tunnel_starting".into())}
+	let staged=ask(&backend, Call::BundleApp).await?;
+	let size=staged["size"].as_u64().unwrap_or_default();
+	let mut bytes=Vec::with_capacity(size as usize);
+	let mut hash=ring::digest::Context::new(&ring::digest::SHA256);
+	while (bytes.len() as u64) < size {
+		let at=bytes.len() as u64;
+		let piece=ask(&backend, Call::BundleChunk{offset:at, len:bundle::CHUNK}).await?;
+		let piece=base64::engine::general_purpose::STANDARD.decode(piece["data"].as_str().unwrap_or_default()).map_err(|e| e.to_string())?;
+		if piece.is_empty() {return Err("app_short".into())}
+		hash.update(&piece);
+		bytes.extend_from_slice(&piece);
+	}
+	let digest=hash.finish();
+	if proto::hex(digest.as_ref()) != staged["sha256"].as_str().unwrap_or_default() {return Err("app_mismatch".into())}
+	let target=format!("{}-{}", if cfg!(target_os="macos") {"darwin"} else {std::env::consts::OS}, std::env::consts::ARCH);
+	let manifest=json!({"version": staged["version"], "platforms": {target: {"url": "https://invalid/", "signature": base64::engine::general_purpose::STANDARD.encode(staged["signature"].as_str().unwrap_or_default())}}});
+	let update=app.updater().map_err(|e| format!("updater unavailable: {e}"))?.restore_update(manifest).map_err(|e| e.to_string())?.ok_or_else(|| "app_not_newer".to_string())?;
+	backend.quit().await;
+	tracing::info!("installing app part {} from a bundle", update.version);
+	tokio::task::spawn_blocking(move || update.install(&bytes)).await.map_err(|e| e.to_string())?.map_err(|e| format!("update failed: {e}"))?;
+	app.restart()
 }
 
 #[tauri::command]
@@ -264,7 +327,7 @@ fn main(){
 		.plugin(tauri_plugin_dialog::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));

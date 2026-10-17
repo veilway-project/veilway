@@ -7,6 +7,7 @@
 //! **Lifetime and the kill switch.** Closing the window or killing the app leaves the helper and a running tunnel as they are (the tray keeps the tunnel up, and a crashed window must not drop the kill switch). The helper exits on `Quit`, or when no window has been connected for two minutes and no tunnel runs. A connection that ends on its own keeps the kill switch in force exactly like the platform layer says (`Ended { kept: true }`), and only `Disconnect` (the platform's `cleanup`) lifts it. The helper adds no teardown of its own to any other path.
 //!
 //! **Per OS.** Linux: root through polkit; the executable and every folder above it have to be root's and closed to others in a release build, or the helper refuses (whoever could replace the file would be root). macOS: root through the administrator prompt; the program is the one in the app bundle, which a drag install leaves writable by the installing user, so a signed LaunchDaemon (`SMAppService`) that checks the signature of its client is the proper form and is open. Windows: an elevated process; `check_install_dir` of the platform layer refuses a folder others can write, and `wintun.dll` has to sit next to the executable (`tauri.windows.conf.json`). A tunnel that is up while the window is away is why Windows NCSI (lesson 3) and the name rules (lesson 6) stay the platform layer's business: nothing here changes them.
+use crate::bundle;
 use crate::logs::{LogLayer, START};
 use crate::ipc::{self, Conn, Server};
 use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
@@ -60,10 +61,17 @@ enum Pending {
 struct Running {subscription: String, stop: Arc<Notify>, answers: mpsc::UnboundedSender<bool>, done: watch::Receiver<bool>}
 
 pub struct Core {
-	library: AsyncMutex<Library>,
+	pub(crate) library: AsyncMutex<Library>,
 	store: Arc<Store>,
 	run: PathBuf,
-	languages: Mutex<Vec<String>>,
+	/// The window's folder, where a bundle is staged for review and an app part is handed back.
+	pub(crate) dir: PathBuf,
+	/// The helper's own folder: the copy of the reviewed bundle and the notice marks.
+	pub(crate) data: PathBuf,
+	/// The uid that owns the window's folder, which the helper checks before it opens anything there.
+	pub(crate) owner: u32,
+	pub(crate) bundle: AsyncMutex<Option<veilway_engine::bundle::Review>>,
+	pub(crate) languages: Mutex<Vec<String>>,
 	pending: AsyncMutex<Option<Pending>>,
 	running: Mutex<Option<Running>>,
 	push: broadcast::Sender<Out>,
@@ -86,15 +94,19 @@ fn kept_message(failure: &platform::Failure) -> String {
 }
 
 impl Core {
-	pub fn new(library: Library, store: Arc<Store>, run: PathBuf) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), store, run, languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
+	pub fn new(library: Library, store: Arc<Store>, run: PathBuf, dir: PathBuf, data: PathBuf, owner: u32) -> Arc<Self> {
+		Arc::new(Self {library: AsyncMutex::new(library), store, run, dir, data, owner, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
 	}
 
 	fn send(&self, out: Out) {let _ = self.push.send(out);}
 
 	fn tags(&self) -> Vec<veilway_proto::subscription::Tag> {tags(&self.languages.lock().unwrap())}
 
-	async fn library_value(&self) -> Result<Value, String> {to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))}
+	pub(crate) async fn library_value(&self) -> Result<Value, String> {
+		let mut value = to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))?;
+		self.add_notices(&mut value)?;
+		Ok(value)
+	}
 
 	/// One request. The error is the text the window shows.
 	pub async fn call(self: &Arc<Self>, call: Call) -> Result<Value, String> {
@@ -234,6 +246,12 @@ impl Core {
 				let sent = self.handle.lock().unwrap().as_ref().is_some_and(|handle| handle.select_exit(tag));
 				if sent {Ok(Value::Null)} else {Err("There is no running tunnel to change the exit of.".into())}
 			}
+			Call::BundleReview => self.bundle_review().await,
+			Call::BundleDocument {subscription} => self.bundle_document(&subscription).await,
+			Call::BundleApp => self.bundle_app().await,
+			Call::BundleChunk {offset, len} => self.bundle_chunk(offset, len).await,
+			Call::BundleNotices => self.bundle_notices().await,
+			Call::BundleClose => self.bundle_close().await,
 			Call::Status => {
 				let running = self.running.lock().unwrap().is_some();
 				to_value(json!({"connected": running, "status": self.last.lock().unwrap().clone(), "kill_switch_kept": !running && platform::firewall::present() == Some(true)}))
@@ -518,9 +536,14 @@ fn run(dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
 	let text = ipc::read_user_file(dir, "token", 0, TOKEN_LEN + 1).context("cannot read the token")?;
 	if text.len() != TOKEN_LEN || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {bail!("the token is not what the app writes")}
 	let data = data_dir()?;
+	#[cfg(unix)]
+	let owner = uid;
+	#[cfg(windows)]
+	let owner = 0;
+	bundle::wipe(dir, &data, owner);
 	let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
 	let (library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
-	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir);
+	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir, dir.to_path_buf(), data.clone(), owner);
 	let sink = core.push.clone();
 	tracing_subscriber::registry().with(LogLayer {sink: move |line| {let _ = sink.send(Out::Log {line});}, helper: true}).init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}
@@ -557,7 +580,7 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
 		let (library, _) = Library::open(Box::new(FileVault(dir.join("vault")))).unwrap();
-		let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))), dir.join("run"));
+		let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))), dir.join("run"), dir.join("window"), dir.join("data"), 0);
 		let socket = dir.join("helper.sock");
 		let server = Server::bind(&socket, uid).ok()?;
 		let task = tokio::spawn(serve(core.clone(), server, token()));

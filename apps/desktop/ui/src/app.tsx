@@ -1,5 +1,6 @@
 import {Backdrop, Banner, Button, ConfirmDialog, DEFAULT_SETTINGS, Dialog, Nav, PRODUCT, Shell, StateBlock, ToastProvider, UiProvider, useToast, type TrafficPoint} from "@veilway/ui";
 import {useEffect, useMemo, useRef, useState} from "react";
+import {Bundle} from "./bundle.tsx";
 import {Home} from "./home.tsx";
 import {Importer} from "./importer.tsx";
 import {failureText, loadPrefs, savePrefs, useD, type Prefs} from "./kit.tsx";
@@ -7,7 +8,7 @@ import {Library} from "./library.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {fa} from "./locales/fa.ts";
 import {SettingsPage} from "./settings.tsx";
-import {asksPrivate, call, on, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo} from "./tauri.ts";
+import {asksPrivate, call, on, type BundleReview, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo} from "./tauri.ts";
 import {UsagePage} from "./usage.tsx";
 
 const PACKS = {en, fa};
@@ -37,7 +38,7 @@ function Brand() {
 
 function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void}) {
 	const {t, locale, percent} = useD(), toast = useToast();
-	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null), [privateAsk, setPrivateAsk] = useState<{id: string, addresses: string[]} | null>(null);
+	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null), [privateAsk, setPrivateAsk] = useState<{id: string, addresses: string[]} | null>(null), [bundle, setBundle] = useState<BundleReview | null>(null);
 	const [running, setRunning] = useState<Running>(IDLE), [busy, setBusy] = useState(false), [ended, setEnded] = useState<Ended | null>(null), [question, setQuestion] = useState<string | null>(null), [points, setPoints] = useState<TrafficPoint[]>([]), [logs, setLogs] = useState<string[]>([]);
 	const [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null);
 	const last = useRef<{at: number, sent: number, received: number} | null>(null);
@@ -99,8 +100,8 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	const updateBanner = update && <Banner tone="info" title={t("update.title", {version: update.version})} action={!progress && <Button size="sm" variant="primary" onClick={install}>{t("update.install")}</Button>}>
 		{progress ? <span className="d-progress"><span>{t("update.installing")}</span>{progress.total ? <><span className="vw-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.downloaded}><span style={{inlineSize: Math.min(100, progress.downloaded / progress.total * 100) + "%"}}/></span><strong className="vw-num vw-small">{percent(progress.downloaded / progress.total)}</strong></> : null}</span> : update.notes.slice(0, 200)}
 	</Banner>;
-	const content = library === null ? (libraryError ? <StateBlock kind="error" title={t("library.loadFailed")} action={<Button onClick={loadLibrary}>{t("action.retry")}</Button>}>{t("library.loadFailedBody")}</StateBlock> : <StateBlock kind="loading" title={t("common.loading")}/>)
-		: adding || (library.length === 0 && tab === "home") ? <Importer first={library.length === 0} onAccept={(id, terms) => onPrefs({accepted: {...prefs.accepted, [id]: terms}})} onCancel={() => setAdding(false)} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
+	const content = bundle ? <Bundle review={bundle} onClose={() => setBundle(null)} onLibrary={setLibrary}/> : library === null ? (libraryError ? <StateBlock kind="error" title={t("library.loadFailed")} action={<Button onClick={loadLibrary}>{t("action.retry")}</Button>}>{t("library.loadFailedBody")}</StateBlock> : <StateBlock kind="loading" title={t("common.loading")}/>)
+		: adding || (library.length === 0 && tab === "home") ? <Importer first={library.length === 0} onAccept={(id, terms) => onPrefs({accepted: {...prefs.accepted, [id]: terms}})} onCancel={() => setAdding(false)} onBundle={setBundle} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
 		: tab === "subscriptions" ? <Library library={library} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
 		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>

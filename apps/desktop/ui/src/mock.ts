@@ -1,6 +1,6 @@
 // Development only: stands in for the Tauri side so the screens can run in a plain browser. main.tsx loads it only when Vite runs in "mock" mode, so a production build never contains it.
 // The address picks the scene and the display: ?scene=empty|question|connected&lang=en|fa&scheme=dark|light.
-import type {Host, Running, StatusView, Subscription} from "./tauri.ts";
+import type {BundleReview, Host, Running, StatusView, Subscription} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
 try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: null, hidden: []})); } catch { /* private window */ }
@@ -10,6 +10,11 @@ const QR = (() => { const n = 29, cells: string[] = []; for (let y = 0; y < n; y
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
 let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
+
+function bundleReview(fa: boolean): BundleReview {
+	const name = fa ? "هاربر نت" : "Harbor Net";
+	return {fingerprint: "7f3a 91c0 4be2 1d55 a08e 6c19 f2b7 3e04", created_at: now() - 3 * DAY, old: false, future: false, release: false, signer: name, apps: [{platform: "linux-x86_64", version: "0.4.0", size: 88 * 1024 ** 2, newer: true, installable: true}, {platform: "macos-aarch64", version: "0.4.0", size: 90 * 1024 ** 2, newer: true, installable: false}, {platform: "windows-x86_64", version: "0.3.1", size: 84 * 1024 ** 2, newer: false, installable: false}], found: [{provider: name, subscription: "sub-harbor", serial: 42, expires_at: now() + 40 * DAY, code: null}, {provider: fa ? "کوای وی‌پی‌ان" : "Quay VPN", subscription: null, serial: null, expires_at: null, code: "same"}], notices: [{providers: [name], severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 2 am for one hour."}], dropped: [{part: 3, code: "notice_no_subscription"}]};
+}
 
 function subscription(fa: boolean): Subscription {
 	return {
@@ -76,6 +81,11 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],
 	remove: () => { held = 0; return []; },
+	bundle_pick: () => bundleReview(languages[0] === "fa"),
+	bundle_document: () => [subscription(languages[0] === "fa")],
+	bundle_notices: () => null,
+	bundle_close: () => null,
+	bundle_install: () => null,
 	answer_hosts: args => { hosts = hosts.map(host => (args.allow as string[]).includes(host.key) ? {...host, state: "allowed"} : (args.decline as string[]).includes(host.key) ? {...host, state: "declined"} : host); return [subscription(languages[0] === "fa")]; },
 	set_lan: args => { lan = args.on === true; return [subscription(languages[0] === "fa")]; }
 };

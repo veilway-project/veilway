@@ -1,13 +1,14 @@
 import {Banner, Button, Glass, List, ListRow, SecretField, TextField} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
 import {agreement, base64, failureText, useD} from "./kit.tsx";
-import {asksPrivate, call, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
+import {asksPrivate, call, type BundleReview, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
-export function Importer({first, onCancel, onDone, onAccept}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void}) {
+export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void, onBundle: (review: BundleReview) => void}) {
 	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
+	const bundle = () => run(call("bundle_pick"), found => { if (found) onBundle(found); });
 	const qr = (picture: Blob) => run(base64(picture).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_qr", {data})), setOffer);
 	const proceed = (agreed?: string[]) => run(call("import_proceed", agreed ? {private: agreed} : {}), found => { if (asksPrivate(found)) { setAsked(found.ask_private); } else { setAsked(null); setReview(found); } });
 	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setSealed(null); setPassword(""); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
@@ -92,6 +93,7 @@ export function Importer({first, onCancel, onDone, onAccept}: {first: boolean, o
 			<div className="d-actions d-start">
 				<Button icon="upload" disabled={busy} onClick={() => fileInput.current?.click()}>{t("import.file")}</Button>
 				<Button icon="upload" disabled={busy} onClick={() => qrInput.current?.click()}>{t("import.qr")}</Button>
+				<Button icon="upload" disabled={busy} onClick={bundle}>{t("bundle.open")}</Button>
 			</div>
 			{!matchMedia("(pointer: coarse)").matches && <p className="vw-muted vw-small">{t("import.pasteHint")}</p>}
 			<input ref={fileInput} type="file" hidden onChange={event => picked(event, "file")}/>

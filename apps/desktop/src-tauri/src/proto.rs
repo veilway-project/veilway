@@ -90,6 +90,18 @@ pub enum Call {
 	Answer { yes: bool },
 	Disconnect,
 	SelectExit { tag: Option<String> },
+	/// Reviews the bundle the window staged in its folder. Nothing is applied until one of the calls below names an item.
+	BundleReview,
+	/// Stores the newer document of one held subscription from the open review, on the user's yes.
+	BundleDocument { subscription: String },
+	/// The installable app part of the open review: its version, release signature, size and hash.
+	BundleApp,
+	/// One piece of that app part, from `offset`, at most `len` bytes, base64.
+	BundleChunk { offset: u64, len: u64 },
+	/// Keeps the notices of the open review: their marks are stored, so the same notices never show again.
+	BundleNotices,
+	/// Drops the open review, its copy and anything staged for it.
+	BundleClose,
 	Status,
 	/// Disconnects if connected, then the helper exits.
 	Quit,

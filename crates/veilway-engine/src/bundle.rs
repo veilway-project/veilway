@@ -1,8 +1,7 @@
 //! The review of an offline bundle in the app (offline bundle page, "Importing" and "Freshness and rollback"). The manifest is checked before anything is written. Once it verifies, the bundle is copied into the app's own storage while each part is hashed, and the pack files and notices that matter are read from that copy. An app part is listed only when its release signature verifies under its platform's family key, with the manifest signed by that same key. Nothing is applied here: a document, an app part or a notice is applied on the user's own yes, and the copy is the caller's to delete when the review ends.
-use crate::import::Library;
 use ring::digest::{Context, SHA256};
 use std::{fmt, fs::{self, File}, io::{self, Read, Seek, SeekFrom, Write}, path::{Path, PathBuf}};
-use veilway_proto::subscription::{bundle::{self, Index, Kind, Message, Refusal, Version}, client::{Refreshed, CLOCK_TOLERANCE}, envelope::{Fingerprint, SigningKey}};
+use veilway_proto::subscription::{bundle::{self, Index, Kind, Message, Refusal, Version}, client::{Held, Refreshed, CLOCK_TOLERANCE}, envelope::{Fingerprint, SigningKey}, payload::Id};
 
 const CHUNK: usize = 65_536;
 const OLD: u64 = 90 * 86_400;
@@ -44,18 +43,22 @@ pub struct Check<'a> {pub families: &'a [SigningKey], pub platform: &'a str, pub
 
 /// An app part whose release signature verified, with the version and name that signature gives. `installable` is the version rule, the platform and the hash together.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct App {pub platform: &'static str, pub version: String, pub size: u64, pub newer: bool, pub installable: bool}
+pub struct App {pub platform: &'static str, pub version: String, pub size: u64, pub newer: bool, pub installable: bool, pub signature: String, pub offset: u64, pub sha256: [u8; 32]}
 
 /// What a pack file gave a stored subscription: a newer document, or why it changes nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Found {
-	Newer {provider: String, serial: u64, expires_at: u64},
+	Newer {provider: String, id: Id, epoch: u64, serial: u64, expires_at: u64},
 	Kept {provider: String, reason: String},
 }
 
 /// A notice for the providers of the stored subscriptions that hold its signing key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {pub providers: Vec<String>, pub message: Message}
+
+/// A newer document of one stored subscription: the period `epoch` it was found under, and its bytes as the static file had them.
+#[derive(Debug, Clone)]
+pub struct Document {pub id: Id, pub epoch: u64, pub body: Vec<u8>}
 
 #[derive(Debug)]
 pub struct Review {
@@ -68,21 +71,23 @@ pub struct Review {
 	pub future: bool,
 	pub apps: Vec<App>,
 	pub found: Vec<Found>,
+	/// Each newer document with the period it is for, to be applied on the user's yes by `Held::refresh_bundle` against the stored subscription as it is then.
+	pub documents: Vec<Document>,
 	pub notices: Vec<Notice>,
 	/// The `issued_at` of each notice key accepted here, which the app stores as the new last one for that key.
 	pub notice_marks: Vec<(SigningKey, u64)>,
-	/// Each part that is not listed above, with the reason in a few words.
-	pub dropped: Vec<String>,
+	/// Each part that is not listed above: its index and a code for why.
+	pub dropped: Vec<(usize, &'static str)>,
 }
 
 /// Reviews the bundle read from `source`, copying it to `copy` (which must not exist) once its manifest verifies under the family keys or a stored subscription's key.
-pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Check) -> Result<Review, Error> {
+pub fn review(source: &mut impl Read, copy: &Path, held: &[Held], check: &Check) -> Result<Review, Error> {
 	let mut first = Vec::new();
 	source.by_ref().take(bundle::HEAD as u64).read_to_end(&mut first)?;
 	let m = bundle::head(&first).map_err(Error::Refused)?;
 	source.by_ref().take(m as u64 + 64).read_to_end(&mut first)?;
 	let mut signers = check.families.to_vec();
-	signers.extend(library.held().iter().flat_map(|held| held.keys().iter().copied()));
+	signers.extend(held.iter().flat_map(|held| held.keys().iter().copied()));
 	let manifest = bundle::manifest_head(&first, &signers).map_err(Error::Refused)?;
 	if manifest.length > bundle::FILE_MAX {return Err(Error::Refused(Refusal::Length))}
 	let mut partial = Partial(None);
@@ -111,10 +116,10 @@ pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Ch
 		at += part.size;
 	}
 	let mut copy_file = File::open(copy)?;
-	let (mut apps, mut found, mut notices, mut marks, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+	let (mut apps, mut found, mut documents, mut notices, mut marks, mut dropped) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
 	for (index, (part, (&ok, &offset))) in manifest.parts.iter().zip(intact.iter().zip(&offsets)).enumerate() {
 		if !ok {
-			dropped.push(format!("part {index} is damaged"));
+			dropped.push((index, "damaged"));
 			continue;
 		}
 		match &part.kind {
@@ -123,9 +128,9 @@ pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Ch
 				match bundle::signed(name, signature, check.families).filter(|signed| signed.version == *version && signed.name == *file && family == Some(manifest.signer)) {
 					Some(signed) => {
 						let newer = matches!((Version::read(&signed.version), Version::read(check.running)), (Some(new), Some(old)) if new > old);
-						apps.push(App {platform: *name, version: signed.version, size: part.size, newer, installable: newer && *name == check.platform});
+						apps.push(App {platform: *name, version: signed.version, size: part.size, newer, installable: newer && *name == check.platform, signature: signature.clone(), offset, sha256: part.sha256});
 					}
-					None => dropped.push(format!("part {index} is an app part whose release signature does not check")),
+					None => dropped.push((index, "app_signature")),
 				}
 			}
 			Kind::Pack {periods} => {
@@ -133,17 +138,17 @@ pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Ch
 				copy_file.seek(SeekFrom::Start(offset))?;
 				copy_file.read_exact(&mut head)?;
 				let Ok(len) = bundle::index_len(&head, part.size) else {
-					dropped.push(format!("part {index} is a pack that does not read"));
+					dropped.push((index, "pack_unreadable"));
 					continue;
 				};
 				let mut bytes = vec![0; len];
 				copy_file.seek(SeekFrom::Start(offset))?;
 				copy_file.read_exact(&mut bytes)?;
 				let Ok(index_of) = Index::read(&bytes, part.size) else {
-					dropped.push(format!("part {index} is a pack that does not read"));
+					dropped.push((index, "pack_unreadable"));
 					continue;
 				};
-				for held in library.held() {
+				for held in held {
 					for &epoch in periods {
 						let Some(name) = held.bundle_name(&manifest.bundle_id, epoch) else {continue};
 						let Some(at) = index_of.find(&name) else {continue};
@@ -153,7 +158,11 @@ pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Ch
 						let provider = held.subscription().provider.as_str().to_owned();
 						let mut after = held.clone();
 						found.push(match after.refresh_bundle(&manifest.bundle_id, epoch, &body, check.now) {
-							Ok(Refreshed::Updated(_)) => Found::Newer {provider, serial: after.subscription().serial, expires_at: after.subscription().expires_at},
+							Ok(Refreshed::Updated(_)) => {
+								let id = after.subscription().id.clone();
+								documents.push(Document {id: id.clone(), epoch, body: body.clone()});
+								Found::Newer {provider, id, epoch, serial: after.subscription().serial, expires_at: after.subscription().expires_at}
+							}
 							Ok(Refreshed::Unchanged) => Found::Kept {provider, reason: "nothing newer".to_owned()},
 							Err(failure) => Found::Kept {provider, reason: failure.to_string()},
 						});
@@ -166,23 +175,23 @@ pub fn review(source: &mut impl Read, copy: &Path, library: &Library, check: &Ch
 				copy_file.read_exact(&mut bytes)?;
 				match bundle::notice(&bytes, &signers, check.now, check.last) {
 					Ok(message) => {
-						let providers: Vec<String> = library.held().iter().filter(|held| held.keys().contains(&message.signer)).map(|held| held.subscription().provider.as_str().to_owned()).collect();
-						if providers.is_empty() {dropped.push(format!("part {index} is a notice for no stored subscription"))} else {
+						let providers: Vec<String> = held.iter().filter(|held| held.keys().contains(&message.signer)).map(|held| held.subscription().provider.as_str().to_owned()).collect();
+						if providers.is_empty() {dropped.push((index, "notice_no_subscription"))} else {
 							marks.retain(|(key, _): &(SigningKey, u64)| *key != message.signer);
 							marks.push((message.signer, message.issued_at));
 							notices.push(Notice {providers, message});
 						}
 					}
-					Err(refusal) => dropped.push(format!("part {index} is a notice that does not verify: {refusal}")),
+					Err(_) => dropped.push((index, "notice_refused")),
 				}
 			}
-			Kind::Other => dropped.push(format!("part {index} is a kind this app does not know")),
+			Kind::Other => dropped.push((index, "unknown_kind")),
 		}
 	}
 	partial.0 = None;
 	let old = check.now > manifest.created_at + OLD;
 	let future = manifest.created_at > check.now + CLOCK_TOLERANCE;
-	Ok(Review {copy: copy.to_path_buf(), bundle_id: manifest.bundle_id, fingerprint: manifest.fingerprint, created_at: manifest.created_at, signer: manifest.signer, old, future, apps, found, notices, notice_marks: marks, dropped})
+	Ok(Review {copy: copy.to_path_buf(), bundle_id: manifest.bundle_id, fingerprint: manifest.fingerprint, created_at: manifest.created_at, signer: manifest.signer, old, future, apps, found, documents, notices, notice_marks: marks, dropped})
 }
 
 #[cfg(test)]

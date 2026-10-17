@@ -40,9 +40,12 @@ enum Pending {
 struct Running {subscription: String, profile: String, stop: Arc<Notify>, answers: mpsc::UnboundedSender<bool>, done: watch::Receiver<bool>}
 
 pub struct Core {
-	library: AsyncMutex<Library>,
+	pub(crate) library: AsyncMutex<Library>,
 	store: Arc<Store>,
-	languages: Mutex<Vec<String>>,
+	/// The app's folder: the bundle's folder lives in it.
+	pub(crate) dir: PathBuf,
+	pub(crate) bundle: AsyncMutex<Option<veilway_engine::bundle::Review>>,
+	pub(crate) languages: Mutex<Vec<String>>,
 	pending: AsyncMutex<Option<Pending>>,
 	running: Mutex<Option<Running>>,
 	push: broadcast::Sender<Out>,
@@ -59,8 +62,8 @@ struct ReviewOut {fingerprint: String, replaces: bool, endpoint_changed: bool, m
 fn to_value<T: Serialize>(value: T) -> Result<Value, String> {serde_json::to_value(value).map_err(|error| error.to_string())}
 
 impl Core {
-	pub fn new(library: Library, store: Arc<Store>) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), store, languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), handle: Mutex::new(None)})
+	pub fn new(library: Library, store: Arc<Store>, dir: PathBuf) -> Arc<Self> {
+		Arc::new(Self {library: AsyncMutex::new(library), store, dir, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), handle: Mutex::new(None)})
 	}
 
 	pub fn subscribe(&self) -> broadcast::Receiver<Out> {self.push.subscribe()}
@@ -69,7 +72,11 @@ impl Core {
 
 	fn tags(&self) -> Vec<veilway_proto::subscription::Tag> {tags(&self.languages.lock().unwrap())}
 
-	async fn library_value(&self) -> Result<Value, String> {to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))}
+	pub(crate) async fn library_value(&self) -> Result<Value, String> {
+		let mut value = to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))?;
+		self.add_notices(&mut value)?;
+		Ok(value)
+	}
 
 	/// One request. The error is the text the window shows.
 	pub async fn call(self: &Arc<Self>, call: Call) -> Result<Value, String> {
@@ -207,6 +214,12 @@ impl Core {
 				let sent = self.handle.lock().unwrap().as_ref().is_some_and(|handle| handle.select_exit(tag));
 				if sent {Ok(Value::Null)} else {Err("There is no running tunnel to change the exit of.".into())}
 			}
+			Call::BundleReview => self.bundle_review().await,
+			Call::BundleDocument {subscription} => self.bundle_document(&subscription).await,
+			Call::BundleApp => self.bundle_app().await,
+			Call::BundleChunk {offset, len} => self.bundle_chunk(offset, len).await,
+			Call::BundleNotices => self.bundle_notices().await,
+			Call::BundleClose => self.bundle_close().await,
 			Call::Status => {
 				let running = self.running.lock().unwrap().is_some();
 				to_value(json!({"connected": running, "status": self.last.lock().unwrap().clone(), "kill_switch_kept": false}))
@@ -366,7 +379,7 @@ pub fn init(dir: &str) -> Result<&'static Host, String> {
 	let _ = START.set(Instant::now());
 	let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().map_err(|error| error.to_string())?;
 	let (library, damaged) = Library::open(Box::new(AndroidVault::new(&dir))).map_err(|error| error.to_string())?;
-	let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))));
+	let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))), dir.clone());
 	let log = core.clone();
 	let _ = tracing_subscriber::registry().with(LogLayer {sink: move |line| log.send(Out::Log {line}), helper: true}).try_init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}

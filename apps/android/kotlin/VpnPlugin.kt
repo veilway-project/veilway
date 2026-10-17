@@ -120,6 +120,45 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 		}
 	}
 
+	/** The system's file picker for an offline bundle. The file is copied into the app's own folder, up to 1 GiB, and nothing is read from the picked place again. */
+	@Command
+	fun pickBundle(invoke: Invoke) {
+		startActivityForResult(invoke, Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), "pickBundleResult")
+	}
+
+	@ActivityCallback
+	fun pickBundleResult(invoke: Invoke, result: ActivityResult) {
+		val uri = result.data?.data
+		if (result.resultCode != Activity.RESULT_OK || uri == null) {
+			invoke.resolve(JSObject().put("picked", false))
+			return
+		}
+		Thread {
+			val target = File(File(activity.filesDir, "bundle").apply { mkdirs() }, "incoming.vwbundle")
+			try {
+				target.delete()
+				val source = activity.contentResolver.openInputStream(uri) ?: throw java.io.IOException("no stream")
+				source.use { input ->
+					target.outputStream().use { out ->
+						val buffer = ByteArray(65536)
+						var total = 0L
+						while (true) {
+							val read = input.read(buffer)
+							if (read < 0) break
+							total += read
+							if (total > 1073741824L) throw java.io.IOException("too large")
+							out.write(buffer, 0, read)
+						}
+					}
+				}
+				invoke.resolve(JSObject().put("picked", true))
+			} catch (e: java.io.IOException) {
+				target.delete()
+				invoke.reject("bundle_copy")
+			}
+		}.start()
+	}
+
 	/** The system's share sheet with a piece of text, the link the user chose to pass on. */
 	@Command
 	fun shareText(invoke: Invoke) {

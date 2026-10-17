@@ -1,5 +1,4 @@
 use super::*;
-use crate::import::FileVault;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::{fs, io::Cursor};
@@ -39,9 +38,8 @@ fn bundle(signer: &(Ed25519KeyPair, SigningKey), version: &str, signature: &str,
 }
 
 fn run(source: &[u8], families: &[SigningKey], platform: &str, dir: &Path) -> Result<Review, Error> {
-	let library = Library::open(Box::new(FileVault(dir.join("vault")))).expect("an empty library").0;
 	let check = Check {families, platform, running: "0.2.0", now: NOW, last: &[]};
-	review(&mut Cursor::new(source), &dir.join("copy.vwbundle"), &library, &check)
+	review(&mut Cursor::new(source), &dir.join("copy.vwbundle"), &[], &check)
 }
 
 fn good(_dir: &Path, version: &str, comment: &str) -> (Vec<u8>, (Ed25519KeyPair, SigningKey)) {
@@ -54,8 +52,9 @@ fn a_newer_app_part_is_listed_installable_and_the_copy_is_the_bundle() {
 	let dir = scratch("newer");
 	let (source, key) = good(&dir, "0.3.0", "timestamp:1 file:veilway.AppImage version:0.3.0");
 	let review = run(&source, &[key.1, key.1], "linux-x86_64", &dir).expect("a good bundle");
-	assert_eq!(review.apps, vec![App {platform: "linux-x86_64", version: "0.3.0".to_owned(), size: 9, newer: true, installable: true}]);
-	assert_eq!(review.dropped, vec!["part 1 is a notice that does not verify: the bundle member \"notice\" is not valid".to_owned()]);
+	let [app] = &review.apps[..] else {panic!("one app part")};
+	assert_eq!((app.platform, app.version.as_str(), app.size, app.newer, app.installable), ("linux-x86_64", "0.3.0", 9, true, true));
+	assert_eq!(review.dropped, vec![(1, "notice_refused")]);
 	assert!(review.found.is_empty() && review.notices.is_empty() && review.notice_marks.is_empty());
 	assert_eq!(fs::read(&review.copy).expect("the copy"), source);
 	assert!(!review.old && !review.future);
@@ -80,7 +79,7 @@ fn a_manifest_version_that_differs_from_the_signed_one_drops_the_app_part() {
 	let source = bundle(&key, "0.4.0", &signature(&key, "timestamp:1 file:veilway.AppImage version:0.3.0"), b"app bytes");
 	let review = run(&source, &[key.1, key.1], "linux-x86_64", &dir).expect("the manifest verifies");
 	assert!(review.apps.is_empty());
-	assert_eq!(review.dropped[0], "part 0 is an app part whose release signature does not check");
+	assert_eq!(review.dropped[0], (0, "app_signature"));
 }
 
 #[test]
@@ -90,7 +89,7 @@ fn an_app_part_is_checked_with_the_key_of_its_own_family_only() {
 	let other = pair(5);
 	let review = run(&source, &[key.1, other.1], "linux-x86_64", &dir).expect("the manifest verifies");
 	assert!(review.apps.is_empty());
-	assert_eq!(review.dropped[0], "part 0 is an app part whose release signature does not check");
+	assert_eq!(review.dropped[0], (0, "app_signature"));
 }
 
 #[test]
@@ -101,7 +100,7 @@ fn a_damaged_part_is_dropped_alone_and_named() {
 	source[at] ^= 1;
 	let review = run(&source, &[key.1, key.1], "linux-x86_64", &dir).expect("the manifest still verifies");
 	assert!(review.apps.is_empty());
-	assert_eq!(review.dropped[0], "part 0 is damaged");
+	assert_eq!(review.dropped[0], (0, "damaged"));
 }
 
 #[test]

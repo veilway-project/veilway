@@ -181,7 +181,7 @@ pub fn logo_url(kind: LogoKind, data: &[u8]) -> Option<String> {
 	Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(data)))
 }
 
-fn notice(notice: &Notice, languages: &[Tag]) -> NoticeOut {NoticeOut {severity: lower(notice.severity), text: notice.text.pick(languages).0.into()}}
+pub(crate) fn notice(notice: &Notice, languages: &[Tag]) -> NoticeOut {NoticeOut {severity: lower(notice.severity), text: notice.text.pick(languages).0.into()}}
 
 pub fn subscription_view(subscription: &Subscription, standing: Standing, can_refresh: bool, lan_local: bool, languages: &[Tag]) -> SubscriptionOut {
 	SubscriptionOut {

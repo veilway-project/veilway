@@ -151,6 +151,34 @@ pub fn read_user_file(dir: &Path, name: &str, _owner: u32, max: usize) -> io::Re
 	Ok(text)
 }
 
+/// Opens `name` in `dir`, a folder of the user `uid`, for reading by a process with more rights. Same checks as `read_user_file`, and the file is returned open, so the caller reads it whole without another path lookup.
+#[cfg(unix)]
+pub fn open_user_file(dir: &Path, name: &str, uid: u32) -> io::Result<std::fs::File> {
+	use rustix::fs::{fstat, open, openat, FileType, Mode, OFlags};
+	let folder = open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+	if fstat(&folder)?.st_uid != uid {return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the folder is not the user's"))}
+	let fd = openat(&folder, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty())?;
+	let found = fstat(&fd)?;
+	if FileType::from_raw_mode(found.st_mode) != FileType::RegularFile || found.st_uid != uid {return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the file is not a plain file of the user's"))}
+	Ok(std::fs::File::from(fd))
+}
+
+/// Removes `name` from `dir` when it is a plain entry of the user `uid`, without following a link.
+#[cfg(unix)]
+pub fn remove_user_file(dir: &Path, name: &str, uid: u32) -> io::Result<()> {
+	use rustix::fs::{fstat, open, unlinkat, AtFlags, Mode, OFlags};
+	let folder = open(dir, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+	if fstat(&folder)?.st_uid != uid {return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the folder is not the user's"))}
+	Ok(unlinkat(&folder, name, AtFlags::empty())?)
+}
+
+/// Windows has no `O_NOFOLLOW`; the file is read only to be checked and handed on, and the folder is the user's own.
+#[cfg(windows)]
+pub fn open_user_file(dir: &Path, name: &str, _owner: u32) -> io::Result<std::fs::File> {std::fs::File::open(dir.join(name))}
+
+#[cfg(windows)]
+pub fn remove_user_file(dir: &Path, name: &str, _owner: u32) -> io::Result<()> {std::fs::remove_file(dir.join(name))}
+
 #[cfg(all(test, unix))]
 mod tests {
 	use super::*;
