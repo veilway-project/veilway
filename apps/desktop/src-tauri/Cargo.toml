@@ -18,7 +18,8 @@ veilway-engine={path="../../../crates/veilway-engine"}
 veilway-proto={path="../../../crates/veilway-proto"}
 tauri={version="2", features=["tray-icon"]}
 tauri-plugin-single-instance="2"
-tauri-plugin-updater="2"
+# No zip: the Windows update is the NSIS setup.exe, never a .zip bundle, and the zip crate of updater 2.14 has open advisories (RUSTSEC-2026-0367 to 0369).
+tauri-plugin-updater={version="2", default-features=false, features=["rustls-tls", "system-proxy"]}
 tauri-plugin-process="2"
 tauri-plugin-autostart="2"
 tauri-plugin-opener="2"
