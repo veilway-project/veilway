@@ -476,6 +476,12 @@ mod tests {
 		let installed = install(&dir.join("addons"), &archive, &pin).unwrap();
 		assert_eq!(fs::read(&installed).unwrap(), exe);
 		assert!(installed.ends_with(format!("xray/{}/{}", xray::RELEASE, if cfg!(windows) {"xray.exe"} else {"xray"})));
+		// The installed file is root's only when the test runs as root; anywhere else the check must refuse it.
+		#[cfg(unix)]
+		let root = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&installed).unwrap()) == 0;
+		#[cfg(not(unix))]
+		let root = true;
+		if !root {return assert!(open_checked(&installed, &pin).is_err())}
 		let mut opened = open_checked(&installed, &pin).unwrap();
 		let mut again = Vec::new();
 		opened.read_to_end(&mut again).unwrap();

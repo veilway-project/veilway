@@ -1,4 +1,5 @@
 //! The kernel takes the rule of Xray's user (`uidrange`, attribute 20) and gives it back by the name a delete uses. Needs CAP_NET_ADMIN (`docker run --cap-add NET_ADMIN`); without it the test has nothing to try. It uses a priority and a user id of its own, so a client that runs in the same network namespace is not touched.
+#![cfg(target_os = "linux")]
 use std::io::ErrorKind;
 use veilway_linux::netlink::{Rt, Rule, TABLE_MAIN};
 
