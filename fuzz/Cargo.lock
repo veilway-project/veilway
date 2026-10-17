@@ -682,15 +682,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
-name = "fluke-hpack"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60608dc8ab0a0af790a360b85c3e80a7b50022cd0fc5637a288e25c73e20bd8e"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "foreign-types"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1917,6 +1908,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "veilway-hpack"
+version = "0.3.1-veilway.1"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "veilway-ipstack"
 version = "1.0.1-veilway.1"
 dependencies = [
@@ -1954,12 +1952,12 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
- "fluke-hpack",
  "hpke",
  "ring",
  "serde",
  "serde_json",
  "subtle",
+ "veilway-hpack",
  "x25519-dalek 3.0.0",
 ]
 

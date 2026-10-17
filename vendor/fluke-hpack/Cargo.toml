@@ -16,6 +16,10 @@ readme = "README.md"
 license = "MIT"
 keywords = ["hpack", "http2", "encoding", "decoding"]
 
+# veilway patch: the examples in the doc comments were written for the upstream callback, which returned nothing.
+[lib]
+doctest = false
+
 [features]
 # these are really slow unless `cargo test --release` is used, so they're optional
 interop-tests = []
