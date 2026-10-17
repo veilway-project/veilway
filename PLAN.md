@@ -349,11 +349,11 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 
 ## v0.2.0: hiding and reach
 
-1. Reality-style mode (below): spec, review, build.
+1. Borrowed-site mode, the Reality-style mode below (`protocol/borrowed-site` in the docs): spec, review, build. There is no outside review, so it ships marked alpha in the panel and the apps: off by default, with a warning that it is new and unreviewed.
 2. HTTP/2 on `tls`, `ws` and `fronted` (below).
 3. The shapes of `fronted` (below), with Server-Sent Events downstream.
 4. A signed offline bundle: an app update and subscription documents in one file, for any one-way channel (a USB stick, Bluetooth, satellite datacasting), trusted by its signature only.
-5. Xray in the apps: VLESS, Trojan and Shadowsocks clients in the Veilway apps, with VMess and UDP.
+5. Xray in the desktop apps: VLESS, Trojan and Shadowsocks clients in the desktop app (Linux, macOS, Windows), with VMess and UDP. Android is left out of v0.2.0.
 6. A panel SDK: `@veilway/panel-sdk`, a typed TypeScript client for the panel's admin API (users, devices, subscriptions, exits, stats), generated from the panel's `openapi.json` like the node's SDK and published with each panel release, for integrations that use API tokens.
 7. Tunnel inbounds: a `tunnel` inbound forwards a TCP or UDP port on one node to an address on the other side of a node link, direct or reverse, without a client. A port on a public node can reach a service behind a home node that has no open port, and the other way round. Config v1 gets the inbound (listen address, link, target, protocol), and the panel gets a form and a preset next to the entry node and reverse tunnel ones.
 8. If there is room: `ws-plain` with the media appearance, bonded connections, the gateway's timing measurement the subscription format requires before it leaves draft, and a design for certificates from the panel (ACME) without a probe surface.
@@ -381,7 +381,7 @@ The client's TLS hello looks like Chrome's, but `fronted` and the WebSocket upgr
 
 ## Reality-style mode (after the alpha)
 
-`tls` shows the node's own certificate, which is why it is rated Detectable. The owner asked for a mode where the node presents a real site's handshake: a client that proves itself in its hello gets the tunnel, everyone else is relayed byte for byte to the real site and sees its genuine certificate. The hardest mode to get right (the proof in the hello, replay, active probes, the chosen site's own behavior), so it gets its own spec, its own threat model section and an outside review before it is offered. Never copy code from Xray (MPL).
+`tls` shows the node's own certificate, which is why it is rated Detectable. The owner asked for a mode where the node presents a real site's handshake: a client that proves itself in its hello gets the tunnel, everyone else is relayed byte for byte to the real site and sees its genuine certificate. The hardest mode to get right (the proof in the hello, replay, active probes, the chosen site's own behavior), so it gets its own spec and its own threat model section. Without an outside review it is offered as alpha only, off by default and labeled as such. Never copy code from Xray (MPL).
 
 ## Xray add-on
 
