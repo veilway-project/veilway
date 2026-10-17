@@ -84,7 +84,7 @@ pub struct Host {
 	/// Every stream listener by its listen address, with the tasks that accept on it and learn the header fields of its upgrade answer. It lives for as long as a config has a `tls` transport on the address, and its sessions with it.
 	tls: HashMap<SocketAddr, (Arc<stream::Listener>, [Task; 2])>,
 	/// Every `faketls` listener by its listen address, with the task that accepts on it. It lives for as long as a config has a `faketls` transport on the address, and its sessions with it.
-	faketls: HashMap<SocketAddr, (Arc<faketls::Listener>, Task)>,
+	faketls: HashMap<SocketAddr, (Arc<faketls::Listener>, [Task; 2])>,
 	/// By the tag of the inbound.
 	tunnels: HashMap<String, Running>,
 	/// Shared with the `Engine`, which takes it out when it shuts down or is dropped: the interface, its routes and its firewall table go with the engine, while everything else here serves on.
@@ -504,9 +504,9 @@ impl Host {
 		});
 		for (addr, socket) in borrowed {
 			let Some(served) = borrowing.remove(&addr) else {continue};
-			tracing::info!("faketls listener {addr}: alpha, new and unreviewed. Whoever is not a user is relayed to the site {}, at most {} at once and {} new connections a second to it, and a user gets a handshake the node makes. The shape of the site is not probed and its flight is not copied live, so this build is Detectable", served.host, served.relayed, served.rate);
+			tracing::info!("faketls listener {addr}: alpha, new and unreviewed. Whoever is not a user is relayed to the site {}, at most {} at once and {} new connections a second to it, and a user gets a handshake the node makes with the sizes and times of the site's own flight, copied live from its answer to the user's hello and from probes of the site (eight now, two seconds apart, then one every 6 h). Nothing of this has been measured against a real site, so this build is Detectable", served.host, served.relayed, served.rate);
 			let listener = shared.faketls.listen(addr, served, Clock::of((shared.now)()).ms);
-			self.faketls.insert(addr, (listener.clone(), Task(faketls::accept(shared, listener, socket))));
+			self.faketls.insert(addr, (listener.clone(), [Task(faketls::probing(shared, &listener)), Task(faketls::accept(shared, listener.clone(), socket))]));
 		}
 		// The pin is said at every start and reload: it is what the operator copies into profiles, and the log is where a node without the control API shows it.
 		for (made, fresh) in &certified {tracing::info!("stream listener {}: tls with a self-signed certificate the node {}, valid until {}, pin {}", made.listen, if *fresh {"made now"} else {"keeps"}, OffsetDateTime::from_unix_timestamp(made.not_after).map_or_else(|_| made.not_after.to_string(), |at| at.date().to_string()), made.pin_text())}

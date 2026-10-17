@@ -6,6 +6,7 @@
 pub mod chunk;
 pub mod control;
 pub mod faketls;
+pub mod flight;
 pub mod fronted;
 pub mod h2;
 pub mod http;
@@ -20,6 +21,7 @@ pub mod shape;
 pub mod shaped;
 pub mod sse;
 pub mod subscription;
+pub mod tls13;
 pub mod udp_obfs;
 mod unicode;
 pub mod websocket;

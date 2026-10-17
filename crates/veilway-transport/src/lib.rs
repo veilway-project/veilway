@@ -25,7 +25,9 @@ mod h2;
 #[cfg(test)]
 mod hello_test;
 pub mod http;
+pub mod mlkem;
 mod parallel;
+pub mod probe;
 mod shaped;
 pub mod stream;
 mod tls;

@@ -3094,6 +3094,7 @@ dependencies = [
  "veilway-hpack",
  "veilway-proto",
  "x25519-dalek 3.0.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3119,6 +3120,7 @@ dependencies = [
  "veilway-proto",
  "x25519-dalek 3.0.0",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

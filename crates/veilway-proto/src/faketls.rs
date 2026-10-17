@@ -24,6 +24,8 @@ const RANDOM: usize = 6;
 const SESSION: usize = 39;
 const CARRIER: usize = 64;
 const PLAIN: usize = 48;
+// What the key agreement is run on when a hello has no share, so that a hello that is no proof costs the node the same work.
+const DUMMY_SHARE: [u8; 32] = [9; 32];
 // The order of the P-256 group.
 const ORDER: [u8; 32] = [0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51];
 
@@ -33,6 +35,8 @@ pub struct Parsed<'a> {
 	pub name: &'a [u8],
 	pub tls13: bool,
 	pub share: usize,
+	/// The offset of the X25519 part of the hybrid share, when the hello has one.
+	pub hybrid: Option<usize>,
 }
 
 fn be16(bytes: &[u8], at: usize) -> Option<usize> {Some(usize::from(u16::from_be_bytes([*bytes.get(at)?, *bytes.get(at + 1)?])))}
@@ -56,8 +60,8 @@ fn offers_tls13(body: &[u8]) -> Option<bool> {
 	(usize::from(*count) == list.len() && list.len() % 2 == 0).then(|| list.chunks(2).any(|pair| pair == [3, 4]))
 }
 
-// The offset of `X` in a key_share extension whose body starts at `start` in the message: the standalone X25519 value, or else the X25519 part after the 1,184 bytes of the ML-KEM-768 key of the hybrid group.
-fn key_share(body: &[u8], start: usize) -> Option<usize> {
+// The offsets in a key_share extension whose body starts at `start` in the message: of the standalone X25519 value, and of the X25519 part after the 1,184 bytes of the ML-KEM-768 key of the hybrid group.
+fn key_share(body: &[u8], start: usize) -> Option<(Option<usize>, Option<usize>)> {
 	let list = body.get(2..)?;
 	if be16(body, 0)? != list.len() {return None}
 	let (mut at, mut standalone, mut hybrid) = (0, None, None);
@@ -72,7 +76,7 @@ fn key_share(body: &[u8], start: usize) -> Option<usize> {
 		}
 		at = value + size;
 	}
-	standalone.or(hybrid)
+	Some((standalone, hybrid))
 }
 
 /// Reads a ClientHello handshake message, with its 4 byte header. Nothing is read past the end of the message, and a message that is not exactly one ClientHello, or that lacks a server name, a TLS 1.3 offer or a share `X`, is `None`.
@@ -84,7 +88,7 @@ pub fn parse(message: &[u8]) -> Option<Parsed<'_>> {
 	let end = at + 2 + be16(message, at)?;
 	if end != message.len() {return None}
 	at += 2;
-	let (mut name, mut tls13, mut share) = (None, false, None);
+	let (mut name, mut tls13, mut share) = (None, false, None::<(Option<usize>, Option<usize>)>);
 	while at < end {
 		let (kind, size, start) = (be16(message, at)?, be16(message, at + 2)?, at + 4);
 		let body = message.get(start..start + size)?;
@@ -96,7 +100,8 @@ pub fn parse(message: &[u8]) -> Option<Parsed<'_>> {
 		}
 		at = start + size;
 	}
-	Some(Parsed {name: name?, tls13, share: share?})
+	let (standalone, hybrid) = share?;
+	Some(Parsed {name: name?, tls13, share: standalone.or(hybrid)?, hybrid})
 }
 
 // The 64 bytes of the carrier: `random`, then the legacy session id. Only called on a message that `parse` has read.
@@ -175,16 +180,17 @@ impl Node {
 		Ok(Self {secret, public: x25519(secret, X25519_BASEPOINT_BYTES), inbound, dummy: BinderKey::derive(&dummy, &inbound, &device)})
 	}
 	/// Steps 1 to 6 of "Verifying" for a complete ClientHello `message`. `names` are the site's names a hello may ask for. The tags are looked up as hour tags only.
+	/// "Steps 1 to 6 are done for every complete hello with dummy inputs where a field is missing, and their results are combined at the end": a hello that is no proof costs the same X25519, the same AEAD open, and the same lookup and binder as one that is.
 	pub fn open<'a, T>(&self, message: &[u8], names: &[&[u8]], tags: &'a impl Tags<T>) -> Outcome<'a, T> {
-		let Some(parsed) = parse(message) else {return Outcome::Stranger};
-		if !parsed.tls13 || !names.contains(&parsed.name) {return Outcome::Stranger}
-		let Some(share) = message.get(parsed.share..parsed.share + 32).and_then(|bytes| bytes.try_into().ok()) else {return Outcome::Stranger};
-		let dh = x25519(self.secret, share);
+		let parsed = parse(message);
+		let named = parsed.as_ref().is_some_and(|parsed| parsed.tls13 && names.contains(&parsed.name));
+		let share: [u8; 32] = parsed.as_ref().and_then(|parsed| message.get(parsed.share..parsed.share + 32)).and_then(|bytes| bytes.try_into().ok()).unwrap_or(DUMMY_SHARE);
 		// A share of low order gives the all-zero result, which no sealer can have made a key of.
-		if dh == [0; 32] {return Outcome::Stranger}
-		let (sealed, borrowed) = (carrier(message), Borrowed::new(&dh));
-		let mut buf = sealed;
-		let Ok(plain) = borrowed.seal(&share, &self.public, &self.inbound).0.open_in_place(aead::Nonce::assume_unique_for_key([0; 12]), aead::Aad::from(&scrubbed(message)[..]), &mut buf) else {return Outcome::Stranger};
+		let (dh, sealed) = (x25519(self.secret, share), if parsed.is_some() {carrier(message)} else {[0; CARRIER]});
+		let (borrowed, mut buf) = (Borrowed::new(&dh), sealed);
+		let aad = if parsed.is_some() {scrubbed(message)} else {FAKETLS_AAD.to_vec()};
+		let opened = borrowed.seal(&share, &self.public, &self.inbound).0.open_in_place(aead::Nonce::assume_unique_for_key([0; 12]), aead::Aad::from(&aad[..]), &mut buf).is_ok();
+		let plain: [u8; PLAIN] = if opened {std::array::from_fn(|index| buf[index])} else {[0; PLAIN]};
 		let version = plain[0] ^ VERSION;
 		let zeros = plain[1..4].iter().chain(&plain[44..PLAIN]).fold(version, |all, byte| all | byte);
 		let timestamp = u64::from_be_bytes(std::array::from_fn(|index| plain[4 + index]));
@@ -192,6 +198,7 @@ impl Node {
 		let binder = device.map_or(&self.dummy, |device| &device.binder);
 		let mac = binder.short(&[&borrowed.binder(&share), &plain[..28]]);
 		let bound: bool = mac[..].ct_eq(&plain[28..44]).into();
+		if !(named && opened && dh != [0; 32]) {return Outcome::Stranger}
 		match device.filter(|_| zeros == 0 && bound) {
 			Some(device) => Outcome::Proved(Opened {device, timestamp, share, seed: borrowed.node_seed(&share, &sealed)}),
 			None => Outcome::Refused,
@@ -443,5 +450,15 @@ mod tests {
 		let message = hello_with(SITE, &[3, 4], Some(&share), Some(&hybrid));
 		let parsed = parse(&message).unwrap();
 		assert_eq!(&message[parsed.share..parsed.share + 32], &share[..]);
+	}
+	#[test]
+	fn a_message_with_nothing_to_read_is_a_stranger_after_the_same_work_as_any_other() {
+		let (table, node) = (table(NOW), node());
+		for message in [vec![], vec![1, 0, 0, 0], vec![1; 70], vec![1; 71], vec![0xff; 4000]] {assert!(matches!(node.open(&message, &[SITE], &table), Outcome::Stranger))}
+		// A hello whose carrier does not open takes the same path to the same answer as one with a name that is none.
+		let message = sealed([0x31; 32], NOW);
+		let mut flipped = message.clone();
+		flipped[RANDOM + 1] ^= 1;
+		assert!(matches!(node.open(&flipped, &[SITE], &table), Outcome::Stranger) && matches!(node.open(&message, &[b"other.example"], &table), Outcome::Stranger));
 	}
 }

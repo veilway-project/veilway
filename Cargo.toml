@@ -57,6 +57,10 @@ webpki-roots="1"
 zip={version="9.0", default-features=false, features=["deflate-flate2-zlib-rs"]}
 # HPACK (RFC 7541) for the HTTP/2 of the stream transports: the Huffman table and the dynamic table, as a function over header blocks. The frames, their order and every limit are written in `veilway-proto`'s `h2`. It depends on `tracing` alone. Vendored in `vendor/fluke-hpack` with local patches, each marked there.
 fluke-hpack={package="veilway-hpack", version="0.3.1-veilway.1", path="vendor/fluke-hpack"}
+# ML-KEM-768 for the hybrid group X25519MLKEM768 of `faketls`, from the BoringSSL the client's hello is already made with (`boring`'s own bindings, which list `mlkem.h`), called in one module of `veilway-transport` with two functions each way. rustls' aws-lc-rs provider was the other way: it would bring a second crypto library (aws-lc-sys, a C build of its own) next to `ring` and BoringSSL for a listener that writes its own handshake and so would use only its ML-KEM, and the node needs no TLS library for this listener at all. The library's generated bindings are not wrapped by `boring`, so this is the same crate at the same version, and `cargo deny` sees no new package.
+boring-sys="5.3"
+# Wipes the secrets of the `faketls` handshake (the key agreement results, the traffic secrets, the ML-KEM private key) when they are done with. It is a crate the tree already has (argon2, hpke and the RustCrypto crates bring it), so `cargo deny` sees no new package, and it is what those crates wipe their own keys with.
+zeroize="1"
 # Argon2id for the sealed subscription file, as a plain function over bytes the caller drew. Pure Rust, no features beyond heap memory.
 argon2={version="0.5", default-features=false, features=["alloc"]}
 

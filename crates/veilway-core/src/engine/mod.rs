@@ -197,10 +197,12 @@ pub struct Options {
 	pub addons: Option<PathBuf>,
 	/// The unix socket of the Xray host, which starts Xray as a user of its own, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
 	pub xray_socket: Option<PathBuf>,
+	/// How long the probes of the site of a `faketls` transport wait at each step. Tests replace it so as not to wait that long.
+	pub probes: veilway_transport::probe::Patience,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None, probes: Default::default()}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -693,6 +695,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER}).collect(), ..Plan::default()};
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots));
+	shared.faketls.set_patience(options.probes);
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let dir = options.dir.clone();
 	let mut host = Host::new(options.dir);

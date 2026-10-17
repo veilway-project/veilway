@@ -26,6 +26,9 @@ use veilway_core::{Engine, FakeTlsTotals, Options, Over};
 use veilway_proto::proof;
 use veilway_proto::subscription::payload::Padding;
 use veilway_proto::subscription::Secret;
+use veilway_proto::flight::{Flight, Wire};
+use veilway_proto::tls13::{write_server_hello, Suite, HYBRID, KEM_CIPHERTEXT, X25519};
+use veilway_transport::probe::{probe, Mode, Patience};
 use veilway_transport::{faketls, flow, End, Ended, Env, Front, Kind, Link, Session, Source, State, Target, Unreachable, Want};
 
 const GATEWAY: [u8; 4] = [10, 7, 0, 1];
@@ -43,6 +46,12 @@ const SECOND: Duration = Duration::from_secs(1);
 /// What a quiet connection is given to stay quiet in.
 const QUIET: Duration = Duration::from_millis(500);
 const PLAIN: Kind = Kind::Packet {flow: 0, control: false};
+/// How long the probes of a test node wait: the site of a test answers at once and ends a connection that is idle after 250 ms.
+const QUICK: Patience = Patience {gap: Duration::from_millis(10), collect: Duration::from_millis(60), idle: Duration::from_millis(600), reaction: Duration::from_millis(600)};
+/// How long the site of a test lets a connection that has finished its handshake sit idle before it closes it.
+const SITE_IDLE: Duration = Duration::from_millis(250);
+/// How long the site of a test waits to answer a `close_notify`.
+const NOTIFY_DELAY: Duration = Duration::from_millis(200);
 /// Port 0 is no listen port of a config, so every listener of a test node takes the next one from here.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(31000);
 /// Every log line of the process, at info.
@@ -118,7 +127,8 @@ impl Drop for Site {
 	fn drop(&mut self) {self.task.abort()}
 }
 
-async fn site() -> Site {
+/// The same site, which waits `delay` before it answers a hello.
+async fn site_after(delay: Duration) -> Site {
 	let made = rcgen::generate_simple_self_signed(vec![NAME.to_string()]).unwrap();
 	let der = CertificateDer::from(made.cert.der().to_vec());
 	let config = ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![der.clone()], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
@@ -132,11 +142,17 @@ async fn site() -> Site {
 				connections.fetch_add(1, Ordering::SeqCst);
 				let acceptor = acceptor.clone();
 				tokio::spawn(async move {
+					tokio::time::sleep(delay).await;
 					let Ok(mut tls) = acceptor.accept(stream).await else {return};
 					let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
 					while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-						match tls.read(&mut buf).await {
-							Ok(count) if count > 0 => head.extend_from_slice(&buf[..count]),
+						match timeout(SITE_IDLE, tls.read(&mut buf)).await {
+							Ok(Ok(count)) if count > 0 => head.extend_from_slice(&buf[..count]),
+							Err(_) => return drop(tls.shutdown().await),
+						Ok(Ok(0)) => {
+							tokio::time::sleep(NOTIFY_DELAY).await;
+							return drop(tls.shutdown().await);
+						}
 							_ => return,
 						}
 					}
@@ -149,8 +165,8 @@ async fn site() -> Site {
 	Site {addr, der, connections, task}
 }
 
-/// A pipe between two ends that records what the end that dialled said, as it was handed on. With `flip` set to a position, the next connection's byte at that position is changed on the way. What is recorded is what the other end received.
-struct Tap {addr: SocketAddr, seen: Arc<Mutex<Vec<Vec<u8>>>>, flip: Arc<AtomicUsize>, task: JoinHandle<()>}
+/// A pipe between two ends that records what the end that dialled said, as it was handed on, and what came back to it. With `flip` set to a position, the next connection's byte at that position is changed on the way. What is recorded as seen is what the other end received.
+struct Tap {addr: SocketAddr, seen: Arc<Mutex<Vec<Vec<u8>>>>, heard: Arc<Mutex<Vec<Vec<u8>>>>, flip: Arc<AtomicUsize>, task: JoinHandle<()>}
 
 impl Drop for Tap {
 	fn drop(&mut self) {self.task.abort()}
@@ -158,18 +174,19 @@ impl Drop for Tap {
 
 async fn tap(upstream: SocketAddr) -> Tap {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let (addr, seen, flip) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::<Vec<u8>>::new())), Arc::new(AtomicUsize::new(0)));
+	let (addr, seen, heard, flip) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::<Vec<u8>>::new())), Arc::new(Mutex::new(Vec::<Vec<u8>>::new())), Arc::new(AtomicUsize::new(0)));
 	let task = tokio::spawn({
-		let (seen, flip) = (seen.clone(), flip.clone());
+		let (seen, heard, flip) = (seen.clone(), heard.clone(), flip.clone());
 		async move {
 			loop {
 				let Ok((client, _)) = listener.accept().await else {return};
-				let (seen, flip) = (seen.clone(), flip.clone());
+				let (seen, heard, flip) = (seen.clone(), heard.clone(), flip.clone());
 				tokio::spawn(async move {
 					let Ok(up) = TcpStream::connect(upstream).await else {return};
 					let at = {
 						let mut seen = seen.lock().unwrap();
 						seen.push(Vec::new());
+						heard.lock().unwrap().push(Vec::new());
 						seen.len() - 1
 					};
 					let ((mut from_client, mut to_client), (mut from_up, mut to_up)) = (client.into_split(), up.into_split());
@@ -194,7 +211,10 @@ async fn tap(upstream: SocketAddr) -> Tap {
 						let mut buf = vec![0u8; 65536];
 						loop {
 							match from_up.read(&mut buf).await {
-								Ok(count) if count > 0 => if to_client.write_all(&buf[..count]).await.is_err() {return},
+								Ok(count) if count > 0 => {
+									heard.lock().unwrap()[at].extend_from_slice(&buf[..count]);
+									if to_client.write_all(&buf[..count]).await.is_err() {return}
+								}
 								_ => return drop(to_client.shutdown().await),
 							}
 						}
@@ -204,7 +224,7 @@ async fn tap(upstream: SocketAddr) -> Tap {
 			}
 		}
 	});
-	Tap {addr, seen, flip, task}
+	Tap {addr, seen, heard, flip, task}
 }
 
 /// A new directory for one test.
@@ -246,16 +266,25 @@ fn parsed(doc: &Value) -> Config {
 struct Node {engine: Engine, addr: SocketAddr, doc: Value, time: Time, site: Site, to_site: Tap, front: Tap}
 
 /// Starts a node on `document` after `change` had its way with it. Its replay file is one a node left that was killed 100 seconds ago, so it takes proofs from its first moment.
-async fn launch(test: &str, time: Time, change: impl FnOnce(&mut Value)) -> Node {
+async fn launch(test: &str, time: Time, change: impl FnOnce(&mut Value)) -> Node {launch_after(test, time, Duration::ZERO, change).await}
+
+/// The same, with a site that waits `delay` before it answers a hello.
+async fn launch_after(test: &str, time: Time, delay: Duration, change: impl FnOnce(&mut Value)) -> Node {
 	LOGGING.call_once(|| tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_ansi(false).with_writer(|| Sink).init());
-	let (dir, addr, site) = (scratch(test), listen(), site().await);
+	let (dir, addr, site) = (scratch(test), listen(), site_after(delay).await);
 	let to_site = tap(site.addr).await;
 	let mut doc = document(proxy().await, addr, to_site.addr);
 	change(&mut doc);
 	seed(&dir.join("replay"), time.secs() - 100, time.secs() - 100);
-	let engine = veilway_core::start(&parsed(&doc), Options {now: time.now, replay: Some(dir.join("replay")), ..Options::new(&dir)}).await.unwrap();
+	let engine = veilway_core::start(&parsed(&doc), Options {now: time.now, replay: Some(dir.join("replay")), probes: QUICK, ..Options::new(&dir)}).await.unwrap();
 	let front = tap(addr).await;
-	Node {engine, addr, doc, time, site, to_site, front}
+	let node = Node {engine, addr, doc, time, site, to_site, front};
+	// The eight probes of the start are connections to the site too: the tests count what a connection of theirs does, so they are waited for and forgotten.
+	eventually("the probes did not finish", || node.totals().probes + node.totals().probe_failed >= 8).await;
+	node.to_site.seen.lock().unwrap().clear();
+	node.to_site.heard.lock().unwrap().clear();
+	node.site.connections.store(0, Ordering::SeqCst);
+	node
 }
 
 impl Node {
@@ -465,6 +494,128 @@ async fn eager() -> (SocketAddr, JoinHandle<()>) {
 /// The first TLS record of what a client sent, which is its hello.
 fn record(sent: &[u8]) -> &[u8] {&sent[..5 + usize::from(u16::from_be_bytes([sent[3], sent[4]]))]}
 
+/// Like `ask`, with the offset of every read from the moment the bytes were written.
+async fn ask_timed(to: SocketAddr, bytes: &[u8], patience: Duration) -> (Vec<(Duration, Vec<u8>)>, bool) {
+	let (mut io, mut got, mut buf) = (TcpStream::connect(to).await.unwrap(), Vec::new(), vec![0u8; 65536]);
+	let started = Instant::now();
+	let _ = io.write_all(bytes).await;
+	loop {
+		match timeout(patience, io.read(&mut buf)).await {
+			Ok(Ok(count)) if count > 0 => got.push((started.elapsed(), buf[..count].to_vec())),
+			Ok(_) => return (got, true),
+			Err(_) => return (got, false),
+		}
+	}
+}
+
+/// Sends `first`, reads until nothing comes for `patience`, sends `second` and reads until the connection ends or 1.5 s pass. What came before, what came after, and whether the other end closed.
+async fn ask_twice(to: SocketAddr, first: &[u8], second: &[u8], patience: Duration) -> (Vec<u8>, Vec<u8>, bool) {
+	let (mut io, mut buf) = (TcpStream::connect(to).await.unwrap(), vec![0u8; 65536]);
+	io.write_all(first).await.unwrap();
+	let (mut one, mut two) = (Vec::new(), Vec::new());
+	while let Ok(Ok(count)) = timeout(patience, io.read(&mut buf)).await {
+		if count == 0 {return (one, two, true)}
+		one.extend_from_slice(&buf[..count]);
+	}
+	io.write_all(second).await.unwrap();
+	loop {
+		match timeout(Duration::from_millis(1500), io.read(&mut buf)).await {
+			Ok(Ok(count)) if count > 0 => two.extend_from_slice(&buf[..count]),
+			Ok(_) => return (one, two, true),
+			Err(_) => return (one, two, false),
+		}
+	}
+}
+
+/// What a site sent for a hello, as the library reads it, with at most `limit` encrypted records.
+fn flight_of(sent: &[u8], hello: &[u8], limit: usize) -> Flight {
+	Flight::read(&[(Duration::ZERO, sent.to_vec())], &hello[5 + 39..5 + 71], limit).unwrap_or_else(|| panic!("no flight in {} bytes starting {:02x?}", sent.len(), &sent[..sent.len().min(8)]))
+}
+
+/// A flight as a comparison between two takes it: the choices of the site and the records in order, not how the reads happened to cut them.
+fn sizes(flight: &Flight) -> (Suite, u16, bool, Vec<Wire>) {(flight.suite, flight.group, flight.key_first, flight.bursts.iter().flat_map(|burst| burst.wire.clone()).collect())}
+
+/// A site that is only a flight, for the sizes and the delay to be seen alone: it reads a hello, waits `wait`, writes a ServerHello of `suite` and `group`, the compatibility record and encrypted records of `sizes` in one write, and sits on the connection. What it writes cannot be read by anybody, so no probe of it succeeds.
+async fn scripted(suite: Suite, group: u16, wait: Duration, sizes: Vec<usize>) -> (SocketAddr, JoinHandle<()>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	(addr, tokio::spawn(async move {
+		loop {
+			let Ok((mut stream, _)) = listener.accept().await else {return};
+			let sizes = sizes.clone();
+			tokio::spawn(async move {
+				let mut hello = vec![0u8; 5];
+				if stream.read_exact(&mut hello).await.is_err() {return}
+				let mut rest = vec![0u8; usize::from(u16::from_be_bytes([hello[3], hello[4]]))];
+				if stream.read_exact(&mut rest).await.is_err() {return}
+				hello.extend_from_slice(&rest);
+				tokio::time::sleep(wait).await;
+				let message = write_server_hello(&hello[5 + 39..5 + 71], suite, group, false, &[7; 32], &vec![9u8; if group == X25519 {32} else {KEM_CIPHERTEXT + 32}]);
+				let mut out = [&[22, 3, 3, (message.len() >> 8) as u8, message.len() as u8][..], &message, &[20, 3, 3, 0, 1, 1]].concat();
+				for size in &sizes {out.extend_from_slice(&[&[23, 3, 3, (size >> 8) as u8, *size as u8][..], &vec![0x5a; *size]].concat())}
+				let _ = stream.write_all(&out).await;
+				let mut sink = [0u8; 256];
+				while stream.read(&mut sink).await.is_ok_and(|count| count > 0) {}
+			});
+		}
+	}))
+}
+
+/// A user's session, opened and closed, and the hello it began with.
+async fn recorded(node: &Node) -> Vec<u8> {
+	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
+	peer.connect().await.unwrap_or_else(|ended| panic!("the session did not open: {ended:?}"));
+	peer.session.close().await;
+	record(&node.front.seen.lock().unwrap()[0]).to_vec()
+}
+
+/// Connections of strangers at once, enough to spend the burst of the budget for new connections to the site.
+async fn exhaust(node: &Node) {
+	let mut asks = Vec::new();
+	for _ in 0..80 {
+		let to = node.addr;
+		asks.push(tokio::spawn(async move {ask(to, b"GET / HTTP/1.1\r\n\r\n", Duration::from_millis(300)).await}));
+	}
+	for ask in asks {ask.await.unwrap();}
+}
+
+/// A pipe in front of `upstream` that cuts what the upstream sends for a connection after its first `cut` bytes and waits `gap` before it sends the rest: a site whose flight comes in two bursts.
+async fn stagger(upstream: SocketAddr, cut: usize, gap: Duration) -> (SocketAddr, JoinHandle<()>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	(addr, tokio::spawn(async move {
+		loop {
+			let Ok((client, _)) = listener.accept().await else {return};
+			tokio::spawn(async move {
+				let Ok(up) = TcpStream::connect(upstream).await else {return};
+				let ((mut from_client, mut to_client), (mut from_up, mut to_up)) = (client.into_split(), up.into_split());
+				let forward = async {
+					let mut buf = vec![0u8; 65536];
+					while let Ok(count) = from_client.read(&mut buf).await {
+						if count == 0 || to_up.write_all(&buf[..count]).await.is_err() {break}
+					}
+					drop(to_up.shutdown().await);
+				};
+				let back = async {
+					let (mut buf, mut sent) = (vec![0u8; 65536], 0);
+					while let Ok(count) = from_up.read(&mut buf).await {
+						if count == 0 {break}
+						let head = cut.saturating_sub(sent).min(count);
+						if head > 0 && head < count {
+							if to_client.write_all(&buf[..head]).await.is_err() || to_client.flush().await.is_err() {return}
+							tokio::time::sleep(gap).await;
+						}
+						if to_client.write_all(&buf[head..count]).await.is_err() || to_client.flush().await.is_err() {return}
+						sent += count;
+					}
+					drop(to_client.shutdown().await);
+				};
+				tokio::join!(forward, back);
+			});
+		}
+	}))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stranger_with_an_ordinary_hello_completes_the_handshake_of_the_site_and_sees_its_certificate() {
 	let time = time!();
@@ -536,9 +687,10 @@ async fn a_device_with_the_proof_gets_a_session_and_its_tunnel_works() {
 	let (totals, numbers) = (node.totals(), peer.session.numbers());
 	assert_eq!((totals.proofs_accepted, totals.established, totals.sessions, totals.pending, totals.refused_hello, totals.stranger_hello), (1, 1, 1, 0, 0, 0));
 	assert!(numbers.sent >= 5 && numbers.received >= 4 && numbers.dropped == 0 && numbers.heard.is_some(), "{numbers:?}");
-	// The user's connection needed nothing of the site: what the node opened at accept was closed unused, and no stranger was relayed.
+	// The user's connection was never relayed: what the node opened at accept was sent the hello, to read the site's flight for it, and nothing else.
 	assert_eq!((totals.relays, totals.early_connections), (0, 1));
-	assert!(node.to_site.seen.lock().unwrap().iter().all(Vec::is_empty));
+	let hello = record(&node.front.seen.lock().unwrap()[0]).to_vec();
+	eventually("the site was not sent the hello", || node.to_site.seen.lock().unwrap().first() == Some(&hello)).await;
 	// Two devices at once, each on its own connection.
 	let mut second = node.peer(1, &link(1, &TRANSPORT), 0);
 	second.connect().await.unwrap();
@@ -551,21 +703,33 @@ async fn a_device_with_the_proof_gets_a_session_and_its_tunnel_works() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_hello_that_is_sent_again_gets_a_flight_nobody_can_read_and_never_reaches_the_site() {
+async fn a_hello_that_is_sent_again_gets_a_flight_of_the_sizes_the_site_gives_for_those_bytes() {
 	let time = time!();
 	let node = launch("replay", time, |_| {}).await;
-	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
-	peer.connect().await.unwrap();
-	peer.session.close().await;
-	let hello = record(&node.front.seen.lock().unwrap()[0]).to_vec();
+	let hello = recorded(&node).await;
 	assert_eq!(hello[..3], [22, 3, 1]);
-	// The same bytes from a new connection: the carrier opens and the replay rule says it was seen. It is not relayed to the site: the node answers with a ServerHello and the rest of a flight whose leaf is random.
-	let (flight, closed) = ask(node.addr, &hello, SECOND).await;
-	assert!(!closed && flight.len() > 200 && flight[..3] == [22, 3, 3] && flight[5] == 2, "the answer to a replayed hello is no flight of the node: {} bytes starting {:02x?}", flight.len(), &flight[..flight.len().min(8)]);
+	// The same bytes from a new connection: the carrier opens and the replay rule says it was seen. It is not relayed: the node answers with a ServerHello and the rest of a flight whose leaf is random, and the site is sent the bytes to read its flight for them.
+	let answer = ask(node.addr, &hello, SECOND).await.0;
+	assert!(answer.len() > 200 && answer[..3] == [22, 3, 3] && answer[5] == 2, "the answer to a replayed hello is no flight of the node: {} bytes starting {:02x?}", answer.len(), &answer[..answer.len().min(8)]);
 	eventually("the replay was not refused as seen", || node.totals().refused_seen == 1).await;
-	assert!(node.to_site.seen.lock().unwrap().iter().all(|seen| !seen.windows(64).any(|window| window == &hello[..64])), "the replayed hello reached the site");
+	eventually("the site was not sent the hello twice", || node.to_site.seen.lock().unwrap().len() == 2).await;
+	assert!(node.to_site.seen.lock().unwrap().iter().all(|seen| *seen == hello), "the site was sent more than the hello");
+	// The paired comparison: the same bytes straight to the site, the flight of the user's own connection, and the copy that was replayed. The site's sizes, its choices and the grouping of its records are in all three.
+	let (direct, _) = ask(node.site.addr, &hello, SECOND).await;
+	let site = flight_of(&direct, &hello, 64);
+	let limit = site.sealed().len();
+	let (own, copy) = (flight_of(&node.front.heard.lock().unwrap()[0], &hello, limit), flight_of(&answer, &hello, limit));
+	// What the site sent the node for the two copies of the hello is what each of them was answered with, to the byte. The site's own flight varies by a byte or two from one connection to the next (a signature in DER is 70 to 72 bytes), so against the direct one the sizes are held to that.
+	let heard = node.to_site.heard.lock().unwrap().clone();
+	let (for_user, for_copy) = (flight_of(&heard[0], &hello, limit), flight_of(&heard[1], &hello, limit));
+	assert_eq!((sizes(&own), sizes(&copy)), (sizes(&for_user), sizes(&for_copy)));
+	for flight in [&own, &copy] {
+		assert_eq!((flight.suite, flight.group, flight.key_first, flight.sealed().len()), (site.suite, site.group, site.key_first, limit));
+		assert!(flight.sealed().iter().zip(site.sealed()).all(|(made, shown)| made.abs_diff(shown) <= 3), "{:?} against {:?}", flight.sealed(), site.sealed());
+	}
 	let totals = node.totals();
-	assert_eq!((totals.stranger_hello, totals.proofs_accepted, totals.sessions), (0, 1, 0));
+	assert_eq!((totals.stranger_hello, totals.proofs_accepted, totals.sessions, totals.flights_live, totals.flights_generic, totals.flights_live_miss), (0, 1, 0, 2, 0, 0));
+	assert!(totals.probes >= 8 && totals.shapes >= 1, "{totals:?}");
 	// The client's next attempt has a hello of its own and is taken.
 	let mut again = node.peer(0, &link(0, &TRANSPORT), 0);
 	again.connect().await.unwrap();
@@ -615,8 +779,9 @@ async fn a_proof_with_a_clock_off_gets_a_flight_that_does_not_match_and_no_sessi
 	eventually("the unknown device was not refused", || node.totals().refused_hello == 2).await;
 	let totals = node.totals();
 	assert_eq!((totals.proofs_accepted, totals.sessions, totals.pending, totals.stranger_hello), (0, 0, 0, 0));
-	// The site was never sent a byte of any of them: what the node opened at accept was closed unused.
-	assert!(node.to_site.seen.lock().unwrap().iter().all(Vec::is_empty));
+	// The site was sent the hello of each and nothing else, to read its flight for it, and none of them was relayed.
+	eventually("the site was not sent the hellos", || node.to_site.seen.lock().unwrap().len() >= 3).await;
+	assert!(node.to_site.seen.lock().unwrap().iter().all(|seen| seen[..3] == [22, 3, 1] && 5 + usize::from(u16::from_be_bytes([seen[3], seen[4]])) == seen.len()));
 	// A client with the right clock is taken after all of that.
 	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
 	peer.connect().await.unwrap();
@@ -719,5 +884,176 @@ async fn a_site_that_cannot_be_reached_closes_strangers_with_no_answer_and_serve
 	peer.connect().await.unwrap_or_else(|ended| panic!("a user was refused while the site was down: {ended:?}"));
 	assert_eq!(peer.leaves(40005).await.as_deref(), Some("main"));
 	peer.session.close().await;
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_flight_of_a_copy_has_the_sizes_the_group_the_suite_and_the_delay_of_the_sites_flight() {
+	let time = time!();
+	let sizes_of_the_site = vec![1200, 1400, 600];
+	let (site, _task) = scripted(Suite::Aes256, HYBRID, Duration::from_millis(150), sizes_of_the_site.clone()).await;
+	let node = launch("scripted", time, |doc| doc["inbounds"][0]["transports"][0]["site"]["address"] = json!(site.to_string())).await;
+	// The probes of a site that cannot complete a handshake keep nothing, and say so.
+	let totals = node.totals();
+	assert_eq!((totals.probes, totals.shapes), (0, 0));
+	assert!(totals.probe_failed >= 8 && logged("failed:"), "{totals:?}");
+	// The client holds the keys of the hybrid share, so the node answers in the group the site chose, and the session works over it.
+	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
+	peer.connect().await.unwrap_or_else(|ended| panic!("the session did not open in the hybrid group: {ended:?}"));
+	assert_eq!(peer.leaves(40010).await.as_deref(), Some("main"));
+	peer.session.close().await;
+	let hello = record(&node.front.seen.lock().unwrap()[0]).to_vec();
+	let own = flight_of(&node.front.heard.lock().unwrap()[0], &hello, 3);
+	assert_eq!((own.suite, own.group, own.sealed()), (Suite::Aes256, HYBRID, sizes_of_the_site));
+	// A copy of the hello gets the same, and not before the site would have answered.
+	let (reads, closed) = ask_timed(node.addr, &hello, SECOND).await;
+	let sent: Vec<u8> = reads.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+	let copy = flight_of(&sent, &hello, 3);
+	assert!(!closed && sizes(&copy) == sizes(&own));
+	assert!(reads[0].0 >= Duration::from_millis(140), "the first byte of the copy came after {:?}, before the site's 150 ms", reads[0].0);
+	assert!(node.totals().flights_live >= 2);
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_first_byte_of_a_copy_comes_when_the_sites_does_and_a_kept_shape_carries_the_time_when_there_is_no_live_answer() {
+	let time = time!();
+	let node = launch_after("timing", time, Duration::from_millis(200), |doc| doc["inbounds"][0]["transports"][0]["limits"] = json!({"site_rate": 1})).await;
+	let hello = recorded(&node).await;
+	// The live copy: the same bytes to the node and to the site, from one place.
+	let ((copy, _), (direct, _)) = (ask_timed(node.addr, &hello, SECOND).await, ask_timed(node.site.addr, &hello, SECOND).await);
+	let (at_copy, at_site) = (copy[0].0, direct[0].0);
+	assert!(at_site >= Duration::from_millis(190) && at_copy >= Duration::from_millis(190), "{at_copy:?} {at_site:?}");
+	assert!(at_copy.abs_diff(at_site) < Duration::from_millis(150), "the copy's first byte came at {at_copy:?} and the site's at {at_site:?}");
+	// With the budget for the site spent there is no connection to read its answer on: the flight is one kept shape's, with the time that shape showed.
+	exhaust(&node).await;
+	let before = node.totals();
+	let (reads, closed) = ask_timed(node.addr, &hello, SECOND).await;
+	assert!(reads[0].0 >= Duration::from_millis(190), "{:?}, closed: {closed}", reads[0].0);
+	let totals = node.totals();
+	assert!(totals.flights_kept > before.flights_kept || totals.flights_live > before.flights_live, "{totals:?}");
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hello_that_opened_and_got_no_session_is_relayed_to_the_site_when_the_allowance_of_its_source_is_spent() {
+	let time = time!();
+	let node = launch("allowance", time, |_| {}).await;
+	let hello = recorded(&node).await;
+	let mut answers = Vec::new();
+	for _ in 0..9 {answers.push(ask(node.addr, &hello, Duration::from_millis(150)).await.0)}
+	// A burst of 4 and one a second: the first are answered with a flight of the node's, and the rest with what the site sent for the hello, as it came. None is closed with no answer.
+	assert!(answers.iter().all(|answer| answer.len() > 100 && answer[5] == 2), "{:?}", answers.iter().map(Vec::len).collect::<Vec<_>>());
+	eventually("the flights over the allowance were not counted", || node.totals().flights_spent >= 1).await;
+	assert!(logged("the allowance of its source or of the listener was spent"));
+	let totals = node.totals();
+	assert_eq!((totals.refused_seen, totals.relays), (9, totals.flights_spent));
+	assert!(totals.flights_spent >= 1 && totals.handshake_failed + totals.flights_spent == 9, "{totals:?}");
+	// A user is not held to it: it has a proof of its own.
+	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
+	peer.connect().await.unwrap();
+	peer.session.close().await;
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayer_that_goes_silent_after_the_flight_gets_the_reaction_of_a_site_to_an_idle_connection() {
+	let time = time!();
+	let node = launch("replayer-silent", time, |_| {}).await;
+	let hello = recorded(&node).await;
+	let shown = probe(node.site.addr, NAME, Mode::Wait, time.secs(), QUICK).await.unwrap().idle.expect("the site ends an idle connection");
+	let started = Instant::now();
+	let (answer, closed) = ask(node.addr, &hello, Duration::from_millis(1800)).await;
+	// Not a bare close at the handshake deadline of 10 s: the alert the site sent when it ended an idle connection, then the end, at about the time it did.
+	assert!(closed && started.elapsed() < Duration::from_secs(5), "closed: {closed} after {:?}", started.elapsed());
+	let (size, ..) = shown.alert.expect("the site sends an alert");
+	assert_eq!(answer[answer.len() - 5 - size..][..3], [23, 3, 3]);
+	assert!(started.elapsed() >= shown.after / 2, "{:?} against {:?}", started.elapsed(), shown.after);
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_flight_goes_out_as_the_sites_comes_in_with_the_serverhello_at_once_and_each_burst_at_its_offset() {
+	let time = time!();
+	let direct = site_after(Duration::ZERO).await;
+	// The ServerHello (127 bytes) and the compatibility record (6) come first, and the encrypted records 200 ms later.
+	let (cut, _task) = stagger(direct.addr, 133, Duration::from_millis(200)).await;
+	let node = launch("burst", time, |doc| doc["inbounds"][0]["transports"][0]["site"]["address"] = json!(cut.to_string())).await;
+	let hello = recorded(&node).await;
+	let (reads, closed) = ask_timed(node.addr, &hello, SECOND).await;
+	let sealed_at = reads.iter().find(|(_, bytes)| bytes.iter().any(|byte| *byte == 23) && bytes.len() > 133).map(|(at, _)| *at).or_else(|| reads.last().map(|(at, _)| *at)).unwrap();
+	assert!(reads.len() >= 2, "{} reads, closed: {closed}", reads.len());
+	assert!(reads[0].0 < Duration::from_millis(120), "the ServerHello came after {:?}", reads[0].0);
+	assert!(sealed_at >= Duration::from_millis(180), "the encrypted records came after {sealed_at:?}, not at the site's 200 ms");
+	let totals = node.totals();
+	assert!(totals.flights_live >= 2 && totals.flights_live_miss == 0, "{totals:?}");
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_node_takes_no_proof_after_24_hours_without_a_probe_and_takes_them_again_after_one() {
+	let time = time!();
+	let mut node = launch("stale", time, |_| {}).await;
+	recorded(&node).await;
+	let rebuilds = node.engine.obfs().table_rebuilds;
+	node.advance(25 * 3600).await;
+	eventually("the tag table did not follow the hour", || node.engine.obfs().table_rebuilds > rebuilds).await;
+	// No probe has succeeded for 24 h by the node's clock: the hello of a user is relayed to the site as a stranger's, which shows it the site's own flight, and it says so.
+	assert_eq!(node.peer(0, &link(0, &TRANSPORT), 0).ended().await, Ended::Unreachable(Unreachable::Certificate));
+	eventually("the hello was not relayed", || node.totals().stranger_stale == 1).await;
+	assert!(logged("no probe of the site has succeeded for 24 h"));
+	assert_eq!(node.totals().proofs_accepted, 1);
+	// A site that changes is probed again at the reload, and the first probe that succeeds ends it.
+	let probes = node.totals().probes;
+	let direct = node.site.addr.to_string();
+	node.reload(|doc| doc["inbounds"][0]["transports"][0]["site"]["address"] = json!(direct)).await;
+	eventually("the site was not probed again", || node.totals().probes > probes).await;
+	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
+	peer.connect().await.unwrap_or_else(|ended| panic!("a user was refused after a probe succeeded: {ended:?}"));
+	assert!(logged("a probe of the site succeeded, so proofs are taken again"));
+	peer.session.close().await;
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replayer_that_sends_garbage_gets_the_reaction_the_site_showed_to_it() {
+	let time = time!();
+	let node = launch("garbage", time, |_| {}).await;
+	let hello = recorded(&node).await;
+	// What the site does to a record that fails to decrypt, from a probe of it as the node makes them.
+	let shown = probe(node.site.addr, NAME, Mode::Garbage, time.secs(), QUICK).await.unwrap().garbage.expect("the site reacts to garbage");
+	let (size, ..) = shown.alert.expect("the site sends an alert");
+	let junk = [&[23u8, 3, 3, 0, 40][..], &[0x42; 40]].concat();
+	let (flight, after, closed) = ask_twice(node.addr, &hello, &junk, Duration::from_millis(100)).await;
+	assert!(flight.len() > 200 && closed, "{} bytes of flight, closed: {closed}", flight.len());
+	assert_eq!((after.len(), &after[..3]), (5 + size, &[23u8, 3, 3][..]), "the node's answer to garbage is not the alert the site sent");
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_the_node_refused_is_answered_after_the_time_the_site_takes_to_answer_a_close_notify() {
+	let time = time!();
+	let node = launch("notify", time, |_| {}).await;
+	let shown = probe(node.site.addr, NAME, Mode::Notify, time.secs(), QUICK).await.unwrap().notified.expect("the site reacts to a close_notify");
+	assert!(shown.after >= Duration::from_millis(150), "{shown:?}");
+	// A client whose clock is two hours off gets a flight it cannot match, finishes the handshake, says goodbye, and waits for the answer.
+	let started = Instant::now();
+	assert_eq!(node.peer(0, &link(0, &TRANSPORT), 7200).ended().await, Ended::Unreachable(Unreachable::Certificate));
+	assert!(started.elapsed() >= Duration::from_millis(150), "the node answered the goodbye after {:?}, before the site's {:?}", started.elapsed(), shown.after);
+	node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_that_sends_nothing_and_has_no_connection_to_the_site_is_closed_as_the_site_closes_an_idle_one() {
+	let time = time!();
+	let node = launch("silent", time, |doc| doc["inbounds"][0]["transports"][0]["limits"] = json!({"site_rate": 1})).await;
+	let shown = probe(node.site.addr, NAME, Mode::Wait, time.secs(), QUICK).await.unwrap().idle.expect("the site ends an idle connection");
+	exhaust(&node).await;
+	let started = Instant::now();
+	let (answer, closed) = ask(node.addr, &[], Duration::from_millis(1500)).await;
+	assert!(closed, "the node held a silent connection for {:?}", started.elapsed());
+	assert!(started.elapsed() >= Duration::from_millis(100) && started.elapsed() < Duration::from_millis(1400), "{:?} against the site's {:?}", started.elapsed(), shown.after);
+	assert_eq!(answer.len(), 5 + shown.alert.map_or(0, |(size, ..)| size));
+	assert_eq!(node.totals().idled, 1);
 	node.engine.shutdown().await;
 }
