@@ -4,6 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
 #   sudo bash veilway.sh                      interactive menu
 #   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
+#   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx]   also set up a web server with HTTPS and a decoy site
 #   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
 #   sudo bash veilway.sh update [node|panel|mirror|both]
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
@@ -11,17 +12,28 @@
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
 #   sudo bash veilway.sh addon xray [install|remove|status]
 #   sudo bash veilway.sh uninstall relay   remove what install relay added
+#   sudo bash veilway.sh uninstall web   remove the web server setup that --domain added
 #   sudo bash veilway.sh panel-prefix [/new-path]   move the admin pages to a new path, random when none is given
-#   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>
+#   bash veilway.sh mirror-sync <folder> [--version vX.Y.Z]   copy a release and its signatures into <folder> in GitHub's layout, to serve or carry
+#   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>,
+#          --allow-downgrade (install a --version older than the installed one),
+#          --mirror <url> (repeatable, https only; tried in order, then GitHub), --mirror-only (never fall back to GitHub),
+#          --domain <name> and --web caddy|nginx (install panel and both)
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
 # comment must read "veilway <tag> <asset>" for the node and "veilway-panel <tag> <asset>" for the panel.
-# Nothing is installed without that check.
-# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480).
+# Nothing is installed without that check, whichever mirror or GitHub the file came from.
+# Without --version the newest tag comes from the signed pointer latest-veilway.txt (latest-veilway-panel.txt for the panel),
+# whose trusted comment must read "<product> latest <tag>"; a pointer older than what is installed is refused.
+# GitHub's own "latest release" answer is the fallback only when no source has a pointer yet.
+# A mirror's layout is GitHub's: <mirror>/<owner>/<repo>/releases/download/<tag>/<asset>.
+# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480), VEILWAY_MIRRORS (mirror urls separated by spaces, after any --mirror).
 # For testing only, to run against a release server of your own (scripts/gate-alpha.sh does): VEILWAY_RELEASE_BASE
 # (default https://github.com, still https only), VEILWAY_RAW_BASE (default https://raw.githubusercontent.com),
-# VEILWAY_NODE_PUBKEY and VEILWAY_PANEL_PUBKEY (default: the key below). They change where a download comes from
-# and which key is trusted. The checks themselves are the same. Each one is printed and needs a yes; with --yes, VEILWAY_TESTING=1 too.
+# VEILWAY_NODE_PUBKEY and VEILWAY_PANEL_PUBKEY (default: the key below), VEILWAY_CADDY_TLS=internal (Caddy's own CA
+# instead of Let's Encrypt) and VEILWAY_NGINX_CERT=<cert.pem>:<key.pem> (that certificate instead of certbot). They change
+# where a download comes from, which key is trusted and where a certificate comes from. The checks themselves are the same.
+# Each one is printed and needs a yes; with --yes, VEILWAY_TESTING=1 too.
 set -euo pipefail
 umask 022
 
@@ -39,8 +51,10 @@ SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za
 IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
 PRIVATE_RE='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
 NUM_RE='^[1-9][0-9]{0,5}$'
+MIRROR_RE='^(https://(\[[0-9A-Fa-f:]+\]|[A-Za-z0-9.-]+)|http://(127(\.[0-9]{1,3}){3}|localhost|\[::1\]))(:[0-9]{1,5})?(/[A-Za-z0-9._~/-]*)?$'
+DOMAIN_RE='^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$'
 OVERRIDES=()
-for v in VEILWAY_RELEASE_BASE VEILWAY_RAW_BASE VEILWAY_NODE_PUBKEY VEILWAY_PANEL_PUBKEY; do if [ -n "${!v:-}" ]; then OVERRIDES+=("$v=${!v}"); fi; done
+for v in VEILWAY_RELEASE_BASE VEILWAY_RAW_BASE VEILWAY_NODE_PUBKEY VEILWAY_PANEL_PUBKEY VEILWAY_CADDY_TLS VEILWAY_NGINX_CERT; do if [ -n "${!v:-}" ]; then OVERRIDES+=("$v=${!v}"); fi; done
 BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/veilway"
 NODE_DIR="$CONF_DIR/node"
@@ -58,10 +72,24 @@ SYSCTL_RELAY="/etc/sysctl.d/99-veilway-relay.conf"
 RELAY_STATE="$VER_DIR/relay.state"
 BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
+WEB_ROOT="/var/www/veilway-site"
+WEB_STATE="$VER_DIR/web.state"
+CADDY_SITE="/etc/caddy/conf.d/veilway-panel.caddy"
+CADDY_IMPORT="import /etc/caddy/conf.d/*.caddy"
+NGINX_SITE="/etc/nginx/conf.d/veilway-panel.conf"
 DRY=0
 ASSUME_YES=0
+ALLOW_DOWNGRADE=0
+MIRROR_ONLY=0
 WANT_VERSION=""
+DOMAIN=""
+WEB=""
+NODE_443=0
+TAG_OUT=""
 TMP=""
+MIRRORS=()
+SOURCES=()
+declare -A DEAD=()
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != "dumb" ]; then
 	B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; C=$'\033[36m'; Z=$'\033[0m'
@@ -163,7 +191,7 @@ ensure_tools() {
 		fi
 		[ "$DRY" = 1 ] || has minisign || die "minisign did not install"
 	fi
-	has setpriv || die "setpriv (util-linux) is needed to write the node's files as the node user"
+	[ "${1:-}" = download ] || has setpriv || die "setpriv (util-linux) is needed to write the node's files as the node user"
 }
 
 spin() {
@@ -177,11 +205,24 @@ spin() {
 	wait "$pid"
 }
 
-fetch() {
-	local url="$1" out="$2" msg="$3" rc=0
-	curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 --connect-timeout 15 -o "$out" "$url" &
+# Returns curl's status instead of stopping. $4 is the protocols allowed for the first request; redirects are always https.
+get_url() {
+	local url="$1" out="$2" msg="$3" proto="${4:-=https}" rc=0
+	curl -fsSL --proto "$proto" --proto-redir '=https' --tlsv1.2 --retry 3 --connect-timeout 15 -o "$out" "$url" &
 	spin $! "$msg" || rc=$?
-	[ "$rc" = 0 ] || die "download failed: $url"
+	return "$rc"
+}
+
+fetch() { get_url "$1" "$2" "$3" || die "download failed: $1"; }
+
+# One file from one source (a mirror or $RELEASE_BASE), laid out as GitHub does. Only a loopback mirror may use http. A source that cannot be reached at all is not asked again in this run, so a blocked address costs one wait.
+get_from() {
+	local base="$1" rel="$2" out="$3" msg="$4" proto="=https" rc=0
+	[ -z "${DEAD[$base]:-}" ] || return 1
+	if [[ "$base" == http://* && "$base" != "$RELEASE_BASE" ]]; then proto="=http,https"; fi
+	get_url "$base/$rel" "$out" "$msg" "$proto" 2>/dev/null || rc=$?
+	case "$rc" in 6 | 7 | 28 | 35 | 52 | 56 | 60) DEAD[$base]=1; warn "cannot reach $base: not asking it again in this run" ;; esac
+	return "$rc"
 }
 
 latest_tag() {
@@ -212,20 +253,51 @@ refuse_links() {
 # Writes into the node's folder run as the node user, so root never writes or follows a link there.
 as_node_user() { setpriv --reuid veilway --regid veilway --clear-groups "$@"; }
 
-# Downloads one asset with its signature into $TMP and refuses unless both the signature and the trusted comment match.
+# Downloads one asset with its signature into $TMP from the first source whose file passes: the signature and the trusted comment must both match. A source that gives a bad file is passed over with a warning, and the run stops only when none is left.
 download_verified() {
-	local repo="$1" key="$2" name="$3" tag="$4" product="$5" base out comment
-	base="$RELEASE_BASE/$repo/releases/download/$tag"
+	local repo="$1" key="$2" name="$3" tag="$4" product="$5" base out why comment tried=""
 	out="$TMP/$name"
-	fetch "$base/$name" "$out" "downloading $name $tag"
-	fetch "$base/$name.minisig" "$out.minisig" "downloading signature"
-	out="$(minisign -V -m "$TMP/$name" -x "$TMP/$name.minisig" -P "$key" 2>&1)" || die "signature check failed for $name: $out"
-	comment="$(printf '%s\n' "$out" | sed -n 's/^Trusted comment: //p' | head -n 1)"
-	[ "$comment" = "$product $tag $name" ] || die "signature is for \"$comment\", expected \"$product $tag $name\": refusing"
-	step "signature verified ($name $tag)"
+	for base in "${SOURCES[@]}"; do
+		tried+="${tried:+, }$base"
+		get_from "$base" "$repo/releases/download/$tag/$name" "$out" "downloading $name $tag from $base" || continue
+		get_from "$base" "$repo/releases/download/$tag/$name.minisig" "$out.minisig" "downloading signature" || continue
+		if ! why="$(minisign -V -m "$out" -x "$out.minisig" -P "$key" 2>&1)"; then warn "signature check failed for $name from $base: $why"; continue; fi
+		comment="$(printf '%s\n' "$why" | sed -n 's/^Trusted comment: //p' | head -n 1)"
+		if [ "$comment" != "$product $tag $name" ]; then warn "$base gave a signature for \"$comment\", expected \"$product $tag $name\""; continue; fi
+		step "signature verified ($name $tag, from $base)"
+		return 0
+	done
+	die "no source gave a verified $name $tag (tried $tried)"
 }
 
-release_tag() { if [ -n "$WANT_VERSION" ]; then printf '%s' "$WANT_VERSION"; else latest_tag "$1"; fi; }
+# Reads the signed pointer "<product> <tag>" from the first source that has a good one and sets TAG_OUT to the tag, keeping the files in $TMP. Returns 1 when no source has one. Mirrors come first; a pointer that fails its signature or its trusted comment "<product> latest <tag>" is passed over.
+pointer_tag() {
+	local repo="$1" key="$2" product="$3" base f why line tag
+	f="$TMP/latest-$product.txt"
+	for base in "${SOURCES[@]}"; do
+		get_from "$base" "$repo/releases/latest/download/latest-$product.txt" "$f" "reading the latest pointer from $base" || continue
+		get_from "$base" "$repo/releases/latest/download/latest-$product.txt.minisig" "$f.minisig" "reading the pointer's signature" || { warn "$base has a pointer without a signature: passed over"; continue; }
+		line="$(head -c 256 "$f")"
+		tag="${line#"$product "}"
+		if [ "$tag" = "$line" ] || [[ ! "$tag" =~ $TAG_RE ]] || [ "$(wc -l <"$f")" -gt 1 ]; then warn "the pointer from $base does not read \"$product <tag>\": passed over"; continue; fi
+		if ! why="$(minisign -V -m "$f" -x "$f.minisig" -P "$key" 2>&1)"; then warn "the pointer from $base fails its signature: $why"; continue; fi
+		if [ "$(printf '%s\n' "$why" | sed -n 's/^Trusted comment: //p' | head -n 1)" != "$product latest $tag" ]; then warn "the pointer from $base is signed for another tag or product: passed over"; continue; fi
+		TAG_OUT="$tag"
+		info "latest is $tag (pointer from $base)"
+		return 0
+	done
+	return 1
+}
+
+# Sets TAG_OUT to the tag to install: --version, else the signed pointer, else GitHub's latest release when no source has a pointer yet.
+release_tag() {
+	local repo="$1" key="$2" product="$3"
+	if [ -n "$WANT_VERSION" ]; then TAG_OUT="$WANT_VERSION"; return 0; fi
+	pointer_tag "$repo" "$key" "$product" && return 0
+	[ "$MIRROR_ONLY" = 0 ] || die "no mirror has a signed latest pointer for $product: pass --version <tag>"
+	info "no signed pointer yet, asking GitHub for the latest release"
+	TAG_OUT="$(latest_tag "$repo")"
+}
 
 install_binary() {
 	local src="$1" dest="$2"
@@ -267,15 +339,18 @@ fetch_and_install() {
 	if [ "$which" = node ]; then repo="$CORE_REPO"; key="$NODE_PUBKEY"; product=veilway; name="veilway-$TARGET"; dest="$BIN_DIR/veilway"
 	else repo="$PANEL_REPO"; key="$PANEL_PUBKEY"; product=veilway-panel; name="veilway-panel-$TARGET"; dest="$BIN_DIR/veilway-panel"; fi
 	if [ "$DRY" = 1 ]; then
-		dry "resolve ${WANT_VERSION:-the latest tag} of $repo"
+		dry "resolve ${WANT_VERSION:-the latest tag (signed pointer latest-$product.txt, trusted comment \"$product latest <tag>\")} of $repo from: ${SOURCES[*]}"
 		dry "download $name and $name.minisig, verify with minisign key ${key:0:12}..., match comment \"$product <tag> $name\""
 		dry "install -m 0755 $dest"
 		return 0
 	fi
-	tag="$(release_tag "$repo")"
+	release_tag "$repo" "$key" "$product"
+	tag="$TAG_OUT"
 	cur="$(installed_version "$which")"
-	if [ -z "$WANT_VERSION" ] && [ -n "$cur" ] && [ "$cur" != "$tag" ] && semver_lower "$tag" "$cur"; then
-		die "$tag is older than the installed $cur: refusing a downgrade (pass --version $tag to do it on purpose)"
+	if [ -n "$cur" ] && [ "$cur" != "$tag" ] && semver_lower "$tag" "$cur"; then
+		if [ -z "$WANT_VERSION" ]; then die "the latest tag $tag is older than the installed $cur: refusing, a stale or hostile mirror can say this (to go back on purpose: --version $tag --allow-downgrade)"; fi
+		[ "$ALLOW_DOWNGRADE" = 1 ] || die "$tag is older than the installed $cur: refusing a downgrade (add --allow-downgrade to do it on purpose)"
+		warn "downgrading $which from $cur to $tag, because --allow-downgrade was given"
 	fi
 	download_verified "$repo" "$key" "$name" "$tag" "$product"
 	install_binary "$TMP/$name" "$dest"
@@ -607,7 +682,8 @@ install_self() {
 	if [ "$DRY" = 1 ]; then dry "install this script as $SELF"; return 0; fi
 	if [ -f "$src" ] && [ "$src" -ef "$SELF" ]; then return 0; fi
 	if ! { [ -f "$src" ] && head -n 2 "$src" | grep -q 'Veilway installer and manager'; }; then
-		tag="$(release_tag "$CORE_REPO")"
+		release_tag "$CORE_REPO" "$NODE_PUBKEY" veilway
+		tag="$TAG_OUT"
 		download_verified "$CORE_REPO" "$NODE_PUBKEY" veilway.sh "$tag" veilway
 		src="$TMP/veilway.sh"
 		head -n 2 "$src" | grep -q 'Veilway installer and manager' || die "the fetched installer script is not the expected file"
@@ -688,6 +764,7 @@ install_panel() {
 	updater_units
 	install_self
 	daemon_reload
+	[ -z "$DOMAIN" ] || web_setup
 	svc enable veilway-panel.service
 	svc enable veilway-panel-update.path
 	svc start veilway-panel-update.path
@@ -723,8 +800,11 @@ EOF
 }
 
 panel_summary() {
-	local token="" prefix="/panel" sub="/sub" i
-	[ -f "$CONF_DIR/panel.json" ] && prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+	local token="" prefix="/panel" sub="/sub" i lines=()
+	if [ -f "$CONF_DIR/panel.json" ]; then
+		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+	fi
 	if [ "$DRY" != 1 ] && has_systemd; then
 		for i in 1 2 3 4 5 6 7 8 9 10; do
 			token="$(journalctl -u veilway-panel --no-pager -o cat 2>/dev/null | sed -n 's/^Setup token (one time): //p' | tail -n 1 || true)"
@@ -733,6 +813,18 @@ panel_summary() {
 		done
 	fi
 	printf '\n'
+	if [ -n "$DOMAIN" ]; then
+		lines=("Admin pages: https://$DOMAIN$prefix/")
+		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
+		lines+=("Open the admin pages in a browser and paste the token there." "It asks for your username, password and the terms." "")
+		lines+=("Web server: $WEB, site file $([ "$WEB" = caddy ] && echo "$CADDY_SITE" || echo "$NGINX_SITE")")
+		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site is $WEB_ROOT/index.html: edit it as you like." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
+		if [ "$WEB" = caddy ]; then lines+=("  Caddy gets and renews the certificate for $DOMAIN by itself."); else lines+=("  certbot renews the certificate with its own timer."); fi
+		if [ "$(web_state node_443_moved)" = 1 ]; then lines+=("The node's TCP transports moved from 443 to 8443: publish the profiles again."); fi
+		lines+=("Remove it all with: sudo bash veilway.sh uninstall web")
+		box "Panel" "${lines[@]}"
+		return 0
+	fi
 	box "Panel" \
 		"Listens on 127.0.0.1:$PANEL_PORT only. Put your web server in front:" \
 		"" \
@@ -798,6 +890,21 @@ do_install() {
 	refuse_links
 	detect_target
 	ensure_tools
+	[ -z "$DOMAIN" ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--domain is for install panel or install both"
+	if [ -z "$DOMAIN" ] && [ -z "$WEB" ] && { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
+		if confirm "Set up a web server with HTTPS for the panel now? It needs a domain name that points at this server."; then
+			DOMAIN="$(ask "Domain name:" "")"
+			WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
+		fi
+	fi
+	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || die "--web needs --domain"
+	if [ -n "$DOMAIN" ]; then
+		DOMAIN="${DOMAIN,,}"
+		[[ "$DOMAIN" =~ $DOMAIN_RE ]] || die "\"$DOMAIN\" is not a domain name: use something like panel.example.com"
+		WEB="${WEB:-caddy}"
+		[ "$WEB" = caddy ] || [ "$WEB" = nginx ] || die "--web is caddy or nginx"
+		web_preflight
+	fi
 	[ "$DRY" = 1 ] || { TMP="$(mktemp -d)"; install -d -m 0755 "$STATE_DIR" 2>/dev/null || true; }
 	has_systemd || [ "$DRY" = 1 ] || warn "systemd is not running: units are written but nothing is started"
 	[ "$DRY" = 1 ] || { mkdir -p "$STATE_DIR" "$PANEL_DIR"; }
@@ -997,6 +1104,7 @@ do_uninstall() {
 		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; act userdel veilway-xray 2>/dev/null || true; act userdel veilway-mirror 2>/dev/null || true; }
 		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; act deluser veilway-xray 2>/dev/null || true; act deluser veilway-mirror 2>/dev/null || true; }
 	else info "config and data kept"; fi
+	[ ! -f "$WEB_STATE" ] || info "the web server setup stays: remove it with: sudo bash veilway.sh uninstall web"
 	step "uninstalled. Backups are in $BACKUP_DIR"
 }
 
@@ -1217,6 +1325,379 @@ do_uninstall_relay() {
 	[ "$DRY" = 1 ] || step "relay removed: its table, files and the settings it added"
 }
 
+# Copies a release of the node and of the panel, and the signed pointers, into a folder laid out as GitHub does, to serve with any web server or to carry. Everything is verified before it is stored. Needs no root.
+do_mirror_sync() {
+	local out="${1:-}" repo key product tag ptag list n dest ptr cur names=() stored=0
+	[ -n "$out" ] || die "usage: veilway.sh mirror-sync <folder> [--version vX.Y.Z]"
+	ensure_tools download
+	if [ "$DRY" = 1 ]; then
+		dry "for the node and the panel: read the signed pointer, list the release's files, download each with its .minisig and verify it"
+		dry "store them under $out/<owner>/<repo>/releases/download/<tag>/, the pointers under releases/latest/download/ and at the top, and veilway.sh at the top"
+		return 0
+	fi
+	TMP="$(mktemp -d)"
+	install -d -m 0755 "$out"
+	for product in veilway veilway-panel; do
+		if [ "$product" = veilway ]; then repo="$CORE_REPO"; key="$NODE_PUBKEY"; else repo="$PANEL_REPO"; key="$PANEL_PUBKEY"; fi
+		ptag=""
+		if pointer_tag "$repo" "$key" "$product"; then ptag="$TAG_OUT"; fi
+		tag="${WANT_VERSION:-$ptag}"
+		if [ -z "$tag" ]; then
+			[ "$MIRROR_ONLY" = 0 ] || die "no mirror has a signed latest pointer for $product: pass --version <tag>"
+			tag="$(latest_tag "$repo")"
+		fi
+		names=()
+		list=""
+		if [ "$MIRROR_ONLY" = 0 ] && [ "$RELEASE_BASE" = https://github.com ]; then
+			list="$(curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 15 "https://api.github.com/repos/$repo/releases/tags/$tag" 2>/dev/null | sed -n 's/.*"browser_download_url": *"[^"]*\/\([^"\/]*\)".*/\1/p' || true)"
+		fi
+		if [ -n "$list" ]; then
+			while read -r n; do
+				[[ "$n" =~ ^[A-Za-z0-9._+-]+$ && "$n" != *.minisig ]] || continue
+				if grep -qxF "$n.minisig" <<<"$list"; then names+=("$n"); else info "$n has no signature and is not copied"; fi
+			done <<<"$list"
+			[ "${#names[@]}" -gt 0 ] || { warn "$product has no signed files for $tag: skipped"; continue; }
+		else
+			info "the list of $product $tag could not be read, so only the files the installer needs are copied"
+			if [ "$product" = veilway ]; then names=(veilway-x86_64-unknown-linux-musl veilway-aarch64-unknown-linux-musl veilway.sh)
+			else names=(veilway-panel-x86_64-unknown-linux-musl veilway-panel-aarch64-unknown-linux-musl); fi
+		fi
+		dest="$out/$repo/releases/download/$tag"
+		install -d -m 0755 "$dest"
+		for n in "${names[@]}"; do
+			download_verified "$repo" "$key" "$n" "$tag" "$product"
+			mv -f "$TMP/$n" "$dest/$n.new"; chmod 0644 "$dest/$n.new"; mv -f "$dest/$n.new" "$dest/$n"
+			mv -f "$TMP/$n.minisig" "$dest/$n.minisig.new"; chmod 0644 "$dest/$n.minisig.new"; mv -f "$dest/$n.minisig.new" "$dest/$n.minisig"
+			stored=$((stored + 1))
+		done
+		step "$product $tag: ${#names[@]} files in $dest"
+		if [ "$ptag" != "$tag" ]; then info "no pointer written: the signed latest of $product is ${ptag:-unknown}, not $tag"; continue; fi
+		ptr="$out/$repo/releases/latest/download"
+		cur="$(sed -n "s/^$product //p" "$ptr/latest-$product.txt" 2>/dev/null | head -n 1 || true)"
+		if [ -n "$cur" ] && [[ "$cur" =~ $TAG_RE ]] && semver_lower "$tag" "$cur"; then warn "kept the pointer in $out, which names the newer $cur"; continue; fi
+		install -d -m 0755 "$ptr"
+		for n in "$ptr" "$out"; do
+			install -m 0644 "$TMP/latest-$product.txt" "$n/latest-$product.txt.new"; mv -f "$n/latest-$product.txt.new" "$n/latest-$product.txt"
+			install -m 0644 "$TMP/latest-$product.txt.minisig" "$n/latest-$product.txt.minisig.new"; mv -f "$n/latest-$product.txt.minisig.new" "$n/latest-$product.txt.minisig"
+		done
+		step "pointer latest-$product.txt says $tag"
+		if [ "$product" = veilway ] && [ -f "$dest/veilway.sh" ]; then
+			install -m 0644 "$dest/veilway.sh" "$out/veilway.sh"; install -m 0644 "$dest/veilway.sh.minisig" "$out/veilway.sh.minisig"
+			step "veilway.sh of $tag is at the top of $out"
+		fi
+	done
+	step "done: $stored files in $out. Serve the folder over https, then install with --mirror https://your-host"
+}
+
+# True for a package that dpkg has installed (not one with only its config files left).
+pkg_has() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "ok installed"; }
+
+# What the web server setup added, one key=value per line, so uninstall web takes back exactly that.
+web_note() {
+	[ "$DRY" = 1 ] && return 0
+	install -d -m 0755 "$VER_DIR"
+	sed -i "/^$1=/d" "$WEB_STATE" 2>/dev/null || true
+	printf '%s=%s\n' "$1" "$2" >>"$WEB_STATE"
+}
+
+web_state() { sed -n "s/^$1=//p" "$WEB_STATE" 2>/dev/null | head -n 1 || true; }
+
+# Installs the packages that are missing and records them, so uninstall web removes only these.
+web_pkg() {
+	local p new=()
+	for p in "$@"; do pkg_has "$p" || new+=("$p"); done
+	[ "${#new[@]}" -gt 0 ] || return 0
+	pkg_install "${new[@]}" || die "cannot install ${new[*]}: install it with apt-get and run this again"
+	web_note pkgs "$(web_state pkgs) ${new[*]}"
+}
+
+# Run before anything is installed: finds out what already holds ports 80 and 443 and stops with an explanation when the setup would take them from someone. The node on 443 is the one case it works around, see web_free_443.
+web_preflight() {
+	local s p out held="" other="" same=0
+	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports 80 and 443"
+	has apt-get || die "the automatic web server setup runs on Debian or Ubuntu: it needs apt-get. Install a web server by hand with the snippets that the install prints, or run this without --domain."
+	for s in nginx caddy apache2 httpd lighttpd haproxy; do
+		if ! has_systemd || ! systemctl is-active --quiet "$s.service" 2>/dev/null; then continue; fi
+		if [ "$s" = "$WEB" ]; then same=1; else other+="${other:+, }$s"; fi
+	done
+	for p in 80 443; do
+		out="$(ss -H -ltnp "sport = :$p" 2>/dev/null || true)"
+		[ -n "$out" ] || continue
+		if [ "$p" = 443 ] && grep -q '"veilway"' <<<"$out"; then NODE_443=1
+		elif ! grep -q "\"$WEB\"" <<<"$out"; then held+="${held:+, }$p"; fi
+	done
+	if [ -n "$other" ] || [ -n "$held" ]; then
+		box "A web server is already here" \
+			"${other:+Running: $other}" \
+			"${held:+TCP port(s) in use by something else: $held}" \
+			"Two programs cannot share ports 80 and 443, and this script will not stop" \
+			"or replace a server it did not install. Either add the panel to your own" \
+			"server by hand (run without --domain for the snippets), or stop that server" \
+			"and run this again."
+		die "nothing was installed or changed"
+	fi
+	if [ "$same" = 1 ]; then
+		warn "$WEB already runs here. Your own configuration stays as it is: this only adds the panel's site file$([ "$WEB" = caddy ] && echo " and one import line")."
+		confirm "Add the panel's site to the running $WEB?" || die "cancelled, nothing was changed"
+	fi
+	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow ports 80 and 443 (sudo ufw allow 80,443/tcp) or the certificate and the site cannot be reached"; fi
+	getent hosts "$DOMAIN" >/dev/null 2>&1 || warn "$DOMAIN does not resolve yet: the certificate needs its DNS record to point at this server"
+	return 0
+}
+
+# The node keeps a tls transport on 443 for its users, and the web server needs 443 for HTTPS. The safe default: the web server takes 443 and the node's TCP transports on 443 move to 8443. The node cannot share 443 with the web server without reading the web server's certificate files, which its sandbox and their owner both forbid, so that design was not built. Profiles that name port 443 stop working until they are published again in the panel.
+web_free_443() {
+	local f="$NODE_DIR/config.json" old new sel='(.inbounds[]?.transports[]? | select((.type | IN("udp", "udp-obfs") | not) and ((.listen // "") | test(":443$"))))'
+	if [ "$DRY" = 1 ]; then dry "if the node listens on TCP 443: move its transports there to 8443 in $f, check the config and restart the node"; return 0; fi
+	[ "$NODE_443" = 1 ] || return 0
+	web_pkg jq
+	old="$(as_node_user cat "$f")" || die "cannot read $f"
+	[ "$(jq "[$sel] | length" <<<"$old")" -gt 0 ] || die "the node listens on 443 with something this script cannot move: move it by hand, then run this again. Nothing was changed."
+	[ -z "$(ss -H -ltn 'sport = :8443')" ] || die "port 8443 is in use here, so the node's transport cannot move there: free it or move the transport by hand. Nothing was changed."
+	warn "the node's transport on 443 has to move: the web server needs 443 for HTTPS"
+	confirm "Move the node's TCP transports from port 443 to 8443? Profiles that name 443 stop working until you publish them again in the panel." || die "cancelled, nothing was changed"
+	new="$(jq "($sel | .listen) |= sub(\":443\$\"; \":8443\")" <<<"$old")"
+	backup_file "$f"
+	( umask 077; printf '%s\n' "$new" | as_node_user tee "$f.new" >/dev/null )
+	as_node_user mv -f "$f.new" "$f"
+	as_node_user chmod 0600 "$f"
+	if ! run_check; then
+		printf '%s\n' "$old" | as_node_user tee "$f" >/dev/null
+		die "the node's config did not pass its check with 8443, so the old one is back"
+	fi
+	svc restart veilway.service
+	sleep 2
+	if [ -n "$(ss -H -ltnp 'sport = :443' | grep '"veilway"' || true)" ]; then
+		printf '%s\n' "$old" | as_node_user tee "$f" >/dev/null
+		svc restart veilway.service
+		die "the node still holds 443 after the move, so its old config is back. Move its listener by hand."
+	fi
+	web_note node_443_moved 1
+	step "moved the node's TCP transports from 443 to 8443"
+}
+
+# Written once and never over an edit: the operator owns the page.
+web_decoy() {
+	if [ "$DRY" = 1 ]; then dry "write a plain static page to $WEB_ROOT/index.html if there is none"; return 0; fi
+	if [ -e "$WEB_ROOT/index.html" ]; then info "kept existing $WEB_ROOT/index.html"; return 0; fi
+	install -d -m 0755 "$WEB_ROOT"
+	cat >"$WEB_ROOT/index.html" <<'EOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Notes from the garden</title>
+<style>
+body { font: 17px/1.6 Georgia, serif; color: #2b2b26; background: #f6f4ee; margin: 0; }
+main { max-width: 38rem; margin: 0 auto; padding: 3rem 1.25rem; }
+h1 { font-size: 1.8rem; margin: 0 0 .25rem; }
+h2 { font-size: 1.15rem; margin: 2rem 0 .25rem; }
+p { margin: .4rem 0; }
+.meta { color: #7a776b; font-size: .9rem; }
+footer { margin-top: 3rem; color: #7a776b; font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>Notes from the garden</h1>
+<p class="meta">A small notebook about vegetables, weather and what went wrong this year.</p>
+<h2>Tomatoes, again</h2>
+<p>Six plants went in late, after the last frost warning. The two by the fence did best, which says more about the fence than about the plants.</p>
+<h2>Compost, a year in</h2>
+<p>Turning the pile every other week made less difference than keeping it damp. Eggshells still show up whole in spring.</p>
+<h2>Rain barrels</h2>
+<p>One barrel is enough for the beds. The second one mostly collects leaves and mosquitoes.</p>
+<footer>Updated when there is something to say.</footer>
+</main>
+</body>
+</html>
+EOF
+	web_note decoy_sha "$(sha256sum "$WEB_ROOT/index.html" | cut -d' ' -f1)"
+	step "wrote the plain site $WEB_ROOT/index.html"
+}
+
+web_caddy() {
+	local cf="/etc/caddy/Caddyfile" cand fresh=0 tls="" prefix="$1" sub="$2"
+	if ! has caddy && ! pkg_has caddy; then
+		fresh=1
+		if [ "$DRY" = 1 ]; then dry "install caddy from the system packages if they are 2.6 or newer, else from Caddy's apt repository (signing key from dl.cloudsmith.io)"
+		else
+			apt-get update -qq >/dev/null 2>&1 || true
+			cand="$(apt-cache policy caddy 2>/dev/null | sed -n 's/^ *Candidate: //p')"
+			if [ -z "$cand" ] || [ "$cand" = "(none)" ] || ! dpkg --compare-versions "$cand" ge 2.6; then
+				info "the system's caddy is ${cand:-missing} (2.6 is needed): using Caddy's own apt repository"
+				web_pkg gnupg ca-certificates curl
+				curl -fsSL --proto '=https' --tlsv1.2 https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || die "cannot get Caddy's signing key"
+				printf '%s\n' "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" >/etc/apt/sources.list.d/caddy-stable.list
+				web_note caddy_repo 1
+				apt-get update -qq >/dev/null 2>&1 || die "apt-get update failed after adding Caddy's repository"
+			fi
+			web_pkg caddy
+		fi
+	fi
+	act install -d -m 0755 /etc/caddy/conf.d
+	if [ "$DRY" = 1 ]; then dry "add the line \"$CADDY_IMPORT\" to $cf (a fresh install gets a Caddyfile with only that line)"
+	elif [ "$fresh" = 1 ] || [ ! -f "$cf" ]; then
+		backup_file "$cf"
+		printf '%s\n' "$CADDY_IMPORT" >"$cf"
+		step "wrote $cf with one line: $CADDY_IMPORT"
+	elif ! grep -qxF "$CADDY_IMPORT" "$cf"; then
+		backup_file "$cf"
+		printf '\n%s\n' "$CADDY_IMPORT" >>"$cf"
+		step "added \"$CADDY_IMPORT\" to the end of $cf, the rest is untouched"
+	fi
+	if [ "${VEILWAY_CADDY_TLS:-}" = internal ]; then tls=$'\n\ttls internal'; fi
+	write_unit "$CADDY_SITE" <<EOF
+# Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
+$DOMAIN {$tls
+	handle $prefix/* {
+		reverse_proxy 127.0.0.1:$PANEL_PORT
+	}
+	handle $sub/* {
+		reverse_proxy 127.0.0.1:$PANEL_PORT
+	}
+	handle {
+		root * $WEB_ROOT
+		file_server
+	}
+}
+EOF
+	if has_systemd && [ "$DRY" = 0 ]; then
+		if ! { if [ "$fresh" = 1 ] || ! systemctl is-active --quiet caddy.service; then svc enable caddy.service; svc restart caddy.service; else svc reload caddy.service; fi; }; then
+			rm -f -- "$CADDY_SITE"
+			die "Caddy did not accept the new site, so it was taken back: see sudo journalctl -u caddy"
+		fi
+	else svc reload caddy.service; fi
+	web_note web caddy
+	[ "$DRY" = 1 ] || step "Caddy serves $DOMAIN: the panel at $prefix and $sub, the plain site everywhere else"
+}
+
+web_nginx() {
+	local fresh=0 prefix="$1" sub="$2" cert="${VEILWAY_NGINX_CERT:-}" tls=""
+	pkg_has nginx || fresh=1
+	if [ -n "$cert" ]; then web_pkg nginx; else web_pkg nginx certbot python3-certbot-nginx; fi
+	if [ "$fresh" = 1 ] && [ -L /etc/nginx/sites-enabled/default ]; then
+		act rm -f /etc/nginx/sites-enabled/default
+		web_note nginx_default_removed 1
+	fi
+	if [ -n "$cert" ]; then tls="	listen 443 ssl;
+	listen [::]:443 ssl;
+	ssl_certificate ${cert%%:*};
+	ssl_certificate_key ${cert#*:};"
+	else tls="	# certbot adds the https part here"; fi
+	write_unit "$NGINX_SITE" <<EOF
+# Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
+server {
+	listen 80;
+	listen [::]:80;
+$tls
+	server_name $DOMAIN;
+	server_tokens off;
+	root $WEB_ROOT;
+	location ~ ^($prefix|$sub)(/|\$) {
+		proxy_pass http://127.0.0.1:$PANEL_PORT;
+		client_max_body_size 100m;
+		proxy_set_header Host \$host;
+		proxy_set_header X-Forwarded-For \$remote_addr;
+	}
+	location / {
+		try_files \$uri \$uri/ =404;
+	}
+}
+EOF
+	if has_systemd && [ "$DRY" = 0 ]; then
+		if ! nginx -t >/dev/null 2>&1; then
+			rm -f -- "$NGINX_SITE"
+			die "nginx did not accept the new site, so it was taken back: see sudo nginx -t"
+		fi
+		if [ "$fresh" = 1 ] || ! systemctl is-active --quiet nginx.service; then svc enable nginx.service; svc restart nginx.service; else svc reload nginx.service; fi
+	else svc reload nginx.service; fi
+	web_note web nginx
+	[ "$DRY" = 1 ] || step "nginx serves $DOMAIN: the panel at $prefix and $sub, the plain site everywhere else"
+	[ -z "$cert" ] || return 0
+	if [ "$DRY" = 1 ]; then dry "certbot --nginx -d $DOMAIN, with an https redirect"; return 0; fi
+	web_note certbot_domain "$DOMAIN"
+	if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then step "certbot issued the certificate for $DOMAIN and turned on https"
+	else warn "certbot could not get a certificate (the DNS record must point at this server and port 80 must be reachable). The site answers on http only until you run: sudo certbot --nginx -d $DOMAIN"; fi
+}
+
+# The panel answers every path it does not serve with its not_found, and the web server's own 404 answers the rest of the site. They have to be the same bytes, or the panel's paths can be told apart.
+web_not_found() {
+	local f="$CONF_DIR/panel.json" headers body new
+	if [ "$DRY" = 1 ]; then dry "set not_found in $f to $WEB's own 404 answer"; return 0; fi
+	if [ "$WEB" = caddy ]; then headers='[]'; body=""
+	else headers='[["content-type", "text/html"]]'; printf -v body '<html>\r\n<head><title>404 Not Found</title></head>\r\n<body>\r\n<center><h1>404 Not Found</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n'; fi
+	new="$(jq --argjson h "$headers" --arg b "$body" '.not_found = {status: 404, headers: $h, body: $b}' "$f")" || die "cannot read $f as JSON"
+	jq -e '.not_found' "$f" >/dev/null 2>&1 || web_note not_found_set 1
+	backup_file "$f"
+	printf '%s\n' "$new" >"$f.new"
+	chown root:veilway-panel "$f.new"; chmod 0640 "$f.new"
+	mv -f "$f.new" "$f"
+	step "set not_found in $f to $WEB's own 404 answer"
+}
+
+# Sets up the web server for the panel's domain: packages, the site file, the plain site, the panel's not_found. It runs before the panel is restarted, so the restart picks up not_found.
+web_setup() {
+	local f="$CONF_DIR/panel.json" prefix="/panel" sub="/sub"
+	step "web server ($WEB) for $DOMAIN"
+	if [ -f "$f" ]; then
+		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"
+		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
+	fi
+	web_note domain "$DOMAIN"
+	web_free_443
+	web_pkg jq
+	web_decoy
+	if [ "$WEB" = caddy ]; then web_caddy "$prefix" "$sub"; else web_nginx "$prefix" "$sub"; fi
+	web_not_found
+}
+
+# Takes back what web_setup recorded in $WEB_STATE: the site file, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
+do_uninstall_web() {
+	local web domain p sha pkgs rest
+	need_root
+	[ -f "$WEB_STATE" ] || die "no web server setup by this script is recorded here"
+	web="$(web_state web)"; domain="$(web_state domain)"; pkgs="$(web_state pkgs)"
+	confirm "Remove the web server setup for $domain ($web): its site file, the plain site if it is unchanged, the panel's not_found${pkgs:+, and the packages ${pkgs# }}?" || die "cancelled"
+	case "$web" in
+		caddy)
+			act rm -f -- "$CADDY_SITE"
+			if [ -f /etc/caddy/Caddyfile ] && [ "$DRY" = 1 ]; then dry "remove the line \"$CADDY_IMPORT\" from /etc/caddy/Caddyfile"
+			elif [ -f /etc/caddy/Caddyfile ]; then rest="$(grep -vxF "$CADDY_IMPORT" /etc/caddy/Caddyfile || true)"; printf '%s\n' "$rest" >/etc/caddy/Caddyfile; fi
+			act rmdir /etc/caddy/conf.d 2>/dev/null || true
+			;;
+		nginx)
+			act rm -f -- "$NGINX_SITE"
+			if [ -n "$(web_state certbot_domain)" ] && has certbot; then act certbot delete --cert-name "$domain" --non-interactive || true; fi
+			if [ "$(web_state nginx_default_removed)" = 1 ] && [ -e /etc/nginx/sites-available/default ]; then act ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default; fi
+			;;
+	esac
+	sha="$(web_state decoy_sha)"
+	if [ -n "$sha" ] && [ -f "$WEB_ROOT/index.html" ] && [ "$(sha256sum "$WEB_ROOT/index.html" | cut -d' ' -f1)" = "$sha" ] && [ "$(find "$WEB_ROOT" -mindepth 1 | wc -l)" = 1 ]; then act rm -rf -- /var/www/veilway-site
+	elif [ -e "$WEB_ROOT" ]; then info "kept $WEB_ROOT: it was edited or holds other files"; fi
+	if [ "$(web_state not_found_set)" = 1 ] && [ -f "$CONF_DIR/panel.json" ] && has jq; then
+		if [ "$DRY" = 1 ]; then dry "remove not_found from $CONF_DIR/panel.json and restart the panel"
+		else
+			jq 'del(.not_found)' "$CONF_DIR/panel.json" >"$CONF_DIR/panel.json.new"
+			chown root:veilway-panel "$CONF_DIR/panel.json.new"; chmod 0640 "$CONF_DIR/panel.json.new"
+			mv -f "$CONF_DIR/panel.json.new" "$CONF_DIR/panel.json"
+			svc restart veilway-panel.service || true
+		fi
+	fi
+	for p in $pkgs; do case "$p" in caddy | nginx) svc stop "$p.service" || true ;; esac; done
+	# shellcheck disable=SC2086
+	[ -z "$pkgs" ] || act env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq $pkgs
+	[[ " $pkgs " == *" $web "* ]] || svc reload "$web.service" || true
+	if [ "$(web_state caddy_repo)" = 1 ]; then
+		act rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+		[ "$DRY" = 1 ] || apt-get update -qq >/dev/null 2>&1 || true
+	fi
+	[ "$(web_state node_443_moved)" != 1 ] || warn "the node's TCP transports stay on 8443: move them back in the panel if you want 443"
+	act rm -f -- "$WEB_STATE"
+	[ "$DRY" = 1 ] || step "web server setup removed"
+}
+
 # The test overrides move downloads and trusted keys away from the release channel, so each one is shown and needs a yes.
 accept_overrides() {
 	local v
@@ -1229,19 +1710,38 @@ accept_overrides() {
 }
 
 main() {
-	local args=() cmd
+	local args=() cmd env_mirrors=() unique=() m
 	while [ $# -gt 0 ]; do
 		case "$1" in
 			--dry-run) DRY=1 ;;
 			--yes | -y) ASSUME_YES=1 ;;
+			--allow-downgrade) ALLOW_DOWNGRADE=1 ;;
+			--mirror-only) MIRROR_ONLY=1 ;;
+			--mirror) [ $# -gt 1 ] || die "--mirror needs an https url"; MIRRORS+=("$2"); shift ;;
+			--mirror=*) MIRRORS+=("${1#*=}") ;;
+			--domain) [ $# -gt 1 ] || die "--domain needs a domain name"; DOMAIN="$2"; shift ;;
+			--domain=*) DOMAIN="${1#*=}" ;;
+			--web) [ $# -gt 1 ] || die "--web needs caddy or nginx"; WEB="$2"; shift ;;
+			--web=*) WEB="${1#*=}" ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
-			-h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+			-h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) args+=("$1") ;;
 		esac
 		shift
 	done
 	[ -z "$WANT_VERSION" ] || [[ "$WANT_VERSION" =~ $TAG_RE ]] || die "that version is not a release tag"
+	read -r -a env_mirrors <<<"${VEILWAY_MIRRORS:-}"
+	MIRRORS+=(${env_mirrors[@]+"${env_mirrors[@]}"})
+	for m in ${MIRRORS[@]+"${MIRRORS[@]}"}; do
+		m="${m%/}"
+		[[ "$m" =~ $MIRROR_RE && "${m#*://}" != *//* && "$m" != *..* ]] || die "\"$m\" is not a mirror address: it must be https://host[/path], or http:// on loopback for tests"
+		[[ " ${unique[*]:-} " == *" $m "* ]] || unique+=("$m")
+	done
+	MIRRORS=(${unique[@]+"${unique[@]}"})
+	SOURCES=(${unique[@]+"${unique[@]}"})
+	[ "$MIRROR_ONLY" = 0 ] || [ "${#MIRRORS[@]}" -gt 0 ] || die "--mirror-only needs a mirror: give --mirror <url> or set VEILWAY_MIRRORS"
+	[ "$MIRROR_ONLY" = 1 ] || SOURCES+=("$RELEASE_BASE")
 	[[ "$PANEL_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$PANEL_PORT))" -ge 1 ] && [ "$((10#$PANEL_PORT))" -le 65535 ] || die "VEILWAY_PANEL_PORT must be a port from 1 to 65535"
 	PANEL_PORT=$((10#$PANEL_PORT))
 	accept_overrides
@@ -1260,11 +1760,12 @@ main() {
 		doctor) do_doctor ;;
 		backup) do_backup "${args[0]:-}" ;;
 		restore) do_restore "${args[0]:-}" ;;
-		uninstall) header; if [ "${args[0]:-}" = relay ]; then do_uninstall_relay; else do_uninstall; fi ;;
+		uninstall) header; case "${args[0]:-}" in relay) do_uninstall_relay ;; web) do_uninstall_web ;; *) do_uninstall ;; esac ;;
+		mirror-sync) header; do_mirror_sync "${args[0]:-}" ;;
 		version) do_version ;;
 		addon) header; do_addon "${args[0]:-}" "${args[1]:-install}" ;;
 		panel-prefix) header; do_panel_prefix "${args[0]:-}" ;;
-		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, panel-prefix, uninstall, version" ;;
+		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, panel-prefix, mirror-sync, uninstall, version" ;;
 	esac
 }
 

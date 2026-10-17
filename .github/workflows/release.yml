@@ -188,7 +188,38 @@ jobs:
           printf "%s\n" "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/minisign.key"
           for f in dist/*; do minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f" -t "veilway $REF_NAME $(basename "$f")" </dev/null; done
           echo "signed every asset in dist with minisign"
+          # The signed pointer to the newest release: installers and mirrors read it instead of asking GitHub's API.
+          # Its trusted comment names the tag, so a mirror cannot pass an old pointer off as a newer one.
+          printf "veilway %s\n" "$REF_NAME" > dist/latest-veilway.txt
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m dist/latest-veilway.txt -t "veilway latest $REF_NAME" </dev/null
+          echo "signed the latest pointer"
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           fail_on_unmatched_files: true
+      # The desktop job's installers, their updater .sig files and latest.json are uploaded by tauri-action straight to the release, so they were not in dist when the files above were signed. Sign every asset that still has no .minisig the same way, so a release mirror can carry them.
+      - name: Sign assets uploaded by the desktop job
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          REF_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::warning::RELEASE_SIGNING_KEY is not set, skipping minisign for the desktop assets"
+            exit 0
+          fi
+          set -euo pipefail
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf "%s\n" "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/minisign.key"
+          mkdir -p extra
+          names=$(gh release view "$REF_NAME" --json assets --jq '.assets[].name')
+          while read -r n; do
+            case "$n" in *.minisig) continue ;; esac
+            grep -qxF "$n.minisig" <<<"$names" && continue
+            gh release download "$REF_NAME" --pattern "$n" --dir extra
+            minisign -S -s "$RUNNER_TEMP/minisign.key" -m "extra/$n" -t "veilway $REF_NAME $n" </dev/null
+            gh release upload "$REF_NAME" "extra/$n.minisig" --clobber
+          done <<<"$names"
+          echo "signed the assets the desktop job uploaded"
