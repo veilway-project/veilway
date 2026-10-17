@@ -4,11 +4,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
 #   sudo bash veilway.sh                      interactive menu
 #   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
+#   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
 #   sudo bash veilway.sh update [node|panel|mirror|both]
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
 #   sudo bash veilway.sh addon xray [install|remove|status]
+#   sudo bash veilway.sh uninstall relay   remove what install relay added
 #   sudo bash veilway.sh panel-prefix [/new-path]   move the admin pages to a new path, random when none is given
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>
 #
@@ -34,6 +36,9 @@ RAW_BASE="${VEILWAY_RAW_BASE:-https://raw.githubusercontent.com}"
 PANEL_PORT="${VEILWAY_PANEL_PORT:-8480}"
 TAG_RE='^v?[0-9A-Za-z._-]+$'
 SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z.-]+)?$'
+IPV4_RE='^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$'
+PRIVATE_RE='^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.)'
+NUM_RE='^[1-9][0-9]{0,5}$'
 OVERRIDES=()
 for v in VEILWAY_RELEASE_BASE VEILWAY_RAW_BASE VEILWAY_NODE_PUBKEY VEILWAY_PANEL_PUBKEY; do if [ -n "${!v:-}" ]; then OVERRIDES+=("$v=${!v}"); fi; done
 BIN_DIR="/usr/local/bin"
@@ -47,6 +52,10 @@ PANEL_DIR="/var/lib/veilway-panel"
 UPDATE_DIR="/var/lib/veilway-panel-update"
 SELF="/usr/local/sbin/veilway.sh"
 VER_DIR="/var/lib/veilway-installer"
+NFT_CONF="/etc/nftables.conf"
+NFT_RELAY="/etc/nftables.d/veilway-relay.nft"
+SYSCTL_RELAY="/etc/sysctl.d/99-veilway-relay.conf"
+RELAY_STATE="$VER_DIR/relay.state"
 BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
 DRY=0
@@ -1087,6 +1096,127 @@ do_addon() {
 	esac
 }
 
+# One nftables table of its own forwards the chosen ports to the node and masquerades the return path, and limits new connections and concurrent TCP connections per source. The state file keeps what was there before, so uninstall relay removes exactly what this added.
+do_install_relay() {
+	local node="" rate=50 conns=256 transports=() names="" ports="" nat="" addr="" address="" name lp np proto busy t
+	local added_pkg=0 added_svc=0 prev="" inc
+	local -A seen=()
+	need_root
+	has apt-get || die "the relay installer runs on Debian or Ubuntu: it needs apt-get"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--transport) [ $# -gt 1 ] || die "--transport needs a value, for example tls:443"; transports+=("$2"); shift ;;
+			--transport=*) transports+=("${1#*=}") ;;
+			--rate) [ $# -gt 1 ] || die "--rate needs a number"; rate="$2"; shift ;;
+			--conns) [ $# -gt 1 ] || die "--conns needs a number"; conns="$2"; shift ;;
+			-*) die "unknown option \"$1\" for install relay" ;;
+			*) [ -z "$node" ] || die "give one node address, not \"$node\" and \"$1\""; node="$1" ;;
+		esac
+		shift
+	done
+	[ -n "$node" ] || die "usage: veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]"
+	[[ "$node" =~ $IPV4_RE ]] || die "the node must be an IPv4 address, not \"$node\": give its IP, the relay does not resolve names"
+	case "$node" in 0.* | 127.* | 169.254.* | 22[4-9].* | 23[0-9].* | 2[45][0-9].*) die "$node is not an address a relay can forward to" ;; esac
+	[[ "$node" =~ $PRIVATE_RE ]] && ! ip -4 -o route show to match "$node" | grep -qv "^default " && die "$node is private and this server has no route to it: the relay could not reach it"
+	ip -4 -o addr show | grep -q " $node/" && die "$node is this server's own address: a relay cannot forward to itself"
+	[[ "$rate" =~ $NUM_RE ]] || die "--rate is new connections per source per second: a number from 1 up"
+	[[ "$conns" =~ $NUM_RE ]] || die "--conns is TCP connections per source at once: a number from 1 up"
+	[ "${#transports[@]}" -gt 0 ] || { [ "$ASSUME_YES" = 1 ] && die "pass --transport name:port, for example --transport tls:443"; read -r -a transports <<<"$(ask "Transports to relay as name:port, separated by spaces (udp, udp-obfs, tls, ws) [tls:443]" tls:443)" || true; }
+	[ "${#transports[@]}" -gt 0 ] || die "no transport given"
+	for t in "${transports[@]}"; do
+		IFS=: read -r name lp np <<<"$t"
+		np="${np:-$lp}"
+		case "$name" in
+			udp | udp-obfs) proto=udp ;;
+			tls | ws) proto=tcp ;;
+			fronted) die "fronted goes through a content delivery network, not a relay: its edge address goes in the panel" ;;
+			*) die "unknown transport \"$name\": use udp, udp-obfs, tls or ws" ;;
+		esac
+		[[ "$lp" =~ $NUM_RE && "$lp" -le 65535 && "$np" =~ $NUM_RE && "$np" -le 65535 ]] || die "$t: the ports must be numbers from 1 to 65535"
+		[ -z "${seen[$proto:$lp]:-}" ] || die "two transports listen on $proto port $lp"
+		seen[$proto:$lp]=1
+		if [ "$proto" = tcp ]; then busy="$(ss -H -ltn "sport = :$lp")"; else busy="$(ss -H -lun "sport = :$lp")"; fi
+		[ -z "$busy" ] || die "$proto port $lp is already in use here, and the relay would take that traffic"
+		printf -v nat '%s\t\tmeta nfproto ipv4 %s dport %s dnat ip to %s:%s\n' "$nat" "$proto" "$lp" "$node" "$np"
+		names+="${names:+, }$name"
+		ports+="${ports:+, }$name $lp"
+		[ "$np" = "$lp" ] || ports+=" (node port $np)"
+	done
+	[[ "$names" == *udp* && ( "$names" == *tls* || "$names" == *ws* ) ]] && warn "udp and tls on one address make apps rate tls Detectable: give them a second relay for tls"
+	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active and drops forwarded traffic by default: set DEFAULT_FORWARD_POLICY=\"ACCEPT\" in /etc/default/ufw and reload it"; fi
+	addr="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)"
+	address="$addr"
+	if [ -z "$addr" ] || [[ "$addr" =~ $PRIVATE_RE ]]; then address="your public IPv4 from your provider (this server's own address is ${addr:-none})"; fi
+	has nft || added_pkg=1
+	has_systemd && [ "$(systemctl is-enabled nftables.service 2>/dev/null)" != enabled ] && added_svc=1
+	prev="$(sysctl -n net.ipv4.ip_forward)"
+	if [ -f "$RELAY_STATE" ]; then info "kept $RELAY_STATE: the state from the first install relay"
+	elif [ "$DRY" = 1 ]; then dry "record in $RELAY_STATE what was there before: nftables added $added_pkg, nftables.service enabled $added_svc, ip_forward $prev"
+	else install -d -m 0755 "$VER_DIR"; printf 'nftables_installed=%s\nnftables_enabled=%s\nip_forward=%s\n' "$added_pkg" "$added_svc" "$prev" >"$RELAY_STATE"; fi
+	has nft || pkg_install nftables || die "cannot install nftables: install it with apt-get and run this again"
+	act install -d -m 0755 /etc/nftables.d
+	svc enable nftables.service
+	write_unit "$SYSCTL_RELAY" <<EOF
+net.ipv4.ip_forward = 1
+EOF
+	act sysctl -q -w net.ipv4.ip_forward=1
+	write_unit "$NFT_RELAY" <<EOF
+# Owned by veilway.sh install relay. The add and delete lines make a reload replace this table alone.
+add table inet veilway_relay
+delete table inet veilway_relay
+table inet veilway_relay {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+$nat	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ct status dnat ip daddr $node masquerade
+	}
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+		ip daddr $node ct state new meter veilway_relay_new size 65536 { ip saddr timeout 60s limit rate over $rate/second } counter drop
+		ip daddr $node meta l4proto tcp ct state new ct count over $conns counter drop
+	}
+}
+EOF
+	act nft -f "$NFT_RELAY" || { rm -f -- "$NFT_RELAY"; die "nftables rejected the relay rules: nothing was loaded"; }
+	inc="include \"$NFT_RELAY\""
+	if [ "$DRY" = 1 ]; then dry "add $inc to $NFT_CONF, so nftables.service loads the table at boot"
+	elif ! grep -qxF "$inc" "$NFT_CONF"; then printf '%s\n' "$inc" >>"$NFT_CONF"; fi
+	[ "$DRY" = 1 ] || step "relay table loaded from $NFT_RELAY"
+	info "limits per source: $rate new connections a second, $conns TCP connections at once"
+	box "Relay" \
+		"In the panel, under Settings > Relays, add a relay with:" \
+		"  name        any, for example relay-1" \
+		"  address     $address" \
+		"  transports  $names" \
+		"  ports       $ports" \
+		"  inbounds    the ones that serve these transports" \
+		"The panel needs a port only where the relay's differs from the node's." \
+		"Save, then publish the profiles again on Profiles."
+	[ "$DRY" = 1 ] || step "done. Remove it with: sudo bash veilway.sh uninstall relay"
+}
+
+# Removes what install relay added: the table, the files it wrote, its include line, and the settings recorded in its state file.
+do_uninstall_relay() {
+	local was_pkg was_svc was_fwd
+	need_root
+	[ -f "$NFT_RELAY" ] || [ -f "$RELAY_STATE" ] || die "no relay is installed here"
+	confirm "Remove the relay table and the files install relay wrote, and undo what it added to nftables and IP forwarding?" || die "cancelled"
+	was_pkg="$(sed -n 's/^nftables_installed=//p' "$RELAY_STATE" 2>/dev/null || true)"
+	was_svc="$(sed -n 's/^nftables_enabled=//p' "$RELAY_STATE" 2>/dev/null || true)"
+	was_fwd="$(sed -n 's/^ip_forward=//p' "$RELAY_STATE" 2>/dev/null || true)"
+	if nft list table inet veilway_relay >/dev/null 2>&1; then act nft delete table inet veilway_relay; fi
+	act rm -f -- "$NFT_RELAY" "$SYSCTL_RELAY"
+	act rmdir /etc/nftables.d 2>/dev/null || true
+	[ -f "$NFT_CONF" ] && act sed -i "\#^include \"$NFT_RELAY\"\$#d" "$NFT_CONF"
+	if [ "${was_fwd:-1}" = 0 ]; then act sysctl -q -w net.ipv4.ip_forward=0; fi
+	if [ "${was_svc:-0}" = 1 ]; then svc disable nftables.service; fi
+	if [ "${was_pkg:-0}" = 1 ]; then act env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq nftables; fi
+	act rm -f -- "$RELAY_STATE"
+	[ "$DRY" = 1 ] || step "relay removed: its table, files and the settings it added"
+}
+
 # The test overrides move downloads and trusted keys away from the release channel, so each one is shown and needs a yes.
 accept_overrides() {
 	local v
@@ -1106,7 +1236,7 @@ main() {
 			--yes | -y) ASSUME_YES=1 ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
-			-h | --help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+			-h | --help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) args+=("$1") ;;
 		esac
 		shift
@@ -1120,7 +1250,7 @@ main() {
 	[ "${#args[@]}" -gt 0 ] && args=("${args[@]:1}")
 	case "$cmd" in
 		"") menu ;;
-		install) header; do_install "${args[0]:-}" ;;
+		install) header; if [ "${args[0]:-}" = relay ]; then do_install_relay "${args[@]:1}"; else do_install "${args[0]:-}"; fi ;;
 		update) header; do_update "${args[0]:-both}" ;;
 		panel-update-request) do_panel_update_request ;;
 		status) do_status ;;
@@ -1130,7 +1260,7 @@ main() {
 		doctor) do_doctor ;;
 		backup) do_backup "${args[0]:-}" ;;
 		restore) do_restore "${args[0]:-}" ;;
-		uninstall) header; do_uninstall ;;
+		uninstall) header; if [ "${args[0]:-}" = relay ]; then do_uninstall_relay; else do_uninstall; fi ;;
 		version) do_version ;;
 		addon) header; do_addon "${args[0]:-}" "${args[1]:-install}" ;;
 		panel-prefix) header; do_panel_prefix "${args[0]:-}" ;;
