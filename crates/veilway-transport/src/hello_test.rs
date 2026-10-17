@@ -68,10 +68,10 @@ fn ja3(hello: &Hello) -> String {
 	format!("771,{},{},{},{}", list(&hello.ciphers), list(&hello.extensions), list(&hello.groups), hello.formats.iter().map(u8::to_string).collect::<Vec<_>>().join("-"))
 }
 
-async fn flight(sni: Option<&str>) -> Hello {
+async fn flight(sni: Option<&str>, h2: bool) -> Hello {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let front = Front {address: listener.local_addr().unwrap(), sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins: vec![[7; 32]], ech: false, self_signed: true};
-	let dialled = tokio::spawn(async move {tls::dial(&front, &Arc::new(RootCertStore::empty()), &None, Instant::now() + Duration::from_secs(5)).await.is_err()});
+	let front = Front {address: listener.local_addr().unwrap(), sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins: vec![[7; 32]], ech: false, self_signed: true, http2: Default::default()};
+	let dialled = tokio::spawn(async move {tls::dial(&front, &Arc::new(RootCertStore::empty()), &None, Instant::now() + Duration::from_secs(5), h2).await.is_err()});
 	let (mut peer, _) = listener.accept().await.unwrap();
 	let mut record = vec![0; 5];
 	peer.read_exact(&mut record).await.unwrap();
@@ -89,7 +89,7 @@ const TARGET: &str = "t13d1516h1_8daaf6152771_5b37b36a67c0";
 async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
 	let mut orders = HashSet::new();
 	for _ in 0..20 {
-		let hello = flight(Some("node.test")).await;
+		let hello = flight(Some("node.test"), false).await;
 		assert_eq!(ja4(&hello), TARGET);
 		assert_eq!(hello.groups, [0x11ec, 0x001d, 0x0017, 0x0018]);
 		assert_eq!(hello.shares, [0x11ec, 0x001d]);
@@ -103,6 +103,12 @@ async fn the_client_hello_is_chromes_by_ja4_and_its_extensions_move_by_ja3() {
 
 #[tokio::test]
 async fn a_candidate_with_no_server_name_sends_none() {
-	let hello = flight(None).await;
+	let hello = flight(None, false).await;
 	assert!(!hello.sni && ja4(&hello).starts_with("t13i1515h1_8daaf6152771_5b37b36a67c0"));
+}
+
+#[tokio::test]
+async fn a_fetch_hello_offers_h2_ahead_of_http_1_1_and_no_alps() {
+	let hello = flight(Some("node.test"), true).await;
+	assert_eq!((hello.alpn.as_slice(), hello.extensions.contains(&17_513)), (&b"h2\x08http/1.1"[..], false));
 }

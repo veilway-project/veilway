@@ -35,8 +35,13 @@ pub fn later(query: &[u8]) -> Option<([u8; 16], u32)> {
 /// Appends one chunk to a body: its length, then the chunk as `sealer` seals it. `wide` is as for `Sealer::seal`.
 /// A chunk that might not fit the body with the most padding it can draw is refused with `Size`, before a chunk number is used: the caller sends the body it has and puts the chunk in the next one. Every other error is the sealer's, and nothing is appended on any.
 pub fn append(sealer: &mut Sealer, items: &[&[u8]], wide: bool, random: &mut Random, body: &mut Vec<u8>) -> Result<(), ChunkError> {
+	append_within(sealer, items, wide, random, body, BODY_MAX)
+}
+
+/// `append` for a body that may not grow past `limit`: the window of an HTTP/2 request (http2 page, "`fronted` over HTTP/2", rule 2).
+pub fn append_within(sealer: &mut Sealer, items: &[&[u8]], wide: bool, random: &mut Random, body: &mut Vec<u8>, limit: usize) -> Result<(), ChunkError> {
 	let (start, used) = (body.len(), items.iter().try_fold(0usize, |sum, item| sum.checked_add(2 + item.len())).ok_or(ChunkError::Size)?);
-	if start.saturating_add(2 + TAG + *WIDE_BOUNDS.end() as usize).saturating_add(used) > BODY_MAX {return Err(ChunkError::Size)}
+	if start.saturating_add(2 + TAG + *WIDE_BOUNDS.end() as usize).saturating_add(used) > limit {return Err(ChunkError::Size)}
 	body.extend_from_slice(&[0; 2]);
 	if let Err(error) = sealer.seal(items, wide, random, body) {
 		body.truncate(start);

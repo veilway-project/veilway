@@ -69,7 +69,9 @@ fn certified(issuer: Option<&Issuer<'static, KeyPair>>, name: &str, valid: Optio
 		None => params.self_signed(&key),
 	}.unwrap();
 	let (own, chain) = (CertificateDer::from(cert.der().to_vec()), [&[CertificateDer::from(cert.der().to_vec())][..], above].concat());
-	let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_protocol_versions(versions).unwrap().with_no_client_auth().with_single_cert(chain, PrivateKeyDer::try_from(key.serialize_der()).unwrap()).unwrap();
+	let mut config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_protocol_versions(versions).unwrap().with_no_client_auth().with_single_cert(chain, PrivateKeyDer::try_from(key.serialize_der()).unwrap()).unwrap();
+	// A front that speaks HTTP/1.1 only picks it from the client's list, as the stream transports need.
+	config.alpn_protocols = vec![b"http/1.1".to_vec()];
 	(Arc::new(config), digest(&SHA256, &key.subject_public_key_info()).as_ref().try_into().unwrap(), own)
 }
 
@@ -150,7 +152,7 @@ fn source() -> Source {
 	})))
 }
 
-fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false, self_signed: false}}
+fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false, self_signed: false, http2: Default::default()}}
 
 fn ws(candidate: Front) -> Target {Target::Ws {path: PATH.into(), candidate}}
 

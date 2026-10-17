@@ -454,7 +454,7 @@ mod tests {
 
 	fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
 
-	fn candidate(pinned: bool) -> Candidate {Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), sni: Some("node.example".into()), host: "node.example".into(), verify_name: None, ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}, self_signed: false}}
+	fn candidate(pinned: bool) -> Candidate {Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), sni: Some("node.example".into()), host: "node.example".into(), verify_name: None, ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}, self_signed: false, http2: Default::default()}}
 
 	fn terms(direction: Direction) -> Terms {
 		Terms {direction, name: "exit in the north".into(), inbound_public_key: x25519([1; 32], X25519_BASEPOINT_BYTES), transport_public_key: Some(x25519([2; 32], X25519_BASEPOINT_BYTES)), dialler: vec!["10.9.0.2".parse().unwrap(), "fd00:9::2".parse().unwrap()], listener: if direction == Direction::Reverse {vec!["10.9.0.3".parse().unwrap(), "fd00:9::3".parse().unwrap()]} else {Vec::new()}, mtu: 1390, transports: vec![Transport::UdpObfs(vec![Dial::parse("203.0.113.9:51821").unwrap(), Dial::parse("[2001:db8::9]:51821").unwrap()]), Transport::Tls(Stream {path: "/assets/app-3f9c2e71.js".into(), candidates: vec![candidate(true)]}), Transport::Ws(Stream {path: "/assets/live-7c1d0a52.js".into(), candidates: vec![candidate(false)]}), Transport::Udp(vec![Dial::parse("10.1.2.3:51820").unwrap()])]}

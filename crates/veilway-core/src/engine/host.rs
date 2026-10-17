@@ -6,7 +6,7 @@ use super::netstack::{self, PacketDev};
 use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
 use super::{certificate, control, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, Host as Named, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use crate::config::{loops, Certificate, Config, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
@@ -236,6 +236,7 @@ impl Host {
 							}
 							_ => None,
 						};
+						let acceptor = acceptor.map(|acceptor| if matches!(transport, Transport::Tls {http2: Some(Http2::On), ..}) {stream::offering_h2(&acceptor)} else {acceptor});
 						let origin = match &decoy.origin.0.host {
 							Named::Ip(ip) => SocketAddr::new(*ip, decoy.origin.0.port),
 							Named::Name(name) => tokio::time::timeout(RESOLVE, lookup_host((name.as_str(), decoy.origin.0.port))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].decoy.origin: the name of the decoy origin of inbound `{}` does not resolve", inbound.tag))?,
@@ -410,7 +411,7 @@ impl Host {
 					},
 					_ => continue,
 				};
-				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
+				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), h2: matches!(transport, Transport::Tls {http2: Some(Http2::On), ..}), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
 			}
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();

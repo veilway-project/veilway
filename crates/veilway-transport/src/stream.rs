@@ -10,15 +10,18 @@
 //! - A device that cannot dial at all (no route, no socket, a socket hook that failed) is `End::Offline`, and a certificate outside its validity at the device's time is `Unreachable::CertificateTime`: neither is held against the candidate.
 //!
 //! An open session is lost when its connection ends, when an idle keepalive gets no chunk back within 10 s, and when a handshake WireGuard started because the node stopped answering (`Kind::Stalled`) gets none either: a connection that goes dark without a reset is noticed by that and by nothing else while the caller keeps sending.
+use crate::h2::{self, Fail, Mark, Opened};
 use crate::http::{self, Stop, HEAD_MAX};
 use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::Ordering;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use veilway_proto::chunk::{ChunkError, Items, Opener, Padding, Sealer, MAX_ITEMS, MAX_PLAINTEXT, MAX_SEALED, TAG};
 use veilway_proto::keys::ChunkKey;
 use veilway_proto::proof::{self, Name};
 use veilway_proto::session::{LIVENESS, LONE_KEEPALIVE};
+use veilway_proto::subscription::payload::Http2;
 use veilway_proto::websocket::{self, Header, BINARY, CLOSE, CLOSE_WAIT, NORMAL, PING, PONG};
 
 /// Reads the header of the frame `bytes` begins with, as a client takes one from a node: `Ok(None)` while the header is not all there. The verdict falls at the header, before a byte of the payload is waited for.
@@ -86,42 +89,87 @@ fn masked(opcode: u8, payload: &[u8], out: &mut Vec<u8>) -> Result<(), End> {
 	Ok(())
 }
 
+// What a session reads and writes: a TLS stream, or the pipe of a WebSocket over HTTP/2.
+trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
+
 pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, candidate: &Front) -> Ended {
-	let (dialled, Some(node)) = (Instant::now() + ATTEMPT, link.node) else {return End::Source.into()};
-	// Everything a session needs of others is taken before anything is dialled: the WireGuard layer is never asked for a session nobody holds any more. "The client creates a new HPKE context for every proof and never reuses one."
-	let (Ok(proof), Ok(padding), Some(first), mut nonce) = (proof::Client::new(&node, link.secret.expose(), &link.inbound, &link.device).prove(name, (port.env.now)(), &mut random), Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random), port.want(Want::First), [0; 16]) else {return End::Source.into()};
-	if random(&mut nonce).is_err() {return End::Random.into()}
-	let (key, roots, hook, device, keepalive) = (STANDARD.encode(nonce), port.env.roots.clone(), port.env.socket.clone(), port.env.device.clone(), lone(&first));
+	let Some(node) = link.node else {return End::Source.into()};
+	// Everything a session needs of others is taken before anything is dialled: the WireGuard layer is never asked for a session nobody holds any more. "The client creates a new HPKE context for every proof and never reuses one." A fallback makes a new proof, so each attempt has its own token.
+	let (Ok(padding), Some(first)) = (Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random), port.want(Want::First)) else {return End::Source.into()};
+	let (roots, hook, device, keepalive) = (port.env.roots.clone(), port.env.socket.clone(), port.env.device.clone(), lone(&first));
 	let (host, agent) = (tls::host(candidate), http::user_agent());
-	// Chrome's order for a WebSocket upgrade over HTTP/1.1.
-	let request = format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n", proof.token);
-	// The dial, the request and its answer. The 10 s for the answer and for the node's first chunk run from the moment the request is written: the node's own 10 s for a session it took run from about then.
-	let opening = async {
-		let (mut io, mut buf) = (tls::dial(candidate, &roots, &hook, dialled).await?, Vec::with_capacity(HEAD_MAX));
-		match timeout_at(dialled, async {io.write_all(request.as_bytes()).await.is_ok() && io.flush().await.is_ok()}).await {
-			Ok(true) => {}
-			Ok(false) => return Err(Ended::Unreachable(Unreachable::Cut)),
-			Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
-		}
-		let deadline = Instant::now() + ATTEMPT;
-		// A close the TLS session vouches for is a refusal. A connection that is reset, or ends without one, is cut: anyone on the path can do that.
-		match timeout_at(deadline, http::answer(&mut io, &mut buf)).await {
-			Ok(Ok(end)) => Ok((io, buf, end, deadline, device())),
-			Ok(Err(Stop::Said(answer))) => Err(Ended::Refused(Refusal {answer, offset: None})),
-			Ok(Err(Stop::Cut)) => Err(Ended::Unreachable(Unreachable::Cut)),
-			Err(_) => Err(Ended::Unreachable(Unreachable::Timeout)),
+	// "`full`: WebSocket over HTTP/2 first, unless this candidate was marked for an hour."
+	let mut http2 = candidate.http2 == Http2::Full && h2::marked(candidate).is_none();
+	let (proof, io, buf, deadline, abnormal) = loop {
+		// Each attempt has its own 10 s, as a fallback is a new connection.
+		let dialled = Instant::now() + ATTEMPT;
+		let Ok(proof) = proof::Client::new(&node, link.secret.expose(), &link.inbound, &link.device).prove(name, (port.env.now)(), &mut random) else {return End::Source.into()};
+		let mut nonce = [0; 16];
+		if random(&mut nonce).is_err() {return End::Random.into()}
+		let key = STANDARD.encode(nonce);
+		// Chrome's order for a WebSocket upgrade over HTTP/1.1. Over HTTP/2 `h2::fields` takes the same fields and writes them in its own order.
+		let request = format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n", proof.token);
+		// The dial, the request and its answer. The 10 s for the answer and for the node's first chunk run from the moment the request is written: the node's own 10 s for a session it took run from about then.
+		let opening = async {
+			let io = tls::dial(candidate, &roots, &hook, dialled, http2).await?;
+			if http2 {
+				if io.0.ssl().selected_alpn_protocol() != Some(b"h2") {
+					h2::mark(candidate, Mark::NoConnect);
+					return Ok(None);
+				}
+				let Some((list, _)) = h2::fields(request.as_bytes(), &host, true) else {return Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None}))};
+				return match h2::Conn::new(io).websocket(&list).await {
+					Ok(Opened::Ready(pipe, abnormal)) => Ok(Some((Box::new(pipe) as Box<dyn Duplex>, Vec::new(), Instant::now() + ATTEMPT, Some(abnormal)))),
+					Ok(Opened::NoConnect) => {
+						h2::mark(candidate, Mark::NoConnect);
+						Ok(None)
+					}
+					Ok(Opened::Misdirected) => {
+						h2::mark(candidate, Mark::Misdirected);
+						Ok(None)
+					}
+					Ok(Opened::Status(status)) => Err(Ended::Refused(Refusal {answer: Answer::Status(status), offset: None})),
+					Err(Fail::Cut) => Err(Ended::Unreachable(Unreachable::Cut)),
+					Err(Fail::Closed) => Err(Ended::Refused(Refusal {answer: Answer::Closed, offset: None})),
+					Err(Fail::Fault) => Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None})),
+				};
+			}
+			let mut io = io;
+			let mut buf = Vec::with_capacity(HEAD_MAX);
+			match timeout_at(dialled, async {io.write_all(request.as_bytes()).await.is_ok() && io.flush().await.is_ok()}).await {
+				Ok(true) => {}
+				Ok(false) => return Err(Ended::Unreachable(Unreachable::Cut)),
+				Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
+			}
+			let deadline = Instant::now() + ATTEMPT;
+			// A close the TLS session vouches for is a refusal. A connection that is reset, or ends without one, is cut: anyone on the path can do that.
+			let end = match timeout_at(deadline, http::answer(&mut io, &mut buf)).await {
+				Ok(Ok(end)) => end,
+				Ok(Err(Stop::Said(answer))) => return Err(Ended::Refused(Refusal {answer, offset: None})),
+				Ok(Err(Stop::Cut)) => return Err(Ended::Unreachable(Unreachable::Cut)),
+				Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
+			};
+			let read_at = device();
+			let Some(head) = http::head(&buf[..end]) else {return Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None}))};
+			// "Only after the certificate matched a pin from the profile, the client may read the `Date` header of the decoy's answer." The difference is taken against the device's own clock, as it stood when the head was read.
+			if let Err(answer) = head.upgraded(key.as_bytes()) {return Err(Ended::Refused(Refusal {answer, offset: head.date().filter(|_| !candidate.pins.is_empty()).map(|date| i64::try_from(date).unwrap_or(i64::MAX).saturating_sub(i64::try_from(read_at).unwrap_or(i64::MAX)))}))}
+			buf.drain(..end);
+			Ok(Some((Box::new(io) as Box<dyn Duplex>, buf, deadline, None)))
+		};
+		// A session that is closed or dropped while it opens stops here: no proof leaves the device after that.
+		let opened = match unasked(&mut port.ask, opening).await {
+			Some(Ok(opened)) => opened,
+			Some(Err(ended)) => return ended,
+			None => return End::Asked.into(),
+		};
+		match opened {
+			Some((io, buf, deadline, abnormal)) => break (proof, io, buf, deadline, abnormal),
+			// The server did not take HTTP/2 for this WebSocket: the next attempt is the HTTP/1.1 upgrade on a new connection.
+			None => http2 = false,
 		}
 	};
-	// A session that is closed or dropped while it opens stops here: no proof leaves the device after that.
-	let (io, mut buf, end, deadline, read_at) = match unasked(&mut port.ask, opening).await {
-		Some(Ok(opened)) => opened,
-		Some(Err(ended)) => return ended,
-		None => return End::Asked.into(),
-	};
-	let Some(head) = http::head(&buf[..end]) else {return Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None})};
-	// "Only after the certificate matched a pin from the profile, the client may read the `Date` header of the decoy's answer." The difference is taken against the device's own clock, as it stood when the head was read.
-	if let Err(answer) = head.upgraded(key.as_bytes()) {return Ended::Refused(Refusal {answer, offset: head.date().filter(|_| !candidate.pins.is_empty()).map(|date| i64::try_from(date).unwrap_or(i64::MAX).saturating_sub(i64::try_from(read_at).unwrap_or(i64::MAX)))})}
-	buf.drain(..end);
 	let ((mut rd, mut wr), mut sealer, mut reader, mut read) = (tokio::io::split(io), Sealer::new(proof.keys.c2s, padding), Reader::new(proof.keys.s2c, buf), vec![0u8; 16_384]);
 	// `batch` is what the next chunk holds, and `flush` that it goes out even if it is a lone keepalive. `held` is a lone keepalive on its way out, with whether it is the idle one. `awaiting` is until when a chunk of the node must have come: after an idle keepalive, and after a handshake WireGuard started because the node stopped answering.
 	let (mut batch, mut flush, mut held, mut awaiting, mut carry, mut established, mut idle) = (vec![(first, Kind::Packet {flow: 0, control: false})], true, None::<(Vec<u8>, Instant, bool)>, None::<Instant>, None::<(Vec<u8>, Kind)>, false, deadline);
@@ -212,7 +260,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 				Ok(count) if count > 0 => reader.feed(&read[..count]),
 				// The end of the connection: in order, with the TLS session's `close_notify`, or cut.
 				got => {
-					(gone, cut) = (true, got.is_err());
+					(gone, cut) = (true, got.is_err() || abnormal.as_ref().is_some_and(|abnormal| abnormal.load(Ordering::Relaxed)));
 					break End::Lost.into();
 				}
 			},

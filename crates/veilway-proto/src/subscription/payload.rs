@@ -343,7 +343,13 @@ pub struct Candidate {
 	pub pins: Vec<[u8; 32]>,
 	/// `self_signed` of a `tls` candidate: the certificate is trusted through `pins` alone, and no chain, name or date of it is checked. Never true on another transport.
 	pub self_signed: bool,
+	/// `http2` of the candidate (http2 page, "Modes"): whether the client offers `h2` and speaks WebSocket over HTTP/2. Absent is `fetch`.
+	pub http2: Http2,
 }
+
+/// How a candidate uses HTTP/2. `off`: `http/1.1` alone everywhere. `fetch`: `fronted` offers `h2` and `http/1.1`, `tls` and `ws` upgrade over HTTP/1.1 as before. `full`: as `fetch`, and `tls` and `ws` first try WebSocket over HTTP/2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Http2 {Off, #[default] Fetch, Full}
 
 /// An address "a client may be told to connect" to: an IP address and a port that passed the refusals made "when the document is parsed". The ones made at each connect are `Dial::own` and `Dial::private`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -639,10 +645,12 @@ fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
 	let verify_name = host(members, "verify_name")?;
 	// "Required when `sni` is empty and not allowed otherwise." A self-signed candidate "has no `verify_name`, since no name is checked", and its `sni` may be empty.
 	if (self_signed && verify_name.is_some()) || (!self_signed && verify_name.is_some() == sni.is_some()) {return Err("verify_name")}
+	// "`http2`: `off`, `fetch` (the default) or `full`." Any other value, or one that is no string, refuses the candidate.
+	let http2 = match members.string("http2", 8)? {None => Http2::Fetch, Some("off") => Http2::Off, Some("fetch") => Http2::Fetch, Some("full") => Http2::Full, Some(_) => return Err("http2")};
 	let ech = members.string("ech", 1_368)?.map(|text| STANDARD.decode(text).ok().filter(|ech| (1..=1_024).contains(&ech.len())).ok_or("ech")).transpose()?;
 	let pins = members.list("pins", 1..=PINS_MAX)?.map(|pins| pins.iter().map(|pin| if let Json::Str(text) = pin {hash(text)} else {None}.ok_or("pins")).collect::<Named<Vec<_>>>()).transpose()?;
 	if (rule == Pins::Required && pins.is_none()) || (rule == Pins::Forbidden && pins.is_some()) {return Err("pins")}
-	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default(), self_signed})
+	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default(), self_signed, http2})
 }
 
 pub(crate) fn transport(value: &Json) -> Result<Transport, Fault> {

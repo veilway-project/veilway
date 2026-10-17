@@ -93,7 +93,7 @@ struct Meta {stream: bool, taken: usize}
 
 // Writes one request, reads the head of the answer within `wait` of the moment the request left, and checks it is the head of an event stream. What is left of the bytes read behind the head comes back with the connection, and so does the moment the request was written.
 async fn start(candidate: &Front, roots: &Arc<RootCertStore>, hook: &Option<Hook>, request: &[u8], deadline: Instant, wait: Duration) -> Result<(Conn, Vec<u8>, Instant), Over> {
-	let mut io = tls::dial(candidate, roots, hook, deadline).await.map_err(Over::Dial)?;
+	let mut io = tls::dial(candidate, roots, hook, deadline, false).await.map_err(Over::Dial)?;
 	if io.write_all(request).await.is_err() || io.flush().await.is_err() {return Err(Over::Cut)}
 	let (mut buf, written) = (Vec::new(), Instant::now());
 	let end = match timeout_at(written + wait, http::answer(&mut io, &mut buf)).await {
@@ -144,7 +144,7 @@ async fn flight(candidate: Front, roots: Arc<RootCertStore>, hook: Option<Hook>,
 	let (mut buf, mut repeats) = (Vec::new(), 0);
 	let answered = timeout_at(limit, async {
 		loop {
-			if conn.is_none() {conn = Some(tls::dial(&candidate, &roots, &hook, limit).await.map_err(|_| Ended::Closed(End::Lost))?)}
+			if conn.is_none() {conn = Some(tls::dial(&candidate, &roots, &hook, limit, false).await.map_err(|_| Ended::Closed(End::Lost))?)}
 			let Some(io) = conn.as_mut() else {return Err(Ended::Closed(End::Lost))};
 			match exchange(io, &request, &mut buf, &mut false).await {
 				Ok((body, close)) => {
@@ -202,7 +202,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 				Err(_) => Err(Ended::Unreachable(Unreachable::Cut)),
 			}
 		} else {
-			let (mut io, mut written, mut buf) = (tls::dial(candidate, &roots, &hook, dialled).await?, false, Vec::new());
+			let (mut io, mut written, mut buf) = (tls::dial(candidate, &roots, &hook, dialled, false).await?, false, Vec::new());
 			match timeout(ATTEMPT, exchange(&mut io, &request, &mut buf, &mut written)).await {
 				Ok(Ok((body, close))) => Ok((Some((io, buf[body].to_vec(), close)), None)),
 				Ok(Err(Stop::Said(answer))) => Err(Ended::Refused(Refusal {answer, offset: None})),

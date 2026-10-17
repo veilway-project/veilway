@@ -6,6 +6,7 @@
 pub mod chunk;
 pub mod control;
 pub mod fronted;
+pub mod h2;
 pub mod http;
 pub mod keys;
 pub mod opening;

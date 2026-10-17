@@ -42,13 +42,13 @@ pub struct Request {
 }
 
 // The characters of a method and of a field name (RFC 9110, "token").
-fn token(byte: u8) -> bool {byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)}
+pub(crate) fn token(byte: u8) -> bool {byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)}
 
 /// The end of the first head in `bytes`: the place behind its empty line.
 pub fn head_end(bytes: &[u8]) -> Option<usize> {bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|at| at + 4)}
 
 // The lines of a head without their line ends, up to the empty line. None for a head with a CR or LF that is not part of a CR LF, with a NUL, or without the empty line at its end.
-fn lines(head: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+pub(crate) fn lines(head: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
 	let inner = head.strip_suffix(b"\r\n\r\n")?;
 	let sound = inner.iter().enumerate().all(|(at, byte)| match byte {
 		b'\r' => inner.get(at + 1) == Some(&b'\n'),
@@ -60,7 +60,7 @@ fn lines(head: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
 }
 
 // A field line as its name and its value without the blanks around it. None for a line that is no field: no colon, a name that is no token, which a folded line and a blank before the colon both are.
-fn field(line: &[u8]) -> Option<(&[u8], &[u8])> {
+pub(crate) fn field(line: &[u8]) -> Option<(&[u8], &[u8])> {
 	let colon = line.iter().position(|byte| *byte == b':')?;
 	let (name, mut value) = (&line[..colon], &line[colon + 1..]);
 	while let [b' ' | b'\t', rest @ ..] | [rest @ .., b' ' | b'\t'] = value {value = rest}
@@ -68,7 +68,7 @@ fn field(line: &[u8]) -> Option<(&[u8], &[u8])> {
 }
 
 // What the fields of a head say about the body behind it, for a head that says one thing only: no body, one length in plain digits, or `chunked` alone. `fields` are the lines behind the first.
-fn framing<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Option<(Option<u64>, bool)> {
+pub(crate) fn framing<'a>(fields: impl Iterator<Item = &'a [u8]>) -> Option<(Option<u64>, bool)> {
 	let (mut length, mut chunked) = (None, false);
 	for line in fields {
 		let (name, value) = field(line)?;

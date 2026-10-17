@@ -335,7 +335,7 @@ mod tests {
 	#[test]
 	fn the_connection_names_the_candidate_and_how_it_is_checked_and_nothing_secret() {
 		use veilway_proto::subscription::payload::{Candidate, Dial, Stream};
-		let candidate = |sni: Option<&str>, pins: Vec<[u8; 32]>, self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: sni.map(str::to_owned), host: "node.example".to_owned(), ech: None, pins, self_signed};
+		let candidate = |sni: Option<&str>, pins: Vec<[u8; 32]>, self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: sni.map(str::to_owned), host: "node.example".to_owned(), ech: None, pins, self_signed, http2: Default::default()};
 		let stream = |candidates| Stream {path: "/aaaaaaaaaaaa".into(), candidates};
 		let tls = Connection::of(&Transport::Tls(stream(vec![candidate(Some("front.example"), vec![[7; 32]], true), candidate(Some("front.example"), vec![[7; 32]], false), candidate(None, Vec::new(), false)])), 0).unwrap();
 		assert_eq!((tls.transport, tls.address.to_string(), tls.host.as_deref(), tls.server_name.as_deref(), tls.check, tls.since), ("tls", "203.0.113.9:443".to_owned(), Some("node.example"), Some("front.example"), Some(Check::PinnedSelfSigned), None));

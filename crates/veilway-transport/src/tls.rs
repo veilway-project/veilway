@@ -73,12 +73,12 @@ pub(crate) fn host(candidate: &Front) -> String {if candidate.address.port() == 
 /// A TCP connection to the candidate's address and a TLS handshake on it, both before `deadline`. What comes back has passed every check of this module's head, or nothing comes back.
 /// A device that has no socket, no address or no route to dial with is `Offline`, and so is one whose `hook` refused the socket: neither says anything about the candidate.
 /// The handshake is a browser's (`fingerprint.rs`) and runs with the library's own chain check off. The checks run on what the server sent before this returns, so no byte of application data goes either way before they pass, and they are the same ones as ever: the chain, the name and the dates by rustls's verifier, the pins behind it, or for a self-signed candidate the pins alone.
-pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &Option<Hook>, deadline: Instant) -> Result<Stream, Ended> {
+pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &Option<Hook>, deadline: Instant, h2: bool) -> Result<Stream, Ended> {
 	let (name, pinned, tls) = (name(candidate).map_err(|_| Ended::Unreachable(Unreachable::Certificate))?, !candidate.pins.is_empty(), || Ended::Unreachable(Unreachable::Tls));
 	// An empty root store was refused before this was called. Should one get here, it is no check passed.
 	let verifier = if candidate.self_signed && pinned {None} else {Some(WebPkiServerVerifier::builder_with_provider(roots.clone(), Arc::new(default_provider())).build().map_err(|_| Ended::Unreachable(Unreachable::Certificate))?)};
 	// "Empty means no server name is sent."
-	let ssl = fingerprint::context().and_then(|context| fingerprint::ssl(context, &name.to_str(), candidate.sni.is_some())).map_err(|_| tls())?;
+	let ssl = fingerprint::context().and_then(|context| fingerprint::ssl(context, &name.to_str(), candidate.sni.is_some(), h2)).map_err(|_| tls())?;
 	let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
 	if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
 	let stream = match timeout_at(deadline, socket.connect(candidate.address)).await {
@@ -100,6 +100,8 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 	// "The client requires TLS 1.3 on a pinned candidate and accepts what the CDN negotiates otherwise." A self-signed candidate is a pinned one. The hello offers 1.2 as a browser's does, so a downgrade is refused here.
 	if pinned && stream.ssl().version2() != Some(SslVersion::TLS1_3) {return Err(tls())}
 	if !stream.ssl().current_cipher().is_some_and(|cipher| acceptable_cipher(cipher.name())) {return Err(tls())}
+	// With `h2` offered the server picks `h2` or `http/1.1`, and anything else, or nothing, ends the attempt.
+	if h2 && !stream.ssl().selected_alpn_protocol().is_some_and(|alpn| alpn == b"h2" || alpn == b"http/1.1") {return Err(tls())}
 	let ssl = stream.ssl();
 	let (Some(leaf), Some(chain)) = (ssl.peer_certificate().and_then(|leaf| leaf.to_der().ok()), ssl.peer_cert_chain()) else {return Err(Ended::Unreachable(Unreachable::Certificate))};
 	let leaf = CertificateDer::from(leaf);

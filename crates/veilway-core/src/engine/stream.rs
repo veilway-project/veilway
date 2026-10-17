@@ -32,7 +32,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering}
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::time::Duration;
 use time::{OffsetDateTime, UtcOffset};
-#[cfg(feature = "bench")]
 use tokio::io::DuplexStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
@@ -56,6 +55,7 @@ use veilway_wg::ws::Acceptor;
 #[cfg(feature = "bench")]
 use veilway_wg::Wg;
 
+mod h2;
 mod shaped;
 
 /// "TLS handshake deadline: 10 s from accept."
@@ -106,7 +106,6 @@ impl Io for tokio_rustls::server::TlsStream<TcpStream> {
 	fn reset(&self) {self.get_ref().0.reset()}
 }
 
-#[cfg(feature = "bench")]
 impl Io for DuplexStream {}
 
 type Stream = Box<dyn Io>;
@@ -157,9 +156,9 @@ pub enum Stranger {
 const STRANGERS: usize = Stranger::Unestablished as usize + 1;
 
 #[derive(Clone, Copy)]
-enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped, ShapedPolls, ShapedRepeats, ShapedLate, ShapedStreams, ShapedEvents, ShapedBeats, ShapedLimited}
+enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped, ShapedPolls, ShapedRepeats, ShapedLate, ShapedStreams, ShapedEvents, ShapedBeats, ShapedLimited, H2Connections, H2Users, H2Strangers, H2Refused, H2Rapid, H2Flood, H2Limit}
 
-const COUNTS: usize = Count::ShapedLimited as usize + 1;
+const COUNTS: usize = Count::H2Limit as usize + 1;
 
 pub struct Counters {counts: [AtomicU64; COUNTS], strangers: [AtomicU64; STRANGERS], ended: Arc<[AtomicU64; ENDS]>}
 
@@ -274,6 +273,14 @@ pub struct StreamTotals {
 	pub shaped_events: u64,
 	pub shaped_beats: u64,
 	pub shaped_limited: u64,
+	/// HTTP/2 connections of a `tls` listener, streams on them that were a user's and a stranger's, streams reset as malformed or over a bound before anything went upstream, and connections closed with GOAWAY for a rapid reset (streams that ended before their answer, whoever reset them), for a flood of frames that carry nothing or of streams opened, and for any other bound (a header block's size or time, the control frames not yet answered).
+	pub h2_connections: u64,
+	pub h2_users: u64,
+	pub h2_strangers: u64,
+	pub h2_refused: u64,
+	pub h2_rapid: u64,
+	pub h2_flood: u64,
+	pub h2_limit: u64,
 }
 
 /// Where the decoy origin of a listener is.
@@ -324,6 +331,13 @@ impl Origin {
 			}
 		}
 	}
+}
+
+/// The acceptor with `h2` in its ALPN list ahead of `http/1.1`, for a listener whose `tls` transports have `http2` on. A client that offers `http/1.1` alone still gets what it got before.
+pub fn offering_h2(acceptor: &Acceptor) -> Acceptor {
+	let mut config = (*acceptor.config().clone()).clone();
+	config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+	Acceptor::from(Arc::new(config))
 }
 
 /// One transport of a listener: the path its proofs arrive on and the tunnel they open.
@@ -414,6 +428,8 @@ pub struct Served {
 	pub pools: Pools,
 	/// Set for a `ws` or `fronted` listener. "A listener serves one kind of peer."
 	pub front: Option<Front>,
+	/// `http2` of the listener's `tls` transports: whether the node offers `h2` next to `http/1.1` once it ends TLS.
+	pub h2: bool,
 }
 
 /// One connection in the undecided pool, or one request of the proxy path among those that wait with nothing proven. Dropping it takes it out, wherever it has got to.
@@ -526,6 +542,8 @@ pub struct Listener {
 	/// Wakes every proxy connection when the listener closes.
 	shut: Notify,
 	counters: Arc<Counters>,
+	/// What the listener keeps of its HTTP/2 connections.
+	h2: h2::Book,
 }
 
 /// What every stream listener of the node shares: the counters, and the way to each of them.
@@ -537,7 +555,7 @@ impl State {
 	pub fn listen(&self, addr: SocketAddr, served: Served) -> Arc<Listener> {
 		let seats = served.front.as_ref().map_or(0, |front| front.connections);
 		let permits = served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE + seats;
-		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools, front: served.front.clone()})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), proxies: Arc::new(Semaphore::new(seats)), seats: Mutex::new(seats), fronts: Arc::default(), decoys: Mutex::default(), polling: Mutex::default(), polled: Arc::default(), shaped: Mutex::default(), shaped_pool: Arc::default(), streams: AtomicI64::new(0), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), shut: Notify::new(), counters: self.counters.clone()});
+		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools, front: served.front.clone(), h2: served.h2})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), proxies: Arc::new(Semaphore::new(seats)), seats: Mutex::new(seats), fronts: Arc::default(), decoys: Mutex::default(), polling: Mutex::default(), polled: Arc::default(), shaped: Mutex::default(), shaped_pool: Arc::default(), streams: AtomicI64::new(0), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), shut: Notify::new(), counters: self.counters.clone(), h2: h2::Book::default()});
 		listener.serve(served);
 		let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
 		listeners.retain(|listener| listener.strong_count() > 0);
@@ -585,7 +603,7 @@ impl State {
 			proxies, decoys, fronted, proxy_accepted: count(Count::Proxied), proxy_requests: count(Count::Requests), proxy_unnamed: count(Count::Unnamed), proxy_idle: count(Count::ProxyIdle), forwards: count(Count::Forwarded), forwards_unframed: count(Count::Unframed), forwards_cut: count(Count::Cut),
 			stranger_head: stranger(Stranger::Head), stranger_session: stranger(Stranger::Session), stranger_body: stranger(Stranger::Body), stranger_unestablished: stranger(Stranger::Unestablished), polls: count(Count::Polls), poll_repeats: count(Count::Repeats),
 			proxy_http10: count(Count::Legacy), forwards_redialed: count(Count::Redialed), origin_dropped: count(Count::OriginDropped),
-			shaped, streams, shaped_polls: count(Count::ShapedPolls), shaped_repeats: count(Count::ShapedRepeats), shaped_late: count(Count::ShapedLate), shaped_streams: count(Count::ShapedStreams), shaped_events: count(Count::ShapedEvents), shaped_beats: count(Count::ShapedBeats), shaped_limited: count(Count::ShapedLimited),
+			shaped, streams, shaped_polls: count(Count::ShapedPolls), shaped_repeats: count(Count::ShapedRepeats), shaped_late: count(Count::ShapedLate), shaped_streams: count(Count::ShapedStreams), shaped_events: count(Count::ShapedEvents), shaped_beats: count(Count::ShapedBeats), shaped_limited: count(Count::ShapedLimited), h2_connections: count(Count::H2Connections), h2_users: count(Count::H2Users), h2_strangers: count(Count::H2Strangers), h2_refused: count(Count::H2Refused), h2_rapid: count(Count::H2Rapid), h2_flood: count(Count::H2Flood), h2_limit: count(Count::H2Limit),
 		}
 	}
 }
@@ -678,7 +696,7 @@ impl Listener {
 	/// A certificate the node made anew under the config in force: the next connection is answered with it, and nothing else changes. What runs keeps the certificate it was accepted with.
 	pub fn certify(&self, acceptor: Acceptor) {
 		let mut served = self.served.write().unwrap_or_else(|e| e.into_inner());
-		*served = Arc::new(Served {acceptor: Some(acceptor), routes: served.routes.clone(), origin: served.origin.clone(), proxy: served.proxy, host: served.host.clone(), pools: served.pools, front: served.front.clone()});
+		*served = Arc::new(Served {acceptor: Some(if served.h2 {offering_h2(&acceptor)} else {acceptor}), routes: served.routes.clone(), origin: served.origin.clone(), proxy: served.proxy, host: served.host.clone(), pools: served.pools, front: served.front.clone(), h2: served.h2});
 	}
 
 	/// The end of a listener whose address no config has any more: its sessions end, and so does every connection it holds.
@@ -827,6 +845,8 @@ async fn direct(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served
 				// "`tls`: WebSocket inside TLS 1.3." A client ends its attempt unless TLS 1.3 was negotiated, so a proof that arrives under an older version is not a user's, and is verified with the same work as one that is.
 				Ok(tls) => {
 					let modern = tls.get_ref().1.protocol_version() == Some(ProtocolVersion::TLSv1_3);
+					// "For a connection where TLS chose `h2`": the node is an HTTP/2 server for it, and decides every stream on its own.
+					if served.h2 && tls.get_ref().1.alpn_protocol() == Some(b"h2") {return h2::serve(shared, listener, served, Box::new(tls), modern, peer, local, place).await}
 					(Box::new(tls), modern)
 				}
 				Err(count) => return listener.counters.count(count),
@@ -2076,7 +2096,7 @@ impl Bench {
 		}).collect();
 		anyhow::ensure!(!routes.is_empty(), "no stream transport");
 		let front = inbound.transports.iter().find_map(|transport| transport.proxied()).map(|proxied| Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, inbound.transports.iter().any(|other| other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))));
-		let listener = shared.stream.listen(SocketAddr::from(([127, 0, 0, 1], 443)), Served {acceptor: None, routes, origin: Origin::Memory(origin), proxy: false, host: String::new(), pools, front});
+		let listener = shared.stream.listen(SocketAddr::from(([127, 0, 0, 1], 443)), Served {acceptor: None, routes, origin: Origin::Memory(origin), proxy: false, host: String::new(), pools, front, h2: false});
 		Ok(Bench {shared, listener, origins})
 	}
 

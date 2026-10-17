@@ -20,6 +20,7 @@
 pub mod choice;
 mod fingerprint;
 mod fronted;
+mod h2;
 #[cfg(test)]
 mod hello_test;
 pub mod http;
@@ -45,7 +46,7 @@ use tokio::time::Instant;
 use veilway_proto::chunk::{self, MAX_ITEM, MIN_ITEM};
 use veilway_proto::proof::Name;
 use veilway_proto::shape::Shape;
-use veilway_proto::subscription::payload::{Candidate, Padding, Profile, Transport};
+use veilway_proto::subscription::payload::{Candidate, Http2, Padding, Profile, Transport};
 use veilway_proto::subscription::Secret;
 use veilway_proto::{session, NoRandom};
 
@@ -124,10 +125,12 @@ pub struct Front {
 	pub ech: bool,
 	/// `self_signed` of the signed profile: the certificate is trusted through `pins` alone, with no chain, name or date checked. Only a `tls` candidate with pins and no `verify_name` may have it.
 	pub self_signed: bool,
+	/// `http2` of the candidate: whether the client offers `h2`, and whether `tls` and `ws` first try WebSocket over HTTP/2.
+	pub http2: Http2,
 }
 
 impl Front {
-	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some(), self_signed: candidate.self_signed}}
+	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some(), self_signed: candidate.self_signed, http2: candidate.http2}}
 }
 
 impl fmt::Debug for Front {

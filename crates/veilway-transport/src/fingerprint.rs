@@ -1,6 +1,6 @@
 //! The ClientHello of `tls`, `ws` and `fronted`: a current Chrome's, made by BoringSSL, the library Chrome uses, so that a censor that reads the first flight sees a common browser and not the Rust TLS library's own (threat model, "Client TLS fingerprint").
 //! This module only decides how a handshake is sent. Who is trusted stays in `tls`: the handshake here runs with BoringSSL's own chain check off, and `tls::dial` holds the chain, the name, the dates and the pins to the same checks as before, with the same library, before a byte of application data is sent or read. The handshake's signature is still verified by BoringSSL against the leaf's key.
-//! What is matched: the cipher suites in Chrome's order, GREASE in every place Chrome puts it, extensions in a random order (as Chrome does since 110, so JA3 varies and JA4 does not), X25519MLKEM768 first among the groups with its key share next to X25519's, the signature algorithms in Chrome's order (the three ML-DSA codepoints first, and a GREASE value ahead of the list), the trust anchors extension with Chrome's list of identifiers, status request, signed certificate timestamps, Brotli certificate compression, and ECH GREASE. ALPS is not sent: Chrome sends it only for a protocol in its ALPN list, and this list is `http/1.1` alone. The one thing that is not Chrome's is the ALPN: `http/1.1` alone, because this client speaks nothing else and a server that picked `h2` would break it. That is Chrome's own list for a WebSocket, and the `h1` in JA4 says so. A `fronted` session is an HTTP/1.1 client in a place where Chrome would say `h2`: that part is open.
+//! What is matched: the cipher suites in Chrome's order, GREASE in every place Chrome puts it, extensions in a random order (as Chrome does since 110, so JA3 varies and JA4 does not), X25519MLKEM768 first among the groups with its key share next to X25519's, the signature algorithms in Chrome's order (the three ML-DSA codepoints first, and a GREASE value ahead of the list), the trust anchors extension with Chrome's list of identifiers, status request, signed certificate timestamps, Brotli certificate compression, and ECH GREASE. ALPS is not sent, because its content is not captured yet (http2 page, "The hello and ALPN"). The ALPN is `h2` then `http/1.1` on a connection that may carry fetch-type requests, and `http/1.1` alone on a WebSocket connection, as Chrome's is
 //! A browser's hello is right for one release. The values here are measured from a capture of Chrome 155 (stable, October 2026, ALPN `http/1.1` as the WebSocket connection sends it, and so no ALPS), and a new Chrome that changes them is a change in this file and its test.
 #![allow(unsafe_code)]
 use boring::error::ErrorStack;
@@ -54,11 +54,11 @@ pub(crate) fn context() -> Result<&'static SslContext, ErrorStack> {
 	Ok(CONTEXT.get_or_init(|| builder.build()))
 }
 
-/// One handshake's `Ssl`. `domain` is the server name when `sni` is set, and is sent as it is.
-pub(crate) fn ssl(context: &SslContext, domain: &str, sni: bool) -> Result<Ssl, ErrorStack> {
+/// One handshake's `Ssl`. `domain` is the server name when `sni` is set, and is sent as it is. `h2` offers `h2` ahead of `http/1.1`.
+pub(crate) fn ssl(context: &SslContext, domain: &str, sni: bool, h2: bool) -> Result<Ssl, ErrorStack> {
 	let mut ssl = Ssl::new(context)?;
 	if sni {ssl.set_hostname(domain)?}
-	ssl.set_alpn_protos(b"\x08http/1.1")?;
+	ssl.set_alpn_protos(if h2 {&b"\x02h2\x08http/1.1"[..]} else {&b"\x08http/1.1"[..]})?;
 	ssl.set_enable_ech_grease(true);
 	Ok(ssl)
 }

@@ -29,7 +29,7 @@ fn dial() -> impl Strategy<Value = Dial> {(select(vec!["203.0.113.9", "198.51.10
 fn host() -> impl Strategy<Value = String> {"[a-z0-9]{1,12}(\\.[a-z0-9]{1,8}){0,2}\\.[a-z]{2,6}"}
 
 fn candidate(pinned: bool) -> impl Strategy<Value = Candidate> {
-	(dial(), option::of(host()), host(), host(), vec(any::<[u8; 32]>(), 1..=2)).prop_map(move |(address, sni, host, verify, pins)| Candidate {address, verify_name: if sni.is_none() {Some(verify)} else {None}, sni, host, ech: None, pins: if pinned {pins} else {Vec::new()}, self_signed: false})
+	(dial(), option::of(host()), host(), host(), vec(any::<[u8; 32]>(), 1..=2)).prop_map(move |(address, sni, host, verify, pins)| Candidate {address, verify_name: if sni.is_none() {Some(verify)} else {None}, sni, host, ech: None, pins: if pinned {pins} else {Vec::new()}, self_signed: false, http2: Default::default()})
 }
 
 fn stream(pinned: bool) -> impl Strategy<Value = Stream> {("/[A-Za-z0-9._~-]{11,40}", vec(candidate(pinned), 1..=2)).prop_filter("a path with a .. component is no path", |(path, _)| !path.split('/').any(|part| part == "..")).prop_map(|(path, candidates)| Stream {path, candidates})}
@@ -114,7 +114,7 @@ proptest! {
 
 #[test]
 fn a_self_signed_candidate_is_no_candidate_of_a_link() {
-	let candidate = |self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: Some("example.org".to_owned()), host: "example.org".to_owned(), ech: None, pins: vec![[7; 32]], self_signed};
+	let candidate = |self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: Some("example.org".to_owned()), host: "example.org".to_owned(), ech: None, pins: vec![[7; 32]], self_signed, http2: Default::default()};
 	let stream = |self_signed| vec![Transport::Tls(Stream {path: "/abcdefghijk".to_owned(), candidates: vec![candidate(self_signed)]})];
 	assert!(transports(transports_json(&stream(false)).as_bytes()).is_ok());
 	assert_eq!(transports(transports_json(&stream(true)).as_bytes()).err(), Some(CodeError::Member("transports")));

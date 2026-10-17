@@ -5,6 +5,7 @@
 //! A later request is numbered, and when its connection ends before its answer is whole, the identical bytes go out again on a new connection, since the node answers a repeat from the response it stored. Without a valid answer inside 10 s the session is dropped. So is it by an answer that is not a `200`: the node no longer knows the session.
 //! A connection is kept from one request to the next unless the answer says `Connection: close`, and unless the front sent a byte nobody asked for in between: one request is in flight, so nothing stands between two answers.
 //! There is no idle keepalive: "the client's polling is the activity, and the response to each request is the sign of life."
+use crate::h2::Wire;
 use crate::http::{self, Stop, CHROME, HEAD_MAX, PLATFORM};
 use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, Unreachable, Want, ATTEMPT};
 use std::ops::Range;
@@ -12,9 +13,10 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use veilway_proto::chunk::{ChunkError, Padding, Sealer, MAX_ITEMS, MAX_PLAINTEXT};
-use veilway_proto::fronted::{self, Opener, REQUEST_MAX};
+use veilway_proto::fronted::{self, Opener, BODY_MAX, REQUEST_MAX};
 use veilway_proto::proof::{self, Name};
 use veilway_proto::session::{LIVENESS, LONE_KEEPALIVE};
+use veilway_proto::subscription::payload::Http2;
 use veilway_proto::uniform;
 
 /// "`fronted` poll wait: 100 ms, multiplied by 1.5 per empty response up to 5 s."
@@ -69,11 +71,11 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 	let (Ok(proof), Ok(padding), Some(first)) = (proof::Client::new(&node, link.secret.expose(), &link.inbound, &link.device).prove(Name::Fronted, (port.env.now)(), &mut random), Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random), port.want(Want::First)) else {return End::Source.into()};
 	let (mut sealer, mut opener, mut body, mut buf, mut scratch) = (Sealer::new(proof.keys.c2s, padding), Opener::new(proof.keys.s2c), Vec::new(), Vec::new(), Vec::new());
 	if fronted::append(&mut sealer, &[&first], wide(Kind::Packet {flow: 0, control: false}, &first), &mut random, &mut body).is_err() {return End::Source.into()}
-	let (request, roots, hook, keepalive) = (post(path, &proof.token, &host, &body), port.env.roots.clone(), port.env.socket.clone(), lone(&first));
+	let (request, roots, hook, keepalive, h2) = (post(path, &proof.token, &host, &body), port.env.roots.clone(), port.env.socket.clone(), lone(&first), candidate.http2 != Http2::Off);
 	// The opening request. A session is open "when a chunk from the node has opened", and the node's first answer comes when WireGuard has authenticated. Its 10 s run from the moment the request is written.
 	let opening = async {
-		let (mut io, mut written) = (tls::dial(candidate, &roots, &hook, dialled).await?, false);
-		match timeout(ATTEMPT, exchange(&mut io, &request, &mut buf, &mut written)).await {
+		let (mut io, mut written) = (Wire::of(tls::dial(candidate, &roots, &hook, dialled, h2).await?), false);
+		match timeout(ATTEMPT, io.exchange(&request, &host, &mut buf, &mut written)).await {
 			Ok(Ok((body, close))) => Ok((io, body, close)),
 			Ok(Err(Stop::Said(answer))) => Err(Ended::Refused(Refusal {answer, offset: None})),
 			Ok(Err(Stop::Cut)) => Err(Ended::Unreachable(Unreachable::Cut)),
@@ -135,7 +137,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 					(count, used) = (count + 1, used + 2 + datagram.len());
 				}
 				let items: Vec<&[u8]> = pending[taken..taken + count].iter().map(|(datagram, _)| &datagram[..]).collect();
-				match fronted::append(&mut sealer, &items, pending[taken..taken + count].iter().any(|(datagram, kind)| wide(*kind, datagram)), &mut random, &mut body) {
+				match fronted::append_within(&mut sealer, &items, pending[taken..taken + count].iter().any(|(datagram, kind)| wide(*kind, datagram)), &mut random, &mut body, io.as_ref().map_or(BODY_MAX, Wire::limit)) {
 					Ok(()) => taken += count,
 					Err(ChunkError::Size) => break,
 					Err(ChunkError::Number) => break 'session End::Exhausted.into(),
@@ -149,15 +151,15 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 			let (request, limit) = (post(path, &query, &host, &body), Instant::now() + LIVENESS);
 			// Whatever a front sent since the last answer, nobody asked for: a connection with a byte waiting on it, or one that has ended, is given up before the request is written, and the request goes on a new one.
 			if let Some(conn) = io.as_mut() {
-				if timeout(Duration::ZERO, conn.read(&mut [0u8; 1])).await.is_ok() {io = None}
+				if conn.stale().await {io = None}
 			}
 			// "Drops the session when a request gets no response within 10 s, or anything but a 200 with a body it can open."
 			let asked = timeout_at(limit, async {
 				let mut repeats = 0;
 				loop {
-					if io.is_none() {io = Some(tls::dial(candidate, &roots, &hook, limit).await.map_err(|_| Ended::Closed(End::Lost))?)}
+					if io.is_none() {io = Some(Wire::of(tls::dial(candidate, &roots, &hook, limit, h2).await.map_err(|_| Ended::Closed(End::Lost))?))}
 					let Some(conn) = io.as_mut() else {return Err(Ended::Closed(End::Lost))};
-					match exchange(conn, &request, &mut buf, &mut false).await {
+					match conn.exchange(&request, &host, &mut buf, &mut false).await {
 						Ok((body, close)) => {
 							if close {io = None}
 							return Ok(body);
@@ -202,7 +204,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 		}
 	};
 	// A session of `fronted` has nothing to say at its end: the node forgets it after its idle time. The connection is closed in order.
-	if let Some(mut io) = io {let _ = timeout(Duration::from_secs(1), io.shutdown()).await;}
+	if let Some(mut io) = io {io.close().await}
 	ended
 }
 

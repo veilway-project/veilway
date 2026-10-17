@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use veilway_core::config::{self, Backend, Certificate, Policy, Transport};
+use veilway_core::config::{self, Backend, Certificate, Http2, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
 use veilway_core::engine::{certificate, dns, icmp, probe, replay, stream};
@@ -401,6 +401,16 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			lines.push(match shape.resolve() {
 				Ok(shape) => line(Status::Ok, "shape", format!("inbound {}, transports[{t}].shape", inbound.tag), format!("{shape}. The profile of this transport must carry the same object: the node cannot see it, and a request in another shape reaches the decoy origin")),
 				Err(member) => line(Status::Fail, "shape", format!("inbound {}, transports[{t}].shape.{member}", inbound.tag), "breaks a rule of the shapes page, so the node serves no such transport"),
+			});
+		}
+	}
+	// The HTTP/2 of each `tls` transport (http2 page, "Modes"): on, the node answers the peer's streams itself, and that is the difference a probe can see.
+	for inbound in &config.inbounds {
+		for (t, transport) in inbound.transports.iter().enumerate() {
+			let Transport::Tls {http2, ..} = transport else {continue};
+			lines.push(match http2 {
+				Some(Http2::On) => line(Status::Warn, "http2", format!("inbound {}, transports[{t}].http2", inbound.tag), "on: the node answers HTTP/2 itself, so its frames differ from the decoy origin's, and the tunnel is offered to peers that negotiate h2"),
+				_ => line(Status::Ok, "http2", format!("inbound {}, transports[{t}].http2", inbound.tag), "off: HTTP/1.1 alone, as before"),
 			});
 		}
 	}

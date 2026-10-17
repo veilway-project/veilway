@@ -249,7 +249,7 @@ impl Config {
 					same_socket && match (transport, other) {
 						(Transport::Ws {path, tls, ..}, Transport::Ws {path: other_path, tls: other_tls, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls,
 						// One listener has one certificate, one decoy origin and one set of pools, and tells its transports apart by their paths.
-						(Transport::Tls {path, tls, decoy, limits, ..}, Transport::Tls {path: other_path, tls: other_tls, decoy: other_decoy, limits: other_limits, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls || decoy != other_decoy || limits != other_limits,
+						(Transport::Tls {path, tls, decoy, limits, http2, ..}, Transport::Tls {path: other_path, tls: other_tls, decoy: other_decoy, limits: other_limits, http2: other_http2, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls || decoy != other_decoy || limits != other_limits || http2 != other_http2,
 						// The web server in front hands a `GET` for one path and a `POST` for another to one listener, which has one decoy origin, one list of proxies and one set of pools.
 						_ if transport.proxied().is_some() && other.proxied().is_some() => transport.proxied().zip(other.proxied()).is_none_or(|(one, two)| here.ip() != there.ip() || one.path == two.path || nested(&one, &two) || nested(&two, &one) || one.decoy != two.decoy || one.trusted != two.trusted || one.header != two.header || one.limits != two.limits),
 						_ => udp == other.datagram(),
@@ -259,7 +259,7 @@ impl Config {
 					r.error(format!("{at}.listen"), format!("conflicts with {other}: {}", match (transport, there) {
 						_ if udp => "two udp or udp-obfs transports never share an address and port",
 						(Transport::Ws {..}, Transport::Ws {..}) => "two ws transports share an address and port only with different paths and identical tls",
-						(Transport::Tls {..}, Transport::Tls {..}) => "two tls transports share an address and port only with different paths and identical tls, decoy and limits",
+						(Transport::Tls {..}, Transport::Tls {..}) => "two tls transports share an address and port only with different paths and identical tls, decoy, limits and http2",
 						_ if transport.proxied().is_some() && there.proxied().is_some() => "ws and fronted transports of veilway inbounds share an address and port only with different paths and identical decoy, trusted_proxies, client_address_header and limits, and a fronted-shaped transport that puts its data in the path takes every path under its own, so no other path of the listener may lie under it",
 						_ => "a listener serves one kind of peer: a tls transport, a ws transport of a wireguard inbound, and the ws and fronted transports of veilway inbounds never share an address and port with one another",
 					}));

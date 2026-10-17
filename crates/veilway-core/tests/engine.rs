@@ -89,7 +89,9 @@ fn certify(name: &str, files: Option<&Path>) -> (Arc<RootCertStore>, [u8; 32], A
 	}
 	let (mut roots, der, provider) = (RootCertStore::empty(), CertificateDer::from(made.cert.der().to_vec()), Arc::new(rustls::crypto::ring::default_provider()));
 	roots.add(der.clone()).unwrap();
-	let config = ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![der], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
+	let mut config = ServerConfig::builder_with_provider(provider).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![der], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
+	// The fronts of these tests speak HTTP/1.1, and pick it from the client's list.
+	config.alpn_protocols = vec![b"http/1.1".to_vec()];
 	(Arc::new(roots), digest(&SHA256, &made.signing_key.subject_public_key_info()).as_ref().try_into().unwrap(), Arc::new(config))
 }
 
