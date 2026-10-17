@@ -363,6 +363,8 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 
 The clients tested on every platform they claim: the macOS app on a real Mac, Windows connected to a real node, the Linux desktop on a real desktop with systemd-resolved. Then the store builds (F-Droid first, the updater off), bonded connections and `ws-plain` if v0.2.0 did not take them, and the `dns` transport built if its design passed review.
 
+Split tunneling in the apps, chosen per subscription and kept on the device: by app (Android through `VpnService` allowed and disallowed apps; Linux by putting the chosen programs in a cgroup that the policy routing and the kill switch know; Windows by WFP filters on the program's path; macOS by address and name only, since per-app needs a NetworkExtension) and by address or name on every platform (routes plus the node-side DNS memory). Two modes: everything through the tunnel except the chosen ones, or only the chosen ones. The kill switch keeps blocking whatever is meant for the tunnel while it is down, and a provider can forbid the second mode in the signed profile.
+
 ## Shapes of `fronted` (after the alpha)
 
 The owner asked for `fronted` to carry more than one HTTP shape, chosen per inbound by the operator, written into the signed profile, and followed by the client. Spec change in `veilway-docs` first, then an adversarial review, then code.
