@@ -450,6 +450,17 @@ pub struct Stream {
 	/// Requests that were sent to a decoy origin once more on a new connection, because the connection kept from the request before had been closed by the origin. `origin_dropped` are connections to a decoy origin that the node dropped between two requests because the origin said something or closed them there: nothing of that is passed on to the proxy.
 	pub forwards_redialed: u64,
 	pub origin_dropped: u64,
+	/// `fronted-shaped` sessions that are established right now (`fronted` counts them as well), and event streams that are live right now.
+	pub shaped: usize,
+	pub streams: usize,
+	/// `fronted-shaped` requests that were accepted, repeats of one answered with its stored answer, repeats answered with the late answer of 80 bytes, event streams that were started, events and heartbeats written to them, and stream requests that their session's allowance of 4 at once and 1 a second had no room for.
+	pub shaped_polls: u64,
+	pub shaped_repeats: u64,
+	pub shaped_late: u64,
+	pub shaped_streams: u64,
+	pub shaped_events: u64,
+	pub shaped_beats: u64,
+	pub shaped_limited: u64,
 }
 
 impl From<veilway_core::StreamTotals> for Stream {
@@ -465,6 +476,7 @@ impl From<veilway_core::StreamTotals> for Stream {
 			proxies: totals.proxies, decoys: totals.decoys, fronted: totals.fronted, proxy_accepted: totals.proxy_accepted, proxy_requests: totals.proxy_requests, proxy_unnamed: totals.proxy_unnamed, proxy_idle: totals.proxy_idle, forwards: totals.forwards, forwards_unframed: totals.forwards_unframed, forwards_cut: totals.forwards_cut,
 			stranger_head: totals.stranger_head, stranger_session: totals.stranger_session, stranger_body: totals.stranger_body, stranger_unestablished: totals.stranger_unestablished, polls: totals.polls, poll_repeats: totals.poll_repeats,
 			proxy_http10: totals.proxy_http10, forwards_redialed: totals.forwards_redialed, origin_dropped: totals.origin_dropped,
+			shaped: totals.shaped, streams: totals.streams, shaped_polls: totals.shaped_polls, shaped_repeats: totals.shaped_repeats, shaped_late: totals.shaped_late, shaped_streams: totals.shaped_streams, shaped_events: totals.shaped_events, shaped_beats: totals.shaped_beats, shaped_limited: totals.shaped_limited,
 		}
 	}
 }
@@ -588,7 +600,7 @@ impl From<veilway_core::ReplayStatus> for Replay {
 /// The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted}
+pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted, #[serde(rename = "fronted-shaped")] FrontedShaped}
 
 /// A device with a live session on one inbound. The address the device connects from is not part of it.
 #[derive(Serialize, JsonSchema)]

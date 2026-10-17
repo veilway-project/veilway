@@ -77,32 +77,37 @@ impl Opener {
 	/// A body is authenticated chunk by chunk and not as a whole. The first chunks of a body are a body too, and so are two bodies one after the other, so a front can deliver a prefix of what the client sent. It can also drop the request, and either costs the session and nothing else. The length of a body is the request's `Content-Length`, which is the caller's to check.
 	pub fn open<'s, 'a>(&'s mut self, body: &[u8], scratch: &'a mut Vec<u8>) -> Result<Opened<'s, 'a>, BodyError> {
 		if let Some(error) = self.ended {return Err(BodyError::Ended(error))}
-		if !(BODY_MIN..=BODY_MAX).contains(&body.len()) {return Err(BodyError::Refused)}
-		scratch.clear();
-		scratch.extend_from_slice(body);
-		let (mut plaintexts, mut at, mut number) = (Vec::new(), 0, self.number);
-		while at < scratch.len() {
-			let [high, low] = *scratch.get(at..at + 2).ok_or(BodyError::Refused)? else {return Err(BodyError::Refused)};
-			let end = at + 2 + usize::from(u16::from_be_bytes([high, low]));
-			// A length "16 to 16,016" that stays inside the body, at a number below 2^60: "a receiver closes the session instead of accepting a chunk with that number", and here nothing is accepted.
-			if !(TAG..=MAX_SEALED).contains(&(end - at - 2)) || number >= NUMBERS {return Err(BodyError::Refused)}
-			let sealed = scratch.get_mut(at + 2..end).ok_or(BodyError::Refused)?;
-			self.key.0.open_in_place(Nonce::assume_unique_for_key(chunk::nonce(number)), Aad::empty(), sealed).map_err(|_| BodyError::Refused)?;
-			plaintexts.push(at + 2..end - TAG);
-			(at, number) = (end, number + 1);
-		}
-		let (opened, mut chunks): (&'a [u8], _) = (scratch, Vec::with_capacity(plaintexts.len()));
-		for plaintext in plaintexts {
-			match chunk::parse(&opened[plaintext]) {
-				Ok(items) => chunks.push(items),
-				Err(error) => {
-					self.ended = Some(error);
-					return Err(BodyError::Ended(error));
-				}
+		match open_body(&self.key, self.number, body, scratch, usize::MAX) {
+			Ok(chunks) => Ok(Opened {number: self.number + chunks.len() as u64, opener: self, chunks}),
+			Err(BodyError::Ended(error)) => {
+				self.ended = Some(error);
+				Err(BodyError::Ended(error))
 			}
+			Err(refused) => Err(refused),
 		}
-		Ok(Opened {opener: self, number, chunks})
 	}
+}
+
+/// Opens every chunk of a body at the numbers `first`, `first + 1` and so on, and gives the datagrams of each: the rule of `Opener::open` for any run of numbers, which a shaped session (`shaped`) starts at `n` times 4,096. At most `most` chunks: a body with more is `Refused`.
+/// A body in which any chunk does not open is `Refused` whatever its other chunks hold, and one whose chunks all open and one is invalid is `Ended`. The caller keeps the session over for good in that case.
+pub(crate) fn open_body<'a>(key: &ChunkKey, first: u64, body: &[u8], scratch: &'a mut Vec<u8>, most: usize) -> Result<Vec<Items<'a>>, BodyError> {
+	if !(BODY_MIN..=BODY_MAX).contains(&body.len()) {return Err(BodyError::Refused)}
+	scratch.clear();
+	scratch.extend_from_slice(body);
+	let (mut plaintexts, mut at, mut number) = (Vec::new(), 0, first);
+	while at < scratch.len() {
+		let [high, low] = *scratch.get(at..at + 2).ok_or(BodyError::Refused)? else {return Err(BodyError::Refused)};
+		let end = at + 2 + usize::from(u16::from_be_bytes([high, low]));
+		// A length "16 to 16,016" that stays inside the body, at a number below 2^60: "a receiver closes the session instead of accepting a chunk with that number", and here nothing is accepted.
+		if !(TAG..=MAX_SEALED).contains(&(end - at - 2)) || number >= NUMBERS || plaintexts.len() >= most {return Err(BodyError::Refused)}
+		let sealed = scratch.get_mut(at + 2..end).ok_or(BodyError::Refused)?;
+		key.0.open_in_place(Nonce::assume_unique_for_key(chunk::nonce(number)), Aad::empty(), sealed).map_err(|_| BodyError::Refused)?;
+		plaintexts.push(at + 2..end - TAG);
+		(at, number) = (end, number + 1);
+	}
+	let (opened, mut chunks): (&'a [u8], _) = (scratch, Vec::with_capacity(plaintexts.len()));
+	for plaintext in plaintexts {chunks.push(chunk::parse(&opened[plaintext]).map_err(BodyError::Ended)?)}
+	Ok(chunks)
 }
 
 /// A body whose chunks all opened and are valid, not yet accepted.

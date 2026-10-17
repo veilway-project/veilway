@@ -167,6 +167,7 @@ pub fn answer(config: &Path, tag: &str) -> i32 {
 			Listed::Tls(stream) => ("tls", stream.candidates.len()),
 			Listed::Ws(stream) => ("ws", stream.candidates.len()),
 			Listed::Fronted(stream) => ("fronted", stream.candidates.len()),
+			Listed::FrontedShaped(stream, _) => ("fronted-shaped", stream.candidates.len()),
 		};
 		std::iter::repeat_n(name, count)
 	}).zip(offer.dials()) {eprintln!("  {transport} {address}{}", if private {"  (a private address: right only where the two nodes share a network)"} else {""})}

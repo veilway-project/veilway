@@ -8,14 +8,14 @@
 #[cfg(feature = "bench")]
 use super::inbound::Peers;
 use super::inbound::{Tunnel, Via};
-use super::limits::{Clock, Ended, Handshakes, Initiation, Seat, Seated, Source, Spent, ENDS};
+use super::limits::{Bucket, Clock, Ended, Handshakes, Initiation, Seat, Seated, Source, Spent, ENDS};
 use super::plan::{Native, Plan, Tags};
 #[cfg(feature = "bench")]
 use super::replay::Guard;
 use super::{Over, Shared};
 #[cfg(feature = "bench")]
 use crate::config::Config;
-use crate::config::{DEFAULT_DECOY_REQUESTS, DEFAULT_FRONTED_SESSIONS, DEFAULT_RELAYED, DEFAULT_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE, MAX_PROXY_CONNECTIONS};
+use crate::config::{DEFAULT_DECOY_REQUESTS, DEFAULT_FRONTED_SESSIONS, DEFAULT_RELAYED, DEFAULT_SESSIONS, DEFAULT_SHAPED_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE, MAX_PROXY_CONNECTIONS};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ipnet::IpNet;
@@ -48,11 +48,15 @@ use veilway_proto::proof::{Name, SessionKeys};
 use veilway_proto::replay::{Decision, Refusal, WRITE_DEADLINE};
 use veilway_proto::request::{Line, Method, Scan, Scanner, HEAD_MAX, HEAD_TIME, LINE_MAX, LINE_TIME};
 use veilway_proto::session::{self, Transport, ECHO, LONE_KEEPALIVE};
+use veilway_proto::shape::Shape;
+use veilway_proto::shaped::{Target, Who};
 use veilway_proto::websocket::{self, BINARY, CLOSE, CLOSE_WAIT, CONTROL_MAX, NORMAL, PING, PONG};
 use veilway_proto::{uniform, NoRandom};
 use veilway_wg::ws::Acceptor;
 #[cfg(feature = "bench")]
 use veilway_wg::Wg;
+
+mod shaped;
 
 /// "TLS handshake deadline: 10 s from accept."
 pub const TLS_HANDSHAKE: Duration = Duration::from_secs(10);
@@ -153,12 +157,15 @@ pub enum Stranger {
 const STRANGERS: usize = Stranger::Unestablished as usize + 1;
 
 #[derive(Clone, Copy)]
-enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped}
+enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped, ShapedPolls, ShapedRepeats, ShapedLate, ShapedStreams, ShapedEvents, ShapedBeats, ShapedLimited}
 
-const COUNTS: usize = Count::OriginDropped as usize + 1;
+const COUNTS: usize = Count::ShapedLimited as usize + 1;
 
-#[derive(Default)]
 pub struct Counters {counts: [AtomicU64; COUNTS], strangers: [AtomicU64; STRANGERS], ended: Arc<[AtomicU64; ENDS]>}
+
+impl Default for Counters {
+	fn default() -> Self {Counters {counts: std::array::from_fn(|_| AtomicU64::new(0)), strangers: Default::default(), ended: Arc::default()}}
+}
 
 impl Counters {
 	fn count(&self, what: Count) {self.counts[what as usize].fetch_add(1, Ordering::Relaxed);}
@@ -256,6 +263,17 @@ pub struct StreamTotals {
 	/// Requests that were sent to the origin a second time, on a new connection, because the connection that was kept from the request before turned out closed, and connections to the origin that were dropped between two requests because the origin said something or closed them there.
 	pub forwards_redialed: u64,
 	pub origin_dropped: u64,
+	/// `fronted-shaped` sessions that are established right now, which `fronted` counts as well, and event streams that are live right now.
+	pub shaped: usize,
+	pub streams: usize,
+	/// `fronted-shaped` requests that were accepted, repeats of them answered with the stored answer and repeats answered with the late answer, event streams that were started, events and heartbeats written to them, and stream requests that their session's allowance had no room for.
+	pub shaped_polls: u64,
+	pub shaped_repeats: u64,
+	pub shaped_late: u64,
+	pub shaped_streams: u64,
+	pub shaped_events: u64,
+	pub shaped_beats: u64,
+	pub shaped_limited: u64,
 }
 
 /// Where the decoy origin of a listener is.
@@ -323,17 +341,22 @@ pub struct Route {
 	/// `upgrade_cookie` and `upgrade_headers` of its inbound.
 	pub cookie: String,
 	pub headers: Vec<String>,
+	/// The shape of a `fronted-shaped` route, which decides how its requests are read and answered.
+	pub shape: Option<Arc<Shape>>,
 }
 
 impl Route {
 	/// The route of a `tls` transport.
-	pub fn tls(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Tls, method: Method::Get, over: Over::Tls, transport: Transport::Tls, cookie, headers}}
+	pub fn tls(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Tls, method: Method::Get, over: Over::Tls, transport: Transport::Tls, cookie, headers, shape: None}}
 
 	/// The route of a native `ws` transport: the session of `tls`, opened by a request that came through the operator's web server.
-	pub fn ws(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Ws, method: Method::Get, over: Over::WsNative, transport: Transport::Ws, cookie, headers}}
+	pub fn ws(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Ws, method: Method::Get, over: Over::WsNative, transport: Transport::Ws, cookie, headers, shape: None}}
 
 	/// The route of a `fronted` transport, whose requests are `POST`s and whose answers are no upgrade.
-	pub fn fronted(path: String, tunnel: Arc<Tunnel>) -> Route {Route {id: 0, path, tunnel, name: Name::Fronted, method: Method::Post, over: Over::Fronted, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new()}}
+	pub fn fronted(path: String, tunnel: Arc<Tunnel>) -> Route {Route {id: 0, path, tunnel, name: Name::Fronted, method: Method::Post, over: Over::Fronted, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), shape: None}}
+
+	/// The route of a `fronted-shaped` transport: requests in the shape it names, in a method that may be any, and answers that are no upgrade. Its proofs carry a name of their own, so none of another transport's opens here.
+	pub fn fronted_shaped(path: String, tunnel: Arc<Tunnel>, shape: Arc<Shape>) -> Route {Route {id: 0, path, tunnel, name: Name::FrontedShaped, method: Method::Other, over: Over::FrontedShaped, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), shape: Some(shape)}}
 }
 
 /// The pools of one listener (transports page, "Node capacity numbers").
@@ -357,13 +380,18 @@ pub struct Front {
 	/// "Proxy connections: twice the `fronted` sessions", "`fronted` sessions: 4,096", and "one source may have 16 requests in flight to the decoy".
 	pub connections: usize,
 	pub fronted: usize,
+	/// "Shaped sessions: 256 per listen address, counted among the 1,024 `fronted` sessions."
+	pub shaped: usize,
 	pub per_source: usize,
 }
 
 impl Front {
-	pub fn of(trusted: Vec<IpNet>, header: Option<String>, limits: Option<crate::config::TransportLimits>) -> Front {
+	/// `stream` says the listener has a shaped transport whose answers come on a stream: "Proxy connections: three times the shaped `sse` sessions, where the classic form uses twice the sessions", because each of those holds a connection for its stream and the front may open one more for each request in flight.
+	pub fn of(trusted: Vec<IpNet>, header: Option<String>, limits: Option<crate::config::TransportLimits>, stream: bool) -> Front {
 		let (limits, fronted) = (limits.unwrap_or_default(), limits.and_then(|limits| limits.fronted_sessions).unwrap_or(DEFAULT_FRONTED_SESSIONS));
-		Front {trusted, header, connections: limits.proxy_connections.unwrap_or((2 * fronted).min(MAX_PROXY_CONNECTIONS)) as usize, fronted: fronted as usize, per_source: limits.decoy_requests_per_source.unwrap_or(DEFAULT_DECOY_REQUESTS) as usize}
+		let shaped = limits.shaped_sessions.unwrap_or(DEFAULT_SHAPED_SESSIONS);
+		let connections = if stream {(2 * fronted).max(3 * shaped)} else {2 * fronted};
+		Front {trusted, header, connections: limits.proxy_connections.unwrap_or(connections.min(MAX_PROXY_CONNECTIONS)) as usize, fronted: fronted as usize, shaped: shaped as usize, per_source: limits.decoy_requests_per_source.unwrap_or(DEFAULT_DECOY_REQUESTS) as usize}
 	}
 
 	/// How many requests of strangers may be in a decoy origin's hands at once, whatever their sources: half the proxy pool. The transports page gives a share to each source and none to all of them, and with that alone enough sources hold every proxy connection, after which the web server in front is left waiting and no user's request arrives.
@@ -485,6 +513,10 @@ pub struct Listener {
 	/// Every `fronted` session by its `sid`, pending or established, and how many of them are established.
 	polling: Mutex<HashMap<[u8; 16], Arc<Polling>>>,
 	polled: Arc<AtomicI64>,
+	/// Every `fronted-shaped` session by its `sid`, pending or established, how many of them are established (they are counted in `polled` as well), and how many event streams are live.
+	shaped: Mutex<HashMap<[u8; 16], Arc<shaped::Shaped>>>,
+	shaped_pool: Arc<AtomicI64>,
+	streams: AtomicI64,
 	/// What the decoy origin sent for each header field of its answer to the node's own request, first values only. None while that has not been learnt.
 	learned: RwLock<Option<Arc<Vec<(String, String)>>>>,
 	relearn: Notify,
@@ -505,7 +537,7 @@ impl State {
 	pub fn listen(&self, addr: SocketAddr, served: Served) -> Arc<Listener> {
 		let seats = served.front.as_ref().map_or(0, |front| front.connections);
 		let permits = served.pools.undecided + served.pools.relayed + served.pools.sessions + SPARE + seats;
-		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools, front: served.front.clone()})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), proxies: Arc::new(Semaphore::new(seats)), seats: Mutex::new(seats), fronts: Arc::default(), decoys: Mutex::default(), polling: Mutex::default(), polled: Arc::default(), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), shut: Notify::new(), counters: self.counters.clone()});
+		let listener = Arc::new(Listener {addr, served: RwLock::new(Arc::new(Served {acceptor: None, routes: Vec::new(), origin: served.origin.clone(), proxy: served.proxy, host: String::new(), pools: served.pools, front: served.front.clone()})), undecided: Mutex::default(), relayed: Mutex::default(), sessions: Mutex::default(), pool: Arc::default(), waiting: AtomicUsize::new(0), ids: AtomicU64::new(1), room: Arc::new(Semaphore::new(permits)), permits: Mutex::new(permits), proxies: Arc::new(Semaphore::new(seats)), seats: Mutex::new(seats), fronts: Arc::default(), decoys: Mutex::default(), polling: Mutex::default(), polled: Arc::default(), shaped: Mutex::default(), shaped_pool: Arc::default(), streams: AtomicI64::new(0), learned: RwLock::default(), relearn: Notify::new(), down: Mutex::default(), closed: AtomicBool::new(false), shut: Notify::new(), counters: self.counters.clone()});
 		listener.serve(served);
 		let mut listeners = self.listeners.lock().unwrap_or_else(|e| e.into_inner());
 		listeners.retain(|listener| listener.strong_count() > 0);
@@ -519,18 +551,22 @@ impl State {
 		for listener in &listeners {
 			let over: Vec<Arc<Polling>> = listener.polling().values().filter(|polling| polling.session.seat.over()).cloned().collect();
 			for polling in &over {listener.forget(polling)}
+			let over: Vec<Arc<shaped::Shaped>> = listener.shaped().values().filter(|shaped| shaped.session.seat.over()).cloned().collect();
+			for shaped in &over {listener.forget_shaped(shaped)}
 		}
 	}
 
 	pub fn totals(&self) -> StreamTotals {
 		let listeners: Vec<Arc<Listener>> = self.listeners.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(Weak::upgrade).collect();
-		let (mut undecided, mut relayed, mut pending, mut sessions, mut proxies, mut decoys, mut fronted) = (0, 0, 0, 0, 0, 0, 0);
+		let (mut undecided, mut relayed, mut pending, mut sessions, mut proxies, mut decoys, mut fronted, mut shaped, mut streams) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
 		for listener in &listeners {
 			undecided += listener.undecided().all.len();
 			relayed += listener.relayed().len();
 			proxies += listener.fronts.load(Ordering::Relaxed).max(0) as usize;
 			decoys += listener.decoys().all.len();
 			fronted += listener.polled.load(Ordering::Relaxed).max(0) as usize;
+			shaped += listener.shaped_pool.load(Ordering::Relaxed).max(0) as usize;
+			streams += listener.streams.load(Ordering::Relaxed).max(0) as usize;
 			for (_, seat) in listener.sessions().values() {
 				if seat.pending() {pending += 1} else if seat.established() {sessions += 1}
 			}
@@ -549,6 +585,7 @@ impl State {
 			proxies, decoys, fronted, proxy_accepted: count(Count::Proxied), proxy_requests: count(Count::Requests), proxy_unnamed: count(Count::Unnamed), proxy_idle: count(Count::ProxyIdle), forwards: count(Count::Forwarded), forwards_unframed: count(Count::Unframed), forwards_cut: count(Count::Cut),
 			stranger_head: stranger(Stranger::Head), stranger_session: stranger(Stranger::Session), stranger_body: stranger(Stranger::Body), stranger_unestablished: stranger(Stranger::Unestablished), polls: count(Count::Polls), poll_repeats: count(Count::Repeats),
 			proxy_http10: count(Count::Legacy), forwards_redialed: count(Count::Redialed), origin_dropped: count(Count::OriginDropped),
+			shaped, streams, shaped_polls: count(Count::ShapedPolls), shaped_repeats: count(Count::ShapedRepeats), shaped_late: count(Count::ShapedLate), shaped_streams: count(Count::ShapedStreams), shaped_events: count(Count::ShapedEvents), shaped_beats: count(Count::ShapedBeats), shaped_limited: count(Count::ShapedLimited),
 		}
 	}
 }
@@ -588,6 +625,8 @@ impl Listener {
 
 	fn polling(&self) -> MutexGuard<'_, HashMap<[u8; 16], Arc<Polling>>> {self.polling.lock().unwrap_or_else(|e| e.into_inner())}
 
+	fn shaped(&self) -> MutexGuard<'_, HashMap<[u8; 16], Arc<shaped::Shaped>>> {self.shaped.lock().unwrap_or_else(|e| e.into_inner())}
+
 	/// Gives a connection of a trusted proxy the place in the proxy pool that was taken for it.
 	fn lease(&self, place: OwnedSemaphorePermit) -> Lease {
 		self.fronts.fetch_add(1, Ordering::Relaxed);
@@ -604,6 +643,12 @@ impl Listener {
 	fn forget(&self, polling: &Arc<Polling>) {
 		self.polling().retain(|_, held| !Arc::ptr_eq(held, polling));
 		self.sessions().remove(&polling.id);
+	}
+
+	/// Takes a `fronted-shaped` session out of the listener's tables, whatever became of it.
+	fn forget_shaped(&self, shaped: &Arc<shaped::Shaped>) {
+		self.shaped().retain(|_, held| !Arc::ptr_eq(held, shaped));
+		self.sessions().remove(&shaped.id);
 	}
 
 	/// What the listener serves right now.
@@ -664,8 +709,8 @@ impl Listener {
 	/// Step 7 of "Verifying" for a stream proof, which the replay rule calls last and only for a proof it would accept. "Session: New proofs are refused and take the unauthenticated path."
 	/// `fronted` is the pool of `fronted` sessions for a proof that opens one, which is held to both.
 	#[allow(clippy::too_many_arguments)]
-	fn charge(&self, shared: &Shared, seat: &Arc<Seat>, from: IpAddr, now: i64, cap: usize, fronted: Option<usize>, why: &mut Stranger) -> bool {
-		if self.pool.load(Ordering::Relaxed) >= cap as i64 || fronted.is_some_and(|fronted| self.polled.load(Ordering::Relaxed) >= fronted as i64) {
+	fn charge(&self, shared: &Shared, seat: &Arc<Seat>, from: IpAddr, now: i64, cap: usize, fronted: Option<usize>, shaped: Option<usize>, why: &mut Stranger) -> bool {
+		if self.pool.load(Ordering::Relaxed) >= cap as i64 || fronted.is_some_and(|fronted| self.polled.load(Ordering::Relaxed) >= fronted as i64) || shaped.is_some_and(|shaped| self.shaped_pool.load(Ordering::Relaxed) >= shaped as i64) {
 			*why = Stranger::Pool;
 			return false;
 		}
@@ -835,7 +880,7 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 	};
 	// 5. "Evaluate, at the end of the request line."
 	let proved = match line {
-		Ok(line) => prove(&shared, &listener, &served, &buf[..line], |route| user && route.over == Over::Tls, peer.ip(), Some(&place)).await.map(|accepted| (line, accepted)),
+		Ok(line) => prove(&shared, &listener, &served, &buf[..line], &[], |route| user && route.over == Over::Tls, peer.ip(), Some(&place)).await.map(|accepted| (line, accepted)),
 		Err(why) => Err(why),
 	};
 	match proved {
@@ -906,15 +951,21 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 /// What that work does not make equal is on the transports page under "Timing", and nothing is added here to hide it.
 /// A line that passed steps 1 to 4 is a device's, and `place` is given up for it: from there on the connection is no stranger's, and no stranger's connection displaces it.
 /// `able` says of a route whether a line on this connection can be a user's on it at all, by what is known besides the line: the kind of peer, and on the proxy path the head of the request. On the proxy path "a `GET` for a `ws` path or a `POST` for a `fronted` path can be a user's", and `from` is the source its proxy named.
-async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], able: impl Fn(&Route) -> bool, from: IpAddr, place: Option<&Place>) -> Result<Accepted, Stranger> {
-	let Some(line) = Line::parse(line) else {return Err(Stranger::Syntax)};
+async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], targets: &[Option<Target<'_>>], able: impl Fn(&Route) -> bool, from: IpAddr, place: Option<&Place>) -> Result<Accepted, Stranger> {
+	let Some(line) = Line::parse_any(line) else {return Err(Stranger::Syntax)};
 	let (plan, paths): (Arc<Plan>, Vec<&[u8]>) = (shared.plan(), served.routes.iter().map(|route| route.path.as_bytes()).collect());
 	let (at, query) = (line.path_among(&paths), line.query.unwrap_or_default());
 	let natives: Vec<Option<(&Native, Arc<Tags>)>> = served.routes.iter().map(|route| plan.inbound_of(&route.tunnel).and_then(|inbound| plan.inbounds[inbound].native.as_ref()).map(|native| (native, native.tags()))).collect();
 	let mut found = None;
 	for (index, (route, native)) in served.routes.iter().zip(&natives).enumerate() {
 		let Some((prover, tags)) = native.as_ref().and_then(|(native, tags)| Some((native.prover.as_ref()?, tags))) else {continue};
-		if let Ok(opened) = prover.node.open((able(route) && at == Some(index) && line.method == route.method).then_some(route.name), query, &tags.table) {found = Some((index, opened))}
+		// A route with a shape reads its own target: the text of a proof is the one of an opening request in the form of the shape, and a later request is no proof. The others take the query of the line on their path and with their method, and none of them takes a line over 4,096 bytes.
+		let candidate = match (&route.shape, targets.get(index)) {
+			(Some(_), Some(Some(target))) => if let Who::Opening(token) = target.who {Some(token)} else {None},
+			(Some(_), _) => None,
+			(None, _) => (able(route) && at == Some(index) && line.method == route.method).then_some(query),
+		};
+		if let Ok(opened) = prover.node.open(candidate.map(|_| route.name), candidate.unwrap_or(query), &tags.table) {found = Some((index, opened))}
 	}
 	let Some((index, mut opened)) = found else {return Err(Stranger::Proof)};
 	if let Some(place) = place {(place.table)(&place.listener).leave(place.id, place.source);}
@@ -922,14 +973,15 @@ async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line:
 	let (Some(native), Some(replay)) = (native, shared.replay.get()) else {return Err(Stranger::NoReplay)};
 	// The session as the limits will know it. It is one of its device's sessions from the moment the limits are charged for it, and nobody's when they are not.
 	// It remembers the node transport key its token opened under as well as the device secret: its chunk keys come from that key too, so the session ends when the config no longer has it.
-	let polled = (route.over == Over::Fronted).then(|| (listener.polled.clone(), served.front.as_ref().map_or(0, |front| front.fronted)));
-	let seat = Seat::new(opened.device.public, opened.device.id, native.prover.as_ref().and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), polled.as_ref().map(|(polled, _)| polled.clone()), listener.counters.ended.clone(), route.transport.idle(), now.ms);
+	let polled = matches!(route.over, Over::Fronted | Over::FrontedShaped).then(|| (listener.polled.clone(), served.front.as_ref().map_or(0, |front| front.fronted)));
+	let shaped = route.shape.as_ref().map(|_| (listener.shaped_pool.clone(), served.front.as_ref().map_or(0, |front| front.shaped)));
+	let seat = Seat::new(opened.device.public, opened.device.id, native.prover.as_ref().and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), polled.as_ref().map(|(polled, _)| polled.clone()), shaped.as_ref().map(|(shaped, _)| shaped.clone()), listener.counters.ended.clone(), route.transport.idle(), now.ms);
 	let (mut writes, mut waiting): (_, Option<(Instant, Held)>) = (replay.writes(), None);
 	loop {
 		// A write that ends after the rule was asked is one this proof has not seen yet, and wakes it.
 		writes.borrow_and_update();
 		let (now, mut why) = (Clock::of((shared.now)()), Stranger::NoReplay);
-		opened = match replay.with(|memory| opened.accept(memory, now.secs, |_| listener.charge(shared, &seat, from, now.ms, served.pools.sessions, polled.as_ref().map(|(_, cap)| *cap), &mut why))) {
+		opened = match replay.with(|memory| opened.accept(memory, now.secs, |_| listener.charge(shared, &seat, from, now.ms, served.pools.sessions, polled.as_ref().map(|(_, cap)| *cap), shaped.as_ref().map(|(_, cap)| *cap), &mut why))) {
 			None => return Err(Stranger::NoReplay),
 			// The first tunnel packet deadline runs from here, "10 s after the proof was accepted", and not from before a wait for a limit.
 			Some(Decision::Accepted(accepted)) => {
@@ -1027,7 +1079,7 @@ fn take(shared: &Shared, listener: &Listener, served: &Served, session: &Arc<Ses
 	// "A session is pending until a WireGuard packet of its device has authenticated on it." A pool that has filled up since the proof leaves the session pending, and it ends at its deadline.
 	let seated = match bound {
 		None => None,
-		Some(bound) if seat.pending() => match shared.limits.establish(seat, served.pools.sessions, served.front.as_ref().map_or(usize::MAX, |front| front.fronted), now.ms) {
+		Some(bound) if seat.pending() => match shared.limits.establish(seat, served.pools.sessions, served.front.as_ref().map_or(usize::MAX, |front| front.fronted), served.front.as_ref().map_or(usize::MAX, |front| front.shaped), now.ms) {
 			Seated::Established => {
 				listener.counters.count(Count::Established);
 				let mut peers = seat.tunnel.lock();
@@ -1424,10 +1476,40 @@ async fn front(shared: Arc<Shared>, listener: Arc<Listener>, io: Stream, peer: S
 		// 3. "Evaluate the request line as a direct peer's is evaluated, with that source. Here a `GET` for a `ws` path or a `POST` for a `fronted` path can be a user's. Steps 1 to 4 of Verifying run for every request": for every one whose line passes the test that uses no secret, as for a direct peer.
 		// What makes a request no user's by its head is known before that and changes none of the work: on `fronted`, step 1 of its state machine, "exactly one `Content-Length`, from 18 to 65,536, and no `Transfer-Encoding`", and on `ws` a head that is HTTP/1.1 as the node reads it, with no body.
 		let (framed, line) = (matches!(request.body, Some(Framing::Length(length)) if (BODY_MIN as u64..=BODY_MAX as u64).contains(&length)), &buf[..request.line]);
+		// A shaped route reads its own head: "for `body`: exactly one `Content-Length`, 18 to `up.limit`, no `Transfer-Encoding`. For the others: no body, so no `Content-Length` other than 0, no `Transfer-Encoding`." Its request line may be up to 4,096 bytes, or 8,192 when `up.limit` is above 4,000, and that of every other route stays at 4,096.
+		let able = |route: &Route| trusted && request.line <= route.shape.as_ref().map_or(LINE_MAX, |shape| shape.line_max()) && match &route.shape {
+			Some(shape) if shape.bodied() => matches!(request.body, Some(Framing::Length(length)) if (BODY_MIN as u64..=shape.up.limit as u64).contains(&length)),
+			Some(_) => matches!(request.body, Some(Framing::None | Framing::Length(0))),
+			None if route.over == Over::Fronted => framed,
+			None => request.body == Some(Framing::None),
+		};
+		// Only a listener with a shaped route reads a line the scanner would not call a candidate, and then only up to the limit of a shaped route.
+		let parsed = Line::parse_any(line).filter(|_| served.routes.iter().any(|route| route.shape.is_some()));
+		let targets: Vec<Option<Target>> = served.routes.iter().map(|route| route.shape.as_ref().zip(parsed.as_ref()).filter(|_| able(route)).and_then(|(shape, parsed)| Target::read(shape, route.path.as_bytes(), parsed, shape.up.name.as_deref().and_then(|name| http::field_once(&buf[..end], name.as_bytes()))))).collect();
 		let proved = match whole {
 			Err(why) => Err(why),
-			Ok(_) if Scanner::new().feed(line) != Scan::Line(request.line) => Err(Stranger::Syntax),
-			Ok(_) => prove(&shared, &listener, &served, line, |route| trusted && if route.over == Over::Fronted {framed} else {request.body == Some(Framing::None)}, source, None).await,
+			// What no route of the listener could accept gets the decoy's answer at once, as on a listener without shaped routes: a line over the longest any route allows for its method, and a method that no shaped route has.
+			Ok(_) if parsed.is_none() && Scanner::new().feed(line) != Scan::Line(request.line) => Err(Stranger::Syntax),
+			Ok(_) if parsed.is_some_and(|parsed| !(matches!(parsed.method, Method::Get | Method::Post) && request.line <= LINE_MAX) && !served.routes.iter().any(|route| route.shape.as_ref().is_some_and(|shape| shape.up.method.as_bytes() == parsed.verb && request.line <= shape.line_max()))) => Err(Stranger::Syntax),
+			Ok(_) => prove(&shared, &listener, &served, line, &targets, able, source, None).await,
+		};
+		// 4. A request of a shaped route that is a user's: the opening request of a proof that was accepted, or a later request whose `sid` is a session of this listener, on the route of that session.
+		let (proved, shaped_ask) = match proved {
+			Ok(accepted) if served.routes[accepted.route].shape.is_some() => {
+				let index = accepted.route;
+				(Err(Stranger::Proof), Some((index, shaped::Asked::Opening(accepted))))
+			}
+			Err(Stranger::Proof) if trusted => {
+				let found = targets.iter().enumerate().find_map(|(index, target)| match target.as_ref()?.who {
+					Who::Later(sid, number) => Some((index, sid, number)),
+					Who::Opening(_) => None,
+				});
+				(Err(Stranger::Proof), found.and_then(|(index, sid, number)| {
+					let session = listener.shaped().get(&sid).cloned()?;
+					(session.route == served.routes[index].id).then_some((index, shaped::Asked::Later(session, number)))
+				}))
+			}
+			other => (other, None),
 		};
 		let (asked, mut why) = match proved {
 			// 4. "A user. For a WebSocket open, the connection leaves the proxy pool: continue with WebSocket session. A head that is not a WebSocket upgrade closes the connection with no HTTP answer."
@@ -1449,7 +1531,24 @@ async fn front(shared: Arc<Shared>, listener: Arc<Listener>, io: Stream, peer: S
 			}), Stranger::Proof),
 			Err(why) => (None, why),
 		};
-		let mut place = None;
+		let (mut place, mut shaped_why) = (None, None);
+		if let Some((index, ask)) = shaped_ask {
+			let total = end + match request.body {
+				Some(Framing::Length(length)) if served.routes[index].shape.as_ref().is_some_and(|shape| shape.bodied()) => length as usize,
+				_ => 0,
+			};
+			match shaped::serve(&shared, &listener, &served, way, &mut from_proxy, &mut to_proxy, &mut buf, &mut filled, &mut eof, end, total, request.line, source, &served.routes[index], ask).await {
+				// "A request that is answered: the node returns to step 1."
+				Poll::Answered => {
+					kept = None;
+					buf.copy_within(total..filled, 0);
+					filled -= total;
+					continue;
+				}
+				Poll::Lost => return,
+				Poll::Stranger(reason, waiting) => (shaped_why, place) = (Some(reason), waiting),
+			}
+		}
 		if let (Some(asked), Some(Framing::Length(length))) = (asked, request.body) {
 			let total = end + length as usize;
 			match poll(&shared, &listener, &served, way, &mut from_proxy, &mut to_proxy, &mut buf, &mut filled, &mut eof, end, total, source, asked).await {
@@ -1465,6 +1564,7 @@ async fn front(shared: Arc<Shared>, listener: Arc<Listener>, io: Stream, peer: S
 			}
 		}
 		// 5. "Not a user. Forward this request to a connection to the decoy origin and relay its response, then return to step 1."
+		let why = shaped_why.unwrap_or(why);
 		listener.counters.strangers[why as usize].fetch_add(1, Ordering::Relaxed);
 		match forward(&listener, &served, way, &mut from_proxy, &mut to_proxy, &mut buf, &mut filled, &mut eof, end, request, kept.take(), source, local, place).await {
 			Handed::Next(origin) => kept = origin,
@@ -1971,10 +2071,11 @@ impl Bench {
 			crate::config::Transport::Tls {path, ..} => Some(Route::tls(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(true))),
 			crate::config::Transport::WsNative {path, ..} => Some(Route::ws(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(false))),
 			crate::config::Transport::Fronted {path, ..} => Some(Route::fronted(path.clone(), tunnel.clone())),
+			crate::config::Transport::FrontedShaped {path, shape, ..} => shape.resolve().ok().map(|shape| Route::fronted_shaped(path.clone(), tunnel.clone(), Arc::new(shape))),
 			_ => None,
 		}).collect();
 		anyhow::ensure!(!routes.is_empty(), "no stream transport");
-		let front = inbound.transports.iter().find_map(|transport| transport.proxied()).map(|proxied| Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits));
+		let front = inbound.transports.iter().find_map(|transport| transport.proxied()).map(|proxied| Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, inbound.transports.iter().any(|other| other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))));
 		let listener = shared.stream.listen(SocketAddr::from(([127, 0, 0, 1], 443)), Served {acceptor: None, routes, origin: Origin::Memory(origin), proxy: false, host: String::new(), pools, front});
 		Ok(Bench {shared, listener, origins})
 	}

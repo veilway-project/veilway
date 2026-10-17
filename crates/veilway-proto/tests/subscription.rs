@@ -1728,3 +1728,40 @@ fn a_refresh_entry_reads_from_its_text_as_a_document_reads_it() {
 	assert!(Refresh::parse(&format!("{{\"url\": \"https://203.0.113.9/s\", \"pins\": [\"{pin}\"]}}")).is_some_and(|entry| entry.pinned() && entry.pins().len() == 1));
 	for bad in ["\"ftp://x.example.net/s\"", "\"https://203.0.113.9/s\"", "{\"url\": \"https://a.example.net/s\"}", &format!("{{\"url\": \"https://a.example.net/s\", \"pins\": [\"{pin}\", \"{pin}\"]}}"), &format!("{{\"url\": \"https://a.example.net/s\", \"pins\": [\"{pin}\"], \"more\": 1}}"), "7", "null"] {assert!(Refresh::parse(bad).is_none(), "{bad}")}
 }
+
+// "A transport that has a shape has the type `fronted-shaped`", read with the rules of the shapes page. A shape that breaks one refuses the profile it is in, and an older client, which does not know the type, drops that profile alone.
+#[test]
+fn a_fronted_shaped_transport_carries_its_shape() {
+	let candidate = json!({"address": "192.0.2.20:443", "sni": "cdn.example.net", "host": "node.example.com"});
+	let shaped = |shape: Value| json!({"type": "fronted-shaped", "path": "/a-path-of-a-transport", "candidates": [candidate.clone()], "shape": shape});
+	let with = |transport: Value| {
+		let mut document = rich();
+		document["profiles"][0]["transports"] = json!([transport]);
+		document
+	};
+	let good = shaped(json!({"up": {"method": "PUT", "in": "body"}, "down": {"mode": "sse", "life": [60, 600]}}));
+	let read_good = subscription(&with(good));
+	let transport = read_good.profiles[0].transports.first().unwrap();
+	let Transport::FrontedShaped(stream, shape) = transport else {panic!("{transport:?}")};
+	assert_eq!((stream.path.as_str(), stream.candidates.len(), shape.up.method.as_str(), shape.up.limit, shape.up.inflight, shape.down.life.clone()), ("/a-path-of-a-transport", 1, "PUT", 65_536, 2, 60..=600));
+	assert_eq!(format!("{transport:?}"), "FrontedShaped(1 candidates)");
+	// A shape with a member the page does not have, a value it refuses, or none at all refuses the profile with the member `shape`.
+	let refused = [
+		shaped(json!({"up": {"method": "GET", "in": "body"}, "down": {"mode": "poll"}})),
+		shaped(json!({"up": {"method": "TRACE", "in": "query"}, "down": {"mode": "poll"}})),
+		shaped(json!({"up": {"method": "GET", "in": "query", "extra": 1}, "down": {"mode": "poll"}})),
+		shaped(json!({"up": {"method": "GET", "in": "query", "inflight": 2}, "down": {"mode": "poll"}})),
+		shaped(json!({"up": {"method": "GET", "in": "header", "name": "Host"}, "down": {"mode": "poll"}})),
+		shaped(json!({"up": {"method": "GET", "in": "query"}})),
+		shaped(json!("get-poll")),
+		json!({"type": "fronted-shaped", "path": "/a-path-of-a-transport", "candidates": [candidate.clone()]}),
+	];
+	for transport in refused {
+		let document = with(transport.clone());
+		assert!(matches!(read(&document), Ok(Payload::Subscription(read)) if read.profiles.len() == 1 && read.refused.len() == 1 && read.refused[0].fault == Fault::Member("shape")), "{transport}");
+	}
+	// A profile with a `fronted-shaped` transport needs the node transport key, as the other stream transports do.
+	let mut document = with(shaped(json!({"up": {"method": "GET", "in": "query"}, "down": {"mode": "poll"}})));
+	document["profiles"][0].as_object_mut().unwrap().remove("transport_public_key");
+	assert!(matches!(read(&document), Ok(Payload::Subscription(read)) if read.refused.len() == 1 && read.refused[0].fault == Fault::Member("transport_public_key")));
+}

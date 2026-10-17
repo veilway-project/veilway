@@ -234,6 +234,6 @@ impl Tunnel {
 fn addresses(transport: &Transport) -> Vec<veilway_proto::subscription::payload::Dial> {
 	match transport {
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
-		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 	}
 }

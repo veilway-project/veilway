@@ -107,6 +107,16 @@ pub fn request_as(head: &[u8], expected: &[u8]) -> Request {
 	Request {line, bodiless, tunnel, body}
 }
 
+/// The value of the field of this name when the head has exactly one, without the blanks around it: the field a `header` shape carries its data in. `None` for a head with none, with two, or with a line that is no field, since a head like that is not read at all.
+pub fn field_once<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+	let mut found = None;
+	for line in lines(head)?.skip(1) {
+		let (field, value) = field(line)?;
+		if field.eq_ignore_ascii_case(name) && found.replace(value).is_some() {return None}
+	}
+	found
+}
+
 /// The address a trusted proxy says a request came from: "the rightmost address in the header named by `client_address_header` that is not itself inside `trusted_proxies`. If the header is absent or unreadable, it is the peer", which is None here.
 /// `name` is the header's name and `trusted` says whether an address is inside `trusted_proxies`. Fields of that name are one list in the order they stand in. An entry is an address as it is written, an IPv6 address also inside brackets, and an IPv4 address inside an IPv6 one is the IPv4 address.
 /// An entry that is no address, to the right of every address that is not a proxy's, makes the header unreadable. What stands to the left of the answer is whatever a visitor sent to the first proxy, and is never read.
@@ -400,6 +410,21 @@ mod tests {
 		assert_eq!(endless.feed(b"HTTP/1.1 200 OK\r\n"), Answer::More);
 		for _ in 0..ANSWER_HEAD_MAX / 1024 {endless.feed(&[b'a'; 1024]);}
 		assert_eq!((endless.feed(b"a"), endless.head.len() <= ANSWER_HEAD_MAX), (Answer::Open, true));
+	}
+
+	#[test]
+	fn a_header_field_is_read_when_the_head_has_it_exactly_once() {
+		let value = |head: &str, name: &str| field_once(head.as_bytes(), name.as_bytes()).map(|value| String::from_utf8_lossy(value).into_owned());
+		assert_eq!(value("GET /a HTTP/1.1\r\nHost: a\r\nX-Hint:  abc_-9 \r\n\r\n", "x-hint").as_deref(), Some("abc_-9"));
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-HINT:\tabc\r\n\r\n", "X-Hint").as_deref(), Some("abc"));
+		// None, two (also in another case), an empty value that is there, a field of a name that only starts alike, and a head that is not sound.
+		assert_eq!(value("GET /a HTTP/1.1\r\nHost: a\r\n\r\n", "X-Hint"), None);
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hint: a\r\nx-hint: a\r\n\r\n", "X-Hint"), None);
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hint:\r\n\r\n", "X-Hint").as_deref(), Some(""));
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hints: a\r\n\r\n", "X-Hint"), None);
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hint: a\r\n folded\r\n\r\n", "X-Hint"), None);
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hint: a\nHost: b\r\n\r\n", "X-Hint"), None);
+		assert_eq!(value("GET /a HTTP/1.1\r\nX-Hint: a\r\n", "X-Hint"), None);
 	}
 
 	#[test]

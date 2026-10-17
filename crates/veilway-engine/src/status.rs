@@ -190,10 +190,11 @@ impl Connection {
 			Transport::Tls(stream) => ("tls", stream),
 			Transport::Ws(stream) => ("ws", stream),
 			Transport::Fronted(stream) => ("fronted", stream),
+			Transport::FrontedShaped(stream, _) => ("fronted-shaped", stream),
 		};
 		let found = stream.candidates.get(candidate)?;
 		let check = if found.self_signed {Check::PinnedSelfSigned} else if found.pins.is_empty() {Check::Public} else {Check::PublicAndPin};
-		let fronted = name == "fronted";
+		let fronted = name.starts_with("fronted");
 		Some(Self {transport: name, address: found.address.address(), host: Some(found.host.clone()).filter(|host| !fronted && !host.is_empty()), front: found.sni.clone().filter(|_| fronted), server_name: found.sni.clone(), check: Some(check), since: None})
 	}
 }

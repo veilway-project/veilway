@@ -1486,6 +1486,129 @@
       ],
       "type": "object"
     },
+    "Shape": {
+      "additionalProperties": false,
+      "description": "The shape of a `fronted-shaped` transport, as the profile of its subscription carries it. The members are those of the shapes page, and the panel writes one object to the config and to the profile.",
+      "properties": {
+        "down": {
+          "$ref": "#/$defs/ShapeDown"
+        },
+        "up": {
+          "$ref": "#/$defs/ShapeUp"
+        }
+      },
+      "required": [
+        "up",
+        "down"
+      ],
+      "type": "object"
+    },
+    "ShapeDown": {
+      "additionalProperties": false,
+      "description": "The downstream half of a shape.",
+      "properties": {
+        "fallback": {
+          "description": "Whether the client may fall back to polling when streams do not work. Only with `sse`. Defaults to true.",
+          "type": "boolean"
+        },
+        "gather": {
+          "description": "Milliseconds the node waits to collect datagrams into one event, `[low, high]`, 0 to 250 each. Only with `sse`. Defaults to `[0, 20]`.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "life": {
+          "description": "The range in seconds a stream's length is drawn from, `[low, high]`, 30 to 3600 each. Only with `sse`. Defaults to `[120, 900]`.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/ShapeMode",
+          "description": "`poll`: answers carry the downstream data. `sse`: one Server-Sent Events stream does."
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ShapeMode": {
+      "enum": [
+        "poll",
+        "sse"
+      ],
+      "type": "string"
+    },
+    "ShapePlace": {
+      "enum": [
+        "body",
+        "query",
+        "path",
+        "header"
+      ],
+      "type": "string"
+    },
+    "ShapeUp": {
+      "additionalProperties": false,
+      "description": "The upstream half of a shape. Which methods go with which `in`, and the bounds of every number, are validation's.",
+      "properties": {
+        "gather": {
+          "description": "Milliseconds the client waits to collect datagrams into one request, drawn from `[low, high]`, 0 to 250 each. Defaults to `[10, 60]`.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "in": {
+          "$ref": "#/$defs/ShapePlace",
+          "description": "Where the data of a request goes. `GET` takes `query`, `path` or `header`; `POST`, `PUT` and `PATCH` take `body`; a custom method takes any."
+        },
+        "inflight": {
+          "description": "Requests that may be in flight at once, not counting the stream. 1 to 4. Defaults to 1 with `poll` and 2 with `sse`, and is 1 with `poll`.",
+          "format": "uint32",
+          "maximum": 4,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "limit": {
+          "description": "The most one request carries, as bytes of body, of request target or of header value. 1024 to 8000 for `query` and `path` (default 4000), 1024 to 4096 for `header` (default 3000), 1024 to 65536 for `body` (default 65536).",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1024,
+          "type": "integer"
+        },
+        "method": {
+          "description": "`GET`, `POST`, `PUT`, `PATCH`, or a custom method of 3 to 16 capital letters. `CONNECT`, `TRACE`, `HEAD` and `OPTIONS` are refused.",
+          "pattern": "^[A-Z]{3,16}$",
+          "type": "string"
+        },
+        "name": {
+          "description": "The name of the one header field that carries the data. Required with `header` and refused otherwise.",
+          "pattern": "^[A-Za-z0-9-]{1,32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "in"
+      ],
+      "type": "object"
+    },
     "Source": {
       "description": "an address such as 192.0.2.1 or a network such as 192.0.2.0/24 with no host bits set",
       "pattern": "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$",
@@ -1704,6 +1827,54 @@
             "trusted_proxies"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`fronted` whose requests and answers are in the shape this transport names (protocol, \"Shapes of fronted\"): which method carries the data, where in the request it goes, and whether the node answers each request or writes to one event stream. Its keys are those of `fronted`, and its proofs are valid on no other transport.",
+          "properties": {
+            "client_address_header": {
+              "pattern": "^[A-Za-z0-9-]{1,64}$",
+              "type": "string"
+            },
+            "decoy": {
+              "$ref": "#/$defs/Decoy"
+            },
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+              "type": "string"
+            },
+            "shape": {
+              "$ref": "#/$defs/Shape"
+            },
+            "trusted_proxies": {
+              "items": {
+                "$ref": "#/$defs/Proxy"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "fronted-shaped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path",
+            "decoy",
+            "trusted_proxies",
+            "shape"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1748,6 +1919,13 @@
           "description": "Established sessions the listener holds at once. Defaults to 16384.",
           "format": "uint32",
           "maximum": 1048576,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "shaped_sessions": {
+          "description": "Established `fronted-shaped` sessions the listener holds at once, counted among its `fronted_sessions`. Each can hold up to 603136 bytes. Defaults to 256, which is about 147 MiB when full.",
+          "format": "uint32",
+          "maximum": 65536,
           "minimum": 1,
           "type": "integer"
         },

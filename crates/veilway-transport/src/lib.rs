@@ -24,6 +24,7 @@ mod fronted;
 mod hello_test;
 pub mod http;
 mod parallel;
+mod shaped;
 pub mod stream;
 mod tls;
 pub use tls::pin_only;
@@ -43,6 +44,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use veilway_proto::chunk::{self, MAX_ITEM, MIN_ITEM};
 use veilway_proto::proof::Name;
+use veilway_proto::shape::Shape;
 use veilway_proto::subscription::payload::{Candidate, Padding, Profile, Transport};
 use veilway_proto::subscription::Secret;
 use veilway_proto::{session, NoRandom};
@@ -139,6 +141,8 @@ pub enum Target {
 	Tls {path: String, candidate: Front},
 	Ws {path: String, candidate: Front},
 	Fronted {path: String, candidate: Front},
+	/// A `fronted` whose requests and answers are in the shape the profile names (shapes page).
+	FrontedShaped {path: String, candidate: Front, shape: Shape},
 }
 
 impl Target {
@@ -150,6 +154,7 @@ impl Target {
 			Transport::Tls(stream) => Self::Tls {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::Ws(stream) => Self::Ws {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::Fronted(stream) => Self::Fronted {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
+			Transport::FrontedShaped(stream, shape) => Self::FrontedShaped {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?), shape: shape.clone()},
 		})
 	}
 	/// The transport's name, the one thing of a target a log line gets.
@@ -159,6 +164,7 @@ impl Target {
 			Self::Tls {..} => "tls",
 			Self::Ws {..} => "ws",
 			Self::Fronted {..} => "fronted",
+			Self::FrontedShaped {..} => "fronted-shaped",
 		}
 	}
 }
@@ -410,7 +416,7 @@ pub fn flow(packet: &[u8]) -> u32 {
 // What `open` and `parallel` check before anything is dialled.
 fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 	if chunk::Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random).is_err() || session::keepalive(link.padding.keepalive.clone()).is_none() {return Err(Refuse::Padding)}
-	let (Target::Tls {path, candidate} | Target::Ws {path, candidate} | Target::Fronted {path, candidate}) = target else {return Ok(())};
+	let (Target::Tls {path, candidate} | Target::Ws {path, candidate} | Target::Fronted {path, candidate} | Target::FrontedShaped {path, candidate, ..}) = target else {return Ok(())};
 	if link.node.is_none() {return Err(Refuse::NodeKey)}
 	if candidate.self_signed && (!matches!(target, Target::Tls {..}) || candidate.verify_name.is_some()) {return Err(Refuse::SelfSigned)}
 	// A self-signed candidate's check reads no root.
@@ -435,6 +441,7 @@ pub(crate) fn launch(link: Link, target: Target, count: usize, env: Env, source:
 			Target::Tls {path, candidate} => stream::run(&mut port, &link, Name::Tls, path, candidate).await,
 			Target::Ws {path, candidate} => stream::run(&mut port, &link, Name::Ws, path, candidate).await,
 			Target::Fronted {path, candidate} => fronted::run(&mut port, &link, path, candidate).await,
+			Target::FrontedShaped {path, candidate, shape} => shaped::run(&mut port, &link, path, candidate, shape).await,
 		};
 		// No address and no name: a log line at info says which transport and how it ended.
 		tracing::info!(transport, ?ended, "a session ended");

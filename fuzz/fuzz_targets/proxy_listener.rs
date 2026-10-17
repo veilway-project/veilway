@@ -47,10 +47,12 @@ impl Harness {
 	fn new() -> Harness {
 		let (text, public) = (|key: &[u8; 32]| veilway_wg::encode_key(key), veilway_wg::public_key(&NODE));
 		let behind = |kind: &str, path: &str| serde_json::json!({"type": kind, "listen": "127.0.0.1:443", "path": path, "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For"});
+		// The transports of the shapes page on the same listener: a request in the query with polled answers, and one in the body with a stream.
+		let shaped = |path: &str, method: &str, place: &str, mode: &str| { let mut transport = behind("fronted-shaped", path); transport["shape"] = serde_json::json!({"up": {"method": method, "in": place}, "down": {"mode": mode}}); transport };
 		let document = serde_json::json!({
 			"version": 1,
 			"dns": {"servers": ["1.1.1.1:53"]},
-			"inbounds": [{"tag": "home", "type": "veilway", "private_key": text(&NODE), "address": ["10.7.0.1/24"], "transport_keys": [text(&TRANSPORT)], "upgrade_cookie": "sid", "transports": [behind("ws", WS), behind("fronted", POLLED)]}],
+			"inbounds": [{"tag": "home", "type": "veilway", "private_key": text(&NODE), "address": ["10.7.0.1/24"], "transport_keys": [text(&TRANSPORT)], "upgrade_cookie": "sid", "transports": [behind("ws", WS), behind("fronted", POLLED), shaped("/assets/shape-4d1e90b7.js", "GET", "query", "poll"), shaped("/assets/shape-5a3c88e1.js", "PUT", "body", "sse")]}],
 			"outbounds": [{"tag": "plain", "type": "direct"}],
 			"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}],
 			"routing": {"default": "main"},

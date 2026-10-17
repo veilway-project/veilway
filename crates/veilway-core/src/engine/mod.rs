@@ -104,6 +104,8 @@ pub enum Over {
 	/// The native `ws` of a `veilway` inbound, behind the operator's web server.
 	WsNative,
 	Fronted,
+	/// The `fronted-shaped` transport of a `veilway` inbound.
+	FrontedShaped,
 }
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.

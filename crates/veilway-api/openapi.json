@@ -1890,6 +1890,48 @@
             "minimum": 0,
             "type": "integer"
           },
+          "shaped": {
+            "description": "`fronted-shaped` sessions that are established right now (`fronted` counts them as well), and event streams that are live right now.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_beats": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_events": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_late": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_limited": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_polls": {
+            "description": "`fronted-shaped` requests that were accepted, repeats of one answered with its stored answer, repeats answered with the late answer of 80 bytes, event streams that were started, events and heartbeats written to them, and stream requests that their session's allowance of 4 at once and 1 a second had no room for.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_repeats": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "shaped_streams": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "stranger_body": {
             "format": "uint64",
             "minimum": 0,
@@ -1939,6 +1981,11 @@
           },
           "stranger_unestablished": {
             "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "streams": {
+            "format": "uint",
             "minimum": 0,
             "type": "integer"
           },
@@ -2032,7 +2079,16 @@
           "poll_repeats",
           "proxy_http10",
           "forwards_redialed",
-          "origin_dropped"
+          "origin_dropped",
+          "shaped",
+          "streams",
+          "shaped_polls",
+          "shaped_repeats",
+          "shaped_late",
+          "shaped_streams",
+          "shaped_events",
+          "shaped_beats",
+          "shaped_limited"
         ],
         "type": "object"
       },
@@ -2075,7 +2131,8 @@
           "ws",
           "udp-obfs",
           "tls",
-          "fronted"
+          "fronted",
+          "fronted-shaped"
         ],
         "type": "string"
       },

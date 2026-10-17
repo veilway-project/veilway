@@ -1,0 +1,1 @@
+{"up":{"method":"DELETE","in":"header","name":"X-Hint","limit":2000,"inflight":3,"gather":[5,80]},"down":{"mode":"sse","gather":[1,30],"life":[60,600],"fallback":false}}

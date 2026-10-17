@@ -23,6 +23,7 @@ pub(crate) const PROOF: &[u8] = b"veilway v1 proof\0";
 pub(crate) const TLS: &[u8] = b"tls\0";
 pub(crate) const WS: &[u8] = b"ws\0";
 pub(crate) const FRONTED: &[u8] = b"fronted\0";
+pub(crate) const FRONTED_SHAPED: &[u8] = b"fronted-shaped\0";
 pub(crate) const BINDER: &[u8] = b"veilway v1 binder\0";
 pub(crate) const C2S: &[u8] = b"veilway v1 c2s\0";
 pub(crate) const S2C: &[u8] = b"veilway v1 s2c\0";

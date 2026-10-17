@@ -115,7 +115,7 @@ pub(crate) struct Core {
 fn count(transport: &Transport) -> usize {
 	match transport {
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.len(),
-		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.len(),
+		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 	}
 }
 
@@ -408,7 +408,7 @@ impl Core {
 	pub(crate) fn own(&self, transport: usize, candidate: usize) -> bool {
 		let found = match &self.transports[transport] {
 			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| skipped(self.consented, dial, &self.networks)),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
+			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
 		};
 		found.unwrap_or(false)
 	}
@@ -445,7 +445,7 @@ impl Core {
 		if let Some(redirect) = &self.settings.hooks.redirect {
 			match &mut target {
 				Target::UdpObfs(address) => *address = redirect(*address),
-				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::Fronted {candidate, ..} => candidate.address = redirect(candidate.address),
+				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} => candidate.address = redirect(candidate.address),
 			}
 		}
 		Session::parallel(&self.link, target, self.profile.parallel, env.clone(), self.wire.source()).map_err(|refuse| {

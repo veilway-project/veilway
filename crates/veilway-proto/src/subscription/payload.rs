@@ -4,7 +4,7 @@
 //!
 //! What refuses what ("Wrong type, out of range, missing"): a fault in a top-level member refuses the document, a fault inside a profile refuses that profile, and a faulty card, notice, support link, listed device, exit or logo is left out. Display text is the stated exception: it is filtered and cut, never refused, except where it must not be empty. A text may come in several languages ("Text in several languages"), and a translation that does not read is dropped by itself: only `default` can make a text wrong.
 use super::{envelope::{SigningKey, Verified}, exchange::{GatewayKey, KEYS_MAX}, hash, is_host, json::{self, Json, Members, Named}, key, mirror, public, visible, Kind, Secret, Tag, Text, Url, LINK_URL_MAX, STRING_MAX, TRANSLATIONS_MAX, URL_MAX};
-use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE};
+use crate::{chunk::{NORMAL_BOUNDS, NORMAL_DEFAULT, WIDE_BOUNDS, WIDE_DEFAULT}, control::{self, display, is_tag, Period, Severity, EXITS_MAX, MTU_MIN, NOTICES_MAX, NOTICE_MAX, USAGE_CLAMP}, proof, request::PATH_MIN, session::KEEPALIVE, shape::Shape};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::{collections::HashSet, fmt, net::{IpAddr, SocketAddr}, ops::{Deref, RangeInclusive}};
 
@@ -269,7 +269,7 @@ pub struct Profile {
 	/// One per family of `device.addresses`, in the same order.
 	pub gateways: Vec<IpAddr>,
 	pub mtu: u16,
-	/// Present whenever a `tls`, `ws` or `fronted` transport is listed.
+	/// Present whenever a `tls`, `ws`, `fronted` or `fronted-shaped` transport is listed.
 	pub transport_public_key: Option<[u8; 32]>,
 	/// In the provider's order. A hint of the control channel names one by its position here.
 	pub transports: Vec<Transport>,
@@ -320,6 +320,8 @@ pub enum Transport {
 	Ws(Stream),
 	/// "No candidate has `pins`."
 	Fronted(Stream),
+	/// A `fronted` whose requests and answers are in the shape the profile says (shapes page). Its candidates are those of `fronted`.
+	FrontedShaped(Stream, Shape),
 }
 
 /// What the three stream transports carry: 1 to 16 candidates and the path, which is "at least 12 characters" under the path rule of the config reference.
@@ -477,6 +479,7 @@ impl fmt::Debug for Transport {
 			Self::Tls(stream) => write!(f, "Tls({} candidates)", stream.candidates.len()),
 			Self::Ws(stream) => write!(f, "Ws({} candidates)", stream.candidates.len()),
 			Self::Fronted(stream) => write!(f, "Fronted({} candidates)", stream.candidates.len()),
+			Self::FrontedShaped(stream, _) => write!(f, "FrontedShaped({} candidates)", stream.candidates.len()),
 		}
 	}
 }
@@ -657,6 +660,8 @@ pub(crate) fn transport(value: &Json) -> Result<Transport, Fault> {
 		"tls" => Transport::Tls(stream(Pins::Required)?),
 		"ws" => Transport::Ws(stream(Pins::Allowed)?),
 		"fronted" => Transport::Fronted(stream(Pins::Forbidden)?),
+		// "A transport that has a shape has the type `fronted-shaped`", and the shape is read as the page says: a member it does not have, or a value it refuses, refuses the transport.
+		"fronted-shaped" => Transport::FrontedShaped(stream(Pins::Forbidden)?, Shape::from_json(members.get("shape").ok_or("shape")?).map_err(|_| "shape")?),
 		_ => return Err(Fault::Unsupported),
 	})
 }
@@ -682,7 +687,7 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	// "One per family of `device.addresses`, in the same order." A gateway that is the device's own address is no gateway.
 	if gateways.len() != device.addresses.len() || gateways.iter().zip(&device.addresses).any(|(gateway, address)| gateway.is_ipv4() != address.is_ipv4() || gateway == address) {return Err(Fault::Member("gateways"))}
 	let transport_public_key = key32(members, "transport_public_key", public)?;
-	if transport_public_key.is_none() && transports.iter().any(|transport| matches!(transport, Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_))) {return Err(Fault::Member("transport_public_key"))}
+	if transport_public_key.is_none() && transports.iter().any(|transport| matches!(transport, Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..))) {return Err(Fault::Member("transport_public_key"))}
 	let padding = match members.object("padding")? {
 		None => Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE},
 		Some(padding) => {

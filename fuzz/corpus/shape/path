@@ -1,0 +1,1 @@
+{"up":{"method":"GET","in":"path","limit":8000},"down":{"mode":"poll"}}

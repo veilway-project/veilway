@@ -4,6 +4,8 @@ use subtle::ConstantTimeEq;
 
 /// "Request line: at most 4,096 bytes, at most 10 s." The line end counts.
 pub const LINE_MAX: usize = 4_096;
+/// A shaped transport whose `up.limit` is above 4,000 reads "a request line of up to 8,192 bytes" (shapes page, "The head, and what the node reads").
+pub const SHAPED_LINE_MAX: usize = 8_192;
 pub const LINE_TIME: Duration = Duration::from_secs(10);
 /// "Request head of a user: at most 16,384 bytes, at most 10 s."
 pub const HEAD_MAX: usize = 16_384;
@@ -13,9 +15,9 @@ pub const PATH_MIN: usize = 12;
 // What follows the request target.
 const ENDING: &[u8] = b" HTTP/1.1\r\n";
 
-/// The two methods a candidate line may have. A `GET` can open a WebSocket session, a `POST` is a `fronted` request.
+/// The methods a candidate line may have. A `GET` can open a WebSocket session, a `POST` is a `fronted` request, and any other method is one a shape names (`Line::parse_any`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Method {Get, Post}
+pub enum Method {Get, Post, Other}
 
 /// What the bytes read so far say about a request line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +63,8 @@ impl Scanner {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Line<'a> {
 	pub method: Method,
+	/// The method as it was written: 3 to 16 capital letters.
+	pub verb: &'a [u8],
 	/// The request target up to its first `?`. It starts with `/`.
 	pub path: &'a [u8],
 	/// What follows the first `?`: the candidate token, or the session id and request number of `fronted`. Nothing here says it is either.
@@ -73,7 +77,16 @@ impl<'a> Line<'a> {
 		if Scanner::new().feed(line) != Scan::Line(line.len()) {return None}
 		let (method, skip) = if line[0] == b'P' {(Method::Post, 5)} else {(Method::Get, 4)};
 		let mut parts = line[skip..line.len() - ENDING.len()].splitn(2, |byte| *byte == b'?');
-		Some(Self {method, path: parts.next()?, query: parts.next()})
+		Some(Self {method, verb: &line[..skip - 1], path: parts.next()?, query: parts.next()})
+	}
+	/// The parts of a request line of a shaped transport: any method of 3 to 16 capital letters, a target that starts with `/` and has only the characters `Scanner` allows, and up to `SHAPED_LINE_MAX` bytes. `None` for everything else. A caller holds a line to `LINE_MAX` where the route it is for is not a shaped one.
+	pub fn parse_any(line: &'a [u8]) -> Option<Self> {
+		let rest = line.strip_suffix(ENDING).filter(|_| line.len() <= SHAPED_LINE_MAX)?;
+		let (verb, target) = rest.split_at(rest.iter().position(|byte| *byte == b' ')?);
+		let target = &target[1..];
+		if !(3..=16).contains(&verb.len()) || !verb.iter().all(u8::is_ascii_uppercase) || target.first() != Some(&b'/') || !target.iter().all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'!' | b'$' | b'&' | b'\'' | b'(' | b')' | b'*' | b'+' | b',' | b';' | b'=' | b':' | b'@' | b'/' | b'?' | b'%')) {return None}
+		let mut parts = target.splitn(2, |byte| *byte == b'?');
+		Some(Self {method: match verb {b"GET" => Method::Get, b"POST" => Method::Post, _ => Method::Other}, verb, path: parts.next()?, query: parts.next()})
 	}
 	/// Whether the path is this configured path, compared in constant time over its whole length: "Stopping at the first difference from the path would show a prober, by timing, how much of the path it had guessed." A path of another length is told apart at once, so the length of a configured path can show. A listener with more than one path uses `path_among`.
 	pub fn path_is(&self, path: &[u8]) -> bool {self.path.ct_eq(path).into()}
@@ -140,13 +153,24 @@ mod tests {
 	fn the_parts_of_a_line() {
 		let line = Line::parse(b"GET /some/path?abc.7 HTTP/1.1\r\n").unwrap();
 		assert_eq!((line.method, line.path, line.query), (Method::Get, &b"/some/path"[..], Some(&b"abc.7"[..])));
-		assert_eq!(Line::parse(b"POST /p HTTP/1.1\r\n"), Some(Line {method: Method::Post, path: b"/p", query: None}));
+		assert_eq!(Line::parse(b"POST /p HTTP/1.1\r\n"), Some(Line {method: Method::Post, verb: b"POST", path: b"/p", query: None}));
 		// An empty query is there, and a second `?` belongs to the query.
 		assert_eq!(Line::parse(b"GET /p? HTTP/1.1\r\n").unwrap().query, Some(&b""[..]));
 		assert_eq!(Line::parse(b"GET /p?a?b HTTP/1.1\r\n").map(|line| (line.path, line.query)), Some((&b"/p"[..], Some(&b"a?b"[..]))));
 		assert_eq!(Line::parse(b"GET /?x HTTP/1.1\r\n").map(|line| (line.path, line.query)), Some((&b"/"[..], Some(&b"x"[..]))));
 		// Only a whole line, and nothing after it.
 		for bytes in [&b""[..], b"GET /p HTTP/1.1\r", b"GET /p HTTP/1.1\r\nHost: x\r\n", b"GET /p\x00 HTTP/1.1\r\n", b"HEAD /p HTTP/1.1\r\n"] {assert_eq!(Line::parse(bytes), None)}
+	}
+
+	#[test]
+	fn the_line_of_a_shaped_transport_has_any_method_and_up_to_8192_bytes() {
+		let line = Line::parse_any(b"PURGE /a/b?c.d HTTP/1.1\r\n").unwrap();
+		assert_eq!((line.method, line.verb, line.path, line.query), (Method::Other, &b"PURGE"[..], &b"/a/b"[..], Some(&b"c.d"[..])));
+		assert_eq!(Line::parse_any(b"GET /p HTTP/1.1\r\n").map(|line| (line.method, line.verb)), Some((Method::Get, &b"GET"[..])));
+		assert_eq!(Line::parse_any(b"POST /p HTTP/1.1\r\n"), Line::parse(b"POST /p HTTP/1.1\r\n"));
+		let long = |size: usize| [&b"PUT /"[..], &vec![b'a'; size - 16], b" HTTP/1.1\r\n"].concat();
+		assert!(Line::parse_any(&long(SHAPED_LINE_MAX)).is_some() && Line::parse_any(&long(SHAPED_LINE_MAX + 1)).is_none() && Line::parse(&long(LINE_MAX + 1)).is_none());
+		for bytes in [&b""[..], b"PU /p HTTP/1.1\r\n", b"PURGEPURGEPURGEPU /p HTTP/1.1\r\n", b"put /p HTTP/1.1\r\n", b"PUT p HTTP/1.1\r\n", b"PUT /p HTTP/1.0\r\n", b"PUT /p HTTP/1.1\n", b"PUT /p q HTTP/1.1\r\n", b"PUT  /p HTTP/1.1\r\n", b"PUT /p\x00 HTTP/1.1\r\n", b"PUT /p#x HTTP/1.1\r\n", b"PUT /p HTTP/1.1\r\nHost: x\r\n", b"PU1 /p HTTP/1.1\r\n"] {assert_eq!(Line::parse_any(bytes), None, "{:?}", String::from_utf8_lossy(bytes))}
 	}
 
 	#[test]

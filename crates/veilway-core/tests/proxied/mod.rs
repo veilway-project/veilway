@@ -48,6 +48,8 @@ pub const ROTATED: [u8; 32] = [0x52; 32];
 /// The paths of the `ws` and of the `fronted` transport, which the origin serves nothing at.
 pub const WS_PATH: &str = "/assets/live-7c1d0a52.js";
 pub const POLL_PATH: &str = "/assets/sync-90be44f1.js";
+/// The path of the `fronted-shaped` transport of a test that adds one (`with_shape`).
+pub const SHAPED_PATH: &str = "/assets/shape-4d1e90b7.js";
 pub const SECOND: Duration = Duration::from_secs(1);
 /// What a quiet connection is given to stay quiet in.
 pub const QUIET: Duration = Duration::from_millis(500);
@@ -546,6 +548,16 @@ pub fn document(proxy: SocketAddr, listen: SocketAddr, origin: SocketAddr) -> Va
 		"routing": {"default": "main", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}, {"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]},
 		"users": (0..KEYS.len()).map(|device| json!({"name": names[device], "exits": "all", "devices": [{"name": "phone", "public_key": text(&public(&KEYS[device])), "transport_secrets": [text(&secret(device))], "addresses": [Ipv4Addr::from(address(device)).to_string()]}]})).collect::<Vec<_>>()
 	})
+}
+
+/// Adds a `fronted-shaped` transport with this shape to the one listener of `document`, which it shares with the `ws` and the `fronted` transport: the same decoy, proxies and pools.
+pub fn with_shape(doc: &mut Value, shape: &Value) {
+	let transports = doc["inbounds"][0]["transports"].as_array_mut().unwrap();
+	let mut shaped = transports[1].clone();
+	shaped["type"] = json!("fronted-shaped");
+	shaped["path"] = json!(SHAPED_PATH);
+	shaped["shape"] = shape.clone();
+	transports.push(shaped);
 }
 
 pub fn parsed(doc: &Value) -> Config {

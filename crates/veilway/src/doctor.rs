@@ -388,10 +388,20 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let mut origins = HashSet::new();
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
-			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..}) = transport else {continue};
+			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..} | Transport::FrontedShaped {path, decoy: origin, ..}) = transport else {continue};
 			// The answer to a `fronted` request is no upgrade and takes no field from the origin.
-			let wanted = if matches!(transport, Transport::Fronted {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
+			let wanted = if matches!(transport, Transport::Fronted {..} | Transport::FrontedShaped {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
 			if origins.insert((origin.origin.host(), path.clone())) {lines.extend(decoy(&format!("inbound {}, transports[{t}].decoy", inbound.tag), origin, path, &wanted, wait).await)}
+		}
+	}
+	// The shape each `fronted-shaped` transport uses (shapes page, "Choosing a shape"): "`veilway doctor` prints the shape each transport uses." The node cannot see the profile, so the line is what the profile has to say as well.
+	for inbound in &config.inbounds {
+		for (t, transport) in inbound.transports.iter().enumerate() {
+			let Some(shape) = transport.proxied().and_then(|proxied| proxied.shape) else {continue};
+			lines.push(match shape.resolve() {
+				Ok(shape) => line(Status::Ok, "shape", format!("inbound {}, transports[{t}].shape", inbound.tag), format!("{shape}. The profile of this transport must carry the same object: the node cannot see it, and a request in another shape reaches the decoy origin")),
+				Err(member) => line(Status::Fail, "shape", format!("inbound {}, transports[{t}].shape.{member}", inbound.tag), "breaks a rule of the shapes page, so the node serves no such transport"),
+			});
 		}
 	}
 	// The proxy path of every `ws` and `fronted` listener (transports page, "Who ends TLS" and "Pools and what happens when one is full"): whether anybody but this host reaches it, and whether the web server in front names the visitor in the header the config says. The second is known only to a node that runs and has read requests.

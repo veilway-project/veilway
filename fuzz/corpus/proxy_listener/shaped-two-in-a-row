@@ -1,0 +1,8 @@
+GET /assets/shape-4d1e90b7.js?x HTTP/1.1
+Host: node.test
+
+PUT /assets/shape-5a3c88e1.js?y HTTP/1.1
+Host: node.test
+Content-Length: 4
+
+abcd

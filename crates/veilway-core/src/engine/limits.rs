@@ -104,6 +104,8 @@ pub struct Seat {
 	pool: Arc<AtomicI64>,
 	/// The established `fronted` sessions of that listener, for a session of that transport and no other.
 	polled: Option<Arc<AtomicI64>>,
+	/// The established `fronted-shaped` sessions of that listener, for a session of that transport and no other. Such a session is counted in `polled` too.
+	shaped: Option<Arc<AtomicI64>>,
 	/// The counters of its transport, by `Ended`.
 	ended: Arc<[AtomicU64; ENDS]>,
 	/// "The node ends a session with no activity for" this long, in milliseconds.
@@ -117,9 +119,9 @@ pub struct Seat {
 }
 
 impl Seat {
-	/// A pending session whose proof is about to be taken to the limits. `pool` counts the established sessions of its listener, `polled` those of them that are `fronted` when this is one, and `idle` is the idle time of its transport.
+	/// A pending session whose proof is about to be taken to the limits. `pool` counts the established sessions of its listener, `polled` those of them that are `fronted` or `fronted-shaped` when this is one, `shaped` those that are `fronted-shaped`, and `idle` is the idle time of its transport.
 	#[allow(clippy::too_many_arguments)]
-	pub fn new(device: [u8; 32], secret: Proved, key: Option<[u8; 32]>, tunnel: Arc<Tunnel>, pool: Arc<AtomicI64>, polled: Option<Arc<AtomicI64>>, ended: Arc<[AtomicU64; ENDS]>, idle: Duration, now: i64) -> Arc<Seat> {Arc::new(Seat {device, secret, key, tunnel, phase: AtomicU8::new(WAITING), pool, polled, ended, idle: idle.as_millis() as i64, opened: AtomicI64::new(now), active: AtomicI64::new(now), since: AtomicI64::new(now), gone: Notify::new()})}
+	pub fn new(device: [u8; 32], secret: Proved, key: Option<[u8; 32]>, tunnel: Arc<Tunnel>, pool: Arc<AtomicI64>, polled: Option<Arc<AtomicI64>>, shaped: Option<Arc<AtomicI64>>, ended: Arc<[AtomicU64; ENDS]>, idle: Duration, now: i64) -> Arc<Seat> {Arc::new(Seat {device, secret, key, tunnel, phase: AtomicU8::new(WAITING), pool, polled, shaped, ended, idle: idle.as_millis() as i64, opened: AtomicI64::new(now), active: AtomicI64::new(now), since: AtomicI64::new(now), gone: Notify::new()})}
 
 	fn phase(&self) -> u8 {self.phase.load(Ordering::Acquire)}
 
@@ -143,6 +145,7 @@ impl Seat {
 		if was != WAITING {
 			self.pool.fetch_sub(1, Ordering::Relaxed);
 			if let Some(polled) = &self.polled {polled.fetch_sub(1, Ordering::Relaxed);}
+			if let Some(shaped) = &self.shaped {shaped.fetch_sub(1, Ordering::Relaxed);}
 		}
 		self.ended[why as usize].fetch_add(1, Ordering::Relaxed);
 		self.gone.notify_one();
@@ -267,7 +270,8 @@ impl State {
 	/// "Only an established session counts against the device's session limit, and only at the moment it becomes established does it replace the device's oldest session when the limit is reached."
 	/// The device's sessions are counted, the session goes live and the oldest gives way under one hold of the limits, so two listeners never both find room for a device's eighth session.
 	/// `fronted` is how many established `fronted` sessions its listener holds, which only a session of that transport is held to. A device's third `fronted` session takes the place of its oldest `fronted` one, which makes room among its eight as well.
-	pub fn establish(&self, seat: &Arc<Seat>, cap: usize, fronted: usize, now: i64) -> Seated {
+	/// `shaped` is the same for the `fronted-shaped` sessions among them, and holds a session of that transport to its own pool the same way.
+	pub fn establish(&self, seat: &Arc<Seat>, cap: usize, fronted: usize, shaped: usize, now: i64) -> Seated {
 		let limits = self.limits();
 		let held: Vec<Arc<Seat>> = limits.devices.get(&seat.device).map(|account| account.seats.iter().filter_map(Weak::upgrade).filter(|held| held.established()).collect()).unwrap_or_default();
 		let polling = seat.polled.is_some() && held.iter().filter(|held| held.polled.is_some()).count() >= DEVICE_FRONTED;
@@ -275,10 +279,12 @@ impl State {
 		// A pool that filled up since the proof was accepted, or that a reload made smaller than what it holds: nothing is displaced for the session. The one place it may still take is the one its device's oldest session gives up in this same pool.
 		if seat.pool.load(Ordering::Relaxed) >= cap as i64 && !oldest.is_some_and(|oldest| Arc::ptr_eq(&oldest.pool, &seat.pool)) {return Seated::Full}
 		if seat.polled.as_ref().is_some_and(|polled| polled.load(Ordering::Relaxed) >= fronted as i64 && !oldest.and_then(|oldest| oldest.polled.as_ref()).is_some_and(|gives| Arc::ptr_eq(gives, polled))) {return Seated::Full}
+		if seat.shaped.as_ref().is_some_and(|counted| counted.load(Ordering::Relaxed) >= shaped as i64 && !oldest.and_then(|oldest| oldest.shaped.as_ref()).is_some_and(|gives| Arc::ptr_eq(gives, counted))) {return Seated::Full}
 		if seat.phase.compare_exchange(WAITING, LIVE, Ordering::AcqRel, Ordering::Acquire).is_err() {return Seated::Gone}
 		if let Some(oldest) = oldest {oldest.end(Ended::Displaced)}
 		seat.pool.fetch_add(1, Ordering::Relaxed);
 		if let Some(polled) = &seat.polled {polled.fetch_add(1, Ordering::Relaxed);}
+		if let Some(counted) = &seat.shaped {counted.fetch_add(1, Ordering::Relaxed);}
 		seat.since.store(now, Ordering::Relaxed);
 		Seated::Established
 	}

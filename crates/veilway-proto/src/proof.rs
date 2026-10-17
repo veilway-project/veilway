@@ -9,7 +9,7 @@
 //! HPKE is RFC 9180 in base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and ChaCha20Poly1305, from the `hpke` crate and used as it is. Nothing of it is written here.
 //!
 //! `Node::open` is steps 1 to 4 of "Verifying": whether a token is a proof of a device. What it gives has no keys in it. `Opened::accept` is steps 5 to 7: it takes the proof through the replay rule and then through the listener's own limits, and only then gives the session keys out.
-use crate::{keys::{BinderKey, ChunkKey, Device, TagKey, Tags, BINDER, C2S, FRONTED, PROOF, S2C, SID, TLS, WS}, replay::{Decision, Kind, Replay, Verdict}, uniform, Random, Refused};
+use crate::{keys::{BinderKey, ChunkKey, Device, TagKey, Tags, BINDER, C2S, FRONTED, FRONTED_SHAPED, PROOF, S2C, SID, TLS, WS}, replay::{Decision, Kind, Replay, Verdict}, uniform, Random, Refused};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hpke::{aead::{AeadTag, ChaCha20Poly1305}, inout::InOutBuf, kdf::HkdfSha256, kem::X25519HkdfSha256, rand_core::{TryCryptoRng, TryRng}, Deserializable, HpkeError, Kem, OpModeR, OpModeS, Serializable};
 use std::{convert::Infallible, fmt, ops::RangeInclusive};
@@ -52,12 +52,12 @@ pub(crate) const BASE: [u8; 32] = [9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 
 /// The transport a proof is made for. Its name is part of the HPKE `info`, "so a proof made for one transport is not valid on another".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Name {Tls = 0, Ws = 1, Fronted = 2}
+pub enum Name {Tls = 0, Ws = 1, Fronted = 2, FrontedShaped = 3}
 
 impl Name {
-	pub const ALL: [Self; 3] = [Self::Tls, Self::Ws, Self::Fronted];
+	pub const ALL: [Self; 4] = [Self::Tls, Self::Ws, Self::Fronted, Self::FrontedShaped];
 	// `info` = `"veilway v1 proof" || name || inbound_pub` ("Inputs").
-	fn info(self, inbound_pub: &[u8; 32]) -> Vec<u8> {[PROOF, [TLS, WS, FRONTED][self as usize], inbound_pub].concat()}
+	fn info(self, inbound_pub: &[u8; 32]) -> Vec<u8> {[PROOF, [TLS, WS, FRONTED, FRONTED_SHAPED][self as usize], inbound_pub].concat()}
 }
 
 /// Why a proof was not made, or a node's keys were not taken. None of these is an answer to a peer.
@@ -226,7 +226,7 @@ pub struct Accepted<'a, T> {
 }
 
 /// What a node holds to open tokens on one inbound: its transport keys.
-pub struct Node {keys: Vec<Private>, infos: [Vec<u8>; 3], dummies: Vec<Device<()>>}
+pub struct Node {keys: Vec<Private>, infos: [Vec<u8>; 4], dummies: Vec<Device<()>>}
 
 impl Node {
 	/// `transport_keys` are the private halves of the inbound's node transport keys, one or two, and not the same key twice.
@@ -507,6 +507,9 @@ mod tests {
 			("one character more", Some(Name::Tls), [good.as_bytes(), b"A"].concat()),
 			("a changed character", Some(Name::Tls), flipped),
 			("another transport", Some(Name::Ws), good.clone().into_bytes()),
+			("the shaped transport", Some(Name::FrontedShaped), good.clone().into_bytes()),
+			("the classic fronted for a shaped token", Some(Name::Fronted), client().prove(Name::FrontedShaped, TIME, &mut seeded(7)).unwrap().token.into_bytes()),
+			("the shaped transport for a classic token", Some(Name::FrontedShaped), client().prove(Name::Fronted, TIME, &mut seeded(8)).unwrap().token.into_bytes()),
 			("a line that cannot be a user's", None, good.clone().into_bytes()),
 			("a token for another node key", Some(Name::Tls), Client::new(&public_key(&[0x34; 32]), &secret, &inbound, &device).prove(Name::Tls, TIME, &mut seeded(3)).unwrap().token.into_bytes()),
 			("a device that is not in the table", Some(Name::Tls), Client::new(&public_key(&NODE), &[0x99; 32], &inbound, &device).prove(Name::Tls, TIME, &mut seeded(4)).unwrap().token.into_bytes()),

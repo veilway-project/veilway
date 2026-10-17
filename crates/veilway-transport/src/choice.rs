@@ -41,7 +41,7 @@ pub enum Class {Cover, NoCover, Exposed, Plain}
 
 pub fn class(transport: &Transport) -> Class {
 	match transport {
-		Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) => Class::Cover,
+		Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..) => Class::Cover,
 		Transport::UdpObfs(_) => Class::NoCover,
 		Transport::Udp(_) => Class::Plain,
 	}
@@ -60,8 +60,11 @@ pub fn digest(transports: &[Transport]) -> u64 {
 			Transport::Tls(stream) => (2, &[][..], Some(stream)),
 			Transport::Ws(stream) => (3, &[][..], Some(stream)),
 			Transport::Fronted(stream) => (4, &[][..], Some(stream)),
+			Transport::FrontedShaped(stream, _) => (5, &[][..], Some(stream)),
 		};
 		take(&[kind]);
+		// A shape that changes is another transport for everything that is remembered about this one.
+		if let Transport::FrontedShaped(_, shape) = transport {take(shape.to_string().as_bytes())}
 		for endpoint in endpoints {take(endpoint.address().to_string().as_bytes())}
 		if let Some(stream) = stream {
 			take(stream.path.as_bytes());

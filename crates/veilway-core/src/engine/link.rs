@@ -278,7 +278,7 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 			for transport in order.iter().copied() {
 				let (count, mut passed) = (match &dialled.transports[transport] {
 					Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
-					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.len(),
+					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 				}, Vec::new());
 				tried += 1;
 				let unreachable = loop {

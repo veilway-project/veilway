@@ -121,6 +121,13 @@ pub fn whole(bytes: &[u8]) -> Result<Option<usize>, Answer> {
 /// Whether `bytes`, to which `count` bytes were just added, now hold the empty line that ends a head. Only the new bytes and the three before them are looked at, so a head that arrives byte by byte is searched once and not once for each byte.
 pub(crate) fn headed(bytes: &[u8], count: usize) -> bool {bytes[bytes.len().saturating_sub(count + 3)..].windows(4).any(|window| window == b"\r\n\r\n")}
 
+/// Whether the head of the answer to a stream request is the head of a stream (shapes page, "The stream"): `200` of HTTP/1.1 with `Content-Type: text/event-stream`, exactly `Transfer-Encoding: chunked`, no `Content-Length` and no content coding. `Status` for an answer that is not a `200`, and `Body` for a `200` that is no stream, which is a stream that did not start. The client decides this from the head, before it reads any body.
+pub fn stream_head(head: &Head) -> Result<(), Answer> {
+	if head.status != 200 || !head.current {return Err(Answer::Status(head.status))}
+	let event = head.one("content-type").is_some_and(|kind| kind.eq_ignore_ascii_case(b"text/event-stream") || kind.to_ascii_lowercase().starts_with(b"text/event-stream;"));
+	if event && head.one("transfer-encoding").is_some_and(|coding| coding.eq_ignore_ascii_case(b"chunked")) && head.values("content-length").next().is_none() && head.values("content-encoding").all(|coding| coding.eq_ignore_ascii_case(b"identity")) {Ok(())} else {Err(Answer::Body)}
+}
+
 /// How reading an answer ended before the answer was whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Stop {
@@ -182,6 +189,20 @@ mod tests {
 		for text in [&b""[..], b"Tue, 14 Nov 2023 22:13:20 UTC", b"Tue, 14 Nov 2023 22:13:20 GMT ", b"Tuesday, 14-Nov-23 22:13:20 GMT", b"Tue Nov 14 22:13:20 2023", b"Tue, 14 Nov 2023 24:13:20 GMT", b"Tue, 14 Nov 2023 22:60:20 GMT", b"Tue, 14 Nov 2023 22:13:60 GMT", b"Tue, 31 Nov 2023 22:13:20 GMT", b"Wed, 29 Feb 2023 00:00:00 GMT", b"Tue, 00 Nov 2023 22:13:20 GMT", b"Tue, 14 nov 2023 22:13:20 GMT", b"Tue, 14 Nov 1969 22:13:20 GMT", b"Tue, +4 Nov 2023 22:13:20 GMT", b"Tue, 14 Nov 2023 22:13:2\xd9 GMT"] {assert_eq!(date(text), None, "{:?}", String::from_utf8_lossy(text))}
 		// Two `Date` fields are no date.
 		assert_eq!(head(b"HTTP/1.1 404 Not Found\r\nDate: Tue, 14 Nov 2023 22:13:20 GMT\r\ndate: Tue, 14 Nov 2023 22:13:20 GMT\r\n\r\n").unwrap().date(), None);
+	}
+
+	#[test]
+	fn the_head_of_a_stream_is_a_200_event_stream_with_the_chunked_coding_alone() {
+		let verdict = |text: &str| stream_head(&head(text.as_bytes()).unwrap());
+		let good = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\n\r\n";
+		assert_eq!(verdict(good), Ok(()));
+		assert_eq!(verdict("HTTP/1.1 200 OK\r\ncontent-type: Text/Event-Stream; charset=utf-8\r\ntransfer-encoding: Chunked\r\n\r\n"), Ok(()));
+		// A `200` that is no stream did not start one: another type, a length, a coding, another transfer coding, none, two of them.
+		for text in ["HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 40\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nContent-Length: 40\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 200 OK\r\nContent-Type: text/event-streams\r\nTransfer-Encoding: chunked\r\n\r\n", "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"] {assert_eq!(verdict(text), Err(Answer::Body), "{text:?}")}
+		// Anything else is not a stream's head: another status, or a version a node does not speak.
+		assert_eq!(verdict("HTTP/1.1 404 Not Found\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"), Err(Answer::Status(404)));
+		assert_eq!(verdict("HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"), Err(Answer::Status(200)));
+		assert_eq!(verdict("HTTP/1.1 100 Continue\r\n\r\n"), Err(Answer::Status(100)));
 	}
 
 	#[test]

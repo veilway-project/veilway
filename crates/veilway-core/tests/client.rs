@@ -27,6 +27,7 @@ use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use veilway_core::Over;
 use veilway_proto::proof;
+use veilway_proto::shape::Shape;
 use veilway_proto::subscription::payload::Padding;
 use veilway_proto::subscription::Secret;
 use veilway_transport::choice::{self, Network, Next, Standing};
@@ -52,7 +53,8 @@ fn certify(dir: &Path) -> (Arc<RootCertStore>, [u8; 32], Arc<ServerConfig>) {
 
 /// What ends TLS in front of the operator's web server: every connection is handed on to `upstream` byte for byte. `seen` holds what each connection's client sent.
 /// With `lose` set, the next bytes that come back from upstream are thrown away and the connection is closed: an answer that is lost on its way. With `twice` set, the next bytes of a client are sent upstream on a connection of the front's own first, as someone would who holds a request back and sends it first.
-struct Edge {addr: SocketAddr, seen: Arc<Mutex<Vec<Vec<u8>>>>, lose: Arc<AtomicBool>, twice: Arc<AtomicBool>, task: JoinHandle<()>}
+/// With `corrupt` set, one character inside the first event of every stream answer is changed, so that the event does not open. With `hold` set, what comes back from upstream on a connection whose client asked for an event stream is kept and never given out, as a CDN that holds an answer until it is complete would do. With `cut` set, such a connection is closed 400 ms after its first answer byte.
+struct Edge {addr: SocketAddr, seen: Arc<Mutex<Vec<Vec<u8>>>>, lose: Arc<AtomicBool>, twice: Arc<AtomicBool>, hold: Arc<AtomicBool>, cut: Arc<AtomicBool>, corrupt: Arc<AtomicBool>, task: JoinHandle<()>}
 
 impl Drop for Edge {
 	fn drop(&mut self) {self.task.abort()}
@@ -60,16 +62,16 @@ impl Drop for Edge {
 
 async fn edge(upstream: SocketAddr, config: Arc<ServerConfig>) -> Edge {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let (addr, seen, lose, twice) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+	let (addr, seen, lose, twice, hold, cut, corrupt) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
 	let task = tokio::spawn({
-		let (seen, lose, twice) = (seen.clone(), lose.clone(), twice.clone());
+		let (seen, lose, twice, hold, cut, corrupt) = (seen.clone(), lose.clone(), twice.clone(), hold.clone(), cut.clone(), corrupt.clone());
 		async move {
 			loop {
 				let Ok((stream, _)) = listener.accept().await else {return};
-				let (acceptor, seen, lose, twice) = (TlsAcceptor::from(config.clone()), seen.clone(), lose.clone(), twice.clone());
+				let (acceptor, seen, lose, twice, hold, cut, corrupt) = (TlsAcceptor::from(config.clone()), seen.clone(), lose.clone(), twice.clone(), hold.clone(), cut.clone(), corrupt.clone());
 				tokio::spawn(async move {
 					let Ok(mut client) = acceptor.accept(stream).await else {return};
-					let (mut up, mut sent, mut answered) = (dial(upstream, CLIENT).await, vec![0u8; 65536], vec![0u8; 65536]);
+					let (mut up, mut sent, mut answered, mut streaming, mut cut_at, mut done) = (dial(upstream, CLIENT).await, vec![0u8; 65536], vec![0u8; 65536], false, None::<tokio::time::Instant>, false);
 					let at = {
 						let mut seen = seen.lock().unwrap();
 						seen.push(Vec::new());
@@ -80,6 +82,7 @@ async fn edge(upstream: SocketAddr, config: Arc<ServerConfig>) -> Edge {
 							got = client.read(&mut sent) => match got {
 								Ok(count) if count > 0 => {
 									seen.lock().unwrap()[at].extend_from_slice(&sent[..count]);
+									streaming |= sent[..count].windows(17).any(|window| window == b"text/event-stream");
 									if twice.swap(false, Ordering::SeqCst) {
 										let mut first = dial(upstream, CLIENT).await;
 										first.write_all(&sent[..count]).await.unwrap();
@@ -87,21 +90,36 @@ async fn edge(upstream: SocketAddr, config: Arc<ServerConfig>) -> Edge {
 									}
 									if up.write_all(&sent[..count]).await.is_err() {return}
 								}
+								// A front that holds a stream answer goes on holding it when the client leaves: the node's connection to it stays open.
+								_ if streaming && hold.load(Ordering::SeqCst) => std::future::pending::<()>().await,
 								_ => return drop(up.shutdown().await),
 							},
-							got = up.read(&mut answered) => match got {
+							got = up.read(&mut answered), if !done => match got {
 								Ok(count) if count > 0 => {
+									if streaming && hold.load(Ordering::SeqCst) {continue}
+									if streaming && corrupt.load(Ordering::SeqCst) {
+										if let Some(at) = answered[..count].windows(6).position(|window| window == b"data: ").filter(|at| at + 12 < count) {answered[at + 12] = if answered[at + 12] == b'A' {b'B'} else {b'A'}}
+									}
+									if streaming && cut.load(Ordering::SeqCst) {cut_at.get_or_insert(tokio::time::Instant::now() + Duration::from_millis(400));}
 									if lose.swap(false, Ordering::SeqCst) || client.write_all(&answered[..count]).await.is_err() || client.flush().await.is_err() {return}
 								}
+								// An answer that is held until it is complete is held when the origin closes it too: the client is given nothing and its connection stays open.
+								_ if streaming && hold.load(Ordering::SeqCst) => done = true,
 								_ => return drop(client.shutdown().await),
 							},
+							_ = async {
+								match cut_at {
+									Some(at) => tokio::time::sleep_until(at).await,
+									None => std::future::pending().await,
+								}
+							} => return drop(client.shutdown().await),
 						}
 					}
 				});
 			}
 		}
 	});
-	Edge {addr, seen, lose, twice, task}
+	Edge {addr, seen, lose, twice, hold, cut, corrupt, task}
 }
 
 /// A node with all four transports and what a client needs to reach each: the addresses of `udp-obfs` and `tls`, the front of `ws` and `fronted`, the roots and the pin.
@@ -703,4 +721,166 @@ async fn a_node_makes_its_own_certificate_and_a_profile_that_pins_it_reaches_the
 	assert!(device.session.numbers().heard.is_some());
 	device.session.close().await;
 	node.engine.shutdown().await;
+}
+
+/// The JSON of a preset by its name, as a profile and a config write it, or the text itself for a shape that is none of them.
+fn shape_text(name: &str) -> &str {
+	match name {
+		"post-stream" => r#"{"up":{"method":"POST","in":"body"},"down":{"mode":"sse"}}"#,
+		"get-stream" => r#"{"up":{"method":"GET","in":"query"},"down":{"mode":"sse"}}"#,
+		"put-poll" => r#"{"up":{"method":"PUT","in":"body"},"down":{"mode":"poll"}}"#,
+		"get-poll" => r#"{"up":{"method":"GET","in":"query"},"down":{"mode":"poll"}}"#,
+		other => other,
+	}
+}
+
+fn shape_of(name: &str) -> Shape {Shape::parse(shape_text(name).as_bytes()).unwrap()}
+
+impl Net {
+	/// The target of the `fronted-shaped` transport with this shape, behind the same front as `fronted`.
+	fn shaped(&self, shape: &Shape) -> Target {Target::FrontedShaped {path: SHAPED_PATH.into(), candidate: self.front(self.edge.addr, false), shape: shape.clone()}}
+}
+
+// Each preset through the library and a front that ends TLS: the session opens, a TCP connection leaves through the exit, and the node knows it as a shaped session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_preset_reaches_the_tunnel_through_a_front() {
+	for name in ["post-stream", "get-stream", "put-poll", "get-poll"] {
+		let (time, shape) = (time!(), shape_of(name));
+		let net = net(Box::leak(format!("shaped-{name}").into_boxed_str()), time, |doc| with_shape(doc, &serde_json::from_str(&shape_text(name)).unwrap())).await;
+		let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+		peer.connect().await.unwrap_or_else(|ended| panic!("{name}: {ended:?}"));
+		assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"), "{name}");
+		let (peers, totals) = (net.node.engine.peers(Some("a")), net.node.totals());
+		assert_eq!((peers[0].over, totals.shaped, totals.sessions, totals.forwards), (Some(Over::FrontedShaped), 1, 1, 0), "{name}: {totals:?}");
+		assert_eq!(totals.shaped_streams, u64::from(shape.streamed()), "{name}");
+		net.node.engine.shutdown().await;
+	}
+}
+
+// "Requests in flight: 1 to 4 and one stream": a shape with three at a time and a stream, and a burst of packets that is sent over them as they come, in whatever order the front lets them arrive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn several_requests_in_flight_carry_a_burst() {
+	let (time, text) = (time!(), r#"{"up":{"method":"GET","in":"query","inflight":3,"gather":[0,5]},"down":{"mode":"sse","gather":[0,5]}}"#);
+	let shape = shape_of(text);
+	let net = net("shaped-burst", time, |doc| with_shape(doc, &serde_json::from_str(text).unwrap())).await;
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	peer.connect().await.unwrap();
+	// Sixty echo requests to the gateway, back to back: the node answers each one itself.
+	for seq in 0..60u16 {
+		let mut out = Vec::new();
+		PacketBuilder::ipv4(address(0), GATEWAY, 64).icmpv4_echo_request(9, seq).write(&mut out, &[0x5a; 200]).unwrap();
+		peer.send(&out);
+	}
+	for seq in 0..60u16 {assert!(peer.recv(5 * SECOND, |packet| packet.len() >= 28 && packet[9] == 1 && packet[20] == 0 && packet[26..28] == seq.to_be_bytes()).await.is_some(), "the reply {seq} did not come")}
+	let seen = net.edge.seen.lock().unwrap().len();
+	// One connection for the stream and no more than three for the requests, as the page says: "at most 1 + `up.inflight`".
+	assert!((2..=4).contains(&seen), "{seen} connections");
+	assert_eq!(net.node.totals().forwards, 0);
+	net.node.engine.shutdown().await;
+}
+
+// "First event: the opening request's stream must answer with its head and first event within 5 s of the client sending it. If there is nothing, the client ends the stream's connection and goes on with `poll` for this session." A front that holds a stream answer until it is complete shows the node nothing but a held connection, and the session polls: the datagram the stream would have carried is lost with it, and WireGuard sends it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_front_that_holds_the_stream_costs_the_stream_and_the_session_polls() {
+	let (time, shape) = (time!(), shape_of("get-stream"));
+	let net = net("shaped-held", time, |doc| with_shape(doc, &serde_json::from_str(&shape_text("get-stream")).unwrap())).await;
+	net.edge.hold.store(true, Ordering::SeqCst);
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	// Nothing comes for 5 s, then the session goes on by polling. The WireGuard layer of the test sends its initiation again, as the real one does, and the answer to it comes in the answer to a request.
+	tokio::time::sleep(Duration::from_secs(6)).await;
+	let init = {
+		let mut out = vec![0u8; 2048];
+		let TunnResult::WriteToNetwork(init) = peer.tunn.lock().unwrap().format_handshake_initiation(&mut out, true) else {panic!("no initiation")};
+		init.to_vec()
+	};
+	peer.session.send(init, Kind::Handshake);
+	peer.connect().await.unwrap();
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	assert!(logged("polling for an hour"));
+	// "Nothing is latched for good" and the mark is for the candidate: another session on it polls from its first request, without a stream.
+	let streams = net.node.totals().shaped_streams;
+	let mut other = net.peer(1, &link(1), net.shaped(&shape));
+	other.connect().await.unwrap();
+	assert_eq!((net.node.totals().shaped_streams, other.leaves(40001).await.as_deref()), (streams, Some("main")));
+	net.node.engine.shutdown().await;
+}
+
+// "If 3 streams in a row last under 10 s each, the client stops asking for streams for this session and polls": a front that ends every stream after a moment. Each stream carries what it was given, the fourth request is no stream request, and the session goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streams_that_end_early_three_times_in_a_row_end_the_stream_attempt() {
+	let (time, shape) = (time!(), shape_of("get-stream"));
+	let net = net("shaped-short", time, |doc| with_shape(doc, &serde_json::from_str(&shape_text("get-stream")).unwrap())).await;
+	net.edge.cut.store(true, Ordering::SeqCst);
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	peer.connect().await.unwrap();
+	eventually("the client went on asking for streams", || logged("streams do not work on this candidate")).await;
+	let streams = net.node.totals().shaped_streams;
+	assert!((3..=4).contains(&streams), "{streams} streams");
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	assert_eq!(net.node.totals().shaped_streams, streams);
+	net.node.engine.shutdown().await;
+}
+
+// The node keeps a stream a front holds open after the client left it, and writes the tunnel's data into it. "No stream", an item of the client's next request that the node can trust like the chunk it is in, makes the node drop that stream, and the data goes in the answers. The front here keeps its connection to the node open when the client leaves, as a CDN that holds an answer does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_that_leaves_a_stream_a_front_keeps_open_is_not_starved() {
+	let (time, shape) = (time!(), shape_of("get-stream"));
+	let net = net("shaped-starved", time, |doc| with_shape(doc, &serde_json::from_str(&shape_text("get-stream")).unwrap())).await;
+	net.edge.hold.store(true, Ordering::SeqCst);
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	tokio::time::sleep(Duration::from_secs(6)).await;
+	let init = {
+		let mut out = vec![0u8; 2048];
+		let TunnResult::WriteToNetwork(init) = peer.tunn.lock().unwrap().format_handshake_initiation(&mut out, true) else {panic!("no initiation")};
+		init.to_vec()
+	};
+	peer.session.send(init, Kind::Handshake);
+	peer.connect().await.unwrap();
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	assert!(net.node.totals().shaped_streams >= 1 && net.node.totals().streams == 0, "{:?}", net.node.totals());
+	net.node.engine.shutdown().await;
+}
+
+// "An event that does not decode or open ends the stream and counts as a stream that did not work": the session does not go on believing the stream is the live one until its length is up, and asks for another at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_event_that_does_not_open_ends_its_stream_and_a_new_one_is_asked_for() {
+	let (time, shape) = (time!(), shape_of("get-stream"));
+	let net = net("shaped-corrupt", time, |doc| with_shape(doc, &serde_json::from_str(&shape_text("get-stream")).unwrap())).await;
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	peer.connect().await.unwrap();
+	assert_eq!(net.node.totals().shaped_streams, 1);
+	net.edge.corrupt.store(true, Ordering::SeqCst);
+	let mut out = Vec::new();
+	PacketBuilder::ipv4(address(0), GATEWAY, 64).icmpv4_echo_request(9, 1).write(&mut out, &[0x5a; 40]).unwrap();
+	peer.send(&out);
+	eventually("the client went on with a stream that did not open", || net.node.totals().shaped_streams >= 2).await;
+	net.edge.corrupt.store(false, Ordering::SeqCst);
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	net.node.engine.shutdown().await;
+}
+
+// "A request that gets no valid answer within 10 s makes the session lost", but a later stream request whose head does not come is a stream that does not work: the session polls. The stream here has the shortest length the page allows, the front holds the next one, and the session is still there when the polling starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_later_stream_whose_head_does_not_come_is_a_fallback_and_not_a_lost_session() {
+	let (time, text) = (time!(), r#"{"up":{"method":"GET","in":"query"},"down":{"mode":"sse","life":[30,30]}}"#);
+	let shape = shape_of(text);
+	let net = net("shaped-late-head", time, |doc| with_shape(doc, &serde_json::from_str(text).unwrap())).await;
+	let mut peer = net.peer(0, &link(0), net.shaped(&shape));
+	peer.connect().await.unwrap();
+	// The first stream is requested to be replaced 27 to 30 s after it began, and the front holds what the node answers to that one.
+	net.edge.hold.store(true, Ordering::SeqCst);
+	eventually_for("the client did not ask for another stream", Duration::from_secs(45), || net.node.totals().shaped_streams >= 2).await;
+	tokio::time::sleep(Duration::from_secs(12)).await;
+	assert!(!matches!(peer.session.state(), State::Ended(_)));
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	net.node.engine.shutdown().await;
+}
+
+/// `eventually` with a time of its own.
+async fn eventually_for(what: &str, budget: Duration, done: impl Fn() -> bool) {
+	let deadline = Instant::now() + budget;
+	while !done() {
+		assert!(Instant::now() < deadline, "{what}");
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
 }

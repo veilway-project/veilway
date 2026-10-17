@@ -62,7 +62,7 @@ proptest! {
 		prop_assert_eq!((offer.direction, &offer.name, offer.inbound_public_key, offer.transport_public_key, &offer.dialler, &offer.listener, offer.mtu, &offer.transports, offer.expires_at, offer.code()), (terms.direction, &terms.name, terms.inbound_public_key, terms.transport_public_key, &terms.dialler, &terms.listener, terms.mtu, &terms.transports, now + lifetime, code));
 		prop_assert_eq!(offer.dials().len(), offer.transports.iter().map(|transport| match transport {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.len(),
+			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 		}).sum::<usize>());
 		let (answer, dialler) = pastes.answer(&offer, now + lifetime, &mut seeded(seeds.1)).unwrap();
 		prop_assert_eq!(answer.len(), ANSWER_CHARS);

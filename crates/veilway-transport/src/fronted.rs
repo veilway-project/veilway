@@ -35,7 +35,7 @@ fn post(path: &str, query: &str, host: &str, body: &[u8]) -> Vec<u8> {
 
 // Writes one request and reads its answer into `buf`, which then holds nothing else. `written` is set when the request has left whole. Where the body of a `200` lies and whether the answer ends its connection, or how the exchange stopped: by what the peer said, a `close_notify` included, or cut.
 // The head is searched as it arrives and read once, and the answer is looked at again only when all of its bytes are there: a front that sends an answer byte by byte costs a read for each byte and no more.
-async fn exchange(io: &mut (impl AsyncRead + AsyncWrite + Unpin), request: &[u8], buf: &mut Vec<u8>, written: &mut bool) -> Result<(Range<usize>, bool), Stop> {
+pub(crate) async fn exchange(io: &mut (impl AsyncRead + AsyncWrite + Unpin), request: &[u8], buf: &mut Vec<u8>, written: &mut bool) -> Result<(Range<usize>, bool), Stop> {
 	let (mut read, mut found, mut whole) = (vec![0u8; 16_384], false, None);
 	buf.clear();
 	if io.write_all(request).await.is_err() || io.flush().await.is_err() {return Err(Stop::Cut)}
@@ -61,7 +61,7 @@ async fn exchange(io: &mut (impl AsyncRead + AsyncWrite + Unpin), request: &[u8]
 pub(crate) fn slower(wait: Duration, empty: bool) -> Duration {if empty {wait.mul_f64(1.5).min(POLL_MAX)} else {POLL}}
 
 // "Each wait multiplied by a number drawn uniformly from 0.75 to 1.25."
-fn spread(wait: Duration) -> Result<Duration, End> {Ok((wait * uniform(750, 1250, &mut random).map_err(|_| End::Random)? / 1000).min(POLL_LEAST))}
+pub(crate) fn spread(wait: Duration) -> Result<Duration, End> {Ok((wait * uniform(750, 1250, &mut random).map_err(|_| End::Random)? / 1000).min(POLL_LEAST))}
 
 pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Front) -> Ended {
 	let (dialled, Some(node), host) = (Instant::now() + ATTEMPT, link.node, tls::host(candidate)) else {return End::Source.into()};

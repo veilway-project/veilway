@@ -149,23 +149,23 @@ impl Config {
 				let at = format!("{at}.transports[{j}]");
 				// Protocol overview, "Config and profile fields this draft assumes": "On a `veilway` inbound, `ws` is the native format and has no `tls` key." It is told from the `ws` of a `wireguard` inbound by its decoy, and neither is ever taken for the other.
 				if inbound.kind == InboundType::Veilway && matches!(transport, Transport::Ws {..}) {r.error(format!("{at}.type"), "expected a ws transport with a decoy and trusted_proxies: the ws of a veilway inbound is the native format behind the operator's own web server, and not the ws of a wireguard inbound")}
-				if let Transport::UdpObfs {limits, ..} | Transport::Tls {limits, ..} | Transport::WsNative {limits, ..} | Transport::Fronted {limits, ..} = transport {
+				if let Transport::UdpObfs {limits, ..} | Transport::Tls {limits, ..} | Transport::WsNative {limits, ..} | Transport::Fronted {limits, ..} | Transport::FrontedShaped {limits, ..} = transport {
 					// Every device of a `veilway` inbound has the transport secret the envelope and the proof are keyed with. A device of a `wireguard` inbound has none.
 					if inbound.kind != InboundType::Veilway {r.error(format!("{at}.type"), "expected \"udp\" or a \"ws\" without a decoy: udp-obfs, tls, fronted and the ws with a decoy are transports of a veilway inbound, whose devices have the transport secrets they are keyed with")}
 					if limits.and_then(|limits| limits.sessions).is_some_and(|sessions| !(1..=MAX_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.sessions"), format!("expected an integer from 1 to {MAX_SESSIONS}"))}
 				}
 				if let Transport::UdpObfs {limits: Some(limits), ..} = transport {
-					for (key, set) in [("undecided", limits.undecided), ("undecided_per_source", limits.undecided_per_source), ("relayed", limits.relayed), ("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions)] {
+					for (key, set) in [("undecided", limits.undecided), ("undecided_per_source", limits.undecided_per_source), ("relayed", limits.relayed), ("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions), ("shaped_sessions", limits.shaped_sessions)] {
 						if set.is_some() {r.error(format!("{at}.limits.{key}"), "expected no such key: it is a pool of a stream listener, and udp-obfs has none")}
 					}
 				}
 				if let Transport::Tls {limits: Some(limits), ..} = transport {
 					// Transports page, "Pools and what happens when one is full": "A `tls` listener has only direct peers."
-					for (key, set) in [("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions)] {
+					for (key, set) in [("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions), ("shaped_sessions", limits.shaped_sessions)] {
 						if set.is_some() {r.error(format!("{at}.limits.{key}"), "expected no such key: it is a pool of the proxy path, and a tls listener has only direct peers")}
 					}
 				}
-				if let Transport::Tls {path, decoy, limits, ..} | Transport::WsNative {path, decoy, limits, ..} | Transport::Fronted {path, decoy, limits, ..} = transport {
+				if let Transport::Tls {path, decoy, limits, ..} | Transport::WsNative {path, decoy, limits, ..} | Transport::Fronted {path, decoy, limits, ..} | Transport::FrontedShaped {path, decoy, limits, ..} = transport {
 					// The characters are those the request line test passes on, and the length is "Request path: at least 12 characters".
 					if !path.starts_with('/') || !(MIN_PROOF_PATH_BYTES..=MAX_WS_PATH_BYTES).contains(&path.len()) || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~/-".contains(&b)) || path.split('/').any(|part| part == "..") {
 						r.error(format!("{at}.path"), format!("expected a path that starts with /, is {MIN_PROOF_PATH_BYTES} to {MAX_WS_PATH_BYTES} bytes from A-Z a-z 0-9 . _ ~ / - and has no .. component"));
@@ -180,6 +180,14 @@ impl Config {
 						Host::Name(_) => r.warning(format!("{at}.decoy.origin"), "a name, which is resolved at start and at every reload: it must lead to the operator's own web server, and what strangers send travels to it unprotected"),
 						Host::Ip(_) => {}
 					}
+				}
+				if let Transport::FrontedShaped {shape, ..} = transport {
+					// Shapes page, "Which combinations are valid": a header that carries the data must not be a field the web server in front reads or writes. The field the listener reads the visitor's address from is the operator's choice, so it is checked here.
+					if let (Some(name), Some(proxied)) = (&shape.up.name, transport.proxied()) {
+						if proxied.header.is_some_and(|header| header.eq_ignore_ascii_case(name)) {r.error(format!("{at}.shape.up.name"), "expected a header that is not the client_address_header of the listener: the web server in front writes that field on every request")}
+					}
+					// Shapes page, "Which combinations are valid": "Anything else refuses the transport."
+					if let Err(member) = shape.resolve() {r.error(format!("{at}.shape.{member}"), "expected a member the shapes page allows: GET takes query, path or header, POST, PUT and PATCH take body, a custom method of 3 to 16 capital letters takes any; CONNECT, TRACE, HEAD and OPTIONS are refused; a header name is required with header and refused otherwise, from 1 to 32 characters of A-Z a-z 0-9 -, and not a field the client writes itself; limit is 1024 to 8000 for query and path, 1024 to 4096 for header and 1024 to 65536 for body; inflight is 1 to 4 and 1 with poll; gather is [low, high] of 0 to 250 ms; life is [low, high] of 30 to 3600 s; gather, life and fallback only with sse")}
 				}
 				if let Transport::Tls {tls: Certificate::Files(tls), ..} = transport {
 					for (key, file) in [("cert", &tls.cert), ("key", &tls.key)] {
@@ -196,6 +204,10 @@ impl Config {
 					if limits.proxy_connections.is_some_and(|connections| !(2..=MAX_PROXY_CONNECTIONS).contains(&connections)) {r.error(format!("{at}.limits.proxy_connections"), format!("expected an integer from 2 to {MAX_PROXY_CONNECTIONS}: requests of strangers may hold half of them, and the other half is for users"))}
 					if limits.decoy_requests_per_source.is_some_and(|requests| !(1..=MAX_DECOY_REQUESTS).contains(&requests)) {r.error(format!("{at}.limits.decoy_requests_per_source"), format!("expected an integer from 1 to {MAX_DECOY_REQUESTS}"))}
 					if limits.fronted_sessions.is_some_and(|sessions| !(1..=MAX_FRONTED_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.fronted_sessions"), format!("expected an integer from 1 to {MAX_FRONTED_SESSIONS}"))}
+					if limits.shaped_sessions.is_some_and(|sessions| !(1..=MAX_FRONTED_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.shaped_sessions"), format!("expected an integer from 1 to {MAX_FRONTED_SESSIONS}"))}
+					// Shapes page, "Numbers that are judgement calls": "Shaped sessions: 256 per listen address, counted among the 1,024 `fronted` sessions. Validation warns above 256."
+					if limits.shaped_sessions.is_some_and(|sessions| (DEFAULT_SHAPED_SESSIONS + 1..=MAX_FRONTED_SESSIONS).contains(&sessions)) {r.warning(format!("{at}.limits.shaped_sessions"), format!("every shaped session can hold {SHAPED_SESSION_BYTES} bytes, so a full pool of this size holds up to {} MiB of them, where the default of {DEFAULT_SHAPED_SESSIONS} sessions holds about 147 MiB", u64::from(limits.shaped_sessions.unwrap_or_default()) * SHAPED_SESSION_BYTES / (1 << 20)))}
+					if limits.shaped_sessions.is_some_and(|sessions| sessions > limits.fronted_sessions.unwrap_or(DEFAULT_FRONTED_SESSIONS)) {r.warning(format!("{at}.limits.shaped_sessions"), "above fronted_sessions, which every shaped session is counted among: the pool of fronted sessions is full first")}
 					// Transports page, "Pools and what happens when one is full": "A `ws` or `fronted` listener is meant for the operator's web server alone: its users arrive through `trusted_proxies`, and a peer outside them is a direct peer that is never a user." A listener with no proxy would serve nobody, and one that trusts every address would believe anybody's word for where a request came from.
 					if !(1..=MAX_TRUSTED_PROXIES).contains(&proxied.trusted.len()) {r.error(format!("{at}.trusted_proxies"), format!("expected 1 to {MAX_TRUSTED_PROXIES} addresses or networks: users reach a ws or fronted transport through the operator's own reverse proxies and no other way"))}
 					index(&mut r, |k| format!("{at}.trusted_proxies[{k}]"), proxied.trusted.iter().take(MAX_TRUSTED_PROXIES));
@@ -229,6 +241,8 @@ impl Config {
 					if tls.is_none() && !listen.0.ip().is_loopback() {r.warning(format!("{at}.listen"), "plain ws without tls is meant for a reverse proxy on the same host; listen on a loopback address")}
 				}
 				let (here, udp) = (transport.listen(), transport.datagram());
+				// Shapes page, "The node's state machine", step 2: "For `path` the node removes the transport's `path` as a prefix, so a path that is a prefix of another transport's path on the same listener is refused by validation."
+				let nested = |outer: &Proxied, inner: &Proxied| outer.shape.is_some_and(|shape| shape.up.place == ShapePlace::Path) && inner.path.strip_prefix(outer.path).is_some_and(|rest| rest.starts_with('/'));
 				let clash = listeners.iter().find(|(_, other)| {
 					let there = other.listen();
 					let same_socket = here.port() == there.port() && here.is_ipv4() == there.is_ipv4() && (here.ip() == there.ip() || here.ip().is_unspecified() || there.ip().is_unspecified());
@@ -237,7 +251,7 @@ impl Config {
 						// One listener has one certificate, one decoy origin and one set of pools, and tells its transports apart by their paths.
 						(Transport::Tls {path, tls, decoy, limits, ..}, Transport::Tls {path: other_path, tls: other_tls, decoy: other_decoy, limits: other_limits, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls || decoy != other_decoy || limits != other_limits,
 						// The web server in front hands a `GET` for one path and a `POST` for another to one listener, which has one decoy origin, one list of proxies and one set of pools.
-						_ if transport.proxied().is_some() && other.proxied().is_some() => transport.proxied().zip(other.proxied()).is_none_or(|(one, two)| here.ip() != there.ip() || one.path == two.path || one.decoy != two.decoy || one.trusted != two.trusted || one.header != two.header || one.limits != two.limits),
+						_ if transport.proxied().is_some() && other.proxied().is_some() => transport.proxied().zip(other.proxied()).is_none_or(|(one, two)| here.ip() != there.ip() || one.path == two.path || nested(&one, &two) || nested(&two, &one) || one.decoy != two.decoy || one.trusted != two.trusted || one.header != two.header || one.limits != two.limits),
 						_ => udp == other.datagram(),
 					}
 				});
@@ -246,7 +260,7 @@ impl Config {
 						_ if udp => "two udp or udp-obfs transports never share an address and port",
 						(Transport::Ws {..}, Transport::Ws {..}) => "two ws transports share an address and port only with different paths and identical tls",
 						(Transport::Tls {..}, Transport::Tls {..}) => "two tls transports share an address and port only with different paths and identical tls, decoy and limits",
-						_ if transport.proxied().is_some() && there.proxied().is_some() => "ws and fronted transports of veilway inbounds share an address and port only with different paths and identical decoy, trusted_proxies, client_address_header and limits",
+						_ if transport.proxied().is_some() && there.proxied().is_some() => "ws and fronted transports of veilway inbounds share an address and port only with different paths and identical decoy, trusted_proxies, client_address_header and limits, and a fronted-shaped transport that puts its data in the path takes every path under its own, so no other path of the listener may lie under it",
 						_ => "a listener serves one kind of peer: a tls transport, a ws transport of a wireguard inbound, and the ws and fronted transports of veilway inbounds never share an address and port with one another",
 					}));
 				}
@@ -470,7 +484,7 @@ impl Config {
 				(Some(_), Some(inbound)) if inbound.kind != InboundType::Veilway => r.error(at("inbound"), "expected a veilway inbound: a link is a device session on a native transport, which a wireguard inbound has none of"),
 				(Some(_), Some(inbound)) => {
 					// "Which transports a link may list. `udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1."
-					if inbound.transports.iter().any(|transport| matches!(transport, Transport::Fronted {..})) {r.error(at("inbound"), "expected an inbound without a fronted transport: a link carries the traffic of many users, and polling that through a CDN is not a transport of a link in this version")}
+					if inbound.transports.iter().any(|transport| matches!(transport, Transport::Fronted {..} | Transport::FrontedShaped {..})) {r.error(at("inbound"), "expected an inbound without a fronted transport: a link carries the traffic of many users, and polling that through a CDN is not a transport of a link in this version")}
 					// "Until one device can no longer crowd an inbound's packet queue, an inbound that carries a link carries no users' devices."
 					if small && home.is_some_and(|home| peopled.has(home)) {r.error(at("inbound"), "expected an inbound that carries no users' devices: a link has an inbound to itself, or shares one only with other links")}
 				}

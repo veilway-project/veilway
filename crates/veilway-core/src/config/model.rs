@@ -767,6 +767,10 @@ pub struct TransportLimits {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(range(min = 1, max = 65536))]
 	pub fronted_sessions: Option<u32>,
+	/// Established `fronted-shaped` sessions the listener holds at once, counted among its `fronted_sessions`. Each can hold up to 603136 bytes. Defaults to 256, which is about 147 MiB when full.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 65536))]
+	pub shaped_sessions: Option<u32>,
 }
 
 /// The decoy origin of a stream listener: the operator's own web server, which answers everyone who is not a user.
@@ -890,15 +894,111 @@ pub enum Transport {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		limits: Option<TransportLimits>,
 	},
+	/// `fronted` whose requests and answers are in the shape this transport names (protocol, "Shapes of fronted"): which method carries the data, where in the request it goes, and whether the node answers each request or writes to one event stream. Its keys are those of `fronted`, and its proofs are valid on no other transport.
+	#[serde(rename = "fronted-shaped")]
+	FrontedShaped {
+		listen: Addr,
+		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
+		path: String,
+		decoy: Decoy,
+		#[schemars(length(min = 1, max = MAX_TRUSTED_PROXIES))]
+		trusted_proxies: Vec<Proxy>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern("^[A-Za-z0-9-]{1,64}$"))]
+		client_address_header: Option<String>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		limits: Option<TransportLimits>,
+		shape: Shape,
+	},
 }
 
-/// What the two transports of the proxy path have besides their listen address: the native `ws` and `fronted`.
-pub struct Proxied<'a> {pub fronted: bool, pub path: &'a str, pub decoy: &'a Decoy, pub trusted: &'a [Proxy], pub header: Option<&'a str>, pub limits: Option<TransportLimits>}
+/// The shape of a `fronted-shaped` transport, as the profile of its subscription carries it. The members are those of the shapes page, and the panel writes one object to the config and to the profile.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Shape {
+	pub up: ShapeUp,
+	pub down: ShapeDown,
+}
+
+/// The upstream half of a shape. Which methods go with which `in`, and the bounds of every number, are validation's.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeUp {
+	/// `GET`, `POST`, `PUT`, `PATCH`, or a custom method of 3 to 16 capital letters. `CONNECT`, `TRACE`, `HEAD` and `OPTIONS` are refused.
+	#[schemars(pattern("^[A-Z]{3,16}$"))]
+	pub method: String,
+	/// Where the data of a request goes. `GET` takes `query`, `path` or `header`; `POST`, `PUT` and `PATCH` take `body`; a custom method takes any.
+	#[serde(rename = "in")]
+	pub place: ShapePlace,
+	/// The name of the one header field that carries the data. Required with `header` and refused otherwise.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern("^[A-Za-z0-9-]{1,32}$"))]
+	pub name: Option<String>,
+	/// The most one request carries, as bytes of body, of request target or of header value. 1024 to 8000 for `query` and `path` (default 4000), 1024 to 4096 for `header` (default 3000), 1024 to 65536 for `body` (default 65536).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1024, max = 65536))]
+	pub limit: Option<u32>,
+	/// Requests that may be in flight at once, not counting the stream. 1 to 4. Defaults to 1 with `poll` and 2 with `sse`, and is 1 with `poll`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = 4))]
+	pub inflight: Option<u32>,
+	/// Milliseconds the client waits to collect datagrams into one request, drawn from `[low, high]`, 0 to 250 each. Defaults to `[10, 60]`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 2, max = 2))]
+	pub gather: Option<Vec<u32>>,
+}
+
+/// The downstream half of a shape.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeDown {
+	/// `poll`: answers carry the downstream data. `sse`: one Server-Sent Events stream does.
+	pub mode: ShapeMode,
+	/// Milliseconds the node waits to collect datagrams into one event, `[low, high]`, 0 to 250 each. Only with `sse`. Defaults to `[0, 20]`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 2, max = 2))]
+	pub gather: Option<Vec<u32>>,
+	/// The range in seconds a stream's length is drawn from, `[low, high]`, 30 to 3600 each. Only with `sse`. Defaults to `[120, 900]`.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 2, max = 2))]
+	pub life: Option<Vec<u32>>,
+	/// Whether the client may fall back to polling when streams do not work. Only with `sse`. Defaults to true.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub fallback: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapePlace {Body, Query, Path, Header}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ShapeMode {Poll, Sse}
+
+impl Shape {
+	/// The shape with its defaults and every rule of the shapes page applied, or the dotted name of the member that breaks one. A range that is not two numbers breaks `up.gather`, `down.gather` or `down.life`.
+	pub fn resolve(&self) -> Result<veilway_proto::shape::Shape, &'static str> {
+		let pair = |range: &Option<Vec<u32>>| -> Result<Option<[u64; 2]>, ()> {range.as_ref().map(|range| if let [low, high] = range[..] {Ok([u64::from(low), u64::from(high)])} else {Err(())}).transpose()};
+		let place = match self.up.place {
+			ShapePlace::Body => "body",
+			ShapePlace::Query => "query",
+			ShapePlace::Path => "path",
+			ShapePlace::Header => "header",
+		};
+		veilway_proto::shape::Shape::resolve(&veilway_proto::shape::Given {
+			method: &self.up.method, place, name: self.up.name.as_deref(), limit: self.up.limit.map(u64::from), inflight: self.up.inflight.map(u64::from), gather: pair(&self.up.gather).map_err(|()| "up.gather")?,
+			mode: if self.down.mode == ShapeMode::Sse {"sse"} else {"poll"}, down_gather: pair(&self.down.gather).map_err(|()| "down.gather")?, life: pair(&self.down.life).map_err(|()| "down.life")?, fallback: self.down.fallback,
+		})
+	}
+}
+
+/// What the three transports of the proxy path have besides their listen address: the native `ws`, `fronted` and `fronted-shaped`.
+pub struct Proxied<'a> {pub fronted: bool, pub path: &'a str, pub decoy: &'a Decoy, pub trusted: &'a [Proxy], pub header: Option<&'a str>, pub limits: Option<TransportLimits>, pub shape: Option<&'a Shape>}
 
 impl Transport {
 	pub fn listen(&self) -> SocketAddr {
 		match self {
-			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::WsNative {listen, ..} | Transport::Fronted {listen, ..} => listen.0,
+			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::WsNative {listen, ..} | Transport::Fronted {listen, ..} | Transport::FrontedShaped {listen, ..} => listen.0,
 		}
 	}
 
@@ -911,7 +1011,7 @@ impl Transport {
 	/// The decoy origin of a transport that takes the stream proof.
 	pub fn decoy(&self) -> Option<&Decoy> {
 		match self {
-			Transport::Tls {decoy, ..} | Transport::WsNative {decoy, ..} | Transport::Fronted {decoy, ..} => Some(decoy),
+			Transport::Tls {decoy, ..} | Transport::WsNative {decoy, ..} | Transport::Fronted {decoy, ..} | Transport::FrontedShaped {decoy, ..} => Some(decoy),
 			_ => None,
 		}
 	}
@@ -919,7 +1019,7 @@ impl Transport {
 	/// The transport as one of the proxy path, when it is one.
 	pub fn proxied(&self) -> Option<Proxied<'_>> {
 		match self {
-			Transport::WsNative {path, decoy, trusted_proxies, client_address_header, limits, ..} | Transport::Fronted {path, decoy, trusted_proxies, client_address_header, limits, ..} => Some(Proxied {fronted: matches!(self, Transport::Fronted {..}), path, decoy, trusted: trusted_proxies, header: client_address_header.as_deref(), limits: *limits}),
+			Transport::WsNative {path, decoy, trusted_proxies, client_address_header, limits, ..} | Transport::Fronted {path, decoy, trusted_proxies, client_address_header, limits, ..} | Transport::FrontedShaped {path, decoy, trusted_proxies, client_address_header, limits, ..} => Some(Proxied {fronted: matches!(self, Transport::Fronted {..} | Transport::FrontedShaped {..}), path, decoy, trusted: trusted_proxies, header: client_address_header.as_deref(), limits: *limits, shape: if let Transport::FrontedShaped {shape, ..} = self {Some(shape)} else {None}}),
 			_ => None,
 		}
 	}
@@ -936,24 +1036,26 @@ fn only<E: de::Error>(kind: &str, others: &[(&str, bool)]) -> Result<(), E> {
 // The objects that pick their keys by `type` are read through a flat struct of every key, so a wrong value keeps its exact path. serde's own tagged enums buffer the object and lose it.
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted}
+enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted, #[serde(rename = "fronted-shaped")] FrontedShaped}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>, shape: Option<Shape>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
 		let keys = TransportKeys::deserialize(d)?;
 		let proxy = [("trusted_proxies", keys.trusted_proxies.is_some()), ("client_address_header", keys.client_address_header.is_some())];
+		let shaped = [("shape", keys.shape.is_some())];
 		match keys.kind {
-			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy].concat()).map(|_| Transport::Udp {listen: keys.listen}),
+			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy, &shaped].concat()).map(|_| Transport::Udp {listen: keys.listen}),
 			// `ws` is two formats under one name. With none of the keys of the proxy path it is the one of a `wireguard` inbound, and with any of them the native one of a `veilway` inbound, which never ends TLS itself. `validate` holds each to its kind of inbound.
-			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && proxy.iter().all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
-			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
-			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
-			TransportType::Tls => only("tls", &proxy).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits})),
-			TransportType::Fronted => only("fronted", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && keys.shape.is_none() && proxy.iter().all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
+			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some())]).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy, &shaped].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
+			TransportType::Tls => only("tls", &[&proxy[..], &shaped].concat()).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits})),
+			TransportType::Fronted => only("fronted", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some())]).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::FrontedShaped => only("fronted-shaped", &[("tls", keys.tls.is_some())]).and_then(|_| Ok(Transport::FrontedShaped {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, shape: keys.shape.ok_or_else(|| de::Error::missing_field("shape"))?})),
 		}
 	}
 }

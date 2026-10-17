@@ -1015,6 +1015,28 @@ export interface components {
              * @description Established sessions right now.
              */
             sessions: number;
+            /**
+             * Format: uint
+             * @description `fronted-shaped` sessions that are established right now (`fronted` counts them as well), and event streams that are live right now.
+             */
+            shaped: number;
+            /** Format: uint64 */
+            shaped_beats: number;
+            /** Format: uint64 */
+            shaped_events: number;
+            /** Format: uint64 */
+            shaped_late: number;
+            /** Format: uint64 */
+            shaped_limited: number;
+            /**
+             * Format: uint64
+             * @description `fronted-shaped` requests that were accepted, repeats of one answered with its stored answer, repeats answered with the late answer of 80 bytes, event streams that were started, events and heartbeats written to them, and stream requests that their session's allowance of 4 at once and 1 a second had no room for.
+             */
+            shaped_polls: number;
+            /** Format: uint64 */
+            shaped_repeats: number;
+            /** Format: uint64 */
+            shaped_streams: number;
             /** Format: uint64 */
             stranger_body: number;
             /** Format: uint64 */
@@ -1041,6 +1063,8 @@ export interface components {
             stranger_syntax: number;
             /** Format: uint64 */
             stranger_unestablished: number;
+            /** Format: uint */
+            streams: number;
             /** Format: uint64 */
             tunnel: number;
             /**
@@ -1071,7 +1095,7 @@ export interface components {
          * @description The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
          * @enum {string}
          */
-        Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted";
+        Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted" | "fronted-shaped";
         /** @description What one tunnel counted since it started. Everything but `open` only grows. */
         TunnelStats: {
             /**

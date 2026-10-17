@@ -161,6 +161,8 @@ pub fn transports_json(transports: &[Transport]) -> String {
 		Transport::Tls(tls) => stream("tls", tls),
 		Transport::Ws(ws) => stream("ws", ws),
 		Transport::Fronted(fronted) => stream("fronted", fronted),
+		// No link lists it: `listed` refuses the type, so this text is never read back.
+		Transport::FrontedShaped(fronted, _) => stream("fronted-shaped", fronted),
 	}).collect::<Vec<_>>().join(","))
 }
 
@@ -175,7 +177,7 @@ pub fn transports(text: &[u8]) -> Result<Vec<Transport>, CodeError> {
 // "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use. A `self_signed` candidate is refused too: a link's `peer.transports` has no such member, so the pairing would end in a link the other node cannot hold.
 fn listed(item: &json::Json) -> Result<Transport, CodeError> {
 	payload::transport(item).ok().filter(|transport| match transport {
-		Transport::Fronted(_) => false,
+		Transport::Fronted(_) | Transport::FrontedShaped(..) => false,
 		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none() && !candidate.self_signed),
 		_ => true,
 	}).ok_or(CodeError::Member("transports"))
@@ -251,7 +253,7 @@ impl Offer {
 	pub fn dials(&self) -> Vec<(SocketAddr, bool)> {
 		self.transports.iter().flat_map(|transport| match transport {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.clone(),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 		}).map(|dial| (dial.address(), dial.private())).collect()
 	}
 	/// The object of the offer as the code carried it.

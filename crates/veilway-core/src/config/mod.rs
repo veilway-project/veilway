@@ -98,6 +98,9 @@ pub const DEFAULT_RELAYED: u32 = 1024;
 pub const MAX_PROXY_CONNECTIONS: u32 = 65536;
 pub const MAX_FRONTED_SESSIONS: u32 = 65536;
 pub const DEFAULT_FRONTED_SESSIONS: u32 = 1024;
+/// Shapes page, "Numbers that are judgement calls": "Shaped sessions: 256 per listen address, counted among the 1,024 `fronted` sessions. Validation warns above 256." and "Memory of one shaped session: at most 603,136 bytes".
+pub const DEFAULT_SHAPED_SESSIONS: u32 = 256;
+pub const SHAPED_SESSION_BYTES: u64 = 603_136;
 pub const LARGE_FRONTED_SESSIONS: u32 = 4096;
 pub const FRONTED_KEPT: u64 = 65536;
 pub const MAX_DECOY_REQUESTS: u32 = 65536;
@@ -302,8 +305,9 @@ pub fn schema() -> String {
 				object.extend(only);
 			}
 		}
-		// A list never holds the same entry twice, and a reserved word is never a tag, wherever a tag is written.
-		if object.get("type").is_some_and(|t| t == "array") {object.insert("uniqueItems".to_string(), Value::Bool(true));}
+		// A list never holds the same entry twice, except a range of two numbers (`[low, high]` of a shape), whose ends may be equal, and a reserved word is never a tag, wherever a tag is written.
+		let range = object.get("minItems") == Some(&json!(2)) && object.get("maxItems") == Some(&json!(2)) && object.get("items").and_then(|items| items.get("type")).is_some_and(|t| t == "integer");
+		if object.get("type").is_some_and(|t| t == "array") && !range {object.insert("uniqueItems".to_string(), Value::Bool(true));}
 		if object.get("pattern").is_some_and(|p| p == TAG_PATTERN) {object.insert("not".to_string(), json!({"enum": RESERVED_TAGS}));}
 	}).transform(&mut schema);
 	if let Some(Value::Array(reserved)) = schema.pointer_mut("/$defs/Inbound/properties/tag/not/enum") {reserved.push(json!(RESERVED_INBOUND_TAG))}

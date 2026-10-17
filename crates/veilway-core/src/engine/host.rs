@@ -210,7 +210,7 @@ impl Host {
 				match transport {
 					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
 					Transport::Udp {..} | Transport::UdpObfs {..} => {}
-					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} => {
+					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} | Transport::FrontedShaped {listen, decoy, ..} => {
 						if !self.tls.contains_key(&listen.0) && !listeners.iter().any(|(addr, _)| *addr == listen.0) {
 							listeners.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
 								socket.listen(1024)?;
@@ -391,7 +391,7 @@ impl Host {
 						});
 						routes.entry(listen.0).or_default().push((path.clone(), tls.clone(), inbound.tunnel.clone(), id));
 					}
-					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} => {}
+					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} | Transport::FrontedShaped {..} => {}
 				}
 			}
 		}
@@ -404,9 +404,13 @@ impl Host {
 					Transport::Tls {path, limits, ..} => (stream::Route::tls(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(true)), *limits),
 					Transport::WsNative {path, limits, ..} => (stream::Route::ws(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(false)), *limits),
 					Transport::Fronted {path, limits, ..} => (stream::Route::fronted(path.clone(), inbound.tunnel.clone()), *limits),
+					Transport::FrontedShaped {path, limits, shape, ..} => match shape.resolve() {
+						Ok(shape) => (stream::Route::fronted_shaped(path.clone(), inbound.tunnel.clone(), Arc::new(shape)), *limits),
+						Err(_) => continue,
+					},
 					_ => continue,
 				};
-				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits))}).routes.push(route);
+				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
 			}
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();

@@ -66,7 +66,7 @@ fn endpoints(profile: &Profile) -> Vec<Endpoint> {
 	for transport in &profile.transports {
 		let (listed, tcp): (Vec<std::net::SocketAddr>, bool) = match transport {
 			Transport::Udp(dials) | Transport::UdpObfs(dials) => (dials.iter().map(|dial| dial.address()).collect(), false),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) => (stream.candidates.iter().map(|candidate| candidate.address.address()).collect(), true),
+			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => (stream.candidates.iter().map(|candidate| candidate.address.address()).collect(), true),
 		};
 		for address in listed {
 			let endpoint = Endpoint {ip: address.ip(), port: address.port(), tcp};
