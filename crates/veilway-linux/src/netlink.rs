@@ -36,6 +36,7 @@ const RTA_PRIORITY: u16 = 6;
 const RTA_TABLE: u16 = 15;
 const FRA_DST: u16 = 1;
 const FRA_PRIORITY: u16 = 6;
+const FRA_UID_RANGE: u16 = 20;
 const FRA_FWMARK: u16 = 10;
 const FRA_TABLE: u16 = 15;
 const FRA_FWMASK: u16 = 16;
@@ -62,7 +63,7 @@ pub struct Route {pub v6: bool, pub dst: Option<(IpAddr, u8)>, pub oif: Option<u
 
 /// A policy routing rule: the traffic it matches is looked up in `table`. The fields that are none match everything. A delete names a rule by the fields it has, and the kernel removes the rules that agree in all of them: that is how this client removes its own rules and no one else's.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Rule {pub v6: bool, pub priority: u32, pub mark: Option<u32>, pub to: Option<(IpAddr, u8)>, pub table: u32, pub ipproto: Option<u8>, pub sport: Option<u16>, pub dport: Option<u16>}
+pub struct Rule {pub v6: bool, pub priority: u32, pub mark: Option<u32>, pub to: Option<(IpAddr, u8)>, pub table: u32, pub ipproto: Option<u8>, pub sport: Option<u16>, pub dport: Option<u16>, pub uid: Option<u32>}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {pub index: u32, pub name: String, pub kind: u16, pub up: bool}
@@ -138,6 +139,8 @@ pub fn rule_body(rule: &Rule) -> Vec<u8> {
 	if let Some((ip, _)) = rule.to {attr(&mut out, FRA_DST, &octets(ip))}
 	attr(&mut out, FRA_TABLE, &rule.table.to_ne_bytes());
 	if let Some(protocol) = rule.ipproto {attr(&mut out, FRA_IP_PROTO, &[protocol])}
+	// `struct fib_rule_uid_range`: the first and the last user id, here one. The route of a connect is looked up with the user, so the source address it picks is the right one.
+	if let Some(uid) = rule.uid {attr(&mut out, FRA_UID_RANGE, &[uid.to_ne_bytes(), uid.to_ne_bytes()].concat())}
 	// `struct fib_rule_port_range`: the first and the last port, here one.
 	for (kind, port) in [(FRA_SPORT_RANGE, rule.sport), (FRA_DPORT_RANGE, rule.dport)] {
 		if let Some(port) = port {attr(&mut out, kind, &[port.to_ne_bytes(), port.to_ne_bytes()].concat())}
@@ -347,6 +350,17 @@ mod tests {
 		let lan = rule_body(&Rule {v6: true, priority: 90, mark: None, to: Some(("fc00::".parse().unwrap(), 7)), table: 254, ..Rule::default()});
 		assert_eq!((lan[0], lan[1]), (10, 7));
 		assert!(attrs(&lan[12..]).iter().any(|(kind, data)| *kind == FRA_DST && data.len() == 16));
+	}
+
+	#[test]
+	fn a_rule_names_a_user_by_the_range_attribute_of_the_kernel() {
+		// linux/fib_rules.h: FRA_UID_RANGE 20, a `struct fib_rule_uid_range` of two u32.
+		let body = rule_body(&Rule {priority: 5121, table: 254, uid: Some(998), ..Rule::default()});
+		let found = attrs(&body[12..]);
+		let range = found.iter().find(|(kind, _)| *kind == FRA_UID_RANGE).map(|(_, data)| data.to_vec()).unwrap();
+		assert_eq!(range, [998u32.to_ne_bytes(), 998u32.to_ne_bytes()].concat());
+		let plain = rule_body(&Rule {priority: 5121, table: 254, ..Rule::default()});
+		assert!(attrs(&plain[12..]).iter().all(|(kind, _)| *kind != FRA_UID_RANGE), "a rule of no user names none");
 	}
 
 	#[test]

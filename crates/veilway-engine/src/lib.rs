@@ -25,6 +25,12 @@ pub mod ip;
 #[cfg(not(feature = "fuzz"))]
 mod ip;
 mod mtu;
+/// Public with the `fuzz` feature, for the fuzz targets that feed it packets.
+#[cfg(feature = "fuzz")]
+pub mod packets;
+#[cfg(not(feature = "fuzz"))]
+mod packets;
+mod socks;
 pub mod status;
 pub mod store;
 #[cfg(feature = "fuzz")]
@@ -32,6 +38,7 @@ pub mod tcp;
 #[cfg(not(feature = "fuzz"))]
 mod tcp;
 mod wire;
+pub mod xray;
 
 use engine::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,7 +52,8 @@ use veilway_proto::NoRandom;
 use veilway_transport::choice;
 use veilway_transport::{Hook, Link};
 
-pub use status::{Attempt, Check, Connection, Counters, Event, ExitView, NoticeView, Retry, Say, State, Status, Stop, UsageView};
+pub use status::{Attempt, Check, Connection, Counters, Event, ExitView, NoticeView, Retry, Say, State, Status, Stop, UsageView, XrayCounters, XraySay, XrayView};
+pub use xray::XrayTunnel;
 pub use store::Store;
 pub use veilway_transport::choice::Class;
 pub use veilway_transport::Clock;
@@ -229,6 +237,22 @@ impl Tunnel {
 		let _ = self.task.await;
 		self.status.borrow().clone()
 	}
+}
+
+/// What a platform layer carries packets of: a tunnel to a node, or the carrier of a legacy profile through Xray. They answer to the same calls, so the loop that moves packets between the device and the engine is written once.
+pub enum Carrier {
+	Native(Tunnel),
+	Xray(XrayTunnel),
+}
+
+impl Carrier {
+	pub fn status(&self) -> Status {match self {Self::Native(tunnel) => tunnel.status(), Self::Xray(tunnel) => tunnel.status()}}
+	pub fn watch(&self) -> watch::Receiver<Status> {match self {Self::Native(tunnel) => tunnel.watch(), Self::Xray(tunnel) => tunnel.watch()}}
+	pub fn send(&self, packet: Vec<u8>) -> bool {match self {Self::Native(tunnel) => tunnel.send(packet), Self::Xray(tunnel) => tunnel.send(packet)}}
+	pub async fn recv(&mut self) -> Option<Vec<u8>> {match self {Self::Native(tunnel) => tunnel.recv().await, Self::Xray(tunnel) => tunnel.recv().await}}
+	/// The device's networks changed. The carrier of a legacy profile has nothing to redo: Xray's own socket is kept out of the tunnel by the platform.
+	pub fn moved(&self, network: String, networks: Vec<Network>) {if let Self::Native(tunnel) = self {tunnel.moved(network, networks)}}
+	pub async fn stop(self) -> Status {match self {Self::Native(tunnel) => tunnel.stop().await, Self::Xray(tunnel) => tunnel.stop().await}}
 }
 
 // The dial addresses a transport of a profile lists.

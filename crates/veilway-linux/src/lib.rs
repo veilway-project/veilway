@@ -14,6 +14,7 @@ pub mod routes;
 pub mod state;
 pub mod tun;
 pub mod vault;
+pub mod xray;
 
 use dns::Pinned;
 use netlink::{Rt, Rule, Watch, TABLE_MAIN};
@@ -23,15 +24,16 @@ use socket2::SockRef;
 use state::Lock;
 use std::fmt;
 use std::future::Future;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, sleep, Instant};
 use tun::Tun;
-use veilway_engine::{lan, Agree, Settings, StartError, Status, Tunnel};
+use veilway_engine::xray::{self as carrier, Live, Params};
+use veilway_engine::{lan, Agree, Carrier, Settings, StartError, Status, Tunnel, XrayTunnel};
 use veilway_proto::subscription::client::{Held, Permit};
-use veilway_proto::subscription::payload::{Profile, Transport};
+use veilway_proto::subscription::payload::{own, Profile, Transport};
 use veilway_transport::Hook;
 
 /// The mark and the table share a number, "VW" in ASCII.
@@ -100,34 +102,77 @@ fn endpoints(profile: &Profile) -> Vec<firewall::Endpoint> {
 	found
 }
 
+/// What a connection needs of the profile it carries, whatever carries it: the addresses the device gets, the gateways the system's resolver is pointed at, the addresses and ports marked sockets (and the user of Xray) may reach, and the user id of Xray's user for a legacy profile, whose packets are marked and looked up in the main table.
+pub struct Target {pub addresses: Vec<IpAddr>, pub gateways: Vec<IpAddr>, pub nodes: Vec<firewall::Endpoint>, pub xray: Option<u32>}
+
 /// Runs a connection until `stop` completes or something fails. Ok is a stop the user asked for, after which everything is removed, the kill switch last. An error is a connection that ended on its own, and the kill switch stays in force (see the head of this module). `settings.socket` and `settings.networks` are set here. A tunnel that does not start (`StartError`, the user has still to be asked something) is the error as well, with the kill switch in force, and `anyhow::Error::downcast_ref::<StartError>` on `Failure::error` finds it: the caller asks and runs again, or calls `cleanup` when the answer is no. The lock is the proof that this is the only client.
-pub async fn run(options: &Options, _lock: &Lock, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
+pub async fn run(options: &Options, lock: &Lock, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
+	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
+	let found = held.subscription().profiles.iter().find(|candidate| candidate.id == profile).ok_or_else(|| before(StartError::NoProfile.into()))?;
+	let target = Target {addresses: found.device.addresses.clone(), gateways: found.gateways.clone(), nodes: endpoints(found), xray: None};
+	settings.socket = Some(hook(options.mark));
+	let start = |held_networks: &networks::Own| -> anyhow::Result<Carrier> {
+		settings.networks = held_networks.networks.clone();
+		settings.network = held_networks.description.clone();
+		Ok(Carrier::Native(Tunnel::start(settings, held, profile, permit, agree)?))
+	};
+	run_target(options, lock, &target, start, on_status, stop).await
+}
+
+/// What a legacy profile gives the Linux layer ("Xray in the desktop apps"): where Xray's server is, Xray's loopback inbound and its login, and the supervisor's word on whether Xray is up. The engine's sockets are not involved: Xray is a process of another user, whose packets the kill switch's tables mark.
+pub struct XrayRun {
+	/// The connection's name, as the app shows it.
+	pub name: String,
+	/// The address Xray's document dials, which `xray::usable` chose before the kill switch went in, and its port.
+	pub server: IpAddr,
+	pub port: u16,
+	/// A Shadowsocks server also gets its UDP port, which Xray's outbound uses for UDP.
+	pub udp: bool,
+	pub socks: SocketAddr,
+	pub login: String,
+	pub resolvers: [IpAddr; 2],
+	pub live: Arc<Live>,
+}
+
+/// The same as `run`, for a legacy profile: the carrier is the engine's userspace stack in front of Xray's SOCKS5 inbound. The tunnel's addresses are the engine's fixed ones, or the second range when a network of the device overlaps the first, and the connect fails with the reason when both do. The server must still be outside the device's own networks.
+pub async fn run_xray(options: &Options, lock: &Lock, xray: XrayRun, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
+	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
+	let held = Rt::open().and_then(|mut rt| networks::read(&mut rt, None)).map_err(|error| before(error.into()))?;
+	if own(xray.server, &held.networks) {return Err(before(anyhow::anyhow!("xray_server_local: the server's address is inside a network this device is on")))}
+	let Some((uid, _)) = xray::ids().map_err(|error| before(error.into()))? else {return Err(before(anyhow::anyhow!("xray_start_failed: the user Xray runs as is not there")))};
+	let Some(addresses) = carrier::addresses(&held.networks) else {return Err(before(anyhow::anyhow!("xray_range_taken: both ranges the tunnel can use overlap a network this device is on")))};
+	let target = Target {addresses: addresses.device.to_vec(), gateways: addresses.gateway.to_vec(), nodes: [true, xray.udp].iter().map(|tcp| firewall::Endpoint {ip: xray.server, port: xray.port, tcp: *tcp}).collect(), xray: Some(uid)};
+	let start = |_: &networks::Own| -> anyhow::Result<Carrier> {Ok(Carrier::Xray(XrayTunnel::start(Params {name: xray.name, socks: xray.socks, login: xray.login, addresses, resolvers: xray.resolvers, live: xray.live, relay_ok: Arc::new(move |relay| xray::listening_as(relay, uid, true).unwrap_or(false))})))};
+	run_target(options, lock, &target, start, on_status, stop).await
+}
+
+/// Runs a connection of a `Target` until `stop` completes or something fails, with the carrier `start` makes once the device's networks are read. See `run` for what an end means.
+async fn run_target(options: &Options, _lock: &Lock, target: &Target, start: impl FnOnce(&networks::Own) -> anyhow::Result<Carrier>, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
 	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
 	// The name goes between quotes in the firewall's script: it is checked before anything is made.
 	if !tun::valid_name(&options.interface) {return Err(before(anyhow::anyhow!("{:?} is not a name a network device can have", options.interface)))}
 	state::secure_dir(&options.state_dir, 0o700).map_err(|error| before(error.into()))?;
-	let profile = held.subscription().profiles.iter().find(|candidate| candidate.id == profile).ok_or_else(|| before(StartError::NoProfile.into()))?;
 	let mut rt = Rt::open().map_err(|error| before(error.into()))?;
 	tracing::info!(interface = %options.interface, kill_switch = options.kill_switch, "connecting");
 	// What an earlier client that did not stop clean left, other than the kill switch: that stays in force until the new one replaces it in a single step.
 	let left = routes::teardown(&mut rt, options.mark, options.table).map_err(|error| before(error.into()))?;
 	let restored = Pinned::restore_leftover(&options.state_dir).map_err(|error| before(error.into()))?;
 	if left > 0 || restored != dns::Restored::Nothing {tracing::info!(routes = left, resolver = ?restored, "removed what an earlier connection left behind")}
-	let gateways = profile.gateways.clone();
-	let (v4, v6) = (profile.device.addresses.iter().any(IpAddr::is_ipv4), profile.device.addresses.iter().any(IpAddr::is_ipv6));
-	let protected = Layout {mark: options.mark, table: options.table, tun: 0, routes: &options.routes, v4, v6, gateways: &gateways, lan: Vec::new()}.protected();
+	let (v4, v6) = (target.addresses.iter().any(IpAddr::is_ipv4), target.addresses.iter().any(IpAddr::is_ipv6));
+	let protected = Layout {mark: options.mark, table: options.table, tun: 0, routes: &options.routes, v4, v6, gateways: &target.gateways, lan: Vec::new(), xray: target.xray}.protected();
 	let own = networks::read(&mut rt, None).map_err(|error| before(error.into()))?;
 	let lan = if options.allow_lan {lan::local(&own.networks)} else {Vec::new()};
 	if options.kill_switch {
-		firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: endpoints(profile), protected, lan: lan.clone(), local_names: options.local_names}).map_err(|error| before(error.into()))?;
+		firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: target.nodes.clone(), protected, lan: lan.clone(), local_names: options.local_names, xray: target.xray.is_some()}).map_err(|error| before(error.into()))?;
 		tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device");
 	} else {
 		// A table an earlier client left would drop this client's own connections to nodes the old profile did not list, with the status saying the kill switch is off.
 		firewall::remove().or_else(|error| if error.kind() == std::io::ErrorKind::NotFound {Ok(())} else {Err(error)}).map_err(|error| before(error.into()))?;
+		// Without the kill switch Xray's packets would still need the mark, or they would enter the tunnel they are carrying.
+		if target.xray.is_some() {firewall::install_marks(options.mark).map_err(|error| before(error.into()))?}
 	}
-	settings.socket = Some(hook(options.mark));
 	let mut up = Up::default();
-	let outcome = up.carry(options, &mut rt, own, lan, settings, held, profile, permit, agree, on_status, stop).await;
+	let outcome = up.carry(options, &mut rt, own, lan, target, start, on_status, stop).await;
 	match outcome {
 		Ok(()) => {
 			let problems = up.undo(options, &mut rt, true).await;
@@ -144,23 +189,21 @@ pub async fn run(options: &Options, _lock: &Lock, mut settings: Settings, held: 
 
 /// What a connection has made so far, so that undoing it can undo exactly that.
 #[derive(Default)]
-struct Up {tunnel: Option<Tunnel>, tun: Option<Tun>, dns: Option<Pinned>}
+struct Up {tunnel: Option<Carrier>, tun: Option<Tun>, dns: Option<Pinned>}
 
 impl Up {
-	async fn carry(&mut self, options: &Options, rt: &mut Rt, mut own: networks::Own, mut lan: Vec<(IpAddr, u8)>, mut settings: Settings, held: &Held, profile: &Profile, permit: &Permit, agree: Agree, mut on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> anyhow::Result<()> {
-		settings.networks = own.networks.clone();
-		settings.network = own.description.clone();
-		let tunnel = self.tunnel.insert(Tunnel::start(settings, held, &profile.id, permit, agree)?);
+	async fn carry(&mut self, options: &Options, rt: &mut Rt, mut own: networks::Own, mut lan: Vec<(IpAddr, u8)>, target: &Target, start: impl FnOnce(&networks::Own) -> anyhow::Result<Carrier>, mut on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> anyhow::Result<()> {
+		let tunnel = self.tunnel.insert(start(&own)?);
 		let mut status_rx = tunnel.watch();
 		let mut mtu = tunnel.status().mtu;
 		let tun = self.tun.insert(Tun::create(&options.interface, rt)?);
-		for ip in &profile.device.addresses {rt.add_address(tun.index, *ip, if ip.is_ipv4() {32} else {128})?}
+		for ip in &target.addresses {rt.add_address(tun.index, *ip, if ip.is_ipv4() {32} else {128})?}
 		rt.set_link(tun.index, Some(u32::from(mtu)))?;
-		let (v4, v6) = (profile.device.addresses.iter().any(IpAddr::is_ipv4), profile.device.addresses.iter().any(IpAddr::is_ipv6));
-		let mut layout = Layout {mark: options.mark, table: options.table, tun: tun.index, routes: &options.routes, v4, v6, gateways: &profile.gateways, lan: lan.clone()};
+		let (v4, v6) = (target.addresses.iter().any(IpAddr::is_ipv4), target.addresses.iter().any(IpAddr::is_ipv6));
+		let mut layout = Layout {mark: options.mark, table: options.table, tun: tun.index, routes: &options.routes, v4, v6, gateways: &target.gateways, lan: lan.clone(), xray: target.xray};
 		let skipped = routes::apply(rt, &routes::plan(&layout))?;
 		if !skipped.is_empty() {tracing::info!(?skipped, "some routes or rules that this device or kernel may not have could not be made")}
-		let dns = self.dns.insert(Pinned::pin(&options.state_dir, &tun.name, &profile.gateways)?);
+		let dns = self.dns.insert(Pinned::pin(&options.state_dir, &tun.name, &target.gateways)?);
 		// The names of the interfaces are the kernel's, and the rest is the profile's: nothing a node says reaches here (invariant 23).
 		let applied = Applied {interface: tun.name.clone(), kill_switch: options.kill_switch, dns: dns.describe(), split: match &options.routes {Routes::Full => None, Routes::Split(nets) => Some(nets.iter().map(ToString::to_string).collect())}, allow_lan: options.allow_lan};
 		tracing::info!(interface = %tun.name, mtu, resolver = dns.describe(), "the tunnel's device is up, with its routes and its resolver");
@@ -214,7 +257,7 @@ impl Up {
 							if moved_lan != lan {
 								lan = moved_lan;
 								layout.lan = lan.clone();
-								if options.kill_switch {firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: endpoints(profile), protected: layout.protected(), lan: lan.clone(), local_names: options.local_names})?}
+								if options.kill_switch {firewall::install(&firewall::Rules {mark: options.mark, tun: options.interface.clone(), nodes: target.nodes.clone(), protected: layout.protected(), lan: lan.clone(), local_names: options.local_names, xray: target.xray.is_some()})?}
 								for v6 in [false, true] {rt.delete_rule(&Rule {v6, priority: routes::PRIORITY_LAN, table: TABLE_MAIN, ..Rule::default()})?;}
 								let skipped = routes::apply(rt, &routes::plan(&layout).into_iter().filter(|step| matches!(&step.item, routes::Item::Rule(rule) if rule.priority == routes::PRIORITY_LAN)).collect::<Vec<_>>())?;
 								tracing::info!(subnets = lan.len(), ?skipped, "the subnets that stay outside the tunnel were replaced");
@@ -237,7 +280,7 @@ impl Up {
 				}
 				() = &mut dns_settle, if dns_due => {
 					dns_due = false;
-					match dns.verify(&profile.gateways) {
+					match dns.verify(&target.gateways) {
 						Ok(true) => tracing::info!("something replaced the system's resolver settings and they were set again"),
 						Ok(false) => {}
 						Err(error) => tracing::warn!(%error, "the system's resolver settings could not be checked"),

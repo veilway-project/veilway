@@ -84,6 +84,32 @@ pub struct Entry {
 	pub host: Option<String>,
 	/// Starts with `/`, at most 256 bytes of visible ASCII.
 	pub path: Option<String>,
+	/// `flow`, a lowercase word.
+	pub flow: Option<String>,
+	/// `fp`, the TLS fingerprint, a lowercase word.
+	pub fp: Option<String>,
+	/// `alpn`: comma-separated words of `a-z0-9-/.`.
+	pub alpn: Option<String>,
+	/// `pbk`, the Reality public key as the link writes it: base64url.
+	pub pbk: Option<String>,
+	/// `sid`, the Reality short id: hexadecimal, at most 16 characters.
+	pub sid: Option<String>,
+	/// `serviceName`, or the `path` of a gRPC `vmess` link.
+	pub service: Option<String>,
+	/// `encryption`, a lowercase word.
+	pub encryption: Option<String>,
+	/// `aid`, the alter id as the link writes it: digits.
+	pub aid: Option<String>,
+	/// `headerType`, or the `type` of a `vmess` link: a lowercase word.
+	pub header: Option<String>,
+	/// `mode` of a gRPC stream, a lowercase word.
+	pub mode: Option<String>,
+	/// The link carries `ed`, early data for a WebSocket stream.
+	pub early: bool,
+	/// The link names a Shadowsocks plugin, which no profile can use.
+	pub plugin: bool,
+	/// The link pins the server's certificate (`pcs`, `pinnedPeerCertSha256`), which no profile carries.
+	pub pinned: bool,
 }
 
 impl fmt::Debug for Entry {
@@ -144,6 +170,25 @@ fn word(text: &str) -> Option<String> {Some(text.to_ascii_lowercase()).filter(|w
 
 fn name(text: &str) -> Option<String> {Some(text.to_ascii_lowercase()).filter(|name| is_host(name))}
 
+fn token(text: &str) -> Option<String> {Some(text.to_owned()).filter(|key| (1..=64).contains(&key.len()) && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))}
+
+fn hex(text: &str) -> Option<String> {Some(text.to_ascii_lowercase()).filter(|sid| sid.len() <= 16 && sid.bytes().all(|byte| byte.is_ascii_hexdigit()))}
+
+fn alpn(text: &str) -> Option<String> {Some(text.to_ascii_lowercase()).filter(|list| list.len() <= 64 && list.split(',').all(|item| (1..=32).contains(&item.len()) && item.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-/.".contains(&byte))))}
+
+fn service(text: &str) -> Option<String> {Some(text.to_owned()).filter(|name| (1..=128).contains(&name.len()) && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-._/".contains(&byte)))}
+
+fn digits(text: &str) -> Option<String> {Some(text.to_owned()).filter(|number| (1..=4).contains(&number.len()) && number.bytes().all(|byte| byte.is_ascii_digit()))}
+
+// A known field with a grammar: absent or empty is fine, and present but malformed refuses the whole link. A dropped field would change what the link means, as a dropped `flow` or `path` does.
+fn checked(value: Option<String>, check: fn(&str) -> Option<String>) -> Option<Option<String>> {
+	match value {
+		None => Some(None),
+		Some(text) if text.is_empty() => Some(None),
+		Some(text) => check(&text).map(Some),
+	}
+}
+
 // Only the characters RFC 3986 allows in a path and a query, since links in the wild carry a query in this field: no double quote, no backslash, no bracket or brace and no space, so that the path is no way into whatever a config is written in.
 fn path(text: &str) -> Option<String> {Some(text).filter(|path| path.starts_with('/') && path.len() <= 256 && path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"-._~!$&()*+,;=:@/?%".contains(&byte))).map(str::to_owned)}
 
@@ -173,13 +218,19 @@ fn reached(host: &str) -> Option<Server> {
 
 fn shown(text: &str) -> Text {Text::shown(text, 64, 256)}
 
-// `credential@host:port?fields#name`, the shape of a `vless` and a `trojan` link.
+// Whether a path carries the early data of a WebSocket stream: `ed=` in its query.
+fn early_data(path: &Option<String>) -> bool {path.as_deref().and_then(|path| path.split_once('?')).is_some_and(|(_, query)| query.split('&').any(|pair| pair.split('=').next() == Some("ed")))}
+
+// `credential@host:port?fields#name`, the shape of a `vless` and a `trojan` link. A field that is there and does not read (a bad percent escape, a host that is no host, a path outside its grammar) refuses the link: dropping it would change what the link means.
 fn plain(scheme: Scheme, rest: &str) -> Option<Entry> {
 	let (rest, label) = rest.split_once('#').unwrap_or((rest, ""));
 	let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
 	let (user, at) = rest.rsplit_once('@')?;
-	let field = |key: &str| query.split('&').filter_map(|pair| pair.split_once('=')).find(|(name, _)| *name == key).and_then(|(_, value)| decoded(value));
-	let tls = match field("security").as_deref() {
+	let field = |key: &str| match query.split('&').filter_map(|pair| pair.split_once('=')).find(|(name, _)| *name == key) {
+		None => Some(None),
+		Some((_, value)) => decoded(value).map(Some),
+	};
+	let tls = match field("security")?.as_deref() {
 		None if scheme == Scheme::Trojan => Tls::Tls,
 		None | Some("none" | "") => Tls::None,
 		Some("tls") => Tls::Tls,
@@ -187,20 +238,26 @@ fn plain(scheme: Scheme, rest: &str) -> Option<Entry> {
 		Some(_) => return None,
 	};
 	let (server, port) = server(at.trim_end_matches('/'))?;
-	Some(Entry {scheme, name: shown(&decoded(label)?), server, port, credential: credential(&decoded(user)?)?, cipher: None, tls, insecure: ["allowInsecure", "insecure"].iter().any(|key| matches!(field(key).as_deref(), Some("1" | "true"))), sni: field("sni").and_then(|sni| name(&sni)), network: field("type").and_then(|kind| word(&kind)), host: field("host").and_then(|host| name(&host)), path: field("path").and_then(|text| path(&text))})
+	let (sni, network, host, path) = (checked(field("sni")?, name)?, checked(field("type")?, word)?, checked(field("host")?, name)?, checked(field("path")?, path)?);
+	let (service, encryption, flow, alpn, fp, pbk, sid) = (checked(field("serviceName")?, service)?, checked(field("encryption")?, word)?, checked(field("flow")?, word)?, checked(field("alpn")?, alpn)?, checked(field("fp")?, word)?, checked(field("pbk")?, token)?, checked(field("sid")?, hex)?);
+	let (header, mode) = (checked(field("headerType")?, word)?, checked(field("mode")?, word)?);
+	let insecure = [field("allowInsecure")?, field("insecure")?].iter().any(|value| matches!(value.as_deref(), Some("1" | "true")));
+	let early = early_data(&path) || query.split('&').any(|pair| pair.split('=').next() == Some("ed"));
+	Some(Entry {scheme, name: shown(&decoded(label)?), server, port, credential: credential(&decoded(user)?)?, cipher: None, tls, insecure, sni, network, host, path, flow, fp, alpn, pbk, sid, service, encryption, aid: None, header, mode, early, plugin: false, pinned: query.split('&').any(|pair| matches!(pair.split('=').next(), Some("pcs" | "pinnedPeerCertSha256")))})
 }
 
 // `base64(cipher:password)@host:port#name`, the same with the first part written out, or `base64(cipher:password@host:port)#name`.
 fn shadowsocks(rest: &str) -> Option<Entry> {
 	let (rest, label) = rest.split_once('#').unwrap_or((rest, ""));
-	let rest = rest.split_once('?').map_or(rest, |(rest, _)| rest).trim_end_matches('/');
+	let (rest, query) = rest.split_once('?').unwrap_or((rest, ""));
+	let rest = rest.trim_end_matches('/');
 	let unpacked = |text: &str| LENIENT.decode(text.trim_end_matches('=').replace('+', "-").replace('/', "_")).ok().and_then(|bytes| String::from_utf8(bytes).ok());
 	let (user, at) = match rest.rsplit_once('@') {
 		Some((user, at)) => (unpacked(user).filter(|user| user.contains(':')).or_else(|| decoded(user))?, at.to_owned()),
 		None => unpacked(rest)?.rsplit_once('@').map(|(user, at)| (user.to_owned(), at.to_owned()))?,
 	};
 	let ((cipher, password), (server, port)) = (user.split_once(':')?, server(&at)?);
-	Some(Entry {scheme: Scheme::Shadowsocks, name: shown(&decoded(label)?), server, port, credential: credential(password)?, cipher: Some(word(cipher)?), tls: Tls::None, insecure: false, sni: None, network: None, host: None, path: None})
+	Some(Entry {scheme: Scheme::Shadowsocks, name: shown(&decoded(label)?), server, port, credential: credential(password)?, cipher: Some(word(cipher)?), tls: Tls::None, insecure: false, sni: None, network: None, host: None, path: None, flow: None, fp: None, alpn: None, pbk: None, sid: None, service: None, encryption: None, aid: None, header: None, mode: None, early: false, plugin: query.split('&').any(|pair| pair.split('=').next() == Some("plugin")), pinned: false})
 }
 
 // `base64(JSON)`, with every value a string, or a number where one is common.
@@ -221,7 +278,15 @@ fn vmess(rest: &str) -> Option<Entry> {
 	};
 	let (address, number) = (field("add")?, port(&field("port")?)?);
 	let server = reached(&address)?;
-	Some(Entry {scheme: Scheme::Vmess, name: shown(&field("ps").unwrap_or_default()), server, port: number, credential: credential(&field("id")?)?, cipher: Some(field("scy").filter(|cipher| !cipher.is_empty()).map_or(Some("auto".to_owned()), |cipher| word(&cipher))?), tls, insecure: matches!(field("allowInsecure").as_deref(), Some("1" | "true")), sni: field("sni").and_then(|sni| name(&sni)), network: field("net").and_then(|kind| word(&kind)), host: field("host").and_then(|host| name(&host)), path: field("path").and_then(|text| path(&text))})
+	let network = checked(field("net"), word)?;
+	let grpc = network.as_deref() == Some("grpc");
+	let (path, service) = if grpc {(None, checked(field("path"), service)?)} else {(checked(field("path"), path)?, None)};
+	let (alpn, fp, pbk, sid, aid) = (checked(field("alpn"), alpn)?, checked(field("fp"), word)?, checked(field("pbk"), token)?, checked(field("sid"), hex)?, checked(field("aid"), digits)?);
+	// For a gRPC stream `type` is the mode (v2rayN writes `gun` or `multi`), for any other it is the header.
+	let kind = checked(field("type"), word)?;
+	let (header, mode) = if grpc {(None, kind)} else {(kind, None)};
+	let early = members.get("ed").is_some() || early_data(&path);
+	Some(Entry {scheme: Scheme::Vmess, name: shown(&field("ps").unwrap_or_default()), server, port: number, credential: credential(&field("id")?)?, cipher: Some(field("scy").filter(|cipher| !cipher.is_empty()).map_or(Some("auto".to_owned()), |cipher| word(&cipher))?), tls, insecure: matches!(field("allowInsecure").as_deref(), Some("1" | "true")), sni: checked(field("sni"), name)?, network, host: checked(field("host"), name)?, path, flow: None, fp, alpn, pbk, sid, service, encryption: None, aid, header, mode, early, plugin: false, pinned: false})
 }
 
 /// Reads the body of the answer to a legacy `GET`: "a list of links, one per line, plain or in base64".

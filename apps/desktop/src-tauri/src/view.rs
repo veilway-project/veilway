@@ -228,7 +228,7 @@ mod tests {
 	use super::*;
 	use veilway_engine::{Counters, Say, Stop};
 
-	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
+	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None, xray: None}}
 
 	#[test]
 	fn a_stopped_tunnel_says_why_in_plain_words_and_names_no_rating() {

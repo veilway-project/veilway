@@ -273,6 +273,75 @@ pub struct Counters {
 	pub probes: u64,
 }
 
+/// What the carrier of a legacy profile counts ("Counters"). Every field but the open flows only grows during a run. No rating word, no profile text and no address is in it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XrayCounters {
+	/// TCP and UDP flows open now.
+	pub open_tcp: u32,
+	pub open_udp: u32,
+	/// Flows that failed: the connection to Xray was refused or cut, or the flow sent and got nothing back. Flows that carried bytes both ways.
+	pub failed_flows: u64,
+	pub carried_flows: u64,
+	/// Bytes of flows, to the server and from it.
+	pub bytes_sent: u64,
+	pub bytes_received: u64,
+	/// Packets of ICMP elsewhere than the gateway, of other protocols than TCP and UDP, and fragments over the caps. Dropped.
+	pub unsupported_packets: u64,
+	/// UDP flows that were dropped: over the cap, while Xray was down, or to a port of the gateway that is no resolver.
+	pub dropped_udp_flows: u64,
+	/// Times Xray was started again, and the Unix time of the last.
+	pub restarts: u64,
+	pub last_restart: Option<u64>,
+}
+
+/// The reason a legacy profile is not carrying, in plain words with a stable code. A refused profile has its own codes, `profile_refused.<part>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XraySay {
+	/// The add-on is not installed, or is another release than this app's.
+	Missing,
+	/// The add-on does not match the fingerprint built into this app.
+	Mismatch,
+	/// The add-on did not start, or its rights could not be limited.
+	StartFailed,
+	/// The add-on ended and is started again. Nothing passes meanwhile.
+	Restarting,
+	/// Flows keep failing and none is carried. Starting the add-on again would not help.
+	NotAnswering,
+	/// The loopback port Xray was to listen on is held by a process of another user. Nothing is carried.
+	PortTaken,
+}
+
+impl XraySay {
+	pub const ALL: &'static [XraySay] = &[Self::Missing, Self::Mismatch, Self::StartFailed, Self::Restarting, Self::NotAnswering, Self::PortTaken];
+	pub fn code(self) -> &'static str {
+		match self {
+			Self::Missing => "xray_missing",
+			Self::Mismatch => "xray_mismatch",
+			Self::StartFailed => "xray_start_failed",
+			Self::Restarting => "xray_restarting",
+			Self::NotAnswering => "server_not_answering",
+			Self::PortTaken => "xray_port_taken",
+		}
+	}
+	pub fn text(self) -> &'static str {
+		match self {
+			Self::Missing => "This connection needs the Xray add-on, which is not installed for this version of the app.",
+			Self::Mismatch => "The Xray add-on does not match this app, so it was not started.",
+			Self::StartFailed => "The Xray add-on could not be started with limited rights, so nothing was started.",
+			Self::Restarting => "The Xray add-on stopped and is starting again. Nothing passes until it is back.",
+			Self::NotAnswering => "The server is not answering. Flows fail and none gets through.",
+			Self::PortTaken => "Another user on this computer holds the port the Xray add-on needs, so nothing is carried.",
+		}
+	}
+}
+
+/// What an app is given besides the common status when the tunnel carries a legacy profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct XrayView {
+	pub counters: XrayCounters,
+	pub say: Option<XraySay>,
+}
+
 /// The whole picture an app draws from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
@@ -292,10 +361,12 @@ pub struct Status {
 	pub counters: Counters,
 	/// The candidate in use, or being tried. `None` when nothing is chosen.
 	pub connection: Option<Connection>,
+	/// Set when the tunnel carries a legacy profile through Xray, and then only the common fields above that make sense for it are filled.
+	pub xray: Option<XrayView>,
 }
 
 impl Status {
-	pub(crate) fn off(name: String, mtu: u16) -> Self {Self {state: State::Off, name, say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
+	pub(crate) fn off(name: String, mtu: u16) -> Self {Self {state: State::Off, name, say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu, control: false, out_of_date: false, counters: Counters::default(), connection: None, xray: None}}
 }
 
 /// Things that happen once, for an app that reacts to them. The state of a tunnel is in `Status`, and these are only what changed.
@@ -330,6 +401,20 @@ mod tests {
 			assert!(!text.contains('\u{2014}') && !text.contains(" - ") && text.ends_with('.'), "{say:?}");
 		}
 		for stop in [Stop::Quota, Stop::Expired, Stop::Disabled, Stop::NodeStopping] {assert!(Say::ALL.contains(&stop.say()))}
+	}
+
+	#[test]
+	fn the_words_for_xray_are_plain_and_their_codes_stable() {
+		let mut codes: Vec<&str> = XraySay::ALL.iter().map(|say| say.code()).collect();
+		assert_eq!(codes, ["xray_missing", "xray_mismatch", "xray_start_failed", "xray_restarting", "server_not_answering", "xray_port_taken"]);
+		codes.sort();
+		codes.dedup();
+		assert_eq!(codes.len(), XraySay::ALL.len());
+		for say in XraySay::ALL {
+			let text = say.text().to_lowercase();
+			for word in ["protected", "detectable", "unsafe", "rating", "class", "cover", "obfs", "tls", "fronted", "cdn"] {assert!(!text.contains(word), "{say:?} says {word}")}
+			assert!(!text.contains('\u{2014}') && !text.contains(" - ") && text.ends_with('.'), "{say:?}");
+		}
 	}
 
 	#[test]

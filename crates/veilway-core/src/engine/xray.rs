@@ -487,3 +487,19 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 	}
 	Vec::new()
 }
+
+#[cfg(test)]
+mod tests {
+	use super::{PIN, RELEASE};
+	use veilway_proto::xray::{self, PINS};
+
+	// The node and the apps name one Xray: the release, the executable of this architecture and the archives of the installer.
+	#[test]
+	fn the_node_and_the_apps_pin_the_same_xray() {
+		let script = include_str!("../../../../scripts/veilway.sh");
+		let target = if cfg!(target_arch = "aarch64") {"linux-arm64-v8a"} else {"linux-64"};
+		assert_eq!((RELEASE, PIN), (xray::RELEASE, xray::pin(target).unwrap().executable));
+		assert!(script.contains(&format!("XRAY_RELEASE=\"{}\"", xray::RELEASE)));
+		for pin in PINS.iter().filter(|pin| pin.target.starts_with("linux")) {assert!(script.contains(&format!("{}) printf '%s' {} ;;", pin.target, pin.archive)), "{}", pin.target)}
+	}
+}

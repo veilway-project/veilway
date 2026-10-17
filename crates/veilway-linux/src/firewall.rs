@@ -11,6 +11,10 @@ use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
 pub const TABLE: &str = "veilway_killswitch";
+/// The tables that mark the packets of Xray's user, one for each family. A chain of the `route` type, which is what makes the kernel look the route up again after the mark is set, exists only in `ip` and `ip6`.
+pub const XRAY_TABLE: &str = "veilway_xray";
+/// The system user Xray runs as (`xray::ensure_user`). It reaches the ruleset between quotes, so it stays a constant.
+pub const XRAY_USER: &str = "veilway-xray";
 
 /// An address and port a marked socket may reach, with the protocol of the transport that uses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +34,15 @@ pub struct Rules {
 	pub lan: Vec<(IpAddr, u8)>,
 	/// The user asked for names on the local network: mDNS and LLMNR are let through with the LAN.
 	pub local_names: bool,
+	/// The profile is a legacy one and Xray runs as its own user: the packets of that user get the mark of the engine's sockets, so that the rule for marked sockets lets exactly its connection to the server out, and the routing rule for the mark sends them out the way the device reaches the network now. The routing of the user is a rule of its own (`routes::PRIORITY_XRAY`), because the route of a connect is looked up before any packet is marked. Xray needs no capability and sets no socket option.
+	pub xray: bool,
+}
+
+/// The ruleset that sets `mark` on every packet of Xray's user, before the kill switch's chain (priority -10) looks at it. A chain of the `route` type exists only in `ip` and `ip6`, hence a table for each, replaced in one transaction like the kill switch.
+pub fn xray_marks(mark: u32) -> String {
+	let mut lines = Vec::new();
+	for family in ["ip", "ip6"] {lines.extend([format!("add table {family} {XRAY_TABLE}"), format!("delete table {family} {XRAY_TABLE}"), format!("table {family} {XRAY_TABLE} {{"), "\tchain output {".into(), "\t\ttype route hook output priority -150; policy accept;".into(), format!("\t\tmeta skuid \"{XRAY_USER}\" meta mark set 0x{mark:08x}"), "\t}".into(), "}".into()])}
+	lines.join("\n") + "\n"
 }
 
 impl Rules {
@@ -57,7 +70,7 @@ impl Rules {
 		}
 		for (ip, _) in self.protected.iter().filter(|(_, prefix)| *prefix == 0) {lines.push(format!("\t\tmeta nfproto {} counter drop", if ip.is_ipv4() {"ipv4"} else {"ipv6"}))}
 		lines.extend(["\t}".into(), "}".into()]);
-		lines.join("\n") + "\n"
+		lines.join("\n") + "\n" + &if self.xray {xray_marks(self.mark)} else {String::new()}
 	}
 }
 
@@ -72,8 +85,15 @@ fn nft_with(arguments: &[&str], script: &str) -> io::Result<()> {
 /// Puts the kill switch in force, replacing one that is there.
 pub fn install(rules: &Rules) -> io::Result<()> {nft_with(&["-f", "-"], &rules.ruleset())}
 
-/// Takes it away. Nothing is wrong if it is not there.
-pub fn remove() -> io::Result<()> {nft_with(&["-f", "-"], &format!("add table inet {TABLE}\ndelete table inet {TABLE}\n"))}
+/// Puts only the marks of Xray's user in force, for a client that runs without the kill switch: without the mark Xray's own connection would enter the tunnel it carries.
+pub fn install_marks(mark: u32) -> io::Result<()> {nft_with(&["-f", "-"], &xray_marks(mark))}
+
+/// Takes it away, and the marks of Xray's user with it. Nothing is wrong if they are not there. A system without a table family for the marks still has its kill switch taken away.
+pub fn remove() -> io::Result<()> {
+	let kill_switch = format!("add table inet {TABLE}\ndelete table inet {TABLE}\n");
+	let marks: String = ["ip", "ip6"].iter().map(|family| format!("add table {family} {XRAY_TABLE}\ndelete table {family} {XRAY_TABLE}\n")).collect();
+	nft_with(&["-f", "-"], &(kill_switch.clone() + &marks)).or_else(|_| nft_with(&["-f", "-"], &kill_switch))
+}
 
 /// Whether it is in force: None when this user cannot tell, or the system has no `nft`.
 pub fn present() -> Option<bool> {
@@ -89,7 +109,7 @@ mod tests {
 
 	fn home() -> Vec<(IpAddr, u8)> {["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"].iter().map(|net| {let (ip, prefix) = net.split_once('/').unwrap(); (ip.parse().unwrap(), prefix.parse().unwrap())}).collect()}
 
-	fn rules() -> Rules {Rules {mark: 0x5657, tun: "vw0".into(), nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: vec![("0.0.0.0".parse().unwrap(), 0), ("::".parse().unwrap(), 0)], lan: Vec::new(), local_names: false}}
+	fn rules() -> Rules {Rules {mark: 0x5657, tun: "vw0".into(), nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: vec![("0.0.0.0".parse().unwrap(), 0), ("::".parse().unwrap(), 0)], lan: Vec::new(), local_names: false, xray: false}}
 
 	// The ruleset is read by the real `nft` when there is one: a rule it refuses fails the run of the gate, and here too where it is installed and may be asked.
 	fn accepted_by_nft(rules: &Rules) {
@@ -165,6 +185,24 @@ mod tests {
 		assert!(!text.contains("meta nfproto"));
 		assert!(text.find("ip daddr 10.20.0.0/16 counter drop").unwrap() < text.find("ip daddr { 192.168.1.0/24").unwrap(), "a split network inside a local subnet would go out in clear");
 		accepted_by_nft(&split);
+	}
+
+	#[test]
+	fn the_packets_of_xrays_user_get_the_mark_before_the_kill_switch_looks_at_them() {
+		let plain = rules().ruleset();
+		assert!(!plain.contains("skuid") && !plain.contains(XRAY_TABLE), "a native profile has no marks of a user");
+		let text = Rules {xray: true, ..rules()}.ruleset();
+		assert!(text.starts_with(&plain), "the kill switch is the same");
+		for family in ["ip", "ip6"] {
+			assert!(text.contains(&format!("add table {family} veilway_xray\ndelete table {family} veilway_xray\ntable {family} veilway_xray {{\n\tchain output {{\n\t\ttype route hook output priority -150; policy accept;\n\t\tmeta skuid \"veilway-xray\" meta mark set 0x00005657\n\t}}\n}}\n")), "{family}");
+		}
+		assert!(!text.contains("table inet veilway_xray") && text.matches("meta skuid").count() == 2, "route chains exist only in ip and ip6, and only the one user is marked");
+		let priority = |after: &str| text.split(after).nth(1).and_then(|rest| rest.split(';').next()).and_then(|number| number.trim().parse::<i32>().ok()).unwrap();
+		assert!(priority("type route hook output priority") < priority("type filter hook output priority"), "the mark is set at a lower priority number than the kill switch's chain, so it runs first");
+		assert_eq!(text.lines().filter(|line| line.starts_with("add table")).count(), 3, "one transaction replaces all three tables");
+		assert!(text.contains("meta mark 0x00005657 ip daddr . udp dport { 192.0.2.10 . 5001 } accept"), "the rule for marked sockets is what lets the user's connection out, to the server alone");
+		assert_eq!(xray_marks(0x5657), text[plain.len()..]);
+		accepted_by_nft(&Rules {xray: true, ..rules()});
 	}
 
 	#[test]

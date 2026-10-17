@@ -272,6 +272,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="xray_packets"
+path="fuzz_targets/xray_packets.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="engine_tcp"
 path="fuzz_targets/engine_tcp.rs"
 test=false

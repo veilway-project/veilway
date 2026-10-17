@@ -53,6 +53,8 @@ subtle={version="2.6", default-features=false}
 x25519-dalek={version="3", default-features=false}
 # The Mozilla root certificates, which the TLS of a node link's dialler is validated against. `tokio-tungstenite` brings the same crate already.
 webpki-roots="1"
+# The archive of the Xray-core add-on: one entry is read out of it, inflated under a cap. Only deflate with the pure Rust zlib-rs backend is on, so no encryption, bzip2, zstd, xz or time code comes in, and the archives are checked against a pin before they are opened.
+zip={version="9.0", default-features=false, features=["deflate-flate2-zlib-rs"]}
 # HPACK (RFC 7541) for the HTTP/2 of the stream transports: the Huffman table and the dynamic table, as a function over header blocks. The frames, their order and every limit are written in `veilway-proto`'s `h2`. It depends on `tracing` alone. Vendored in `vendor/fluke-hpack` with local patches, each marked there.
 fluke-hpack={package="veilway-hpack", version="0.3.1-veilway.1", path="vendor/fluke-hpack"}
 # Argon2id for the sealed subscription file, as a plain function over bytes the caller drew. Pure Rust, no features beyond heap memory.

@@ -40,6 +40,9 @@ rustls.workspace=true
 webpki-roots.workspace=true
 # The hook the caller hands every socket to is a reference of this crate's type.
 socket2.workspace=true
+# The Xray carrier (`xray`): the userspace stack the device's packets enter, and the packets it writes for itself (echo replies, resets, unreachable errors).
+ipstack.workspace=true
+etherparse.workspace=true
 
 [dev-dependencies]
 proptest.workspace=true

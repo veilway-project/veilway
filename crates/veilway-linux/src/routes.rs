@@ -13,6 +13,8 @@ use std::net::IpAddr;
 pub const PRIORITY_SPLIT: u32 = 5100;
 pub const PRIORITY_LAN: u32 = 5110;
 pub const PRIORITY_MARKED: u32 = 5120;
+/// The user Xray runs as is looked up in the main table, like a marked socket: its own connection to the server must not enter the tunnel it carries.
+pub const PRIORITY_XRAY: u32 = 5121;
 pub const PRIORITY_DHCP: u32 = 5125;
 pub const PRIORITY_TUNNEL: u32 = 5130;
 const METRIC_REFUSE: u32 = 1000;
@@ -41,6 +43,8 @@ pub struct Layout<'a> {
 	pub gateways: &'a [IpAddr],
 	/// What goes outside the tunnel for the user's "let apps reach devices on this network": the subnets of `veilway_engine::lan::local`, empty when it is off.
 	pub lan: Vec<(IpAddr, u8)>,
+	/// The user id of Xray's user, for a legacy profile. The rule is by user because the route of a connect is looked up before any packet is marked, and a source address chosen then would be the tunnel's.
+	pub xray: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +98,7 @@ pub fn plan(layout: &Layout) -> Vec<Step> {
 	for (ip, prefix) in &layout.lan {steps.push(Step {item: Item::Rule(Rule {v6: ip.is_ipv6(), priority: PRIORITY_LAN, to: Some((*ip, *prefix)), table: TABLE_MAIN, ..Rule::default()}), optional: unused(ip.is_ipv6())})}
 	for v6 in [false, true] {
 		steps.push(Step {item: Item::Rule(Rule {v6, priority: PRIORITY_MARKED, mark: Some(layout.mark), table: TABLE_MAIN, ..Rule::default()}), optional: unused(v6)});
+		if let Some(uid) = layout.xray {steps.push(Step {item: Item::Rule(Rule {v6, priority: PRIORITY_XRAY, uid: Some(uid), table: TABLE_MAIN, ..Rule::default()}), optional: unused(v6)})}
 		steps.push(Step {item: Item::Rule(dhcp(v6)), optional: true});
 		steps.push(Step {item: Item::Rule(Rule {v6, priority: PRIORITY_TUNNEL, table: layout.table, ..Rule::default()}), optional: unused(v6)});
 	}
@@ -121,6 +126,8 @@ pub fn owned(mark: u32, table: u32) -> Vec<Rule> {
 		rules.push(Rule {v6, priority: PRIORITY_SPLIT, table, ..Rule::default()});
 		rules.push(Rule {v6, priority: PRIORITY_LAN, table: TABLE_MAIN, ..Rule::default()});
 		rules.push(Rule {v6, priority: PRIORITY_MARKED, mark: Some(mark), table: TABLE_MAIN, ..Rule::default()});
+		// Named by its priority and its table alone, like the rules to the local subnets: a delete needs no user id, so a passwd that cannot be read, or a user that is gone, leaves nothing behind.
+		rules.push(Rule {v6, priority: PRIORITY_XRAY, table: TABLE_MAIN, ..Rule::default()});
 		rules.push(dhcp(v6));
 		rules.push(Rule {v6, priority: PRIORITY_TUNNEL, table, ..Rule::default()});
 	}
@@ -152,7 +159,7 @@ pub fn teardown(rt: &mut Rt, mark: u32, table: u32) -> io::Result<usize> {
 mod tests {
 	use super::*;
 
-	fn layout<'a>(routes: &'a Routes, gateways: &'a [IpAddr], v6: bool, lan: &[(&str, u8)]) -> Layout<'a> {Layout {mark: 0x5657, table: 0x5657, tun: 9, routes, v4: true, v6, gateways, lan: lan.iter().map(|(ip, prefix)| (ip.parse().unwrap(), *prefix)).collect()}}
+	fn layout<'a>(routes: &'a Routes, gateways: &'a [IpAddr], v6: bool, lan: &[(&str, u8)]) -> Layout<'a> {Layout {mark: 0x5657, table: 0x5657, tun: 9, routes, v4: true, v6, gateways, lan: lan.iter().map(|(ip, prefix)| (ip.parse().unwrap(), *prefix)).collect(), xray: None}}
 
 	fn rules(steps: &[Step]) -> Vec<&Rule> {steps.iter().filter_map(|step| if let Item::Rule(rule) = &step.item {Some(rule)} else {None}).collect()}
 
@@ -168,6 +175,20 @@ mod tests {
 		assert_eq!(routes.iter().map(|route| (route.v6, route.kind, route.metric, route.oif)).collect::<Vec<_>>(), [(false, Kind::Blackhole, 1000, None), (false, Kind::Unicast, METRIC_TUNNEL, Some(9)), (true, Kind::Blackhole, 1000, None), (true, Kind::Unicast, METRIC_TUNNEL, Some(9))]);
 		assert!(METRIC_TUNNEL < METRIC_REFUSE && METRIC_TUNNEL > 0);
 		assert!(steps.iter().filter(|step| !step.optional).all(|step| !matches!(&step.item, Item::Rule(rule) if rule.ipproto.is_some())));
+	}
+
+	#[test]
+	fn the_user_of_xray_is_looked_up_in_main_after_the_marked_sockets_and_only_for_a_legacy_profile() {
+		let none = plan(&layout(&Routes::Full, &[], true, &[]));
+		assert!(rules(&none).iter().all(|rule| rule.uid.is_none()), "a native profile has no rule of a user");
+		let steps = plan(&Layout {xray: Some(998), ..layout(&Routes::Full, &[], true, &[])});
+		let found = rules(&steps);
+		let users: Vec<_> = found.iter().filter(|rule| rule.uid.is_some()).map(|rule| (rule.v6, rule.priority, rule.uid, rule.table)).collect();
+		assert_eq!(users, [(false, PRIORITY_XRAY, Some(998), TABLE_MAIN), (true, PRIORITY_XRAY, Some(998), TABLE_MAIN)]);
+		assert!(PRIORITY_MARKED < PRIORITY_XRAY && PRIORITY_XRAY < PRIORITY_DHCP);
+		// A teardown removes it without knowing the user: the rules it names carry no id, so cleanup reads no passwd.
+		let removed: Vec<_> = owned(0x5657, 0x5657).into_iter().filter(|rule| rule.priority == PRIORITY_XRAY).map(|rule| (rule.v6, rule.uid, rule.table)).collect();
+		assert_eq!(removed, [(false, None, TABLE_MAIN), (true, None, TABLE_MAIN)]);
 	}
 
 	#[test]
@@ -247,11 +268,11 @@ mod tests {
 	fn the_rules_a_delete_names_are_all_this_clients_own() {
 		let found = owned(0x5657, 0x5657);
 		// The one exception is the rule to a local subnet: its destination depends on the network the device was on, so a client that crashed cannot name it, and the priority is the client's own.
-		assert!(found.iter().all(|rule| rule.table == 0x5657 || rule.mark.is_some() || rule.to.is_some() || rule.dport.is_some() || rule.priority == PRIORITY_LAN), "a delete that names only a priority would remove other programs' rules");
+		assert!(found.iter().all(|rule| rule.table == 0x5657 || rule.mark.is_some() || rule.to.is_some() || rule.dport.is_some() || rule.priority == PRIORITY_LAN || rule.priority == PRIORITY_XRAY), "a delete that names only a priority would remove other programs' rules");
 		assert!(found.iter().all(|rule| (5100..5200).contains(&rule.priority)));
-		for step in plan(&layout(&Routes::Full, &["10.7.0.1".parse().unwrap()], true, &[("192.168.1.0", 24)])) {
+		for step in plan(&Layout {xray: Some(998), ..layout(&Routes::Full, &["10.7.0.1".parse().unwrap()], true, &[("192.168.1.0", 24)])}) {
 			if let Item::Rule(rule) = step.item {
-				let named = found.iter().any(|owned| owned.v6 == rule.v6 && owned.priority == rule.priority && owned.table == rule.table && (owned.mark == rule.mark) && (owned.to == rule.to || owned.priority == PRIORITY_SPLIT || owned.priority == PRIORITY_LAN || owned.priority == PRIORITY_TUNNEL) && owned.dport == rule.dport);
+				let named = found.iter().any(|owned| owned.v6 == rule.v6 && owned.priority == rule.priority && owned.table == rule.table && (owned.mark == rule.mark) && (owned.to == rule.to || owned.priority == PRIORITY_SPLIT || owned.priority == PRIORITY_LAN || owned.priority == PRIORITY_TUNNEL) && owned.dport == rule.dport && (owned.uid == rule.uid || owned.priority == PRIORITY_XRAY));
 				assert!(named, "{rule:?} would not be removed");
 			}
 		}

@@ -3,6 +3,8 @@ use anyhow::{anyhow, bail, Context};
 use clap::Args;
 use ipnet::IpNet;
 use std::io::{BufRead, Write};
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -26,14 +28,20 @@ use platform::{Applied, Options, Routes, Stop};
 use veilway_proto::subscription::client::{Offer, Standing};
 use veilway_proto::subscription::payload::Id;
 use veilway_proto::subscription::Tag;
+#[cfg(target_os = "linux")]
+use veilway_engine::xray::Live;
+#[cfg(target_os = "linux")]
+use veilway_proto::subscription::{legacy::{self, Scheme, Server}, payload::private};
+#[cfg(target_os = "linux")]
+use veilway_proto::xray::{self, document::{self, Run}, profile};
 
 #[derive(Args)]
 pub struct Connect {
-	/// A link or a subscription file to import first. Without it the subscription already imported is used
+	/// A link or a subscription file to import first. Without it the subscription already imported is used. A vless://, vmess://, trojan:// or ss:// link connects through the Xray add-on at once, and nothing of it is kept
 	source: Option<String>,
 	/// Which subscription, when more than one is held: the start of its id
 	#[arg(long)] subscription: Option<String>,
-	/// Which connection of the subscription, when it has more than one
+	/// Which connection of the subscription, when it has more than one. For pasted links of other apps: the number of the link, from 1
 	#[arg(long)] profile: Option<String>,
 	/// Send only this network through the tunnel (and the tunnel's own gateway), and let the rest leave as it always did. Repeat for more. Without it everything goes through the tunnel
 	#[arg(long = "route")] routes: Vec<IpNet>,
@@ -179,6 +187,13 @@ pub fn render(status: &Status, applied: &Applied, now: u64) -> String {
 	if !status.exits.is_empty() {lines.push(format!("Exits: {}.", status.exits.iter().map(|exit| format!("{}{}", exit.name, if exit.selected || (exit.configured && !status.exits.iter().any(|other| other.selected)) {" (in use)"} else {""})).collect::<Vec<_>>().join(", ")))}
 	for notice in &status.notices {lines.push(format!("From the provider: {}", notice.text))}
 	if status.out_of_date {lines.push("This connection's settings are out of date. Refresh the subscription.".into())}
+	if let Some(view) = status.xray {
+		let flows = view.counters;
+		if let Some(say) = view.say {lines.push(format!("Note: {}", say.text()))}
+		lines.push(format!("Flows: {} TCP and {} UDP open, {} carried, {} failed. Through the server: {} sent, {} received.", flows.open_tcp, flows.open_udp, flows.carried_flows, flows.failed_flows, size(flows.bytes_sent), size(flows.bytes_received)));
+		lines.push(format!("Not carried: {} packets of kinds other than TCP and UDP, and {} UDP flows.", flows.unsupported_packets, flows.dropped_udp_flows));
+		lines.push(format!("Add-on restarts: {}.", flows.restarts));
+	}
 	lines.join("\n") + "\n"
 }
 
@@ -241,10 +256,111 @@ fn kept_message(failure: &platform::Failure) -> String {
 	if failure.kept {format!("{failure}. The connection ended on its own, and the kill switch is still in force, so nothing leaves this device outside the tunnel. Run `veilway disconnect` to restore your normal connection.")} else {format!("{failure}")}
 }
 
+/// Writes the status file and prints a line when the state changes, for both kinds of connection. A wait counts down, and a line is printed when the state changes and not at every second of the count.
+fn announce(run: &Path, shown: &mut String, status: &Status, applied: &Applied) {
+	let at = now();
+	if let Err(error) = state::write_status(run, &render(status, applied, at)) {tracing::warn!(%error, "the status could not be written")}
+	let key = state_line(status, 0);
+	if key != *shown {
+		println!("{}: {}", status.name, state_line(status, at));
+		*shown = key;
+	}
+}
+
+const LEGACY: [&str; 4] = ["vless://", "vmess://", "trojan://", "ss://"];
+
+fn is_legacy(text: &str) -> bool {LEGACY.iter().any(|scheme| text.trim_start().starts_with(scheme))}
+
+/// The text of a file that holds links of other apps, for `connect`. A link carries its credential, so it is not taken from the command line, which every user of the computer can read: it is read from a file that only its owner can read. None when `source` is no such file. A file with links in it that others can read is an error and is not used.
+fn legacy_file(source: &str) -> anyhow::Result<Option<String>> {
+	let path = Path::new(source);
+	let Ok(meta) = std::fs::symlink_metadata(path) else {return Ok(None)};
+	if !meta.is_file() || meta.len() > 1 << 20 {return Ok(None)}
+	let Ok(text) = std::fs::read_to_string(path) else {return Ok(None)};
+	if !is_legacy(&text) {return Ok(None)}
+	#[cfg(unix)]
+	{
+		use std::os::unix::fs::MetadataExt;
+		if meta.mode() & 0o077 != 0 {bail!("legacy_file_open: {source} holds a link with a credential and can be read by others: run chmod 600 on it")}
+		if meta.uid() != 0 && std::env::var("SUDO_UID").ok().and_then(|id| id.parse::<u32>().ok()) != Some(meta.uid()) {bail!("legacy_file_owner: {source} is owned by a user who is neither root nor the one who ran sudo")}
+	}
+	Ok(Some(text))
+}
+
+/// Connects to pasted links of other apps through the Xray add-on ("Xray in the desktop apps"). Nothing of the links is kept: they are read, checked against the table of what can connect, and used for this run. Steps, in this order: the profile is checked, the add-on is found and checked against the pin (or offered for download, with a yes), the server's name is resolved and its address checked, the user Xray runs as is made, and only then does the Linux layer put the kill switch in force and start the carrier. The supervisor of Xray runs beside it until the connection ends.
+#[cfg(target_os = "linux")]
+async fn connect_xray(args: &Connect, source: &str, data: &Path, signals: &mut Signals) -> anyhow::Result<()> {
+	if !rustix::process::geteuid().is_root() {bail!("xray_needs_root: the add-on runs as a user of its own, and the tunnel and the firewall need root: run it with sudo")}
+	let list = legacy::list(source.as_bytes()).map_err(|error| anyhow!("{error}"))?;
+	let entry = match (&args.profile, list.entries.len()) {
+		(Some(number), count) => number.parse::<usize>().ok().and_then(|number| number.checked_sub(1)).and_then(|at| list.entries.get(at)).ok_or_else(|| anyhow!("The pasted text has {count} connections, pick one with --profile and a number from 1 to {count}."))?,
+		(None, 1) => &list.entries[0],
+		(None, 0) => bail!("No link of a kind this app reads was found ({} skipped).", list.skipped),
+		(None, count) => bail!("The pasted text has {count} connections, pick one with --profile and a number from 1 to {count}."),
+	};
+	let profile = profile::check(entry).map_err(|refusal| anyhow!("{}: this connection cannot be used with the add-on, so nothing was started", refusal.code()))?;
+	let target = crate::xray::target().ok_or_else(|| anyhow!("xray_missing: there is no Xray add-on for this system"))?;
+	let pin = xray::pin(target).ok_or_else(|| anyhow!("xray_missing: there is no Xray add-on for this system"))?;
+	let (addons, run) = (data.join("addons"), Options::default().run_dir);
+	let binary = addons.join("xray").join(xray::RELEASE).join("xray");
+	// The lock is held from here to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
+	let lock = state::lock(&run).await?;
+	if std::fs::symlink_metadata(&binary).is_err() {
+		eprintln!("This profile needs Xray-core, a program made by another project. Veilway can download version {} from github.com/XTLS/Xray-core (at most {}) and check it against a fingerprint built into this app. It runs on your computer with limited rights and only carries this profile's traffic.", xray::RELEASE, size(crate::xray::ARCHIVE_MAX));
+		if !ask("Install and connect?", signals).await? {bail!("xray_missing: the Xray add-on is not installed. Nothing was downloaded.")}
+		state::secure_dir(&addons, 0o700).with_context(|| format!("cannot use {} for the add-on", addons.display()))?;
+		let part = addons.join("xray.zip.part");
+		// The same mirrors the installer script takes, https only, tried after GitHub: the archive is checked against the pin whichever answers.
+		let mirrors: Vec<String> = std::env::var("VEILWAY_MIRRORS").map(|list| list.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
+		let installed = match crate::xray::download(target, &part, &mirrors).await {
+			Ok(()) => crate::xray::install(&addons, &part, pin),
+			Err(error) => Err(error),
+		};
+		let _ = std::fs::remove_file(&part);
+		installed.map_err(|error| anyhow!("xray_install_failed: {error:#}"))?;
+		eprintln!("Installed.");
+	}
+	if let Err(error) = crate::xray::open_checked(&binary, pin) {
+		tracing::warn!("{error:#}");
+		bail!("{}: the Xray add-on does not match this app, so it was not started", if error.is::<crate::xray::Mismatch>() {"xray_mismatch"} else {"xray_start_failed"});
+	}
+	let candidates: Vec<IpAddr> = match &profile.server {
+		Server::Address(address) => vec![*address],
+		Server::Name(name) => tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((name.as_str(), profile.port))).await.map_err(|_| anyhow!("xray_server_unresolved: the server's name did not resolve in 10 seconds"))?.map_err(|_| anyhow!("xray_server_unresolved: the server's name did not resolve"))?.map(|found| found.ip()).collect(),
+	};
+	let Some(server) = platform::xray::usable(&candidates)?.first().copied() else {bail!("xray_server_unusable: no address of the server can be used: they are all special addresses, or inside a network this device is on")};
+	if private(server) && !ask("This connection goes to a private address, which is not on the internet. That is normal for a server on your own network and unusual otherwise. Connect?", signals).await? {bail!("Not connected.")}
+	let ids = platform::xray::ensure_user().map_err(|error| anyhow!("xray_start_failed: {error}"))?;
+	let (login, port) = (crate::xray::new_login()?, std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port());
+	let document = document::document(&profile, &Run {port, login: &login, address: server, interface: None});
+	let secrets: Vec<String> = [Some(login.clone()), Some(profile.credential.expose().to_owned()), Some(server.to_string()), Some(profile.port.to_string()), match &profile.server {Server::Name(name) => Some(name.clone()), Server::Address(_) => None}].into_iter().flatten().collect();
+	let options = Options {interface: args.interface.clone(), kill_switch: !args.no_kill_switch, allow_lan: args.allow_lan, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes.clone())}, run_dir: run.clone(), ..Options::default()};
+	let (live, (stop, _)) = (Live::new(), tokio::sync::watch::channel(false));
+	let supervisor = tokio::spawn(crate::xray::supervise(binary, pin, document, port, login.clone(), secrets, ids, live.clone(), stop.subscribe()));
+	let name = if entry.name.as_str().is_empty() {"Xray profile".to_owned()} else {entry.name.as_str().to_owned()};
+	let mut shown = String::new();
+	let on_status = |status: &Status, applied: &Applied| announce(&run, &mut shown, status, applied);
+	let running = platform::XrayRun {name, server, port: profile.port, udp: profile.scheme == Scheme::Shadowsocks, socks: std::net::SocketAddr::from(([127, 0, 0, 1], port)), login, resolvers: [IpAddr::from([1, 1, 1, 1]), IpAddr::from([9, 9, 9, 9])], live};
+	let outcome = platform::run_xray(&options, &lock, running, on_status, signals.next()).await;
+	let _ = stop.send(true);
+	let _ = supervisor.await;
+	if let Err(failure) = outcome {bail!(kept_message(&failure))}
+	eprintln!("Disconnected. Everything is back as it was.");
+	Ok(())
+}
+
+/// The same command on the systems whose layers do not run the add-on yet: the carrier is in the engine, and what is missing is the layer's own start of Xray with limited rights and its kill switch rules for the add-on's socket.
+#[cfg(not(target_os = "linux"))]
+async fn connect_xray(_args: &Connect, _source: &str, _data: &Path, _signals: &mut Signals) -> anyhow::Result<()> {
+	bail!("xray_unsupported_platform: connecting through the Xray add-on is not built for this system yet")
+}
+
 pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).with_writer(std::io::stderr).init();
 	let (data, run) = (data_dir(args.data_dir.clone())?, Options::default().run_dir);
 	let mut signals = Signals::new()?;
+	if args.source.as_deref().is_some_and(is_legacy) {bail!("legacy_link_on_command_line: a link of another app carries its credential, and a command line can be read by every user of this computer. Put the link in a file that only you can read (chmod 600) and give the file to `veilway connect`")}
+	if let Some(text) = args.source.as_deref().map(legacy_file).transpose()?.flatten() {return connect_xray(&args, &text, &data, &mut signals).await}
 	let (mut library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
 	for _ in damaged {eprintln!("A stored subscription does not read any more and is left out.")}
 	if let Some(source) = &args.source {import_source(&mut library, source, &mut signals).await?}
@@ -274,16 +390,7 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile.id), Agree::default());
 	loop {
 		let mut shown = String::new();
-		let on_status = |status: &Status, applied: &Applied| {
-			let at = now();
-			if let Err(error) = state::write_status(&run, &render(status, applied, at)) {tracing::warn!(%error, "the status could not be written")}
-			// A wait counts down, and a line is printed when the state changes and not at every second of the count.
-			let key = state_line(status, 0);
-			if key != shown {
-				println!("{}: {}", status.name, state_line(status, at));
-				shown = key;
-			}
-		};
+		let on_status = |status: &Status, applied: &Applied| announce(&run, &mut shown, status, applied);
 		#[cfg(unix)]
 		let stop = signals.next();
 		#[cfg(windows)]
@@ -375,9 +482,9 @@ pub fn show() -> i32 {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use veilway_engine::{Counters, Say, Stop};
+	use veilway_engine::{Counters, Say, Stop, XrayCounters, XraySay, XrayView};
 
-	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None}}
+	fn status(state: State) -> Status {Status {state, name: "Home".into(), say: None, exits: Vec::new(), usage: None, notices: Vec::new(), mtu: 1390, control: false, out_of_date: false, counters: Counters::default(), connection: None, xray: None}}
 
 	fn applied() -> Applied {Applied {interface: "vw0".into(), kill_switch: true, dns: "/etc/resolv.conf", split: None, allow_lan: false}}
 
@@ -389,6 +496,45 @@ mod tests {
 		for word in ["protected", "detectable", "unsafe", "rating", "nocover", "cover", "obfs", "tls", "fronted", "websocket", "transport"] {assert!(!text.contains(word), "{word} in {text}")}
 		assert!(text.contains("connected, through the exit main.") && text.contains("kill switch: on") && text.contains("looked up only through the tunnel"));
 		assert!(!text.contains('\u{2014}'));
+	}
+
+	#[test]
+	fn a_connection_through_the_add_on_shows_its_counters_and_its_reason_in_plain_words() {
+		let mut found = status(State::Reconnecting {attempt: None, wait: None});
+		found.xray = Some(XrayView {counters: XrayCounters {open_tcp: 3, open_udp: 1, failed_flows: 2, carried_flows: 40, bytes_sent: 2048, bytes_received: 4096, unsupported_packets: 5, dropped_udp_flows: 1, restarts: 2, last_restart: Some(9)}, say: Some(XraySay::Restarting)});
+		let text = render(&found, &applied(), 100);
+		assert!(text.contains("Note: The Xray add-on stopped and is starting again.") && text.contains("Flows: 3 TCP and 1 UDP open, 40 carried, 2 failed. Through the server: 2.0 KB sent, 4.0 KB received.") && text.contains("Not carried: 5 packets of kinds other than TCP and UDP, and 1 UDP flows.") && text.contains("Add-on restarts: 2."), "{text}");
+		let lower = text.to_lowercase();
+		for word in ["protected", "detectable", "unsafe", "rating", "nocover", "cover", "obfs", "fronted", "transport"] {assert!(!lower.contains(word), "{word} in {text}")}
+		assert!(!render(&status(State::Off), &applied(), 0).contains("Add-on restarts"), "a native connection has no counters of the add-on");
+	}
+
+	#[test]
+	fn only_links_of_other_apps_take_the_add_on_path() {
+		for source in ["vless://id@host:443", "  vmess://eyJ9", "trojan://p@h:1", "ss://x@h:1"] {assert!(is_legacy(source), "{source}")}
+		for source in ["https://panel.example/sub", "veilway://x", "/tmp/file", "vlessx://a"] {assert!(!is_legacy(source), "{source}")}
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn a_link_comes_from_a_file_only_its_owner_can_read_and_never_from_the_command_line() {
+		use std::os::unix::fs::PermissionsExt;
+		let dir = std::env::temp_dir().join(format!("veilway-legacy-file-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		let (open, closed, native) = (dir.join("open"), dir.join("closed"), dir.join("native"));
+		for (path, text, mode) in [(&open, "vless://id@host.example:443\n", 0o644), (&closed, "vless://id@host.example:443\n", 0o600), (&native, "{}", 0o644)] {
+			std::fs::write(path, text).unwrap();
+			std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+		}
+		let error = legacy_file(open.to_str().unwrap()).unwrap_err().to_string();
+		assert!(error.starts_with("legacy_file_open") && !error.contains("id@host"), "{error}");
+		let owned = legacy_file(closed.to_str().unwrap());
+		assert!(owned.as_ref().is_ok_and(|text| text.as_deref() == Some("vless://id@host.example:443\n")) || owned.unwrap_err().to_string().starts_with("legacy_file_owner"));
+		assert_eq!(legacy_file(native.to_str().unwrap()).unwrap(), None, "a file that holds no such link is for the other path");
+		assert_eq!(legacy_file(dir.join("none").to_str().unwrap()).unwrap(), None);
+		assert_eq!(legacy_file("vless://id@host.example:443").unwrap(), None, "a link is no file");
+		let _ = std::fs::remove_dir_all(&dir);
 	}
 
 	#[test]

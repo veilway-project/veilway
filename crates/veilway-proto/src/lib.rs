@@ -22,6 +22,7 @@ pub mod subscription;
 pub mod udp_obfs;
 mod unicode;
 pub mod websocket;
+pub mod xray;
 
 /// The one answer to everything that is not a valid proof, opening packet or data packet for this node. It says nothing about the cause, and a caller must not try to learn one: a refused stream request takes the unauthenticated path and a refused datagram is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
