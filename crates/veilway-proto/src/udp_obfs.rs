@@ -283,6 +283,7 @@ mod tests {
 			trace::op("lookup");
 			self.0.find_epoch(tag)
 		}
+		fn find_hour(&self, tag: &[u8; 16]) -> Option<&Device<u32>> {self.0.find_hour(tag)}
 	}
 
 	// The device of the vectors as number 7 and a second device as number 8, each with its device tag, as a node with a stream transport would have it, and its tags for the three epochs around `time`.

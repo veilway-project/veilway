@@ -93,6 +93,13 @@ pub const DEFAULT_UNDECIDED_PER_SOURCE: u32 = 64;
 /// No more than this, because the listener looks at every relayed connection, with the pool held, to find the one to close for room.
 pub const MAX_RELAYED: u32 = 65536;
 pub const DEFAULT_RELAYED: u32 = 1024;
+/// The borrowed-site transport (`faketls`, borrowed-site page, "Numbers that are judgement calls"): strangers relayed to the site, 256 in all by default, and new connections to the site a second, 16 by default. The upper bound of the second is the config's own.
+pub const DEFAULT_SITE_RELAYED: u32 = 256;
+pub const DEFAULT_SITE_RATE: u32 = 16;
+pub const MAX_SITE_RATE: u32 = 1024;
+pub const DEFAULT_SITE_PORT: u16 = 443;
+/// "`site.names`: optional extra server names that a user's hello may carry, at most 4."
+pub const MAX_SITE_NAMES: usize = 4;
 /// The pools of the proxy path (transports page, "Node capacity numbers"): "Proxy connections: twice the `fronted` sessions", and "Decoy requests in flight per source on the proxy path: 16".
 /// The page's "`fronted` sessions: 4,096" is not the default here. A session keeps its last response for the repeat, up to `FRONTED_KEPT` bytes, so a full pool of 4,096 holds 256 MiB of them, which a host with 1 GB does not carry next to everything else. The default is 1,024, which is 64 MiB when full, and a pool above `LARGE_FRONTED_SESSIONS` is a warning that says what it holds.
 pub const MAX_PROXY_CONNECTIONS: u32 = 65536;
@@ -140,6 +147,7 @@ pub const RESERVED_INBOUND_TAG: &str = "users";
 /// The schema patterns of a tag and of a user, device or group name.
 pub const TAG_PATTERN: &str = "^[a-z0-9][a-z0-9_-]{0,63}$";
 pub const NAME_PATTERN: &str = "^[a-z0-9][a-z0-9._-]{0,63}$";
+pub const DOMAIN_PATTERN: &str = "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$";
 /// Ranges an inbound pool must lie inside.
 pub const POOL_RANGES: [&str; 5] = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "fc00::/7"];
 /// What the `ip` entry `geoip:private` stands for: every private and special-purpose range.

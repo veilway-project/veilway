@@ -3084,6 +3084,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
+ "boring",
  "hpke",
  "proptest",
  "ring",
@@ -3109,12 +3110,15 @@ dependencies = [
  "rustix",
  "rustls",
  "socket2",
+ "subtle",
  "time",
  "tokio",
  "tokio-boring",
  "tokio-rustls",
  "tracing",
  "veilway-proto",
+ "x25519-dalek 3.0.0",
+ "x509-parser",
 ]
 
 [[package]]

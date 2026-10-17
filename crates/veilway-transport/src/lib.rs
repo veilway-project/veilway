@@ -1,4 +1,4 @@
-//! The client's side of the native transports (transports page of the protocol): `udp-obfs`, `tls`, `ws` and `fronted`, behind one `Session`.
+//! The client's side of the native transports (transports page of the protocol): `udp-obfs`, `tls`, `ws`, `fronted` and `faketls`, behind one `Session`.
 //!
 //! A session carries WireGuard datagrams between a device and a node and nothing else. There is no WireGuard here, no TUN device, no routing, no DNS and no control channel: the caller hands datagrams in with `Session::send` and takes them out with `Session::recv`.
 //! Two things only the WireGuard layer can make are asked of it through `Source`: the datagram a session opens with ("a handshake initiation, or a keepalive of a tunnel that is already up") and the idle keepalive. The rekey point of the transports page is the WireGuard layer's own business and is not here.
@@ -18,6 +18,7 @@
 #![deny(unsafe_code)]
 
 pub mod choice;
+pub mod faketls;
 mod fingerprint;
 mod fronted;
 mod h2;
@@ -44,6 +45,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use veilway_proto::chunk::{self, MAX_ITEM, MIN_ITEM};
+use veilway_proto::faketls::Client as FakeTlsClient;
 use veilway_proto::proof::Name;
 use veilway_proto::shape::Shape;
 use veilway_proto::subscription::payload::{Candidate, Http2, Padding, Profile, Transport};
@@ -146,6 +148,8 @@ pub enum Target {
 	Fronted {path: String, candidate: Front},
 	/// A `fronted` whose requests and answers are in the shape the profile names (shapes page).
 	FrontedShaped {path: String, candidate: Front, shape: Shape},
+	/// A `faketls` candidate: the real site's name in `sni`, and the one `Client` of the link (`faketls::client`), which every attempt and every connection of a link shares. There is no `Transport` of the profile for it yet, so `Target::of` never makes one.
+	FakeTls {candidate: Front, client: Arc<Mutex<FakeTlsClient>>},
 }
 
 impl Target {
@@ -168,6 +172,7 @@ impl Target {
 			Self::Ws {..} => "ws",
 			Self::Fronted {..} => "fronted",
 			Self::FrontedShaped {..} => "fronted-shaped",
+			Self::FakeTls {..} => "faketls",
 		}
 	}
 }
@@ -229,7 +234,7 @@ pub enum Unreachable {
 	Connect,
 	/// The TLS handshake failed for something that is no verdict on the certificate.
 	Tls,
-	/// The certificate did not pass its candidate's check: it did not validate for the name, matched no pin of the candidate, or on a self-signed candidate the handshake was not signed with the pinned key. It is never the node refusing the device, since nothing of the answer was authenticated: the app says "the server's certificate does not match this profile; the network may be interfering".
+	/// The certificate did not pass its candidate's check: it did not validate for the name, matched no pin of the candidate, or on a self-signed candidate the handshake was not signed with the pinned key. On `faketls` it is the leaf not being the one the client derives, or the handshake not being signed with it: the real site, an interceptor, or a node that refused the hello, and the node's refusal cannot be told from the other two. It is never the node refusing the device, since nothing of the answer was authenticated: the app says "the server's certificate does not match this profile; the network may be interfering".
 	Certificate,
 	/// The certificate is not valid at the time the device's clock shows: it ran out, or is not valid yet. The attempt ends as for any certificate that is not accepted. It marks nothing, since the first thing to check is the device's clock.
 	CertificateTime,
@@ -265,7 +270,7 @@ pub enum End {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-	/// A WebSocket frame that is masked, fragmented, text, too long or no frame.
+	/// A WebSocket frame that is masked, fragmented, text, too long or no frame. On `faketls`: a record that is none of a session's or does not open, or a frame with a length that is not the record's.
 	Frame,
 	/// A chunk that does not open at its number, or opens and is invalid.
 	Chunk,
@@ -312,6 +317,8 @@ pub enum Refuse {
 	Roots,
 	/// A `host` or a `path` with a blank, a line end, a control character or a `?` in it, which would write another request than the one meant.
 	Request,
+	/// A `faketls` candidate with a pin, a self-signed mark or a `verify_name`, none of which a borrowed site takes: the leaf is held against the key the client derives and against nothing else.
+	Candidate,
 }
 
 impl fmt::Display for Refuse {
@@ -419,6 +426,12 @@ pub fn flow(packet: &[u8]) -> u32 {
 // What `open` and `parallel` check before anything is dialled.
 fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 	if chunk::Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random).is_err() || session::keepalive(link.padding.keepalive.clone()).is_none() {return Err(Refuse::Padding)}
+	if let Target::FakeTls {candidate, ..} = target {
+		if link.node.is_none() {return Err(Refuse::NodeKey)}
+		if candidate.ech {return Err(Refuse::Ech)}
+		if candidate.self_signed || !candidate.pins.is_empty() || candidate.verify_name.is_some() {return Err(Refuse::Candidate)}
+		return tls::name(candidate).map(|_| ());
+	}
 	let (Target::Tls {path, candidate} | Target::Ws {path, candidate} | Target::Fronted {path, candidate} | Target::FrontedShaped {path, candidate, ..}) = target else {return Ok(())};
 	if link.node.is_none() {return Err(Refuse::NodeKey)}
 	if candidate.self_signed && (!matches!(target, Target::Tls {..}) || candidate.verify_name.is_some()) {return Err(Refuse::SelfSigned)}
@@ -439,12 +452,13 @@ pub(crate) fn launch(link: Link, target: Target, count: usize, env: Env, source:
 	let task = tokio::spawn(async move {
 		let (mut port, transport) = (Port {out: queued, input, ask: asked, state, shared, last: heard, source, env}, target.name());
 		let ended = match &target {
-			Target::Tls {..} | Target::Ws {..} if count > 1 => parallel::run(&mut port, &link, &target, count).await,
+			Target::Tls {..} | Target::Ws {..} | Target::FakeTls {..} if count > 1 => parallel::run(&mut port, &link, &target, count).await,
 			Target::UdpObfs(to) => udp::run(&mut port, &link, *to).await,
 			Target::Tls {path, candidate} => stream::run(&mut port, &link, Name::Tls, path, candidate).await,
 			Target::Ws {path, candidate} => stream::run(&mut port, &link, Name::Ws, path, candidate).await,
 			Target::Fronted {path, candidate} => fronted::run(&mut port, &link, path, candidate).await,
 			Target::FrontedShaped {path, candidate, shape} => shaped::run(&mut port, &link, path, candidate, shape).await,
+			Target::FakeTls {candidate, client} => faketls::run(&mut port, &link, client, candidate).await,
 		};
 		// No address and no name: a log line at info says which transport and how it ended.
 		tracing::info!(transport, ?ended, "a session ended");
@@ -456,7 +470,7 @@ pub(crate) fn launch(link: Link, target: Target, count: usize, env: Env, source:
 impl Session {
 	/// Opens a session to `target` and returns at once: the session is `Opening` until a chunk of the node has opened, and `state` and `recv` say how it went. Called inside a tokio runtime.
 	pub fn open(link: &Link, target: Target, env: Env, source: Source) -> Result<Session, Refuse> {Self::parallel(link, target, 1, env, source)}
-	/// The same over up to `connections` connections of `tls` or `ws`, the profile's `parallel`: "Each connection is its own session with its own proof and keys, for the same device", the second and later ones opened "one at a time, each after a delay drawn uniformly from 1 to 5 s". Every other transport has one.
+	/// The same over up to `connections` connections of `tls`, `ws` or `faketls`, the profile's `parallel`: "Each connection is its own session with its own proof and keys, for the same device", the second and later ones opened "one at a time, each after a delay drawn uniformly from 1 to 5 s". Every other transport has one.
 	pub fn parallel(link: &Link, target: Target, connections: u8, env: Env, source: Source) -> Result<Session, Refuse> {
 		check(link, &target, &env)?;
 		let ((input, inbox), shared) = (mpsc::channel(INBOX), Arc::new(Shared {datagram: (usize::from(link.mtu) + 32).min(MAX_ITEM), sent: AtomicU64::new(0), received: AtomicU64::new(0), dropped: AtomicU64::new(0), heard: Mutex::new(None)}));

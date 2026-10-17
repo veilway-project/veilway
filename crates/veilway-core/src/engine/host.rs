@@ -5,8 +5,9 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{certificate, control, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::limits::Clock;
+use super::{certificate, control, faketls, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{loops, Certificate, Config, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
@@ -82,6 +83,8 @@ pub struct Host {
 	ws: HashMap<SocketAddr, Relay>,
 	/// Every stream listener by its listen address, with the tasks that accept on it and learn the header fields of its upgrade answer. It lives for as long as a config has a `tls` transport on the address, and its sessions with it.
 	tls: HashMap<SocketAddr, (Arc<stream::Listener>, [Task; 2])>,
+	/// Every `faketls` listener by its listen address, with the task that accepts on it. It lives for as long as a config has a `faketls` transport on the address, and its sessions with it.
+	faketls: HashMap<SocketAddr, (Arc<faketls::Listener>, Task)>,
 	/// By the tag of the inbound.
 	tunnels: HashMap<String, Running>,
 	/// Shared with the `Engine`, which takes it out when it shuts down or is dropped: the interface, its routes and its firewall table go with the engine, while everything else here serves on.
@@ -109,6 +112,9 @@ pub struct Staged {
 	/// The stream listeners the node does not have yet, and for every address stream transports listen on, what its certificate files hold now, when it ends TLS, and where its decoy origin is now.
 	tls: Vec<(SocketAddr, TcpListener)>,
 	streams: HashMap<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>,
+	/// The `faketls` listeners the node does not have yet, and for every address a `faketls` transport listens on, where its site is now: the address of the config, or what its name resolved to.
+	borrowed: Vec<(SocketAddr, TcpListener)>,
+	sites: HashMap<SocketAddr, SocketAddr>,
 	/// The self-signed certificates of those listeners, each with whether it was made now.
 	certified: Vec<(certificate::Made, bool)>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
@@ -168,7 +174,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new()}}
 
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
@@ -205,6 +211,7 @@ impl Host {
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
 		let (mut listeners, mut streams, mut certified) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new());
+		let (mut borrowed, mut sites) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, SocketAddr>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate() {
 				match transport {
@@ -244,6 +251,22 @@ impl Host {
 						// "Validation refuses an origin whose address and port equal a listen address of the node, since requests would loop", and this is where a name is held to it.
 						if plan.inbounds.iter().flat_map(|inbound| &inbound.transports).any(|other| !other.datagram() && loops(other.listen(), origin)) {anyhow::bail!("inbounds[{i}].transports[{t}].decoy.origin: the decoy origin of inbound `{}` resolves to an address and port the node itself listens on, so every request of a stranger would come back to the node", inbound.tag)}
 						streams.insert(listen.0, (acceptor, origin));
+					}
+					Transport::FakeTls {listen, site, ..} => {
+						if !self.faketls.contains_key(&listen.0) && !borrowed.iter().any(|(addr, _)| *addr == listen.0) {
+							borrowed.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
+								socket.listen(1024)?;
+								TcpListener::from_std(socket.into())
+							}).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over tcp: {}", inbound.tag, e.kind()))?));
+						}
+						// Once for each address, on every reload: "The name is resolved once per reload."
+						let address = match site.address {
+							Some(address) => address.0,
+							None => tokio::time::timeout(RESOLVE, lookup_host((site.host.as_str(), site.port.unwrap_or(DEFAULT_SITE_PORT)))).await.ok().and_then(Result::ok).and_then(|mut found| found.next()).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].site.host: the name of the site of inbound `{}` does not resolve", inbound.tag))?,
+						};
+						// A site at an address and port the node itself listens on would send every stranger's connection back to the node.
+						if plan.inbounds.iter().flat_map(|inbound| &inbound.transports).any(|other| !other.datagram() && loops(other.listen(), address)) {anyhow::bail!("inbounds[{i}].transports[{t}].site.host: the site of inbound `{}` is an address and port the node itself listens on, so every stranger's connection would come back to the node", inbound.tag)}
+						sites.insert(listen.0, address);
 					}
 					Transport::Ws {listen, tls, ..} => {
 						if !self.ws.contains_key(&listen.0) && !relays.iter().any(|(addr, _)| *addr == listen.0) {
@@ -336,12 +359,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, certified, tunnels: fresh, loopbacks, forwards, l3: staged})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, l3: staged})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, certified, tunnels, loopbacks, forwards, l3} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, l3} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -392,7 +415,7 @@ impl Host {
 						});
 						routes.entry(listen.0).or_default().push((path.clone(), tls.clone(), inbound.tunnel.clone(), id));
 					}
-					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} | Transport::FrontedShaped {..} => {}
+					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} | Transport::FrontedShaped {..} | Transport::FakeTls {..} => {}
 				}
 			}
 		}
@@ -414,7 +437,15 @@ impl Host {
 				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), h2: matches!(transport, Transport::Tls {http2: Some(Http2::On), ..}), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
 			}
 		}
-		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();
+		// What each `faketls` listener serves from here on: the site, the names a hello may carry, the key of the transport and the limits of the transport.
+		let mut borrowing: HashMap<SocketAddr, faketls::Served> = HashMap::new();
+		for inbound in &plan.inbounds {
+			for transport in &inbound.transports {
+				let (Transport::FakeTls {listen, site, transport_key, limits}, Some(address)) = (transport, sites.get(&transport.listen())) else {continue};
+				borrowing.insert(listen.0, faketls::Served {tunnel: inbound.tunnel.clone(), key: transport_key.0, host: site.host.clone(), names: std::iter::once(&site.host).chain(site.names.iter().flatten()).map(|name| name.as_bytes().to_vec()).collect(), site: *address, relayed: limits.and_then(|limits| limits.relayed).unwrap_or(DEFAULT_SITE_RELAYED) as usize, rate: limits.and_then(|limits| limits.site_rate).unwrap_or(DEFAULT_SITE_RATE)});
+			}
+		}
+		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).chain(self.faketls.keys().filter(|addr| !borrowing.contains_key(addr))).copied().collect();
 		// "A tunnel whose entry did not change keeps its connections. One that changed or went away closes its listener and its connections." The socket of a changed tunnel that keeps its address is handed on, so its address is not given back.
 		let named: Vec<Forwarded> = self.config.iter().flat_map(|config| &config.tunnels).filter(|written| written.on()).map(Forwarded::effective).collect();
 		let (mut stopped, current) = (Vec::new(), self.config.clone());
@@ -459,6 +490,23 @@ impl Host {
 			}
 			let listener = shared.stream.listen(addr, served);
 			self.tls.insert(addr, (listener.clone(), [Task(stream::accept(shared, listener.clone(), socket)), Task(stream::learn(&listener))]));
+		}
+		// A listener whose address the config still has is told what it serves now, and keeps every session whose transport key is as it was. One whose address nobody has any more closes with everything it holds.
+		self.faketls.retain(|addr, (listener, _)| match borrowing.remove(addr) {
+			Some(served) => {
+				listener.serve(served);
+				true
+			}
+			None => {
+				listener.close();
+				false
+			}
+		});
+		for (addr, socket) in borrowed {
+			let Some(served) = borrowing.remove(&addr) else {continue};
+			tracing::info!("faketls listener {addr}: alpha, new and unreviewed. Whoever is not a user is relayed to the site {}, at most {} at once and {} new connections a second to it, and a user gets a handshake the node makes. The shape of the site is not probed and its flight is not copied live, so this build is Detectable", served.host, served.relayed, served.rate);
+			let listener = shared.faketls.listen(addr, served, Clock::of((shared.now)()).ms);
+			self.faketls.insert(addr, (listener.clone(), Task(faketls::accept(shared, listener, socket))));
 		}
 		// The pin is said at every start and reload: it is what the operator copies into profiles, and the log is where a node without the control API shows it.
 		for (made, fresh) in &certified {tracing::info!("stream listener {}: tls with a self-signed certificate the node {}, valid until {}, pin {}", made.listen, if *fresh {"made now"} else {"keeps"}, OffsetDateTime::from_unix_timestamp(made.not_after).map_or_else(|_| made.not_after.to_string(), |at| at.date().to_string()), made.pin_text())}

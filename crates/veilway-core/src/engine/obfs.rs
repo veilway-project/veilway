@@ -301,7 +301,7 @@ impl State {
 	/// Says and counts the tags of a table that another secret had already and that were left out, for the plan that is put in force and for the table of a new epoch.
 	pub fn collided(&self, inbound: &str, collisions: usize) {
 		self.counters.collisions.fetch_add(collisions as u64, Ordering::Relaxed);
-		tracing::error!("inbound {inbound}: {collisions} epoch tag(s) of one transport secret equal a tag of another and are left out of the tag table, so their device cannot open a session in that epoch. Two random secrets never do this: replace the secrets of the inbound's devices");
+		tracing::error!("inbound {inbound}: {collisions} epoch or hour tag(s) of one transport secret equal a tag of another and are left out of the tag table, so their device cannot open a session in that epoch. Two random secrets never do this: replace the secrets of the inbound's devices");
 	}
 
 	pub fn totals(&self, plan: &Plan) -> ObfsTotals {
@@ -569,9 +569,11 @@ pub async fn tables(shared: Arc<Shared>) {
 	let (mut tick, mut failed) = (tokio::time::interval(TABLE_EVERY), None::<(usize, u64)>);
 	loop {
 		tick.tick().await;
-		let (plan, epoch) = (shared.plan(), udp_obfs::epoch(replay::seconds((shared.now)())));
+		let (plan, now) = (shared.plan(), replay::seconds((shared.now)()));
+		let epoch = udp_obfs::epoch(now);
 		for at in 0..plan.inbounds.len() {
-			let Some(before) = plan.inbounds[at].native.as_ref().map(|native| native.tags().epoch).filter(|before| *before != epoch) else {continue};
+			// A table follows the hour as well where the inbound has a `faketls` transport, and is then built in the epoch of the table it replaces.
+			let Some(before) = plan.inbounds[at].native.as_ref().filter(|native| native.stale(now)).map(|native| native.tags().epoch) else {continue};
 			let (building, secs) = (plan.clone(), replay::seconds((shared.now)()));
 			let built = tokio::task::spawn_blocking(move || building.inbounds[at].native.as_ref().map(|native| native.build(secs))).await;
 			let (Ok(Some(tags)), Some(native)) = (built, plan.inbounds[at].native.as_ref()) else {
@@ -587,7 +589,7 @@ pub async fn tables(shared: Arc<Shared>) {
 			if before.abs_diff(into) > 1 {
 				shared.obfs.counters.late.fetch_add(1, Ordering::Relaxed);
 				tracing::error!("inbound {}: its tag table was built for epoch {before} and the clock is in epoch {into}, so every opening packet was refused until now. The clock stepped, or the node was held up for minutes", plan.inbounds[at].tag);
-			} else if behind > LATE {
+			} else if before != into && behind > LATE {
 				shared.obfs.counters.late.fetch_add(1, Ordering::Relaxed);
 				tracing::warn!("inbound {}: its tag table of {size} tags for epoch {into} is in force {behind}s after that epoch began. Nobody was refused for it: the table before held this epoch too. A table that is a whole epoch late refuses every client", plan.inbounds[at].tag);
 			}
@@ -607,7 +609,7 @@ impl Bench {
 		for (device, _) in devices {peers.add(*device, None)}
 		let (state, keys) = (State::default(), devices.iter().flat_map(|(device, secrets)| secrets.iter().map(|secret| Arc::new(Derived::new(secret, &public, device)))).collect());
 		let listener = state.listen(Arc::new(Tunnel::new("bench".to_string(), peers, mpsc::channel(1).0)), cap);
-		Bench {listener, state, limits: limits::State::default(), native: Native::new(&public, None, 1390, keys, true, None, now), replay: Guard::unwritten(1024, now), work: Work::default()}
+		Bench {listener, state, limits: limits::State::default(), native: Native::new(&public, None, 1390, keys, true, None, Vec::new(), now), replay: Guard::unwritten(1024, now), work: Work::default()}
 	}
 
 	/// One datagram from `from` at the wall clock `now`, in Unix milliseconds. What the node would send back to `from`, and how many IP packets came out of the tunnel.

@@ -830,7 +830,7 @@ fn the_new_keys_are_validated_shown_and_compared() {
 		("two transports of one listener with two headers", &|doc| doc["inbounds"][0]["transports"][1]["client_address_header"] = json!("X-Real-IP"), vec![format!("{polled}.listen")]),
 		("two transports of one listener with two sets of pools", &|doc| doc["inbounds"][0]["transports"][1]["limits"] = json!({"fronted_sessions": 8}), vec![format!("{polled}.listen")]),
 		("a tls transport on the address of the proxy path", &|doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "tls", "listen": "127.0.0.1:8443", "path": "/assets/third-path.js", "tls": {"cert": "cert.pem", "key": "key.pem"}, "decoy": {"origin": "http://127.0.0.1:8080"}})), vec!["inbounds[0].transports[2].listen".to_string()]),
-		("a transport nobody built", &|doc| doc["inbounds"][0]["transports"][1]["type"] = json!("faketls"), vec![format!("{polled}.type")]),
+		("a transport nobody built", &|doc| doc["inbounds"][0]["transports"][1]["type"] = json!("quic"), vec![format!("{polled}.type")]),
 	] {assert_eq!(errors(change), path, "{case}")}
 	// What is only a warning: a listener that is not on loopback, where the node never ends TLS, and a listener that takes nobody's word for where a request came from. An inbound with `fronted` alone needs no cookie, and one that is set is never used.
 	let warned = |change: &dyn Fn(&mut Value)| -> Vec<String> {

@@ -4,6 +4,7 @@ pub mod certificate;
 mod chain;
 pub mod control;
 pub mod dns;
+pub mod faketls;
 mod flows;
 pub mod gate;
 mod host;
@@ -29,6 +30,7 @@ mod xray_udp;
 pub mod xray_host;
 
 pub use control::ControlTotals;
+pub use faketls::FakeTlsTotals;
 pub use obfs::ObfsTotals;
 pub use stream::StreamTotals;
 pub use tunnel::Totals as TunnelTotals;
@@ -106,6 +108,8 @@ pub enum Over {
 	Fronted,
 	/// The `fronted-shaped` transport of a `veilway` inbound.
 	FrontedShaped,
+	/// The borrowed-site `faketls` transport of a `veilway` inbound.
+	FakeTls,
 }
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.
@@ -336,6 +340,8 @@ pub struct Shared {
 	limits: limits::State,
 	/// What the stream listeners share.
 	stream: stream::State,
+	/// What the `faketls` listeners share.
+	faketls: faketls::State,
 	/// The replay memory, from the first config with an obfuscated transport on. It belongs to the process: no reload empties it or gives it back.
 	replay: OnceLock<Arc<replay::Guard>>,
 	/// Where the replay file is. None for a node that was given no path, which starts no obfuscated transport.
@@ -355,7 +361,7 @@ pub struct Shared {
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default()}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -632,6 +638,9 @@ impl Engine {
 
 	/// What the stream listeners did since start, and the connections and sessions they hold right now.
 	pub fn stream(&self) -> StreamTotals {self.shared.stream.totals()}
+
+	/// What the `faketls` listeners did since start, and what they hold right now.
+	pub fn faketls(&self) -> FakeTlsTotals {self.shared.faketls.totals()}
 
 	/// Every tunnel that runs, in the order of the config, with what it counted since it started. A tunnel that a reload changed starts counting over.
 	pub fn tunnels(&self) -> Vec<(String, TunnelTotals)> {self.shared.tunnels.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(tag, state)| (tag.clone(), state.totals())).collect()}

@@ -1617,6 +1617,49 @@
       ],
       "type": "object"
     },
+    "Site": {
+      "additionalProperties": false,
+      "description": "The real site a `faketls` transport borrows (borrowed-site page, \"Config and profile fields\"). The site is a third party that has not agreed to anything: the operator chooses it, and `acknowledged` says the operator knows what that means.",
+      "properties": {
+        "acknowledged": {
+          "const": true,
+          "description": "Must be true. Every stranger's connection and every early connection of a user is a connection to a site whose owner has not agreed, from this node's address, and using its name may break its terms of use or the law where the operator is.",
+          "type": "boolean"
+        },
+        "address": {
+          "$ref": "#/$defs/Addr",
+          "description": "An address and port to connect to instead of resolving `host`."
+        },
+        "host": {
+          "description": "The site's name: the only server name a user's hello may carry besides `names`, and the name of the connections the node relays to the site.",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "type": "string"
+        },
+        "names": {
+          "description": "Extra server names that a user's hello may carry. At most 4.",
+          "items": {
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+            "type": "string"
+          },
+          "maxItems": 4,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "port": {
+          "description": "The site's port. Defaults to 443.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host",
+        "acknowledged"
+      ],
+      "type": "object"
+    },
     "Source": {
       "description": "an address such as 192.0.2.1 or a network such as 192.0.2.0/24 with no host bits set",
       "pattern": "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$",
@@ -1746,6 +1789,36 @@
             "path",
             "tls",
             "decoy"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The borrowed-site transport of a `veilway` inbound (alpha, new and unreviewed): the node holds no certificate, a client proves itself inside its first TLS message, and every other connection is relayed to the real `site`. `limits` takes `relayed` and `site_rate` alone.",
+          "properties": {
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "site": {
+              "$ref": "#/$defs/Site"
+            },
+            "transport_key": {
+              "$ref": "#/$defs/TransportKey",
+              "description": "The private half of the transport's own key: no other transport of the node may have it."
+            },
+            "type": {
+              "const": "faketls",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "site",
+            "transport_key"
           ],
           "type": "object"
         },
@@ -1938,6 +2011,13 @@
           "description": "Established `fronted-shaped` sessions the listener holds at once, counted among its `fronted_sessions`. Each can hold up to 603136 bytes. Defaults to 256, which is about 147 MiB when full.",
           "format": "uint32",
           "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "site_rate": {
+          "description": "New connections a second that a `faketls` listener opens to its site, for the relay of strangers and the early connections together. Only on `faketls`. Defaults to 16. When it is spent, users are still served.",
+          "format": "uint32",
+          "maximum": 1024,
           "minimum": 1,
           "type": "integer"
         },

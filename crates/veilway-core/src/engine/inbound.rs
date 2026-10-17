@@ -5,7 +5,7 @@ use super::netstack::Fit;
 use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
 use super::obfs::{self, Room};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
-use super::{chain, control, flows, gate, l3, link, resolver, stream, Over, Shared};
+use super::{chain, control, faketls, flows, gate, l3, link, resolver, stream, Over, Shared};
 use crate::config::Protocol;
 use ipstack::{IpStack, IpStackStream};
 use std::io;
@@ -28,16 +28,16 @@ const FIN_OR_RST: u8 = 0x05;
 
 /// How a peer's last authenticated datagram reached its tunnel, which is the way replies leave: a socket that carries WireGuard as it is, a `udp-obfs` session on a socket, or the session of a stream transport on its connection. Nothing leaves once the transport, or the session, is gone.
 #[derive(Clone)]
-pub enum Via {None, Socket(Weak<UdpSocket>, Over), Obfs(Weak<UdpSocket>, Weak<obfs::Session>), Stream(Weak<stream::Session>), Dial(Weak<link::Dialler>)}
+pub enum Via {None, Socket(Weak<UdpSocket>, Over), Obfs(Weak<UdpSocket>, Weak<obfs::Session>), Stream(Weak<stream::Session>), FakeTls(Weak<faketls::Session>), Dial(Weak<link::Dialler>)}
 
 /// A way to a peer that is there right now.
 #[derive(Clone)]
 /// `Dial` is the session of a node link this node dials, which the client's side of the transports holds.
-pub enum Route {Socket(Arc<UdpSocket>, SocketAddr), Obfs(Arc<UdpSocket>, Arc<obfs::Session>), Stream(Arc<stream::Session>), Dial(Arc<link::Dialler>)}
+pub enum Route {Socket(Arc<UdpSocket>, SocketAddr), Obfs(Arc<UdpSocket>, Arc<obfs::Session>), Stream(Arc<stream::Session>), FakeTls(Arc<faketls::Session>), Dial(Arc<link::Dialler>)}
 
 impl Route {
 	/// Whether what leaves this way travels in chunks, whose padding goes by what a datagram holds.
-	pub fn padded(&self) -> bool {matches!(self, Route::Obfs(..) | Route::Stream(..))}
+	pub fn padded(&self) -> bool {matches!(self, Route::Obfs(..) | Route::Stream(..) | Route::FakeTls(..))}
 
 	/// Sends one WireGuard datagram. `control` says it holds a control channel packet, which a session of an obfuscated transport pads wide like a handshake message (transports page, "Padding", rule 2), and `room` how large a `udp-obfs` session may make its packet.
 	/// `tunnel` is the peer's, which counts a datagram no socket took. A stream session never waits: its connection has a queue, and a datagram the queue has no room for is dropped and counted.
@@ -46,6 +46,7 @@ impl Route {
 			Route::Socket(socket, to) => tunnel.sent(socket.send_to(datagram, *to).await),
 			Route::Obfs(socket, session) => session.send(tunnel, socket, datagram, control, room).await,
 			Route::Stream(session) => session.push(datagram, control),
+			Route::FakeTls(session) => session.push(datagram, control),
 			Route::Dial(dialler) => dialler.push(datagram),
 		}
 	}
@@ -56,6 +57,7 @@ impl Route {
 			Route::Socket(socket, to) => tunnel.sent(socket.try_send_to(datagram, *to)),
 			Route::Obfs(socket, session) => if let Some(sealed) = session.seal(Some(datagram), control, Room::Inbound) {tunnel.sent(socket.try_send_to(&sealed, session.source))},
 			Route::Stream(session) => session.push(datagram, control),
+			Route::FakeTls(session) => session.push(datagram, control),
 			Route::Dial(dialler) => dialler.push(datagram),
 		}
 	}
@@ -90,6 +92,7 @@ impl Peers {
 			Via::Socket(socket, _) => socket.upgrade().zip(self.wg.endpoint(peer)).map(|(socket, to)| Route::Socket(socket, to)),
 			Via::Obfs(socket, session) => socket.upgrade().zip(session.upgrade().filter(|session| session.live())).map(|(socket, session)| Route::Obfs(socket, session)),
 			Via::Stream(session) => session.upgrade().filter(|session| session.live()).map(Route::Stream),
+			Via::FakeTls(session) => session.upgrade().filter(|session| session.live()).map(Route::FakeTls),
 			Via::Dial(dialler) => dialler.upgrade().map(Route::Dial),
 		}
 	}
@@ -101,6 +104,7 @@ impl Peers {
 			Via::Socket(socket, over) => (socket.strong_count() > 0).then_some(*over),
 			Via::Obfs(socket, session) => (socket.strong_count() > 0 && session.upgrade().is_some_and(|session| session.live())).then_some(Over::UdpObfs),
 			Via::Stream(session) => session.upgrade().filter(|session| session.live()).map(|session| session.over),
+			Via::FakeTls(session) => session.upgrade().filter(|session| session.live()).map(|_| Over::FakeTls),
 		}
 	}
 }

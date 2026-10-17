@@ -1,7 +1,7 @@
 //! Strict JSON reading. serde's own error texts quote the offending value, so nothing here passes one through:
 //! the document is first read into a small tree, then deserialized by a deserializer whose error type only
 //! ever says where the problem is and what was expected.
-use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, TransportSecret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
+use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, Transport, TransportSecret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::de::{self, DeserializeSeed, Deserializer, Expected, IgnoredAny, IntoDeserializer, MapAccess, SeqAccess, Unexpected, Visitor};
@@ -307,6 +307,17 @@ impl Config {
 						match was.and_then(|was| was.transport_keys.as_ref()).and_then(|kept| kept.iter().find(|kept| super::reload::marker(&kept.0) == *value)) {
 							Some(kept) => *value = STANDARD.encode(kept.0),
 							None => report.error(format!("inbounds[{i}].transport_keys[{k}]"), "expected a transport key: the marker of one names a key of the running inbound with this tag, as the config that was read shows it, and that inbound has no key this marker names. A key that is new has to be sent itself"),
+						}
+					}
+				}
+				// The key of a `faketls` transport is named the same way, among the faketls transports of the running inbound.
+				if let Some(Json::Arr(list)) = inbound.get_mut("transports") {
+					for (t, transport) in list.iter_mut().enumerate() {
+						let Json::Obj(transport) = transport else {continue};
+						let Some(Json::Str(value)) = transport.get_mut("transport_key").filter(|value| matches!(&**value, Json::Str(value) if value.starts_with("<redacted"))) else {continue};
+						match was.into_iter().flat_map(|was| &was.transports).find_map(|kept| match kept {Transport::FakeTls {transport_key, ..} if super::reload::marker(&transport_key.0) == *value => Some(transport_key), _ => None}) {
+							Some(kept) => *value = STANDARD.encode(kept.0),
+							None => report.error(format!("inbounds[{i}].transports[{t}].transport_key"), "expected a transport key: the marker of one names the key of a faketls transport of the running inbound with this tag, as the config that was read shows it, and that inbound has none this marker names. A key that is new has to be sent itself"),
 						}
 					}
 				}

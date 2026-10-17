@@ -20,6 +20,8 @@ hpke.workspace=true
 subtle.workspace=true
 # The key agreement of a node link's pairing. `ring` agrees only with a private key it drew itself, and this crate draws nothing.
 x25519-dalek.workspace=true
+# The P-256 key of a `faketls` leaf: `ring` takes a scalar only inside a key pair it has checked, so the public point is multiplied here. BoringSSL is the library the transports already build.
+boring={version="5.3", default-features=false}
 base64.workspace=true
 argon2.workspace=true
 fluke-hpack.workspace=true

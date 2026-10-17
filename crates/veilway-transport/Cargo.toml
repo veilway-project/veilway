@@ -4,7 +4,7 @@ version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-description="Client side of the Veilway transports: udp-obfs, tls, ws and fronted, carrying WireGuard datagrams to a node."
+description="Client side of the Veilway transports: udp-obfs, tls, ws, fronted and faketls, carrying WireGuard datagrams to a node."
 readme="README.md"
 keywords=["vpn", "wireguard", "tls", "obfuscation", "censorship"]
 categories=["network-programming", "cryptography"]
@@ -24,6 +24,11 @@ brotli={version="9", default-features=false, features=["std"]}
 rustls.workspace=true
 # SHA-256 of a certificate's SubjectPublicKeyInfo for the pins, and the system's random source. No cryptography is written here.
 ring.workspace=true
+# The key share `X` of a `faketls` hello, as a plain function over the bytes the client drew, and the public key of the leaf the node answers with (`faketls.rs`).
+x25519-dalek.workspace=true
+x509-parser.workspace=true
+# The comparison of the leaf's key with the one the client derives takes the same time wherever the two differ.
+subtle.workspace=true
 base64.workspace=true
 tracing.workspace=true
 

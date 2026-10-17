@@ -153,6 +153,28 @@ impl Config {
 					// Every device of a `veilway` inbound has the transport secret the envelope and the proof are keyed with. A device of a `wireguard` inbound has none.
 					if inbound.kind != InboundType::Veilway {r.error(format!("{at}.type"), "expected \"udp\" or a \"ws\" without a decoy: udp-obfs, tls, fronted and the ws with a decoy are transports of a veilway inbound, whose devices have the transport secrets they are keyed with")}
 					if limits.and_then(|limits| limits.sessions).is_some_and(|sessions| !(1..=MAX_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.sessions"), format!("expected an integer from 1 to {MAX_SESSIONS}"))}
+					if limits.and_then(|limits| limits.site_rate).is_some() {r.error(format!("{at}.limits.site_rate"), "expected no such key: it is the limit of a faketls listener on its connections to the site")}
+				}
+				// Borrowed-site page, "Config and profile fields" and "The third party".
+				if let Transport::FakeTls {site, limits, ..} = transport {
+					if inbound.kind != InboundType::Veilway {r.error(format!("{at}.type"), "expected \"udp\" or a \"ws\" without a decoy: faketls is a transport of a veilway inbound, whose devices have the transport secrets its proofs are keyed with")}
+					if !site.acknowledged {r.error(format!("{at}.site.acknowledged"), "expected true: every stranger's connection and every early connection of a user goes to the site from this node's address, and its owner has not agreed to any of it. Using its name may break its terms of use or the law where the operator is")}
+					if !domain(&site.host, false) {r.error(format!("{at}.site.host"), "expected a lowercase DNS name such as www.example.com: the only server name a user's hello may carry besides site.names")}
+					let names = site.names.as_deref().unwrap_or_default();
+					if names.len() > MAX_SITE_NAMES {r.error(format!("{at}.site.names"), format!("expected at most {MAX_SITE_NAMES} names"))}
+					index(&mut r, |k| format!("{at}.site.names[{k}]"), names.iter().take(MAX_SITE_NAMES));
+					for (k, name) in names.iter().enumerate().take(MAX_SITE_NAMES) {
+						if !domain(name, false) {r.error(format!("{at}.site.names[{k}]"), "expected a lowercase DNS name such as www.example.com")} else if *name == site.host {r.error(format!("{at}.site.names[{k}]"), "expected a name other than site.host, which is accepted already")}
+					}
+					if site.port == Some(0) {r.error(format!("{at}.site.port"), "expected a port from 1 to 65535")}
+					if site.address.is_none() {r.warning(format!("{at}.site.address"), "not set: the name in site.host is resolved at start and at every reload, and the node connects to what it resolves to")}
+					if let Some(limits) = limits {
+						for (key, set) in [("sessions", limits.sessions), ("undecided", limits.undecided), ("undecided_per_source", limits.undecided_per_source), ("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions), ("shaped_sessions", limits.shaped_sessions)] {
+							if set.is_some() {r.error(format!("{at}.limits.{key}"), "expected no such key: a faketls listener takes relayed and site_rate alone")}
+						}
+						if limits.relayed.is_some_and(|relayed| !(1..=MAX_RELAYED).contains(&relayed)) {r.error(format!("{at}.limits.relayed"), format!("expected an integer from 1 to {MAX_RELAYED}"))}
+						if limits.site_rate.is_some_and(|rate| !(1..=MAX_SITE_RATE).contains(&rate)) {r.error(format!("{at}.limits.site_rate"), format!("expected an integer from 1 to {MAX_SITE_RATE}"))}
+					}
 				}
 				if let Transport::UdpObfs {limits: Some(limits), ..} = transport {
 					for (key, set) in [("undecided", limits.undecided), ("undecided_per_source", limits.undecided_per_source), ("relayed", limits.relayed), ("proxy_connections", limits.proxy_connections), ("decoy_requests_per_source", limits.decoy_requests_per_source), ("fronted_sessions", limits.fronted_sessions), ("shaped_sessions", limits.shaped_sessions)] {
@@ -258,6 +280,7 @@ impl Config {
 				if let Some((other, there)) = clash {
 					r.error(format!("{at}.listen"), format!("conflicts with {other}: {}", match (transport, there) {
 						_ if udp => "two udp or udp-obfs transports never share an address and port",
+						(Transport::FakeTls {..}, _) | (_, Transport::FakeTls {..}) => "a faketls transport never shares an address and port with another transport: it takes a listener of its own",
 						(Transport::Ws {..}, Transport::Ws {..}) => "two ws transports share an address and port only with different paths and identical tls",
 						(Transport::Tls {..}, Transport::Tls {..}) => "two tls transports share an address and port only with different paths and identical tls, decoy, limits and http2",
 						_ if transport.proxied().is_some() && there.proxied().is_some() => "ws and fronted transports of veilway inbounds share an address and port only with different paths and identical decoy, trusted_proxies, client_address_header and limits, and a fronted-shaped transport that puts its data in the path takes every path under its own, so no other path of the listener may lie under it",
@@ -271,6 +294,11 @@ impl Config {
 		for (at, transport) in &listeners {
 			let Some(Decoy {origin: Origin(HostPort {host: Host::Ip(ip), port}), ..}) = transport.decoy() else {continue};
 			if let Some((other, _)) = listeners.iter().find(|(_, other)| !other.datagram() && loops(other.listen(), SocketAddr::new(*ip, *port))) {r.error(format!("{at}.decoy.origin"), format!("expected the operator's own web server, found the address and port {other} listens on: every request of a stranger would come back to the node"))}
+		}
+		// Borrowed-site page, "Config and profile fields": a site that resolves to the node's own address is a loop. A name is held against the listen addresses when it is resolved, at start and at every reload.
+		for (at, transport) in &listeners {
+			let Transport::FakeTls {site: Site {address: Some(address), ..}, ..} = transport else {continue};
+			if let Some((other, _)) = listeners.iter().find(|(_, other)| !other.datagram() && loops(other.listen(), address.0)) {r.error(format!("{at}.site.address"), format!("expected the real site, found the address and port {other} listens on: every stranger's connection would come back to the node"))}
 		}
 		if self.outbounds.len() > MAX_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_OUTBOUNDS} outbounds"))}
 		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} => tag.as_str()}));
@@ -381,6 +409,14 @@ impl Config {
 		for (i, inbound) in self.inbounds.iter().enumerate().take(MAX_INBOUNDS) {
 			for (j, key) in inbound.transport_keys.iter().flatten().enumerate().take(MAX_TRANSPORT_KEYS) {
 				if wireguard.contains(&key.0) {r.error(format!("inbounds[{i}].transport_keys[{j}]"), "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(key.0) {r.error(format!("inbounds[{i}].transport_keys[{j}]"), "expected a key no other inbound uses, and not the same key twice")}
+			}
+		}
+		// Borrowed-site page, "The proof": "Validation refuses a config in which the key of a `faketls` transport equals the transport key of any other transport on the node", because the hello that it opens is in clear on the path.
+		for (i, inbound) in self.inbounds.iter().enumerate().take(MAX_INBOUNDS) {
+			for (j, transport) in inbound.transports.iter().enumerate().take(MAX_TRANSPORTS) {
+				let Transport::FakeTls {transport_key, ..} = transport else {continue};
+				let at = format!("inbounds[{i}].transports[{j}].transport_key");
+				if wireguard.contains(&transport_key.0) {r.error(at, "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(transport_key.0) {r.error(at, "expected a key of its own: the key of a faketls transport equals no other transport key of the node, so that a leak of it opens nothing else")}
 			}
 		}
 		// Per user: the exits they are entitled to, their groups, and the inbounds their devices live in.

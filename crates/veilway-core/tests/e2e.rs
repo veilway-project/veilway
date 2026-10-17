@@ -769,7 +769,7 @@ async fn an_idle_tcp_flow_lives_exactly_as_long_as_tcp_idle_secs(){
 
 #[test]
 fn egress_never_dials_directly(){
-	let (mut dirs, mut decoy_dials, mut origins_built)=(vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")], 0, 0);
+	let (mut dirs, mut decoy_dials, mut site_dials, mut origins_built)=(vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")], 0, 0, 0);
 	while let Some(dir)=dirs.pop(){
 		for entry in std::fs::read_dir(&dir).unwrap(){
 			let path=entry.unwrap().path();
@@ -781,10 +781,13 @@ fn egress_never_dials_directly(){
 			// The only TcpStream dial allowed for a user's traffic is the control connection to the proxy itself, and the only other
 			// sockets that reach out belong to the `direct` outbound, which lives in one file.
 			// The stream listener dials one more place, and no user's traffic goes there: the decoy origin of its config, which is the operator's own web server and the one address a stranger's bytes are handed to.
+			// So does the `faketls` listener: the site of its config, which is the one address a stranger's bytes are handed to, and the one place the early connection of every accepted connection goes.
 			for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
 				let decoy=path.ends_with("engine/stream.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(to))");
-				assert!(line.contains("up.addr")|| decoy, "{} dials {} without the proxy", path.display(), line.trim());
+				let site=path.ends_with("engine/faketls.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(site))");
+				assert!(line.contains("up.addr")|| decoy|| site, "{} dials {} without the proxy", path.display(), line.trim());
 				decoy_dials+=decoy as usize;
+				site_dials+=site as usize;
 			}
 			for line in text.lines().filter(|l| l.contains("TcpSocket::new")|| l.contains(".connect(target)")){
 				assert!(path.ends_with("engine/flows.rs"), "{} dials {} outside the direct outbound", path.display(), line.trim());
@@ -796,7 +799,7 @@ fn egress_never_dials_directly(){
 			}
 		}
 	}
-	assert_eq!((decoy_dials, origins_built), (1, 1));
+	assert_eq!((decoy_dials, site_dials, origins_built), (1, 1, 1));
 }
 
 async fn close_reaches_upstream(server_closes:bool, sport:u16)->bool{

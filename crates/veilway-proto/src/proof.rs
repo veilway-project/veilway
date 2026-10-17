@@ -349,6 +349,7 @@ mod tests {
 			self.0.find_device(tag)
 		}
 		fn find_epoch(&self, tag: &[u8; 16]) -> Option<&Device<u32>> {self.0.find_epoch(tag)}
+		fn find_hour(&self, tag: &[u8; 16]) -> Option<&Device<u32>> {self.0.find_hour(tag)}
 	}
 
 	// The device of the vectors as number 7, and a second device with a secret of 0xb1 bytes and a key of 0xb0 bytes as number 8. Device 7 also has its epoch tag of epoch 5 in the table, as a node with a `udp-obfs` transport would.

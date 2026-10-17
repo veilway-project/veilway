@@ -1150,9 +1150,9 @@ fn the_new_keys_are_validated_and_their_secrets_are_shown_to_nobody() {
 		("a secret that is no key", &|doc| doc["users"][0]["devices"][0]["transport_secrets"] = json!(["short"]), "users[0].devices[0].transport_secrets[0]"),
 		("the marker of the control api", &|doc| doc["users"][0]["devices"][0]["transport_secrets"] = json!([REDACTED]), "users[0].devices[0].transport_secrets[0]"),
 		("an all zero secret", &|doc| doc["users"][0]["devices"][0]["transport_secrets"] = json!([text(&[0; 32])]), "users[0].devices[0].transport_secrets[0]"),
-		// The `ws` without a decoy is that of a `wireguard` inbound, and of the protocol's own transports `faketls` and `quic` are not built.
+		// The `ws` without a decoy is that of a `wireguard` inbound, and of the protocol's own transports `quic` is not built.
 		("the ws of a wireguard inbound on a veilway inbound", &|doc| doc["inbounds"][0]["transports"] = json!([{"type": "ws", "listen": "127.0.0.1:8443", "path": "/wg"}]), "inbounds[0].transports[0].type"),
-		("a transport that is not built", &|doc| doc["inbounds"][0]["transports"][0]["type"] = json!("faketls"), "inbounds[0].transports[0].type"),
+		("a transport that is not built", &|doc| doc["inbounds"][0]["transports"][0]["type"] = json!("quic"), "inbounds[0].transports[0].type"),
 		("an inbound type nobody knows", &|doc| doc["inbounds"][0]["type"] = json!("native"), "inbounds[0].type"),
 		("five notices", &|doc| doc["notices"] = json!([{"text": "1"}, {"text": "2"}, {"text": "3"}, {"text": "4"}, {"text": "5"}]), "notices"),
 		("a notice of 281 bytes", &|doc| doc["notices"] = json!([{"text": "x".repeat(281)}]), "notices[0].text"),

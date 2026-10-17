@@ -445,7 +445,7 @@ impl Core {
 		if let Some(redirect) = &self.settings.hooks.redirect {
 			match &mut target {
 				Target::UdpObfs(address) => *address = redirect(*address),
-				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} => candidate.address = redirect(candidate.address),
+				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} | Target::FakeTls {candidate, ..} => candidate.address = redirect(candidate.address),
 			}
 		}
 		Session::parallel(&self.link, target, self.profile.parallel, env.clone(), self.wire.source()).map_err(|refuse| {

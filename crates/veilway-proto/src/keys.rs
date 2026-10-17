@@ -28,6 +28,13 @@ pub(crate) const BINDER: &[u8] = b"veilway v1 binder\0";
 pub(crate) const C2S: &[u8] = b"veilway v1 c2s\0";
 pub(crate) const S2C: &[u8] = b"veilway v1 s2c\0";
 pub(crate) const SID: &[u8] = b"veilway v1 sid\0";
+// The borrowed-site mode (`faketls`, its protocol page, "Keys"): the salt of `prk_f`, the three labels of its keys, the label of the hour tag and the one of the associated data.
+const FAKETLS: &[u8] = b"veilway v1 faketls\0";
+const FAKETLS_SEAL: &[u8] = b"veilway v1 faketls seal\0";
+const FAKETLS_BINDER: &[u8] = b"veilway v1 faketls binder\0";
+const FAKETLS_NODE: &[u8] = b"veilway v1 faketls node key\0";
+const FAKETLS_HOUR: &[u8] = b"veilway v1 faketls hour tag\0";
+pub(crate) const FAKETLS_AAD: &[u8] = b"veilway v1 faketls aad\0";
 // Node links: the label the pairing hash begins with, and the salt of the link's transport secret.
 pub(crate) const LINK_PAIRING: &[u8] = b"veilway v1 link pairing\0";
 const LINK_SECRET: &[u8] = b"veilway v1 link secret\0";
@@ -99,6 +106,8 @@ impl TagKey {
 	pub fn device_tag(&self) -> [u8; 16] {truncated(&self.0, &[DEVICE_TAG])}
 	/// The epoch tag, which names the device on a `udp-obfs` opening packet: the first 16 bytes of HMAC-SHA-256(`k_tag`, `"veilway v1 epoch tag" || e`), with the epoch number as 8 bytes, big-endian as every integer on the wire.
 	pub fn epoch_tag(&self, epoch: u64) -> [u8; 16] {truncated(&self.0, &[EPOCH_TAG, &epoch.to_be_bytes()])}
+	/// The hour tag of `faketls`: the first 16 bytes of HMAC-SHA-256(`k_tag`, `"veilway v1 faketls hour tag" || e`), with `e` the hour (Unix time divided by 3,600) as 8 bytes.
+	pub fn hour_tag(&self, hour: u64) -> [u8; 16] {truncated(&self.0, &[FAKETLS_HOUR, &hour.to_be_bytes()])}
 }
 
 impl fmt::Debug for TagKey {
@@ -111,6 +120,8 @@ pub struct BinderKey(hmac::Key);
 impl BinderKey {
 	/// `k_bind` = HKDF-Expand(`prk`, `"veilway v1 proof binder" || inbound_pub || device_pub`, 32).
 	pub fn derive(secret: &[u8; 32], inbound_pub: &[u8; 32], device_pub: &[u8; 32]) -> Self {Self(hmac::Key::from(prk(secret).expand(&[PROOF_BINDER, inbound_pub, device_pub], hmac::HMAC_SHA256).expect("32 bytes are within the output limit of HKDF-SHA-256")))}
+	/// The first 16 bytes of HMAC-SHA-256 over the parts, which is the binder of `faketls`.
+	pub(crate) fn short(&self, parts: &[&[u8]]) -> [u8; 16] {truncated(&self.0, parts)}
 	pub(crate) fn mac(&self, message: &[u8]) -> [u8; 32] {
 		let mut mac = [0; 32];
 		mac.copy_from_slice(hmac::sign(&self.0, message).as_ref());
@@ -126,6 +137,23 @@ impl BinderKey {
 
 impl fmt::Debug for BinderKey {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {f.write_str("BinderKey(..)")}
+}
+
+/// The keys of one `faketls` hello, all from `prk_f` = HKDF-Extract(salt `"veilway v1 faketls"`, ikm `dh`), where `dh` is the X25519 result of the hello's key share `X` and the node's transport key.
+pub(crate) struct Borrowed(hkdf::Prk);
+
+impl Borrowed {
+	pub(crate) fn new(dh: &[u8; 32]) -> Self {Self(hkdf::Salt::new(hkdf::HKDF_SHA256, FAKETLS).extract(dh))}
+	/// `k_seal` = HKDF-Expand(`prk_f`, `"veilway v1 faketls seal" || X || T_pub || inbound_pub`, 32), new for every `X`.
+	pub(crate) fn seal(&self, share: &[u8; 32], node: &[u8; 32], inbound: &[u8; 32]) -> ChunkKey {ChunkKey::new(&expand(&self.0, &[FAKETLS_SEAL, share, node, inbound]))}
+	/// `b` = HKDF-Expand(`prk_f`, `"veilway v1 faketls binder" || X`, 32), the key the binder is computed from.
+	pub(crate) fn binder(&self, share: &[u8; 32]) -> [u8; 32] {expand(&self.0, &[FAKETLS_BINDER, share])}
+	/// `node_seed` = HKDF-Expand(`prk_f`, `"veilway v1 faketls node key" || X || carrier`, 40), which makes the node's leaf key.
+	pub(crate) fn node_seed(&self, share: &[u8; 32], carrier: &[u8; 64]) -> [u8; 40] {expand(&self.0, &[FAKETLS_NODE, share, carrier])}
+}
+
+impl fmt::Debug for Borrowed {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {f.write_str("Borrowed(..)")}
 }
 
 /// `k_obfs`, from which every `udp-obfs` session of a device takes its keys.
@@ -223,23 +251,28 @@ pub trait Tags<T> {
 	fn find_device(&self, tag: &[u8; 16]) -> Option<&Device<T>>;
 	/// The device a `udp-obfs` opening packet names by an epoch tag of an epoch the node accepts now.
 	fn find_epoch(&self, tag: &[u8; 16]) -> Option<&Device<T>>;
+	/// The device a `faketls` hello names by an hour tag of an hour the node accepts now.
+	fn find_hour(&self, tag: &[u8; 16]) -> Option<&Device<T>>;
 }
 
 /// A tag table over two hash maps, for a caller that needs no other. `V` is a `Device` or anything that lends one, such as an `Arc` of a device that several tags name.
 /// A lookup that hits compares the 16 bytes of the tag with an ordinary comparison. A tag is no secret from whoever can put one in front of this table: it is inside a proof sealed to the node, or masked with a key every subscriber of the inbound has.
-pub struct Table<V> {devices: HashMap<[u8; 16], V>, epochs: HashMap<[u8; 16], V>}
+pub struct Table<V> {devices: HashMap<[u8; 16], V>, epochs: HashMap<[u8; 16], V>, hours: HashMap<[u8; 16], V>}
 
 impl<V> Table<V> {
-	pub fn new() -> Self {Self {devices: HashMap::new(), epochs: HashMap::new()}}
-	/// Adds the device tag of one device secret. `false`, and nothing added, when the tag is in the table already as either kind: "Validation refuses a config in which two tags of one inbound are equal."
+	pub fn new() -> Self {Self {devices: HashMap::new(), epochs: HashMap::new(), hours: HashMap::new()}}
+	/// Adds the device tag of one device secret. `false`, and nothing added, when the tag is in the table already as any kind: "Validation refuses a config in which two tags of one inbound are equal."
 	#[must_use = "a tag that was not added is a config that validation must refuse"]
-	pub fn device(&mut self, tag: [u8; 16], entry: V) -> bool {!self.epochs.contains_key(&tag) && !self.devices.contains_key(&tag) && self.devices.insert(tag, entry).is_none()}
+	pub fn device(&mut self, tag: [u8; 16], entry: V) -> bool {!self.epochs.contains_key(&tag) && !self.hours.contains_key(&tag) && !self.devices.contains_key(&tag) && self.devices.insert(tag, entry).is_none()}
 	/// Adds the epoch tag of one device secret for one epoch, under the same rule.
 	#[must_use = "a tag that was not added is a config that validation must refuse"]
-	pub fn epoch(&mut self, tag: [u8; 16], entry: V) -> bool {!self.devices.contains_key(&tag) && !self.epochs.contains_key(&tag) && self.epochs.insert(tag, entry).is_none()}
-	/// The number of tags, of both kinds.
-	pub fn len(&self) -> usize {self.devices.len() + self.epochs.len()}
-	pub fn is_empty(&self) -> bool {self.devices.is_empty() && self.epochs.is_empty()}
+	pub fn epoch(&mut self, tag: [u8; 16], entry: V) -> bool {!self.devices.contains_key(&tag) && !self.epochs.contains_key(&tag) && !self.hours.contains_key(&tag) && self.epochs.insert(tag, entry).is_none()}
+	/// Adds the hour tag of one device secret for one hour of `faketls`, under the same rule.
+	#[must_use = "a tag that was not added is a config that validation must refuse"]
+	pub fn hour(&mut self, tag: [u8; 16], entry: V) -> bool {!self.devices.contains_key(&tag) && !self.epochs.contains_key(&tag) && !self.hours.contains_key(&tag) && self.hours.insert(tag, entry).is_none()}
+	/// The number of tags, of all kinds.
+	pub fn len(&self) -> usize {self.devices.len() + self.epochs.len() + self.hours.len()}
+	pub fn is_empty(&self) -> bool {self.devices.is_empty() && self.epochs.is_empty() && self.hours.is_empty()}
 }
 
 impl<V> Default for Table<V> {
@@ -247,12 +280,13 @@ impl<V> Default for Table<V> {
 }
 
 impl<V> fmt::Debug for Table<V> {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Table({} device tags, {} epoch tags)", self.devices.len(), self.epochs.len())}
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Table({} device tags, {} epoch tags, {} hour tags)", self.devices.len(), self.epochs.len(), self.hours.len())}
 }
 
 impl<T, V: Borrow<Device<T>>> Tags<T> for Table<V> {
 	fn find_device(&self, tag: &[u8; 16]) -> Option<&Device<T>> {self.devices.get(tag).map(Borrow::borrow)}
 	fn find_epoch(&self, tag: &[u8; 16]) -> Option<&Device<T>> {self.epochs.get(tag).map(Borrow::borrow)}
+	fn find_hour(&self, tag: &[u8; 16]) -> Option<&Device<T>> {self.hours.get(tag).map(Borrow::borrow)}
 }
 
 // An HKDF-Expand output of `N` bytes, for the one derivation that is not 32 long.
@@ -383,6 +417,6 @@ mod tests {
 		assert!(table.find_epoch(&tags.device_tag()).is_none() && table.find_device(&tags.epoch_tag(5)).is_none() && table.find_epoch(&tags.epoch_tag(6)).is_none());
 		// "Validation refuses a config in which two tags of one inbound are equal": a tag is taken once, as either kind.
 		for tag in [tags.device_tag(), tags.epoch_tag(5)] {assert!(!table.device(tag, entry.clone()) && !table.epoch(tag, entry.clone()))}
-		assert_eq!((table.len(), format!("{table:?}")), (2, "Table(1 device tags, 1 epoch tags)".to_owned()));
+		assert_eq!((table.len(), format!("{table:?}")), (2, "Table(1 device tags, 1 epoch tags, 0 hour tags)".to_owned()));
 	}
 }

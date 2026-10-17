@@ -1095,7 +1095,7 @@ export interface components {
          * @description The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
          * @enum {string}
          */
-        Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted" | "fronted-shaped";
+        Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted" | "fronted-shaped" | "faketls";
         /** @description What one tunnel counted since it started. Everything but `open` only grows. */
         TunnelStats: {
             /**

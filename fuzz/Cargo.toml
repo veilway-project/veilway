@@ -14,6 +14,8 @@ veilway-core={path="../crates/veilway-core", features=["bench"]}
 # The engine_* targets drive what the client engine reads from a file and from the node.
 veilway-engine={path="../crates/veilway-engine", features=["fuzz"]}
 veilway-proto={path="../crates/veilway-proto"}
+# The faketls_hello target seals a real hello with the public half of the client's share.
+x25519-dalek={version="3", default-features=false}
 # The client_* targets drive what the client's side of the transports reads from the network.
 veilway-transport={path="../crates/veilway-transport"}
 # The linux_netlink target drives what the Linux layer reads from the kernel.
@@ -337,6 +339,13 @@ bench=false
 [[bin]]
 name="fuzz_h2_decoder"
 path="fuzz_targets/fuzz_h2_decoder.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
+name="faketls_hello"
+path="fuzz_targets/faketls_hello.rs"
 test=false
 doc=false
 bench=false

@@ -20,7 +20,7 @@ use veilway_proto::session::KEEPALIVE;
 use veilway_proto::keys::{self, TagKey};
 use veilway_proto::subscription::payload::{self, Candidate, Dial, Stream};
 use veilway_proto::subscription::Secret;
-use veilway_proto::{proof, udp_obfs, NoRandom};
+use veilway_proto::{faketls, proof, udp_obfs, NoRandom};
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
 pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>, pub latency: Arc<Latency>}
@@ -113,28 +113,36 @@ pub struct Derived {
 	named: [u8; 16],
 	pub device: Arc<keys::Device<Proved>>,
 	epochs: Mutex<Vec<(u64, [u8; 16])>>,
+	/// The hour tags of `faketls`, kept the same way.
+	hours: Mutex<Vec<(u64, [u8; 16])>>,
 }
 
 impl Derived {
 	/// `inbound` and `device` are the WireGuard public keys of the inbound and of the device.
 	pub fn new(secret: &[u8; 32], inbound: &[u8; 32], device: &[u8; 32]) -> Derived {
 		let tags = TagKey::derive(secret, inbound);
-		Derived {named: tags.device_tag(), tags, device: Arc::new(keys::Device::derive(Proved(*secret), secret, inbound, device)), epochs: Mutex::default()}
+		Derived {named: tags.device_tag(), tags, device: Arc::new(keys::Device::derive(Proved(*secret), secret, inbound, device)), epochs: Mutex::default(), hours: Mutex::default()}
 	}
 
 	/// The epoch tag of each of `epochs`, which are the three a table holds. Those of the epochs before are forgotten.
-	fn tags(&self, epochs: [u64; 3]) -> [[u8; 16]; 3] {
-		let mut known = self.epochs.lock().unwrap_or_else(|e| e.into_inner());
-		let tags = epochs.map(|epoch| known.iter().find(|(of, _)| *of == epoch).map_or_else(|| self.tags.epoch_tag(epoch), |(_, tag)| *tag));
-		*known = epochs.into_iter().zip(tags).collect();
+	fn tags(&self, epochs: [u64; 3]) -> [[u8; 16]; 3] {Self::remembered(&self.epochs, epochs, |epoch| self.tags.epoch_tag(epoch))}
+
+	/// The hour tag of each of `hours`, which are the three a table holds.
+	fn hour_tags(&self, hours: [u64; 3]) -> [[u8; 16]; 3] {Self::remembered(&self.hours, hours, |hour| self.tags.hour_tag(hour))}
+
+	fn remembered(known: &Mutex<Vec<(u64, [u8; 16])>>, steps: [u64; 3], make: impl Fn(u64) -> [u8; 16]) -> [[u8; 16]; 3] {
+		let mut known = known.lock().unwrap_or_else(|e| e.into_inner());
+		let tags = steps.map(|step| known.iter().find(|(of, _)| *of == step).map_or_else(|| make(step), |(_, tag)| *tag));
+		*known = steps.into_iter().zip(tags).collect();
 		tags
 	}
 }
 
 /// The tag table of one inbound at one epoch (transports page, "How the node finds the device"): of every transport secret of every device that may connect, the epoch tags of the previous, the current and the next epoch where the inbound has a `udp-obfs` transport, and the device tag where it has a transport that takes the stream proof. It is built whole and swapped in whole.
 pub struct Tags {
-	/// The epoch number the table was built in.
+	/// The epoch number the table was built in, and the hour.
 	pub epoch: u64,
+	pub hour: u64,
 	pub table: keys::Table<Arc<keys::Device<Proved>>>,
 	/// Tags that were another secret's already and were left out, which no two random secrets ever cause: "Validation refuses a config in which two tags of one inbound are equal."
 	pub collisions: usize,
@@ -148,6 +156,14 @@ impl Prover {
 	pub fn new(keys: &[[u8; 32]], inbound: &[u8; 32]) -> anyhow::Result<Prover> {Ok(Prover {keys: keys.to_vec(), node: proof::Node::new(keys, inbound, &mut |bytes: &mut [u8]| SystemRandom::new().fill(bytes).map_err(|_| NoRandom)).map_err(|e| anyhow!("the node transport keys of an inbound cannot be used: {e}"))?})}
 }
 
+/// What opens the hellos of one `faketls` transport: its private key, and the node of `veilway_proto::faketls` made with it.
+pub struct Borrowed {pub key: [u8; 32], pub node: faketls::Node}
+
+impl Borrowed {
+	/// `inbound` is the WireGuard public key of the inbound.
+	pub fn new(key: [u8; 32], inbound: &[u8; 32]) -> anyhow::Result<Borrowed> {Ok(Borrowed {key, node: faketls::Node::new(key, *inbound, &mut |bytes: &mut [u8]| SystemRandom::new().fill(bytes).map_err(|_| NoRandom)).map_err(|e| anyhow!("the transport key of a faketls transport cannot be used: {e}"))?})}
+}
+
 /// What a `veilway` inbound with an obfuscated transport holds for it.
 pub struct Native {
 	pub node: udp_obfs::Node,
@@ -155,6 +171,8 @@ pub struct Native {
 	pub prover: Option<Arc<Prover>>,
 	/// Whether the inbound has a `udp-obfs` transport, whose opening packets name a device by an epoch tag.
 	epochs: bool,
+	/// Set for an inbound with `faketls` transports, one for each, whose hellos name a device by an hour tag.
+	pub borrowed: Vec<Arc<Borrowed>>,
 	/// The upper bounds of wide and of normal padding on what the node sends.
 	pub wide: u32,
 	pub normal: u32,
@@ -166,24 +184,39 @@ pub struct Native {
 
 impl Native {
 	/// `now` is the wall clock in Unix seconds, which decides the epochs of the first table.
-	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, epochs: bool, prover: Option<Arc<Prover>>, now: u64) -> Native {
-		let native = Native {node: udp_obfs::Node::new(inbound), prover, epochs, wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, table: keys::Table::new(), collisions: 0}))};
+	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, epochs: bool, prover: Option<Arc<Prover>>, borrowed: Vec<Arc<Borrowed>>, now: u64) -> Native {
+		let native = Native {node: udp_obfs::Node::new(inbound), prover, epochs, borrowed, wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, hour: 0, table: keys::Table::new(), collisions: 0}))};
 		native.swap(native.build(now));
 		native
 	}
 
 	/// The table for the epochs around `now`. It costs one HMAC for each tag that was not computed before, so it runs away from the packet path.
-	/// "Each entry knows which kind it is. A device tag is valid only in a stream proof and an epoch tag only on an opening packet": a kind of tag no transport of the inbound asks for is not in the table at all.
+	/// "Each entry knows which kind it is. A device tag is valid only in a stream proof, an epoch tag only on an opening packet and an hour tag only in a `faketls` hello": a kind of tag no transport of the inbound asks for is not in the table at all.
 	pub fn build(&self, now: u64) -> Tags {
 		let (epochs, mut table, mut collisions) = (udp_obfs::epochs(now), keys::Table::new(), 0);
+		let hour = faketls::hour(now);
+		let hours = [hour.saturating_sub(1), hour, hour + 1];
 		for derived in &self.keys {
 			if self.prover.is_some() && !table.device(derived.named, derived.device.clone()) {collisions += 1}
 			// The first epochs of all time name the same epoch twice, and a tag is in the table once.
 			for (at, tag) in derived.tags(epochs).into_iter().enumerate().filter(|_| self.epochs) {
 				if !epochs[..at].contains(&epochs[at]) && !table.epoch(tag, derived.device.clone()) {collisions += 1}
 			}
+			// The first hours of all time name the same hour twice.
+			for (at, tag) in derived.hour_tags(hours).into_iter().enumerate().filter(|_| self.hours()) {
+				if !hours[..at].contains(&hours[at]) && !table.hour(tag, derived.device.clone()) {collisions += 1}
+			}
 		}
-		Tags {epoch: udp_obfs::epoch(now), table, collisions}
+		Tags {epoch: udp_obfs::epoch(now), hour, table, collisions}
+	}
+
+	/// Whether the inbound has a `faketls` transport.
+	fn hours(&self) -> bool {!self.borrowed.is_empty()}
+
+	/// Whether the table in force was built in another epoch than the one `now` is in, or, for an inbound with a `faketls` transport, in another hour.
+	pub fn stale(&self, now: u64) -> bool {
+		let tags = self.tags();
+		tags.epoch != udp_obfs::epoch(now) || (self.hours() && tags.hour != faketls::hour(now))
 	}
 
 	/// The table in force. A packet takes it once and works on that one value.
@@ -582,7 +615,8 @@ impl Plan {
 				// The transport keys open tokens only where a transport of the inbound takes them. What opens them is the plan before's while the keys are the same keys in the same order.
 				let secret: Vec<[u8; 32]> = inbound.transport_keys.iter().flatten().filter(|_| inbound.proved()).map(|key| key.0).collect();
 				let prover = if secret.is_empty() {None} else if let Some(kept) = previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()?.prover.as_ref()).find(|kept| kept.keys == secret) {Some(kept.clone())} else {Some(Arc::new(Prover::new(&secret, &public)?))};
-				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, inbound.enveloped(), prover, now.unix_timestamp().max(0) as u64));
+				let borrowed = inbound.transports.iter().filter_map(|transport| if let Transport::FakeTls {transport_key, ..} = transport {Some(Borrowed::new(transport_key.0, &public).map(Arc::new))} else {None}).collect::<anyhow::Result<Vec<_>>>()?;
+				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, inbound.enveloped(), prover, borrowed, now.unix_timestamp().max(0) as u64));
 			}
 			Ok(())
 		};

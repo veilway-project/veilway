@@ -108,9 +108,9 @@ impl Io for tokio_rustls::server::TlsStream<TcpStream> {
 
 impl Io for DuplexStream {}
 
-type Stream = Box<dyn Io>;
+pub(super) type Stream = Box<dyn Io>;
 
-fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| NoRandom)}
+pub(super) fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| NoRandom)}
 
 /// Why a peer was decided as "not a user". This is for the node's counters: the peer gets the decoy origin's answer whatever it is, and nothing here is ever said to it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,11 +440,11 @@ impl Drop for Place {
 }
 
 #[derive(Default)]
-struct Undecided {all: BTreeMap<u64, (Source, Arc<Notify>)>, by_source: HashMap<Source, VecDeque<u64>>}
+pub(super) struct Undecided {pub(super) all: BTreeMap<u64, (Source, Arc<Notify>)>, pub(super) by_source: HashMap<Source, VecDeque<u64>>}
 
 impl Undecided {
 	/// Takes a connection out. Whether it was still in.
-	fn leave(&mut self, id: u64, source: Source) -> bool {
+	pub(super) fn leave(&mut self, id: u64, source: Source) -> bool {
 		if let Some(ids) = self.by_source.get_mut(&source) {
 			ids.retain(|held| *held != id);
 			if ids.is_empty() {self.by_source.remove(&source);}
@@ -454,7 +454,7 @@ impl Undecided {
 }
 
 /// One connection in the relayed pool: when a byte last crossed it, in Unix milliseconds, and what closes it when the pool needs its place.
-struct Relayed {last: AtomicI64, kill: Notify}
+pub(super) struct Relayed {pub(super) last: AtomicI64, pub(super) kill: Notify}
 
 /// What only the one request in flight of a `fronted` session has: the node's side of the chunks, the session's allowance of handshakes, and what waits to go to the device.
 struct Turn {sealer: Sealer, handshakes: Handshakes, waiting: mpsc::Receiver<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
@@ -1323,7 +1323,7 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 /// `first` is what the origin said before the peer's request line was complete, which the peer is given before anything else, and `open` whether the origin's connection was still open behind it: false when it closed, and the kind of the error when it broke.
 /// Everything the origin sends is written out to the peer, through the TLS layer's own buffer, before the node waits for anything else: the end of an answer never stays in the node until the next one. Towards the origin there is no such buffer: it is a plain socket.
 /// When the origin has closed, the peer is closed once all of that was handed on, however long the peer takes to read it: only the pool's own rule ends a relayed connection early, and one that is closed for room is closed at once, with no wait. An origin that reset its connection resets the peer's.
-async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[u8], first: &[u8], open: Result<bool, io::ErrorKind>, slot: &Relayed) {
+pub(super) async fn relay(now: fn() -> OffsetDateTime, io: Stream, origin: Stream, sent: &[u8], first: &[u8], open: Result<bool, io::ErrorKind>, slot: &Relayed) {
 	let ((mut from_peer, mut to_peer), (mut from_origin, mut to_origin)) = (tokio::io::split(io), tokio::io::split(origin));
 	// What a peer or an origin does to its connection is theirs to say; anything else, such as a system out of buffers, is logged.
 	let odd = |e: &io::Error| !matches!(e.kind(), io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::BrokenPipe | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof);
