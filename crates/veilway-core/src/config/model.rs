@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_UPGRADE_HEADERS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_TUNNEL_CONNECTIONS, DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_TUNNELS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_SOURCES, MAX_UPGRADE_HEADERS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -318,6 +318,12 @@ text_value!(IpEntry, "a network such as 10.7.0.0/24 with no host bits set, geoip
 	IpEntry::Tunnel(tag) => format!("tunnel:{tag}"),
 });
 
+/// One network that may connect to a tunnel. An address alone is the network of that one address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Source(pub IpNet);
+
+text_value!(Source, "an address such as 192.0.2.1 or a network such as 192.0.2.0/24 with no host bits set", "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$", |s| if s.contains('/') {net(s, false).map(Source)} else {ip(s).map(|ip| Source(IpNet::from(ip)))}, |source| if source.0.prefix_len() == source.0.max_prefix_len() {source.0.addr().to_string()} else {source.0.to_string()});
+
 /// An inbound's gateway address with the prefix of its pool. The host part is the gateway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GatewayNet(pub IpNet);
@@ -535,6 +541,10 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_LINKS))]
 	pub links: Vec<Link>,
+	/// The ports of this node that are forwarded through a `chain` exit to an address on the far side of a node link, with no client.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_TUNNELS))]
+	pub tunnels: Vec<Tunnel>,
 	/// The Xray add-on: inbounds of Xray that carry the users listed in their `clients`. Off when the key is absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub xray: Option<Xray>,
@@ -1401,6 +1411,51 @@ impl Link {
 		let obfs = self.peer.as_ref().is_some_and(|peer| peer.transports.iter().any(|transport| transport.kind == LinkTransportType::UdpObfs)) || self.inbound.as_ref().is_some_and(|tag| inbounds.iter().any(|inbound| inbound.tag == *tag && inbound.enveloped()));
 		self.mtu.unwrap_or(if obfs {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})
 	}
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelProtocol {Tcp, Udp}
+
+/// A tunnel (node links page, "Tunnels"): one TCP or UDP port of this node forwarded to one address on the far side of a node link, through a `chain` exit, with no client.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Tunnel {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	/// Defaults to true. A tunnel that is not enabled is validated and does not listen.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub enabled: Option<bool>,
+	pub protocol: TunnelProtocol,
+	/// The address this node listens on. No other tunnel, inbound transport or listener of this node uses the same address, port and protocol.
+	pub listen: Addr,
+	/// The tag of a `chain` exit.
+	#[schemars(pattern(TAG_PATTERN))]
+	pub exit: String,
+	/// The address the far node is asked to reach. Not a link address, not inside an inbound pool of this node, and nothing the destination gate refuses. A private address works only when the far node set `allow_private` for the link.
+	pub target: Addr,
+	/// The networks that may connect. Without it, a tunnel that listens on an address that is not loopback is a warning.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_TUNNEL_SOURCES))]
+	pub sources: Option<Vec<Source>>,
+	/// TCP connections or UDP sessions at once. Defaults to 256. One client address holds at most 16.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = MAX_TUNNEL_CONNECTIONS))]
+	pub max_connections: Option<u32>,
+}
+
+impl Tunnel {
+	/// Whether this tunnel listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
+	/// `max_connections` in force.
+	pub fn limit(&self) -> u32 {self.max_connections.unwrap_or(DEFAULT_TUNNEL_CONNECTIONS)}
+
+	/// What a reload cannot change in a running tunnel without closing its connections: everything but `sources` and `max_connections`.
+	pub fn core(&self) -> Tunnel {Tunnel {enabled: Some(true), sources: None, max_connections: None, ..self.clone()}}
+
+	/// The tunnel with its defaults written out, so that two spellings of one tunnel are equal.
+	pub fn effective(&self) -> Tunnel {Tunnel {enabled: Some(self.on()), max_connections: Some(self.limit()), ..self.clone()}}
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]

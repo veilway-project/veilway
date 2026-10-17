@@ -560,7 +560,7 @@
       "oneOf": [
         {
           "const": "wireguard",
-          "description": "Plain WireGuard. Its gateway answers DNS and nothing else.",
+          "description": "Plain WireGuard. Its gateway answers DNS and ping, and nothing else.",
           "type": "string"
         },
         {
@@ -1486,6 +1486,11 @@
       ],
       "type": "object"
     },
+    "Source": {
+      "description": "an address such as 192.0.2.1 or a network such as 192.0.2.0/24 with no host bits set",
+      "pattern": "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$",
+      "type": "string"
+    },
     "Timestamp": {
       "description": "an RFC 3339 timestamp with an offset such as 2027-01-31T00:00:00Z",
       "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
@@ -1766,6 +1771,92 @@
     "TransportSecret": {
       "description": "a transport secret: 44 characters of standard base64 with padding",
       "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "type": "string"
+    },
+    "Tunnel": {
+      "additionalProperties": false,
+      "description": "A tunnel (node links page, \"Tunnels\"): one TCP or UDP port of this node forwarded to one address on the far side of a node link, through a `chain` exit, with no client.",
+      "properties": {
+        "enabled": {
+          "description": "Defaults to true. A tunnel that is not enabled is validated and does not listen.",
+          "type": "boolean"
+        },
+        "exit": {
+          "description": "The tag of a `chain` exit.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "listen": {
+          "$ref": "#/$defs/Addr",
+          "description": "The address this node listens on. No other tunnel, inbound transport or listener of this node uses the same address, port and protocol."
+        },
+        "max_connections": {
+          "description": "TCP connections or UDP sessions at once. Defaults to 256. One client address holds at most 16.",
+          "format": "uint32",
+          "maximum": 4096,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "protocol": {
+          "$ref": "#/$defs/TunnelProtocol"
+        },
+        "sources": {
+          "description": "The networks that may connect. Without it, a tunnel that listens on an address that is not loopback is a warning.",
+          "items": {
+            "$ref": "#/$defs/Source"
+          },
+          "maxItems": 64,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Addr",
+          "description": "The address the far node is asked to reach. Not a link address, not inside an inbound pool of this node, and nothing the destination gate refuses. A private address works only when the far node set `allow_private` for the link."
+        }
+      },
+      "required": [
+        "tag",
+        "protocol",
+        "listen",
+        "exit",
+        "target"
+      ],
+      "type": "object"
+    },
+    "TunnelProtocol": {
+      "enum": [
+        "tcp",
+        "udp"
+      ],
       "type": "string"
     },
     "UdpPolicy": {
@@ -2089,6 +2180,15 @@
     },
     "routing": {
       "$ref": "#/$defs/Routing"
+    },
+    "tunnels": {
+      "description": "The ports of this node that are forwarded through a `chain` exit to an address on the far side of a node link, with no client.",
+      "items": {
+        "$ref": "#/$defs/Tunnel"
+      },
+      "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
     },
     "users": {
       "items": {

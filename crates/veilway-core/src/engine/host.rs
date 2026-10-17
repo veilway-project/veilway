@@ -5,8 +5,8 @@ use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
 use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
-use super::{certificate, control, l3, link, obfs, replay, stream, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, Host as Named, Protocol, Tls, Transport, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::{certificate, control, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{loops, Certificate, Config, Host as Named, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
@@ -65,6 +65,9 @@ struct Running {tunnel: Arc<Tunnel>, _tasks: Vec<Task>, loopback: Option<(Socket
 /// One address `ws` transports listen on: the end its listener is told through, and the routes it serves, each with the path, the `tls` of its transport, its tunnel and the number that tells it from an earlier route.
 struct Relay {served: watch::Sender<Arc<ws::Served>>, routes: Vec<(String, Option<Tls>, Arc<Tunnel>, u64)>}
 
+/// A tunnel as it runs: the tunnel with its defaults written out, what it counts, the socket it listens on and the task that accepts on it, which takes every connection of the tunnel with it.
+struct Forward {config: Forwarded, links: Vec<String>, state: Arc<tunnel::State>, bound: tunnel::Bound, _task: Task}
+
 /// The l3 exit as it runs.
 pub struct Wired {wanted: l3::Wanted, port: l3::Port, queue: l3::Queue, pub running: l3::Running}
 
@@ -91,6 +94,8 @@ pub struct Host {
 	shapes: HashMap<String, ([u8; 32], [u8; 32], u16)>,
 	/// The task that dials each link, by the link's tag, with what it dials: the tunnel, the link's id and keys and secret, its MTU and the other node's transports. Anything else is a new task.
 	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64))>,
+	/// The tunnels of the config in force that are enabled, by tag.
+	forwards: HashMap<String, Forward>,
 }
 
 /// What `prepare` took for a config that is not in force yet. Dropping it gives all of it back.
@@ -109,6 +114,8 @@ pub struct Staged {
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
 	tunnels: Vec<(Arc<Tunnel>, IpStack, Receiver<Vec<u8>>)>,
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
+	/// The tunnels that are new or changed, with their defaults written out, each with the socket it listens on.
+	forwards: Vec<(Forwarded, tunnel::Bound)>,
 	l3: Option<Wired>,
 }
 
@@ -134,6 +141,11 @@ pub(super) async fn bind(addr: SocketAddr, kind: Type, released: bool) -> io::Re
 	}
 }
 
+/// The tags of the links of the `chain` exit a tunnel names, in the config's order. A change to them closes the tunnel's connections.
+fn chain_links(config: &Config, exit: &str) -> Vec<String> {
+	config.exits.iter().find(|candidate| candidate.tag == exit).and_then(|candidate| if let crate::config::Backend::Chain(chain) = &candidate.backend {Some(chain.links.clone())} else {None}).unwrap_or_default()
+}
+
 /// What tells the device of a flow that the flow was ended from the node's side, and the tunnel address it goes to: a reset for TCP, as from the host the device was talking to, and for UDP an ICMP error from the gateway.
 /// Other protocols have nothing at the device that an error without the packet it answers could end. None as well when the device no longer holds the address the flow came from.
 pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
@@ -156,7 +168,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new()}}
 
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
@@ -252,6 +264,22 @@ impl Host {
 				}
 			}
 		}
+		// Node links page, "Tunnels": one whose entry did not change keeps its listener. One that is new, or changed, binds its address now, or takes the socket of the one it replaces on the same address and protocol.
+		let mut forwards = Vec::new();
+		for (i, written) in config.tunnels.iter().enumerate().filter(|(_, written)| written.on()) {
+			let (written, udp) = (written.effective(), written.protocol == TunnelProtocol::Udp);
+			if self.forwards.get(&written.tag).is_some_and(|running| running.config.core() == written.core() && running.links == chain_links(config, &written.exit)) {continue}
+			let listen = written.listen.0;
+			let bound = match self.forwards.values().find(|running| running.config.listen == written.listen && running.config.protocol == written.protocol) {
+				Some(running) => running.bound.clone(),
+				None if udp => tunnel::Bound::Udp(Arc::new(bind(listen, Type::DGRAM, self.released.contains(&listen)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("tunnels[{i}].listen: tunnel `{}` cannot listen there over udp: {}", written.tag, e.kind()))?)),
+				None => tunnel::Bound::Tcp(Arc::new(bind(listen, Type::STREAM, self.released.contains(&listen)).await.and_then(|socket| {
+					socket.listen(1024)?;
+					TcpListener::from_std(socket.into())
+				}).map_err(|e| anyhow!("tunnels[{i}].listen: tunnel `{}` cannot listen there over tcp: {}", written.tag, e.kind()))?)),
+			};
+			forwards.push((written, bound));
+		}
 		// Return traffic finds its interface by the routes of the pools, and two interfaces cannot both have those. Telling them apart takes policy routing, which is not built.
 		let wanted = {
 			let mut wired = plan.exits.iter().enumerate().filter_map(|(at, exit)| if let Backend::L3 {interface, masquerade} = &exit.backend {Some((at, exit, interface, masquerade))} else {None});
@@ -307,12 +335,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, certified, tunnels: fresh, loopbacks, l3: staged})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, certified, tunnels: fresh, loopbacks, forwards, l3: staged})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, certified, tunnels, loopbacks, l3} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, certified, tunnels, loopbacks, forwards, l3} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -382,6 +410,31 @@ impl Host {
 			}
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).copied().collect();
+		// "A tunnel whose entry did not change keeps its connections. One that changed or went away closes its listener and its connections." The socket of a changed tunnel that keeps its address is handed on, so its address is not given back.
+		let named: Vec<Forwarded> = self.config.iter().flat_map(|config| &config.tunnels).filter(|written| written.on()).map(Forwarded::effective).collect();
+		let (mut stopped, current) = (Vec::new(), self.config.clone());
+		self.forwards.retain(|tag, running| {
+			let kept = named.iter().any(|written| written.core() == running.config.core() && current.as_ref().is_some_and(|config| chain_links(config, &written.exit) == running.links));
+			if !kept {stopped.push((tag.clone(), running.config.listen.0))}
+			kept
+		});
+		// A tunnel that only changed who may connect or how many is told, and closes what the change leaves out.
+		for written in &named {
+			if let Some(running) = self.forwards.get_mut(&written.tag).filter(|running| running.config != *written) {
+				running.state.retune(written);
+				running.config = written.clone();
+			}
+		}
+		for (written, bound) in forwards {
+			tracing::info!("tunnel {}: {} on {} to {} through exit {}, at most {} at once", written.tag, if written.protocol == TunnelProtocol::Udp {"udp"} else {"tcp"}, written.listen.0, plan.show(written.target.0), written.exit, written.limit());
+			let state = Arc::new(tunnel::State::new(&written));
+			self.forwards.insert(written.tag.clone(), Forward {links: current.as_ref().map(|config| chain_links(config, &written.exit)).unwrap_or_default(), config: written.clone(), state: state.clone(), bound: bound.clone(), _task: Task(tunnel::serve(shared, written, bound, state))});
+		}
+		for (tag, listen) in stopped {
+			if !self.forwards.values().any(|running| running.config.listen.0 == listen) {self.released.insert(listen);}
+			if !self.forwards.contains_key(&tag) {tracing::info!("tunnel {tag}: closed, with every connection it had")}
+		}
+		*shared.tunnels.lock().unwrap_or_else(|e| e.into_inner()) = self.config.iter().flat_map(|config| &config.tunnels).filter_map(|written| self.forwards.get(&written.tag).map(|running| (written.tag.clone(), running.state.clone()))).collect();
 		// A listener whose address the config still has is told what it serves now, and keeps every session whose transport is as it was. One whose address nobody has any more closes with everything it holds.
 		self.tls.retain(|addr, (listener, _)| match serving.remove(addr) {
 			Some(served) => {

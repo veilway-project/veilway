@@ -805,6 +805,8 @@ export interface components {
              */
             state_write_failures: number;
             stream: components["schemas"]["Stream"];
+            /** @description Every tunnel that runs, in the order of the config. A tunnel that a reload changed starts counting over. */
+            tunnels: components["schemas"]["TunnelStats"][];
             udp_obfs: components["schemas"]["UdpObfs"];
             users: components["schemas"]["Rated"][];
             /**
@@ -1070,6 +1072,64 @@ export interface components {
          * @enum {string}
          */
         Transport: "udp" | "ws" | "udp-obfs" | "tls" | "fronted";
+        /** @description What one tunnel counted since it started. Everything but `open` only grows. */
+        TunnelStats: {
+            /**
+             * Format: uint64
+             * @description TCP connections the far side did not open within 10 seconds or refused.
+             */
+            connect_failed: number;
+            /** Format: uint64 */
+            down_bytes: number;
+            /** Format: uint64 */
+            down_packets: number;
+            /**
+             * Format: uint64
+             * @description Packets from the link that a full queue or an unknown session could not take, and datagrams that did not fit the link.
+             */
+            dropped: number;
+            /** Format: uint64 */
+            idled: number;
+            /** @description The tag of the tunnel. */
+            name: string;
+            /** Format: uint */
+            open: number;
+            /**
+             * Format: uint64
+             * @description TCP connections or UDP sessions the tunnel took, and those open right now.
+             */
+            opened: number;
+            /** Format: uint64 */
+            refused_client: number;
+            /** Format: uint64 */
+            refused_down: number;
+            /** Format: uint64 */
+            refused_full: number;
+            /** Format: uint64 */
+            refused_limit: number;
+            /** Format: uint64 */
+            refused_rate: number;
+            /**
+             * Format: uint64
+             * @description Connections refused (TCP) and datagrams dropped (UDP): from an address in none of `sources`, past `max_connections`, past the 16 of one source, past 8 new ones a second for one source, while the `chain` exit was down, and for want of a translated port.
+             */
+            refused_sources: number;
+            /**
+             * Format: uint64
+             * @description TCP connections that a reset or the link going down ended, and those closed after an hour with no byte.
+             */
+            reset: number;
+            /**
+             * Format: uint64
+             * @description Bytes of the clients' own data towards the far side (up) and back (down).
+             */
+            up_bytes: number;
+            /**
+             * Format: uint64
+             * @description Inner IP packets sent into the link and taken out of it for the tunnel.
+             */
+            up_packets: number;
+        };
         /** @description What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key. */
         UdpObfs: {
             /** Format: uint64 */

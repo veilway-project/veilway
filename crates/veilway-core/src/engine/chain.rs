@@ -1,7 +1,7 @@
 //! The entry half of node links (node links page, "Translation at the entry"): an exit of the backend `chain`, which sends what is routed to it into a link and delivers only what answers a flow it sent.
 //! "The entry translates every flow to the link's address, as a home router does": the exit is given one address for the whole link, and never a user's tunnel address, key or name. The translation is a second index beside the flow table, bounded by it, and a flow keeps its translation for as long as the flow table keeps the flow.
 //! What comes back from the link is hostile: whoever runs the exit can send anything into its tunnel. A packet is delivered only to the device whose live flow it answers, rewritten back by that flow's translation, and everything else is dropped and counted.
-use super::{dns, flows};
+use super::{dns, flows, tunnel};
 use super::icmp::Kind;
 use super::netstack::{self, Fit, Packet, ECHO_REPLY_V4, ECHO_REPLY_V6, ECHO_REQUEST_V4, ECHO_REQUEST_V6};
 use super::obfs::Room;
@@ -14,7 +14,7 @@ use std::hash::{BuildHasher, Hasher, RandomState};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 /// "Translated ports and echo identifiers at the entry: 1024 to 65535, drawn at random."
 pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
@@ -40,8 +40,20 @@ const TOLD: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Far {link: [u8; 16], protocol: u8, remote: IpAddr, rport: u16, port: u16}
 
-/// Whose a translation is: a flow of a device, by its key, its echo identifier plus one (0 for anything but a ping) and the id of its entry in the flow table, with the device and the user an identifier past the flow's first is counted against (see `Flows::echo`), or a lookup of the node's own resolver, which waits for its one answer.
-enum Owner {Flow(Key, u32, u64, Option<([u8; 32], Arc<str>)>), Own(Option<oneshot::Sender<Vec<u8>>>)}
+/// Whose a translation is: a flow of a device, by its key, its echo identifier plus one (0 for anything but a ping) and the id of its entry in the flow table, with the device and the user an identifier past the flow's first is counted against (see `Flows::echo`), a lookup of the node's own resolver, which waits for its one answer,
+/// or a connection or session of a tunnel (node links page, "Tunnels"), which is handed every packet that answers it, whole, and gives its translation up itself with `forget`.
+enum Owner {Flow(Key, u32, u64, Option<([u8; 32], Arc<str>)>), Own(Option<oneshot::Sender<Vec<u8>>>), Tunnel(mpsc::Sender<Vec<u8>>, Arc<tunnel::State>)}
+
+/// What an answer from a link belongs to.
+#[derive(Debug, PartialEq, Eq)]
+enum Found {
+	/// A flow of a device: its key and echo identifier, with the id of its entry in the flow table.
+	Flow(Key, u32, u64),
+	/// A lookup of the node's own resolver, which was handed its answer.
+	Own,
+	/// A connection or session of a tunnel, which was handed the packet.
+	Tunnel,
+}
 
 struct Mapped {far: Far, owner: Owner, seen: Instant}
 
@@ -165,48 +177,64 @@ impl Nat {
 		Ok(far.port)
 	}
 
-	/// The flow an answer from `link` belongs to: its key and echo identifier, with the id of its entry in the flow table. A lookup of the node's own resolver is handed its answer here, `payload` being what came back, and gives None.
-	fn back(&self, link: [u8; 16], protocol: u8, remote: IpAddr, rport: u16, port: u16, payload: Option<&[u8]>) -> Option<(Key, u32, u64)> {
+	/// What an answer from `link` belongs to. A lookup of the node's own resolver is handed its answer here, `payload` being what came back, and a tunnel is handed the whole packet `whole`, which it reads itself: a full queue drops it, counted.
+	fn back(&self, link: [u8; 16], protocol: u8, remote: IpAddr, rport: u16, port: u16, payload: Option<&[u8]>, whole: &[u8]) -> Option<Found> {
 		let mut table = self.lock();
 		let far = Far {link, protocol, remote, rport, port};
 		let mapped = table.back.get_mut(&far)?;
 		mapped.seen = Instant::now();
 		match &mut mapped.owner {
-			Owner::Flow(key, ident, id, _) => Some((*key, *ident, *id)),
+			Owner::Flow(key, ident, id, _) => Some(Found::Flow(*key, *ident, *id)),
 			Owner::Own(waiting) => {
 				if let (Some(waiting), Some(payload)) = (waiting.take(), payload) {let _ = waiting.send(payload.to_vec());}
-				None
+				Some(Found::Own)
+			}
+			Owner::Tunnel(queue, state) => {
+				state.arrived(queue.try_send(whole.to_vec()).is_ok());
+				Some(Found::Tunnel)
 			}
 		}
 	}
 
-	/// A port for one lookup of the node's resolver through `link`, and where its answer comes. It is held until the answer has come or the lookup has given up, see `forget`.
-	fn own(&self, link: [u8; 16], server: SocketAddr) -> Option<(u16, oneshot::Receiver<Vec<u8>>)> {
-		let (mut table, now, (tell, told)) = (self.lock(), Instant::now(), oneshot::channel());
+	/// A port of `link` for something that waits for answers from `remote` over `protocol`, and holds it as `owner` until it is given up with `forget`. None when no port could be drawn or the table is full.
+	fn draw(&self, link: [u8; 16], protocol: u8, remote: SocketAddr, owner: Owner) -> Option<u16> {
+		let (mut table, now) = (self.lock(), Instant::now());
 		if table.back.len() >= MAPPED {return None}
 		for _ in 0..DRAWS {
 			let mut bytes = [0u8; 2];
 			random(&mut bytes).ok()?;
-			let far = Far {link, protocol: Protocol::UDP, remote: server.ip(), rport: server.port(), port: u16::from_be_bytes(bytes) % (PORTS.end() - PORTS.start() + 1) + PORTS.start()};
+			let far = Far {link, protocol, remote: remote.ip(), rport: remote.port(), port: u16::from_be_bytes(bytes) % (PORTS.end() - PORTS.start() + 1) + PORTS.start()};
 			if table.free(&far, now) {
-				table.back.insert(far, Mapped {far, owner: Owner::Own(Some(tell)), seen: now});
-				return Some((far.port, told));
+				table.back.insert(far, Mapped {far, owner, seen: now});
+				return Some(far.port);
 			}
 		}
 		None
 	}
 
-	fn forget(&self, link: [u8; 16], server: SocketAddr, port: u16) {self.lock().release(&Far {link, protocol: Protocol::UDP, remote: server.ip(), rport: server.port(), port}, Instant::now());}
+	/// A port for one lookup of the node's resolver through `link`, and where its answer comes. It is held until the answer has come or the lookup has given up, see `forget`.
+	fn own(&self, link: [u8; 16], server: SocketAddr) -> Option<(u16, oneshot::Receiver<Vec<u8>>)> {
+		let (tell, told) = oneshot::channel();
+		self.draw(link, Protocol::UDP, server, Owner::Own(Some(tell))).map(|port| (port, told))
+	}
+
+	/// "Source port: drawn from the entry's translation, from the same range and the same table as users' flows, with the same rest time." A port of `link` for a connection or session of a tunnel to `target`, which is handed every packet that answers it through `queue`.
+	pub(super) fn tunnel(&self, link: [u8; 16], protocol: u8, target: SocketAddr, queue: mpsc::Sender<Vec<u8>>, state: Arc<tunnel::State>) -> Option<u16> {self.draw(link, protocol, target, Owner::Tunnel(queue, state))}
+
+	/// Gives a translation up: the port rests, as the port of a flow that ended does.
+	pub(super) fn forget(&self, link: [u8; 16], protocol: u8, remote: SocketAddr, port: u16) {self.lock().release(&Far {link, protocol, remote: remote.ip(), rport: remote.port(), port}, Instant::now());}
 
 	/// Once a second: a translation goes with its flow, an echo identifier after it has been quiet, and a port at rest when its time is over.
 	pub fn sweep(&self, flows: &Flows) {
 		// The flow table is asked once, and under no lock of this table, which every packet of every link waits on. A translation made in between is not in `dead` and waits for the next sweep.
-		let owned: Vec<(Key, u64)> = self.lock().back.values().filter_map(|mapped| match mapped.owner {Owner::Flow(key, _, id, _) => Some((key, id)), Owner::Own(_) => None}).collect::<HashSet<_>>().into_iter().collect();
+		let owned: Vec<(Key, u64)> = self.lock().back.values().filter_map(|mapped| match mapped.owner {Owner::Flow(key, _, id, _) => Some((key, id)), Owner::Own(_) | Owner::Tunnel(..) => None}).collect::<HashSet<_>>().into_iter().collect();
 		let dead: HashSet<(Key, u64)> = owned.iter().zip(flows.held(&owned)).filter(|(_, held)| !held).map(|(flow, _)| *flow).collect();
 		let (mut table, now) = (self.lock(), Instant::now());
 		let gone: Vec<Far> = table.back.values().filter(|mapped| match mapped.owner {
 			Owner::Flow(key, ident, id, _) => dead.contains(&(key, id)) || (ident != 0 && now.saturating_duration_since(mapped.seen) > ECHO_IDLE),
 			Owner::Own(_) => now.saturating_duration_since(mapped.seen) > LOOKUP * 2,
+			// A tunnel gives its own up. One whose queue has no reader any more is one that was lost without doing so.
+			Owner::Tunnel(ref queue, _) => queue.is_closed(),
 		}).map(|mapped| mapped.far).collect();
 		let charged: Vec<([u8; 32], Arc<str>)> = gone.iter().filter_map(|far| table.release(far, now)).collect();
 		table.resting.retain(|_, until| *until > now);
@@ -222,7 +250,7 @@ impl Nat {
 	pub fn of(&self, link: &[u8; 16]) -> usize {self.lock().back.keys().filter(|far| far.link == *link).count()}
 
 	/// "For each link the entry hashes the flow together with the link's id and takes the link with the highest result."
-	fn rank(&self, key: &Key, link: &[u8; 16]) -> u64 {
+	pub(super) fn rank(&self, key: &Key, link: &[u8; 16]) -> u64 {
 		let mut hasher = self.spread.build_hasher();
 		hasher.write(&[key.protocol]);
 		for part in [key.src, key.dst] {
@@ -415,6 +443,15 @@ impl Shared {
 		true
 	}
 
+	/// One packet that a tunnel made, to go into link `link` behind `exit`: the fields that show where a packet came from are rewritten as for any packet sent into a link. The tunnel has chosen the link and holds the translated port, and sizes its packets to the link's MTU. False when it went nowhere.
+	pub(super) async fn tunnelled(&self, plan: &Plan, exit: usize, link: usize, mut raw: Vec<u8>) -> bool {
+		let Some(packet) = netstack::parse(&raw) else {return false};
+		fields(&mut raw, &packet);
+		let sent = self.into_link(plan, link, &raw).await;
+		if sent {plan.exits[exit].traffic.up(raw.len())}
+		sent
+	}
+
 	/// One packet of a flow of the device `from` that was routed to `exit`, a `chain` exit, in the order of the page: the flow's link, the translation, the size, the fields, and into the link. Usage was counted per user before any of it, when the packet came in.
 	#[allow(clippy::too_many_arguments)]
 	pub(super) async fn chained(self: &Arc<Self>, plan: &Arc<Plan>, from: Holder, mut raw: Vec<u8>, packet: &Packet, key: Key, id: u64, exit: usize) {
@@ -486,7 +523,7 @@ impl Shared {
 				None if quoted.sport == 0 && quoted.dport == 0 && !matches!(quoted.protocol, Protocol::TCP | Protocol::UDP | Protocol::SCTP) => (0, 0),
 				None => (quoted.dport, quoted.sport),
 			};
-			self.nat.back(of.id, quoted.protocol, quoted.dst, rport, port, None).map(|found| (found, Some(quoted)))
+			self.nat.back(of.id, quoted.protocol, quoted.dst, rport, port, None, &raw).map(|found| (found, Some(quoted)))
 		} else {
 			let (rport, port) = match packet.icmp {
 				Some((ECHO_REPLY_V4 | ECHO_REPLY_V6, 0)) => (0, u16::from_be_bytes([raw[packet.upper + 4], raw[packet.upper + 5]])),
@@ -495,9 +532,15 @@ impl Shared {
 			};
 			// The answer to a lookup of the node's own resolver ends here: it is handed to the lookup and goes to no device.
 			let payload = (packet.protocol == Protocol::UDP).then(|| &raw[packet.upper + 8..]);
-			self.nat.back(of.id, packet.protocol, packet.src, rport, port, payload).map(|found| (found, None))
+			self.nat.back(of.id, packet.protocol, packet.src, rport, port, payload, &raw).map(|found| (found, None))
 		};
-		let Some(((key, ident, id), quoted)) = found else {return lost(Reason::NoFlow)};
+		let ((key, ident, id), quoted) = match found {
+			Some((Found::Flow(key, ident, id), quoted)) => ((key, ident, id), quoted),
+			// Handed to a lookup of the node's resolver or to a tunnel, which count what they take themselves.
+			Some((Found::Own, _)) => return,
+			Some((Found::Tunnel, _)) => return if let Some(exit) = of.exit {plan.exits[exit].traffic.down(raw.len())},
+			None => return lost(Reason::NoFlow),
+		};
 		// The flow must still live as the entry the translation was made for, routed to the exit this link is behind, and its device must still hold the address it came from. An answer keeps the flow alive only while its device keeps sending on it, see `Flows::answered`.
 		let (Some((owner, Decision::Exit {exit, by: By::Backend})), Some(to)) = (self.flows.answered(&key, id, plan.generation), plan.by_address.get(&key.src).copied()) else {return lost(Reason::NoFlow)};
 		if Some(exit) != of.exit || plan.devices[to.device].public_key != owner {return lost(Reason::NoFlow)}
@@ -562,7 +605,7 @@ impl Shared {
 		let sent = built.is_ok() && raw.len() <= usize::from(of.mtu) && self.into_link(plan, link, &raw).await;
 		if sent {plan.exits[exit].traffic.up(query.len())}
 		let answer = if sent {tokio::time::timeout(LOOKUP, answer).await.ok().and_then(Result::ok)} else {None};
-		self.nat.forget(of.id, server, port);
+		self.nat.forget(of.id, Protocol::UDP, server, port);
 		let mut answer = answer.filter(|answer| flows::answers(&asked, answer))?;
 		answer.get_mut(..2)?.copy_from_slice(query.get(..2)?);
 		Some(answer)
@@ -724,7 +767,7 @@ mod tests {
 		assert_eq!((nat.of_flow(&key, 0, id, &flows), nat.of_flow(&key, 0, id + 1, &flows), nat.of(&[7; 16])), (Some(([7; 16], port)), None, 0));
 		let id = flows.insert(key, [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, Vec::new(), None, 0).unwrap();
 		let port = nat.map(&key, 0, id, [7; 16], true, &flows).unwrap();
-		assert_eq!((nat.back([7; 16], Protocol::UDP, key.dst, 443, port, None), nat.back([8; 16], Protocol::UDP, key.dst, 443, port, None), nat.back([7; 16], Protocol::UDP, key.dst, 444, port, None)), (Some((key, 0, id)), None, None));
+		assert_eq!((nat.back([7; 16], Protocol::UDP, key.dst, 443, port, None, &[]), nat.back([8; 16], Protocol::UDP, key.dst, 443, port, None, &[]), nat.back([7; 16], Protocol::UDP, key.dst, 444, port, None, &[])), (Some(Found::Flow(key, 0, id)), None, None));
 		// Without ports one flow holds the remote address under the protocol, and another flow is refused until it has gone.
 		let (gre, other) = (Key {protocol: 47, sport: 0, dport: 0, ..key}, Key {protocol: 47, sport: 0, dport: 0, src: "10.7.0.3".parse().unwrap(), ..key});
 		let held = flows.insert(gre, [1; 32], "a", Decision::Exit {exit: 0, by: By::Backend}, Vec::new(), None, 0).unwrap();
@@ -740,7 +783,7 @@ mod tests {
 		// The port of a flow that ended rests and is not drawn again for the same remote address and port.
 		flows.end(&[(key, id)], 0);
 		nat.sweep(&flows);
-		assert_eq!(nat.back([7; 16], Protocol::UDP, key.dst, 443, port, None), None);
+		assert_eq!(nat.back([7; 16], Protocol::UDP, key.dst, 443, port, None, &[]), None);
 		assert!(!nat.lock().free(&Far {link: [7; 16], protocol: Protocol::UDP, remote: key.dst, rport: 443, port}, Instant::now()));
 		assert!(nat.lock().free(&Far {link: [7; 16], protocol: Protocol::UDP, remote: key.dst, rport: 443, port}, Instant::now() + REST));
 	}

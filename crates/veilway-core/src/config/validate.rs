@@ -7,7 +7,7 @@ use base64::Engine;
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use veilway_proto::subscription::is_host;
 use veilway_proto::subscription::payload::dialable;
 use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
@@ -846,6 +846,39 @@ impl Config {
 				}
 			}
 		}
+		// Node links page, "Tunnels": a tunnel is on the entry half and names a `chain` exit. "No other tunnel, inbound transport or listener of this node uses the same address, port and protocol", and "the target is never a link address, an address of the entry's pools, or anything the destination gate refuses". A tunnel that is not enabled is held to all of it.
+		if self.tunnels.len() > MAX_TUNNELS {r.error("tunnels", format!("expected at most {MAX_TUNNELS} tunnels"))}
+		let tunnels = &self.tunnels[..self.tunnels.len().min(MAX_TUNNELS)];
+		tags(&mut r, "tunnels", tunnels.iter().map(|tunnel| tunnel.tag.as_str()));
+		let overlap = |a: SocketAddr, b: SocketAddr| a.port() == b.port() && a.is_ipv4() == b.is_ipv4() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified());
+		let link_addresses: HashSet<IpAddr> = links.iter().flat_map(|link| link.addresses.dialler.iter().chain(link.addresses.listener.iter().flatten())).map(|ip| ip.0).collect();
+		for (i, tunnel) in tunnels.iter().enumerate() {
+			let at = format!("tunnels[{i}]");
+			let udp = tunnel.protocol == TunnelProtocol::Udp;
+			let here = tunnel.listen.0;
+			if let Some((other, _)) = listeners.iter().find(|(_, other)| udp == other.datagram() && overlap(here, other.listen())) {r.error(format!("{at}.listen"), format!("conflicts with {other}: a tunnel never shares an address, port and protocol with a transport"))}
+			if let Some(xray) = self.xray.as_ref().filter(|_| !udp) {
+				if let Some(j) = xray.inbounds.iter().take(MAX_XRAY_INBOUNDS).position(|inbound| overlap(here, inbound.listen.0) || (inbound.listen.0.is_ipv6() && inbound.listen.0.ip().is_unspecified() && inbound.listen.0.port() == here.port())) {r.error(format!("{at}.listen"), format!("conflicts with xray.inbounds[{j}].listen: a tunnel never shares an address and port with a listener of the node"))}
+			}
+			if let Some(j) = tunnels[..i].iter().position(|other| other.protocol == tunnel.protocol && overlap(here, other.listen.0)) {r.error(format!("{at}.listen"), format!("conflicts with tunnels[{j}].listen: two tunnels never share an address, port and protocol"))}
+			match self.exits.iter().find(|exit| exit.tag == tunnel.exit).map(|exit| &exit.backend) {
+				None => r.error(format!("{at}.exit"), "expected the tag of an exit, found a tag no exit has"),
+				Some(Backend::Chain(_)) => {}
+				Some(_) => r.error(format!("{at}.exit"), "expected an exit with a chain backend: a tunnel leaves through a node link"),
+			}
+			let target = tunnel.target.0;
+			if listeners.iter().any(|(_, other)| overlap(target, other.listen())) || self.xray.iter().flat_map(|xray| &xray.inbounds).take(MAX_XRAY_INBOUNDS).any(|inbound| overlap(target, inbound.listen.0)) || tunnels.iter().any(|other| overlap(target, other.listen.0)) {r.error(format!("{at}.target"), "expected an address that is not a listen address of this node: the node would connect to itself")}
+			if link_addresses.contains(&target.ip()) {r.error(format!("{at}.target"), "expected an address that is not a link address: a link address is never a destination")} else if gate::refused(target.ip(), &pools) {r.error(format!("{at}.target"), "expected an address the destination gate lets through: not loopback, link-local, multicast, unspecified, nor inside an inbound pool of this node")}
+			match &tunnel.sources {
+				None if !here.ip().is_loopback() && udp => r.error(format!("{at}.sources"), "expected the networks that may get answers: a UDP tunnel on an address that is not loopback needs them, and a source address can be forged, so the target authenticates its own clients"),
+				None if !here.ip().is_loopback() => r.warning(format!("{at}.sources"), "anyone who reaches this address can connect to the target: list the networks that may connect, or listen on a loopback address behind a firewall or a proxy"),
+				Some(list) if list.is_empty() || list.len() > MAX_TUNNEL_SOURCES => r.error(format!("{at}.sources"), format!("expected 1 to {MAX_TUNNEL_SOURCES} networks")),
+				Some(list) => drop(index(&mut r, |j| format!("{at}.sources[{j}]"), list.iter().take(MAX_TUNNEL_SOURCES))),
+				None => {}
+			}
+			if tunnel.max_connections.is_some_and(|n| !(1..=MAX_TUNNEL_CONNECTIONS).contains(&n)) {r.error(format!("{at}.max_connections"), format!("expected an integer from 1 to {MAX_TUNNEL_CONNECTIONS}"))}
+		}
+		if tunnels.iter().map(|tunnel| u64::from(tunnel.limit())).sum::<u64>() > MAX_TUNNEL_TOTAL {r.error("tunnels", format!("expected the max_connections of all tunnels to come to at most {MAX_TUNNEL_TOTAL}: a quarter of the flow table, so that tunnels cannot fill the translation users' flows need"))}
 		r
 	}
 }

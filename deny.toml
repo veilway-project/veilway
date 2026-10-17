@@ -38,6 +38,8 @@ allow = [
 	"Unicode-3.0",
 	# webpki-roots: the Mozilla root certificate list, data rather than code.
 	"CDLA-Permissive-2.0",
+	# smoltcp: the userspace TCP of the tunnels.
+	"0BSD",
 ]
 
 # MPL-2.0 is file-level copyleft. It is accepted only for these unmodified desktop dependencies (all pulled in by tauri), not for the core.

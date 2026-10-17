@@ -20,6 +20,7 @@ pub mod replay;
 pub mod resolver;
 pub mod route;
 pub mod stream;
+pub mod tunnel;
 pub mod usage;
 pub mod xray;
 mod xray_owner;
@@ -30,6 +31,7 @@ pub mod xray_host;
 pub use control::ControlTotals;
 pub use obfs::ObfsTotals;
 pub use stream::StreamTotals;
+pub use tunnel::Totals as TunnelTotals;
 pub use plan::{Denied, Plan};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
@@ -344,12 +346,14 @@ pub struct Shared {
 	dialling: Arc<()>,
 	/// The self-signed certificates the node made for the `tls` listeners of the config in force, by listen address.
 	certificates: Mutex<Vec<certificate::Made>>,
+	/// The tunnels that run, in the order of the config, with what each counts.
+	tunnels: Mutex<Vec<(String, Arc<tunnel::State>)>>,
 }
 
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default()}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -626,6 +630,9 @@ impl Engine {
 
 	/// What the stream listeners did since start, and the connections and sessions they hold right now.
 	pub fn stream(&self) -> StreamTotals {self.shared.stream.totals()}
+
+	/// Every tunnel that runs, in the order of the config, with what it counted since it started. A tunnel that a reload changed starts counting over.
+	pub fn tunnels(&self) -> Vec<(String, TunnelTotals)> {self.shared.tunnels.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(tag, state)| (tag.clone(), state.totals())).collect()}
 
 	/// The self-signed certificates the node made for its `tls` listeners, each with the pin a profile carries for it.
 	pub fn certificates(&self) -> Vec<certificate::Made> {self.shared.certificates.lock().unwrap_or_else(|e| e.into_inner()).clone()}

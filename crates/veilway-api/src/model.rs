@@ -349,6 +349,8 @@ pub struct Stats {
 	/// Datagrams the node made for a device and no socket took, over every transport of every inbound. A socket of a `veilway` inbound never fragments, so a packet larger than the host's interface carries is counted here and not sent: lower the inbound's `mtu` when this grows.
 	pub send_failed: u64,
 	pub control: Control,
+	/// Every tunnel that runs, in the order of the config. A tunnel that a reload changed starts counting over.
+	pub tunnels: Vec<TunnelStats>,
 	pub udp_obfs: UdpObfs,
 	pub stream: Stream,
 	/// The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory.
@@ -465,6 +467,36 @@ impl From<veilway_core::StreamTotals> for Stream {
 			proxy_http10: totals.proxy_http10, forwards_redialed: totals.forwards_redialed, origin_dropped: totals.origin_dropped,
 		}
 	}
+}
+
+/// What one tunnel counted since it started. Everything but `open` only grows.
+#[derive(Serialize, JsonSchema)]
+pub struct TunnelStats {
+	/// The tag of the tunnel.
+	pub name: String,
+	/// TCP connections or UDP sessions the tunnel took, and those open right now.
+	pub opened: u64,
+	pub open: usize,
+	/// Connections refused (TCP) and datagrams dropped (UDP): from an address in none of `sources`, past `max_connections`, past the 16 of one source, past 8 new ones a second for one source, while the `chain` exit was down, and for want of a translated port.
+	pub refused_sources: u64,
+	pub refused_limit: u64,
+	pub refused_client: u64,
+	pub refused_rate: u64,
+	pub refused_down: u64,
+	pub refused_full: u64,
+	/// TCP connections the far side did not open within 10 seconds or refused.
+	pub connect_failed: u64,
+	/// TCP connections that a reset or the link going down ended, and those closed after an hour with no byte.
+	pub reset: u64,
+	pub idled: u64,
+	/// Packets from the link that a full queue or an unknown session could not take, and datagrams that did not fit the link.
+	pub dropped: u64,
+	/// Bytes of the clients' own data towards the far side (up) and back (down).
+	pub up_bytes: u64,
+	pub down_bytes: u64,
+	/// Inner IP packets sent into the link and taken out of it for the tunnel.
+	pub up_packets: u64,
+	pub down_packets: u64,
 }
 
 /// What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key.

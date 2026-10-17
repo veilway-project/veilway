@@ -124,6 +124,8 @@ pub struct Diff {
 	pub users: Changes,
 	/// Node links, by tag. A link whose `enabled` is left out and one that writes true are the same link.
 	pub links: Changes,
+	/// Tunnels, by tag. A tunnel with its defaults left out and the same with them written out are the same tunnel.
+	pub tunnels: Changes,
 	pub dns: bool,
 	pub log: bool,
 	pub routing_default: bool,
@@ -218,6 +220,7 @@ impl Diff {
 			rules: changes(&old.routing.rules, &new.routing.rules, |rule| rule.tag.as_str(), |was, is| was == is || Rule {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Rule {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
 			users,
 			links: changes(&old.links, &new.links, |link| link.tag.as_str(), |was, is| was == is || Link {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Link {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
+			tunnels: changes(&old.tunnels, &new.tunnels, |tunnel| tunnel.tag.as_str(), |was, is| was.effective() == is.effective()),
 			dns: old.dns.servers != new.dns.servers || old.dns.hijack.unwrap_or(true) != new.dns.hijack.unwrap_or(true) || old.dns.sets != new.dns.sets,
 			// `level` and `destinations` are read with their defaults, so `Log` already holds effective values.
 			log: old.log != new.log,

@@ -1474,6 +1474,13 @@
           "stream": {
             "$ref": "#/components/schemas/Stream"
           },
+          "tunnels": {
+            "description": "Every tunnel that runs, in the order of the config. A tunnel that a reload changed starts counting over.",
+            "items": {
+              "$ref": "#/components/schemas/TunnelStats"
+            },
+            "type": "array"
+          },
           "udp_obfs": {
             "$ref": "#/components/schemas/UdpObfs"
           },
@@ -1515,6 +1522,7 @@
           "state_write_failures",
           "send_failed",
           "control",
+          "tunnels",
           "udp_obfs",
           "stream",
           "replay"
@@ -2070,6 +2078,122 @@
           "fronted"
         ],
         "type": "string"
+      },
+      "TunnelStats": {
+        "description": "What one tunnel counted since it started. Everything but `open` only grows.",
+        "properties": {
+          "connect_failed": {
+            "description": "TCP connections the far side did not open within 10 seconds or refused.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "down_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "down_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dropped": {
+            "description": "Packets from the link that a full queue or an unknown session could not take, and datagrams that did not fit the link.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idled": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The tag of the tunnel.",
+            "type": "string"
+          },
+          "open": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "opened": {
+            "description": "TCP connections or UDP sessions the tunnel took, and those open right now.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_client": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_down": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_full": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_limit": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_rate": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused_sources": {
+            "description": "Connections refused (TCP) and datagrams dropped (UDP): from an address in none of `sources`, past `max_connections`, past the 16 of one source, past 8 new ones a second for one source, while the `chain` exit was down, and for want of a translated port.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reset": {
+            "description": "TCP connections that a reset or the link going down ended, and those closed after an hour with no byte.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_bytes": {
+            "description": "Bytes of the clients' own data towards the far side (up) and back (down).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_packets": {
+            "description": "Inner IP packets sent into the link and taken out of it for the tunnel.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "name",
+          "opened",
+          "open",
+          "refused_sources",
+          "refused_limit",
+          "refused_client",
+          "refused_rate",
+          "refused_down",
+          "refused_full",
+          "connect_failed",
+          "reset",
+          "idled",
+          "dropped",
+          "up_bytes",
+          "down_bytes",
+          "up_packets",
+          "down_packets"
+        ],
+        "type": "object"
       },
       "UdpObfs": {
         "description": "What the `udp-obfs` transports did since start, and what they hold right now. Everything but `pending`, `sessions` and `tags` only grows. A datagram that is dropped gets no answer whatever the reason, and no reason holds an address, a tag or a key.",

@@ -52,6 +52,14 @@ pub const MAX_LINKS: usize = 64;
 pub const MAX_CHAIN_LINKS: usize = 4;
 pub const DEFAULT_LINK_FLOWS: u32 = 16384;
 pub const MAX_LINK_FLOWS: u32 = 65536;
+/// Node links page, "Tunnels": at most 64 tunnels, 1 to 64 networks in `sources`, `max_connections` 1 to 4096 with 256 by default, and "at most 16 of them for one client address".
+pub const MAX_TUNNELS: usize = 64;
+pub const MAX_TUNNEL_SOURCES: usize = 64;
+pub const MAX_TUNNEL_CONNECTIONS: u32 = 4096;
+pub const DEFAULT_TUNNEL_CONNECTIONS: u32 = 256;
+pub const TUNNEL_PER_CLIENT: usize = 16;
+/// "The `max_connections` of all tunnels together come to at most 16,384, a quarter of the flow table."
+pub const MAX_TUNNEL_TOTAL: u64 = 16384;
 /// The endpoints or candidates of one transport a link dials, and the pins of one candidate, as a profile of a subscription has them.
 pub const MAX_LINK_CANDIDATES: usize = 16;
 pub const MAX_LINK_PINS: usize = 4;
