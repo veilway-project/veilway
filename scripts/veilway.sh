@@ -691,7 +691,7 @@ panel_config() {
 	local f="$CONF_DIR/panel.json" prefix
 	if [ "$DRY" = 1 ]; then dry "write $f (loopback 127.0.0.1:$PANEL_PORT, random prefix, keys and database under $PANEL_DIR)"; return 0; fi
 	[ -f "$f" ] && { info "kept existing $f"; return 0; }
-	prefix="/p-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	prefix="/$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 	cat >"$f" <<EOF
 {
 	"listen": "127.0.0.1:$PANEL_PORT",
@@ -754,7 +754,7 @@ do_panel_prefix() {
 	need_root
 	[ -f "$f" ] || die "no panel is installed: $f is missing"
 	old="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"; sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
-	[ -n "$new" ] || new="/p-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	[ -n "$new" ] || new="/$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
 	[[ "$new" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$new" != *//* && "$new" != *..* ]] || die "the path must start with /, end without one, and hold only letters, digits, -, _, . and /"
 	[[ "$new" != "$sub" && "$new/" != "$sub/"* && "$sub/" != "$new/"* ]] || die "the path must not be, sit inside or hold the subscription path $sub"
 	[ "$new" != "$old" ] || die "the admin pages are already at $new"
