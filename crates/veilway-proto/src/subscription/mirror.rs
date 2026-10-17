@@ -75,7 +75,7 @@ pub fn live(now: u64) -> Vec<u64> {
 pub fn host_key(base: &Url) -> String {format!("{}#static", base.authority())}
 
 /// The file name for `epoch`: `mirror_id` in lowercase hexadecimal, then `.bin`. The file URL is `base_url` followed by it, with nothing between.
-pub fn file_name(keys: &MirrorKeys, base_url: &str, epoch: u64) -> String {
+pub fn file_name(keys: &MirrorKeys, base_url: impl AsRef<[u8]>, epoch: u64) -> String {
 	let mut name: String = keys.id(epoch, base_url).iter().map(|byte| format!("{byte:02x}")).collect();
 	name.push_str(".bin");
 	name
@@ -97,12 +97,12 @@ pub fn time_limit(length: Option<usize>) -> Duration {
 	})
 }
 
-fn key_and_aad(keys: &MirrorKeys, base_url: &str, epoch: u64, salt: &[u8; 32]) -> (crate::keys::ChunkKey, Vec<u8>) {
+fn key_and_aad(keys: &MirrorKeys, base_url: impl AsRef<[u8]>, epoch: u64, salt: &[u8; 32]) -> (crate::keys::ChunkKey, Vec<u8>) {
 	(keys.file(salt), [MIRROR_FILE, &keys.id(epoch, base_url)].concat())
 }
 
 /// The file of one device for one period on the static mirror of `base_url`, of `size` bytes (one of `SIZES`): the panel's side. `envelope` is the signed document as the endpoint would answer, without `usage`, or a signed refusal. The salt is drawn here from `random` and is never reused, so each write has a key of its own and the zero nonce is used once per key.
-pub fn seal(keys: &MirrorKeys, base_url: &str, epoch: u64, size: usize, envelope: &[u8], random: &mut Random) -> Result<Vec<u8>, SealError> {
+pub fn seal(keys: &MirrorKeys, base_url: impl AsRef<[u8]>, epoch: u64, size: usize, envelope: &[u8], random: &mut Random) -> Result<Vec<u8>, SealError> {
 	let capacity = capacity(size).ok_or(SealError::Size)?;
 	if envelope.is_empty() || envelope.len() > capacity {return Err(SealError::Envelope)}
 	let mut salt = [0; 32];
@@ -117,7 +117,7 @@ pub fn seal(keys: &MirrorKeys, base_url: &str, epoch: u64, size: usize, envelope
 }
 
 /// "How the client opens a file", steps 1 to 3, in order: the size first, then the seal, then the length and the zeros. The envelope it gives back goes to `Held::refresh_static`, which runs the rest.
-pub fn open(keys: &MirrorKeys, base_url: &str, epoch: u64, body: &[u8]) -> Result<Vec<u8>, OpenError> {
+pub fn open(keys: &MirrorKeys, base_url: impl AsRef<[u8]>, epoch: u64, body: &[u8]) -> Result<Vec<u8>, OpenError> {
 	let capacity = capacity(body.len()).ok_or(OpenError::Size)?;
 	let salt: [u8; 32] = body[..32].try_into().expect("a file holds its salt");
 	let (key, aad) = key_and_aad(keys, base_url, epoch, &salt);

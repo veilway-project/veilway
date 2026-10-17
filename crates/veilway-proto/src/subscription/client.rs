@@ -11,7 +11,7 @@
 //! What stays the caller's: asking the user, choosing how a request travels ("When a fetch happens"), sending a request to nothing but `Held::endpoints`, never following a redirect, and keeping a `Stored` where the platform keeps secrets.
 //!
 //! **What is stored is trusted as the link is.** A `Stored` holds the keys a subscription is verified under, so whoever can write the client's storage chooses the keys, the document and where the token goes. `Held::restore` checks that a stored value holds together. It cannot check that it is the one that was stored.
-use super::{envelope::{self, EnvelopeError, Fingerprint, SigningKey}, exchange::GatewayKey, fetch::{DeviceName, Op, Request}, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, mirror::{self, OpenError}, payload::{self, Fault, Id, KeyOrigin, MainEndpoint, Payload, PayloadError, Reason, Refresh, Refusal, Subscription}, DeviceSecret, Kind, Secret, Url, BODY_MAX, CARRIED_MAX, LINK_URL_MAX};
+use super::{bundle, envelope::{self, EnvelopeError, Fingerprint, SigningKey}, exchange::GatewayKey, fetch::{DeviceName, Op, Request}, legacy::{self, Headers, LegacyError, List}, link::{Carried, Legacy, Link, Native}, mirror::{self, OpenError}, payload::{self, Fault, Id, KeyOrigin, MainEndpoint, Payload, PayloadError, Reason, Refresh, Refusal, Subscription}, DeviceSecret, Kind, Secret, Url, BODY_MAX, CARRIED_MAX, LINK_URL_MAX};
 use crate::{keys::MirrorKeys, proof, uniform, NoRandom, Random};
 use std::{collections::HashSet, fmt, net::IpAddr, time::Duration};
 
@@ -671,6 +671,14 @@ impl Held {
 	pub fn refresh_static(&mut self, target: &StaticTarget, body: &[u8], now: u64) -> Result<Refreshed, Failure> {
 		let keys = self.mirror_keys().ok_or(Failure::Mirror(OpenError::Seal))?;
 		let envelope = mirror::open(&keys, target.base.as_str(), target.epoch, body).map_err(Failure::Mirror)?;
+		self.refresh(&envelope, now)
+	}
+	/// The name of this device's file in the pack of `bundle_id` for `epoch` (offline bundle page, "Broadcast"): the same `mirror_id` as on a static mirror, with the bundle's base. `None` for a subscription that came as a whole document.
+	pub fn bundle_name(&self, bundle_id: &[u8; 16], epoch: u64) -> Option<[u8; 16]> {self.mirror_keys().map(|keys| keys.id(epoch, bundle::base(bundle_id)))}
+	/// `refresh_static` for the file of a bundle's pack: opened as a static file is, then its envelope goes through `refresh`, so every rule of an answer applies.
+	pub fn refresh_bundle(&mut self, bundle_id: &[u8; 16], epoch: u64, body: &[u8], now: u64) -> Result<Refreshed, Failure> {
+		let keys = self.mirror_keys().ok_or(Failure::Mirror(OpenError::Seal))?;
+		let envelope = mirror::open(&keys, bundle::base(bundle_id), epoch, body).map_err(Failure::Mirror)?;
 		self.refresh(&envelope, now)
 	}
 	pub fn standing(&self, now: u64) -> Standing {if now < self.subscription.expires_at {Standing::Current} else if now - self.subscription.expires_at <= GRACE {Standing::OutOfDate} else {Standing::Stale}}

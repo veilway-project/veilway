@@ -564,7 +564,7 @@ fn severity(members: Members) -> Option<Severity> {
 }
 
 // "`severity` (`"info"` or `"warning"`) and `text` (display text, cut to 280 bytes)."
-fn notice(members: Members) -> Option<Notice> {Some(Notice {severity: severity(members)?, text: text(members, "text", false, usize::MAX, NOTICE_MAX).ok()??})}
+pub(crate) fn notice(members: Members) -> Option<Notice> {Some(Notice {severity: severity(members)?, text: text(members, "text", false, usize::MAX, NOTICE_MAX).ok()??})}
 
 fn card(members: Members) -> Option<Card> {
 	let label = || text(members, "label", false, LABEL, 4 * LABEL).ok().flatten();

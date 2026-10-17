@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 mod client;
+mod bundle;
 mod doctor;
 mod link;
 #[cfg(unix)]
@@ -118,6 +119,27 @@ enum Command {
 	Bridge {#[command(subcommand)] command: Bridge},
 	/// Pair a node link with another node: one command on each node, which each print the entry for that node's config once both operators have compared the fingerprint
 	Link {#[command(subcommand)] command: Link},
+	/// Make an offline bundle from parts that are already signed, or inspect one the way an app's review does
+	Bundle {#[command(subcommand)] command: Bundle},
+}
+
+#[derive(Subcommand)]
+enum Bundle {
+	/// Write a bundle. Each --app is PLATFORM=ARTIFACT:SIGNATURE (the release signature file, whose trusted comment gives the version and the name), each --pack is PERIODS=FILE with the periods the pack names, and each --notice is a signed notice. The signing key file holds the 32 byte seed in base64 and must be mode 600
+	Make {
+		#[arg(long)] key: PathBuf,
+		#[arg(long)] out: PathBuf,
+		/// The id of the bundle, 32 lowercase hex digits. Required with --pack, since a pack is sealed for one bundle id; without packs a random id is drawn
+		#[arg(long)] bundle_id: Option<String>,
+		#[arg(long = "app")] apps: Vec<String>,
+		#[arg(long = "pack")] packs: Vec<String>,
+		#[arg(long = "notice")] notices: Vec<PathBuf>,
+	},
+	/// Check a bundle and print what an app would list. Exit status: 0 it verifies, 1 it is refused. --key adds a provider's public key (32 bytes of base64) to the release keys
+	Inspect {
+		file: PathBuf,
+		#[arg(long = "key")] keys: Vec<String>,
+	},
 }
 
 #[derive(Subcommand)]
@@ -434,6 +456,8 @@ async fn main() -> anyhow::Result<()> {
 		}
 		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, transports, mtu, lifetime}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, &transports, mtu, lifetime)),
 		Command::Link {command: Link::Answer {config, tag}} => std::process::exit(link::answer(&config, &tag)),
+		Command::Bundle {command: Bundle::Make {key, out, bundle_id, apps, packs, notices}} => bundle::make(&key, &out, bundle_id.as_deref(), &apps, &packs, &notices),
+		Command::Bundle {command: Bundle::Inspect {file, keys}} => std::process::exit(if bundle::inspect(&file, &keys)? {0} else {1}),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Connect(args) => client::connect(args).await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]

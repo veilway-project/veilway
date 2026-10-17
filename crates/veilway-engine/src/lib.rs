@@ -17,6 +17,7 @@ mod channel;
 pub use channel::{Event as ChannelEvent, Reader};
 mod engine;
 pub mod lan;
+pub mod bundle;
 pub mod import;
 /// Public with the `fuzz` feature, for the fuzz targets that feed it bytes.
 #[cfg(feature = "fuzz")]

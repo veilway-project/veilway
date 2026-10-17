@@ -83,6 +83,8 @@ impl SigningKey {
 	pub fn fingerprint(&self) -> Fingerprint {Fingerprint(std::array::from_fn(|index| digest(&SHA256, &self.0).as_ref()[index]))}
 	/// "The header is one exact byte string per key", "with the members in this order and no white space".
 	pub fn header(&self) -> String {format!("{{\"alg\":\"EdDSA\",\"typ\":\"veilway-sub+jws\",\"kid\":\"{}\"}}", self.kid().text())}
+	/// The header of a notice in an offline bundle (offline bundle page, "Who signs what"), which no subscription document carries.
+	pub(crate) fn notice_header(&self) -> String {format!("{{\"alg\":\"EdDSA\",\"typ\":\"veilway-bundle-notice+jws\",\"kid\":\"{}\"}}", self.kid().text())}
 }
 
 // A public key is no secret, but 32 raw bytes in a log line help nobody: the fingerprint is what a user and a provider compare.
@@ -126,21 +128,26 @@ pub(crate) fn canonical(part: &[u8]) -> bool {
 
 /// Steps 1 to 3 of "What is checked, in order": `document` is within `limit` (`BODY_MAX` for an answer and a file, `CARRIED_MAX` for a link) and has exactly three well encoded parts, the first part is the header of a key in `held`, and the signature verifies under that key over the first two parts and the dot between them, "exactly as they were delivered".
 /// Until the signature has verified, the payload part is looked at only as far as its characters go. It is decoded after that, and it is parsed by whoever takes the `Verified`.
-pub fn verify(document: &[u8], held: &[SigningKey], limit: usize) -> Result<Verified, EnvelopeError> {
+pub fn verify(document: &[u8], held: &[SigningKey], limit: usize) -> Result<Verified, EnvelopeError> {verify_as(document, held, limit, SigningKey::header)}
+
+/// `verify` for a document whose header is `header` of each held key: the same steps, for another kind of JWS.
+pub(crate) fn verify_as(document: &[u8], held: &[SigningKey], limit: usize, header: fn(&SigningKey) -> String) -> Result<Verified, EnvelopeError> {
 	if document.len() > limit {return Err(EnvelopeError::Size)}
 	let mut parts = document.split(|byte| *byte == b'.');
-	let (Some(header), Some(payload), Some(signature), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {return Err(EnvelopeError::Parts)};
-	if !canonical(header) || !canonical(payload) {return Err(EnvelopeError::Encoding)}
+	let (Some(first), Some(payload), Some(signature), None) = (parts.next(), parts.next(), parts.next(), parts.next()) else {return Err(EnvelopeError::Parts)};
+	if !canonical(first) || !canonical(payload) {return Err(EnvelopeError::Encoding)}
 	let signature: [u8; 64] = std::str::from_utf8(signature).ok().and_then(unsealed).ok_or(EnvelopeError::Encoding)?;
 	// Two held keys can share a key id only if the provider made them so. Each key the header names is tried.
-	let mut named = held.iter().filter(|key| sealed(key.header().as_bytes()).as_bytes() == header).peekable();
+	let mut named = held.iter().filter(|key| sealed(header(key).as_bytes()).as_bytes() == first).peekable();
 	if named.peek().is_none() {return Err(EnvelopeError::UnknownKey)}
 	// "The second half of the signature must be below the group order." `ring` refuses it as well, which a test shows. It is checked here too, so that the rule does not rest on one library's reading of it.
-	let below = signature[32..].iter().rev().zip(ORDER.iter().rev()).find(|(byte, order)| byte != order).is_some_and(|(byte, order)| byte < order);
-	let signed = &document[..header.len() + 1 + payload.len()];
-	let signer = named.find(|key| below && UnparsedPublicKey::new(&ED25519, key.0).verify(signed, &signature).is_ok()).ok_or(EnvelopeError::Signature)?;
+	let signed = &document[..first.len() + 1 + payload.len()];
+	let signer = named.find(|key| below(&signature) && UnparsedPublicKey::new(&ED25519, key.0).verify(signed, &signature).is_ok()).ok_or(EnvelopeError::Signature)?;
 	Ok(Verified {payload: URL_SAFE_NO_PAD.decode(payload).map_err(|_| EnvelopeError::Encoding)?, signer: *signer})
 }
+
+/// "The second half of the signature must be below the group order." Shared with the bundle's manifest signature.
+pub(crate) fn below(signature: &[u8; 64]) -> bool {signature[32..].iter().rev().zip(ORDER.iter().rev()).find(|(byte, order)| byte != order).is_some_and(|(byte, order)| byte < order)}
 
 /// Writes a document: the header of `key`, `payload` and what `sign` gives for the bytes a signature covers. This is the provider's side, and the side of every test. The private key stays with the caller, whose `sign` is Ed25519 as RFC 8032 defines it.
 pub fn seal(key: &SigningKey, payload: &[u8], sign: impl FnOnce(&[u8]) -> [u8; 64]) -> String {

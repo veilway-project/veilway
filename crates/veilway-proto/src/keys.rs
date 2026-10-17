@@ -290,7 +290,7 @@ impl MirrorKeys {
 	/// `k_name` and `k_mirror`, in that order, for the storage that seals them.
 	pub fn expose(&self) -> (&[u8; 32], &[u8; 32]) {(&self.name, &self.key)}
 	/// `mirror_id` = HKDF-Expand(`k_name`, `"veilway v1 sub mirror id" || be64(epoch) || base_url`, 16): the name of the device's file for that period on the static mirror of `base_url`, exactly as the document's string holds it.
-	pub fn id(&self, epoch: u64, base_url: &str) -> [u8; 16] {expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.name), &[MIRROR_ID, &epoch.to_be_bytes(), base_url.as_bytes()])}
+	pub fn id(&self, epoch: u64, base_url: impl AsRef<[u8]>) -> [u8; 16] {expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.name), &[MIRROR_ID, &epoch.to_be_bytes(), base_url.as_ref()])}
 	/// `k_file` = HKDF-Expand(`k_mirror`, `"veilway v1 sub mirror seal" || salt`, 32): the key of one write of a file, used once.
 	pub(crate) fn file(&self, salt: &[u8; 32]) -> ChunkKey {ChunkKey::new(&expand(&hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &self.key), &[MIRROR_SEAL, salt]))}
 }

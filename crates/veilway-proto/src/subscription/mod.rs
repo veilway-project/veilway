@@ -9,6 +9,7 @@ use payload::dialable;
 use std::{fmt, net::IpAddr};
 use subtle::ConstantTimeEq;
 
+pub mod bundle;
 pub mod client;
 pub mod envelope;
 pub mod exchange;
