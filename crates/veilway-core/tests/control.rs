@@ -1121,9 +1121,9 @@ async fn the_node_sends_a_device_no_segment_larger_than_it_announced() {
 	let mut fits = Tcp::open_with(&mut a, A.into(), PUBLIC.into(), 40602, 7000, Some(1240)).await.unwrap();
 	assert_eq!((fits.take(&mut a, 6004).await.len(), fits.sizes.iter().max()), (6004, Some(&1280)));
 	assert!(a.inbox.iter().all(|packet| packet[0] != 0x45 || u16::from_be_bytes([packet[6], packet[7]]) & 0x3fff == 0), "a fragment was sent");
-	// An option that asks for a segment smaller than any host must take is not followed below that size.
+	// An option that asks for a segment smaller than 88 bytes, Linux's floor, is not followed below it.
 	let mut tiny = Tcp::open_with(&mut a, A.into(), PUBLIC.into(), 40603, 7000, Some(1)).await.unwrap();
-	assert_eq!((tiny.take(&mut a, 6004).await.len(), tiny.sizes.iter().max()), (6004, Some(&576)));
+	assert_eq!((tiny.take(&mut a, 6004).await.len(), tiny.sizes.iter().max()), (6004, Some(&128)));
 }
 
 #[test]

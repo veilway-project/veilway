@@ -783,6 +783,12 @@ async fn tcp_main_logic_loop(
                         PacketType::Invalid => {}
                     }
                 } else if flags == (ACK | FIN) {
+                    // veilway patch: a gap filled by a late segment can release more than one handoff moves (8192 bytes), and
+                    // those bytes sit before the FIN. Hand them over first, or the ACK below lands in the middle of them and
+                    // the reader reaches end of stream without them.
+                    if let Some(data) = tcb.consume_unordered_packets(usize::MAX) {
+                        data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
+                    }
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
                     tcb.increase_ack();
                     write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
@@ -1091,4 +1097,69 @@ pub(crate) fn create_raw_packet(
         transport: TransportHeader::Tcp(tcp_header),
         payload: Some(payload),
     })
+}
+
+// veilway patch: tests for the patches in this file.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const PEER: &str = "10.0.0.2:12345";
+    const LOCAL: &str = "10.0.0.1:80";
+
+    fn peer_segment(seq: u32, ack: u32, flags: u8, payload: &[u8]) -> NetworkPacket {
+        create_raw_packet(PEER.parse().unwrap(), LOCAL.parse().unwrap(), |_, _| usize::MAX, flags, TTL, seq, ack, u16::MAX, payload.to_vec(), None).unwrap()
+    }
+
+    /// Opens a connection with the given SYN options, completes the handshake and returns the stream, the device receiver and the stack's next sequence number.
+    async fn established(options: &[TcpOptionElement]) -> (IpStackTcpStream, PacketReceiver, u32) {
+        let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+        let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+        syn.syn = true;
+        syn.set_options(options).unwrap();
+        let stream = IpStackTcpStream::new(PEER.parse().unwrap(), LOCAL.parse().unwrap(), syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+        let local_seq = match up_rx.recv().await.unwrap().transport_header() {
+            TransportHeader::Tcp(header) => header.sequence_number + 1,
+            _ => panic!("the stack wrote a packet that is not TCP"),
+        };
+        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, &[])).unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
+        (stream, up_rx, local_seq)
+    }
+
+    /// A gap filled by a late segment releases more contiguous bytes than one handoff moves (8192), and the FIN follows
+    /// before the next packet could move the rest: every byte still reaches the reader before end of stream.
+    #[tokio::test]
+    async fn bytes_left_after_a_gap_fill_are_read_before_end_of_stream() {
+        let (mut stream, _up_rx, local_seq) = established(&[]).await;
+        let mut sent = Vec::new();
+        for i in 0..7u8 {
+            let chunk = vec![i + 1; 1460];
+            stream.stream_sender().send(peer_segment(1011 + i as u32 * 1460, local_seq, ACK, &chunk)).unwrap();
+            sent.push(chunk);
+        }
+        stream.stream_sender().send(peer_segment(1001, local_seq, ACK, &[0; 10])).unwrap();
+        stream.stream_sender().send(peer_segment(1011 + 7 * 1460, local_seq, ACK | FIN, &[])).unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+        let mut read = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut read)).await.expect("no end of stream").unwrap();
+        assert_eq!(read, [vec![vec![0u8; 10]], sent].concat().concat(), "bytes were lost before end-of-stream");
+    }
+
+    /// RFC 9293 3.7.1: a segment never carries more payload than the MSS the peer announced in its SYN, and an announced
+    /// MSS below 88 (Linux's TCP_MIN_MSS) is read as 88.
+    #[tokio::test]
+    async fn segments_stay_within_the_peers_mss() {
+        for (announced, expected) in [(600, 600), (100, 100), (40, 88)] {
+            let (mut stream, mut up_rx, _) = established(&[TcpOptionElement::MaximumSegmentSize(announced)]).await;
+            assert_eq!(stream.write(&[7; 1460]).await.unwrap(), expected, "peer MSS {announced}: wrong write size");
+            assert_eq!(up_rx.recv().await.unwrap().payload.map(|p| p.len()), Some(expected));
+        }
+    }
 }

@@ -100,10 +100,10 @@ impl Tcb {
     }
 
     /// veilway patch: takes the MSS option of the peer's SYN. RFC 9293 3.7.1: a sender never sends a segment larger than the
-    /// peer announced. Below 536, the size every host takes, the option is not followed further, so a peer cannot ask for
-    /// its data one byte a packet.
+    /// peer announced. Below 88, the floor Linux applies (TCP_MIN_MSS), the option is not followed further, so a peer cannot
+    /// ask for its data one byte a packet.
     pub(super) fn set_peer_mss(&mut self, mss: u16) {
-        self.peer_mss = mss.max(536);
+        self.peer_mss = mss.max(88);
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
