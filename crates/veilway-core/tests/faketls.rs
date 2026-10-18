@@ -877,7 +877,8 @@ async fn a_site_that_cannot_be_reached_closes_strangers_with_no_answer_and_serve
 		listener.local_addr().unwrap()
 	};
 	let node = launch("down", time, |doc| doc["inbounds"][0]["transports"][0]["site"]["address"] = json!(gone.to_string())).await;
-	let (answer, closed) = ask(node.addr, b"GET / HTTP/1.1\r\n\r\n", SECOND).await;
+	// On Windows the node learns that the site refuses only after the SYN retries, so the stranger is closed seconds later.
+	let (answer, closed) = ask(node.addr, b"GET / HTTP/1.1\r\n\r\n", if cfg!(windows) {Duration::from_secs(12)} else {SECOND}).await;
 	assert!(answer.is_empty() && closed);
 	eventually("the site was not counted as down", || node.totals().site_down == 1).await;
 	assert!(logged("its site cannot be reached"));
