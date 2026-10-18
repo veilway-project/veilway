@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/veilway-project/veilway/main/scripts/veilway.sh | sudo bash
 #   sudo bash veilway.sh                      interactive menu
 #   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
-#   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx]   also set up a web server with HTTPS and a decoy site
+#   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx] [--https-port 443]   also set up a web server with HTTPS and a decoy site
 #   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
 #   sudo bash veilway.sh update [node|panel|mirror|both]
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
@@ -18,7 +18,7 @@
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>,
 #          --allow-downgrade (install a --version older than the installed one),
 #          --mirror <url> (repeatable, https only; tried in order, then GitHub), --mirror-only (never fall back to GitHub),
-#          --domain <name> and --web caddy|nginx (install panel and both)
+#          --domain <name>, --web caddy|nginx and --https-port <port> (install panel and both; default 443, else the panel is at https://name:port/<prefix>/)
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
 # comment must read "veilway <tag> <asset>" for the node and "veilway-panel <tag> <asset>" for the panel.
@@ -84,7 +84,9 @@ MIRROR_ONLY=0
 WANT_VERSION=""
 DOMAIN=""
 WEB=""
-NODE_443=0
+HTTPS_PORT=""
+HTTPS_HOST=""
+NODE_HTTPS=0
 TAG_OUT=""
 TMP=""
 MIRRORS=()
@@ -800,7 +802,7 @@ EOF
 }
 
 panel_summary() {
-	local token="" prefix="/panel" sub="/sub" i lines=()
+	local token="" prefix="/panel" sub="/sub" i from to moved lines=()
 	if [ -f "$CONF_DIR/panel.json" ]; then
 		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
 		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
@@ -814,13 +816,14 @@ panel_summary() {
 	fi
 	printf '\n'
 	if [ -n "$DOMAIN" ]; then
-		lines=("Admin pages: https://$DOMAIN$prefix/")
+		lines=("Admin pages: https://$HTTPS_HOST$prefix/")
 		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
 		lines+=("Open the admin pages in a browser and paste the token there." "It asks for your username, password and the terms." "")
 		lines+=("Web server: $WEB, site file $([ "$WEB" = caddy ] && echo "$CADDY_SITE" || echo "$NGINX_SITE")")
 		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site is $WEB_ROOT/index.html: edit it as you like." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
 		if [ "$WEB" = caddy ]; then lines+=("  Caddy gets and renews the certificate for $DOMAIN by itself."); else lines+=("  certbot renews the certificate with its own timer."); fi
-		if [ "$(web_state node_443_moved)" = 1 ]; then lines+=("The node's TCP transports moved from 443 to 8443: publish the profiles again."); fi
+		lines+=("  Port 80 must stay reachable: the certificate is checked over it.")
+		moved="$(web_state node_moved)"; [ -n "$moved" ] || [ -z "$(web_state node_443_moved)" ] || moved="443 8443"; if [ -n "$moved" ]; then read -r from to <<<"$moved"; lines+=("The node's TCP transports moved from $from to $to: publish the profiles again."); fi
 		lines+=("Remove it all with: sudo bash veilway.sh uninstall web")
 		box "Panel" "${lines[@]}"
 		return 0
@@ -851,11 +854,12 @@ panel_summary() {
 
 # Moves the admin pages to a new path, a random one or the one given. The web server in front has to follow, so its new lines are printed; a panel that does not come back up gets the old path again.
 do_panel_prefix() {
-	local f="$CONF_DIR/panel.json" new="${1:-}" old sub
+	local f="$CONF_DIR/panel.json" new="${1:-}" old sub host="your-domain" port
 	need_root
 	[ -f "$f" ] || die "no panel is installed: $f is missing"
 	old="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"; sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
 	[ -n "$new" ] || new="/$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+	port="$(web_state https_port)"; [ -z "$port" ] || [ "$port" = 443 ] || host+=":$port"
 	[[ "$new" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$new" != *//* && "$new" != *..* ]] || die "the path must start with /, end without one, and hold only letters, digits, -, _, . and /"
 	[[ "$new" != "$sub" && "$new/" != "$sub/"* && "$sub/" != "$new/"* ]] || die "the path must not be, sit inside or hold the subscription path $sub"
 	[ "$new" != "$old" ] || die "the admin pages are already at $new"
@@ -871,7 +875,7 @@ do_panel_prefix() {
 		die "the panel did not start with $new, so it is back at $old: see sudo journalctl -u veilway-panel"
 	fi
 	step "the admin pages are now at $new"
-	box "Panel path" "Change the path in your web server's config, then reload it:" "" "  nginx:  location ~ ^($new|$sub)(/|\$) {" "  Caddy:  reverse_proxy $new/* 127.0.0.1:$PANEL_PORT" "" "Admin pages: https://your-domain$new/"
+	box "Panel path" "Change the path in your web server's config, then reload it:" "" "  nginx:  location ~ ^($new|$sub)(/|\$) {" "  Caddy:  reverse_proxy $new/* 127.0.0.1:$PANEL_PORT" "" "Admin pages: https://$host$new/"
 }
 
 pick_component() {
@@ -898,11 +902,18 @@ do_install() {
 		fi
 	fi
 	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || die "--web needs --domain"
+	[ -z "$HTTPS_PORT" ] || [ -n "$DOMAIN" ] || die "--https-port needs --domain"
 	if [ -n "$DOMAIN" ]; then
 		DOMAIN="${DOMAIN,,}"
 		[[ "$DOMAIN" =~ $DOMAIN_RE ]] || die "\"$DOMAIN\" is not a domain name: use something like panel.example.com"
 		WEB="${WEB:-caddy}"
 		[ "$WEB" = caddy ] || [ "$WEB" = nginx ] || die "--web is caddy or nginx"
+		HTTPS_PORT="${HTTPS_PORT:-$(web_state https_port)}"; HTTPS_PORT="${HTTPS_PORT:-443}"
+		[[ "$HTTPS_PORT" =~ ^[0-9]{1,5}$ ]] && [ "$((10#$HTTPS_PORT))" -ge 1 ] && [ "$((10#$HTTPS_PORT))" -le 65535 ] || die "--https-port must be a port from 1 to 65535"
+		HTTPS_PORT=$((10#$HTTPS_PORT))
+		[ "$HTTPS_PORT" != 80 ] || die "port 80 cannot be the HTTPS port: the certificate is checked over port 80"
+		[ "$HTTPS_PORT" != "$PANEL_PORT" ] || die "port $PANEL_PORT is the panel's own port on 127.0.0.1: pick another --https-port"
+		HTTPS_HOST="$DOMAIN"; [ "$HTTPS_PORT" = 443 ] || HTTPS_HOST+=":$HTTPS_PORT"
 		web_preflight
 	fi
 	[ "$DRY" = 1 ] || { TMP="$(mktemp -d)"; install -d -m 0755 "$STATE_DIR" 2>/dev/null || true; }
@@ -1411,26 +1422,26 @@ web_pkg() {
 	web_note pkgs "$(web_state pkgs) ${new[*]}"
 }
 
-# Run before anything is installed: finds out what already holds ports 80 and 443 and stops with an explanation when the setup would take them from someone. The node on 443 is the one case it works around, see web_free_443.
+# Run before anything is installed: finds out what already holds ports 80 and the HTTPS port and stops with an explanation when the setup would take them from someone. The node on the HTTPS port is the one case it works around, see web_free_https.
 web_preflight() {
 	local s p out held="" other="" same=0
-	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports 80 and 443"
+	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports 80 and $HTTPS_PORT"
 	has apt-get || die "the automatic web server setup runs on Debian or Ubuntu: it needs apt-get. Install a web server by hand with the snippets that the install prints, or run this without --domain."
 	for s in nginx caddy apache2 httpd lighttpd haproxy; do
 		if ! has_systemd || ! systemctl is-active --quiet "$s.service" 2>/dev/null; then continue; fi
 		if [ "$s" = "$WEB" ]; then same=1; else other+="${other:+, }$s"; fi
 	done
-	for p in 80 443; do
+	for p in 80 "$HTTPS_PORT"; do
 		out="$(ss -H -ltnp "sport = :$p" 2>/dev/null || true)"
 		[ -n "$out" ] || continue
-		if [ "$p" = 443 ] && grep -q '"veilway"' <<<"$out"; then NODE_443=1
+		if [ "$p" = "$HTTPS_PORT" ] && grep -q '"veilway"' <<<"$out"; then NODE_HTTPS=1
 		elif ! grep -q "\"$WEB\"" <<<"$out"; then held+="${held:+, }$p"; fi
 	done
 	if [ -n "$other" ] || [ -n "$held" ]; then
 		box "A web server is already here" \
 			"${other:+Running: $other}" \
 			"${held:+TCP port(s) in use by something else: $held}" \
-			"Two programs cannot share ports 80 and 443, and this script will not stop" \
+			"Two programs cannot share ports 80 and $HTTPS_PORT, and this script will not stop" \
 			"or replace a server it did not install. Either add the panel to your own" \
 			"server by hand (run without --domain for the snippets), or stop that server" \
 			"and run this again."
@@ -1440,40 +1451,42 @@ web_preflight() {
 		warn "$WEB already runs here. Your own configuration stays as it is: this only adds the panel's site file$([ "$WEB" = caddy ] && echo " and one import line")."
 		confirm "Add the panel's site to the running $WEB?" || die "cancelled, nothing was changed"
 	fi
-	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow ports 80 and 443 (sudo ufw allow 80,443/tcp) or the certificate and the site cannot be reached"; fi
+	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow ports 80 and $HTTPS_PORT (sudo ufw allow 80,$HTTPS_PORT/tcp) or the certificate and the site cannot be reached"; fi
 	getent hosts "$DOMAIN" >/dev/null 2>&1 || warn "$DOMAIN does not resolve yet: the certificate needs its DNS record to point at this server"
 	return 0
 }
 
-# The node keeps a tls transport on 443 for its users, and the web server needs 443 for HTTPS. The safe default: the web server takes 443 and the node's TCP transports on 443 move to 8443. The node cannot share 443 with the web server without reading the web server's certificate files, which its sandbox and their owner both forbid, so that design was not built. Profiles that name port 443 stop working until they are published again in the panel.
-web_free_443() {
-	local f="$NODE_DIR/config.json" old new sel='(.inbounds[]?.transports[]? | select((.type | IN("udp", "udp-obfs") | not) and ((.listen // "") | test(":443$"))))'
-	if [ "$DRY" = 1 ]; then dry "if the node listens on TCP 443: move its transports there to 8443 in $f, check the config and restart the node"; return 0; fi
-	[ "$NODE_443" = 1 ] || return 0
+# The node may keep a TCP transport on the HTTPS port for its users, and the web server needs that port for HTTPS. The safe default: the web server takes the port and the node's TCP transports on it move to 8443 (8444 when the port is 8443). The node cannot share the port with the web server without reading the web server's certificate files, which its sandbox and their owner both forbid, so that design was not built. Profiles that name the port stop working until they are published again in the panel.
+web_free_https() {
+	# shellcheck disable=SC2016
+	local f="$NODE_DIR/config.json" old new move_to=8443 sel='(.inbounds[]?.transports[]? | select((.type | IN("udp", "udp-obfs") | not) and ((.listen // "") | endswith($p))))'
+	[ "$HTTPS_PORT" != 8443 ] || move_to=8444
+	if [ "$DRY" = 1 ]; then dry "if the node listens on TCP $HTTPS_PORT: move its transports there to $move_to in $f, check the config and restart the node"; return 0; fi
+	[ "$NODE_HTTPS" = 1 ] || return 0
 	web_pkg jq
 	old="$(as_node_user cat "$f")" || die "cannot read $f"
-	[ "$(jq "[$sel] | length" <<<"$old")" -gt 0 ] || die "the node listens on 443 with something this script cannot move: move it by hand, then run this again. Nothing was changed."
-	[ -z "$(ss -H -ltn 'sport = :8443')" ] || die "port 8443 is in use here, so the node's transport cannot move there: free it or move the transport by hand. Nothing was changed."
-	warn "the node's transport on 443 has to move: the web server needs 443 for HTTPS"
-	confirm "Move the node's TCP transports from port 443 to 8443? Profiles that name 443 stop working until you publish them again in the panel." || die "cancelled, nothing was changed"
-	new="$(jq "($sel | .listen) |= sub(\":443\$\"; \":8443\")" <<<"$old")"
+	[ "$(jq --arg p ":$HTTPS_PORT" "[$sel] | length" <<<"$old")" -gt 0 ] || die "the node listens on $HTTPS_PORT with something this script cannot move: move it by hand, then run this again. Nothing was changed."
+	[ -z "$(ss -H -ltn "sport = :$move_to")" ] || die "port $move_to is in use here, so the node's transport cannot move there: free it or move the transport by hand. Nothing was changed."
+	warn "the node's transport on $HTTPS_PORT has to move: the web server needs $HTTPS_PORT for HTTPS"
+	confirm "Move the node's TCP transports from port $HTTPS_PORT to $move_to? Profiles that name $HTTPS_PORT stop working until you publish them again in the panel." || die "cancelled, nothing was changed"
+	new="$(jq --arg p ":$HTTPS_PORT" --arg m ":$move_to" "($sel | .listen) |= (rtrimstr(\$p) + \$m)" <<<"$old")"
 	backup_file "$f"
 	( umask 077; printf '%s\n' "$new" | as_node_user tee "$f.new" >/dev/null )
 	as_node_user mv -f "$f.new" "$f"
 	as_node_user chmod 0600 "$f"
 	if ! run_check; then
 		printf '%s\n' "$old" | as_node_user tee "$f" >/dev/null
-		die "the node's config did not pass its check with 8443, so the old one is back"
+		die "the node's config did not pass its check with $move_to, so the old one is back"
 	fi
 	svc restart veilway.service
 	sleep 2
-	if [ -n "$(ss -H -ltnp 'sport = :443' | grep '"veilway"' || true)" ]; then
+	if [ -n "$(ss -H -ltnp "sport = :$HTTPS_PORT" | grep '"veilway"' || true)" ]; then
 		printf '%s\n' "$old" | as_node_user tee "$f" >/dev/null
 		svc restart veilway.service
-		die "the node still holds 443 after the move, so its old config is back. Move its listener by hand."
+		die "the node still holds $HTTPS_PORT after the move, so its old config is back. Move its listener by hand."
 	fi
-	web_note node_443_moved 1
-	step "moved the node's TCP transports from 443 to 8443"
+	web_note node_moved "$HTTPS_PORT $move_to"
+	step "moved the node's TCP transports from $HTTPS_PORT to $move_to"
 }
 
 # Written once and never over an edit: the operator owns the page.
@@ -1550,7 +1563,7 @@ web_caddy() {
 	if [ "${VEILWAY_CADDY_TLS:-}" = internal ]; then tls=$'\n\ttls internal'; fi
 	write_unit "$CADDY_SITE" <<EOF
 # Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
-$DOMAIN {$tls
+$HTTPS_HOST {$tls
 	handle $prefix/* {
 		reverse_proxy 127.0.0.1:$PANEL_PORT
 	}
@@ -1570,7 +1583,7 @@ EOF
 		fi
 	else svc reload caddy.service; fi
 	web_note web caddy
-	[ "$DRY" = 1 ] || step "Caddy serves $DOMAIN: the panel at $prefix and $sub, the plain site everywhere else"
+	[ "$DRY" = 1 ] || step "Caddy serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"
 }
 
 web_nginx() {
@@ -1581,8 +1594,8 @@ web_nginx() {
 		act rm -f /etc/nginx/sites-enabled/default
 		web_note nginx_default_removed 1
 	fi
-	if [ -n "$cert" ]; then tls="	listen 443 ssl;
-	listen [::]:443 ssl;
+	if [ -n "$cert" ]; then tls="	listen $HTTPS_PORT ssl;
+	listen [::]:$HTTPS_PORT ssl;
 	ssl_certificate ${cert%%:*};
 	ssl_certificate_key ${cert#*:};"
 	else tls="	# certbot adds the https part here"; fi
@@ -1614,12 +1627,13 @@ EOF
 		if [ "$fresh" = 1 ] || ! systemctl is-active --quiet nginx.service; then svc enable nginx.service; svc restart nginx.service; else svc reload nginx.service; fi
 	else svc reload nginx.service; fi
 	web_note web nginx
-	[ "$DRY" = 1 ] || step "nginx serves $DOMAIN: the panel at $prefix and $sub, the plain site everywhere else"
+	[ "$DRY" = 1 ] || step "nginx serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"
 	[ -z "$cert" ] || return 0
-	if [ "$DRY" = 1 ]; then dry "certbot --nginx -d $DOMAIN, with an https redirect"; return 0; fi
+	if [ "$DRY" = 1 ]; then dry "certbot --nginx -d $DOMAIN --https-port $HTTPS_PORT, with an https redirect"; return 0; fi
 	web_note certbot_domain "$DOMAIN"
-	if certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then step "certbot issued the certificate for $DOMAIN and turned on https"
-	else warn "certbot could not get a certificate (the DNS record must point at this server and port 80 must be reachable). The site answers on http only until you run: sudo certbot --nginx -d $DOMAIN"; fi
+	if certbot --nginx -d "$DOMAIN" --https-port "$HTTPS_PORT" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then step "certbot issued the certificate for $DOMAIN and turned on https"
+		[ "$HTTPS_PORT" = 443 ] || { sed -i "s|return 301 https://\$host\$request_uri;|return 301 https://\$host:$HTTPS_PORT\$request_uri;|" "$NGINX_SITE"; svc reload nginx.service; }
+	else warn "certbot could not get a certificate (the DNS record must point at this server and port 80 must be reachable). The site answers on http only until you run: sudo certbot --nginx -d $DOMAIN --https-port $HTTPS_PORT"; fi
 }
 
 # The panel answers every path it does not serve with its not_found, and the web server's own 404 answers the rest of the site. They have to be the same bytes, or the panel's paths can be told apart.
@@ -1640,13 +1654,14 @@ web_not_found() {
 # Sets up the web server for the panel's domain: packages, the site file, the plain site, the panel's not_found. It runs before the panel is restarted, so the restart picks up not_found.
 web_setup() {
 	local f="$CONF_DIR/panel.json" prefix="/panel" sub="/sub"
-	step "web server ($WEB) for $DOMAIN"
+	step "web server ($WEB) for $HTTPS_HOST"
 	if [ -f "$f" ]; then
 		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"
 		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
 	fi
 	web_note domain "$DOMAIN"
-	web_free_443
+	web_note https_port "$HTTPS_PORT"
+	web_free_https
 	web_pkg jq
 	web_decoy
 	if [ "$WEB" = caddy ]; then web_caddy "$prefix" "$sub"; else web_nginx "$prefix" "$sub"; fi
@@ -1655,11 +1670,11 @@ web_setup() {
 
 # Takes back what web_setup recorded in $WEB_STATE: the site file, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
 do_uninstall_web() {
-	local web domain p sha pkgs rest
+	local web domain p sha pkgs rest port from to moved
 	need_root
 	[ -f "$WEB_STATE" ] || die "no web server setup by this script is recorded here"
-	web="$(web_state web)"; domain="$(web_state domain)"; pkgs="$(web_state pkgs)"
-	confirm "Remove the web server setup for $domain ($web): its site file, the plain site if it is unchanged, the panel's not_found${pkgs:+, and the packages ${pkgs# }}?" || die "cancelled"
+	web="$(web_state web)"; domain="$(web_state domain)"; pkgs="$(web_state pkgs)"; port="$(web_state https_port)"
+	confirm "Remove the web server setup for $domain ($web on port ${port:-443}): its site file, the plain site if it is unchanged, the panel's not_found${pkgs:+, and the packages ${pkgs# }}?" || die "cancelled"
 	case "$web" in
 		caddy)
 			act rm -f -- "$CADDY_SITE"
@@ -1693,7 +1708,7 @@ do_uninstall_web() {
 		act rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 		[ "$DRY" = 1 ] || apt-get update -qq >/dev/null 2>&1 || true
 	fi
-	[ "$(web_state node_443_moved)" != 1 ] || warn "the node's TCP transports stay on 8443: move them back in the panel if you want 443"
+	moved="$(web_state node_moved)"; [ -n "$moved" ] || [ -z "$(web_state node_443_moved)" ] || moved="443 8443"; if [ -n "$moved" ]; then read -r from to <<<"$moved"; warn "the node's TCP transports stay on $to: move them back in the panel if you want $from"; fi
 	act rm -f -- "$WEB_STATE"
 	[ "$DRY" = 1 ] || step "web server setup removed"
 }
@@ -1723,6 +1738,8 @@ main() {
 			--domain=*) DOMAIN="${1#*=}" ;;
 			--web) [ $# -gt 1 ] || die "--web needs caddy or nginx"; WEB="$2"; shift ;;
 			--web=*) WEB="${1#*=}" ;;
+			--https-port) [ $# -gt 1 ] || die "--https-port needs a port number"; HTTPS_PORT="$2"; shift ;;
+			--https-port=*) HTTPS_PORT="${1#*=}" ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
 			-h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
