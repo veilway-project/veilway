@@ -778,7 +778,7 @@ fn egress_never_dials_directly(){
 				continue;
 			}
 			// A file's own unit tests dial their in-test servers; only the code above them runs on a node.
-			let whole=std::fs::read_to_string(&path).unwrap();
+			let whole=std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
 			let text=whole.split("#[cfg(test)]\nmod tests").next().unwrap_or_default();
 			// The only TcpStream dial allowed for a user's traffic is the control connection to the proxy itself, and the only other
 			// sockets that reach out belong to the `direct` outbound, which lives in one file.
