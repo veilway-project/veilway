@@ -134,7 +134,8 @@ pub fn install(addons: &Path, archive: &Path, pin: &Pin) -> anyhow::Result<PathB
 	}
 	#[cfg(unix)]
 	fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
-	File::open(&staged)?.sync_all()?;
+	// Windows flushes a file only through a handle that can write.
+	OpenOptions::new().write(true).open(&staged)?.sync_all()?;
 	let installed = folder.join(name);
 	#[cfg(target_os = "macos")]
 	immutable(&installed, false)?;
