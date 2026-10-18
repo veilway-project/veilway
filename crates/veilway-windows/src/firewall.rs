@@ -44,6 +44,8 @@ pub enum Cond {
 	Protocol(u8),
 	/// The program that runs this code, by the identity the engine gives its executable.
 	App,
+	/// A program at this path, by the identity the engine gives that file: the Xray add-on.
+	Program(String),
 	/// The port on this side. DHCP is told from other datagrams to port 67 by it.
 	LocalPort(u16),
 	/// The adapter the connection would leave by, by its LUID.
@@ -68,6 +70,8 @@ pub struct Rules {
 	pub lan: Vec<IpNet>,
 	/// The user asked for names on the local network: mDNS and LLMNR are let through with the LAN.
 	pub local_names: bool,
+	/// The path of the Xray add-on's executable, for a legacy profile: the connections to the nodes are then that program's only, and this program's own are not let out to them.
+	pub xray: Option<String>,
 }
 
 impl Rules {
@@ -79,7 +83,7 @@ impl Rules {
 			for accept in [false, true] {
 				add("loopback", v6, accept, true, W_TOP, vec![Cond::Remote(if v6 {"::1/128"} else {"127.0.0.0/8"}.parse().unwrap())]);
 				if let Some(luid) = self.tun {add("the tunnel", v6, accept, true, W_TOP, vec![Cond::Interface(luid)])}
-				for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, accept, true, W_TOP, vec![Cond::App, Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())])}
+				for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, accept, true, W_TOP, vec![self.xray.clone().map_or(Cond::App, Cond::Program), Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())])}
 				if !accept {for protocol in [UDP, TCP] {add("names", v6, accept, false, W_NAMES, vec![Cond::Protocol(protocol), Cond::RemotePort(53)])}}
 				// mDNS, LLMNR and NetBIOS tell whoever listens which names this device asks for, on any network and not only a LAN that was let through.
 				if !self.local_names {for port in LOCAL_NAMES {add("local names", v6, accept, false, W_NAMES, vec![Cond::Protocol(UDP), Cond::RemotePort(port)])}}
@@ -184,8 +188,10 @@ mod wfp {
 	struct AppId(*mut FWP_BYTE_BLOB);
 
 	impl AppId {
-		fn of_this_program() -> io::Result<Self> {
-			let path = wide(&std::env::current_exe()?.to_string_lossy());
+		fn of_this_program() -> io::Result<Self> {Self::of_path(&std::env::current_exe()?.to_string_lossy())}
+
+		fn of_path(path: &str) -> io::Result<Self> {
+			let path = wide(path);
 			let mut blob: *mut FWP_BYTE_BLOB = null_mut();
 			// SAFETY: `path` is a null-terminated wide string that lives through the call, and `blob` is a live local the call writes a pointer to.
 			check(unsafe {FwpmGetAppIdFromFileName0(path.as_ptr(), &mut blob)})?;
@@ -203,9 +209,9 @@ mod wfp {
 
 	/// The values a filter's conditions point at, which live until the filter is added.
 	#[allow(dead_code)]
-	enum Held {V4(Box<FWP_V4_ADDR_AND_MASK>), V6(Box<FWP_V6_ADDR_AND_MASK>), Luid(Box<u64>)}
+	enum Held {V4(Box<FWP_V4_ADDR_AND_MASK>), V6(Box<FWP_V6_ADDR_AND_MASK>), Luid(Box<u64>), Program(AppId)}
 
-	fn condition(cond: &Cond, app: &AppId, held: &mut Vec<Held>) -> FWPM_FILTER_CONDITION0 {
+	fn condition(cond: &Cond, app: &AppId, held: &mut Vec<Held>) -> io::Result<FWPM_FILTER_CONDITION0> {
 		// SAFETY: a zeroed condition is a valid empty one (null pointers, zero enums), and every field that matters is set below.
 		let mut out: FWPM_FILTER_CONDITION0 = unsafe {std::mem::zeroed()};
 		out.matchType = FWP_MATCH_EQUAL;
@@ -242,6 +248,13 @@ mod wfp {
 				out.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
 				out.conditionValue.Anonymous.byteBlob = app.0;
 			}
+			Cond::Program(path) => {
+				let program = AppId::of_path(path)?;
+				out.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+				out.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
+				out.conditionValue.Anonymous.byteBlob = program.0;
+				held.push(Held::Program(program));
+			}
 			Cond::LocalPort(port) => {
 				out.fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
 				out.conditionValue.r#type = FWP_UINT16;
@@ -255,12 +268,12 @@ mod wfp {
 				held.push(Held::Luid(value));
 			}
 		}
-		out
+		Ok(out)
 	}
 
 	fn add_filter(engine: &Engine, key: u128, boot: bool, spec: &Spec, app: &AppId) -> io::Result<()> {
 		let mut held = Vec::new();
-		let mut conds: Vec<FWPM_FILTER_CONDITION0> = spec.conds.iter().map(|cond| condition(cond, app, &mut held)).collect();
+		let mut conds: Vec<FWPM_FILTER_CONDITION0> = spec.conds.iter().map(|cond| condition(cond, app, &mut held)).collect::<io::Result<_>>()?;
 		let mut name = wide(&format!("Veilway kill switch: {}", spec.name));
 		// SAFETY: a zeroed filter is a valid empty one; the fields that matter are set below.
 		let mut filter: FWPM_FILTER0 = unsafe {std::mem::zeroed()};
@@ -400,7 +413,7 @@ mod tests {
 
 	fn home() -> Vec<IpNet> {["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"].iter().map(|net| net.parse().unwrap()).collect()}
 
-	fn rules() -> Rules {Rules {tun: Some(7), nodes: vec![Endpoint {ip: "203.0.113.9".parse().unwrap(), port: 443, tcp: true}, Endpoint {ip: "2001:db8::9".parse().unwrap(), port: 51820, tcp: false}], protected: full(), lan: Vec::new(), local_names: false}}
+	fn rules() -> Rules {Rules {tun: Some(7), nodes: vec![Endpoint {ip: "203.0.113.9".parse().unwrap(), port: 443, tcp: true}, Endpoint {ip: "2001:db8::9".parse().unwrap(), port: 51820, tcp: false}], protected: full(), lan: Vec::new(), local_names: false, xray: None}}
 
 	fn full() -> Vec<IpNet> {vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]}
 
@@ -415,6 +428,21 @@ mod tests {
 		assert!(node6.v6 && node6.conds.contains(&Cond::Protocol(UDP)) && node6.conds.contains(&Cond::Remote("2001:db8::9/128".parse().unwrap())));
 		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("the node") && !spec.accept).count(), 2);
 		assert_eq!(specs.iter().filter(|spec| spec.name.starts_with("the node") && spec.accept).count(), 2);
+	}
+
+	#[test]
+	fn with_xray_the_nodes_are_let_out_to_its_program_and_not_to_this_one() {
+		let path = "C:\\ProgramData\\Veilway\\addons\\xray\\v1\\xray.exe".to_owned();
+		let specs = Rules {xray: Some(path.clone()), ..rules()}.specs();
+		let nodes: Vec<&Spec> = specs.iter().filter(|spec| spec.name.starts_with("the node")).collect();
+		assert_eq!(nodes.len(), 4);
+		for node in nodes {
+			assert_eq!(node.conds[0], Cond::Program(path.clone()));
+			assert!(!node.conds.contains(&Cond::App) && node.conds.len() == 4);
+		}
+		let plain = rules().specs();
+		let others = |specs: &[Spec]| specs.iter().filter(|spec| !spec.name.starts_with("the node")).cloned().collect::<Vec<_>>();
+		assert_eq!(others(&specs), others(&plain), "only the filters for the nodes change");
 	}
 
 	#[test]

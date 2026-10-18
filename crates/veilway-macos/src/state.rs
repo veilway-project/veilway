@@ -16,6 +16,8 @@ use tokio::time::{sleep, Instant};
 pub const DEFAULT: &str = "/var/run/veilway";
 /// What has to survive a reboot or a crash: the pf token, and in `client` the vault and the engine's memory. Root only.
 pub const DATA: &str = "/Library/Application Support/Veilway";
+/// Where the add-ons are kept (`addons/xray/<release>/xray` below it). Root's and closed to others for writing, but not for reading and entering: the add-on runs as an account of its own, and macOS runs a file by its path, so that account must be able to reach it. `DATA` is closed to everyone but root, which is why it is not under there.
+pub const ADDONS: &str = "/Library/Application Support/Veilway Add-ons";
 const LOCK: &str = "client.lock";
 const STATUS: &str = "status.txt";
 /// The directories the programs the client runs as root are looked for in, and nowhere else: not `PATH`, which a user who started the program with `sudo -E` may have set.

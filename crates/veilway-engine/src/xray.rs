@@ -10,7 +10,7 @@ use ipstack::{IpStack, IpStackConfig, IpStackStream, IpStackTcpStream, IpStackUd
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -79,10 +79,19 @@ pub struct Live {
 	restarts: AtomicU64,
 	last_restart: AtomicU64,
 	say: Mutex<Option<XraySay>>,
+	// The physical interface Xray's own socket is kept on where the platform does it with a socket option (macOS and Windows), and the process number of the running child, 0 while there is none.
+	interface: watch::Sender<Option<String>>,
+	pid: AtomicU32,
 }
 
 impl Live {
-	pub fn new() -> Arc<Self> {Arc::new(Self {up: watch::channel(false).0, restarts: AtomicU64::new(0), last_restart: AtomicU64::new(0), say: Mutex::new(None)})}
+	pub fn new() -> Arc<Self> {Arc::new(Self {up: watch::channel(false).0, restarts: AtomicU64::new(0), last_restart: AtomicU64::new(0), say: Mutex::new(None), interface: watch::channel(None).0, pid: AtomicU32::new(0)})}
+	/// The name of the physical interface the document names. The platform layer sets it before Xray starts and again when the device's networks move to another one; the supervisor restarts Xray on a change. A name equal to the one held wakes nobody.
+	pub fn set_interface(&self, name: String) {self.interface.send_if_modified(|held| if held.as_deref() == Some(name.as_str()) {false} else {*held = Some(name); true});}
+	pub fn watch_interface(&self) -> watch::Receiver<Option<String>> {self.interface.subscribe()}
+	/// The process number of the running child, which the platforms that look sockets up by process ask for, or `None` while Xray is not running.
+	pub fn set_pid(&self, pid: Option<u32>) {self.pid.store(pid.unwrap_or(0), Ordering::Relaxed)}
+	pub fn pid(&self) -> Option<u32> {Some(self.pid.load(Ordering::Relaxed)).filter(|pid| *pid != 0)}
 	/// Xray answers the SOCKS handshake, or does not. Going up clears the reason it was not.
 	pub fn set_up(&self, up: bool) {
 		if up {*self.say.lock().unwrap() = None}

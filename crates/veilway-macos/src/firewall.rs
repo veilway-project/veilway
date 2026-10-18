@@ -38,6 +38,8 @@ pub struct Rules {
 	pub lan: Vec<IpNet>,
 	/// The user asked for names on the local network: mDNS, LLMNR and NetBIOS are let through with the LAN, on their groups and ports only.
 	pub local_names: bool,
+	/// The user id Xray runs as, for a legacy profile: the connections to the nodes are then that user's only, and the client's own (root's) are not let out to them. pf knows the owner of a TCP or UDP socket of this device, which the client's own transport cannot be told by.
+	pub xray: Option<u32>,
 }
 
 impl Rules {
@@ -47,7 +49,7 @@ impl Rules {
 		let mut lines = vec!["pass quick on lo0 all".to_owned()];
 		// Outbound only: what comes back is the state of what went out. A pass in from the tunnel would let whoever is on the other side of it reach every service of this device that listens, which nothing here asks for.
 		if let Some(tun) = &self.tun {lines.push(format!("pass out quick on {tun} all {STATE}"))}
-		for node in &self.nodes {lines.push(format!("pass out quick {} proto {} from any to {} port {} {STATE}", if node.ip.is_ipv4() {"inet"} else {"inet6"}, if node.tcp {"tcp"} else {"udp"}, node.ip, node.port))}
+		for node in &self.nodes {lines.push(format!("pass out quick {} proto {} from any to {} port {} {}{STATE}", if node.ip.is_ipv4() {"inet"} else {"inet6"}, if node.tcp {"tcp"} else {"udp"}, node.ip, node.port, self.xray.map_or_else(String::new, |uid| format!("user {uid} "))))}
 		// DHCP by its ports and nothing else of those hosts. The server's address is not known for a renewal, which is unicast, so any address is allowed on these ports only. The answers to a broadcast come to an address the question was not sent to, so they cannot be part of a state.
 		lines.push(format!("pass out quick inet proto udp from any port 68 to any port 67 {STATE}"));
 		lines.push("pass in quick inet proto udp from any port 67 to any port 68 no state".into());
@@ -203,7 +205,7 @@ mod tests {
 
 	fn home() -> Vec<IpNet> {nets(&["192.168.1.0/24", "169.254.0.0/16", "224.0.0.0/24", "fe80::/10", "ff02::/16"])}
 
-	fn full() -> Rules {Rules {tun: None, nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: nets(&["0.0.0.0/0", "::/0"]), lan: Vec::new(), local_names: false}}
+	fn full() -> Rules {Rules {tun: None, nodes: vec![node("192.0.2.10", 5001, false), node("2001:db8::10", 5001, false), node("198.51.100.7", 443, true)], protected: nets(&["0.0.0.0/0", "::/0"]), lan: Vec::new(), local_names: false, xray: None}}
 
 	fn position(text: &str, line: &str) -> usize {text.lines().position(|found| found == line).unwrap_or_else(|| panic!("no rule {line:?} in\n{text}"))}
 
@@ -226,6 +228,17 @@ mod tests {
 		let (udp4, udp6, tcp4) = (position(&text, "pass out quick inet proto udp from any to 192.0.2.10 port 5001 keep state (if-bound)"), position(&text, "pass out quick inet6 proto udp from any to 2001:db8::10 port 5001 keep state (if-bound)"), position(&text, "pass out quick inet proto tcp from any to 198.51.100.7 port 443 keep state (if-bound)"));
 		let first_block = text.lines().position(|line| line.starts_with("block")).unwrap();
 		assert!(udp4 < first_block && udp6 < first_block && tcp4 < first_block);
+	}
+
+	#[test]
+	fn with_xray_the_nodes_are_let_out_to_its_user_only_and_the_other_rules_are_the_same() {
+		let plain = full().ruleset();
+		assert!(!plain.contains(" user "), "a native profile's rules name no user");
+		let text = Rules {xray: Some(317), ..full()}.ruleset();
+		position(&text, "pass out quick inet proto udp from any to 192.0.2.10 port 5001 user 317 keep state (if-bound)");
+		position(&text, "pass out quick inet6 proto udp from any to 2001:db8::10 port 5001 user 317 keep state (if-bound)");
+		position(&text, "pass out quick inet proto tcp from any to 198.51.100.7 port 443 user 317 keep state (if-bound)");
+		assert_eq!(text.replace(" user 317", ""), plain, "only the rules for the nodes change");
 	}
 
 	#[test]

@@ -7,12 +7,10 @@ use rustls::{ClientConfig, RootCertStore};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
 use veilway_engine::xray::{Live, XraySay};
@@ -21,6 +19,22 @@ use veilway_proto::xray::{self, Pin};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::process::Stdio;
+#[cfg(unix)]
+use tokio::process::{Child, Command};
+#[cfg(windows)]
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use veilway_windows::xray::Child;
+
+/// `FILE_SHARE_READ`: the file is opened so that nobody can write to it or delete it while it is held.
+#[cfg(windows)]
+const SHARE_READ: u32 = 1;
+#[cfg(windows)]
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const REPARSE_POINT: u32 = 0x400;
 
 /// The archive as the release publishes it, at most this many bytes.
 pub const ARCHIVE_MAX: u64 = 64 << 20;
@@ -61,17 +75,23 @@ impl std::fmt::Display for Mismatch {
 
 impl std::error::Error for Mismatch {}
 
-/// Opens the installed executable without following a link, and holds it to the pin: the owner is root and nobody else can write to it. The open file is rewound and returned, so the caller runs what was hashed. A file that fails the pin is a `Mismatch`.
+/// Opens the installed executable without following a link, and holds it to the pin: the owner is root (the Administrators or SYSTEM on Windows, for it and the folders above it) and nobody else can write to it. The open file is rewound and returned, so the caller runs what was hashed on Linux. On Windows it is opened so that nobody can write to it or delete it, and the caller keeps it open until the child has exited. A file that fails the pin is a `Mismatch`.
 pub fn open_checked(path: &Path, pin: &Pin) -> anyhow::Result<File> {
 	let mut options = OpenOptions::new();
 	options.read(true);
 	#[cfg(unix)]
 	options.custom_flags(libc::O_NOFOLLOW);
+	#[cfg(windows)]
+	options.share_mode(SHARE_READ).custom_flags(OPEN_REPARSE_POINT);
 	let mut file = options.open(path).with_context(|| format!("the Xray executable cannot be opened: {}", path.display()))?;
 	#[cfg(unix)]
 	let meta = file.metadata()?;
 	#[cfg(unix)]
 	if meta.uid() != 0 || meta.mode() & 0o022 != 0 {return Err(Mismatch("the executable is not root's or can be written by someone else".to_owned()).into())}
+	#[cfg(windows)]
+	if file.metadata()?.file_attributes() & REPARSE_POINT != 0 {return Err(Mismatch("the executable is a link".to_owned()).into())}
+	#[cfg(windows)]
+	if let Some(problem) = veilway_windows::state::addon_problem(path)? {return Err(Mismatch(problem).into())}
 	let got = digest(&mut file)?;
 	if got != pin.executable {return Err(Mismatch(format!("want {}, got {got}", pin.executable)).into())}
 	file.seek(SeekFrom::Start(0))?;
@@ -116,12 +136,28 @@ pub fn install(addons: &Path, archive: &Path, pin: &Pin) -> anyhow::Result<PathB
 	fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))?;
 	File::open(&staged)?.sync_all()?;
 	let installed = folder.join(name);
+	#[cfg(target_os = "macos")]
+	immutable(&installed, false)?;
 	fs::rename(&staged, &installed)?;
+	#[cfg(target_os = "macos")]
+	immutable(&installed, true)?;
 	for old in fs::read_dir(addons.join("xray"))? {
 		let old = old?.path();
-		if old != folder && old.is_dir() {fs::remove_dir_all(&old)?}
+		if old != folder && old.is_dir() {
+			#[cfg(target_os = "macos")]
+			immutable(&old.join(name), false)?;
+			fs::remove_dir_all(&old)?
+		}
 	}
 	Ok(installed)
+}
+
+/// Sets the immutable flag of a file (`chflags uchg`), or clears it, so that the add-on cannot be swapped by a root process that does not mean to. macOS runs a file by its path, so this is what keeps the path to what was hashed. A file that is not there is fine.
+#[cfg(target_os = "macos")]
+fn immutable(path: &Path, on: bool) -> io::Result<()> {
+	let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
+	// SAFETY: the path is a NUL-terminated string that lives through the call.
+	if unsafe {libc::chflags(name.as_ptr(), if on {libc::UF_IMMUTABLE} else {0})} == 0 {Ok(())} else {Err(io::Error::last_os_error()).or_else(|error| if error.kind() == io::ErrorKind::NotFound {Ok(())} else {Err(error)})}
 }
 
 const MIN: Duration = Duration::from_secs(1);
@@ -177,7 +213,7 @@ fn unix_now() -> u64 {SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |el
 
 /// Starts the add-on from the descriptor of the file that was checked, as `ids` (the user and group made for it, which the caller got from the Linux layer). The path is `/proc/self/fd/N`, so the file that was hashed is the file that runs and there is no window between the check and the exec. Between the fork and the exec, and in the child only: the supplementary groups are dropped and the ids are changed, `no_new_privs` is set, a kill signal is asked for when this process ends, every capability is dropped, and the process is made dumpable again, which a change of ids undid and without which it cannot open its own `/proc/self/fd`. Environment empty, working directory the root of the filesystem, no console.
 #[cfg(target_os = "linux")]
-fn spawn_checked(file: &File, args: &[&str], ids: (u32, u32)) -> io::Result<Child> {
+fn spawn_checked(file: &File, _path: &Path, args: &[&str], ids: (u32, u32)) -> io::Result<Child> {
 	let (fd, parent) = (file.as_raw_fd(), std::process::id() as libc::pid_t);
 	let mut command = Command::new(format!("/proc/self/fd/{fd}"));
 	command.arg0("xray").args(args).env_clear().current_dir("/").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
@@ -197,26 +233,87 @@ fn spawn_checked(file: &File, args: &[&str], ids: (u32, u32)) -> io::Result<Chil
 	command.spawn()
 }
 
-/// macOS and Windows: the rights of the child are not limited yet, so the add-on does not start there ("If the rights cannot be dropped, Xray does not start").
-#[cfg(not(target_os = "linux"))]
-fn spawn_checked(_file: &File, _args: &[&str], _ids: (u32, u32)) -> io::Result<Child> {Err(io::Error::new(io::ErrorKind::Unsupported, "the rights of the Xray add-on cannot be limited on this system yet"))}
+/// macOS has no way to run a descriptor, so the path is run: it was hashed an instant ago, it lies in folders only root can write in, and the file has the immutable flag (`install`), which is the residual risk the spec names. Between the fork and the exec, and in the child only: a monitor process is forked that watches this process and Xray with a kqueue and kills Xray when this process ends however it ends (the child waits until the monitor has said it watches both), then the supplementary groups are dropped and the ids are changed to those of the account made for Xray. Environment empty, working directory the root of the filesystem.
+#[cfg(target_os = "macos")]
+fn spawn_checked(_file: &File, path: &Path, args: &[&str], ids: (u32, u32)) -> io::Result<Child> {
+	let parent = std::process::id() as libc::pid_t;
+	let mut command = Command::new(path);
+	command.arg0("xray").args(args).env_clear().current_dir("/").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+	// Safety: only async-signal-safe calls run between the fork and the exec, and none allocates.
+	unsafe {
+		command.pre_exec(move || {
+			let (me, mut ready) = (libc::getpid(), [0 as libc::c_int; 2]);
+			if libc::pipe(ready.as_mut_ptr()) != 0 {return Err(io::Error::last_os_error())}
+			match libc::fork() {
+				-1 => return Err(io::Error::last_os_error()),
+				0 => {
+					// The monitor. It watches both with a kqueue, says one byte on the pipe (1 once the watch is in, 0 if it could not be), and then waits for the first of the two to end; if that is this process it kills Xray, and if that is Xray it has nothing left to do. An end that came before the watch began is reported at once as an error event, and means the same.
+					libc::close(ready[0]);
+					let queue = libc::kqueue();
+					let mut changes: [libc::kevent; 2] = std::mem::zeroed();
+					for (change, pid) in changes.iter_mut().zip([parent, me]) {
+						change.ident = pid as libc::uintptr_t;
+						change.filter = libc::EVFILT_PROC;
+						change.flags = libc::EV_ADD | libc::EV_ONESHOT;
+						change.fflags = libc::NOTE_EXIT;
+					}
+					let (mut event, now): (libc::kevent, libc::timespec) = (std::mem::zeroed(), std::mem::zeroed());
+					let mut got = if queue >= 0 {libc::kevent(queue, changes.as_ptr(), 2, &mut event, 1, &now)} else {-1};
+					let registered: u8 = u8::from(got >= 0);
+					libc::write(ready[1], (&registered as *const u8).cast(), 1);
+					libc::close(ready[1]);
+					if registered == 0 {libc::_exit(1)}
+					if got == 0 {got = libc::kevent(queue, std::ptr::null(), 0, &mut event, 1, std::ptr::null())}
+					if got > 0 && event.ident as libc::pid_t != me {libc::kill(me, libc::SIGKILL);}
+					libc::_exit(0);
+				}
+				_ => {}
+			}
+			libc::close(ready[1]);
+			let mut said = 0u8;
+			let read = libc::read(ready[0], (&mut said as *mut u8).cast(), 1);
+			libc::close(ready[0]);
+			if read != 1 || said != 1 {return Err(io::Error::other("the monitor of the child did not start"))}
+			if libc::setgroups(0, std::ptr::null()) != 0 || libc::setgid(ids.1) != 0 || libc::setuid(ids.0) != 0 {return Err(io::Error::last_os_error())}
+			Ok(())
+		});
+	}
+	command.spawn()
+}
 
-/// Whether every socket that listens on the loopback address at `port` belongs to `uid`, and at least one does. Read from `/proc/net`, so a process of another user that took the port first (or shares it) is seen whatever it answers.
+/// Windows: the child gets a restricted token and a job object that kills it (`veilway_windows::xray::Child`), and runs from the path, which the caller holds open with sharing that denies writes and deletes until the child has exited. The ids are not used: there is no account.
+#[cfg(windows)]
+fn spawn_checked(_file: &File, path: &Path, args: &[&str], _ids: (u32, u32)) -> io::Result<Child> {
+	let root = veilway_windows::state::program("cmd.exe")?.ancestors().last().map(Path::to_path_buf).ok_or_else(|| io::Error::other("the system drive has no root"))?;
+	Child::spawn(path, args, &root)
+}
+
+/// Whether every socket that listens on the loopback address at `port` belongs to Xray, and at least one does. On Linux Xray is told from the rest by its user, whose sockets are read from `/proc/net`; on macOS and Windows by the process, whose number the supervisor holds. A process that took the port first (or shares it) is seen whatever it answers.
 #[cfg(target_os = "linux")]
-fn listener_owned(port: u16, uid: u32) -> bool {veilway_linux::xray::listening_as(std::net::SocketAddr::from(([127, 0, 0, 1], port)), uid, false).unwrap_or(false)}
+fn listener_owned(port: u16, ids: (u32, u32), _pid: Option<u32>) -> bool {veilway_linux::xray::listening_as(std::net::SocketAddr::from(([127, 0, 0, 1], port)), ids.0, false).unwrap_or(false)}
 
-#[cfg(not(target_os = "linux"))]
-fn listener_owned(_port: u16, _uid: u32) -> bool {false}
+#[cfg(target_os = "macos")]
+fn listener_owned(port: u16, _ids: (u32, u32), pid: Option<u32>) -> bool {pid.is_some_and(|pid| veilway_macos::xray::listening_as(std::net::SocketAddr::from(([127, 0, 0, 1], port)), pid, false).unwrap_or(false))}
 
-/// Runs the add-on until `stop` is set: the executable is checked before each start and run from the open file, the document is given on standard input, and `live` says the add-on is up after the first SOCKS handshake with the login has worked and down the moment it ends or its local check fails twice. The local check runs every 10 s. A stop closes the input, waits 8 s and kills the child. A failure at any point waits and starts again, and every start after the first is a restart for the counter.
+#[cfg(windows)]
+fn listener_owned(port: u16, _ids: (u32, u32), pid: Option<u32>) -> bool {pid.is_some_and(|pid| veilway_windows::xray::listening_as(std::net::SocketAddr::from(([127, 0, 0, 1], port)), pid, false).unwrap_or(false))}
+
+/// Runs the add-on until `stop` is set: the executable is checked before each start and run from the open file (kept open until the child has ended, which on Windows is what keeps it from being swapped), the document is built for the physical interface that `live` holds at the time (`document` takes its name, or none) and given on standard input, a change of that interface restarts the child at once, and `live` says the add-on is up after the first SOCKS handshake with the login has worked and down the moment it ends or its local check fails twice. The local check runs every 10 s. A stop closes the input, waits 8 s and kills the child. A failure at any point waits and starts again, and every start after the first is a restart for the counter.
 #[allow(clippy::too_many_arguments)]
-pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: String, port: u16, login: String, secrets: Vec<String>, ids: (u32, u32), live: Arc<Live>, mut stop: watch::Receiver<bool>) {
-	let (mut wait, mut starts) = (MIN, 0u32);
+pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: impl Fn(Option<&str>) -> String, port: u16, login: String, secrets: Vec<String>, ids: (u32, u32), live: Arc<Live>, mut stop: watch::Receiver<bool>) {
+	let (mut wait, mut starts, mut interface) = (MIN, 0u32, live.watch_interface());
 	loop {
 		let started = Instant::now();
 		if starts > 0 {live.restarted(unix_now())}
 		starts += 1;
-		let spawned = open_checked(&binary, pin).and_then(|file| spawn_checked(&file, &["run", "-config", "stdin:"], ids).map_err(anyhow::Error::from));
+		let text = document(interface.borrow_and_update().as_deref());
+		// The open file stays here until the child is gone.
+		let mut held = Vec::new();
+		let spawned = open_checked(&binary, pin).and_then(|file| {
+			let child = spawn_checked(&file, &binary, &["run", "-config", "stdin:"], ids)?;
+			held.push(file);
+			Ok(child)
+		});
 		let ran = match spawned {
 			Err(error) => {
 				live.explain(if error.is::<Mismatch>() {XraySay::Mismatch} else {XraySay::StartFailed});
@@ -226,7 +323,11 @@ pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: String, por
 			Ok(mut child) => {
 				// Xray reads `stdin:` to its end, so the input is closed as soon as the document is in, and a document that did not go in is a failed start.
 				let wrote = match child.stdin.take() {
-					Some(mut input) => input.write_all(document.as_bytes()).await,
+					Some(mut input) => match input.write_all(text.as_bytes()).await {
+						// A file of the runtime writes in the background, and closes only when its writes are done.
+						Ok(()) => input.flush().await,
+						Err(error) => Err(error),
+					},
 					None => Err(io::Error::new(io::ErrorKind::BrokenPipe, "no standard input")),
 				};
 				if let Err(error) = wrote {
@@ -244,20 +345,28 @@ pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: String, por
 				}
 				if let Some(output) = child.stdout.take() {tokio::spawn(drain(output, secrets.clone()));}
 				if let Some(output) = child.stderr.take() {tokio::spawn(drain(output, secrets.clone()));}
+				live.set_pid(child.id());
 				tracing::info!("xray: started");
-				let (mut tick, mut probe, mut up, mut missed) = (tokio::time::interval(HEALTH), tokio::time::interval(Duration::from_millis(250)), false, 0);
+				let (mut moved, mut tick, mut probe, mut up, mut missed) = (false, tokio::time::interval(HEALTH), tokio::time::interval(Duration::from_millis(250)), false, 0);
 				tick.tick().await;
 				let ended = loop {
 					tokio::select! {
 						status = child.wait() => {
 							tracing::warn!("xray: exited with {status:?}");
-							break started.elapsed();
+							// An end the supervisor asked for because the interface changed is not a failure, and does not lengthen the wait.
+							break if moved {MAX} else {started.elapsed()};
+						}
+						_ = interface.changed() => {
+							tracing::info!("xray: the physical interface changed, restarting");
+							moved = true;
+							live.set_up(false);
+							let _ = child.start_kill();
 						}
 						// Nothing is carried before the first handshake with the login has worked.
 						_ = probe.tick(), if !up => {
 							if socks_ok(port, &login).await {
 								// The port was picked and released before Xray bound it, so whoever answers must be Xray's user.
-								if !listener_owned(port, ids.0) {
+								if !listener_owned(port, ids, child.id()) {
 									live.explain(XraySay::PortTaken);
 									tracing::warn!("xray: the SOCKS port is held by another user, nothing is carried");
 									let _ = child.start_kill();
@@ -272,7 +381,7 @@ pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: String, por
 							}
 						}
 						_ = tick.tick(), if up => {
-							if socks_ok(port, &login).await && listener_owned(port, ids.0) {missed = 0} else {
+							if socks_ok(port, &login).await && listener_owned(port, ids, child.id()) {missed = 0} else {
 								missed += 1;
 								if missed == 2 {
 									tracing::warn!("xray: the local check failed twice, restarting");
@@ -285,11 +394,13 @@ pub async fn supervise(binary: PathBuf, pin: &'static Pin, document: String, por
 							live.set_up(false);
 							let _ = tokio::time::timeout(STOP, child.wait()).await;
 							let _ = child.start_kill();
+							live.set_pid(None);
 							return;
 						}
 					}
 				};
 				live.set_up(false);
+				live.set_pid(None);
 				ended
 			}
 		};
@@ -476,11 +587,11 @@ mod tests {
 		let installed = install(&dir.join("addons"), &archive, &pin).unwrap();
 		assert_eq!(fs::read(&installed).unwrap(), exe);
 		assert!(installed.ends_with(format!("xray/{}/{}", xray::RELEASE, if cfg!(windows) {"xray.exe"} else {"xray"})));
-		// The installed file is root's only when the test runs as root; anywhere else the check must refuse it.
+		// The installed file is trusted only when the test runs as root (an administrator on Windows, in a folder only they can write in); anywhere else the check must refuse it.
 		#[cfg(unix)]
 		let root = std::os::unix::fs::MetadataExt::uid(&fs::metadata(&installed).unwrap()) == 0;
 		#[cfg(not(unix))]
-		let root = true;
+		let root = veilway_windows::state::addon_problem(&installed).ok().flatten().is_none();
 		if !root {return assert!(open_checked(&installed, &pin).is_err())}
 		let mut opened = open_checked(&installed, &pin).unwrap();
 		let mut again = Vec::new();
@@ -505,7 +616,7 @@ mod tests {
 		fs::set_permissions(&installed, fs::Permissions::from_mode(0o755)).unwrap();
 		let pin = pin(&installed, &fs::read(&installed).unwrap());
 		let file = open_checked(&installed, &pin).unwrap();
-		let mut child = spawn_checked(&file, &["30"], ids).unwrap();
+		let mut child = spawn_checked(&file, &installed, &["30"], ids).unwrap();
 		let status = fs::read_to_string(format!("/proc/{}/status", child.id().unwrap())).unwrap();
 		let field = |name: &str| status.lines().find_map(|line| line.strip_prefix(name)).map(|rest| rest.trim().to_owned()).unwrap();
 		assert_eq!(field("Uid:"), format!("{0}\t{0}\t{0}\t{0}", ids.0));
@@ -537,7 +648,8 @@ mod tests {
 		let pin: &'static Pin = Box::leak(Box::new(pin(&installed, script.as_bytes())));
 		let (stop, stopped) = watch::channel(false);
 		let document = "d".repeat(100_000);
-		let task = tokio::spawn(supervise(installed, pin, document.clone(), 1, "login".into(), Vec::new(), ids, Live::new(), stopped));
+		let sent = document.clone();
+		let task = tokio::spawn(supervise(installed, pin, move |_| sent.clone(), 1, "login".into(), Vec::new(), ids, Live::new(), stopped));
 		let seen = tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
 				if let Ok(text) = fs::read_to_string(out.join("doc")) {return text}

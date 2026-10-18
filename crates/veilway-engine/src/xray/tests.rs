@@ -394,3 +394,21 @@ fn an_answer_over_the_packet_size_becomes_a_header_with_the_truncated_bit_and_no
 	assert_eq!(truncated(&answer[..12]).unwrap().len(), 12);
 	assert_eq!(truncated(&answer[..11]), None, "less than a header is no answer");
 }
+
+#[tokio::test]
+async fn the_interface_wakes_the_supervisor_only_when_it_changes_and_the_pid_is_none_until_set() {
+	let live = Live::new();
+	let mut watched = live.watch_interface();
+	assert_eq!((watched.borrow().clone(), live.pid()), (None, None));
+	live.set_interface("en0".into());
+	assert!(watched.has_changed().unwrap());
+	assert_eq!(watched.borrow_and_update().as_deref(), Some("en0"));
+	live.set_interface("en0".into());
+	assert!(!watched.has_changed().unwrap(), "the same name is no change");
+	live.set_interface("en1".into());
+	assert!(watched.has_changed().unwrap());
+	live.set_pid(Some(42));
+	assert_eq!(live.pid(), Some(42));
+	live.set_pid(None);
+	assert_eq!(live.pid(), None);
+}

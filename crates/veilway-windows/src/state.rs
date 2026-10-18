@@ -64,6 +64,9 @@ pub fn default_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf::from
 /// Where a client that has no `--data-dir` keeps its vault and what it remembers.
 pub fn default_data_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf::from("C:\\ProgramData")).join("Veilway").join("client")}
 
+/// Where the add-ons are kept (`xray\<release>\xray.exe` below it): `Veilway\addons` in ProgramData, made for administrators and SYSTEM to write and users to read (`Access::Read`). It is not under the client's data folder because the add-on runs with a token that has the Administrators group switched off, and so it needs the read and execute right the users' group gives.
+pub fn default_addons_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf::from("C:\\ProgramData")).join("Veilway").join("addons")}
+
 /// The path of a program in the system's own folder, and nowhere else: not `PATH` and not the working directory, which an ordinary user could have planted a program in.
 pub fn program(name: &str) -> io::Result<PathBuf> {
 	use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
@@ -116,6 +119,17 @@ fn security(path: &Path) -> io::Result<(String, Vec<(String, u32, bool)>)> {
 	// SAFETY: the descriptor came from `GetNamedSecurityInfoW` and is freed once, after the last use of what points into it.
 	unsafe {LocalFree(descriptor)};
 	found
+}
+
+/// Why a file that is to run, and the folders above it up to ProgramData, cannot be trusted to hold what was put there: one that is not owned by SYSTEM or the Administrators, or that someone besides them can write in or replace. None when it can.
+pub fn addon_problem(path: &Path) -> io::Result<Option<String>> {
+	let base = known_folder().unwrap_or_else(|_| PathBuf::from("C:\\ProgramData"));
+	for at in path.ancestors().take_while(|at| *at != base && at.parent().is_some()) {
+		let (owner, aces) = security(at)?;
+		if !acl::trusted_owner(&owner) {return Ok(Some(format!("{} is owned by {owner}", at.display())))}
+		if let Some((sid, ..)) = aces.iter().find(|(sid, mask, inherit_only)| acl::grants_write(sid, *mask, *inherit_only)) {return Ok(Some(format!("{sid} can write in {}", at.display())))}
+	}
+	Ok(None)
 }
 
 /// A directory that only SYSTEM and the administrators can use, made if it is not there, owned by the Administrators group, and never a link. One that is there already must be owned by SYSTEM or the Administrators: an ordinary user can make a folder first and keep the right to change its ACL for ever. Everything between ProgramData and the folder gets the same, so that the folder cannot be moved from above.
