@@ -3,7 +3,6 @@ use anyhow::{anyhow, bail, Context};
 use clap::Args;
 use ipnet::IpNet;
 use std::io::{BufRead, Write};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,9 +26,8 @@ use platform::{Applied, Options, Routes, Stop};
 use veilway_proto::subscription::client::{Offer, Standing};
 use veilway_proto::subscription::payload::Id;
 use veilway_proto::subscription::Tag;
-use veilway_engine::xray::Live;
-use veilway_proto::subscription::{legacy::{self, Scheme, Server}, payload::private};
-use veilway_proto::xray::{self, document::{self, Run}, profile};
+use veilway_proto::subscription::{legacy, payload::private};
+use veilway_proto::xray::{self, profile};
 
 #[derive(Args)]
 pub struct Connect {
@@ -287,8 +285,7 @@ fn legacy_file(source: &str) -> anyhow::Result<Option<String>> {
 	Ok(Some(text))
 }
 
-/// Connects to pasted links of other apps through the Xray add-on ("Xray in the desktop apps"). Nothing of the links is kept: they are read, checked against the table of what can connect, and used for this run. Steps, in this order: the profile is checked, the add-on is found and checked against the pin (or offered for download, with a yes), the server's name is resolved and its address checked, the account Xray runs as is made (Linux and macOS; Windows gives the child a restricted token instead) and the physical interface it keeps its socket on is read (macOS and Windows), and only then does the platform layer put the kill switch in force and start the carrier. The supervisor of Xray runs beside it until the connection ends.
-#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+/// Connects to pasted links of other apps through the Xray add-on ("Xray in the desktop apps"). Nothing of the links is kept: they are read, checked against the table of what can connect, and used for this run. Steps, in this order: the profile is checked, the add-on is found (or offered for download, with a yes), the add-on is held to its pin, the server's name is resolved and its address checked, and `veilway_xray::run` does the rest.
 async fn connect_xray(args: &Connect, source: &str, data: &Path, signals: &mut Signals) -> anyhow::Result<()> {
 	#[cfg(unix)]
 	if !rustix::process::geteuid().is_root() {bail!("xray_needs_root: the add-on runs as an account of its own, and the tunnel and the firewall need root: run it with sudo")}
@@ -300,79 +297,29 @@ async fn connect_xray(args: &Connect, source: &str, data: &Path, signals: &mut S
 		(None, count) => bail!("The pasted text has {count} connections, pick one with --profile and a number from 1 to {count}."),
 	};
 	let profile = profile::check(entry).map_err(|refusal| anyhow!("{}: this connection cannot be used with the add-on, so nothing was started", refusal.code()))?;
-	let target = crate::xray::target().ok_or_else(|| anyhow!("xray_missing: there is no Xray add-on for this system"))?;
+	let target = veilway_xray::target().ok_or_else(|| anyhow!("xray_missing: there is no Xray add-on for this system"))?;
 	let pin = xray::pin(target).ok_or_else(|| anyhow!("xray_missing: there is no Xray add-on for this system"))?;
-	let run = Options::default().run_dir;
-	// Where the add-ons are kept. On Linux the descriptor is run, so the folder stays root's alone. macOS runs the path as an account of its own, and Windows runs the path with a token that has the Administrators group switched off, so both keep the add-ons where others may read and enter, and never write.
-	#[cfg(target_os = "linux")]
-	let addons = data.join("addons");
-	#[cfg(target_os = "macos")]
-	let addons = PathBuf::from(state::ADDONS);
-	#[cfg(windows)]
-	let addons = state::default_addons_dir();
-	let binary = addons.join("xray").join(xray::RELEASE).join(if cfg!(windows) {"xray.exe"} else {"xray"});
+	let (run, addons) = (Options::default().run_dir, veilway_xray::addons_dir(data));
 	// The lock is held from here to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 	let lock = state::lock(&run).await?;
-	if std::fs::symlink_metadata(&binary).is_err() {
-		eprintln!("This profile needs Xray-core, a program made by another project. Veilway can download version {} from github.com/XTLS/Xray-core (at most {}) and check it against a fingerprint built into this app. It runs on your computer with limited rights and only carries this profile's traffic.", xray::RELEASE, size(crate::xray::ARCHIVE_MAX));
+	if !veilway_xray::installed(&addons) {
+		eprintln!("This profile needs Xray-core, a program made by another project. Veilway can download version {} from github.com/XTLS/Xray-core (at most {}) and check it against a fingerprint built into this app. It runs on your computer with limited rights and only carries this profile's traffic.", xray::RELEASE, size(veilway_xray::ARCHIVE_MAX));
 		if !ask("Install and connect?", signals).await? {bail!("xray_missing: the Xray add-on is not installed. Nothing was downloaded.")}
-		#[cfg(target_os = "linux")]
-		state::secure_dir(&addons, 0o700).with_context(|| format!("cannot use {} for the add-on", addons.display()))?;
-		#[cfg(target_os = "macos")]
-		state::secure_tree(&addons, 0o755).with_context(|| format!("cannot use {} for the add-on", addons.display()))?;
-		#[cfg(windows)]
-		state::secure_dir(&addons, platform::acl::Access::Read).with_context(|| format!("cannot use {} for the add-on", addons.display()))?;
-		let part = addons.join("xray.zip.part");
-		// The same mirrors the installer script takes, https only, tried after GitHub: the archive is checked against the pin whichever answers.
-		let mirrors: Vec<String> = std::env::var("VEILWAY_MIRRORS").map(|list| list.split_whitespace().map(str::to_owned).collect()).unwrap_or_default();
-		let installed = match crate::xray::download(target, &part, &mirrors).await {
-			Ok(()) => crate::xray::install(&addons, &part, pin),
-			Err(error) => Err(error),
-		};
-		let _ = std::fs::remove_file(&part);
-		installed.map_err(|error| anyhow!("xray_install_failed: {error:#}"))?;
+		veilway_xray::fetch_install(&addons, target, pin, &veilway_xray::mirrors_from_env(), &std::sync::atomic::AtomicU64::new(0)).await.map_err(|(step, error)| anyhow!("{}: {error:#}", step.code()))?;
 		eprintln!("Installed.");
 	}
-	if let Err(error) = crate::xray::open_checked(&binary, pin) {
-		tracing::warn!("{error:#}");
-		bail!("{}: the Xray add-on does not match this app, so it was not started", if error.is::<crate::xray::Mismatch>() {"xray_mismatch"} else {"xray_start_failed"});
-	}
-	let candidates: Vec<IpAddr> = match &profile.server {
-		Server::Address(address) => vec![*address],
-		Server::Name(name) => tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((name.as_str(), profile.port))).await.map_err(|_| anyhow!("xray_server_unresolved: the server's name did not resolve in 10 seconds"))?.map_err(|_| anyhow!("xray_server_unresolved: the server's name did not resolve"))?.map(|found| found.ip()).collect(),
-	};
-	let Some(server) = platform::xray::usable(&candidates)?.first().copied() else {bail!("xray_server_unusable: no address of the server can be used: they are all special addresses, or inside a network this device is on")};
+	veilway_xray::check_addon(&veilway_xray::executable(&addons), pin)?;
+	let server = veilway_xray::server(&profile).await?;
 	if private(server) && !ask("This connection goes to a private address, which is not on the internet. That is normal for a server on your own network and unusual otherwise. Connect?", signals).await? {bail!("Not connected.")}
-	// Windows has no account to make: the child gets a restricted token, and the ids are not used.
-	#[cfg(unix)]
-	let ids = platform::xray::ensure_user().map_err(|error| anyhow!("xray_start_failed: {error}"))?;
-	#[cfg(windows)]
-	let ids = (0u32, 0u32);
-	let live = Live::new();
-	// On macOS and Windows Xray's own socket is kept out of the tunnel by its document, with the name of the physical interface the engine's sockets are bound to, which has to be known before Xray starts. The layer keeps it current. Linux marks the account's packets instead.
-	#[cfg(not(target_os = "linux"))]
-	live.set_interface(platform::xray::physical()?.ok_or_else(|| anyhow!("xray_offline: the device has no network outside the tunnel"))?);
-	let (login, port) = (crate::xray::new_login()?, std::net::TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port());
-	let secrets: Vec<String> = [Some(login.clone()), Some(profile.credential.expose().to_owned()), Some(server.to_string()), Some(profile.port.to_string()), match &profile.server {Server::Name(name) => Some(name.clone()), Server::Address(_) => None}].into_iter().flatten().collect();
-	let (udp, server_port) = (profile.scheme == Scheme::Shadowsocks, profile.port);
 	let options = Options {interface: args.interface.clone(), kill_switch: !args.no_kill_switch, allow_lan: args.allow_lan, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes.clone())}, run_dir: run.clone(), ..Options::default()};
-	let (stop, _) = tokio::sync::watch::channel(false);
-	// The document is built again for every start, since the interface it names can have changed.
-	let document_login = login.clone();
-	let build = move |interface: Option<&str>| document::document(&profile, &Run {port, login: &document_login, address: server, interface});
-	let supervisor = tokio::spawn(crate::xray::supervise(binary.clone(), pin, build, port, login.clone(), secrets, ids, live.clone(), stop.subscribe()));
 	let name = if entry.name.as_str().is_empty() {"Xray profile".to_owned()} else {entry.name.as_str().to_owned()};
 	let mut shown = String::new();
 	let on_status = |status: &Status, applied: &Applied| announce(&run, &mut shown, status, applied);
-	let running = platform::XrayRun {name, #[cfg(windows)] program: binary, server, port: server_port, udp, socks: std::net::SocketAddr::from(([127, 0, 0, 1], port)), login, resolvers: [IpAddr::from([1, 1, 1, 1]), IpAddr::from([9, 9, 9, 9])], live};
 	#[cfg(unix)]
 	let ended = signals.next();
 	#[cfg(windows)]
 	let ended = async {tokio::select! {reason = signals.next() => reason, () = lock.stop_asked() => Stop::Asked}};
-	let outcome = platform::run_xray(&options, &lock, running, on_status, ended).await;
-	let _ = stop.send(true);
-	let _ = supervisor.await;
-	if let Err(failure) = outcome {bail!(kept_message(&failure))}
+	if let Err(failure) = veilway_xray::run(&options, &lock, profile, server, name, veilway_xray::executable(&addons), pin, on_status, ended).await {bail!(kept_message(&failure))}
 	eprintln!("Disconnected. Everything is back as it was.");
 	Ok(())
 }

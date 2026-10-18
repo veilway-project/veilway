@@ -1,11 +1,38 @@
 [package]
-publish=false
 name="veilway-xray"
 version.workspace=true
 edition.workspace=true
 license.workspace=true
 repository.workspace=true
-description="Placeholder for the optional Xray sidecar manager of Veilway."
+description="The Xray-core add-on of the Veilway client: pinned install, supervisor, and a run of a legacy profile on the platform layer."
 readme="README.md"
 keywords=["vpn", "xray", "veilway"]
 categories=["network-programming"]
+
+[dependencies]
+veilway-proto={path="../veilway-proto", version="0.2.0"}
+veilway-engine={path="../veilway-engine", version="0.2.0"}
+tokio.workspace=true
+anyhow.workspace=true
+tracing.workspace=true
+ring.workspace=true
+rustls.workspace=true
+tokio-rustls.workspace=true
+webpki-roots.workspace=true
+# The add-on's archive: one entry is read out of the zip, see the workspace manifest.
+zip.workspace=true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace=true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+veilway-linux={path="../veilway-linux", version="0.2.0"}
+
+[target.'cfg(target_os = "macos")'.dependencies]
+veilway-macos={path="../veilway-macos", version="0.2.0"}
+
+[target.'cfg(windows)'.dependencies]
+veilway-windows={path="../veilway-windows", version="0.2.0"}
+
+[dev-dependencies]
+rustix={workspace=true, features=["process"]}

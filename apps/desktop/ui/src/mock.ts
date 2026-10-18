@@ -1,6 +1,6 @@
 // Development only: stands in for the Tauri side so the screens can run in a plain browser. main.tsx loads it only when Vite runs in "mock" mode, so a production build never contains it.
-// The address picks the scene and the display: ?scene=empty|question|connected&lang=en|fa&scheme=dark|light.
-import type {BundleReview, Host, Running, StatusView, Subscription} from "./tauri.ts";
+// The address picks the scene and the display: ?scene=empty|question|connected|offer|xray&lang=en|fa&scheme=dark|light. "offer" holds pasted links with no Xray add-on, "xray" is connected through it.
+import type {BundleReview, Host, LegacyOffer, Running, StatusView, Subscription, XrayState} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
 try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: query.get("profile") ? {subscription: "sub-harbor", profile: query.get("profile")} : null, hidden: []})); } catch { /* private window */ }
@@ -26,11 +26,20 @@ function subscription(fa: boolean): Subscription {
 	};
 }
 
+// Pasted links of another app, kept unsigned and connected through the Xray add-on.
+const pasted = (): Subscription => ({id: "legacy.7c1e", provider: "", standing: "current", expires_at: 0, can_refresh: false, profiles: [{id: "1", name: "Edge Frankfurt", exits: [], left_out: false, legacy: {protocol: "vless", unsafe_cap: false, refused: null}}, {id: "2", name: "Backup", exits: [], left_out: false, legacy: {protocol: "trojan", unsafe_cap: false, refused: null}}], usage: null, cards: [], notices: [], support: [], terms: null, privacy: null, logo: null, accent: null, left_out: 0, lan_local: lan, hosts: [], legacy: true});
+const legacyOffer: LegacyOffer = {kind: "legacy", connections: [{name: "Edge Frankfurt", protocol: "vless", unsafe_cap: false}, {name: "Backup", protocol: "trojan", unsafe_cap: false}], refused: [{name: "Old KCP", code: "profile_refused.stream"}], skipped: 0, cut: false};
+const xrayScene = scene === "offer" || scene === "xray";
+let xrayInstalled = scene === "xray", legacyHeld = xrayScene, lastLegacy = false;
+const xrayState = (): XrayState => ({supported: true, installed: xrayInstalled, release: "v26.3.27", size: 64 * 1024 ** 2, installing: false});
+const list = () => [...(legacyHeld ? [pasted()] : []), ...(held ? [subscription(languages[0] === "fa")] : [])];
+
 const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened, alpha: query.get("transport") === "faketls"};
-let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty", selected: string | null = null;
+let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty" && scene !== "offer", selected: string | null = null;
 const status = (): StatusView => {
 	sent += 40000 + Math.random() * 90000;
 	received += 600000 + Math.random() * 2400000;
+	if (xrayScene) return {state: "connected", name: "Edge Frankfurt", exit: null, wait_until: null, say_code: null, say: null, exits: [], usage: null, notices: [], sent_bytes: sent, received_bytes: received, mtu: 1400, out_of_date: false, connection: null, applied: null, xray: {open_tcp: 14, open_udp: 3, failed_flows: 2, carried_flows: 318, bytes_sent: sent, bytes_received: received, unsupported_packets: 6, dropped_udp_flows: 0, restarts: 0, last_restart: null, say_code: null, say: null}};
 	return {
 		state: scene === "question" ? "connecting" : "connected", name: "Main", exit: "fra", wait_until: null, say_code: null, say: null,
 		exits: [{tag: "fra", name: "Frankfurt", country: "de", selected: selected === "fra", configured: true, working: true, load: "low"}, {tag: "ams", name: "Amsterdam", country: "nl", selected: selected === "ams", configured: true, working: true, load: "medium"}, {tag: "hel", name: "Helsinki", country: "fi", selected: selected === "hel", configured: true, working: true, load: "high"}, {tag: "ist", name: "Istanbul", country: "tr", selected: false, configured: true, working: false, load: "unknown"}],
@@ -53,7 +62,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 		return id;
 	},
 	"plugin:event|unlisten": () => null,
-	library: args => { languages = (args.languages as string[]) ?? ["en"]; return held ? [subscription(languages[0] === "fa")] : []; },
+	library: args => { languages = (args.languages as string[]) ?? ["en"]; return list(); },
 	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: false}),
 	log_history: () => ["0.4s client ready", "1.2s connect requested", "2.0s connected through Frankfurt"],
 	get_settings: () => ({auto_update: false, theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true}),
@@ -62,12 +71,21 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	set_autostart: () => null,
 	open_link: () => null,
 	check_update: () => ({available: false, version: "0.1.0", notes: "", current: "0.1.0"}),
-	connect: () => { connected = true; return null; },
+	connect: () => { if (xrayScene && !xrayInstalled) return {xray_offer: xrayState()}; connected = true; return null; },
+	xray_state: xrayState,
+	xray_install: () => {
+		[300, 600, 900].forEach((at, i) => setTimeout(() => emit("xray-install", {phase: "downloading", downloaded: (i + 1) * 4 * 1024 ** 2, state: null, error: null}), at));
+		setTimeout(() => { xrayInstalled = true; emit("xray-install", {phase: "done", downloaded: 12 * 1024 ** 2, state: xrayState(), error: null}); }, 1200);
+		return null;
+	},
+	xray_remove: () => { xrayInstalled = false; return xrayState(); },
 	disconnect: () => { connected = false; return null; },
 	answer: () => null,
 	select_exit: args => { selected = (args.tag as string | null) ?? null; return null; },
 	import_open: args => {
-		const source = args.source as {kind: string, password?: string};
+		const source = args.source as {kind: string, password?: string, text?: string};
+		lastLegacy = source.kind === "link" && /^(vless|vmess|trojan|ss):\/\//.test(source.text ?? "");
+		if (lastLegacy) return /type=kcp/.test(source.text ?? "") ? Promise.reject("profile_refused.stream") : legacyOffer;
 		if (source.kind === "file" && query.has("sealed")) return Promise.reject("needs_password");
 		if (source.kind === "sealed" && source.password !== "correct horse battery") return Promise.reject("wrong_password");
 		return ({kind: "native", host: "sub.harbor.example", fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: true, plain: false, in_file: false});
@@ -77,10 +95,10 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	share_text: () => null,
 	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, plain: false, in_file: false}),
 	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, moving: null, left_out: [], preview: subscription(languages[0] === "fa")}),
-	import_keep: args => { if (args.keep) held = 1; return held ? [subscription(languages[0] === "fa")] : []; },
+	import_keep: args => { if (args.keep && lastLegacy) legacyHeld = true; else if (args.keep) held = 1; return list(); },
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],
-	remove: () => { held = 0; return []; },
+	remove: args => { if (args.id === "legacy.7c1e") legacyHeld = false; else held = 0; return list(); },
 	bundle_pick: () => bundleReview(languages[0] === "fa"),
 	bundle_document: () => [subscription(languages[0] === "fa")],
 	bundle_notices: () => null,

@@ -67,6 +67,7 @@ fn forward(app: &AppHandle, out: Out) {
 		Out::Question {text} => {let _ = app.emit("question", text);}
 		Out::Ended {error, kept} => {let _ = app.emit("ended", json!({"error": error, "kept": kept}));}
 		Out::Log {line} => {let _ = app.emit("log", line);}
+		Out::XrayInstall {..} => {}
 		Out::Reply {..} | Out::Challenge {..} => {}
 	}
 }

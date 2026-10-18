@@ -4,7 +4,7 @@ use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use std::io::Cursor;
 use veilway_engine::import::Library;
-use veilway_engine::{Retry, State, Status, Store};
+use veilway_engine::{Retry, State, Status, Store, XraySay};
 use veilway_proto::subscription::client::{Held, Standing};
 use veilway_proto::subscription::payload::{Card, LogoKind, MainEndpoint, Notice, Subscription};
 use veilway_proto::subscription::{Kind, Tag, Url};
@@ -29,6 +29,10 @@ pub struct AppliedOut {pub interface: String, pub kill_switch: bool, pub dns: St
 pub struct ConnectionOut {pub transport: String, pub address: String, pub host: Option<String>, pub front: Option<String>, pub server_name: Option<String>, pub check: Option<String>, pub since: Option<u64>, /// The transport is in alpha: the window says so next to the connection.
 	#[serde(default)] pub alpha: bool}
 
+/// What the carrier of pasted links counts, and its reason when there is one. Numbers and a code only: no rating word, no profile text, no address.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct XrayOut {pub open_tcp: u32, pub open_udp: u32, pub failed_flows: u64, pub carried_flows: u64, pub bytes_sent: u64, pub bytes_received: u64, pub unsupported_packets: u64, pub dropped_udp_flows: u64, pub restarts: u64, pub last_restart: Option<u64>, pub say_code: Option<String>, pub say: Option<String>}
+
 /// The state of the tunnel as the UI draws it. `state` is one of off, connecting, connected, reconnecting, stopped, failed; `say` is the plain-words reason when there is one, with a stable `say_code` for translation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct StatusView {
@@ -47,6 +51,9 @@ pub struct StatusView {
 	pub out_of_date: bool,
 	pub connection: Option<ConnectionOut>,
 	pub applied: Option<AppliedOut>,
+	/// Set while a profile of pasted links runs through the Xray add-on.
+	#[serde(default)]
+	pub xray: Option<XrayOut>,
 }
 
 fn lower<T: std::fmt::Debug>(value: T) -> String {format!("{value:?}").to_lowercase()}
@@ -77,6 +84,10 @@ pub fn status_view(status: &Status, applied: Option<AppliedOut>) -> StatusView {
 		out_of_date: status.out_of_date,
 		connection: status.connection.as_ref().map(|found| ConnectionOut {transport: found.transport.into(), address: found.address.to_string(), host: found.host.clone(), front: found.front.clone(), server_name: found.server_name.clone(), check: found.check.map(|check| check.code().into()), since: found.since, alpha: found.alpha}),
 		applied,
+		xray: status.xray.map(|view| {
+			let (found, say): (veilway_engine::XrayCounters, Option<XraySay>) = (view.counters, view.say);
+			XrayOut {open_tcp: found.open_tcp, open_udp: found.open_udp, failed_flows: found.failed_flows, carried_flows: found.carried_flows, bytes_sent: found.bytes_sent, bytes_received: found.bytes_received, unsupported_packets: found.unsupported_packets, dropped_udp_flows: found.dropped_udp_flows, restarts: found.restarts, last_restart: found.last_restart, say_code: say.map(|say| say.code().into()), say: say.map(|say| say.text().into())}
+		}),
 	}
 }
 
@@ -89,6 +100,10 @@ pub enum CardOut {
 	Link {label: String, url: String},
 }
 
+/// A connection of pasted links: its protocol, whether the core caps it at Unsafe (otherwise it is capped at Detectable, and never higher), and the code of the table's refusal when it cannot connect.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct LegacyOut {pub protocol: String, pub unsafe_cap: bool, pub refused: Option<String>}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ProfileOut {
 	pub id: String,
@@ -97,6 +112,8 @@ pub struct ProfileOut {
 	/// Some of its addresses or ways of connecting did not read and were left out. The window says so.
 	#[serde(default)]
 	pub left_out: bool,
+	#[serde(default)]
+	pub legacy: Option<LegacyOut>,
 }
 
 /// A backup update host of a subscription, or the endpoint a move asks for. `key` is what the user's answer names it by: the host and port with `#pinned`, `#plain` or `#static`, or for a move its URL and kind, never the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, `static` for a static mirror, which never does, and `move` for the endpoint of a move, which would become the main one. `state` is `waiting`, `allowed` or `declined`. `check` is how the host is reached: `chain`, `pinned` or `plain`, and over `plain` the network can tell that the device uses this app. `from` is the main endpoint a move leaves.
@@ -149,6 +166,9 @@ pub struct SubscriptionOut {
 	/// The backup update hosts of a held subscription, empty in a review: the hosts on an import's screen are confirmed with it.
 	#[serde(default)]
 	pub hosts: Vec<HostOut>,
+	/// Pasted links of other apps: unsigned, never refreshed, connected through the Xray add-on. The window names it, since it has no provider.
+	#[serde(default)]
+	pub legacy: bool,
 }
 
 /// The privacy policy of the apps themselves in English and Persian, which `open_link` always opens.
@@ -198,7 +218,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		standing: match standing {Standing::Current => "current", Standing::OutOfDate => "out_of_date", _ => "stale"}.into(),
 		expires_at: subscription.expires_at,
 		can_refresh,
-		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect(), left_out: !profile.dropped.is_empty()}).collect(),
+		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect(), left_out: !profile.dropped.is_empty(), legacy: None}).collect(),
 		usage: subscription.usage.as_ref().map(|usage| (usage.used_bytes, usage.quota_bytes, lower(usage.period))),
 		cards: subscription.cards.iter().map(|card| match card {
 			Card::Stat {label, value, unit} => CardOut::Stat {label: label.pick(languages).0.into(), value: value.pick(languages).0.into(), unit: unit.as_ref().map(|unit| unit.pick(languages).0.into())},
@@ -215,6 +235,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		left_out: subscription.left_out,
 		lan_local,
 		hosts: Vec::new(),
+		legacy: false,
 	}
 }
 
@@ -267,6 +288,17 @@ mod tests {
 		brand(&mut value);
 		assert!(value[0]["logo"].as_str().unwrap().starts_with("data:image/png;base64,"));
 		assert!(value[1]["preview"]["logo"].is_null() && value[2]["logo"].is_null());
+	}
+
+	#[test]
+	fn the_counters_of_the_xray_carrier_are_numbers_and_a_code_only() {
+		let mut found = status(State::Connected {exit: None});
+		found.xray = Some(veilway_engine::XrayView {counters: veilway_engine::XrayCounters {open_tcp: 3, open_udp: 1, failed_flows: 2, carried_flows: 40, bytes_sent: 2048, bytes_received: 4096, unsupported_packets: 5, dropped_udp_flows: 1, restarts: 2, last_restart: Some(9)}, say: Some(XraySay::NotAnswering)});
+		let view = status_view(&found, None).xray.unwrap();
+		assert_eq!((view.open_tcp, view.carried_flows, view.unsupported_packets, view.restarts, view.say_code.as_deref()), (3, 40, 5, 2, Some("server_not_answering")));
+		let text = serde_json::to_string(&view).unwrap().to_lowercase();
+		for word in ["protected", "detectable", "rating", "unsafe"] {assert!(!text.contains(word), "{word} in {text}")}
+		assert!(status_view(&status(State::Off), None).xray.is_none());
 	}
 
 	#[test]

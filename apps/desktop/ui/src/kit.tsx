@@ -1,4 +1,4 @@
-import {useI18n} from "@veilway/ui";
+import {Icon, useI18n} from "@veilway/ui";
 import {useEffect, useState} from "react";
 import {en, type DesktopKey} from "./locales/en.ts";
 import type {Subscription} from "./tauri.ts";
@@ -45,6 +45,21 @@ export function useLogo(data: string | null): string | undefined {
 }
 
 export const fromUnix = (seconds: number) => new Date(seconds * 1000);
+
+// The names the protocols of pasted links go by.
+const PROTOCOLS: Record<string, string> = {vless: "VLESS", vmess: "VMess", trojan: "Trojan", shadowsocks: "Shadowsocks"};
+export const protocolName = (protocol: string | undefined) => protocol ? PROTOCOLS[protocol] ?? protocol : "";
+
+const DIFFERENT: DesktopKey[] = ["xray.diff.unsigned", "xray.diff.control", "xray.diff.protocols", "xray.diff.names", "xray.diff.restart", "xray.diff.third", "xray.diff.features"];
+
+// What a connection of pasted links does not have next to a Veilway subscription: one short line, and the whole list on request.
+export function LegacyNote() {
+	const {t} = useD();
+	return <div className="d-legacy-note">
+		<p className="vw-muted vw-small">{t("xray.short")}</p>
+		<details><summary><span>{t("xray.details")}</span><Icon name="chevronDown"/></summary><ul>{DIFFERENT.map(key => <li key={key}>{t(key)}</li>)}</ul></details>
+	</div>;
+}
 
 // Reads a picked or pasted file as base64 without the data: prefix.
 export function base64(file: Blob): Promise<string> {

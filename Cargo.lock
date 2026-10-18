@@ -3005,9 +3005,9 @@ dependencies = [
  "veilway-proto",
  "veilway-wg",
  "veilway-windows",
+ "veilway-xray",
  "webpki-roots 1.0.9",
  "x509-parser",
- "zip",
 ]
 
 [[package]]
@@ -3264,6 +3264,23 @@ dependencies = [
 [[package]]
 name = "veilway-xray"
 version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "ring",
+ "rustix",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "veilway-engine",
+ "veilway-linux",
+ "veilway-macos",
+ "veilway-proto",
+ "veilway-windows",
+ "webpki-roots 1.0.9",
+ "zip",
+]
 
 [[package]]
 name = "version_check"

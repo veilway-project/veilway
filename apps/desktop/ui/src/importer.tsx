@@ -1,11 +1,11 @@
-import {Banner, Button, Glass, List, ListRow, SecretField, TextField} from "@veilway/ui";
+import {Banner, Button, Glass, List, ListRow, SecretField, TextField, UnsafeNote} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
-import {agreement, base64, failureText, useD} from "./kit.tsx";
-import {asksPrivate, call, type BundleReview, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
+import {agreement, base64, failureText, LegacyNote, protocolName, useD} from "./kit.tsx";
+import {asksPrivate, call, type BundleReview, type LegacyOffer, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void, onBundle: (review: BundleReview) => void}) {
-	const {t, locale} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
+	const {t, locale, number} = useD(), [text, setText] = useState(""), [offer, setOffer] = useState<Offer | LegacyOffer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const bundle = () => run(call("bundle_pick"), found => { if (found) onBundle(found); });
@@ -67,6 +67,20 @@ export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: 
 				{failure}
 				<div className="d-actions"><Button type="button" onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button type="submit" variant="primary" disabled={busy || !password}>{t(busy ? "sealed.opening" : "sealed.open")}</Button></div>
 			</form>
+		</Glass>
+	</div>;
+	// Links of another app: read and checked already, nothing to fetch, so keeping them is the one step. What the table refused is listed with its reason; it is kept too, marked, and cannot connect.
+	if (offer?.kind === "legacy") return <div className="d-page">
+		<Glass className="d-panel">
+			<h1 className="vw-h2">{t("import.legacy.title")}</h1>
+			<p>{t("import.legacy.body")}</p>
+			<List label={t("import.review.connections")}>{offer.connections.map((connection, i) => <ListRow key={i} title={connection.name} detail={[protocolName(connection.protocol), t("xray.tcpUdp"), t("xray.unsigned")].join(locale === "fa" ? "، " : ", ")} trailing={connection.unsafe_cap ? <UnsafeNote/> : undefined}/>)}</List>
+			{offer.refused.length > 0 && <Banner tone="warning" title={t("import.legacy.refused", {count: offer.refused.length})}><span className="d-refused">{offer.refused.map((refused, i) => <span key={i}><strong>{refused.name}</strong> {failureText(refused.code, t)}</span>)}</span></Banner>}
+			{offer.skipped > 0 && <p className="vw-muted vw-small">{t("import.legacy.skipped", {count: offer.skipped})}</p>}
+			{offer.cut && <p className="vw-muted vw-small">{t("import.legacy.cut", {count: number(256)})}</p>}
+			<LegacyNote/>
+			{failure}
+			<div className="d-actions"><Button onClick={cancel} disabled={busy}>{t("common.cancel")}</Button><Button variant="primary" disabled={busy} onClick={() => run(call("import_keep", {keep: true}), onDone)}>{t("import.legacy.keep")}</Button></div>
 		</Glass>
 	</div>;
 	if (offer) {

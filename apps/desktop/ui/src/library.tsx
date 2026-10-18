@@ -1,6 +1,6 @@
-import {Banner, Button, Checkbox, ConfirmDialog, Dialog, Glass, Icon, IconButton, List, ListRow, StateBlock, useToast} from "@veilway/ui";
+import {Banner, Button, Checkbox, ConfirmDialog, Dialog, Glass, Icon, IconButton, List, ListRow, StateBlock, UnsafeNote, useToast} from "@veilway/ui";
 import {Fragment, useState} from "react";
-import {fromUnix, useD, useLogo} from "./kit.tsx";
+import {failureText, fromUnix, LegacyNote, protocolName, useD, useLogo} from "./kit.tsx";
 import {ShareDialog} from "./share.tsx";
 import {call, type Subscription} from "./tauri.ts";
 
@@ -34,7 +34,7 @@ export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: 
 		{library.length === 0 ? <Glass className="d-panel"><StateBlock kind="empty" title={t("library.empty")}>{t("library.emptyBody")}</StateBlock></Glass> : <Glass className="d-list"><List label={t("library.title")}>{library.map(subscription => <Fragment key={subscription.id}><ListRow
 			leading={<Logo subscription={subscription}/>}
 			title={subscription.provider}
-			detail={[t(`library.standing.${subscription.standing}`), t("library.ends", {date: date(fromUnix(subscription.expires_at))}), t("library.connections", {count: subscription.profiles.length})].join(locale === "fa" ? "، " : ", ")}
+			detail={(subscription.legacy ? [t("xray.tcpUdp"), t("xray.unsigned"), t("library.connections", {count: subscription.profiles.length})] : [t(`library.standing.${subscription.standing}`), t("library.ends", {date: date(fromUnix(subscription.expires_at))}), t("library.connections", {count: subscription.profiles.length})]).join(locale === "fa" ? "، " : ", ")}
 			trailing={<span className="d-row-actions">
 				{subscription.can_refresh && <IconButton icon="refresh" label={t("library.refresh", {provider: subscription.provider})} disabled={refreshing === subscription.id} onClick={() => { setRefreshing(subscription.id); onRefresh(subscription.id).finally(() => setRefreshing(null)); }}/>}
 				{subscription.can_refresh && <Button size="sm" variant="quiet" icon="upload" onClick={() => setSharing(subscription)}>{t("library.share")}</Button>}
@@ -42,11 +42,16 @@ export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: 
 			</span>}/>
 			{subscription.hosts.some(host => host.state === "waiting") ? <li className="d-row-notice"><Icon name="info"/><span className="d-row-notice-text"><span>{t(subscription.hosts.some(host => host.state === "waiting" && host.kind === "move") ? "library.hosts.noticeMove" : "library.hosts.notice")}</span><span className="vw-muted vw-small">{t("library.hosts.noticeBody")}</span></span><Button size="sm" onClick={() => setHosts({id: subscription.id, review: true})}>{t("library.hosts.review")}</Button></li>
 				: subscription.hosts.length > 0 && <li className="d-row-notice"><Icon name="globe"/><span className="d-row-notice-text"><span>{t("library.hosts.label")}</span><span className="vw-muted vw-small">{t("library.hosts.counts", {allowed: subscription.hosts.filter(host => host.state === "allowed").length, declined: subscription.hosts.filter(host => host.state === "declined").length})}</span></span><Button size="sm" variant="quiet" onClick={() => setHosts({id: subscription.id, review: false})}>{t("library.hosts.manage")}</Button></li>}
+			{subscription.legacy && <>
+				{subscription.profiles.map(profile => <li key={profile.id} className="d-row-notice"><Icon name={profile.legacy?.refused ? "error" : "globe"}/><span className="d-row-notice-text"><span className="d-xray-tags"><span>{profile.name}</span><span className="vw-muted vw-small">{protocolName(profile.legacy?.protocol)}</span>{profile.legacy?.unsafe_cap && <UnsafeNote/>}</span>{profile.legacy?.refused && <span className="vw-muted vw-small">{failureText(profile.legacy.refused, t)}</span>}</span></li>)}
+				<li className="d-row-notice"><Icon name="eye"/><span className="d-row-notice-text vw-muted vw-small">{t("xray.detectable")}</span></li>
+				<li className="d-row-option"><LegacyNote/></li>
+			</>}
 			{(subscription.bundle_notices ?? []).map(notice => <li key={notice.issued_at + notice.text} className="d-row-notice"><Icon name="info"/><span className="d-row-notice-text"><span>{notice.text}</span><span className="vw-muted vw-small">{t("bundle.notice.fromFile")}</span></span></li>)}
 			<li className="d-row-option"><Checkbox label={t("library.lan")} checked={subscription.lan_local} onChange={on => { setLan(subscription, on); }}/><span className="vw-muted vw-small">{t("library.lanHint")}</span></li>
 		</Fragment>)}</List></Glass>}
 		{sharing && <ShareDialog subscription={sharing} onClose={() => setSharing(null)}/>}
 		{hosts && reviewing && <Hosts key={`${hosts.id}-${hosts.review}`} subscription={reviewing} review={hosts.review} onClose={() => setHosts(null)} onChange={onChange}/>}
-		<ConfirmDialog open={removing !== null} onOpenChange={open => { if (!open) setRemoving(null); }} danger title={t("library.removeTitle", {provider: removing?.provider ?? ""})} body={t("library.removeBody")} confirmLabel={t("library.remove")} onConfirm={() => { if (removing) remove(removing); }}/>
+		<ConfirmDialog open={removing !== null} onOpenChange={open => { if (!open) setRemoving(null); }} danger title={t("library.removeTitle", {provider: removing?.provider ?? ""})} body={t(removing?.legacy ? "library.removeBodyLegacy" : "library.removeBody")} confirmLabel={t("library.remove")} onConfirm={() => { if (removing) remove(removing); }}/>
 	</div>;
 }

@@ -8,9 +8,10 @@
 //!
 //! **Per OS.** Linux: root through polkit; the executable and every folder above it have to be root's and closed to others in a release build, or the helper refuses (whoever could replace the file would be root). macOS: root through the administrator prompt; the program is the one in the app bundle, which a drag install leaves writable by the installing user, so a signed LaunchDaemon (`SMAppService`) that checks the signature of its client is the proper form and is open. Windows: an elevated process; `check_install_dir` of the platform layer refuses a folder others can write, and `wintun.dll` has to sit next to the executable (`tauri.windows.conf.json`). A tunnel that is up while the window is away is why Windows NCSI (lesson 3) and the name rules (lesson 6) stay the platform layer's business: nothing here changes them.
 use crate::bundle;
+use crate::legacy;
 use crate::logs::{LogLayer, START};
 use crate::ipc::{self, Conn, Server};
-use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
+use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Phase, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
 use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, SubscriptionOut};
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
@@ -18,7 +19,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
@@ -29,7 +30,8 @@ use veilway_engine::import::{self, Fetcher, Library, Reviewed};
 use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store};
 use veilway_proto::subscription::client::{Fetching, Standing, Offer, NativeOffer, CarriedOffer};
 use veilway_proto::subscription::Kind;
-use veilway_proto::subscription::payload::Id;
+use veilway_proto::subscription::payload::{private, Id};
+use veilway_proto::xray::{self, profile::Profile, Pin};
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
 #[cfg(target_os = "macos")]
@@ -47,6 +49,7 @@ const HELLO_WAIT: Duration = Duration::from_secs(5);
 /// What a window may have waiting to be written before it is dropped as one that does not read.
 const CLIENT_QUEUE: usize = 256;
 const STOP_WAIT: Duration = Duration::from_secs(30);
+const PRIVATE: &str = "This connection goes to a private address, which is not on the internet. That is normal for a server on your own network and unusual otherwise. Connect?";
 
 pub fn now() -> u64 {SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |elapsed| elapsed.as_secs())}
 
@@ -56,12 +59,26 @@ enum Pending {
 	Carried(CarriedOffer),
 	Fetching(Fetching),
 	Reviewed(Reviewed),
+	/// Pasted links of another app, read and checked. Nothing is fetched for them; `ImportKeep` keeps what passed.
+	Legacy(legacy::Read),
+}
+
+/// What a connect runs: a profile of a signed subscription, or one of pasted links through the Xray add-on at `binary`.
+enum Job {
+	Native {held: veilway_proto::subscription::client::Held, profile: String},
+	Xray {profile: Profile, name: String, binary: PathBuf, pin: &'static Pin, allow_lan: bool},
 }
 
 struct Running {subscription: String, stop: Arc<Notify>, answers: mpsc::UnboundedSender<bool>, done: watch::Receiver<bool>}
 
 pub struct Core {
 	pub(crate) library: AsyncMutex<Library>,
+	/// The pasted links of other apps, in a vault of their own.
+	legacy: AsyncMutex<legacy::Store>,
+	/// Held while the add-on is installed or removed, and while a connection of pasted links is set up, so that no two of them overlap.
+	installing: Arc<AsyncMutex<()>>,
+	/// Whether a connect has answered with the offer to install the add-on and nothing has installed it since. Only then is `XrayInstall` taken.
+	offered: AtomicBool,
 	store: Arc<Store>,
 	run: PathBuf,
 	/// The window's folder, where a bundle is staged for review and an app part is handed back.
@@ -94,8 +111,8 @@ fn kept_message(failure: &platform::Failure) -> String {
 }
 
 impl Core {
-	pub fn new(library: Library, store: Arc<Store>, run: PathBuf, dir: PathBuf, data: PathBuf, owner: u32) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), store, run, dir, data, owner, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
+	pub fn new(library: Library, pasted: legacy::Store, store: Arc<Store>, run: PathBuf, dir: PathBuf, data: PathBuf, owner: u32) -> Arc<Self> {
+		Arc::new(Self {library: AsyncMutex::new(library), legacy: AsyncMutex::new(pasted), installing: Arc::new(AsyncMutex::new(())), offered: AtomicBool::new(false), store, run, dir, data, owner, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
 	}
 
 	fn send(&self, out: Out) {let _ = self.push.send(out);}
@@ -103,7 +120,9 @@ impl Core {
 	fn tags(&self) -> Vec<veilway_proto::subscription::Tag> {tags(&self.languages.lock().unwrap())}
 
 	pub(crate) async fn library_value(&self) -> Result<Value, String> {
-		let mut value = to_value(library_view(&*self.library.lock().await, &self.store, &self.tags(), now()))?;
+		let mut views = library_view(&*self.library.lock().await, &self.store, &self.tags(), now());
+		views.extend(self.legacy.lock().await.held().iter().map(|pasted| legacy::view(pasted, self.store.lan_local(&pasted.id))));
+		let mut value = to_value(views)?;
 		self.add_notices(&mut value)?;
 		Ok(value)
 	}
@@ -118,6 +137,14 @@ impl Core {
 				self.library_value().await
 			}
 			Call::ImportOpen {source} => {
+				// Only one import is open at a time: whatever was open ends here, also when this one is refused, so that links read earlier do not stay in memory.
+				self.drop_import().await;
+				if let Some(lines) = match &source {Source::Link {text} => legacy::lines(text), _ => None} {
+					let read = legacy::read(&lines).map_err(str::to_owned)?;
+					let out = json!({"kind": "legacy", "connections": read.items.iter().enumerate().filter(|(_, item)| item.checked.is_ok()).map(|(at, item)| json!({"name": item.name(at), "protocol": item.protocol(), "unsafe_cap": item.unsafe_cap()})).collect::<Vec<_>>(), "refused": read.items.iter().enumerate().filter_map(|(at, item)| item.checked.as_ref().err().map(|code| json!({"name": item.name(at), "code": code}))).collect::<Vec<_>>(), "skipped": read.skipped, "cut": read.cut});
+					*self.pending.lock().await = Some(Pending::Legacy(read));
+					return Ok(out);
+				}
 				let offer = match source {
 					Source::Link {text} => import::open(&text),
 					Source::File {data} => import::open_file(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| import::Code::FileUnreadable.as_str().to_owned())?),
@@ -163,6 +190,12 @@ impl Core {
 			}
 			Call::ImportKeep {keep} => {
 				let mut pending = self.pending.lock().await;
+				if matches!(pending.as_ref(), Some(Pending::Legacy(_))) {
+					if let (true, Some(Pending::Legacy(read))) = (keep, pending.take()) {self.legacy.lock().await.add(read, format!("{}{}", legacy::PREFIX, random_hex(16).map_err(|_| import::Code::Random.as_str().to_owned())?), now()).map_err(|error| if error.kind() == std::io::ErrorKind::StorageFull {import::Code::Full.as_str().to_owned()} else {import::Code::Store.as_str().to_owned()})?;}
+					*pending = None;
+					drop(pending);
+					return self.library_value().await;
+				}
 				if keep && matches!(pending.as_ref(), Some(Pending::Reviewed(reviewed)) if reviewed.endpoint.is_some()) {self.fetch_gate()?}
 				let Some(Pending::Reviewed(reviewed)) = pending.take() else {return Err("There is no subscription waiting to be kept.".into())};
 				drop(pending);
@@ -184,11 +217,7 @@ impl Core {
 				Ok(json!({"data": base64::engine::general_purpose::STANDARD.encode(file)}))
 			}
 			Call::ImportCancel => {
-				match self.pending.lock().await.take() {
-					Some(Pending::Fetching(fetching)) => fetcher().abandon(fetching, &[]).await,
-					Some(Pending::Reviewed(reviewed)) => fetcher().decline(reviewed).await,
-					_ => {}
-				}
+				self.drop_import().await;
 				Ok(Value::Null)
 			}
 			Call::Refresh {subscription: id, private} => {
@@ -206,6 +235,7 @@ impl Core {
 			}
 			Call::Remove {subscription: id} => {
 				if self.running.lock().unwrap().as_ref().is_some_and(|running| running.subscription == id) {return Err("Disconnect before removing the subscription that is in use.".into())}
+				if id.starts_with(legacy::PREFIX) {self.legacy.lock().await.remove(&id).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				let mut library = self.library.lock().await;
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
 				if let Some(found) = found {library.remove(&found).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
@@ -228,7 +258,7 @@ impl Core {
 				self.library_value().await
 			}
 			Call::SetLan {subscription: id, on} => {
-				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
+				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) && !self.legacy.lock().await.held().iter().any(|pasted| pasted.id == id) {return Err("That subscription is not held.".into())}
 				self.store.set_lan_local(&id, on);
 				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
@@ -240,6 +270,66 @@ impl Core {
 				Ok(json!({"alpha": on}))
 			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
+			Call::Xray => Ok(self.xray_state()),
+			Call::XrayInstall => {
+				self.fetch_gate()?;
+				if !self.offered.load(Ordering::SeqCst) {return Err("xray_no_offer".into())}
+				let installing = self.installing.clone().try_lock_owned().map_err(|_| "xray_installing")?;
+				let pin = veilway_xray::target().and_then(xray::pin).ok_or("xray_unsupported")?;
+				// The lock `veilway connect` holds for its whole run: with it held by anyone, a connection of the command line or of this helper may be running the add-on that would be replaced.
+				let lock = state::lock(&self.run).await.map_err(|error| {
+					tracing::warn!("xray: the add-on was not installed, the connection lock is held: {error}");
+					"xray_busy"
+				})?;
+				let core = self.clone();
+				// The install runs in a task of its own, and the window is told how it goes by pushes, so that this window's Disconnect and Answer are not held up for the five minutes it can take.
+				tokio::spawn(async move {
+					let addons = veilway_xray::addons_dir(&core.data);
+					let (progress, mirrors) = (AtomicU64::new(0), if cfg!(debug_assertions) {veilway_xray::mirrors_from_env()} else {Vec::new()});
+					let outcome = if veilway_xray::installed(&addons) {Ok(())} else {
+						let install = veilway_xray::fetch_install(&addons, pin.target, pin, &mirrors, &progress);
+						tokio::pin!(install);
+						let mut tick = tokio::time::interval(Duration::from_millis(500));
+						loop {
+							tokio::select! {
+								outcome = &mut install => break outcome,
+								_ = tick.tick() => core.send(Out::XrayInstall {phase: Phase::Downloading, downloaded: progress.load(Ordering::Relaxed), state: None, error: None}),
+							}
+						}
+					};
+					// Released before the window is told, since it connects as soon as it hears.
+					drop((lock, installing));
+					let downloaded = progress.load(Ordering::Relaxed);
+					core.send(match outcome {
+						Ok(()) => {
+							tracing::info!("xray: the add-on {} is installed", xray::RELEASE);
+							core.offered.store(false, Ordering::SeqCst);
+							Out::XrayInstall {phase: Phase::Done, downloaded, state: Some(core.xray_state()), error: None}
+						}
+						Err((step, error)) => {
+							tracing::warn!("xray: the add-on was not installed: {error:#}");
+							Out::XrayInstall {phase: Phase::Failed, downloaded, state: None, error: Some(step.code().to_owned())}
+						}
+					});
+				});
+				Ok(Value::Null)
+			}
+			Call::XrayRemove => {
+				// First, before anything is stopped: an install or a connection being set up decides whether this goes on at all.
+				let _installing = self.installing.try_lock().map_err(|_| "xray_installing")?;
+				let uses = self.running.lock().unwrap().as_ref().is_some_and(|running| running.subscription.starts_with(legacy::PREFIX));
+				if uses {self.disconnect().await.map_err(|error| format!("{error:#}"))?}
+				let _lock = state::lock(&self.run).await.map_err(|error| {
+					tracing::warn!("xray: the add-on was not removed, the connection lock is held: {error}");
+					"xray_busy"
+				})?;
+				veilway_xray::remove(&veilway_xray::addons_dir(&self.data)).map_err(|error| {
+					tracing::warn!("xray: the add-on was not removed: {error:#}");
+					"xray_remove_failed".to_owned()
+				})?;
+				tracing::info!("xray: the add-on is removed");
+				Ok(self.xray_state())
+			}
 			Call::Answer {yes} => {
 				let sent = self.running.lock().unwrap().as_ref().is_some_and(|running| running.answers.send(yes).is_ok());
 				if sent {Ok(Value::Null)} else {Err("There is no question waiting.".into())}
@@ -292,9 +382,40 @@ impl Core {
 		}
 	}
 
+	/// Ends the import that is open, whatever step it is at: a fetch is abandoned, a review is declined, and pasted links that were read are dropped with their credentials.
+	async fn drop_import(&self) {
+		match self.pending.lock().await.take() {
+			Some(Pending::Fetching(fetching)) => Fetcher::new(default_roots(), None).abandon(fetching, &[]).await,
+			Some(Pending::Reviewed(reviewed)) => Fetcher::new(default_roots(), None).decline(reviewed).await,
+			_ => {}
+		}
+	}
+
+	/// What the window is told about the add-on, also as the offer: whether this system has one, whether this app's release is installed, the release and the most its download can be, and whether an install is running.
+	fn xray_state(&self) -> Value {json!({"supported": veilway_xray::target().and_then(xray::pin).is_some(), "installed": veilway_xray::installed(&veilway_xray::addons_dir(&self.data)), "release": xray::RELEASE, "size": veilway_xray::ARCHIVE_MAX, "installing": self.installing.try_lock().is_err()})}
+
+	/// A profile of pasted links that the table refuses does not start, and without the add-on of this app's release the answer is the offer, before anything is changed.
 	async fn connect(self: &Arc<Self>, subscription: String, profile: String, options: Options) -> Result<Value, String> {
-		let held = self.library.lock().await.held().iter().find(|held| held.id().as_str() == subscription).cloned().ok_or("That subscription is not held.")?;
-		if !held.subscription().profiles.iter().any(|candidate| candidate.id == profile) {return Err("That connection is not in the subscription.".into())}
+		// Held to the end of this call, which is after the connection is registered as running: a removal that comes later sees it, and one that is under way refuses this.
+		let pasted = subscription.starts_with(legacy::PREFIX);
+		let mut installing = if pasted {Some(self.installing.try_lock().map_err(|_| "xray_installing")?)} else {None};
+		let job = if pasted {
+			let (checked, name) = self.legacy.lock().await.find(&subscription, &profile).map(|(item, name)| (item.checked.clone(), name)).ok_or("That connection is not in the subscription.")?;
+			let profile = checked.map_err(str::to_owned)?;
+			if self.running.lock().unwrap().is_some() {return Err("Already connected.".into())}
+			let pin = veilway_xray::target().and_then(xray::pin).ok_or("xray_unsupported")?;
+			let addons = veilway_xray::addons_dir(&self.data);
+			if !veilway_xray::installed(&addons) {
+				installing.take();
+				self.offered.store(true, Ordering::SeqCst);
+				return Ok(json!({"xray_offer": self.xray_state()}));
+			}
+			Job::Xray {profile, name, binary: veilway_xray::executable(&addons), pin, allow_lan: self.store.lan_local(&subscription)}
+		} else {
+			let held = self.library.lock().await.held().iter().find(|held| held.id().as_str() == subscription).cloned().ok_or("That subscription is not held.")?;
+			if !held.subscription().profiles.iter().any(|candidate| candidate.id == profile) {return Err("That connection is not in the subscription.".into())}
+			Job::Native {held, profile}
+		};
 		let (stop, (answers, replies), (done_tx, done)) = (Arc::new(Notify::new()), mpsc::unbounded_channel(), watch::channel(false));
 		let mut running = self.running.lock().unwrap();
 		if running.is_some() {return Err("Already connected.".into())}
@@ -302,7 +423,10 @@ impl Core {
 		// The engine and the platform layer are driven on a runtime of their own, on a thread of their own: their futures need not be Send, and nothing the window does can block them.
 		std::thread::Builder::new().name("tunnel".into()).spawn(move || {
 			let ended = match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
-				Ok(runtime) => runtime.block_on(core.session(held, profile, options, notify, replies)),
+				Ok(runtime) => match job {
+					Job::Native {held, profile} => runtime.block_on(core.session(held, profile, options, notify, replies)),
+					Job::Xray {profile, name, binary, pin, allow_lan} => runtime.block_on(core.session_xray(profile, name, binary, pin, allow_lan, options, notify, replies)),
+				},
 				Err(error) => Err((error.to_string(), false)),
 			};
 			core.running.lock().unwrap().take();
@@ -336,11 +460,7 @@ impl Core {
 		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
 		let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default());
 		loop {
-			let on_status = |status: &Status, applied: &Applied| {
-				let view = status_view(status, Some(AppliedOut {interface: applied.interface.clone(), kill_switch: applied.kill_switch, dns: applied.dns.into(), split: applied.split.clone(), allow_lan: applied.allow_lan}));
-				*self.last.lock().unwrap() = Some(view.clone());
-				self.send(Out::Status(view));
-			};
+			let on_status = |status: &Status, applied: &Applied| self.shown(status, applied);
 			#[cfg(unix)]
 			let stopped = async {
 				stop.notified().await;
@@ -354,7 +474,7 @@ impl Core {
 			// The tunnel did not start because the user has still to say something. The kill switch is in force while the question waits. A no, or a stop, is the user's own end of it, and lifts what is in force; any other end is not.
 			let yes = match failure.error.downcast_ref::<StartError>() {
 				Some(StartError::Private) => {
-					let yes = self.ask("This connection goes to a private address, which is not on the internet. That is normal for a server on your own network and unusual otherwise. Connect?", &stop, &mut answers).await;
+					let yes = self.ask(PRIVATE, &stop, &mut answers).await;
 					agree.private |= yes;
 					yes
 				}
@@ -384,6 +504,32 @@ impl Core {
 				return Ok(());
 			}
 		}
+	}
+
+	/// What the platform layer reports goes to every window, and is kept for the next one that comes.
+	fn shown(&self, status: &Status, applied: &Applied) {
+		let view = status_view(status, Some(AppliedOut {interface: applied.interface.clone(), kill_switch: applied.kill_switch, dns: applied.dns.into(), split: applied.split.clone(), allow_lan: applied.allow_lan}));
+		*self.last.lock().unwrap() = Some(view.clone());
+		self.send(Out::Status(view));
+	}
+
+	/// `veilway connect` with pasted links, without the terminal: the add-on is held to its pin and the server is looked up before anything is in force, a private address is asked about, and `veilway_xray::run` does the rest under the one lock. Ok and an error mean what they mean for `session`.
+	#[allow(clippy::too_many_arguments)]
+	async fn session_xray(&self, profile: Profile, name: String, binary: PathBuf, pin: &'static Pin, allow_lan: bool, options: Options, stop: Arc<Notify>, mut answers: mpsc::UnboundedReceiver<bool>) -> Result<(), (String, bool)> {
+		let plain = |error: anyhow::Error| (format!("{error:#}"), false);
+		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
+		veilway_xray::check_addon(&binary, pin).map_err(plain)?;
+		let server = veilway_xray::server(&profile).await.map_err(plain)?;
+		if private(server) && !self.ask(PRIVATE, &stop, &mut answers).await {return Ok(())}
+		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan, local_names: options.local_names && allow_lan, routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
+		#[cfg(unix)]
+		let stopped = async {
+			stop.notified().await;
+			Stop::Asked
+		};
+		#[cfg(windows)]
+		let stopped = async {tokio::select! {() = stop.notified() => Stop::Asked, () = lock.stop_asked() => Stop::Asked}};
+		veilway_xray::run(&platform_options, &lock, profile, server, name, binary, pin, |status: &Status, applied: &Applied| self.shown(status, applied), stopped).await.map_err(|failure| (kept_message(&failure), failure.kept))
 	}
 
 	/// A running connection is asked to stop, which it does the clean way. With none running, whatever an earlier one left in force is removed.
@@ -555,10 +701,13 @@ fn run(dir: &Path, owner: Option<&str>) -> anyhow::Result<()> {
 	bundle::wipe(dir, &data, account);
 	let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?;
 	let (library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
-	let core = Core::new(library, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir, dir.to_path_buf(), data.clone(), account);
+	let (pasted, dropped, unopened) = legacy::Store::open(Box::new(SecretVault::new(data.join("legacy-vault"))));
+	let core = Core::new(library, pasted, Arc::new(Store::open(data.join("client.json"))), platform::Options::default().run_dir, dir.to_path_buf(), data.clone(), account);
 	let sink = core.push.clone();
 	tracing_subscriber::registry().with(LogLayer {sink: move |line| {let _ = sink.send(Out::Log {line});}, helper: true}).init();
 	for _ in damaged {tracing::warn!("a stored subscription does not read any more and is left out")}
+	if dropped > 0 {tracing::warn!("{dropped} stored pastes of links do not read any more and are left out")}
+	if let Some(error) = unopened {tracing::warn!("the pasted links cannot be read, and none is written over them: {error}")}
 	runtime.block_on(async {
 		#[cfg(unix)]
 		let server = {
@@ -592,7 +741,8 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::DirBuilder::new().mode(0o755).create(&dir).unwrap();
 		let (library, _) = Library::open(Box::new(FileVault(dir.join("vault")))).unwrap();
-		let core = Core::new(library, Arc::new(Store::open(dir.join("client.json"))), dir.join("run"), dir.join("window"), dir.join("data"), 0);
+		let (pasted, _, _) = legacy::Store::open(Box::new(FileVault(dir.join("legacy-vault"))));
+		let core = Core::new(library, pasted, Arc::new(Store::open(dir.join("client.json"))), dir.join("run"), dir.join("window"), dir.join("data"), 0);
 		let socket = dir.join("helper.sock");
 		let server = Server::bind(&socket, uid).ok()?;
 		let task = tokio::spawn(serve(core.clone(), server, token()));
@@ -612,6 +762,109 @@ mod tests {
 		assert_eq!(link.call(Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await.unwrap_err(), "That subscription is not held.");
 		assert_eq!(link.call(Call::Answer {yes: true}).await.unwrap_err(), "There is no question waiting.");
 		assert_eq!(link.call(Call::SelectExit {tag: None}).await.unwrap_err(), "There is no running tunnel to change the exit of.");
+	}
+
+	const GOOD: &str = "vless://5f2c8e1a-0b3d-4c6e-9a7f-1d2e3f4a5b6c@203.0.113.5:443?security=tls&sni=edge.example&type=ws&path=%2Fws#Edge";
+
+	#[tokio::test]
+	async fn a_pasted_link_the_table_refuses_gives_its_code_and_nothing_is_kept() {
+		let (core, socket, _task) = start("refused", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		let refused = "vless://5f2c8e1a-0b3d-4c6e-9a7f-1d2e3f4a5b6c@203.0.113.5:443?security=tls&type=kcp#Kcp";
+		assert_eq!(link.call(Call::ImportOpen {source: Source::Link {text: refused.into()}}).await.unwrap_err(), "profile_refused.stream");
+		assert_eq!(link.call(Call::ImportOpen {source: Source::Link {text: "trojan://secret@203.0.113.5:443?allowInsecure=1".into()}}).await.unwrap_err(), "profile_refused.certificate");
+		assert_eq!(link.call(Call::ImportKeep {keep: true}).await.unwrap_err(), "There is no subscription waiting to be kept.");
+		assert_eq!(link.call(Call::Library {languages: vec!["en".into()]}).await.unwrap(), json!([]));
+		assert!(socket.parent().unwrap().join("legacy-vault").metadata().is_err(), "nothing was written");
+		assert!(core.pending.lock().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn a_refused_paste_ends_the_import_that_was_open_and_the_links_read_before_are_not_kept_by_a_later_yes() {
+		let (core, socket, _task) = start("ends", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		link.call(Call::ImportOpen {source: Source::Link {text: GOOD.into()}}).await.unwrap();
+		assert!(matches!(core.pending.lock().await.as_ref(), Some(Pending::Legacy(read)) if read.items.len() == 1));
+		let refused = "vless://5f2c8e1a-0b3d-4c6e-9a7f-1d2e3f4a5b6c@203.0.113.5:443?security=tls&type=kcp#Kcp";
+		assert_eq!(link.call(Call::ImportOpen {source: Source::Link {text: refused.into()}}).await.unwrap_err(), "profile_refused.stream");
+		assert!(core.pending.lock().await.is_none(), "the links read before do not stay in memory");
+		assert_eq!(link.call(Call::ImportKeep {keep: true}).await.unwrap_err(), "There is no subscription waiting to be kept.");
+		assert!(socket.parent().unwrap().join("legacy-vault").metadata().is_err(), "nothing was written");
+		link.call(Call::ImportOpen {source: Source::Link {text: GOOD.into()}}).await.unwrap();
+		assert!(link.call(Call::ImportOpen {source: Source::Link {text: "not a link".into()}}).await.is_err());
+		assert!(core.pending.lock().await.is_none(), "a paste that is no link ends it too");
+		link.call(Call::ImportOpen {source: Source::Link {text: GOOD.into()}}).await.unwrap();
+		link.call(Call::ImportCancel).await.unwrap();
+		assert!(core.pending.lock().await.is_none());
+	}
+
+	#[tokio::test]
+	async fn a_pasted_list_is_kept_in_its_vault_with_what_passed_and_shown_as_unsigned() {
+		let (_core, socket, _task) = start("kept", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		let text = format!("{GOOD}\nss://bm9uZTpwYXNz@203.0.113.6:8388#Weak\nnot a link\n");
+		let offer = link.call(Call::ImportOpen {source: Source::Link {text}}).await.unwrap();
+		assert_eq!((offer["kind"].as_str(), offer["connections"][0]["name"].as_str(), offer["connections"][0]["protocol"].as_str(), offer["skipped"].as_u64()), (Some("legacy"), Some("Edge"), Some("vless"), Some(1)));
+		assert_eq!((offer["connections"].as_array().unwrap().len(), offer["refused"][0]["name"].as_str(), offer["refused"][0]["code"].as_str()), (1, Some("Weak"), Some("profile_refused.cipher")));
+		let library = link.call(Call::ImportKeep {keep: true}).await.unwrap();
+		let pasted = &library[0];
+		assert!(pasted["legacy"] == true && pasted["id"].as_str().unwrap().starts_with(legacy::PREFIX) && pasted["can_refresh"] == false);
+		let profiles = pasted["profiles"].as_array().unwrap();
+		assert_eq!((profiles.len(), profiles[0]["legacy"]["protocol"].as_str(), profiles[0]["legacy"]["refused"].clone()), (2, Some("vless"), Value::Null));
+		assert_eq!((profiles[1]["id"].as_str(), profiles[1]["name"].as_str(), profiles[1]["legacy"]["protocol"].as_str(), profiles[1]["legacy"]["refused"].as_str()), (Some("2"), Some("Weak"), Some("shadowsocks"), Some("profile_refused.cipher")));
+		let vault = std::fs::read_to_string(socket.parent().unwrap().join("legacy-vault")).unwrap();
+		assert!(vault.contains("edge.example") && vault.contains("8388") && !vault.contains("not a link"), "both links are kept, and the line that is no link is not");
+		let id = pasted["id"].as_str().unwrap().to_owned();
+		assert_eq!(link.call(Call::Connect {subscription: id.clone(), profile: "2".into(), options: Options::default()}).await.unwrap_err(), "profile_refused.cipher", "a refused link never connects, with the add-on or without it");
+		assert_eq!(link.call(Call::Remove {subscription: id}).await.unwrap(), json!([]));
+	}
+
+	#[tokio::test]
+	async fn connecting_pasted_links_without_the_add_on_gives_the_offer_and_starts_nothing() {
+		let (core, socket, _task) = start("offer", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		link.call(Call::ImportOpen {source: Source::Link {text: GOOD.into()}}).await.unwrap();
+		let id = link.call(Call::ImportKeep {keep: true}).await.unwrap()[0]["id"].as_str().unwrap().to_owned();
+		let state = link.call(Call::Xray).await.unwrap();
+		assert_eq!((state["installed"].as_bool(), state["release"].as_str()), (Some(false), Some(xray::RELEASE)));
+		let answer = link.call(Call::Connect {subscription: id.clone(), profile: "1".into(), options: Options::default()}).await.unwrap();
+		if veilway_xray::target().is_none() {return}
+		assert!(core.offered.load(Ordering::SeqCst));
+		let offer = &answer["xray_offer"];
+		assert_eq!((offer["installed"].as_bool(), offer["release"].as_str(), offer["size"].as_u64()), (Some(false), Some(xray::RELEASE), Some(veilway_xray::ARCHIVE_MAX)));
+		assert!(core.running.lock().unwrap().is_none(), "nothing was started");
+		assert_eq!(link.call(Call::Connect {subscription: id, profile: "2".into(), options: Options::default()}).await.unwrap_err(), "That connection is not in the subscription.");
+	}
+
+	#[tokio::test]
+	async fn the_add_on_is_not_installed_without_an_offer_or_changed_while_the_lock_of_a_connection_is_held() {
+		if veilway_xray::target().and_then(xray::pin).is_none() {return}
+		let (core, socket, _task) = start("lock", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		assert_eq!(link.call(Call::XrayInstall).await.unwrap_err(), "xray_no_offer");
+		core.offered.store(true, Ordering::SeqCst);
+		let held = state::lock(&core.run).await.unwrap();
+		assert_eq!(link.call(Call::XrayInstall).await.unwrap_err(), "xray_busy");
+		assert_eq!(link.call(Call::XrayRemove).await.unwrap_err(), "xray_busy");
+		assert_eq!(link.call(Call::Xray).await.unwrap()["installing"], false, "a refused install leaves nothing running");
+		drop(held);
+	}
+
+	#[tokio::test]
+	async fn a_removal_takes_the_install_before_it_stops_anything_and_a_connect_of_pasted_links_waits_for_neither() {
+		let (core, socket, _task) = start("order", euid()).await.unwrap();
+		let link = link(&socket, &token()).await.unwrap();
+		link.call(Call::ImportOpen {source: Source::Link {text: GOOD.into()}}).await.unwrap();
+		let id = link.call(Call::ImportKeep {keep: true}).await.unwrap()[0]["id"].as_str().unwrap().to_owned();
+		let installing = core.installing.clone().try_lock_owned().unwrap();
+		assert_eq!(link.call(Call::Xray).await.unwrap()["installing"], true);
+		assert_eq!(link.call(Call::Connect {subscription: id.clone(), profile: "1".into(), options: Options::default()}).await.unwrap_err(), "xray_installing");
+		let stop = Arc::new(Notify::new());
+		*core.running.lock().unwrap() = Some(Running {subscription: id, stop: stop.clone(), answers: mpsc::unbounded_channel().0, done: watch::channel(false).1});
+		assert_eq!(link.call(Call::XrayRemove).await.unwrap_err(), "xray_installing");
+		assert!(tokio::time::timeout(Duration::from_millis(100), stop.notified()).await.is_err(), "the connection that uses the add-on was not told to stop");
+		assert!(core.running.lock().unwrap().is_some());
+		drop(installing);
 	}
 
 	#[tokio::test]

@@ -1,18 +1,19 @@
 import {Banner, Button, ConnectSwitch, Dialog, Glass, Icon, List, ListRow, ProviderCard, SelectField, StatRow, StatTile, UsageBar, useToast, type ConnectState, type ProviderItem, type TrafficPoint} from "@veilway/ui";
 import {useEffect, useState} from "react";
-import {agreement, fromUnix, useD, useLogo, type Prefs} from "./kit.tsx";
+import {agreement, failureText, fromUnix, useD, useLogo, type Prefs} from "./kit.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {call, type Ended, type Exit, type Profile, type Running, type Subscription} from "./tauri.ts";
 
 type Choice = {subscription: Subscription, profile: Profile};
 
 export function Home({running, busy, ended, points, choices, chosen, prefs, onPrefs, onConnect, onDisconnect, onRefresh}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void}) {
-	const {t, rate, time, date, locale, number} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
+	const {t, rate, time, date, locale, number, bytes} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
 	const status = running.status, state = running.connected ? status?.state ?? "connecting" : "off", subscription = chosen?.subscription, logo = useLogo(subscription?.logo ?? null);
 	const link: ConnectState = state === "connected" ? "on" : state === "off" || state === "failed" ? "off" : "connecting";
 	const heading = state === "connected" ? t("state.connected") : state === "connecting" ? t("state.connecting") : state === "reconnecting" ? t("state.reconnecting") : state === "stopped" ? t("state.stopped") : state === "failed" ? t("state.failed") : t("state.disconnected");
 	const exits = status?.exits ?? [], current = exits.find(e => e.tag === status?.exit), usage = status?.usage, now = points[points.length - 1];
-	const code = status?.say_code && ("say." + status.say_code) in en ? t(("say." + status.say_code) as DesktopKey) : status?.say;
+	const xray = status?.xray ?? null, said = xray?.say_code ?? status?.say_code, refused = chosen?.profile.legacy?.refused ?? null;
+	const code = said && ("say." + said) in en ? t(("say." + said) as DesktopKey) : xray?.say ?? status?.say;
 	const wait = status?.wait_until ? t("home.retryAt", {time: time(fromUnix(status.wait_until))}) : state === "stopped" ? t("home.retryAsked") : null;
 	const country = (exit: Exit) => { try { return exit.country ? new Intl.DisplayNames([locale], {type: "region"}).of(exit.country.toUpperCase()) : undefined; } catch { return undefined; } };
 	const exitDetail = (exit: Exit) => [country(exit), exit.working ? t(("home.load." + (["low", "medium", "high"].includes(exit.load) ? exit.load : "unknown")) as DesktopKey) : t("home.exitDown")].filter(Boolean).join(locale === "fa" ? "، " : ", ");
@@ -44,17 +45,18 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 	return <div className="d-page">
 		<div className="d-hero">
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
-			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{subscription.provider}</span>}</p>
+			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{chosen?.profile.legacy ? [subscription.provider, t("xray.tcpUdp")].join(locale === "fa" ? "، " : ", ") : subscription.provider}</span>}</p>
 			{chosen?.profile.left_out && <p className="vw-muted vw-small">{t("profile.leftOut")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
-			<ConnectSwitch state={link} disabled={busy || !chosen || (pending && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
+			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>
 		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, detail: c.subscription.provider}))}/>}
+		{refused && link === "off" && <Banner tone="warning" title={t("home.refused")}>{failureText(refused, t)}</Banner>}
 		{pending && subscription && <Banner tone="info" title={t("terms.title", {provider: subscription.provider})} action={<Button size="sm" variant="primary" onClick={() => onPrefs({accepted: {...prefs.accepted, [subscription.id]: terms ?? ""}})}>{t("terms.accept")}</Button>}>
 			{t(accepted === undefined ? "terms.body" : "terms.changed", {provider: subscription.provider})}
 			<span className="d-actions d-start">{([["terms.terms", subscription.terms], ["terms.privacy", subscription.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" variant="quiet" icon="external" onClick={() => open(url)}>{t(label)}</Button>)}</span>
 		</Banner>}
-		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error === "alpha_off" ? t("alpha.off") : ended?.error, kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
+		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error === "alpha_off" ? t("alpha.off") : ended?.error && failureText(ended.error, t), kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}
 		{exits.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={exits.find(e => e.selected)?.name ?? t("home.exitAuto")} trailing={<Icon name="chevronForward"/>}/></List></Glass>}
@@ -70,6 +72,11 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			</StatRow>
 			{usage && <UsageBar label={t(("home.period." + (["daily", "weekly", "monthly"].includes(usage.period) ? usage.period : "none")) as DesktopKey)} used={usage.used_bytes} total={usage.quota_bytes || null}/>}
 			{usage?.expires_at ? <p className="vw-muted vw-small">{t("home.planEnds", {date: date(fromUnix(usage.expires_at))})}</p> : null}
+		</Glass>}
+		{xray && <Glass className="d-panel d-xray-stats">
+			<h2 className="vw-h3">{t("xray.status.title")}</h2>
+			<dl>{([["xray.status.openTcp", number(xray.open_tcp)], ["xray.status.openUdp", number(xray.open_udp)], ["xray.status.carried", number(xray.carried_flows)], ["xray.status.failed", number(xray.failed_flows)], ["xray.status.sent", bytes(xray.bytes_sent).text], ["xray.status.received", bytes(xray.bytes_received).text], ["xray.status.unsupported", number(xray.unsupported_packets)], ["xray.status.droppedUdp", number(xray.dropped_udp_flows)], ["xray.status.restarts", number(xray.restarts)]] as const).map(([key, shown]) => <div key={key}><dt>{t(key)}</dt><dd className="vw-num">{shown}</dd></div>)}</dl>
+			<p className="vw-muted vw-small">{t("xray.status.note")}</p>
 		</Glass>}
 		{subscription && items.length > 0 && (prefs.hidden.includes(subscription.id) ? <Button variant="quiet" icon="eye" className="d-start" onClick={() => onPrefs({hidden: prefs.hidden.filter(id => id !== subscription.id)})}>{t("home.showProvider", {provider: subscription.provider})}</Button>
 			: <ProviderCard provider={subscription.provider} accent={subscription.accent ?? undefined} logo={logo} cards={items} onHide={() => onPrefs({hidden: [...prefs.hidden, subscription.id]})} onOpenLink={open}/>)}

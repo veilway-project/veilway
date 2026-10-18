@@ -54,7 +54,7 @@ jobs:
           CARGO_PUBLISH_TIMEOUT: "600"
         run: |
           set -euo pipefail
-          for c in veilway-ipstack veilway-hpack veilway-proto veilway-wg veilway-transport veilway-engine veilway-core veilway-api veilway-linux veilway-macos veilway-windows veilway; do
+          for c in veilway-ipstack veilway-hpack veilway-proto veilway-wg veilway-transport veilway-engine veilway-core veilway-api veilway-linux veilway-macos veilway-windows veilway-xray veilway; do
             v=$(cargo metadata --no-deps --format-version 1 | jq -r --arg c "$c" '.packages[] | select(.name == $c) | .version')
             if curl -sf -A "veilway-publish" "https://crates.io/api/v1/crates/$c/$v" >/dev/null; then echo "$c $v is already published"; continue; fi
             cargo publish --locked --no-verify -p "$c" --config "publish.timeout=600"

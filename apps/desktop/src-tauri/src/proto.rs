@@ -67,11 +67,11 @@ pub enum Call {
 	/// The window's proof that it holds the token, answering the helper's `Challenge`.
 	Auth { proof: String },
 	Library { languages: Vec<String> },
-	/// Step 1 of an import. Nothing leaves the device until `ImportProceed`.
+	/// Step 1 of an import. Nothing leaves the device until `ImportProceed`. A pasted link of another app, or a list of them, is read and checked here and fetches nothing: the answer lists what can connect, and `ImportKeep` keeps it.
 	ImportOpen { source: Source },
 	/// The user's first yes (a native link contacts the provider's server, a carried one is read). `private` is the private addresses the user said yes to after the question "This subscription is on a private address", exactly as that question showed them.
 	ImportProceed {#[serde(default)] private: Vec<String>},
-	/// The user's second answer, after seeing the provider and the connections.
+	/// The user's second answer, after seeing the provider and the connections, or the answer to the links of another app.
 	ImportKeep { keep: bool },
 	ImportCancel,
 	/// The link of a held subscription, for the user to pass on as text or a code. Only the link, never the device's keys.
@@ -83,7 +83,14 @@ pub enum Call {
 	Remove { subscription: String },
 	/// The user's answer about a subscription's backup update hosts, each as the library view gave it (`HostOut::key`): `allow` are confirmed, `decline` are declined or lose their yes. A host the subscription does not list waiting or confirmed is ignored.
 	AnswerHosts { subscription: String, allow: Vec<String>, decline: Vec<String> },
+	/// For a profile of pasted links with no add-on of this app's release, the answer is the offer to install it, `{"xray_offer": {...}}`, and nothing has started.
 	Connect { subscription: String, profile: String, options: Options },
+	/// Whether this system can have the Xray add-on, whether the release this app pins is installed, the release and the most its download can be.
+	Xray,
+	/// Downloads and installs the add-on, after the user's yes to the offer; refused when no offer was made. The answer comes at once, with null: the install runs in a task of the helper and is told by `Out::XrayInstall` pushes, and the window connects again when it hears that the add-on is in.
+	XrayInstall,
+	/// Removes the add-on, after a disconnect if a profile that uses it runs. The pasted links stay.
+	XrayRemove,
 	/// "Let apps reach devices on this network" for one subscription, saved and used from the next connect. The local network goes through the tunnel unless this is on.
 	SetLan { subscription: String, on: bool },
 	/// Whether the user turned on the transports in alpha (`alpha_transports`). Gives `{"alpha": bool}`.
@@ -131,7 +138,13 @@ pub enum Out {
 	Ended { error: Option<String>, kept: bool },
 	/// A line the engine or the platform layer logged in the helper.
 	Log { line: String },
+	/// How the install of the add-on goes: `Downloading` with the bytes so far every half second, then `Done` with the state `Xray` answers with, or `Failed` with the code of the step.
+	XrayInstall { phase: Phase, downloaded: u64, state: Option<Value>, error: Option<String> },
 }
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum Phase {Downloading, Done, Failed}
 
 /// Reads one line, never more than `max` bytes of it. `None` is the end of the stream. A longer line is an error and the stream is not read again.
 pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R, max: usize) -> std::io::Result<Option<String>> {
@@ -174,11 +187,19 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Alpha, Call::SetAlpha {on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Xray, Call::XrayInstall, Call::XrayRemove, Call::Alpha, Call::SetAlpha {on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);
 		}
+	}
+
+	#[test]
+	fn the_progress_of_an_install_is_a_push_with_its_phase() {
+		let push = Out::XrayInstall {phase: Phase::Failed, downloaded: 7, state: None, error: Some("xray_disk_failed".into())};
+		let text = serde_json::to_string(&push).unwrap();
+		assert!(text.contains("\"type\":\"xray_install\"") && text.contains("\"phase\":\"failed\""));
+		assert_eq!(serde_json::from_str::<Out>(&text).unwrap(), push);
 	}
 
 	#[tokio::test]

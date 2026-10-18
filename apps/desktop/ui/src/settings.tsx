@@ -1,14 +1,15 @@
 import {Banner, Button, ConfirmDialog, Glass, Segmented, StateBlock, Switch, useToast} from "@veilway/ui";
 import {useEffect, useState} from "react";
-import {ANDROID, useD, type Prefs} from "./kit.tsx";
-import {call, type Settings, type UpdateInfo} from "./tauri.ts";
+import {ANDROID, failureText, useD, type Prefs} from "./kit.tsx";
+import {call, type Settings, type UpdateInfo, type XrayState} from "./tauri.ts";
 
 export function SettingsPage({prefs, onPrefs, settings, onSettings, logs, onUpdate}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void, logs: string[], onUpdate: (info: UpdateInfo | null) => void}) {
 	const {t} = useD(), toast = useToast(), [showLog, setShowLog] = useState(false), [checking, setChecking] = useState(false), [checked, setChecked] = useState<UpdateInfo | null>(null), [checkError, setCheckError] = useState<string | null>(null);
-	const [autostart, setAutostart] = useState<boolean | null>(null), [alpha, setAlpha] = useState<boolean | null>(null), [asking, setAsking] = useState(false);
-	useEffect(() => { if (!ANDROID) call("get_autostart").then(setAutostart, () => {}); }, []);
+	const [autostart, setAutostart] = useState<boolean | null>(null), [alpha, setAlpha] = useState<boolean | null>(null), [asking, setAsking] = useState(false), [xray, setXray] = useState<XrayState | null>(null), [removing, setRemoving] = useState(false);
+	useEffect(() => { if (!ANDROID) { call("get_autostart").then(setAutostart, () => {}); call("xray_state").then(setXray, () => {}); } }, []);
 	useEffect(() => { call("get_alpha").then(found => setAlpha(found.alpha), () => {}); }, []);
 	const saveAlpha = (on: boolean) => call("set_alpha", {on}).then(found => setAlpha(found.alpha), error => toast({tone: "danger", title: t("settings.alphaFailed"), body: error}));
+	const removeXray = () => call("xray_remove").then(found => { setXray(found); toast({tone: "success", title: t("settings.xrayRemoved")}); }, error => toast({tone: "danger", title: t("settings.xrayRemoveFailed"), body: failureText(error, t)}));
 	const setStart = (enabled: boolean) => call("set_autostart", {enabled}).then(() => setAutostart(enabled), error => toast({tone: "danger", title: t("settings.autostartFailed"), body: error}));
 	const check = () => { setChecking(true); setCheckError(null); call("check_update").then(info => { setChecked(info); onUpdate(info.available ? info : null); }, setCheckError).finally(() => setChecking(false)); };
 	if (showLog) return <div className="d-page">
@@ -33,6 +34,8 @@ export function SettingsPage({prefs, onPrefs, settings, onSettings, logs, onUpda
 			{checked && !checked.available && <Banner tone="success" title={t("settings.upToDate")}/>}
 			{checkError && <Banner tone="danger" title={t("settings.checkFailed")}>{checkError}</Banner>}
 		</Glass>}
+		{!ANDROID && xray?.supported && <Glass className="d-panel"><div className="d-setting"><span className="vw-label">{t("settings.xray")}</span><span className="vw-muted vw-small">{xray.installed ? t("settings.xrayInstalled", {release: `\u2066${xray.release}\u2069`}) : t("settings.xrayMissing")}</span>{xray.installed && <Button onClick={() => setRemoving(true)}>{t("settings.xrayRemove")}</Button>}</div></Glass>}
+		<ConfirmDialog open={removing} onOpenChange={setRemoving} danger title={t("settings.xrayRemoveTitle")} body={t("settings.xrayRemoveBody")} confirmLabel={t("settings.xrayRemove")} onConfirm={removeXray}/>
 		<Glass className="d-panel"><div className="d-setting"><span className="vw-label">{t("settings.privacy")}</span><span className="vw-muted vw-small">{t("settings.privacyHint")}</span><Button icon="external" onClick={() => call("open_link", {url: `https://veilway-project.github.io/veilway-docs/${settings.locale === "fa" ? "fa/" : ""}legal/app-privacy/`}).catch(error => toast({tone: "danger", title: t("settings.privacy"), body: error}))}>{t("terms.privacy")}</Button></div></Glass>
 		<Button variant="quiet" icon="activity" className="d-start" onClick={() => setShowLog(true)}>{t("settings.log")}</Button>
 	</div>;

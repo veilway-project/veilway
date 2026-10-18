@@ -46,6 +46,10 @@ libc="0.2.150"
 # The helper opens the one folder of the user's that it reads from with openat, never following a link.
 rustix={version="1", default-features=false, features=["std", "process", "fs"]}
 
+# The Xray add-on that the helper runs a profile of pasted links through.
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+veilway-xray={path="../../../crates/veilway-xray"}
+
 [target.'cfg(target_os = "linux")'.dependencies]
 veilway-linux={path="../../../crates/veilway-linux"}
 

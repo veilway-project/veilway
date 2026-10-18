@@ -4,6 +4,7 @@ mod bundle;
 mod bundle_store;
 mod helper;
 mod ipc;
+mod legacy;
 mod link;
 mod logs;
 mod proto;
@@ -61,13 +62,14 @@ impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:da
 
 fn dark()->String{"dark".to_string()}
 
-/// What the helper says by itself becomes events for the UI: `status`, `question` (a yes or no the engine needs, answered with `answer`), `ended` and `log`.
+/// What the helper says by itself becomes events for the UI: `status`, `question` (a yes or no the engine needs, answered with `answer`), `ended`, `log` and `xray-install` (how the install of the add-on goes).
 fn forward(app:&AppHandle, out:Out){
 	match out{
 		Out::Status(view)=>{let _=app.emit("status", view);}
 		Out::Question{text}=>{let _=app.emit("question", text);}
 		Out::Ended{error, kept}=>{let _=app.emit("ended", serde_json::json!({"error":error, "kept":kept}));}
 		Out::Log{line}=>push_log(line),
+		Out::XrayInstall{phase, downloaded, state, error}=>{let _=app.emit("xray-install", serde_json::json!({"phase":phase, "downloaded":downloaded, "state":state, "error":error}));}
 		Out::Reply{..}|Out::Challenge{..}=>{}
 	}
 }
@@ -222,6 +224,17 @@ async fn connect(app:AppHandle, backend:State<'_, Arc<Backend>>, subscription:St
 	ask(&backend, Call::Connect{subscription, profile, options}).await
 }
 
+/// Whether the Xray add-on can be had here and is installed, its release and the most its download can be.
+#[tauri::command]
+async fn xray_state(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::Xray).await}
+
+/// Installs the add-on after the user's yes to the offer that `connect` gave. The window connects again when it is in.
+#[tauri::command]
+async fn xray_install(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::XrayInstall).await}
+
+#[tauri::command]
+async fn xray_remove(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::XrayRemove).await}
+
 #[tauri::command]
 async fn answer(backend:State<'_, Arc<Backend>>, yes:bool)->Result<Value, String>{ask(&backend, Call::Answer{yes}).await}
 
@@ -334,7 +347,7 @@ fn main(){
 		.plugin(tauri_plugin_dialog::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, library, refresh, remove, answer_hosts, set_lan, xray_state, xray_install, xray_remove, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));

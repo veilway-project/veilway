@@ -34,8 +34,6 @@ base64.workspace=true
 rustls.workspace=true
 tokio-rustls.workspace=true
 webpki-roots.workspace=true
-# The Xray-core add-on's archive: one entry is read out of the zip, see the workspace manifest.
-zip.workspace=true
 ipnet.workspace=true
 
 [target.'cfg(unix)'.dependencies]
@@ -60,6 +58,8 @@ veilway-windows={path="../veilway-windows", version="0.2.0"}
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
 veilway-engine={path="../veilway-engine", version="0.2.0"}
+# The Xray add-on that `connect` runs a legacy profile through.
+veilway-xray={path="../veilway-xray", version="0.2.0"}
 
 [dev-dependencies]
 rcgen.workspace=true

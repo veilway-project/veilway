@@ -8,7 +8,7 @@ import {Library} from "./library.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {fa} from "./locales/fa.ts";
 import {SettingsPage} from "./settings.tsx";
-import {asksPrivate, call, on, type BundleReview, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo} from "./tauri.ts";
+import {asksPrivate, call, offersXray, on, type BundleReview, type Ended, type Progress, type Running, type Settings, type Subscription, type UpdateInfo, type XrayInstallPush, type XrayState} from "./tauri.ts";
 import {UsagePage} from "./usage.tsx";
 
 const PACKS = {en, fa};
@@ -18,6 +18,8 @@ const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe"
 
 // Used only until the helper's settings arrive, and when they cannot be read.
 const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true};
+// The add-on has not run on a real Mac yet, which its offer says there.
+const MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
 export function App() {
 	const [prefs, setPrefs] = useState<Prefs>(loadPrefs), [saved, setSaved] = useState<Settings | null>(null);
@@ -37,11 +39,11 @@ function Brand() {
 }
 
 function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void}) {
-	const {t, locale, percent} = useD(), toast = useToast();
+	const {t, locale, percent, bytes} = useD(), toast = useToast();
 	const [tab, setTab] = useState("home"), [adding, setAdding] = useState(false), [library, setLibrary] = useState<Subscription[] | null>(null), [libraryError, setLibraryError] = useState<string | null>(null), [privateAsk, setPrivateAsk] = useState<{id: string, addresses: string[]} | null>(null), [bundle, setBundle] = useState<BundleReview | null>(null);
 	const [running, setRunning] = useState<Running>(IDLE), [busy, setBusy] = useState(false), [ended, setEnded] = useState<Ended | null>(null), [question, setQuestion] = useState<string | null>(null), [points, setPoints] = useState<TrafficPoint[]>([]), [logs, setLogs] = useState<string[]>([]);
-	const [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null);
-	const last = useRef<{at: number, sent: number, received: number} | null>(null);
+	const [update, setUpdate] = useState<UpdateInfo | null>(null), [progress, setProgress] = useState<Progress | null>(null), [xrayOffer, setXrayOffer] = useState<XrayState | null>(null), [installing, setInstalling] = useState(false), [downloaded, setDownloaded] = useState(0);
+	const last = useRef<{at: number, sent: number, received: number} | null>(null), installed = useRef<(push: XrayInstallPush) => void>(() => {});
 	const loadLibrary = () => { setLibraryError(null); call("library", {languages: locale === "fa" ? ["fa", "en"] : ["en"]}).then(setLibrary, setLibraryError); };
 	useEffect(loadLibrary, [locale]);
 	useEffect(() => { document.title = t("app.title"); }, [t]);
@@ -53,7 +55,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 			setQuestion(null);
 			setEnded(done.error || done.kept ? done : null);
 			setPoints([]);
-		}), on("log", line => setLogs(list => [...list.slice(-199), line])), on("update-progress", setProgress)];
+		}), on("log", line => setLogs(list => [...list.slice(-199), line])), on("update-progress", setProgress), on("xray-install", push => installed.current(push))];
 		return () => offs.forEach(off => off.then(stop => stop()));
 	}, []);
 	// At start, every six hours, and when the tunnel comes up or goes down, since a check made while the kill switch held could not reach the release.
@@ -76,13 +78,25 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		}, () => {}), 1000);
 		return () => clearInterval(timer);
 	}, [running.connected]);
-	const choices = (library ?? []).flatMap(subscription => subscription.profiles.map(profile => ({subscription, profile})));
+	// Pasted links have no provider: the window names them.
+	const named = useMemo(() => library?.map(subscription => subscription.legacy ? {...subscription, provider: t("xray.pasted")} : subscription) ?? null, [library, t]);
+	const choices = (named ?? []).flatMap(subscription => subscription.profiles.map(profile => ({subscription, profile})));
 	const chosen = choices.find(c => c.subscription.id === prefs.choice?.subscription && c.profile.id === prefs.choice?.profile) ?? choices[0];
 	const connect = () => {
 		if (!chosen) return;
 		setBusy(true);
 		setEnded(null);
-		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {local_names: false, routes: []}}).then(() => setRunning(old => ({...old, connected: true})), error => toast({tone: "danger", title: t("home.connectFailed"), body: error})).finally(() => setBusy(false));
+		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {local_names: false, routes: []}}).then(found => { if (offersXray(found)) return setXrayOffer(found.xray_offer); setRunning(old => ({...old, connected: true})); }, error => toast({tone: "danger", title: t("home.connectFailed"), body: failureText(error, t)})).finally(() => setBusy(false));
+	};
+	// The add-on is installed only after the yes to its offer. The helper answers at once and tells how it goes with pushes, so Disconnect and the questions are not held up; the connection is made again once it is in.
+	const installXray = () => { setInstalling(true); setDownloaded(0); call("xray_install").catch(error => { setInstalling(false); toast({tone: "danger", title: t("xray.installFailed"), body: failureText(error, t)}); }); };
+	installed.current = push => {
+		setDownloaded(push.downloaded);
+		if (push.phase === "downloading") return;
+		setInstalling(false);
+		if (push.phase === "failed") return toast({tone: "danger", title: t("xray.installFailed"), body: failureText(push.error ?? "", t)});
+		setXrayOffer(null);
+		connect();
 	};
 	const disconnect = () => {
 		setBusy(true);
@@ -100,16 +114,20 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	const updateBanner = update && <Banner tone="info" title={t("update.title", {version: update.version})} action={!progress && <Button size="sm" variant="primary" onClick={install}>{t("update.install")}</Button>}>
 		{progress ? <span className="d-progress"><span>{t("update.installing")}</span>{progress.total ? <><span className="vw-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.downloaded}><span style={{inlineSize: Math.min(100, progress.downloaded / progress.total * 100) + "%"}}/></span><strong className="vw-num vw-small">{percent(progress.downloaded / progress.total)}</strong></> : null}</span> : update.notes.slice(0, 200)}
 	</Banner>;
-	const content = bundle ? <Bundle review={bundle} onClose={() => setBundle(null)} onLibrary={setLibrary}/> : library === null ? (libraryError ? <StateBlock kind="error" title={t("library.loadFailed")} action={<Button onClick={loadLibrary}>{t("action.retry")}</Button>}>{t("library.loadFailedBody")}</StateBlock> : <StateBlock kind="loading" title={t("common.loading")}/>)
-		: adding || (library.length === 0 && tab === "home") ? <Importer first={library.length === 0} onAccept={(id, terms) => onPrefs({accepted: {...prefs.accepted, [id]: terms}})} onCancel={() => setAdding(false)} onBundle={setBundle} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
+	const content = bundle ? <Bundle review={bundle} onClose={() => setBundle(null)} onLibrary={setLibrary}/> : named === null ? (libraryError ? <StateBlock kind="error" title={t("library.loadFailed")} action={<Button onClick={loadLibrary}>{t("action.retry")}</Button>}>{t("library.loadFailedBody")}</StateBlock> : <StateBlock kind="loading" title={t("common.loading")}/>)
+		: adding || (named.length === 0 && tab === "home") ? <Importer first={named.length === 0} onAccept={(id, terms) => onPrefs({accepted: {...prefs.accepted, [id]: terms}})} onCancel={() => setAdding(false)} onBundle={setBundle} onDone={found => { setLibrary(found); setAdding(false); setTab("home"); toast({tone: "success", title: t("import.added")}); }}/>
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
-		: tab === "subscriptions" ? <Library library={library} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
+		: tab === "subscriptions" ? <Library library={named} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
 		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
 		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh}/>;
 	const lit = running.status?.state === "connected";
 	return <Backdrop fixed lit={lit} className="d-app">
 		<Shell nav={<Nav header={<Brand/>} value={adding ? "subscriptions" : tab} onChange={id => { setAdding(false); setTab(id); }} items={[{id: "home", label: t("nav.home"), icon: "power"}, {id: "usage", label: t("nav.usage"), icon: "chart"}, {id: "subscriptions", label: t("nav.subscriptions"), icon: "inbox"}, {id: "settings", label: t("nav.settings"), icon: "settings"}]}/>} banner={updateBanner}>{content}</Shell>
 		<Dialog open={kind !== null} onOpenChange={open => { if (!open && question !== null) answer(false); }} title={t(`question.${kind ?? "other"}.title` as DesktopKey)} description={kind === "other" ? question ?? "" : t(`question.${kind ?? "other"}.body` as DesktopKey)} footer={<><Button onClick={() => answer(false)}>{t("question.no")}</Button><Button variant={kind === "unsafe" || kind === "stale" ? "danger" : "primary"} onClick={() => answer(true)}>{t(`question.${kind ?? "other"}.yes` as DesktopKey)}</Button></>}/>
+		<Dialog open={xrayOffer !== null} onOpenChange={open => { if (!open && !installing) setXrayOffer(null); }} title={t("xray.offer.title")} description={t("xray.offer.body", {release: `\u2066${xrayOffer?.release ?? ""}\u2069`, size: bytes(xrayOffer?.size ?? 0).text})} footer={<><Button disabled={installing} onClick={() => setXrayOffer(null)}>{t("common.cancel")}</Button><Button variant="primary" disabled={installing} onClick={installXray}>{t(installing ? "xray.offer.installing" : "xray.offer.yes")}</Button></>}>
+			{MAC && <p className="vw-muted vw-small">{t("xray.offer.untested")}</p>}
+			{installing && <p className="vw-muted vw-small" role="status">{t("xray.offer.progress", {size: bytes(downloaded).text})}</p>}
+		</Dialog>
 		<ConfirmDialog open={privateAsk !== null} onOpenChange={open => { if (!open) setPrivateAsk(null); }} title={t("private.title")} body={t("private.body", {addresses: `\u2066${privateAsk?.addresses.join(", ") ?? ""}\u2069`})} confirmLabel={t("private.yes")} onConfirm={() => { if (privateAsk) refresh(privateAsk.id, privateAsk.addresses); }}/>
 	</Backdrop>;
 }

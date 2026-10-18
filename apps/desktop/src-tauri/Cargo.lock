@@ -5467,6 +5467,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "typed-path"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5601,6 +5607,7 @@ dependencies = [
  "veilway-macos",
  "veilway-proto",
  "veilway-windows",
+ "veilway-xray",
  "windows-sys 0.61.2",
 ]
 
@@ -5736,6 +5743,26 @@ dependencies = [
  "veilway-transport",
  "windows-sys 0.61.2",
  "wintun-bindings",
+]
+
+[[package]]
+name = "veilway-xray"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "ring",
+ "rustls",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "veilway-engine",
+ "veilway-linux",
+ "veilway-macos",
+ "veilway-proto",
+ "veilway-windows",
+ "webpki-roots",
+ "zip",
 ]
 
 [[package]]
@@ -6760,6 +6787,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
+]
+
+[[package]]
+name = "zip"
+version = "9.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.14.2",
+ "memchr",
+ "nix",
+ "typed-path",
 ]
 
 [[package]]

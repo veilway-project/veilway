@@ -5,8 +5,6 @@ mod doctor;
 mod link;
 #[cfg(unix)]
 mod mirror;
-#[cfg(any(target_os = "linux", target_os = "macos", windows))]
-mod xray;
 
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
