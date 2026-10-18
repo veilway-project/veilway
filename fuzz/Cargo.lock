@@ -1907,6 +1907,7 @@ dependencies = [
  "veilway-proto",
  "veilway-transport",
  "veilway-wg",
+ "x25519-dalek 3.0.0",
 ]
 
 [[package]]
@@ -1954,6 +1955,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
+ "boring",
  "hpke",
  "ring",
  "serde",
@@ -1961,6 +1963,7 @@ dependencies = [
  "subtle",
  "veilway-hpack",
  "x25519-dalek 3.0.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -1976,10 +1979,14 @@ dependencies = [
  "rustix",
  "rustls",
  "socket2",
+ "subtle",
  "tokio",
  "tokio-boring",
  "tracing",
  "veilway-proto",
+ "x25519-dalek 3.0.0",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

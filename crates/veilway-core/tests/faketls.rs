@@ -318,7 +318,8 @@ impl Node {
 
 /// Waits for something the engine does on its own time.
 async fn eventually(what: &str, done: impl Fn() -> bool) {
-	let deadline = Instant::now() + Duration::from_secs(8);
+	// Windows answers a connect to a closed loopback port only after its SYN retries, about 2 s each, so the probes of a site that is down take longer there.
+	let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) {40} else {8});
 	while !done() {
 		assert!(Instant::now() < deadline, "{what}");
 		tokio::time::sleep(Duration::from_millis(20)).await;
