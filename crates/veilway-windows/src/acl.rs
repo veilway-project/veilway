@@ -6,8 +6,8 @@ const TRUSTED: [&str; 2] = ["S-1-5-18", "S-1-5-32-544"];
 const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
 /// CREATOR OWNER, whose entries are replaced by the owner's, and which is trusted exactly as far as the owner is.
 const CREATOR_OWNER: &str = "S-1-3-0";
-/// Write data or add a file, append data or add a subfolder, delete a child, write the DACL, write the owner, and the generic write and all rights.
-const WRITE_MASK: u32 = 0x2 | 0x4 | 0x40 | 0x4_0000 | 0x8_0000 | 0x4000_0000 | 0x1000_0000;
+/// Write data or add a file, append data or add a subfolder, delete a child, delete, write the DACL, write the owner, and the generic write and all rights.
+const WRITE_MASK: u32 = 0x2 | 0x4 | 0x40 | 0x1_0000 | 0x4_0000 | 0x8_0000 | 0x4000_0000 | 0x1000_0000;
 /// Read and execute, which is what a folder that others may list and open gives.
 const READ_EXECUTE: &str = "0x1200a9";
 
@@ -66,6 +66,7 @@ mod tests {
 	#[test]
 	fn an_untrusted_writer_of_the_exe_folder_is_found_and_a_reader_is_not() {
 		assert!(grants_write("S-1-5-32-545", 0x2, false), "users may add files");
+		assert!(grants_write("S-1-5-32-545", 0x1_0000, false), "users may delete");
 		assert!(grants_write("S-1-5-11", 0x1f01ff, false), "authenticated users have full control");
 		assert!(grants_write("S-1-5-21-1-2-3-1001", 0x4_0000, false), "write DACL");
 		assert!(!grants_write("S-1-5-32-545", 0x1200a9, false), "users may read and execute");

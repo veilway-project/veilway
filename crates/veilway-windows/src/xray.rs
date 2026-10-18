@@ -1,12 +1,20 @@
 //! What Xray needs of Windows ("The binary", "How traffic reaches Xray", "Supervision"): the child with a restricted token in a job object that kills it, the choice of the server's address among the ones its name resolved to, the name of the physical adapter its own socket is kept on, and the look-up of who holds a loopback port.
 //!
-//! The spec leaves open whether Windows makes an account for Xray. This layer does not: the child runs as the user of the helper with the Administrators group switched to deny-only and every privilege taken away (`CreateRestrictedToken`), which needs no password and no account to look after. That is weaker than a user of its own against a flaw that reads this user's files, and the decision is the spec's. The job object allows one process, so Xray cannot start another, and kills it when the helper's handle to the job closes, which is when the helper ends however it ends. The token's integrity level is not lowered.
+//! The spec leaves open whether Windows makes an account for Xray. This layer does not: the child runs as the user of the helper with the Administrators groups switched to deny-only, every privilege taken away (`CreateRestrictedToken`) and the integrity level lowered to Low, so that it cannot write to what the user owns. That needs no password and no account to look after, and is weaker than a user of its own against a flaw that reads this user's files; the decision is the spec's. The job object allows one process, so Xray cannot start another, and kills it when the helper's handle to the job closes, which is when the helper ends however it ends. The kill switch names the user's SID next to the program, so that another user who runs the same file does not pass.
 //!
 //! Xray's socket stays out of the tunnel with `sockopt.interface` in the document, the friendly name of the adapter the engine's sockets are bound to (`IP_UNICAST_IF`). The kill switch lets the executable of Xray, and no other program, reach the server by address, port and protocol (`firewall::Rules::xray`).
 use std::net::{IpAddr, SocketAddr};
 
-/// The groups switched to deny-only in the child's token, by SID: the Administrators.
-pub const DISABLED_SIDS: [&str; 1] = ["S-1-5-32-544"];
+/// The groups switched to deny-only in the child's token, by SID: the Administrators, and "local account and member of Administrators", which the elevated token of a local administrator carries besides. A SID the token does not hold makes the start fail, which is the safe side.
+pub const DISABLED_SIDS: [&str; 2] = ["S-1-5-32-544", "S-1-5-114"];
+/// The integrity level of the child's token: Low, so that it cannot write to what the user owns.
+pub const LOW_INTEGRITY: &str = "S-1-16-4096";
+
+/// The environment block of the child: `SystemRoot` and `SystemDrive` and nothing else, as UTF-16 `NAME=value` entries each ended by a NUL, and the block ended by one more. Winsock does not start without them.
+pub fn environment_block(system_root: &str, system_drive: &str) -> Vec<u16> {format!("SystemRoot={system_root}\0SystemDrive={system_drive}\0\0").encode_utf16().collect()}
+
+/// Taken by whoever starts a process while handles are marked inheritable, so that the ends of Xray's pipes are in no other child, and by whoever starts a process of this crate by other means (`netsh`), around the start.
+pub static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A socket of a process, as the tables of the IP Helper list them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +34,7 @@ pub fn command_line(program: &str, arguments: &[&str]) -> String {
 }
 
 #[cfg(windows)]
-pub use system::{alias, listening_as, physical, usable, Child};
+pub use system::{alias, listening_as, physical, usable, user_sid, Child};
 
 #[cfg(windows)]
 mod system {
@@ -45,11 +53,15 @@ mod system {
 	use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceIndexToLuid, ConvertInterfaceLuidToAlias, GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6TABLE_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6TABLE_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER, UDP_TABLE_OWNER_PID};
 	use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 	use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
-	use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
-	use windows_sys::Win32::Security::{AdjustTokenPrivileges, CreateRestrictedToken, LookupPrivilegeValueW, DISABLE_MAX_PRIVILEGE, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY};
+	use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
+	use windows_sys::Win32::Security::{AdjustTokenPrivileges, CreateRestrictedToken, GetLengthSid, GetTokenInformation, LookupPrivilegeValueW, SetTokenInformation, TokenIntegrityLevel, TokenUser, DISABLE_MAX_PRIVILEGE, LUID_AND_ATTRIBUTES, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SID_AND_ATTRIBUTES, TOKEN_ADJUST_DEFAULT, TOKEN_MANDATORY_LABEL, TOKEN_USER, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY};
 	use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE};
 	use windows_sys::Win32::System::Pipes::CreatePipe;
+	use windows_sys::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 	use windows_sys::Win32::System::Threading::{CreateProcessAsUserW, DeleteProcThreadAttributeList, GetCurrentProcess, GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW};
+
+	/// `SE_GROUP_INTEGRITY`: the entry of the label is an integrity level.
+	const SE_GROUP_INTEGRITY: u32 = 0x20;
 
 	fn wide(text: &str) -> Vec<u16> {text.encode_utf16().chain(std::iter::once(0)).collect()}
 
@@ -133,18 +145,18 @@ mod system {
 		Ok(!found.is_empty() && found.iter().all(|holder| *holder == pid))
 	}
 
-	// A pipe whose two ends can be inherited, as `CreateProcess` needs the child's end to be. The caller clears the flag on its own end.
+	// A pipe whose ends are not inherited. The child's end is marked right before the process is made, under `SPAWN`.
 	fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
-		let attributes = SECURITY_ATTRIBUTES {nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1};
+		let attributes = SECURITY_ATTRIBUTES {nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 0};
 		let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
 		// SAFETY: both out pointers are live locals and the attributes are live through the call.
 		if unsafe {CreatePipe(&mut read, &mut write, &attributes, 1 << 16)} == 0 {return Err(io::Error::last_os_error())}
 		Ok((owned(read), owned(write)))
 	}
 
-	fn not_inherited(handle: &OwnedHandle) -> io::Result<()> {
+	fn inheritable(handle: &OwnedHandle, on: bool) -> io::Result<()> {
 		// SAFETY: the handle is open for the length of the call.
-		if unsafe {SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, 0)} == 0 {Err(io::Error::last_os_error())} else {Ok(())}
+		if unsafe {SetHandleInformation(handle.as_raw_handle(), HANDLE_FLAG_INHERIT, if on {HANDLE_FLAG_INHERIT} else {0})} == 0 {Err(io::Error::last_os_error())} else {Ok(())}
 	}
 
 	// The token of the child: a restricted copy of this process's own, with the groups of `DISABLED_SIDS` deny-only and no privilege. The privilege to raise quotas is switched on in this process's token first, since starting a process with another token asks for it.
@@ -174,7 +186,40 @@ mod system {
 			// SAFETY: each SID came from `ConvertStringSidToSidW`, which says to free it with this call, once.
 			unsafe {LocalFree(sid.Sid)};
 		}
-		if made == 0 {Err(error)} else {Ok(owned(restricted))}
+		if made == 0 {return Err(error)}
+		let restricted = owned(restricted);
+		let mut low = null_mut();
+		// SAFETY: the string is null-terminated and `low` a live local the call writes a pointer to, freed below.
+		if unsafe {ConvertStringSidToSidW(wide(LOW_INTEGRITY).as_ptr(), &mut low)} == 0 {return Err(io::Error::last_os_error())}
+		let label = TOKEN_MANDATORY_LABEL {Label: SID_AND_ATTRIBUTES {Sid: low, Attributes: SE_GROUP_INTEGRITY}};
+		// SAFETY: the token is open with the right to adjust its defaults, the label points at a live SID, and the length is that of the struct and the SID it names.
+		let lowered = unsafe {SetTokenInformation(restricted.as_raw_handle(), TokenIntegrityLevel, (&label as *const TOKEN_MANDATORY_LABEL).cast(), std::mem::size_of::<TOKEN_MANDATORY_LABEL>() as u32 + GetLengthSid(low))};
+		let error = io::Error::last_os_error();
+		// SAFETY: the SID came from `ConvertStringSidToSidW`, freed once.
+		unsafe {LocalFree(low)};
+		if lowered == 0 {Err(error)} else {Ok(restricted)}
+	}
+
+	/// The SID of the user of this process, in text: the user the child runs as, which the kill switch names next to the program.
+	pub fn user_sid() -> io::Result<String> {
+		let mut current: HANDLE = null_mut();
+		// SAFETY: the process handle is a pseudo handle and `current` is a live local the call writes to.
+		if unsafe {OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut current)} == 0 {return Err(io::Error::last_os_error())}
+		let current = owned(current);
+		let mut length = 0u32;
+		// SAFETY: a null buffer of size 0 asks for the size, written to `length`; the call fails with that request.
+		unsafe {GetTokenInformation(current.as_raw_handle(), TokenUser, null_mut(), 0, &mut length)};
+		let mut buffer = vec![0u64; (length as usize).div_ceil(8)];
+		// SAFETY: the buffer is live, aligned for the struct and at least `length` bytes long.
+		if unsafe {GetTokenInformation(current.as_raw_handle(), TokenUser, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, &mut length)} == 0 {return Err(io::Error::last_os_error())}
+		let mut text: *mut u16 = null_mut();
+		// SAFETY: the buffer holds a `TOKEN_USER` whose SID points into it, and `text` is a live local the call writes a pointer to.
+		if unsafe {ConvertSidToStringSidW((*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut text)} == 0 {return Err(io::Error::last_os_error())}
+		// SAFETY: a null-terminated wide string that the call allocated, copied and freed once.
+		let found = unsafe {String::from_utf16_lossy(std::slice::from_raw_parts(text, (0..).take_while(|at| *text.add(*at) != 0).count()))};
+		// SAFETY: as above.
+		unsafe {LocalFree(text.cast())};
+		Ok(found)
 	}
 
 	// A job that kills what is in it when its last handle closes, and allows one process.
@@ -207,7 +252,6 @@ mod system {
 		pub fn spawn(program: &Path, arguments: &[&str], working_directory: &Path) -> io::Result<Self> {
 			let token = restricted_token()?;
 			let ((input, stdin), (stdout, output), (stderr, error)) = (pipe()?, pipe()?, pipe()?);
-			for parent in [&stdin, &stdout, &stderr] {not_inherited(parent)?}
 			let mut handles = [input.as_raw_handle(), output.as_raw_handle(), error.as_raw_handle()];
 			let mut size = 0usize;
 			// SAFETY: a null list asks for the size it needs, which is written to `size`; the call fails with that request, and that is not an error here.
@@ -224,12 +268,20 @@ mod system {
 			(startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError) = (handles[0], handles[1], handles[2]);
 			startup.lpAttributeList = list.as_mut_ptr().cast();
 			let (application, mut command, directory) = (wide(&program.to_string_lossy()), wide(&command_line(&program.to_string_lossy(), arguments)), wide(&working_directory.to_string_lossy()));
-			// An environment of no variables: one empty entry, the end of the block.
-			let environment = [0u16; 2];
+			let mut windows = [0u16; 260];
+			// SAFETY: the buffer is live and its length in characters is passed.
+			let length = unsafe {GetSystemWindowsDirectoryW(windows.as_mut_ptr(), windows.len() as u32)} as usize;
+			if length == 0 || length >= windows.len() {return Err(io::Error::other("the system would not say where Windows is"))}
+			let environment = environment_block(&String::from_utf16_lossy(&windows[..length]), working_directory.to_string_lossy().trim_end_matches('\\'));
 			let mut created = PROCESS_INFORMATION::default();
+			// Nobody else starts a process while the child's ends can be inherited.
+			let guard = SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+			for child in [&input, &output, &error] {inheritable(child, true)?}
 			// SAFETY: every pointer is live through the call: the strings, the startup struct with its list of handles, the environment and the out struct. The token is open, and a restricted copy of this process's own needs no privilege to assign.
 			let ok = unsafe {CreateProcessAsUserW(token.as_raw_handle(), application.as_ptr(), command.as_mut_ptr(), null(), null(), 1, CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT, environment.as_ptr().cast(), directory.as_ptr(), (&startup as *const STARTUPINFOEXW).cast(), &mut created)};
 			let created_error = io::Error::last_os_error();
+			for child in [&input, &output, &error] {let _ = inheritable(child, false);}
+			drop(guard);
 			// SAFETY: the list was initialized above and is deleted once, after the call that used it.
 			unsafe {DeleteProcThreadAttributeList(list.as_mut_ptr().cast())};
 			if ok == 0 {return Err(created_error)}
@@ -302,7 +354,15 @@ mod tests {
 	}
 
 	#[test]
-	fn the_administrators_are_switched_off_in_the_childs_token() {
-		assert_eq!(DISABLED_SIDS, ["S-1-5-32-544"]);
+	fn the_administrators_are_switched_off_and_the_integrity_is_low_in_the_childs_token() {
+		assert_eq!(DISABLED_SIDS, ["S-1-5-32-544", "S-1-5-114"]);
+		assert_eq!(LOW_INTEGRITY, "S-1-16-4096");
+	}
+
+	#[test]
+	fn the_environment_is_the_system_root_and_drive_and_nothing_else() {
+		let block = environment_block("C:\\Windows", "C:");
+		assert_eq!(String::from_utf16(&block).unwrap(), "SystemRoot=C:\\Windows\0SystemDrive=C:\0\0");
+		assert_eq!(block.iter().filter(|unit| **unit == 0).count(), 3);
 	}
 }

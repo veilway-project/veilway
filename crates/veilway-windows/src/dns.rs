@@ -57,6 +57,8 @@ mod pin {
 	const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 	fn run(program: &std::path::Path, args: &[String]) -> io::Result<String> {
+		// Held while the process is started, so that Xray's pipes are not inherited by it.
+		let _guard = crate::xray::SPAWN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 		let out = Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW).output().map_err(|error| io::Error::new(error.kind(), format!("{} did not run: {error}", program.display())))?;
 		if !out.status.success() {return Err(io::Error::other(format!("{} {} failed: {}{}", program.display(), args.join(" "), String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim())))}
 		Ok(String::from_utf8_lossy(&out.stdout).into_owned())

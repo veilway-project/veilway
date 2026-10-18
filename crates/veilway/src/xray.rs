@@ -83,6 +83,9 @@ pub fn open_checked(path: &Path, pin: &Pin) -> anyhow::Result<File> {
 	options.custom_flags(libc::O_NOFOLLOW);
 	#[cfg(windows)]
 	options.share_mode(SHARE_READ).custom_flags(OPEN_REPARSE_POINT);
+	// The folders above the file are checked on every start, as when they were made: a folder that someone else can write in lets them swap the file for a link.
+	#[cfg(target_os = "macos")]
+	if let Err(error) = veilway_macos::state::secure_tree(path.parent().unwrap_or(path), 0o755) {return Err(Mismatch(error.to_string()).into())}
 	let mut file = options.open(path).with_context(|| format!("the Xray executable cannot be opened: {}", path.display()))?;
 	#[cfg(unix)]
 	let meta = file.metadata()?;
@@ -244,12 +247,15 @@ fn spawn_checked(_file: &File, path: &Path, args: &[&str], ids: (u32, u32)) -> i
 	unsafe {
 		command.pre_exec(move || {
 			let (me, mut ready) = (libc::getpid(), [0 as libc::c_int; 2]);
-			if libc::pipe(ready.as_mut_ptr()) != 0 {return Err(io::Error::last_os_error())}
+			if ids.0 == 0 || libc::pipe(ready.as_mut_ptr()) != 0 {return Err(io::Error::other("the child would run as root, or the monitor's pipe could not be made"))}
 			match libc::fork() {
 				-1 => return Err(io::Error::last_os_error()),
 				0 => {
 					// The monitor. It watches both with a kqueue, says one byte on the pipe (1 once the watch is in, 0 if it could not be), and then waits for the first of the two to end; if that is this process it kills Xray, and if that is Xray it has nothing left to do. An end that came before the watch began is reported at once as an error event, and means the same.
-					libc::close(ready[0]);
+					// Everything this process inherited is closed but the pipe to say it by: the write end of Xray's input (which Xray would never see the end of), the lock, the interface and the sockets are not the monitor's to hold, and it is still root.
+					for fd in 0..libc::getdtablesize() {
+						if fd != ready[1] {libc::close(fd);}
+					}
 					let queue = libc::kqueue();
 					let mut changes: [libc::kevent; 2] = std::mem::zeroed();
 					for (change, pid) in changes.iter_mut().zip([parent, me]) {

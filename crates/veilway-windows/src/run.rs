@@ -79,8 +79,8 @@ fn endpoints(profile: &Profile) -> Vec<Endpoint> {
 /// What a connection needs of the profile it carries, whatever carries it: the addresses the device gets, the gateways the name policy is pointed at, the addresses and ports the engine's sockets (or Xray's program) may reach, and for a legacy profile Xray's program and its supervisor.
 pub struct Target {pub addresses: Vec<IpAddr>, pub gateways: Vec<IpAddr>, pub nodes: Vec<Endpoint>, pub xray: Option<XrayHold>}
 
-/// The path of Xray's executable, whose connection to the server the kill switch lets out, and the channel to its supervisor, which is told the physical adapter's name when it changes.
-pub struct XrayHold {pub program: String, pub live: Arc<Live>}
+/// The path of Xray's executable and the SID of the user it runs as, whose connection to the server the kill switch lets out, and the channel to its supervisor, which is told the physical adapter's name when it changes.
+pub struct XrayHold {pub program: String, pub user: String, pub live: Arc<Live>}
 
 /// Runs a connection until `stop` completes or something fails. Ok is a stop the user asked for, after which everything is removed, the kill switch last. An error is a connection that ended on its own, and the kill switch stays in force. `settings.socket` and `settings.networks` are set here. A tunnel that does not start (`StartError`, the user has still to be asked something) is the error as well, with the kill switch in force, and `anyhow::Error::downcast_ref::<StartError>` on `Failure::error` finds it: the caller asks and runs again, or calls `cleanup` when the user said no.
 pub async fn run(options: &Options, lock: &state::Lock, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
@@ -119,8 +119,9 @@ pub async fn run_xray(options: &Options, lock: &state::Lock, xray: XrayRun, on_s
 	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
 	let held = networks::read(None).map_err(|error| before(error.into()))?;
 	if own(xray.server, &held.networks) {return Err(before(anyhow::anyhow!("xray_server_local: the server's address is inside a network this device is on")))}
+	let user = crate::xray::user_sid().map_err(|error| before(error.into()))?;
 	let Some(addresses) = carrier::addresses(&held.networks) else {return Err(before(anyhow::anyhow!("xray_range_taken: both ranges the tunnel can use overlap a network this device is on")))};
-	let target = Target {addresses: addresses.device.to_vec(), gateways: addresses.gateway.to_vec(), nodes: [true, xray.udp].iter().map(|tcp| Endpoint {ip: xray.server, port: xray.port, tcp: *tcp}).collect(), xray: Some(XrayHold {program: xray.program.to_string_lossy().into_owned(), live: xray.live.clone()})};
+	let target = Target {addresses: addresses.device.to_vec(), gateways: addresses.gateway.to_vec(), nodes: [true, xray.udp].iter().map(|tcp| Endpoint {ip: xray.server, port: xray.port, tcp: *tcp}).collect(), xray: Some(XrayHold {program: xray.program.to_string_lossy().into_owned(), user, live: xray.live.clone()})};
 	let live = xray.live.clone();
 	let start = |_: &Own, _: &Arc<AtomicU32>| -> anyhow::Result<Carrier> {Ok(Carrier::Xray(XrayTunnel::start(Params {name: xray.name, socks: xray.socks, login: xray.login, addresses, resolvers: xray.resolvers, live: xray.live, relay_ok: Arc::new(move |relay| live.pid().is_some_and(|pid| crate::xray::listening_as(relay, pid, true).unwrap_or(false)))})))};
 	run_target(options, lock, &target, start, on_status, stop).await
@@ -138,7 +139,7 @@ async fn run_target(options: &Options, _lock: &state::Lock, target: &Target, sta
 	let (own, physical) = (networks::read(None).map_err(|error| before(error.into()))?, Arc::new(AtomicU32::new(0)));
 	physical.store(own.interface.unwrap_or(0), Ordering::Relaxed);
 	let protected = Layout {routes: &options.routes, gateways: &target.gateways}.protected();
-	let rules = Rules {tun: None, nodes: target.nodes.clone(), protected, lan: if options.allow_lan {lan::local(&own.networks).into_iter().filter_map(|(ip, prefix)| IpNet::new(ip, prefix).ok()).collect()} else {Vec::new()}, local_names: options.local_names, xray: target.xray.as_ref().map(|xray| xray.program.clone())};
+	let rules = Rules {tun: None, nodes: target.nodes.clone(), protected, lan: if options.allow_lan {lan::local(&own.networks).into_iter().filter_map(|(ip, prefix)| IpNet::new(ip, prefix).ok()).collect()} else {Vec::new()}, local_names: options.local_names, xray: target.xray.as_ref().map(|xray| firewall::XrayRule {program: xray.program.clone(), user: xray.user.clone()})};
 	// With the kill switch off nothing is protected, but names still only go through the tunnel (port 53 is blocked elsewhere), and what an earlier client left is replaced, so that its filters do not drop this client's connections to nodes the old profile did not list.
 	firewall::install(&Rules {protected: if options.kill_switch {rules.protected.clone()} else {Vec::new()}, ..rules.clone()}).map_err(|error| before(error.into()))?;
 	if options.kill_switch {tracing::info!("the kill switch is in force: only the tunnel and the engine's own connections leave this device")}

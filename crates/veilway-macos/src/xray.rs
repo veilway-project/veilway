@@ -43,8 +43,13 @@ fn dscl(arguments: &[String]) -> io::Result<String> {
 
 fn words(arguments: &[&str]) -> Vec<String> {arguments.iter().map(|word| (*word).to_owned()).collect()}
 
-/// The ids of the account Xray runs as, if it exists. A record that is not there is a failure of `dscl`, and is read as none.
-pub fn ids() -> io::Result<Option<(u32, u32)>> {Ok(dscl(&words(&["-read", &format!("/Users/{XRAY_USER}"), "UniqueID", "PrimaryGroupID"])).ok().as_deref().and_then(ids_from))}
+/// The ids of the account Xray runs as, if it exists. A record that is not there is a failure of `dscl`, and is read as none. One that is there with ids outside 300 to 399, or a group id other than the user id, is an error.
+pub fn ids() -> io::Result<Option<(u32, u32)>> {
+	let Some(found) = dscl(&words(&["-read", &format!("/Users/{XRAY_USER}"), "UniqueID", "PrimaryGroupID"])).ok().as_deref().and_then(ids_from) else {return Ok(None)};
+	// A record that is there already is believed only if it is the kind this layer makes: a service id, and the same number for the group. Anything else could be root or a real user.
+	if found.0 != found.1 || !IDS.contains(&found.0) {return Err(io::Error::other(format!("the account {XRAY_USER} exists with ids {} and {}, which are not the service ids this layer makes it with. Remove it as an administrator or do not connect", found.0, found.1)))}
+	Ok(Some(found))
+}
 
 /// The account Xray runs as: made if it is not there. Root only, and it is the helper that does it, before the kill switch goes in.
 pub fn ensure_user() -> io::Result<(u32, u32)> {

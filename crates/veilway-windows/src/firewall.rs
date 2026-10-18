@@ -46,6 +46,8 @@ pub enum Cond {
 	App,
 	/// A program at this path, by the identity the engine gives that file: the Xray add-on.
 	Program(String),
+	/// The user a connection is made as, by SID in text: the filter matches when the connecting process's token is that user's, so another user who runs the same program does not pass.
+	User(String),
 	/// The port on this side. DHCP is told from other datagrams to port 67 by it.
 	LocalPort(u16),
 	/// The adapter the connection would leave by, by its LUID.
@@ -70,20 +72,25 @@ pub struct Rules {
 	pub lan: Vec<IpNet>,
 	/// The user asked for names on the local network: mDNS and LLMNR are let through with the LAN.
 	pub local_names: bool,
-	/// The path of the Xray add-on's executable, for a legacy profile: the connections to the nodes are then that program's only, and this program's own are not let out to them.
-	pub xray: Option<String>,
+	/// The Xray add-on, for a legacy profile: the connections to the nodes are then that program's, as that user, and this program's own are not let out to them.
+	pub xray: Option<XrayRule>,
 }
+
+/// The path of the Xray add-on's executable and the SID, in text, of the user it runs as.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XrayRule {pub program: String, pub user: String}
 
 impl Rules {
 	/// The filters, family by family, outbound (`ALE_AUTH_CONNECT`) and then inbound (`ALE_AUTH_RECV_ACCEPT`, where a flow that a program listens for is authorized: without them a service on this device answers strangers on the physical network). The order is the order of their keys.
 	pub fn specs(&self) -> Vec<Spec> {
 		let mut found = Vec::new();
+		let who: Vec<Cond> = self.xray.as_ref().map_or_else(|| vec![Cond::App], |xray| vec![Cond::Program(xray.program.clone()), Cond::User(xray.user.clone())]);
 		let mut add = |name: &str, v6: bool, accept: bool, permit: bool, weight: u8, conds: Vec<Cond>| found.push(Spec {name: format!("{name} ({}{})", if v6 {"IPv6"} else {"IPv4"}, if accept {", inbound"} else {""}), v6, accept, permit, weight, conds});
 		for v6 in [false, true] {
 			for accept in [false, true] {
 				add("loopback", v6, accept, true, W_TOP, vec![Cond::Remote(if v6 {"::1/128"} else {"127.0.0.0/8"}.parse().unwrap())]);
 				if let Some(luid) = self.tun {add("the tunnel", v6, accept, true, W_TOP, vec![Cond::Interface(luid)])}
-				for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, accept, true, W_TOP, vec![self.xray.clone().map_or(Cond::App, Cond::Program), Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())])}
+				for node in self.nodes.iter().filter(|node| node.ip.is_ipv6() == v6) {add("the node", v6, accept, true, W_TOP, who.iter().cloned().chain([Cond::Protocol(if node.tcp {TCP} else {UDP}), Cond::RemotePort(node.port), Cond::Remote(IpNet::new(node.ip, if v6 {128} else {32}).unwrap())]).collect())}
 				if !accept {for protocol in [UDP, TCP] {add("names", v6, accept, false, W_NAMES, vec![Cond::Protocol(protocol), Cond::RemotePort(53)])}}
 				// mDNS, LLMNR and NetBIOS tell whoever listens which names this device asks for, on any network and not only a LAN that was let through.
 				if !self.local_names {for port in LOCAL_NAMES {add("local names", v6, accept, false, W_NAMES, vec![Cond::Protocol(UDP), Cond::RemotePort(port)])}}
@@ -114,8 +121,10 @@ mod wfp {
 	use std::io;
 	use std::ptr::{null, null_mut};
 	use windows_sys::core::GUID;
-	use windows_sys::Win32::Foundation::{ERROR_SUCCESS, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE};
+	use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, FWP_E_ALREADY_EXISTS, FWP_E_FILTER_NOT_FOUND, FWP_E_PROVIDER_NOT_FOUND, FWP_E_SUBLAYER_NOT_FOUND, HANDLE};
 	use windows_sys::Win32::NetworkManagement::WindowsFilteringPlatform::*;
+	use windows_sys::Win32::Security::Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1};
+	use windows_sys::Win32::Security::GetSecurityDescriptorLength;
 	use windows_sys::Win32::System::Rpc::RPC_C_AUTHN_WINNT;
 
 	fn guid(key: u128) -> GUID {GUID::from_u128(key)}
@@ -209,7 +218,15 @@ mod wfp {
 
 	/// The values a filter's conditions point at, which live until the filter is added.
 	#[allow(dead_code)]
-	enum Held {V4(Box<FWP_V4_ADDR_AND_MASK>), V6(Box<FWP_V6_ADDR_AND_MASK>), Luid(Box<u64>), Program(AppId)}
+	enum Held {V4(Box<FWP_V4_ADDR_AND_MASK>), V6(Box<FWP_V6_ADDR_AND_MASK>), Luid(Box<u64>), Program(AppId), User(Box<FWP_BYTE_BLOB>, Descriptor)}
+
+	/// A security descriptor that `ConvertStringSecurityDescriptorToSecurityDescriptorW` allocated, freed when dropped.
+	struct Descriptor(*mut core::ffi::c_void);
+
+	impl Drop for Descriptor {
+		// SAFETY: the descriptor came from the call that says to free it with `LocalFree`, once.
+		fn drop(&mut self) {unsafe {LocalFree(self.0)};}
+	}
 
 	fn condition(cond: &Cond, app: &AppId, held: &mut Vec<Held>) -> io::Result<FWPM_FILTER_CONDITION0> {
 		// SAFETY: a zeroed condition is a valid empty one (null pointers, zero enums), and every field that matters is set below.
@@ -254,6 +271,18 @@ mod wfp {
 				out.conditionValue.r#type = FWP_BYTE_BLOB_TYPE;
 				out.conditionValue.Anonymous.byteBlob = program.0;
 				held.push(Held::Program(program));
+			}
+			Cond::User(sid) => {
+				let mut descriptor = null_mut();
+				// SAFETY: the string is null-terminated and `descriptor` a live local the call writes a pointer to. The right asked for in the entry is the one that a filter's match is decided by (`FWP_ACTRL_MATCH_FILTER`).
+				if unsafe {ConvertStringSecurityDescriptorToSecurityDescriptorW(wide(&format!("D:(A;;0x1;;;{sid})")).as_ptr(), SDDL_REVISION_1, &mut descriptor, null_mut())} == 0 {return Err(io::Error::last_os_error())}
+				let descriptor = Descriptor(descriptor);
+				// SAFETY: the descriptor is valid until `descriptor` is dropped.
+				let mut blob = Box::new(FWP_BYTE_BLOB {size: unsafe {GetSecurityDescriptorLength(descriptor.0)}, data: descriptor.0.cast()});
+				out.fieldKey = FWPM_CONDITION_ALE_USER_ID;
+				out.conditionValue.r#type = FWP_SECURITY_DESCRIPTOR_TYPE;
+				out.conditionValue.Anonymous.sd = &mut *blob;
+				held.push(Held::User(blob, descriptor));
 			}
 			Cond::LocalPort(port) => {
 				out.fieldKey = FWPM_CONDITION_IP_LOCAL_PORT;
@@ -433,12 +462,13 @@ mod tests {
 	#[test]
 	fn with_xray_the_nodes_are_let_out_to_its_program_and_not_to_this_one() {
 		let path = "C:\\ProgramData\\Veilway\\addons\\xray\\v1\\xray.exe".to_owned();
-		let specs = Rules {xray: Some(path.clone()), ..rules()}.specs();
+		let user = "S-1-5-21-1-2-3-1001".to_owned();
+		let specs = Rules {xray: Some(XrayRule {program: path.clone(), user: user.clone()}), ..rules()}.specs();
 		let nodes: Vec<&Spec> = specs.iter().filter(|spec| spec.name.starts_with("the node")).collect();
 		assert_eq!(nodes.len(), 4);
 		for node in nodes {
-			assert_eq!(node.conds[0], Cond::Program(path.clone()));
-			assert!(!node.conds.contains(&Cond::App) && node.conds.len() == 4);
+			assert_eq!(node.conds[..2], [Cond::Program(path.clone()), Cond::User(user.clone())], "the program and the user it runs as");
+			assert!(!node.conds.contains(&Cond::App) && node.conds.len() == 5);
 		}
 		let plain = rules().specs();
 		let others = |specs: &[Spec]| specs.iter().filter(|spec| !spec.name.starts_with("the node")).cloned().collect::<Vec<_>>();
