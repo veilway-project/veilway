@@ -28,8 +28,8 @@ use tokio_rustls::TlsAcceptor;
 use veilway_core::Over;
 use veilway_proto::proof;
 use veilway_proto::shape::Shape;
-use veilway_proto::subscription::payload::{Http2, Padding};
-use veilway_proto::subscription::Secret;
+use veilway_proto::subscription::payload::{self, Http2, Padding, Payload};
+use veilway_proto::subscription::{envelope, Secret, BODY_MAX};
 use veilway_transport::choice::{self, Network, Next, Standing};
 use veilway_transport::{flow, Answer, End, Ended, Env, Front, Kind, Link, Refusal, Session, Source, State, Target, Unreachable, Want};
 
@@ -143,7 +143,7 @@ async fn net(test: &'static str, time: Time, change: impl FnOnce(&mut Value)) ->
 }
 
 /// What device `n` holds for the inbound.
-fn link(n: usize) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}}
+fn link(n: usize) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()}}
 
 impl Net {
 	fn front(&self, address: SocketAddr, pinned: bool) -> Front {Front {address, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: if pinned {vec![self.pin]} else {Vec::new()}, ech: false, self_signed: false, http2: Default::default()}}
@@ -922,4 +922,61 @@ async fn a_full_candidate_falls_back_to_http_1_1_when_the_node_does_not_offer_ht
 	assert_eq!((totals.h2_connections, totals.h2_users), (0, 0), "{totals:?}");
 	assert_eq!(peer.session.close().await, Ended::Closed(End::Asked));
 	net.node.engine.shutdown().await;
+}
+
+/// A `faketls` profile as a provider writes it, read the way a client reads a signed document, against a node that borrows a local TLS 1.3 site. The target is made from the transport alone: its key is the transport's, and the profile has no key of its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_faketls_profile_reaches_its_tunnel_with_the_key_of_its_transport() {
+	let (time, borrowed) = (time!(), listen());
+	let made = rcgen::generate_simple_self_signed(vec!["www.example.com".to_string()]).unwrap();
+	let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![CertificateDer::from(made.cert.der().to_vec())], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
+	let (site, acceptor) = (TcpListener::bind("127.0.0.1:0").await.unwrap(), TlsAcceptor::from(Arc::new(config)));
+	let site_addr = site.local_addr().unwrap();
+	// The site answers each request with one page and closes, as a site does that has nothing to keep a connection for.
+	let site_task = tokio::spawn(async move {
+		while let Ok((stream, _)) = site.accept().await {
+			let acceptor = acceptor.clone();
+			tokio::spawn(async move {
+				let Ok(mut tls) = acceptor.accept(stream).await else {return};
+				let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
+				while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+					match timeout(Duration::from_millis(250), tls.read(&mut buf)).await {
+						Ok(Ok(count)) if count > 0 => head.extend_from_slice(&buf[..count]),
+						_ => return drop(tls.shutdown().await),
+					}
+				}
+				let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").await;
+				let _ = tls.shutdown().await;
+			});
+		}
+	});
+	let net = net("client-faketls", time, |doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "faketls", "listen": borrowed.to_string(), "transport_key": text(&[0x65; 32]), "site": {"host": "www.example.com", "address": site_addr.to_string(), "acknowledged": true}}))).await;
+	let n = 4;
+	let profile = json!({
+		"type": "veilway", "id": "borrowed", "name": "Borrowed", "inbound_public_key": text(&public(&NODE)),
+		"device": {"public_key": text(&public(&KEYS[n])), "private_key": text(&KEYS[n]), "transport_secrets": [text(&secret(n))], "addresses": [format!("10.7.0.{}", 2 + n)]},
+		"gateways": ["10.7.0.1"], "mtu": 1390,
+		"transports": [{"type": "faketls", "transport_public_key": text(&proof::public_key(&[0x65; 32])), "candidates": [{"address": "192.0.2.10:443", "sni": "www.example.com"}]}],
+	});
+	let provider = ring::signature::Ed25519KeyPair::from_seed_unchecked(&[0x11; 32]).unwrap();
+	let key = envelope::SigningKey::new(ring::signature::KeyPair::public_key(&provider).as_ref().try_into().unwrap()).unwrap();
+	let document = json!({"v": 1, "subscription_id": "test-subscription-0002", "serial": 1, "issued_at": time.secs() - 10, "expires_at": time.secs() + 86_400, "signing_keys": [base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key.bytes())], "provider": {"name": "Test provider"}, "profiles": [profile]});
+	let sealed = envelope::seal(&key, &serde_json::to_vec(&document).unwrap(), |signed| provider.sign(signed).as_ref().try_into().unwrap());
+	let Ok(Payload::Subscription(read)) = payload::parse(&envelope::verify(sealed.as_bytes(), &[key], BODY_MAX).unwrap()) else {panic!("the document did not read")};
+	let profile = &read.profiles[0];
+	assert_eq!((profile.transport_public_key, read.refused.len()), (None, 0));
+	let link = Link::of(profile).unwrap();
+	let mut target = Target::of(&profile.transports[0], 0, &link).unwrap();
+	// The candidate's address is a documentation address, as a provider's would be a public one. The test dials the node in its place.
+	let Target::FakeTls {candidate, ..} = &mut target else {panic!("not a faketls target")};
+	assert_eq!((candidate.address.to_string(), candidate.sni.as_deref()), ("192.0.2.10:443".to_owned(), Some("www.example.com")));
+	candidate.address = borrowed;
+	let mut peer = net.peer(n, &link, target);
+	peer.connect().await.unwrap_or_else(|ended| panic!("{ended:?}"));
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	assert!(peer.ping(200, 1).await);
+	assert_eq!(net.node.engine.peers(Some("e"))[0].over, Some(Over::FakeTls));
+	assert_eq!(peer.session.close().await, Ended::Closed(End::Asked));
+	net.node.engine.shutdown().await;
+	site_task.abort();
 }

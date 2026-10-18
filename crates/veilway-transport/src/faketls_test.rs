@@ -29,7 +29,7 @@ fn fill<const N: usize>() -> [u8; N] {
 	bytes
 }
 
-fn link() -> Link {Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: Some(x25519(NODE, X25519_BASEPOINT_BYTES)), mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=20_000}}}
+fn link() -> Link {Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: Some(x25519(NODE, X25519_BASEPOINT_BYTES)), mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=20_000}, borrowed: Default::default()}}
 
 fn node(key: [u8; 32]) -> Node {Node::new(key, INBOUND, &mut random).unwrap()}
 
@@ -54,12 +54,13 @@ fn source() -> crate::Source {
 
 fn session(address: std::net::SocketAddr) -> Session {
 	let link = link();
-	Session::open(&link, Target::FakeTls {candidate: front(address), client: client(&link).unwrap()}, env(), source()).unwrap()
+	Session::open(&link, Target::FakeTls {candidate: front(address), client: client(&link, &link.node.unwrap())}, env(), source()).unwrap()
 }
 
 #[tokio::test]
 async fn the_hello_is_chromes_with_a_proof_a_node_opens_and_a_key_share_that_is_new_every_time() {
-	let client = client(&link()).unwrap();
+	let link = link();
+	let client = client(&link, &link.node.unwrap());
 	let (node, table, mut shares_seen) = (node(NODE), table(), HashSet::new());
 	for _ in 0..8 {
 		let (record, x, kem, leaf) = hello(&client, SITE, NOW).unwrap();
@@ -296,15 +297,25 @@ async fn a_padding_only_frame_is_a_frame_of_the_node() {
 #[tokio::test]
 async fn a_candidate_a_borrowed_site_does_not_take_is_refused_before_anything_is_dialled() {
 	let (link, address) = (link(), "127.0.0.1:9".parse().unwrap());
-	let open = |link: &Link, candidate: Front| Session::open(link, Target::FakeTls {candidate, client: client(&self::link()).unwrap()}, env(), source()).map(|_| ()).unwrap_err();
+	let open = |link: &Link, candidate: Front| Session::open(link, Target::FakeTls {candidate, client: client(link, &self::link().node.unwrap())}, env(), source()).map(|_| ()).unwrap_err();
 	assert_eq!(open(&link, Front {pins: vec![[1; 32]], ..front(address)}), Refuse::Candidate);
 	assert_eq!(open(&link, Front {self_signed: true, ..front(address)}), Refuse::Candidate);
 	assert_eq!(open(&link, Front {verify_name: Some(SITE.into()), ..front(address)}), Refuse::Candidate);
 	assert_eq!(open(&link, Front {ech: true, ..front(address)}), Refuse::Ech);
 	assert_eq!(open(&link, Front {sni: None, ..front(address)}), Refuse::Name);
 	assert_eq!(open(&link, Front {sni: Some("192.0.2.7".into()), ..front(address)}), Refuse::Name);
-	assert_eq!(open(&Link {node: None, ..self::link()}, front(address)), Refuse::NodeKey);
-	assert!(client(&Link {node: None, ..self::link()}).is_none());
+	// The key is the transport's own, held by the client of the target: a link without `node` takes it all the same.
+	let bare = Link {node: None, ..self::link()};
+	assert!(Session::open(&bare, Target::FakeTls {candidate: front(address), client: client(&bare, &link.node.unwrap())}, env(), source()).is_ok());
+}
+
+#[test]
+fn a_link_has_one_client_for_each_key() {
+	let (link, other) = (link(), x25519([0x62; 32], X25519_BASEPOINT_BYTES));
+	let key = link.node.unwrap();
+	assert!(Arc::ptr_eq(&client(&link, &key), &client(&link.clone(), &key)));
+	assert!(!Arc::ptr_eq(&client(&link, &key), &client(&link, &other)));
+	assert!(!Arc::ptr_eq(&client(&link, &key), &client(&self::link(), &key)), "another link is another device");
 }
 
 // A node that is the page's own flight writer: it opens the proof, writes the flight of `group` and `suite` with `answer` over records of the sizes it is given, and reads the client's Finished and its first frame. What the client does is the test's to see.
@@ -372,7 +383,7 @@ async fn a_clock_the_device_got_wrong_is_put_right_by_the_offset_the_environment
 	let server = tokio::spawn(serve_flight(listener, Suite::Aes128, X25519, vec![3000]));
 	let link = link();
 	let env = Env {device: Arc::new(|| NOW - 7200), now: Arc::new(|| NOW - 7200 + 7200), roots: Arc::new(RootCertStore::empty()), socket: None};
-	let mut session = Session::open(&link, Target::FakeTls {candidate: front(address), client: client(&link).unwrap()}, env, source()).unwrap();
+	let mut session = Session::open(&link, Target::FakeTls {candidate: front(address), client: client(&link, &link.node.unwrap())}, env, source()).unwrap();
 	assert_eq!(timeout(Duration::from_secs(10), session.recv()).await.unwrap().unwrap(), [4; 40]);
 	session.close().await;
 	assert!(server.await.unwrap().finished);

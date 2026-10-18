@@ -43,8 +43,9 @@ impl Kept {
 }
 
 /// The whole file. `lan_local` holds the ids of the subscriptions whose user let apps reach devices on the local network outside the tunnel: absent is off, which is also what a file from before this setting says. The first version of this setting was stored as `lan_tunnel` and is not read.
+/// `alpha_transports` is the one client setting that lets the engine dial a transport in alpha, `faketls`: off by default, and off in a file from before it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_local: BTreeSet<String>}
+pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_local: BTreeSet<String>, pub alpha_transports: bool}
 
 /// Why a file was not taken as it is. Either way the client starts without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,7 @@ struct FileWire {
 	#[serde(default)] seed: u64,
 	#[serde(default)] profiles: BTreeMap<String, ProfileWire>,
 	#[serde(default)] lan_local: Vec<String>,
+	#[serde(default)] alpha_transports: bool,
 }
 
 fn class_word(class: Class) -> &'static str {
@@ -139,7 +141,7 @@ pub fn parse(bytes: &[u8]) -> Result<Saved, Damaged> {
 	if bytes.len() > FILE_MAX {return Err(Damaged::Size)}
 	let wire: FileWire = serde_json::from_slice(bytes).map_err(|_| Damaged::Form)?;
 	if wire.version != VERSION {return Err(Damaged::Form)}
-	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_local: wire.lan_local.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect()};
+	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_local: wire.lan_local.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect(), alpha_transports: wire.alpha_transports};
 	for (key, profile) in wire.profiles.into_iter().filter(|(key, _)| key_ok(key)).take(PROFILES_MAX) {
 		let mut kept = Kept {standing: read_standing(profile.standing), stream_first: profile.stream_first, declined: classes(&profile.declined), ..Kept::default()};
 		for (network, wire) in profile.networks.into_iter().filter(|(network, _)| key_ok(network)).take(NETWORKS_MAX) {kept.networks.push((network, read_network(wire)))}
@@ -162,7 +164,7 @@ pub fn encode(saved: &Saved) -> Vec<u8> {
 		})
 	}).collect();
 	// A map with string keys and plain numbers cannot fail to be written.
-	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_local: saved.lan_local.iter().cloned().collect()}).unwrap_or_default()
+	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_local: saved.lan_local.iter().cloned().collect(), alpha_transports: saved.alpha_transports}).unwrap_or_default()
 }
 
 /// How a network is kept: the first eight bytes of the SHA-256 of the seed and the caller's description, in hex. The same network is the same key on this installation and an unrelated one on another.
@@ -279,6 +281,14 @@ impl Store {
 		let changed = if on {key_ok(subscription) && (guard.0.lan_local.len() < PROFILES_MAX || guard.0.lan_local.contains(subscription)) && guard.0.lan_local.insert(subscription.to_owned())} else {guard.0.lan_local.remove(subscription)};
 		guard.1 |= changed;
 	}
+	/// Whether the user turned on transports in alpha (`alpha_transports`). Off until they do: "No `faketls` candidate is dialed until it is on." A running tunnel reads it at every attempt.
+	pub fn alpha_transports(&self) -> bool {self.lock().0.alpha_transports}
+	/// Saves that setting. The app shows `ALPHA_WARNING` before it turns it on the first time.
+	pub fn set_alpha_transports(&self, on: bool) {
+		let mut guard = self.lock();
+		guard.1 |= guard.0.alpha_transports != on;
+		guard.0.alpha_transports = on;
+	}
 	/// The user agrees to a class of transport for a profile.
 	pub fn agree(&self, key: &str, class: Class) {
 		self.update(key, |kept| {
@@ -332,7 +342,7 @@ mod tests {
 		(standing(), vec(("[a-f0-9]{16}", network()), 0..4), vec(("[a-f0-9]{16}", 0usize..256, any::<u16>(), any::<u64>()), 0..4), classes_strategy(), proptest::option::of(any::<bool>())).prop_map(|(standing, networks, mtus, declined, stream_first)| Kept {standing, networks, mtus: mtus.into_iter().map(|(network, transport, mtu, when)| Remembered {network, transport, mtu, when}).collect(), declined, stream_first})
 	}
 
-	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4)).prop_map(|(seed, profiles, lan_local)| Saved {seed, profiles, lan_local})}
+	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4)).prop_map(|(seed, profiles, lan_local)| Saved {seed, profiles, lan_local, alpha_transports: seed % 2 == 0})}
 
 	// What every result of `parse` promises, whatever the bytes were.
 	fn bounded(saved: &Saved) -> bool {

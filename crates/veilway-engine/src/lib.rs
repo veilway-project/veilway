@@ -152,6 +152,8 @@ pub enum StartError {
 	Ask(Vec<Class>),
 	/// Nothing the profile lists can be used: no transport this build can open, or none the user agreed to.
 	Nothing,
+	/// What the profile lists that could be used is in alpha (`faketls`), and `alpha_transports` is off. The app shows `ALPHA_WARNING`, and with the user's yes calls `Store::set_alpha_transports` and starts again.
+	Alpha,
 }
 
 impl std::fmt::Display for StartError {
@@ -170,6 +172,9 @@ pub fn ask_text(class: Class) -> &'static str {
 	}
 }
 
+/// What the app says before the user turns on `alpha_transports` the first time, in plain words. It names no class and no rating.
+pub const ALPHA_WARNING: &str = "This way of connecting is still being tested and has not been reviewed by anyone outside the project. It makes the connection look like a visit to a real website, and that website has not agreed to it. Turn it on only if you accept that.";
+
 /// One tunnel. Dropping it stops it; `stop` waits for the session to be closed first.
 pub struct Tunnel {
 	commands: mpsc::UnboundedSender<Command>,
@@ -186,17 +191,24 @@ impl Tunnel {
 	pub fn start(settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree) -> Result<Self, StartError> {
 		let subscription = held.subscription();
 		if permit.id() != held.id() {return Err(StartError::Permit)}
-		let profile = subscription.profiles.iter().find(|candidate| candidate.id == profile).ok_or(StartError::NoProfile)?;
+		let at = subscription.profiles.iter().position(|candidate| candidate.id == profile).ok_or(StartError::NoProfile)?;
+		let profile = &subscription.profiles[at];
 		let key = profile.device.private_key.clone().or_else(|| held.device().map(|device| device.private().clone())).ok_or(StartError::NoKey)?;
 		let link = Link::of(profile).ok_or(StartError::NoKey)?;
 		if profile.rating_cap == Some(RatingCap::Unsafe) && !agree.unsafe_profile {return Err(StartError::Unsafe)}
-		if !agree.private && profile.transports.iter().any(|transport| addresses(transport).iter().any(|address| address.private())) {return Err(StartError::Private)}
+		let alpha = settings.store.alpha_transports();
+		if !agree.private && profile.transports.iter().filter(|transport| choice::usable(transport, alpha)).any(|transport| addresses(transport).iter().any(|address| address.private())) {return Err(StartError::Private)}
+		for drop in &profile.dropped {tracing::info!(profile = %profile.id, transport = drop.transport, count = drop.count, reason = drop.cause.word(), "part of the profile was left out because it did not read")}
+		let capped = held.capped().iter().filter(|(of, _, _)| *of == at).count();
+		if capped > 0 {tracing::info!(profile = %profile.id, count = capped, "cover candidates share an address with a datagram endpoint of the subscription: their rating is at most Detectable")}
 		let (store_key, now) = (store::profile_key(held.id().as_str(), &profile.id), (settings.clock)());
 		let kept = settings.store.kept(&store_key);
-		let plan = choice::plan(&profile.transports, kept.stream_first.unwrap_or(profile.stream_first), &kept.network(&store::network_key(settings.store.seed(), &settings.network)), &kept.standing, now);
+		let (stream_first, network) = (kept.stream_first.unwrap_or(profile.stream_first), kept.network(&store::network_key(settings.store.seed(), &settings.network)));
+		let plan = choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, alpha);
 		let ask: Vec<Class> = plan.ask.into_iter().filter(|class| !kept.declined.contains(class)).collect();
 		if !ask.is_empty() {return Err(StartError::Ask(ask))}
-		if plan.order.is_empty() {return Err(StartError::Nothing)}
+		// Alpha is the reason only if turning it on would give something to try.
+		if plan.order.is_empty() {return Err(if !alpha && !choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, true).order.is_empty() {StartError::Alpha} else {StartError::Nothing})}
 		let (commands, input) = mpsc::unbounded_channel();
 		*settings.handle.0.lock().unwrap() = Some(commands.clone());
 		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
@@ -255,10 +267,41 @@ impl Carrier {
 	pub async fn stop(self) -> Status {match self {Self::Native(tunnel) => tunnel.stop().await, Self::Xray(tunnel) => tunnel.stop().await}}
 }
 
+/// Where the transports of a profile are dialled, each with whether it is TCP, none twice: what the platform's kill switch lets the engine's own sockets out to. A transport the engine will not dial, `faketls` while `alpha` is off, is not listed.
+pub fn nodes(transports: &[Transport], alpha: bool) -> Vec<(std::net::SocketAddr, bool)> {
+	let mut found = Vec::new();
+	for transport in transports.iter().filter(|transport| choice::usable(transport, alpha)) {
+		let tcp = !matches!(transport, Transport::Udp(_) | Transport::UdpObfs(_));
+		for dial in addresses(transport) {
+			if !found.contains(&(dial.address(), tcp)) {found.push((dial.address(), tcp))}
+		}
+	}
+	found
+}
+
 // The dial addresses a transport of a profile lists.
 fn addresses(transport: &Transport) -> Vec<veilway_proto::subscription::payload::Dial> {
 	match transport {
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
 		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+		Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use veilway_proto::subscription::payload::{Borrowed, Dial};
+
+	fn dial(text: &str) -> Dial {Dial::parse(text).unwrap()}
+
+	#[test]
+	fn the_kill_switch_opens_no_address_of_a_transport_the_engine_will_not_dial() {
+		let borrowed = |address: &str| Borrowed {address: dial(address), sni: "www.example.com".into()};
+		let transports = [Transport::Udp(vec![dial("192.0.2.10:51820"), dial("192.0.2.10:51820")]), Transport::FakeTls {key: [0x45; 32], candidates: vec![borrowed("192.0.2.20:443"), borrowed("192.0.2.10:51820")]}];
+		// Off, the borrowed site's candidates are not there at all, and the doubled endpoint is one.
+		assert_eq!(nodes(&transports, false), [("192.0.2.10:51820".parse().unwrap(), false)]);
+		// On, they are, by TCP, and the same address and port by UDP is another entry.
+		assert_eq!(nodes(&transports, true), [("192.0.2.10:51820".parse().unwrap(), false), ("192.0.2.20:443".parse().unwrap(), true), ("192.0.2.10:51820".parse().unwrap(), true)]);
 	}
 }

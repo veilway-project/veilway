@@ -233,6 +233,12 @@ impl Core {
 				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
 			}
+			Call::Alpha => Ok(json!({"alpha": self.store.alpha_transports()})),
+			Call::SetAlpha {on} => {
+				self.store.set_alpha_transports(on);
+				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
+				Ok(json!({"alpha": on}))
+			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
 			Call::Answer {yes} => {
 				let sent = self.running.lock().unwrap().as_ref().is_some_and(|running| running.answers.send(yes).is_ok());
@@ -362,6 +368,12 @@ impl Core {
 						if self.ask(ask_text(*class), &stop, &mut answers).await {self.store.agree(&key, *class)} else {self.store.decline(&key, *class)}
 					}
 					true
+				}
+				Some(StartError::Alpha) => {
+					let cleaned = platform::cleanup(&platform_options, &lock);
+					let _ = self.store.flush();
+					cleaned.map_err(plain)?;
+					return Err(("alpha_off".into(), false));
 				}
 				Some(_) | None => return Err((kept_message(&failure), failure.kept)),
 			};

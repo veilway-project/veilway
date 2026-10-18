@@ -2,7 +2,8 @@
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde_json::{json, Value};
 use std::fs;
-use veilway_proto::{control::{self, Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Move, Offer, Refreshed, Replaced, Review, Role, Standing, GRACE}, direction, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Direction, Kind, Secret, Tag, Text, Translation, Url, BODY_MAX, CARRIED_MAX}, NoRandom};
+use veilway_proto::proof::public_key;
+use veilway_proto::{control::{self, Period, Severity}, subscription::{client::{wait, Accepted, Damaged, Failure, Held, Move, Offer, Refreshed, Replaced, Review, Role, Standing, GRACE}, direction, envelope::{self, EnvelopeError, Kid, SigningKey}, fetch::{DeviceName, Op, Received, RequestError}, legacy::{self, Cap, LegacyError, Scheme, Server, Tls}, link::{Carried, Link, LinkError}, payload::{self, dialable, own, Card, Cause, Dial, Fault, JsonError, KeyOrigin, LogoKind, Network, Payload, PayloadError, RatingCap, Reason, Subscription, Transport}, Direction, Kind, Secret, Tag, Text, Translation, Url, BODY_MAX, CARRIED_MAX}, NoRandom};
 
 // The clock of every test: 100 s after the documents of vectors.py were issued.
 const ISSUED: u64 = 1_700_000_000;
@@ -294,6 +295,11 @@ fn the_document_of_the_vectors_reads_as_what_it_says() {
 	assert_eq!((profile.exits[0].tag.as_str(), profile.exits[0].name.as_str(), profile.exits[0].country, profile.exits[0].full_ip), ("de", "Berlin", Some(*b"DE"), true));
 	// "A cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped": the set the core compares with.
 	assert!(document.profile_datagram_addresses().contains(&stream.candidates[0].address.address().ip()) && document.profile_datagram_addresses().len() == 2);
+	// A `faketls` candidate is a cover candidate: one on the address of a datagram endpoint is capped like the `tls` one.
+	let mut borrowed = payload("content");
+	borrowed["profiles"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "faketls", "transport_public_key": std_base64(&public_key(&[0x41; 32])), "candidates": [{"address": "198.51.100.4:443", "sni": "www.example.com"}, {"address": "192.0.2.10:443", "sni": "www.example.org"}]}));
+	let borrowed = subscription(&borrowed);
+	assert_eq!(borrowed.capped(&borrowed.profile_datagram_addresses()), [(0, 1, 0), (0, 2, 1)]);
 	assert_eq!((document.devices[0].name.as_str(), document.devices[0].enrolled_at, document.devices[0].this, document.devices[0].pending), ("phone", ISSUED, true, false));
 	let usage = document.usage.clone().unwrap();
 	assert_eq!((usage.used_bytes, usage.quota_bytes, usage.period, usage.period_start, usage.expires_at, usage.device_limit), (1, 2, Period::Monthly, ISSUED, 0, 3));
@@ -316,6 +322,8 @@ enum Want {
 	LeftOut(usize),
 	// The document reads whole: the value is at a limit, not over it.
 	Fine,
+	// The candidate is refused and nothing else: the first profile is kept without the transport whose only candidate it was ("A transport whose candidates are all refused is left out").
+	Dropped,
 }
 
 // A document of two profiles and every kind of provider content, in which the first profile has a stream transport of each kind.
@@ -336,13 +344,28 @@ fn judge(name: &str, document: &Value, want: Want) {
 		(Ok(Payload::Subscription(read)), Want::Profile(fault)) => assert_eq!((read.refused.iter().map(|refused| (refused.position, refused.fault)).collect::<Vec<_>>(), read.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>()), (vec![(0, fault)], vec!["other"]), "{name}"),
 		(Ok(Payload::Subscription(read)), Want::LeftOut(count)) => assert_eq!((read.left_out, read.profiles.len(), read.refused.len()), (count, 2, 0), "{name}"),
 		(Ok(Payload::Subscription(read)), Want::Fine) => assert_eq!((read.left_out, read.profiles.len(), read.refused.len()), (0, 2, 0), "{name}"),
+		(Ok(Payload::Subscription(read)), Want::Dropped) => {
+			assert_eq!((read.profiles.len(), read.refused.len(), read.profiles[0].transports.len() + 1), (2, 0, read.profiles[1].transports.len()), "{name}");
+			// Which transport went, why, and that every address of the others is still there in its place.
+			let addresses = |profile: &payload::Profile| profile.transports.iter().map(|transport| match transport {
+				Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.iter().map(|dial| dial.address().to_string()).collect::<Vec<_>>(),
+				Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
+				Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
+			}).collect::<Vec<_>>();
+			let [gone] = read.profiles[0].dropped[..] else {panic!("{name}: {:?}", read.profiles[0].dropped)};
+			assert_eq!((gone.count, gone.cause, read.profiles[1].dropped.is_empty()), (1, Cause::NoCandidates, true), "{name}");
+			let mut whole = addresses(&read.profiles[1]);
+			whole.remove(gone.transport);
+			assert_eq!(addresses(&read.profiles[0]), whole, "{name}");
+			assert_eq!(read.profiles[0].places.iter().map(|place| place.transport).collect::<Vec<_>>(), (0..read.profiles[1].transports.len()).filter(|at| *at != gone.transport).collect::<Vec<_>>(), "{name}");
+		}
 		(other, want) => panic!("{name}: wanted {want:?}, got {other:?}"),
 	}
 }
 
 #[test]
 fn a_hostile_document_for_every_limit_and_rule() {
-	use {Fault::Unsupported, PayloadError as E, Want::{Fine, LeftOut, Profile, Refused}};
+	use {Fault::Unsupported, PayloadError as E, Want::{Dropped, Fine, LeftOut, Profile, Refused}};
 	let (member, fault) = (|name: &'static str| Refused(E::Member(name)), |name: &'static str| Profile(Fault::Member(name)));
 	let (zero, one, small) = ("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=");
 	let (key1, key2, key3) = (json!(std_base64(key(0x11).bytes())), json!(std_base64(key(0x22).bytes())), json!(small));
@@ -397,16 +420,16 @@ fn a_hostile_document_for_every_limit_and_rule() {
 		// "Where a client may be told to connect."
 		("/profiles/0/transports/0/endpoints", None, fault("endpoints")), ("/profiles/0/transports/0/endpoints", Some(json!([])), fault("endpoints")), ("/profiles/0/transports/0/endpoints", Some(list(json!("192.0.2.10:51820"), 16)), Fine), ("/profiles/0/transports/0/endpoints", Some(list(json!("192.0.2.10:51820"), 17)), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!(51820)), fault("endpoints")),
 		("/profiles/0/transports/0/endpoints/0", Some(json!("127.0.0.1:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("127.255.255.254:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[::1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("169.254.1.1:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[fe80::1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[febf::1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("0.0.0.0:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("0.1.2.3:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[::]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("224.0.0.1:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("239.255.255.255:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[ff02::1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("255.255.255.255:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[::ffff:192.0.2.10]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[::ffff:c000:20a]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("192.0.2.10:0")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("192.0.2.10:051820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("192.0.2.10:65536")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("192.0.2.10")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("node.example.com:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[fe80::1%1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("[2001:db8::10%1]:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("2001:db8::10:51820")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("192.0.2.10:51820 ")), fault("endpoints")), ("/profiles/0/transports/0/endpoints/0", Some(json!("10.1.2.3:51820")), Fine), ("/profiles/0/transports/0/endpoints/0", Some(json!("[fe7f::1]:65535")), Fine),
-		("/profiles/0/transports/1/candidates/0/address", Some(json!("127.0.0.1:443")), fault("address")), ("/profiles/0/transports/1/candidates/0/address", Some(json!("192.0.2.10:0")), fault("address")), ("/profiles/0/transports/1/candidates/0/address", None, fault("address")), ("/profiles/0/transports/1/candidates/0/address", Some(json!("node.example.com:443")), fault("address")),
+		("/profiles/0/transports/1/candidates/0/address", Some(json!("127.0.0.1:443")), Dropped), ("/profiles/0/transports/1/candidates/0/address", Some(json!("192.0.2.10:0")), Dropped), ("/profiles/0/transports/1/candidates/0/address", None, Dropped), ("/profiles/0/transports/1/candidates/0/address", Some(json!("node.example.com:443")), Dropped),
 		// The path, the candidates and the names.
 		("/profiles/0/transports/1/path", None, fault("path")), ("/profiles/0/transports/1/path", Some(json!("/a-path-of-a")), Fine), ("/profiles/0/transports/1/path", Some(json!("/a-path-of-")), fault("path")), ("/profiles/0/transports/1/path", Some(json!("a-path-of-a-transport")), fault("path")), ("/profiles/0/transports/1/path", Some(json!("/a-path-of-a/../transport")), fault("path")), ("/profiles/0/transports/1/path", Some(json!("/a-path-of-a-transport?x")), fault("path")), ("/profiles/0/transports/1/path", Some(json!("/a-path-of-a-transp%6frt")), fault("path")), ("/profiles/0/transports/1/path", Some(json!(format!("/{}", long(255)))), Fine), ("/profiles/0/transports/1/path", Some(json!(format!("/{}", long(256)))), fault("path")),
-		("/profiles/0/transports/1/candidates", None, fault("candidates")), ("/profiles/0/transports/1/candidates", Some(json!([])), fault("candidates")), ("/profiles/0/transports/1/candidates", Some(list(rich()["profiles"][0]["transports"][1]["candidates"][0].clone(), 16)), Fine), ("/profiles/0/transports/1/candidates", Some(list(rich()["profiles"][0]["transports"][1]["candidates"][0].clone(), 17)), fault("candidates")), ("/profiles/0/transports/1/candidates/0", Some(json!("192.0.2.10:443")), fault("candidates")),
-		("/profiles/0/transports/1/candidates/0/sni", None, fault("sni")), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("Node.example.com")), fault("sni")), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("*.example.com")), fault("sni")), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("192.0.2.10")), fault("sni")), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("")), fault("verify_name")), ("/profiles/0/transports/1/candidates/0/verify_name", Some(json!("node.example.com")), fault("verify_name")), ("/profiles/0/transports/1/candidates/0/host", None, fault("host")), ("/profiles/0/transports/1/candidates/0/host", Some(json!("")), fault("host")), ("/profiles/0/transports/1/candidates/0/host", Some(json!("node.example.com:443")), fault("host")), ("/profiles/0/transports/1/candidates/0/host", Some(json!(format!("{}.example.com", long(64)))), fault("host")),
-		("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_024]))), Fine), ("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_025]))), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("")), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("AAA")), fault("ech")), ("/profiles/0/transports/1/candidates/0/ech", Some(json!([0])), fault("ech")),
+		("/profiles/0/transports/1/candidates", None, fault("candidates")), ("/profiles/0/transports/1/candidates", Some(json!([])), fault("candidates")), ("/profiles/0/transports/1/candidates", Some(list(rich()["profiles"][0]["transports"][1]["candidates"][0].clone(), 16)), Fine), ("/profiles/0/transports/1/candidates", Some(list(rich()["profiles"][0]["transports"][1]["candidates"][0].clone(), 17)), fault("candidates")), ("/profiles/0/transports/1/candidates/0", Some(json!("192.0.2.10:443")), Dropped),
+		("/profiles/0/transports/1/candidates/0/sni", None, Dropped), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("Node.example.com")), Dropped), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("*.example.com")), Dropped), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("192.0.2.10")), Dropped), ("/profiles/0/transports/1/candidates/0/sni", Some(json!("")), Dropped), ("/profiles/0/transports/1/candidates/0/verify_name", Some(json!("node.example.com")), Dropped), ("/profiles/0/transports/1/candidates/0/host", None, Dropped), ("/profiles/0/transports/1/candidates/0/host", Some(json!("")), Dropped), ("/profiles/0/transports/1/candidates/0/host", Some(json!("node.example.com:443")), Dropped), ("/profiles/0/transports/1/candidates/0/host", Some(json!(format!("{}.example.com", long(64)))), Dropped),
+		("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_024]))), Fine), ("/profiles/0/transports/1/candidates/0/ech", Some(json!(std_base64(&[7; 1_025]))), Dropped), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("")), Dropped), ("/profiles/0/transports/1/candidates/0/ech", Some(json!("AAA")), Dropped), ("/profiles/0/transports/1/candidates/0/ech", Some(json!([0])), Dropped),
 		// Pins per candidate, with the rule of each transport: `tls` at index 1, `ws` at 2, `fronted` at 3.
-		("/profiles/0/transports/1/candidates/0/pins", None, fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 4)), Fine), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 5)), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([&small[..43]])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([1])), fault("pins")), ("/profiles/0/transports/1/candidates/0/pins", Some(pin.clone()), fault("pins")), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([pin])), Fine), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([])), fault("pins")), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([pin])), fault("pins")), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([])), fault("pins")),
+		("/profiles/0/transports/1/candidates/0/pins", None, Dropped), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([])), Dropped), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 4)), Fine), ("/profiles/0/transports/1/candidates/0/pins", Some(list(pin.clone(), 5)), Dropped), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([&small[..43]])), Dropped), ("/profiles/0/transports/1/candidates/0/pins", Some(json!([1])), Dropped), ("/profiles/0/transports/1/candidates/0/pins", Some(pin.clone()), Dropped), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([pin])), Fine), ("/profiles/0/transports/2/candidates/0/pins", Some(json!([])), Dropped), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([pin])), Dropped), ("/profiles/0/transports/3/candidates/0/pins", Some(json!([])), Dropped),
 		// `self_signed`: a boolean, and on a `tls` candidate alone.
-		("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(true)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(false)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!("true")), fault("self_signed")), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(1)), fault("self_signed")), ("/profiles/0/transports/1/candidates/0/self_signed", Some(Value::Null), fault("self_signed")), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(true)), fault("self_signed")), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(false)), fault("self_signed")), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(true)), fault("self_signed")), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(false)), fault("self_signed")),
+		("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(true)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(false)), Fine), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!("true")), Dropped), ("/profiles/0/transports/1/candidates/0/self_signed", Some(json!(1)), Dropped), ("/profiles/0/transports/1/candidates/0/self_signed", Some(Value::Null), Dropped), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(true)), Dropped), ("/profiles/0/transports/2/candidates/0/self_signed", Some(json!(false)), Dropped), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(true)), Dropped), ("/profiles/0/transports/3/candidates/0/self_signed", Some(json!(false)), Dropped),
 		// The optional members of a profile.
 		("/profiles/0/stream_first", Some(json!(true)), Fine), ("/profiles/0/stream_first", Some(json!("true")), fault("stream_first")), ("/profiles/0/stream_first", Some(json!(1)), fault("stream_first")), ("/profiles/0/stream_first", Some(Value::Null), fault("stream_first")), ("/profiles/0/parallel", Some(json!(0)), fault("parallel")), ("/profiles/0/parallel", Some(json!(4)), Fine), ("/profiles/0/parallel", Some(json!(5)), fault("parallel")), ("/profiles/0/min_control_version", Some(json!(0)), fault("min_control_version")), ("/profiles/0/min_control_version", Some(json!(255)), Fine), ("/profiles/0/min_control_version", Some(json!(256)), fault("min_control_version")),
 		("/profiles/0/padding", Some(json!({})), Fine), ("/profiles/0/padding", Some(json!([])), fault("padding")), ("/profiles/0/padding", Some(json!({"wide_max": 511})), fault("wide_max")), ("/profiles/0/padding", Some(json!({"wide_max": 512, "normal_max": 64})), Fine), ("/profiles/0/padding", Some(json!({"wide_max": 1024})), fault("wide_max")), ("/profiles/0/padding", Some(json!({"normal_max": 63})), fault("normal_max")), ("/profiles/0/padding", Some(json!({"normal_max": 256})), fault("normal_max")),
@@ -465,14 +488,14 @@ fn a_self_signed_candidate_is_a_tls_candidate_with_pins_and_no_name_to_check() {
 		for (member, value) in changes {put(&mut document, &format!("{at}/{member}"), value.clone())}
 		document
 	};
-	use Want::{Fine, Profile};
+	use Want::{Dropped, Fine};
 	for (name, changes, want) in [
 		("an empty sni and no verify_name", vec![("self_signed", Some(json!(true))), ("sni", Some(json!("")))], Fine),
-		("an empty sni and a verify_name", vec![("self_signed", Some(json!(true))), ("sni", Some(json!(""))), ("verify_name", Some(json!("node.example.com")))], Profile(Fault::Member("verify_name"))),
-		("a sni and a verify_name", vec![("self_signed", Some(json!(true))), ("verify_name", Some(json!("node.example.com")))], Profile(Fault::Member("verify_name"))),
-		("no pins", vec![("self_signed", Some(json!(true))), ("pins", None)], Profile(Fault::Member("pins"))),
-		("five pins", vec![("self_signed", Some(json!(true))), ("pins", Some(Value::Array(vec![rich()["profiles"][0]["transports"][1]["candidates"][0]["pins"][0].clone(); 5])))], Profile(Fault::Member("pins"))),
-		("false with an empty sni and no verify_name", vec![("self_signed", Some(json!(false))), ("sni", Some(json!("")))], Profile(Fault::Member("verify_name"))),
+		("an empty sni and a verify_name", vec![("self_signed", Some(json!(true))), ("sni", Some(json!(""))), ("verify_name", Some(json!("node.example.com")))], Dropped),
+		("a sni and a verify_name", vec![("self_signed", Some(json!(true))), ("verify_name", Some(json!("node.example.com")))], Dropped),
+		("no pins", vec![("self_signed", Some(json!(true))), ("pins", None)], Dropped),
+		("five pins", vec![("self_signed", Some(json!(true))), ("pins", Some(Value::Array(vec![rich()["profiles"][0]["transports"][1]["candidates"][0]["pins"][0].clone(); 5])))], Dropped),
+		("false with an empty sni and no verify_name", vec![("self_signed", Some(json!(false))), ("sni", Some(json!("")))], Dropped),
 	] {judge(name, &changed(&changes), want)}
 	// What is read is what the page means: `true` alone makes a candidate self-signed.
 	let read = subscription(&changed(&[("self_signed", Some(json!(true))), ("sni", Some(json!("")))]));
@@ -1269,6 +1292,19 @@ fn pinned(host: &str, pin: u8, changes: &[(&str, Value)]) -> Held {pinned_review
 
 // A whole document of the vectors, which carries its own device keys, with members changed.
 fn whole(changes: &[(&str, Value)]) -> String {sign(0x11, &with(payload("content"), changes))}
+
+// The `faketls` candidate joins the comparison of addresses like a `tls` one: it is capped when its address is a datagram endpoint's, whether that is a `udp` endpoint of a profile or a pinned endpoint that is an IP literal.
+#[test]
+fn a_faketls_candidate_on_a_datagram_address_is_capped_in_the_document_the_client_holds() {
+	let mut transports = payload("content")["profiles"][0]["transports"].clone();
+	transports.as_array_mut().unwrap().push(json!({"type": "faketls", "transport_public_key": std_base64(&public_key(&[0x41; 32])), "candidates": [{"address": "198.51.100.4:443", "sni": "www.example.com"}, {"address": "203.0.113.7:443", "sni": "www.example.org"}, {"address": "192.0.2.10:8443", "sni": "www.example.net"}]}));
+	// The tls candidate of the vectors is on the address of its `udp-obfs` endpoint, and so is the third `faketls` one. The second is on the address of the pinned endpoint.
+	assert_eq!(pinned("203.0.113.7:8443", 1, &[("/profiles/0/transports", transports.clone())]).capped(), [(0, 1, 0), (0, 2, 1), (0, 2, 2)]);
+	// An endpoint with a host name is not compared, so the second is not capped.
+	assert_eq!(pinned("sub.example.com:8443", 1, &[("/profiles/0/transports", transports.clone())]).capped(), [(0, 1, 0), (0, 2, 2)]);
+	let review = pinned_review("203.0.113.7:8443", 1, issue(0x11, &[("/profiles/0/transports", transports)]).as_bytes(), &[]).unwrap();
+	assert_eq!(review.capped(), [(0, 1, 0), (0, 2, 1), (0, 2, 2)]);
+}
 
 #[test]
 fn a_pinned_endpoint_is_checked_by_the_pins_held_and_a_list_must_include_one() {

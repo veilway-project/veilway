@@ -5,10 +5,10 @@ import {listen, type UnlistenFn} from "@tauri-apps/api/event";
 export type Notice = {severity: string, text: string};
 export type Exit = {tag: string, name: string, country: string | null, selected: boolean, configured: boolean, working: boolean, load: string};
 export type Usage = {used_bytes: number, quota_bytes: number, period: string, expires_at: number, up_bytes: number, down_bytes: number};
-export type Connection = {transport: string, address: string, host: string | null, front: string | null, server_name: string | null, check: string | null, since: number | null};
+export type Connection = {transport: string, address: string, host: string | null, front: string | null, server_name: string | null, check: string | null, since: number | null, alpha: boolean};
 export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, connection: Connection | null, applied: unknown};
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
-export type Profile = {id: string, name: string, exits: [string, string][]};
+export type Profile = {id: string, name: string, exits: [string, string][], left_out: boolean};
 // A backup update address of a subscription, or the new main address a move asks for. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does, and a `move` would become the main one. Over `plain` the network can tell that the device uses this app. `from` is the address a move leaves.
 export type Host = {key: string, host: string, kind: "update" | "static" | "move", state: "waiting" | "allowed" | "declined", check: "chain" | "pinned" | "plain", from: string | null};
 export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, lan_local: boolean, hosts: Host[], bundle_notices?: {severity: string, text: string, issued_at: number}[]};
@@ -49,6 +49,8 @@ type Commands = {
 	remove: [{id: string}, Subscription[]],
 	answer_hosts: [{id: string, allow: string[], decline: string[]}, Subscription[]],
 	set_lan: [{id: string, on: boolean}, Subscription[]],
+	get_alpha: [{}, {alpha: boolean}],
+	set_alpha: [{on: boolean}, {alpha: boolean}],
 	connect: [{subscription: string, profile: string, options: Options}, null],
 	answer: [{yes: boolean}, null],
 	disconnect: [{}, null],

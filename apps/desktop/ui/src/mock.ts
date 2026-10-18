@@ -3,13 +3,13 @@
 import type {BundleReview, Host, Running, StatusView, Subscription} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
-try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: null, hidden: []})); } catch { /* private window */ }
+try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: query.get("profile") ? {subscription: "sub-harbor", profile: query.get("profile")} : null, hidden: []})); } catch { /* private window */ }
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 // Not a real code: a pattern with the three finder squares, for the screenshots only.
 const QR = (() => { const n = 29, cells: string[] = []; for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { const finder = (x < 8 && y < 8) || (x >= n - 8 && y < 8) || (x < 8 && y >= n - 8), edge = (a: number, b: number) => a === 0 || a === 6 || b === 0 || b === 6 || (a >= 2 && a <= 4 && b >= 2 && b <= 4); const dark = finder ? (x < 8 && y < 8 ? edge(x, y) : x >= n - 8 && y < 8 ? edge(x - (n - 7), y) : edge(x, y - (n - 7))) && x % (n - 7) < 7 && y % (n - 7) < 7 || false : ((x * 7 + y * 13 + x * y) % 5 < 2); if (dark) cells.push(`<rect x="${x + 2}" y="${y + 2}" width="1" height="1"/>`); } return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n + 4} ${n + 4}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${cells.join("")}</g></svg>`; })();
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
-let lan = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
+let lan = false, alpha = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
 
 function bundleReview(fa: boolean): BundleReview {
 	const name = fa ? "هاربر نت" : "Harbor Net";
@@ -19,14 +19,14 @@ function bundleReview(fa: boolean): BundleReview {
 function subscription(fa: boolean): Subscription {
 	return {
 		id: "sub-harbor", provider: fa ? "هاربر نت" : "Harbor Net", standing: "current", expires_at: now() + 23 * DAY, can_refresh: true,
-		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]]}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]]}],
+		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]], left_out: false}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]], left_out: true}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
 		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], terms: "https://harbor.example/terms", privacy: "https://harbor.example/privacy", logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan, hosts
 	};
 }
 
-const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened};
+const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened, alpha: query.get("transport") === "faketls"};
 let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty", selected: string | null = null;
 const status = (): StatusView => {
 	sent += 40000 + Math.random() * 90000;
@@ -87,7 +87,9 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	bundle_close: () => null,
 	bundle_install: () => null,
 	answer_hosts: args => { hosts = hosts.map(host => (args.allow as string[]).includes(host.key) ? {...host, state: "allowed"} : (args.decline as string[]).includes(host.key) ? {...host, state: "declined"} : host); return [subscription(languages[0] === "fa")]; },
-	set_lan: args => { lan = args.on === true; return [subscription(languages[0] === "fa")]; }
+	set_lan: args => { lan = args.on === true; return [subscription(languages[0] === "fa")]; },
+	get_alpha: () => ({alpha}),
+	set_alpha: args => { alpha = args.on === true; return {alpha}; }
 };
 
 Object.assign(window, {

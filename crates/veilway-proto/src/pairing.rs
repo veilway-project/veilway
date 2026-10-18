@@ -163,6 +163,8 @@ pub fn transports_json(transports: &[Transport]) -> String {
 		Transport::Fronted(fronted) => stream("fronted", fronted),
 		// No link lists it: `listed` refuses the type, so this text is never read back.
 		Transport::FrontedShaped(fronted, _) => stream("fronted-shaped", fronted),
+		// Nor this one, for the same reason.
+		Transport::FakeTls {key, candidates} => format!("{{\"type\":\"faketls\",\"transport_public_key\":{},\"candidates\":[{}]}}", text(&key_text(key)), candidates.iter().map(|candidate| format!("{{\"address\":{},\"sni\":{}}}", text(&candidate.address.address().to_string()), text(&candidate.sni))).collect::<Vec<_>>().join(",")),
 	}).collect::<Vec<_>>().join(","))
 }
 
@@ -175,9 +177,12 @@ pub fn transports(text: &[u8]) -> Result<Vec<Transport>, CodeError> {
 }
 
 // "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use. A `self_signed` candidate is refused too: a link's `peer.transports` has no such member, so the pairing would end in a link the other node cannot hold.
+// A profile drops a candidate that does not read and keeps the rest. An offer is the operator's own text, so it is held to every candidate: one that does not read refuses the list.
 fn listed(item: &json::Json) -> Result<Transport, CodeError> {
-	payload::transport(item).ok().filter(|transport| match transport {
-		Transport::Fronted(_) | Transport::FrontedShaped(..) => false,
+	let written = Members::of(item).and_then(|members| members.list("candidates", 0..=usize::MAX).ok().flatten()).map(<[_]>::len);
+	payload::transport(item).ok().and_then(|read| read.transport).filter(|transport| match transport {
+		Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => false,
+		Transport::Tls(stream) | Transport::Ws(stream) if written != Some(stream.candidates.len()) => false,
 		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none() && !candidate.self_signed),
 		_ => true,
 	}).ok_or(CodeError::Member("transports"))
@@ -254,6 +259,7 @@ impl Offer {
 		self.transports.iter().flat_map(|transport| match transport {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.clone(),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+			Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
 		}).map(|dial| (dial.address(), dial.private())).collect()
 	}
 	/// The object of the offer as the code carried it.
@@ -739,6 +745,6 @@ mod tests {
 		// What is written reads back as what it was.
 		let root = json::parse(written.as_bytes()).unwrap();
 		let json::Json::Arr(items) = &root else {panic!("no list")};
-		assert_eq!(items.iter().map(|item| payload::transport(item).unwrap()).collect::<Vec<_>>(), terms(Direction::Forward).transports);
+		assert_eq!(items.iter().map(|item| payload::transport(item).unwrap().transport.unwrap()).collect::<Vec<_>>(), terms(Direction::Forward).transports);
 	}
 }

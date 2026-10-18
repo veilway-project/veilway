@@ -55,7 +55,7 @@ fuzz_target!(|data: &[u8]| {
 	let mut now = NOW;
 	loop {
 		// What may be planned, by a second writing of the rule, and what is.
-		let (best, plan) = (transports.iter().map(choice::class).min(), choice::plan(&transports, flags & 1 != 0, &network, &standing, now));
+		let (best, plan) = (transports.iter().map(choice::class).min(), choice::plan(&transports, flags & 1 != 0, &network, &standing, now, true));
 		let allowed: Vec<usize> = (0..transports.len()).filter(|at| Some(choice::class(&transports[*at])) == best || standing.consent.contains(&choice::class(&transports[*at]))).collect();
 		assert!(plan.order.iter().all(|at| allowed.contains(at)) && plan.order.is_empty() == allowed.is_empty(), "the plan {:?} of the allowed {allowed:?}", plan.order);
 		assert!((1..plan.order.len()).all(|at| !plan.order[..at].contains(&plan.order[at])) && plan.ask.iter().all(|class| !standing.consent.contains(class) && Some(*class) > best), "a transport planned twice, or a question about a class that needs none");
@@ -97,7 +97,7 @@ fuzz_target!(|data: &[u8]| {
 				let wait = choice::fallback(&mut network, profile, &plan.order, transport, b & 1 != 0, u32::from(b >> 1 & 3) + 1, u32::from(a), now, &mut random).expect("the random source of the target does not fail");
 				assert!(wait.as_secs() <= HOUR, "a wait of {wait:?}");
 				// "The last transport of a profile that the client is allowed to use is never set aside."
-				assert!(allowed.is_empty() || !choice::plan(&transports, flags & 1 != 0, &network, &standing, now).order.is_empty());
+				assert!(allowed.is_empty() || !choice::plan(&transports, flags & 1 != 0, &network, &standing, now, true).order.is_empty());
 			}
 			3 => now = if what & 0x80 != 0 {now.saturating_sub(u64::from(a) * u64::from(b))} else {now + u64::from(a) * u64::from(b)},
 			4 => match (a % 3, [Class::NoCover, Class::Plain][usize::from(b & 1)]) {
@@ -113,7 +113,7 @@ fuzz_target!(|data: &[u8]| {
 		if mutated {
 			assert!(network.profile == profile && network.aside.iter().all(|(_, _, until)| *until > now && *until <= now + HOUR) && network.tried.iter().all(|(_, _, when)| *when <= now) && network.worked.is_none_or(|(_, _, when)| when <= now) && network.silent.is_none_or(|(_, since)| since <= now), "a state that cannot be true at {now}: {network:?}");
 			// Nothing that is set aside is planned while something else is free.
-			let order = choice::plan(&transports, flags & 1 != 0, &network, &standing, now).order;
+			let order = choice::plan(&transports, flags & 1 != 0, &network, &standing, now, true).order;
 			let aside = |at: &usize| network.aside.iter().any(|(transport, candidate, _)| transport == at && candidate.is_none());
 			assert!(order.iter().all(|at| !aside(at)) || order.iter().all(aside), "a transport that is set aside in the plan {order:?}: {:?}", network.aside);
 		}

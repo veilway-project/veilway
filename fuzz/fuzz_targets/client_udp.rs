@@ -28,7 +28,7 @@ const MAX: usize = 1390 + udp_obfs::OVERHEAD;
 //              5  the network changed
 // The node here is `veilway-proto`'s own: it opens every opening packet the client sends and keeps the keys. Whatever the input is, every packet the client sends must be an opening packet of the device, never smaller than a first answer, or a data packet under the keys of one of its opening packets: nothing leaves outside a session. No packet is above the `mtu` and 62 bytes. The client takes a datagram only from a packet the node sealed, under the keys of whichever opening packet the node answers, gives exactly the datagram that was sealed, always reads the answer to its newest opening packet, and is established by nothing else. One attempt has four opening packets at the most, and once the timers have run nothing is due before the clock moves.
 fuzz_target!(|data: &[u8]| {
-	let (link, start, mut out, mut count) = (Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: None, mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}, Instant::now(), Vec::new(), 0u8);
+	let (link, start, mut out, mut count) = (Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: None, mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()}, Instant::now(), Vec::new(), 0u8);
 	let mut random = |bytes: &mut [u8]| -> Result<(), NoRandom> {
 		for byte in bytes {
 			count = count.wrapping_mul(13).wrapping_add(7);

@@ -100,14 +100,16 @@ pub struct Link {
 	pub device: [u8; 32],
 	/// The device transport secret: "The client uses the first."
 	pub secret: Secret<32>,
-	/// The node transport public key, which `tls`, `ws` and `fronted` seal their proofs to.
+	/// The node transport public key, which `tls`, `ws` and `fronted` seal their proofs to. A `faketls` transport has its own, and never uses this one.
 	pub node: Option<[u8; 32]>,
 	pub mtu: u16,
 	pub padding: Padding,
+	/// The `faketls` clients of this link, one for each key of a `faketls` transport (`faketls::client`), shared by every clone of the link.
+	pub borrowed: faketls::Clients,
 }
 
 impl Link {
-	pub fn of(profile: &Profile) -> Option<Self> {Some(Self {inbound: profile.inbound_public_key, device: profile.device.public_key, secret: profile.device.transport_secrets.first()?.clone(), node: profile.transport_public_key, mtu: profile.mtu, padding: profile.padding.clone()})}
+	pub fn of(profile: &Profile) -> Option<Self> {Some(Self {inbound: profile.inbound_public_key, device: profile.device.public_key, secret: profile.device.transport_secrets.first()?.clone(), node: profile.transport_public_key, mtu: profile.mtu, padding: profile.padding.clone(), borrowed: faketls::Clients::default()})}
 }
 
 impl fmt::Debug for Link {
@@ -150,13 +152,14 @@ pub enum Target {
 	Fronted {path: String, candidate: Front},
 	/// A `fronted` whose requests and answers are in the shape the profile names (shapes page).
 	FrontedShaped {path: String, candidate: Front, shape: Shape},
-	/// A `faketls` candidate: the real site's name in `sni`, and the one `Client` of the link (`faketls::client`), which every attempt and every connection of a link shares. There is no `Transport` of the profile for it yet, so `Target::of` never makes one.
+	/// A `faketls` candidate: the real site's name in `sni`, and the one `Client` of the link for the transport's key (`faketls::client`), which every attempt and every connection to that key shares.
 	FakeTls {candidate: Front, client: Arc<Mutex<FakeTlsClient>>},
 }
 
 impl Target {
-	/// Endpoint or candidate `at` of a transport of a profile. None for plain `udp`, which is not served here, and for a place the transport does not have.
-	pub fn of(transport: &Transport, at: usize) -> Option<Self> {
+	/// Endpoint or candidate `at` of a transport of a profile, for `link`. None for plain `udp`, which is not served here, and for a place the transport does not have.
+	/// A `faketls` target is made with the key of its own transport, and never with `Link::node`.
+	pub fn of(transport: &Transport, at: usize, link: &Link) -> Option<Self> {
 		Some(match transport {
 			Transport::Udp(_) => return None,
 			Transport::UdpObfs(endpoints) => Self::UdpObfs(endpoints.get(at)?.address()),
@@ -164,6 +167,10 @@ impl Target {
 			Transport::Ws(stream) => Self::Ws {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::Fronted(stream) => Self::Fronted {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::FrontedShaped(stream, shape) => Self::FrontedShaped {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?), shape: shape.clone()},
+			Transport::FakeTls {key, candidates} => {
+				let found = candidates.get(at)?;
+				Self::FakeTls {candidate: Front {address: found.address.address(), sni: Some(found.sni.clone()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}, client: faketls::client(link, key)}
+			}
 		})
 	}
 	/// The transport's name, the one thing of a target a log line gets.
@@ -428,8 +435,8 @@ pub fn flow(packet: &[u8]) -> u32 {
 // What `open` and `parallel` check before anything is dialled.
 fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 	if chunk::Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random).is_err() || session::keepalive(link.padding.keepalive.clone()).is_none() {return Err(Refuse::Padding)}
+	// A `faketls` target holds the client of its own transport's key, so it needs no `Link::node`.
 	if let Target::FakeTls {candidate, ..} = target {
-		if link.node.is_none() {return Err(Refuse::NodeKey)}
 		if candidate.ech {return Err(Refuse::Ech)}
 		if candidate.self_signed || !candidate.pins.is_empty() || candidate.verify_name.is_some() {return Err(Refuse::Candidate)}
 		return tls::name(candidate).map(|_| ());

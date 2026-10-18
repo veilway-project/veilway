@@ -36,7 +36,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 	const up = since === null ? null : Math.max(0, Math.floor(tick / 1000) - since), clock = up === null ? null : [Math.floor(up / 3600), Math.floor(up / 60) % 60, up % 60].map((n, i) => String(n).padStart(i ? 2 : 1, "0")).join(":");
 	const check = connection?.check && ("details.check." + connection.check) in en ? ("details.check." + connection.check) as DesktopKey : null;
 	const rows = connection ? [
-		{key: "details.server", shown: connection.address, code: true}, {key: "details.host", shown: connection.host, code: true}, {key: "details.transport", shown: connection.transport, code: true}, {key: "details.front", shown: connection.front, code: true}, {key: "details.serverName", shown: connection.server_name, code: true},
+		{key: "details.server", shown: connection.address, code: true}, {key: "details.host", shown: connection.host, code: true}, {key: "details.transport", shown: connection.transport, code: true}, {key: "details.front", shown: connection.front, code: true}, {key: "details.serverName", shown: connection.server_name, code: true}, {key: "details.alpha", shown: connection.alpha ? t("details.alpha.yes") : null, plain: connection.alpha ? en["details.alpha.yes"] : null, code: false},
 		{key: "details.check", shown: check && t(check), plain: check && en[check], code: false}, {key: "details.mtu", shown: number(status?.mtu ?? 0), plain: String(status?.mtu), code: true}, {key: "details.uptime", shown: clock && clock.split(":").map((part, i) => i ? number(Number(part), {minimumIntegerDigits: 2}) : number(Number(part))).join(":"), plain: clock, code: true}
 	].flatMap(row => row.shown ? [{...row, key: row.key as DesktopKey, plain: row.plain ?? row.shown}] : []) : [];
 	const copyDetails = () => navigator.clipboard.writeText(en["details.title"] + "\n" + rows.map(row => en[row.key] + ": " + row.plain).join("\n")).then(() => toast({tone: "success", title: t("details.copied")}), () => toast({tone: "danger", title: t("details.copyFailed")}));
@@ -45,6 +45,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		<div className="d-hero">
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
 			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{subscription.provider}</span>}</p>
+			{chosen?.profile.left_out && <p className="vw-muted vw-small">{t("profile.leftOut")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
 			<ConnectSwitch state={link} disabled={busy || !chosen || (pending && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>
@@ -53,7 +54,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			{t(accepted === undefined ? "terms.body" : "terms.changed", {provider: subscription.provider})}
 			<span className="d-actions d-start">{([["terms.terms", subscription.terms], ["terms.privacy", subscription.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" variant="quiet" icon="external" onClick={() => open(url)}>{t(label)}</Button>)}</span>
 		</Banner>}
-		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error, kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
+		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error === "alpha_off" ? t("alpha.off") : ended?.error, kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}
 		{exits.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={exits.find(e => e.selected)?.name ?? t("home.exitAuto")} trailing={<Icon name="chevronForward"/>}/></List></Glass>}

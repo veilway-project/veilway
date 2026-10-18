@@ -43,7 +43,7 @@ fn offered(code: &str) {
 	let mut stream = false;
 	for transport in &offer.transports {
 		match transport {
-			Transport::Fronted(_) | Transport::FrontedShaped(..) => panic!("an offer lists fronted"),
+			Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => panic!("an offer lists fronted or faketls"),
 			Transport::Tls(listed) | Transport::Ws(listed) => {
 				stream = true;
 				assert!(listed.candidates.iter().all(|candidate| candidate.ech.is_none() && (!matches!(transport, Transport::Tls(_)) || !candidate.pins.is_empty())));

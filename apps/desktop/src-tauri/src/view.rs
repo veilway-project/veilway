@@ -26,7 +26,8 @@ pub struct UsageOut {pub used_bytes: u64, pub quota_bytes: u64, pub period: Stri
 pub struct AppliedOut {pub interface: String, pub kill_switch: bool, pub dns: String, pub split: Option<Vec<String>>, pub allow_lan: bool}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ConnectionOut {pub transport: String, pub address: String, pub host: Option<String>, pub front: Option<String>, pub server_name: Option<String>, pub check: Option<String>, pub since: Option<u64>}
+pub struct ConnectionOut {pub transport: String, pub address: String, pub host: Option<String>, pub front: Option<String>, pub server_name: Option<String>, pub check: Option<String>, pub since: Option<u64>, /// The transport is in alpha: the window says so next to the connection.
+	#[serde(default)] pub alpha: bool}
 
 /// The state of the tunnel as the UI draws it. `state` is one of off, connecting, connected, reconnecting, stopped, failed; `say` is the plain-words reason when there is one, with a stable `say_code` for translation.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -74,7 +75,7 @@ pub fn status_view(status: &Status, applied: Option<AppliedOut>) -> StatusView {
 		received_bytes: status.counters.bytes_received,
 		mtu: status.mtu,
 		out_of_date: status.out_of_date,
-		connection: status.connection.as_ref().map(|found| ConnectionOut {transport: found.transport.into(), address: found.address.to_string(), host: found.host.clone(), front: found.front.clone(), server_name: found.server_name.clone(), check: found.check.map(|check| check.code().into()), since: found.since}),
+		connection: status.connection.as_ref().map(|found| ConnectionOut {transport: found.transport.into(), address: found.address.to_string(), host: found.host.clone(), front: found.front.clone(), server_name: found.server_name.clone(), check: found.check.map(|check| check.code().into()), since: found.since, alpha: found.alpha}),
 		applied,
 	}
 }
@@ -89,7 +90,14 @@ pub enum CardOut {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-pub struct ProfileOut {pub id: String, pub name: String, pub exits: Vec<(String, String)>}
+pub struct ProfileOut {
+	pub id: String,
+	pub name: String,
+	pub exits: Vec<(String, String)>,
+	/// Some of its addresses or ways of connecting did not read and were left out. The window says so.
+	#[serde(default)]
+	pub left_out: bool,
+}
 
 /// A backup update host of a subscription, or the endpoint a move asks for. `key` is what the user's answer names it by: the host and port with `#pinned`, `#plain` or `#static`, or for a move its URL and kind, never the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, `static` for a static mirror, which never does, and `move` for the endpoint of a move, which would become the main one. `state` is `waiting`, `allowed` or `declined`. `check` is how the host is reached: `chain`, `pinned` or `plain`, and over `plain` the network can tell that the device uses this app. `from` is the main endpoint a move leaves.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -190,7 +198,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		standing: match standing {Standing::Current => "current", Standing::OutOfDate => "out_of_date", _ => "stale"}.into(),
 		expires_at: subscription.expires_at,
 		can_refresh,
-		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect()}).collect(),
+		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect(), left_out: !profile.dropped.is_empty()}).collect(),
 		usage: subscription.usage.as_ref().map(|usage| (usage.used_bytes, usage.quota_bytes, lower(usage.period))),
 		cards: subscription.cards.iter().map(|card| match card {
 			Card::Stat {label, value, unit} => CardOut::Stat {label: label.pick(languages).0.into(), value: value.pick(languages).0.into(), unit: unit.as_ref().map(|unit| unit.pick(languages).0.into())},
@@ -243,9 +251,11 @@ mod tests {
 	#[test]
 	fn the_connection_in_use_is_given_as_text_and_has_no_secret() {
 		let mut found = status(State::Connected {exit: None});
-		found.connection = Some(veilway_engine::Connection {transport: "tls", address: "192.0.2.7:443".parse().unwrap(), host: Some("node.example".into()), front: None, server_name: Some("cdn.example".into()), check: Some(veilway_engine::Check::PublicAndPin), since: Some(5)});
+		found.connection = Some(veilway_engine::Connection {transport: "tls", address: "192.0.2.7:443".parse().unwrap(), host: Some("node.example".into()), front: None, server_name: Some("cdn.example".into()), check: Some(veilway_engine::Check::PublicAndPin), since: Some(5), alpha: false});
 		let view = status_view(&found, None).connection.unwrap();
-		assert_eq!((view.transport.as_str(), view.address.as_str(), view.check.as_deref(), view.since), ("tls", "192.0.2.7:443", Some("public-and-pin"), Some(5)));
+		assert_eq!((view.transport.as_str(), view.address.as_str(), view.check.as_deref(), view.since, view.alpha), ("tls", "192.0.2.7:443", Some("public-and-pin"), Some(5), false));
+		found.connection = Some(veilway_engine::Connection {transport: "faketls", address: "192.0.2.7:443".parse().unwrap(), host: None, front: None, server_name: Some("www.example.com".into()), check: None, since: None, alpha: true});
+		assert!(status_view(&found, None).connection.unwrap().alpha);
 		assert!(status_view(&status(State::Off), None).connection.is_none());
 	}
 

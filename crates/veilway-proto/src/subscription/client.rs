@@ -323,6 +323,8 @@ impl Review {
 	pub fn pins(&self) -> &[[u8; 32]] {&self.pins}
 	/// The addresses of the `udp` and `udp-obfs` endpoints of the profiles, and of the pinned or plain endpoints that are IP literals, which "count as a `udp` endpoint at that address" for the cap of a cover transport.
 	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {addresses(&self.subscription, self.endpoint.as_ref(), self.moving.as_ref())}
+	/// The cover candidates, `faketls` ones included, that share an address with one of `datagram_addresses` and are capped at Detectable, as `Subscription::capped` gives them.
+	pub fn capped(&self) -> Vec<(usize, usize, usize)> {self.subscription.capped(&self.datagram_addresses())}
 	/// The move the document asks for: "the new host and how it is checked". "Accepting the import accepts the move."
 	pub fn moving(&self) -> Option<&MainEndpoint> {self.moving.as_ref()}
 	/// The endpoint the request went to: the link's, unless the import recovers a subscription that had moved.
@@ -577,6 +579,8 @@ impl Held {
 	pub fn decline_move(&mut self, seen: &str) {if let Some(moving) = self.moving.as_mut().filter(|moving| moving.key() == seen) {(moving.confirmed, moving.declined) = (false, true)}}
 	/// The addresses of the `udp` and `udp-obfs` endpoints of the profiles, and of the pinned or plain endpoints that are IP literals, the main endpoint's, a move's and the refresh entries', which "count as a `udp` endpoint at that address": a cover transport at one of them is capped at Detectable.
 	pub fn datagram_addresses(&self) -> HashSet<IpAddr> {addresses(&self.subscription, self.endpoint.as_ref(), self.moving.as_ref().map(|moving| &moving.endpoint))}
+	/// The cover candidates, `faketls` ones included, that share an address with one of `datagram_addresses` and are capped at Detectable, as `Subscription::capped` gives them.
+	pub fn capped(&self) -> Vec<(usize, usize, usize)> {self.subscription.capped(&self.datagram_addresses())}
 	// Whether a link that replaces this one checks its endpoint another way: this one moved away from its own link's endpoint, it is reached another way, or it is pinned by a pin this does not hold. "Importing a link sets the main endpoint back to the link's."
 	fn rechecked(&self, link: &Native) -> bool {self.origin.as_ref().is_some_and(|(own, _)| self.endpoint.as_ref() != Some(own.endpoint()) || self.kind() != Some(link.kind()) || link.pin().is_some_and(|pin| !self.pins.contains(pin)))}
 	/// The refresh hosts of the last good document that wait for the user, each as `host:port`, `host:port#pinned` for a pinned entry, or `host:port#static` for a static mirror: the app "asks at the next refresh the user starts. Until then the client uses the hosts it already had."

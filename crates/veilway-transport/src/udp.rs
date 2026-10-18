@@ -240,7 +240,7 @@ mod tests {
 		assert!(bound("127.0.0.1:9".parse().unwrap(), &Some(refused)).await.is_err());
 	}
 
-	fn link() -> Link {Link {inbound: [1; 32], device: [2; 32], secret: Secret::new([3; 32]), node: None, mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}}
+	fn link() -> Link {Link {inbound: [1; 32], device: [2; 32], secret: Secret::new([3; 32]), node: None, mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()}}
 
 	// The WireGuard layer of a test: a handshake initiation in shape for an opening, a keepalive in shape for the idle keepalive, and a count of how often each was asked.
 	fn source(asked: &mut (usize, usize)) -> impl FnMut(Want) -> Option<Vec<u8>> + '_ {

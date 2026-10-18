@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::{collections::HashSet, sync::OnceLock};
-use veilway_proto::{control, proof::public_key, subscription::{client::{Held, Offer, Refreshed, Role}, envelope::{self, SigningKey}, is_host, link::{Carried, Link}, payload::{self, Card, Payload, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, INTEGER_MAX, LIFETIME_MAX, LOGO_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX, UPDATE_INTERVAL}, Tag, Text, BODY_MAX, LINK_URL_MAX, TAG_MAX, TRANSLATIONS_MAX, URL_MAX}};
+use veilway_proto::{control, proof::public_key, subscription::{client::{Held, Offer, Refreshed, Role}, envelope::{self, SigningKey}, is_host, link::{Carried, Link}, payload::{self, Card, Cause, Payload, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, INTEGER_MAX, LIFETIME_MAX, LOGO_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX, UPDATE_INTERVAL}, Tag, Text, BODY_MAX, LINK_URL_MAX, TAG_MAX, TRANSLATIONS_MAX, URL_MAX}};
 
 // The payload of a whole document of tests/vectors.py, with a provider-issued device key, after one byte of settings. The file that carries it starts with the key it is signed under.
 const IMPORT: &[u8] = include_bytes!("../corpus/fuzz_subscription/import");
@@ -98,7 +98,12 @@ fn sound(read: &Subscription) {
 		assert!(ids.insert(&profile.id) && profile.name.visible() && (1280..=1500).contains(&profile.mtu) && (1..=4).contains(&profile.parallel) && profile.min_control_version >= 1 && (1..=TRANSPORTS_MAX).contains(&profile.transports.len()) && profile.exits.len() <= control::EXITS_MAX && profile.notices.len() <= control::NOTICES_MAX && profile.exits.iter().all(|exit| control::is_tag(&exit.tag) && exit.name.visible()), "a profile outside its ranges");
 		assert!((1..=2).contains(&profile.device.addresses.len()) && profile.gateways.len() == profile.device.addresses.len() && (1..=2).contains(&profile.device.transport_secrets.len()) && profile.device.private_key.as_ref().is_none_or(|private| public_key(private.expose()) == profile.device.public_key), "device keys that do not hold together");
 		assert!(profile.padding.keepalive.start() + 10_000 <= *profile.padding.keepalive.end() && *profile.padding.keepalive.start() >= 10_000 && *profile.padding.keepalive.end() <= 60_000 && (512..=1023).contains(&profile.padding.wide_max) && (64..=255).contains(&profile.padding.normal_max), "padding outside its ranges");
-		for transport in &profile.transports {
+		let keys: Vec<_> = profile.transports.iter().filter_map(|transport| if let Transport::FakeTls {key, ..} = transport {Some(key)} else {None}).collect();
+		assert!(keys.iter().enumerate().all(|(at, key)| !keys[..at].contains(key)), "two faketls transports with one key");
+		// The places the document wrote: one for each transport kept, rising, with the candidates kept in rising places too, and every drop within the document.
+		assert!(profile.places.len() == profile.transports.len() && profile.places.windows(2).all(|pair| pair[0].transport < pair[1].transport) && profile.places.iter().all(|place| place.transport < TRANSPORTS_MAX && place.candidates.windows(2).all(|pair| pair[0] < pair[1]) && place.candidates.iter().all(|at| *at < CANDIDATES_MAX)), "places that do not hold together");
+		assert!(profile.dropped.windows(2).all(|pair| pair[0].transport <= pair[1].transport) && profile.dropped.iter().all(|drop| drop.transport < TRANSPORTS_MAX && (1..=CANDIDATES_MAX).contains(&drop.count) && profile.places.iter().any(|place| place.transport == drop.transport) == (drop.cause == Cause::Candidate)), "a drop that does not hold together");
+		for (transport, place) in profile.transports.iter().zip(&profile.places) {
 			let dials: Vec<_> = match transport {
 				Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
 				Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => {
@@ -106,8 +111,12 @@ fn sound(read: &Subscription) {
 					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && (if candidate.self_signed {candidate.verify_name.is_none() && matches!(transport, Transport::Tls(_))} else {candidate.sni.is_some() != candidate.verify_name.is_some()}) && (matches!(transport, Transport::Ws(_)) || candidate.pins.is_empty() != matches!(transport, Transport::Tls(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len())), "a candidate that breaks the rule of its transport"));
 					stream.candidates.iter().map(|candidate| candidate.address).collect()
 				}
+				Transport::FakeTls {key, candidates} => {
+					assert!(profile.transport_public_key != Some(*key) && candidates.iter().all(|candidate| !candidate.sni.is_empty() && is_host(&candidate.sni)), "a faketls transport with the profile's key or no site");
+					candidates.iter().map(|candidate| candidate.address).collect()
+				}
 			};
-			assert!((1..=CANDIDATES_MAX).contains(&dials.len()));
+			assert!((1..=CANDIDATES_MAX).contains(&dials.len()) && place.candidates.len() == dials.len());
 			for address in dials.iter().map(|dial| dial.address()) {assert!(address.port() != 0 && !address.ip().is_loopback() && !address.ip().is_unspecified() && !address.ip().is_multicast() && address.ip().to_canonical() == address.ip(), "a dial address a document may not name")}
 		}
 	}

@@ -3,7 +3,7 @@ use proptest::{collection::vec, option, prelude::*, sample::{select, Index}};
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs};
-use veilway_proto::{control, proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, exchange::GatewayKey, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, Tag, Text, BODY_MAX, TRANSLATIONS_MAX}, NoRandom};
+use veilway_proto::{control, proof::public_key, subscription::{client::{Failure, Held, Offer, Refreshed}, envelope::{self, EnvelopeError, SigningKey}, exchange::GatewayKey, fetch::{DeviceName, Received}, legacy, link::{Carried, Link}, payload::{self, Card, Payload, PayloadError, Reason, Subscription, Transport, CANDIDATES_MAX, CARDS_MAX, DEVICES_MAX, PINS_MAX, PROFILES_MAX, REFRESH_URLS_MAX, SUPPORT_MAX, TRANSPORTS_MAX}, is_host, Tag, Text, BODY_MAX, TRANSLATIONS_MAX}, NoRandom};
 
 const ISSUED: u64 = 1_700_000_000;
 
@@ -125,6 +125,10 @@ fn sound(read: &Subscription) {
 					assert!(stream.path.len() >= 12 && profile.transport_public_key.is_some());
 					stream.candidates.iter().for_each(|candidate| assert!(candidate.pins.len() <= PINS_MAX && (if candidate.self_signed {candidate.verify_name.is_none() && matches!(transport, Transport::Tls(_))} else {candidate.sni.is_some() != candidate.verify_name.is_some()}) && (candidate.pins.is_empty() != matches!(transport, Transport::Tls(_)) || matches!(transport, Transport::Ws(_))) && candidate.ech.as_ref().is_none_or(|ech| (1..=1_024).contains(&ech.len()))));
 					stream.candidates.iter().map(|candidate| candidate.address).collect()
+				}
+				Transport::FakeTls {key, candidates} => {
+					assert!(profile.transport_public_key != Some(*key) && candidates.iter().all(|candidate| is_host(&candidate.sni)));
+					candidates.iter().map(|candidate| candidate.address).collect()
 				}
 			};
 			assert!((1..=CANDIDATES_MAX).contains(&dials.len()));

@@ -38,6 +38,7 @@ const OBFS: &str = "10.99.0.1:5001";
 const TLS: &str = "10.99.0.2:5002";
 const DEAD_TLS: &str = "10.99.0.3:5003";
 const SLOW_TLS: &str = "10.99.0.5:5005";
+const FAKETLS: &str = "10.99.0.6:5006";
 /// How long a stop the node decided may take to reach the engine: the `bye` is a datagram that a loaded runner can lose, and then only the idle keepalive and the liveness limit show the cut-off (G57).
 const STOP: Duration = Duration::from_secs(60);
 const PLAIN: &str = "10.99.0.4:5004";
@@ -189,6 +190,8 @@ fn transport(kind: &str, net: &Net) -> Value {
 		"tls-blocked-first" => json!({"type": "tls", "path": TLS_PATH, "candidates": [{"address": DEAD_TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}, {"address": TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}]}),
 		"tls-slow-first" => json!({"type": "tls", "path": TLS_PATH, "candidates": [{"address": SLOW_TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}, {"address": TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}]}),
 		"tls-blocked" => json!({"type": "tls", "path": TLS_PATH, "candidates": [{"address": DEAD_TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}]}),
+		"faketls-blocked" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x45; 32])), "candidates": [{"address": DEAD_TLS, "sni": "www.example.com"}]}),
+		"faketls" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x65; 32])), "candidates": [{"address": FAKETLS, "sni": "www.example.com"}]}),
 		other => panic!("{other}"),
 	}
 }
@@ -549,6 +552,88 @@ async fn when_the_cover_transport_is_unreachable_the_next_one_is_tried_after_the
 	let (_, network) = &kept.networks[0];
 	assert!(network.aside.iter().any(|(transport, candidate, until)| (*transport, *candidate) == (0, None) && *until <= time.secs() + 3_700) && network.worked.is_some_and(|(transport, _, _)| transport == 1), "{network:?} {}", std::fs::read_to_string(net.dir.join("fallback.json")).unwrap());
 	assert!(logged("a transport is unreachable and set aside"));
+}
+
+// "No `faketls` candidate is dialed until `alpha_transports` is on": off, a profile is used as if it had no `faketls` transport, and one with nothing else does not start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_faketls_transport_is_never_dialed_while_alpha_transports_is_off() {
+	let time = time!();
+	let net = net("engine-alpha", time, |_| {}).await;
+	let both = library(&net, "alpha", &payload(time, vec![profile(&net, 0, &["faketls-blocked", "udp-obfs"])])).await;
+	let settings = net.settings("alpha");
+	assert!(!settings.store.alpha_transports());
+	// Off, `udp-obfs` is the best class the profile has, so there is no question, and it is the only transport tried.
+	let mut run = Run::new(start(&net, settings.clone(), &both, PRIVATE).unwrap(), 0);
+	let status = run.connected().await;
+	assert!(run.ping(200, 1).await);
+	assert_eq!((status.connection.as_ref().map(|connection| (connection.transport, connection.alpha)), status.counters.attempts), (Some(("udp-obfs", false)), 1));
+	run.tunnel.stop().await;
+	settings.store.flush().unwrap();
+	assert!(Store::open(net.dir.join("alpha.json")).kept(&format!("{ID}/home")).networks.iter().all(|(_, network)| network.aside.is_empty()));
+	// On, `faketls` is the cover transport of the profile, and `udp-obfs` now needs the user's yes.
+	settings.store.set_alpha_transports(true);
+	assert_eq!(start(&net, settings.clone(), &both, PRIVATE).err(), Some(StartError::Ask(vec![Class::NoCover])));
+	// A profile whose only transport is `faketls` does not start while the setting is off, and does once it is on.
+	let only = library(&net, "alpha-only", &payload(time, vec![profile(&net, 1, &["faketls-blocked"])])).await;
+	let settings = net.settings("alpha-only");
+	// Its address is a private one, which is asked about only when the transport may be dialled.
+	assert_eq!(start(&net, settings.clone(), &only, Agree::default()).err(), Some(StartError::Alpha));
+	assert_eq!(start(&net, settings.clone(), &only, PRIVATE).err(), Some(StartError::Alpha));
+	assert!(!veilway_engine::ALPHA_WARNING.is_empty());
+	settings.store.set_alpha_transports(true);
+	assert_eq!(start(&net, settings.clone(), &only, Agree::default()).err(), Some(StartError::Private));
+	start(&net, settings, &only, PRIVATE).unwrap().stop().await;
+}
+
+// A session over `faketls` that is running ends when `alpha_transports` is turned off, and the profile is used as if it had no `faketls` transport from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_alpha_transports_off_ends_a_running_faketls_session() {
+	let (time, borrowed) = (time!(), listen());
+	let made = rcgen::generate_simple_self_signed(vec!["www.example.com".to_string()]).unwrap();
+	let config = ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider())).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![CertificateDer::from(made.cert.der().to_vec())], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
+	let (site, acceptor) = (TcpListener::bind("127.0.0.1:0").await.unwrap(), TlsAcceptor::from(Arc::new(config)));
+	let site_addr = site.local_addr().unwrap();
+	// The site answers each request with one page and closes, as a site does that has nothing to keep a connection for.
+	let site_task = tokio::spawn(async move {
+		while let Ok((stream, _)) = site.accept().await {
+			let acceptor = acceptor.clone();
+			tokio::spawn(async move {
+				let Ok(mut tls) = acceptor.accept(stream).await else {return};
+				let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
+				while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+					match timeout(Duration::from_millis(250), tls.read(&mut buf)).await {
+						Ok(Ok(count)) if count > 0 => head.extend_from_slice(&buf[..count]),
+						_ => return drop(tls.shutdown().await),
+					}
+				}
+				let _ = tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello").await;
+				let _ = tls.shutdown().await;
+			});
+		}
+	});
+	let net = net("engine-alpha-live", time, |doc| doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "faketls", "listen": borrowed.to_string(), "transport_key": text(&[0x65; 32]), "site": {"host": "www.example.com", "address": site_addr.to_string(), "acknowledged": true}}))).await;
+	let (base, fake) = (net.redirect(), FAKETLS.parse::<SocketAddr>().unwrap());
+	let settings = net.settings("alpha-live").with_redirect(Arc::new(move |address| if address == fake {borrowed} else {base(address)}));
+	let only = library(&net, "alpha-live", &payload(time, vec![profile(&net, 0, &["faketls"])])).await;
+	settings.store.set_alpha_transports(true);
+	let mut run = Run::new(start(&net, settings.clone(), &only, PRIVATE).unwrap(), 0);
+	let status = run.connected().await;
+	assert_eq!(status.connection.as_ref().map(|connection| (connection.transport, connection.alpha)), Some(("faketls", true)));
+	assert!(run.ping(200, 1).await);
+	settings.store.set_alpha_transports(false);
+	let status = run.until("the faketls session was not ended", Duration::from_secs(30), |status| matches!(status.state, State::Failed)).await;
+	assert_eq!(status.say, Some(Say::AlphaOff));
+	// Nothing dials it again while the setting is off.
+	let attempts = status.counters.attempts;
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let status = run.tunnel.status();
+	assert!(matches!(status.state, State::Failed) && status.counters.attempts == attempts, "{:?}", status);
+	// And on again, it connects without a new start.
+	settings.store.set_alpha_transports(true);
+	run.tunnel.connect_again();
+	run.until("it did not connect again", Duration::from_secs(40), |status| matches!(status.state, State::Connected {..})).await;
+	run.tunnel.stop().await;
+	site_task.abort();
 }
 
 // "A client that received `bye` knows the tunnel was ended on purpose. It shows the reason, does not treat any transport or candidate as failed, and does not run transport fallback."

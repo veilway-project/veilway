@@ -12,7 +12,7 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown, CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
 use veilway_engine::import::{self, Fetcher, Library};
-use veilway_engine::{ask_text, default_roots, Agree, Check, Retry, Settings, StartError, State, Status, Store};
+use veilway_engine::{ask_text, default_roots, Agree, Check, Retry, Settings, StartError, State, Status, Store, ALPHA_WARNING};
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
 #[cfg(target_os = "macos")]
@@ -47,6 +47,10 @@ pub struct Connect {
 	#[arg(long, requires = "allow_lan")] local_names: bool,
 	/// Do not block what is not tunnelled when the tunnel is down or reconnecting
 	#[arg(long)] no_kill_switch: bool,
+	/// Allow ways of connecting that are still being tested (alpha). Says what that means and asks once; the answer is kept until --no-alpha
+	#[arg(long)] alpha: bool,
+	/// Switch the alpha ways of connecting off again
+	#[arg(long, conflicts_with = "alpha")] no_alpha: bool,
 	/// The name of the tunnel's network device
 	#[cfg_attr(target_os = "linux", arg(long, default_value = "vw0"))]
 	#[cfg_attr(target_os = "macos", arg(long, default_value = "utun"))]
@@ -174,7 +178,7 @@ pub fn render(status: &Status, applied: &Applied, now: u64) -> String {
 	lines.push(format!("Device: {}, packet size {}.", applied.interface, status.mtu));
 	if let Some(found) = &status.connection {
 		let check = found.check.map(|check| match check {Check::Public => "public certificate", Check::PublicAndPin => "public certificate and pin", Check::PinnedSelfSigned => "pinned self-signed"});
-		let parts = [Some(format!("{}{}", found.address, found.host.as_ref().map_or_else(String::new, |host| format!(" ({host})")))), Some(found.transport.to_owned()), found.front.as_ref().map(|front| format!("front {front}")), found.server_name.as_ref().map(|name| format!("server name {name}")), check.map(str::to_owned), found.since.map(|since| format!("up {} s", now.saturating_sub(since)))];
+		let parts = [Some(format!("{}{}", found.address, found.host.as_ref().map_or_else(String::new, |host| format!(" ({host})")))), Some(found.transport.to_owned()), found.front.as_ref().map(|front| format!("front {front}")), found.server_name.as_ref().map(|name| format!("server name {name}")), check.map(str::to_owned), found.alpha.then(|| "alpha: new and not reviewed outside the project, borrows a real site that has not agreed".to_owned()), found.since.map(|since| format!("up {} s", now.saturating_sub(since)))];
 		lines.push(format!("Server: {}.", parts.into_iter().flatten().collect::<Vec<_>>().join(", ")));
 	}
 	let counters = status.counters;
@@ -402,6 +406,10 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	let store = Arc::new(Store::open(data.join("client.json")));
 	let mut settings = Settings::new(store.clone(), Arc::new(now), default_roots(), String::new());
 	settings.languages = languages();
+	if args.no_alpha {store.set_alpha_transports(false)} else if args.alpha && !store.alpha_transports() {
+		if !ask(&format!("{ALPHA_WARNING} Allow it?"), &mut signals).await? {bail!("Not connected. Alpha ways of connecting stay off.")}
+		store.set_alpha_transports(true);
+	}
 	let options = Options {interface: args.interface, kill_switch: !args.no_kill_switch, allow_lan: args.allow_lan, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes)}, run_dir: run.clone(), ..Options::default()};
 	// The one lock every command takes, held from here to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
 	let lock = state::lock(&run).await?;
@@ -434,6 +442,7 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 				}
 				all
 			}
+			Some(StartError::Alpha) => Err(anyhow!("This connection can only be made in a way that is still being tested (alpha), and that is switched off. Run `veilway connect --alpha` to read what that means and switch it on.")),
 			Some(_) | None => bail!(kept_message(&failure)),
 		};
 		// The terminal going away is not an answer: nobody is there, and the kill switch stays like after any other end.
@@ -558,7 +567,7 @@ mod tests {
 	#[test]
 	fn the_server_line_gives_the_candidate_in_use_and_no_secret() {
 		let mut found = status(State::Connected {exit: None});
-		found.connection = Some(veilway_engine::Connection {transport: "fronted", address: "192.0.2.7:443".parse().unwrap(), host: None, front: Some("cdn.example".into()), server_name: Some("cdn.example".into()), check: Some(Check::Public), since: Some(40)});
+		found.connection = Some(veilway_engine::Connection {transport: "fronted", address: "192.0.2.7:443".parse().unwrap(), host: None, front: Some("cdn.example".into()), server_name: Some("cdn.example".into()), check: Some(Check::Public), since: Some(40), alpha: false});
 		let text = render(&found, &applied(), 100);
 		assert!(text.contains("Server: 192.0.2.7:443, fronted, front cdn.example, server name cdn.example, public certificate, up 60 s."), "{text}");
 	}

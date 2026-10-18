@@ -140,7 +140,7 @@ async fn framing(config: Arc<ServerConfig>, frames: Vec<u8>, said: Arc<Mutex<Vec
 	}).await.0
 }
 
-fn link(keepalive: u32) -> Link {Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: keepalive..=keepalive}}}
+fn link(keepalive: u32) -> Link {Link {inbound: INBOUND, device: DEVICE, secret: Secret::new(SECRET), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Bounds {wide_max: 1023, normal_max: 255, keepalive: keepalive..=keepalive}, borrowed: Default::default()}}
 
 fn env(roots: &Arc<RootCertStore>) -> Env {Env {device: Arc::new(|| NOW), now: Arc::new(|| NOW), roots: roots.clone(), socket: None}}
 

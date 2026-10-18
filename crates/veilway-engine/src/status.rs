@@ -29,6 +29,8 @@ pub enum Say {
 	Lost,
 	/// The engine can use nothing of this profile as it stands.
 	NothingToTry,
+	/// What the profile lists that could be used is in alpha, and the setting for it is off.
+	AlphaOff,
 	/// The path cannot carry this way of connecting even at the smallest size.
 	PathTooSmall,
 	QuotaUsed,
@@ -52,7 +54,7 @@ pub enum Say {
 }
 
 impl Say {
-	pub const ALL: &'static [Say] = &[Self::CertificateMismatch, Self::CertificateTime, Self::Refused, Self::ClockWrong, Self::Unreachable, Self::Silence, Self::Offline, Self::BudgetSpent, Self::Lost, Self::NothingToTry, Self::PathTooSmall, Self::QuotaUsed, Self::Expired, Self::Disabled, Self::NodeStopping, Self::ControlUnverified, Self::ControlUnavailable, Self::AppTooOld, Self::NodeTooOld, Self::ProfileOutOfDate, Self::ClockDrift, Self::Random];
+	pub const ALL: &'static [Say] = &[Self::CertificateMismatch, Self::CertificateTime, Self::Refused, Self::ClockWrong, Self::Unreachable, Self::Silence, Self::Offline, Self::BudgetSpent, Self::Lost, Self::NothingToTry, Self::AlphaOff, Self::PathTooSmall, Self::QuotaUsed, Self::Expired, Self::Disabled, Self::NodeStopping, Self::ControlUnverified, Self::ControlUnavailable, Self::AppTooOld, Self::NodeTooOld, Self::ProfileOutOfDate, Self::ClockDrift, Self::Random];
 	pub fn code(self) -> &'static str {
 		match self {
 			Self::CertificateMismatch => "certificate-mismatch",
@@ -65,6 +67,7 @@ impl Say {
 			Self::BudgetSpent => "budget-spent",
 			Self::Lost => "lost",
 			Self::NothingToTry => "nothing-to-try",
+			Self::AlphaOff => "alpha-off",
 			Self::PathTooSmall => "path-too-small",
 			Self::QuotaUsed => "quota-used",
 			Self::Expired => "expired",
@@ -91,6 +94,7 @@ impl Say {
 			Self::BudgetSpent => "Many addresses were tried on this network in the last hour. Waiting before trying more.",
 			Self::Lost => "The connection to the server was lost. Reconnecting.",
 			Self::NothingToTry => "Nothing in this connection can be used as it stands. Refresh the subscription or choose another connection.",
+			Self::AlphaOff => "This connection can only be made in a way that is still being tested, and that is switched off. Turn on the alpha setting in the settings to use it.",
 			Self::PathTooSmall => "This network cannot carry this way of connecting. Trying another way.",
 			Self::QuotaUsed => "The data allowance is used up. The connection comes back when the next period starts.",
 			Self::Expired => "The account has expired.",
@@ -107,7 +111,7 @@ impl Say {
 	}
 }
 
-/// A candidate being tried, by position in the signed profile: the transport's place in its list and the places of the one or two candidates that are open now.
+/// A candidate being tried, by position in the signed profile as the document wrote it: the transport's place in its list and the places of the one or two candidates that are open now. A transport or a candidate that was left out does not shift the ones after it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {pub transport: usize, pub candidates: Vec<usize>}
 
@@ -167,17 +171,20 @@ impl Check {
 /// The candidate in use, or the first one being tried, as the profile has it. `since` is the Unix time its session opened, and is `None` until one has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
-	/// `udp`, `udp-obfs`, `tls`, `ws` or `fronted`.
+	/// `udp`, `udp-obfs`, `tls`, `ws`, `fronted`, `fronted-shaped` or `faketls`.
 	pub transport: &'static str,
 	pub address: SocketAddr,
 	/// The host name of a candidate that has one. Not given for `fronted`, whose host is the hidden service behind the front.
 	pub host: Option<String>,
 	/// The name of the front, for `fronted`.
 	pub front: Option<String>,
-	/// The TLS server name sent, if any.
+	/// The TLS server name sent, if any. On `faketls` it is the name of the site the node borrows.
 	pub server_name: Option<String>,
+	/// None on `udp`, `udp-obfs` and `faketls`, whose certificate is held to a key the client derives and to nothing a user can check.
 	pub check: Option<Check>,
 	pub since: Option<u64>,
+	/// The transport is in alpha (`faketls`): new, not reviewed outside the project, and it borrows a real site that has not agreed. An app says so next to the connection.
+	pub alpha: bool,
 }
 
 impl Connection {
@@ -185,7 +192,11 @@ impl Connection {
 		let (name, stream) = match transport {
 			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => {
 				let address = endpoints.get(candidate)?.address();
-				return Some(Self {transport: if matches!(transport, Transport::Udp(_)) {"udp"} else {"udp-obfs"}, address, host: None, front: None, server_name: None, check: None, since: None});
+				return Some(Self {transport: if matches!(transport, Transport::Udp(_)) {"udp"} else {"udp-obfs"}, address, host: None, front: None, server_name: None, check: None, since: None, alpha: false});
+			}
+			Transport::FakeTls {candidates, ..} => {
+				let found = candidates.get(candidate)?;
+				return Some(Self {transport: "faketls", address: found.address.address(), host: None, front: None, server_name: Some(found.sni.clone()), check: None, since: None, alpha: true});
 			}
 			Transport::Tls(stream) => ("tls", stream),
 			Transport::Ws(stream) => ("ws", stream),
@@ -195,7 +206,7 @@ impl Connection {
 		let found = stream.candidates.get(candidate)?;
 		let check = if found.self_signed {Check::PinnedSelfSigned} else if found.pins.is_empty() {Check::Public} else {Check::PublicAndPin};
 		let fronted = name.starts_with("fronted");
-		Some(Self {transport: name, address: found.address.address(), host: Some(found.host.clone()).filter(|host| !fronted && !host.is_empty()), front: found.sni.clone().filter(|_| fronted), server_name: found.sni.clone(), check: Some(check), since: None})
+		Some(Self {transport: name, address: found.address.address(), host: Some(found.host.clone()).filter(|host| !fronted && !host.is_empty()), front: found.sni.clone().filter(|_| fronted), server_name: found.sni.clone(), check: Some(check), since: None, alpha: false})
 	}
 }
 

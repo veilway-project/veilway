@@ -18,7 +18,7 @@ use tokio::time::{interval, sleep, Instant};
 use veilway_engine::xray::{self as carrier, Live, Params};
 use veilway_engine::{lan, Agree, Carrier, Settings, StartError, Status, Tunnel, XrayTunnel};
 use veilway_proto::subscription::client::{Held, Permit};
-use veilway_proto::subscription::payload::{own, Profile, Transport};
+use veilway_proto::subscription::payload::own;
 
 /// The longest a burst of changes of the device's networks may be waited out before the engine is told.
 const SETTLE_MOST: Duration = Duration::from_secs(2);
@@ -60,22 +60,6 @@ impl fmt::Display for Failure {
 
 impl std::error::Error for Failure {}
 
-// Every address a profile lists for the node and its fronts, with the protocol and port the transport uses it by.
-fn endpoints(profile: &Profile) -> Vec<Endpoint> {
-	let mut found: Vec<Endpoint> = Vec::new();
-	for transport in &profile.transports {
-		let (listed, tcp): (Vec<std::net::SocketAddr>, bool) = match transport {
-			Transport::Udp(dials) | Transport::UdpObfs(dials) => (dials.iter().map(|dial| dial.address()).collect(), false),
-			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => (stream.candidates.iter().map(|candidate| candidate.address.address()).collect(), true),
-		};
-		for address in listed {
-			let endpoint = Endpoint {ip: address.ip(), port: address.port(), tcp};
-			if !found.contains(&endpoint) {found.push(endpoint)}
-		}
-	}
-	found
-}
-
 /// What a connection needs of the profile it carries, whatever carries it: the addresses the device gets, the gateways the name policy is pointed at, the addresses and ports the engine's sockets (or Xray's program) may reach, and for a legacy profile Xray's program and its supervisor.
 pub struct Target {pub addresses: Vec<IpAddr>, pub gateways: Vec<IpAddr>, pub nodes: Vec<Endpoint>, pub xray: Option<XrayHold>}
 
@@ -86,7 +70,7 @@ pub struct XrayHold {pub program: String, pub user: String, pub live: Arc<Live>}
 pub async fn run(options: &Options, lock: &state::Lock, mut settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, on_status: impl FnMut(&Status, &Applied), stop: impl Future<Output = Stop>) -> Result<(), Failure> {
 	let before = |error: anyhow::Error| Failure {error, kept: firewall::present() == Some(true)};
 	let found = held.subscription().profiles.iter().find(|candidate| candidate.id == profile).ok_or_else(|| before(StartError::NoProfile.into()))?;
-	let target = Target {addresses: found.device.addresses.clone(), gateways: found.gateways.clone(), nodes: endpoints(found), xray: None};
+	let target = Target {addresses: found.device.addresses.clone(), gateways: found.gateways.clone(), nodes: veilway_engine::nodes(&found.transports, settings.store.alpha_transports()).into_iter().map(|(address, tcp)| Endpoint {ip: address.ip(), port: address.port(), tcp}).collect(), xray: None};
 	let start = |held_networks: &Own, physical: &Arc<AtomicU32>| -> anyhow::Result<Carrier> {
 		settings.networks = held_networks.networks.clone();
 		settings.network = held_networks.description.clone();

@@ -169,7 +169,7 @@ impl Peer {
 				if let TunnResult::WriteToNetwork(datagram) = made {Some(datagram.to_vec())} else {None}
 			}
 		}));
-		let leg = Leg {inbound: public(node_key), device: public(key), secret: Secret::new(SECRET), node: None, mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}};
+		let leg = Leg {inbound: public(node_key), device: public(key), secret: Secret::new(SECRET), node: None, mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()};
 		let env = Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots: Arc::new(RootCertStore::empty()), socket: None};
 		Peer {tunn, up, carrier: Carrier::Session(Session::open(&leg, Target::UdpObfs(at), env, source).unwrap()), inbox: VecDeque::new(), from}
 	}

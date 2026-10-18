@@ -201,6 +201,12 @@ impl Core {
 				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
 				self.library_value().await
 			}
+			Call::Alpha => Ok(json!({"alpha": self.store.alpha_transports()})),
+			Call::SetAlpha {on} => {
+				self.store.set_alpha_transports(on);
+				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
+				Ok(json!({"alpha": on}))
+			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
 			Call::Answer {yes} => {
 				let sent = self.running.lock().unwrap().as_ref().is_some_and(|running| running.answers.send(yes).is_ok());
@@ -315,6 +321,7 @@ impl Core {
 					}
 					true
 				}
+				Some(StartError::Alpha) => return Err(("alpha_off".into(), false)),
 				Some(_) | None => return Err((format!("{error:#}"), false)),
 			};
 			if !yes {

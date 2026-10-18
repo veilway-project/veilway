@@ -235,6 +235,21 @@ impl Subscription {
 	/// The addresses of every `udp` and `udp-obfs` endpoint of every profile. "A cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable": the core, which computes ratings, compares each candidate's address with this set.
 	/// Only the profiles' addresses, which is not the set a cap is computed from: the pinned endpoints of the link and of `refresh_urls` that are IP literals count too, and only the client knows the link. A cap uses `Held::datagram_addresses` or `Review::datagram_addresses`.
 	pub fn profile_datagram_addresses(&self) -> HashSet<IpAddr> {self.profiles.iter().flat_map(|profile| &profile.transports).flat_map(|transport| if let Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) = transport {&endpoints[..]} else {&[]}).map(|dial| dial.address().ip()).collect()}
+	/// The cover candidates whose address is in `datagram`, by their places in `profiles`, in the transports and in the lists of candidates as they are held (`Profile::document_place` gives the places the document wrote), as (profile, transport, candidate): "a cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable". `datagram` is the set a cap is computed from, `Held::datagram_addresses` or `Review::datagram_addresses`. A `faketls` candidate is a cover candidate and is compared like any other.
+	pub fn capped(&self, datagram: &HashSet<IpAddr>) -> Vec<(usize, usize, usize)> {
+		let mut found = Vec::new();
+		for (at, profile) in self.profiles.iter().enumerate() {
+			for (place, transport) in profile.transports.iter().enumerate() {
+				let addresses: Vec<Dial> = match transport {
+					Transport::Udp(_) | Transport::UdpObfs(_) => Vec::new(),
+					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
+					Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
+				};
+				found.extend(addresses.iter().enumerate().filter(|(_, dial)| datagram.contains(&dial.address().ip())).map(|(candidate, _)| (at, place, candidate)));
+			}
+		}
+		found
+	}
 }
 
 /// Why a profile was refused while its document was kept.
@@ -269,10 +284,14 @@ pub struct Profile {
 	/// One per family of `device.addresses`, in the same order.
 	pub gateways: Vec<IpAddr>,
 	pub mtu: u16,
-	/// Present whenever a `tls`, `ws`, `fronted` or `fronted-shaped` transport is listed.
+	/// Present whenever a `tls`, `ws`, `fronted` or `fronted-shaped` transport is listed. A `faketls` transport has a key of its own, and this one is never used in its place.
 	pub transport_public_key: Option<[u8; 32]>,
-	/// In the provider's order. A hint of the control channel names one by its position here.
+	/// In the provider's order, without the ones that were left out. A hint of the control channel names one by its position in the document, which is `places`, not its position here.
 	pub transports: Vec<Transport>,
+	/// For each of `transports`, where the document wrote it and its candidates. Nothing that matches a position uses the index into `transports` or into a candidate list: it goes through this.
+	pub places: Vec<Place>,
+	/// What was left out of the profile while it was kept, in the document's order.
+	pub dropped: Vec<Dropped>,
 	pub stream_first: bool,
 	pub parallel: u8,
 	pub padding: Padding,
@@ -284,7 +303,52 @@ pub struct Profile {
 	pub notices: Vec<Notice>,
 }
 
+/// Where the document wrote a transport that was kept, and each candidate of it that was kept (`endpoints` of `udp` and `udp-obfs` are all kept or the transport is refused, so for those it is 0 up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {pub transport: usize, pub candidates: Vec<usize>}
+
+/// Why part of a profile was left out while the profile was kept. The words are stable, for logs and for the app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+	/// A candidate did not read.
+	Candidate,
+	/// Every candidate of a transport did not read, so the transport is left out.
+	NoCandidates,
+	/// A `faketls` transport without a key that reads, with a list of candidates that is not 1 to 16, or with a member it must not have.
+	Faketls,
+	/// A `faketls` key equal to the profile's `transport_public_key`.
+	KeyOfProfile,
+	/// A `faketls` key that another `faketls` transport has too. Neither is kept.
+	KeyTwice,
+}
+
+impl Cause {
+	pub fn word(self) -> &'static str {
+		match self {
+			Self::Candidate => "candidate",
+			Self::NoCandidates => "no_candidates",
+			Self::Faketls => "faketls",
+			Self::KeyOfProfile => "key_of_profile",
+			Self::KeyTwice => "key_twice",
+		}
+	}
+}
+
+/// A transport (by its place in the document) that lost `count` candidates, or was itself left out, for `cause`. A transport left out for `NoCandidates` counts the candidates it had, and one left out for another cause counts 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Dropped {pub transport: usize, pub count: usize, pub cause: Cause}
+
 impl Profile {
+	/// The place in the document of candidate `candidate` of `transports[transport]`, as the profile holds them.
+	pub fn document_place(&self, transport: usize, candidate: usize) -> Option<(usize, usize)> {
+		let place = self.places.get(transport)?;
+		Some((place.transport, *place.candidates.get(candidate)?))
+	}
+	/// What a position of the document, such as a hint's, names in this profile: the transport and the candidate as the profile holds them. `None` when the document's item was left out.
+	pub fn find(&self, transport: usize, candidate: usize) -> Option<(usize, usize)> {
+		let at = self.places.iter().position(|place| place.transport == transport)?;
+		Some((at, self.places[at].candidates.iter().position(|place| *place == candidate)?))
+	}
 	/// The name of this profile's catalogue for an exit the node sent ("Languages" on the control channel page): the exit with the same tag, when its `default` is byte for byte the name the node sent. The app then shows `Text::pick` of it. `None` in every other case, and the app shows `sent.shown_name()`: "a signed label that has gone stale must not sit on an exit whose meaning the operator has changed".
 	pub fn exit_name(&self, sent: &control::Exit) -> Option<&Text> {self.exits.iter().find(|exit| exit.tag == sent.tag).map(|exit| &exit.name).filter(|name| name.is(&sent.name))}
 	/// "The same check covers the tunnel side: when a `device` address or a gateway falls inside one of the device's own networks, the profile cannot be used on that network."
@@ -322,7 +386,13 @@ pub enum Transport {
 	Fronted(Stream),
 	/// A `fronted` whose requests and answers are in the shape the profile says (shapes page). Its candidates are those of `fronted`.
 	FrontedShaped(Stream, Shape),
+	/// Borrowed-site mode (borrowed-site page), alpha: `key` is the public key of this transport's own key on the node, `T_pub`, and the candidates are in the provider's order.
+	FakeTls {key: [u8; 32], candidates: Vec<Borrowed>},
 }
+
+/// A candidate of a `faketls` transport: the node's address, and in `sni` the name of the site the node borrows, never the node's own.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Borrowed {pub address: Dial, pub sni: String}
 
 /// What the three stream transports carry: 1 to 16 candidates and the path, which is "at least 12 characters" under the path rule of the config reference.
 #[derive(Clone, PartialEq, Eq)]
@@ -486,6 +556,7 @@ impl fmt::Debug for Transport {
 			Self::Ws(stream) => write!(f, "Ws({} candidates)", stream.candidates.len()),
 			Self::Fronted(stream) => write!(f, "Fronted({} candidates)", stream.candidates.len()),
 			Self::FrontedShaped(stream, _) => write!(f, "FrontedShaped({} candidates)", stream.candidates.len()),
+			Self::FakeTls {candidates, ..} => write!(f, "FakeTls({} candidates)", candidates.len()),
 		}
 	}
 }
@@ -496,6 +567,10 @@ impl fmt::Debug for Stream {
 
 impl fmt::Debug for Candidate {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Candidate({} pins{})", self.pins.len(), if self.self_signed {", self-signed"} else {""})}
+}
+
+impl fmt::Debug for Borrowed {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {write!(f, "Borrowed({:?})", self.address)}
 }
 
 impl fmt::Debug for Dial {
@@ -630,6 +705,9 @@ pub(crate) fn addresses(members: Members, name: &'static str) -> Named<Vec<IpAdd
 #[derive(Clone, Copy, PartialEq)]
 enum Pins {Required, Allowed, Forbidden}
 
+// What a `faketls` transport and its candidates do not have: there is no front, no path and no certificate to check but the one the client derives. One of them refuses the candidate it is on, or the transport when it is on the transport.
+const BORROWED_NOT: [&str; 8] = ["path", "host", "verify_name", "ech", "pins", "self_signed", "http2", "shape"];
+
 fn host<'a>(members: Members<'a>, name: &'static str) -> Named<Option<&'a str>> {members.string(name, 253)?.map(|host| Some(host).filter(|host| is_host(host)).ok_or(name)).transpose()}
 
 fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
@@ -653,23 +731,64 @@ fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
 	Ok(Candidate {address, sni: sni.map(str::to_owned), host: need("host", host(members, "host"))?.to_owned(), verify_name: verify_name.map(str::to_owned), ech, pins: pins.unwrap_or_default(), self_signed, http2})
 }
 
-pub(crate) fn transport(value: &Json) -> Result<Transport, Fault> {
+/// One transport as `transport` read it: the transport, or `None` when it is left out, the places in the document of the candidates (or endpoints) that were kept, and what was dropped, if anything, as a cause and a count.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Read {pub transport: Option<Transport>, pub places: Vec<usize>, pub dropped: Option<(Cause, usize)>}
+
+/// One transport of a profile, or one that is left out: one whose candidates were all refused, or a `faketls` transport that is refused. A fault that refuses the profile is an `Err`.
+/// "A candidate with a member it must not have refuses that candidate and nothing else. A transport whose candidates are all refused is left out." Every candidate is read alone, of every type, and whatever is wrong with it costs it alone. What was left out is in the answer, with the places in the document of what was kept.
+pub(crate) fn transport(value: &Json) -> Result<Read, Fault> {
 	let members = Members::of(value).ok_or("transports")?;
 	let endpoints = || need("endpoints", members.list("endpoints", 1..=CANDIDATES_MAX))?.iter().map(|item| if let Json::Str(text) = item {Dial::parse(text)} else {None}.ok_or("endpoints")).collect::<Named<Vec<_>>>();
-	let stream = |rule: Pins| -> Named<Stream> {
+	// The stream that read, the places of its candidates in the document and how many candidates did not read.
+	let stream = |rule: Pins| -> Named<(Option<Stream>, Vec<usize>, usize)> {
 		// "`path` follows the path rule of the config reference and is at least 12 characters": it starts with `/`, is at most 256 bytes from `A-Z a-z 0-9 . _ ~ / -` and has no `..` component.
 		let path = need("path", members.string("path", 256))?;
 		if path.len() < PATH_MIN || !path.starts_with('/') || !path.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._~/-".contains(&byte)) || path.split('/').any(|part| part == "..") {return Err("path")}
-		Ok(Stream {path: path.to_owned(), candidates: need("candidates", members.list("candidates", 1..=CANDIDATES_MAX))?.iter().map(|item| candidate(item, rule)).collect::<Named<_>>()?})
+		let list = need("candidates", members.list("candidates", 1..=CANDIDATES_MAX))?;
+		let (candidates, places): (Vec<Candidate>, Vec<usize>) = list.iter().enumerate().filter_map(|(at, item)| candidate(item, rule).ok().map(|found| (found, at))).unzip();
+		let left = list.len() - places.len();
+		Ok(((!candidates.is_empty()).then(|| Stream {path: path.to_owned(), candidates}), places, left))
 	};
-	Ok(match need("type", members.string("type", STRING_MAX))? {
-		"udp" => Transport::Udp(endpoints()?),
-		"udp-obfs" => Transport::UdpObfs(endpoints()?),
-		"tls" => Transport::Tls(stream(Pins::Required)?),
-		"ws" => Transport::Ws(stream(Pins::Allowed)?),
-		"fronted" => Transport::Fronted(stream(Pins::Forbidden)?),
+	// A transport that was made, or none because no candidate of it read: then the count is what it had.
+	fn made(transport: Option<Transport>, places: Vec<usize>, left: usize) -> Read {Read {dropped: if transport.is_none() {Some((Cause::NoCandidates, left))} else {Some((Cause::Candidate, left)).filter(|(_, left)| *left > 0)}, transport, places}}
+	let kind = need("type", members.string("type", STRING_MAX))?;
+	Ok(match kind {
+		"udp" | "udp-obfs" => {
+			let found = endpoints()?;
+			let places = (0..found.len()).collect();
+			made(Some(if kind == "udp" {Transport::Udp(found)} else {Transport::UdpObfs(found)}), places, 0)
+		}
+		"tls" => {
+			let (found, places, left) = stream(Pins::Required)?;
+			made(found.map(Transport::Tls), places, left)
+		}
+		"ws" => {
+			let (found, places, left) = stream(Pins::Allowed)?;
+			made(found.map(Transport::Ws), places, left)
+		}
+		"fronted" => {
+			let (found, places, left) = stream(Pins::Forbidden)?;
+			made(found.map(Transport::Fronted), places, left)
+		}
 		// "A transport that has a shape has the type `fronted-shaped`", and the shape is read as the page says: a member it does not have, or a value it refuses, refuses the transport.
-		"fronted-shaped" => Transport::FrontedShaped(stream(Pins::Forbidden)?, Shape::from_json(members.get("shape").ok_or("shape")?).map_err(|_| "shape")?),
+		"fronted-shaped" => {
+			let shape = Shape::from_json(members.get("shape").ok_or("shape")?).map_err(|_| "shape")?;
+			let (found, places, left) = stream(Pins::Forbidden)?;
+			made(found.map(|stream| Transport::FrontedShaped(stream, shape)), places, left)
+		}
+		// A `faketls` transport is refused, and left out, for a member it must not have, for a `transport_public_key` that is missing or does not read, and for a `candidates` that is not a list of 1 to 16. Its key is a public key of X25519 like the profile's, so one of small order is refused too.
+		"faketls" => {
+			let (key, list) = (members.string("transport_public_key", 44).ok().flatten().and_then(public), members.list("candidates", 1..=CANDIDATES_MAX).ok().flatten());
+			let (Some(key), Some(list), false) = (key, list, BORROWED_NOT.iter().any(|name| members.get(name).is_some())) else {return Ok(Read {transport: None, places: Vec::new(), dropped: Some((Cause::Faketls, 1))})};
+			// A candidate has `address`, read as every other candidate's, and `sni`, a host name that is required and is never empty, a wildcard or an address.
+			let (candidates, places): (Vec<Borrowed>, Vec<usize>) = list.iter().enumerate().filter_map(|(at, item)| {
+				let members = Members::of(item).filter(|members| !BORROWED_NOT.iter().any(|name| members.get(name).is_some()))?;
+				Some((Borrowed {address: Dial::parse(members.string("address", STRING_MAX).ok()??)?, sni: members.string("sni", 253).ok()?.filter(|sni| is_host(sni))?.to_owned()}, at))
+			}).unzip();
+			let left = list.len() - places.len();
+			made((!candidates.is_empty()).then_some(Transport::FakeTls {key, candidates}), places, left)
+		}
 		_ => return Err(Fault::Unsupported),
 	})
 }
@@ -687,7 +806,11 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	if need("type", members.string("type", STRING_MAX))? != "veilway" {return Err(Fault::Unsupported)}
 	let read: Vec<_> = need("transports", members.list("transports", 1..=TRANSPORTS_MAX))?.iter().map(transport).collect();
 	if read.contains(&Err(Fault::Unsupported)) {return Err(Fault::Unsupported)}
-	let transports = read.into_iter().collect::<Result<Vec<_>, _>>()?;
+	let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+	for (at, read) in read.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().enumerate() {
+		if let Some((cause, count)) = read.dropped {dropped.push(Dropped {transport: at, count, cause})}
+		if let Some(found) = read.transport {kept.push((found, Place {transport: at, candidates: read.places}))}
+	}
 	let id = need("id", members.string("id", 64))?;
 	if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-') || id.starts_with(['_', '-']) {return Err(Fault::Member("id"))}
 	let device = device(need("device", members.object("device"))?)?;
@@ -695,6 +818,20 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	// "One per family of `device.addresses`, in the same order." A gateway that is the device's own address is no gateway.
 	if gateways.len() != device.addresses.len() || gateways.iter().zip(&device.addresses).any(|(gateway, address)| gateway.is_ipv4() != address.is_ipv4() || gateway == address) {return Err(Fault::Member("gateways"))}
 	let transport_public_key = key32(members, "transport_public_key", public)?;
+	// "A `faketls` key equal to the profile's `transport_public_key` or to another `faketls` transport's key refuses that `faketls` transport only." Of two with one key neither is kept: nothing says which of them has it right.
+	let borrowed: Vec<[u8; 32]> = kept.iter().filter_map(|(transport, _)| if let Transport::FakeTls {key, ..} = transport {Some(*key)} else {None}).collect();
+	kept.retain(|(transport, place)| {
+		let Transport::FakeTls {key, ..} = transport else {return true};
+		let cause = if transport_public_key == Some(*key) {Cause::KeyOfProfile} else if borrowed.iter().filter(|other| *other == key).count() > 1 {Cause::KeyTwice} else {return true};
+		// What was recorded of its candidates is moot once the transport itself is gone.
+		dropped.retain(|drop| drop.transport != place.transport);
+		dropped.push(Dropped {transport: place.transport, count: 1, cause});
+		false
+	});
+	dropped.sort_by_key(|drop| drop.transport);
+	let (transports, places): (Vec<Transport>, Vec<Place>) = kept.into_iter().unzip();
+	// "A profile whose transports are all left out is refused."
+	if transports.is_empty() {return Err(Fault::Member("transports"))}
 	if transport_public_key.is_none() && transports.iter().any(|transport| matches!(transport, Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..))) {return Err(Fault::Member("transport_public_key"))}
 	let padding = match members.object("padding")? {
 		None => Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE},
@@ -713,7 +850,7 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	let exits = members.list("exits", 0..=EXITS_MAX)?.unwrap_or_default().iter().filter_map(|item| Members::of(item).and_then(exit).filter(|exit| tags.insert(exit.tag.clone()))).collect();
 	// A list of another type or of more than 4 is a member of the profile out of its range. A notice in it that does not read is left out, as one at the top level is.
 	let notices = members.list("notices", 0..=NOTICES_MAX)?.unwrap_or_default().iter().filter_map(|item| Members::of(item).and_then(notice)).collect();
-	Ok(Profile {id: id.to_owned(), name: need("name", text(members, "name", true, NAME, 4 * NAME))?, inbound_public_key: need("inbound_public_key", key32(members, "inbound_public_key", public))?, device, gateways, mtu: need("mtu", members.uint("mtu", u64::from(MTU_MIN)..=MTU_MAX))? as u16, transport_public_key, transports, stream_first: members.boolean("stream_first")?.unwrap_or(false), parallel: members.uint("parallel", 1..=4)?.unwrap_or(1) as u8, padding, min_control_version: members.uint("min_control_version", 1..=255)?.unwrap_or(1) as u8, rating_cap, exits, notices})
+	Ok(Profile {id: id.to_owned(), name: need("name", text(members, "name", true, NAME, 4 * NAME))?, inbound_public_key: need("inbound_public_key", key32(members, "inbound_public_key", public))?, device, gateways, mtu: need("mtu", members.uint("mtu", u64::from(MTU_MIN)..=MTU_MAX))? as u16, transport_public_key, transports, places, dropped, stream_first: members.boolean("stream_first")?.unwrap_or(false), parallel: members.uint("parallel", 1..=4)?.unwrap_or(1) as u8, padding, min_control_version: members.uint("min_control_version", 1..=255)?.unwrap_or(1) as u8, rating_cap, exits, notices})
 }
 
 /// Reads the payload of a verified document: steps 4 to 6 of "What is checked, in order", without the checks that need the clock or the stored document, which are `client`'s.
@@ -776,4 +913,189 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 	let (usage, logo) = (usage.flatten(), logo.flatten());
 	let accent = members.string("accent", 7)?.map(|text| text.strip_prefix('#').filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())).and_then(|digits| u32::from_str_radix(digits, 16).ok()).map(|colour| [(colour >> 16) as u8, (colour >> 8) as u8, colour as u8]).ok_or("accent")).transpose()?;
 	Ok(Payload::Subscription(Box::new(Subscription {id, serial, issued_at, expires_at, signing_keys, provider, update_interval, refresh_urls, gateway_keys: gateway_keys(members, "gateway_keys", false)?, main_endpoint, static_mirrors, endpoint_pins, profiles, refused, devices, usage, support, agreement, cards, logo, accent, notices, left_out})))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::{json, Value};
+
+	// Keys of the tests are the public halves of private keys that are one byte repeated: obviously made up, and none of them all zeros.
+	fn key(fill: u8) -> String {STANDARD.encode(proof::public_key(&[fill; 32]))}
+	fn pin() -> String {STANDARD.encode([0x33; 32])}
+	fn borrowed(address: &str, sni: &str) -> Value {json!({"address": address, "sni": sni})}
+	fn faketls(fill: u8, candidates: Vec<Value>) -> Value {json!({"type": "faketls", "transport_public_key": key(fill), "candidates": candidates})}
+	fn two() -> Vec<Value> {vec![borrowed("192.0.2.10:443", "www.example.com"), borrowed("[2001:db8::10]:443", "www.example.org")]}
+	fn obfs() -> Value {json!({"type": "udp-obfs", "endpoints": ["192.0.2.30:51821"]})}
+	// A profile with these transports and, with `node`, the profile's own `transport_public_key` of that fill.
+	fn profile_of(transports: Vec<Value>, node: Option<u8>) -> Value {
+		let mut profile = json!({"type": "veilway", "id": "home", "name": "Home", "inbound_public_key": key(0x12), "device": {"public_key": key(0x21), "transport_secrets": [STANDARD.encode([0x5a; 32])], "addresses": ["10.7.0.2"]}, "gateways": ["10.7.0.1"], "mtu": 1390, "transports": transports});
+		if let Some(fill) = node {profile["transport_public_key"] = json!(key(fill))}
+		profile
+	}
+	fn read(profile: &Value) -> Result<Profile, Fault> {
+		let parsed = json::parse(profile.to_string().as_bytes()).unwrap();
+		super::profile(Members::of(&parsed).unwrap())
+	}
+	// What a profile of one transport and a `udp-obfs` keeps of the first: `None` when it was left out.
+	fn kept(transport: Value) -> Option<Transport> {
+		let read = read(&profile_of(vec![transport, obfs()], Some(0x31))).unwrap();
+		(read.transports.len() == 2).then(|| read.transports[0].clone())
+	}
+	fn snis(transport: &Option<Transport>) -> Vec<String> {if let Some(Transport::FakeTls {candidates, ..}) = transport {candidates.iter().map(|candidate| candidate.sni.clone()).collect()} else {Vec::new()}}
+
+	#[test]
+	fn a_faketls_transport_has_its_own_key_and_its_candidates_in_order() {
+		// A profile whose only transport is `faketls` needs no profile-level key.
+		let read = read(&profile_of(vec![faketls(0x41, two())], None)).unwrap();
+		let Transport::FakeTls {key, candidates} = &read.transports[0] else {panic!("{:?}", read.transports)};
+		assert_eq!((*key, read.transport_public_key), (proof::public_key(&[0x41; 32]), None));
+		assert_eq!(candidates.iter().map(|candidate| (candidate.address.address().to_string(), candidate.sni.as_str())).collect::<Vec<_>>(), [("192.0.2.10:443".to_owned(), "www.example.com"), ("[2001:db8::10]:443".to_owned(), "www.example.org")]);
+		// What it prints holds no address, name or key.
+		assert_eq!(format!("{:?}", read.transports[0]), "FakeTls(2 candidates)");
+		assert_eq!(format!("{:?}", candidates[0]), "Borrowed(Dial(IPv4))");
+		// Unknown members are ignored, as in every version 1 object.
+		let mut transport = faketls(0x41, vec![json!({"address": "192.0.2.10:443", "sni": "www.example.com", "weight": 3})]);
+		transport["note"] = json!("x");
+		assert_eq!(snis(&kept(transport)), ["www.example.com"]);
+	}
+
+	#[test]
+	fn a_member_a_borrowed_site_does_not_take_refuses_the_candidate_or_the_transport_it_is_on() {
+		for name in BORROWED_NOT {
+			// On a candidate it drops that candidate alone.
+			let mut candidates = two();
+			candidates[0][name] = json!(false);
+			assert_eq!(snis(&kept(faketls(0x41, candidates))), ["www.example.org"], "{name}");
+			// On the transport it refuses the transport, and the profile keeps the rest.
+			let mut transport = faketls(0x41, two());
+			transport[name] = json!("/x");
+			assert_eq!(kept(transport), None, "{name}");
+		}
+	}
+
+	#[test]
+	fn the_sni_of_a_candidate_is_a_host_name_and_never_empty_or_an_address() {
+		let too_long = format!("{}.example.com", ["a"; 125].join("."));
+		assert!(too_long.len() > 253);
+		for sni in [json!(""), json!("WWW.Example.com"), json!("*.example.com"), json!("192.0.2.7"), json!("[2001:db8::1]"), json!("a..example.com"), json!("-a.example.com"), json!("www.example.com."), json!(too_long), json!(7), Value::Null] {
+			assert_eq!(snis(&kept(faketls(0x41, vec![json!({"address": "192.0.2.10:443", "sni": sni.clone()}), borrowed("192.0.2.11:443", "www.example.org")]))), ["www.example.org"], "{sni}");
+		}
+		assert_eq!(snis(&kept(faketls(0x41, vec![json!({"address": "192.0.2.10:443"}), borrowed("192.0.2.11:443", "www.example.org")]))), ["www.example.org"]);
+		// A transport whose candidates are all refused is left out.
+		assert_eq!(kept(faketls(0x41, vec![borrowed("192.0.2.10:443", "")])), None);
+	}
+
+	#[test]
+	fn a_faketls_transport_without_a_key_that_reads_is_left_out() {
+		let mut missing = faketls(0x41, two());
+		missing.as_object_mut().unwrap().remove("transport_public_key");
+		assert_eq!(kept(missing), None);
+		for bad in [json!(""), json!(&key(0x41)[..43]), json!(STANDARD.encode([0; 32])), json!(STANDARD.encode([0x41; 31])), json!(key(0x41).replace('=', "A")), json!(7), json!([key(0x41)])] {
+			let mut transport = faketls(0x41, two());
+			transport["transport_public_key"] = bad.clone();
+			assert_eq!(kept(transport), None, "{bad}");
+		}
+		// A key on a candidate is no key of the transport: it is an unknown member there, and the transport still has none.
+		assert_eq!(kept(json!({"type": "faketls", "candidates": [{"address": "192.0.2.10:443", "sni": "www.example.com", "transport_public_key": key(0x41)}]})), None);
+	}
+
+	#[test]
+	fn the_profile_key_is_no_fallback_for_a_faketls_key() {
+		let mut transport = faketls(0x41, two());
+		transport.as_object_mut().unwrap().remove("transport_public_key");
+		// Its only transport left out, the profile is refused, although it has a key of its own.
+		assert_eq!(read(&profile_of(vec![transport], Some(0x31))).err(), Some(Fault::Member("transports")));
+	}
+
+	#[test]
+	fn a_faketls_key_that_is_another_transports_refuses_that_faketls_transport() {
+		let tls = json!({"type": "tls", "path": "/assets/app-1234.js", "candidates": [{"address": "192.0.2.20:443", "sni": "node.example.com", "host": "node.example.com", "pins": [pin()]}]});
+		// The profile's own key.
+		let read_same = read(&profile_of(vec![faketls(0x31, two()), tls.clone()], Some(0x31))).unwrap();
+		assert!(matches!(&read_same.transports[..], [Transport::Tls(_)]), "{:?}", read_same.transports);
+		// Two `faketls` transports with one key are both left out, and one with a key of its own is kept.
+		let read_twice = read(&profile_of(vec![faketls(0x41, two()), faketls(0x41, two()), faketls(0x42, two()), tls], Some(0x31))).unwrap();
+		assert!(matches!(&read_twice.transports[..], [Transport::FakeTls {key, ..}, Transport::Tls(_)] if *key == proof::public_key(&[0x42; 32])), "{:?}", read_twice.transports);
+		// Several with keys of their own are allowed.
+		assert_eq!(read(&profile_of(vec![faketls(0x41, two()), faketls(0x42, two())], None)).unwrap().transports.len(), 2);
+	}
+
+	#[test]
+	fn a_faketls_candidate_dials_only_where_every_candidate_may() {
+		for address in [json!("127.0.0.1:443"), json!("[::1]:443"), json!("169.254.1.1:443"), json!("[fe80::1]:443"), json!("192.0.2.10:0"), json!("192.0.2.10:0443"), json!("0.0.0.0:443"), json!("[::ffff:192.0.2.10]:443"), json!("www.example.com:443"), json!("192.0.2.10"), json!(443)] {
+			assert_eq!(snis(&kept(faketls(0x41, vec![json!({"address": address.clone(), "sni": "www.example.com"}), borrowed("192.0.2.11:443", "www.example.org")]))), ["www.example.org"], "{address}");
+		}
+	}
+
+	#[test]
+	fn a_faketls_transport_has_1_to_16_candidates() {
+		let one = borrowed("192.0.2.10:443", "www.example.com");
+		assert_eq!(kept(faketls(0x41, Vec::new())), None);
+		assert_eq!(snis(&kept(faketls(0x41, vec![one.clone(); 16]))).len(), 16);
+		assert_eq!(kept(faketls(0x41, vec![one.clone(); 17])), None);
+		let mut not_a_list = faketls(0x41, Vec::new());
+		not_a_list["candidates"] = one;
+		assert_eq!(kept(not_a_list), None);
+	}
+
+	#[test]
+	fn a_malformed_candidate_of_any_stream_transport_drops_only_itself() {
+		let good = json!({"address": "192.0.2.20:443", "sni": "node.example.com", "host": "node.example.com"});
+		let pinned = json!({"address": "192.0.2.21:443", "sni": "node.example.com", "host": "node.example.com", "pins": [pin()]});
+		let shape = json!({"up": {"method": "GET", "in": "query"}, "down": {"mode": "poll"}});
+		let mut self_signed = good.clone();
+		self_signed["self_signed"] = json!(true);
+		let mut bad_sni = good.clone();
+		bad_sni["sni"] = json!("Node.example.com");
+		// For each type: a candidate it refuses, and one it takes.
+		for (kind, bad, fine) in [("tls", &good, &pinned), ("ws", &self_signed, &pinned), ("fronted", &pinned, &good), ("fronted-shaped", &pinned, &good), ("fronted-shaped", &bad_sni, &good)] {
+			let mut transport = json!({"type": kind, "path": "/assets/app-1234.js", "candidates": [bad, fine]});
+			if kind == "fronted-shaped" {transport["shape"] = shape.clone()}
+			let Some(Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _)) = kept(transport.clone()) else {panic!("{kind}")};
+			assert_eq!(stream.candidates.iter().map(|candidate| candidate.address.address().to_string()).collect::<Vec<_>>(), [fine["address"].as_str().unwrap()], "{kind}");
+			// A list whose candidates are all refused leaves the transport out, and a profile whose transports are all left out is refused.
+			transport["candidates"] = json!([bad]);
+			assert_eq!(kept(transport.clone()), None, "{kind}");
+			assert_eq!(read(&profile_of(vec![transport], Some(0x31))).err(), Some(Fault::Member("transports")), "{kind}");
+		}
+	}
+
+	#[test]
+	fn what_was_left_out_does_not_shift_the_places_the_document_wrote() {
+		let good = json!({"address": "192.0.2.20:443", "sni": "node.example.com", "host": "node.example.com"});
+		let pinned = json!({"address": "192.0.2.21:443", "sni": "node.example.com", "host": "node.example.com", "pins": [pin()]});
+		let three = vec![borrowed("192.0.2.10:443", ""), borrowed("192.0.2.11:443", "www.example.com"), borrowed("192.0.2.12:443", "www.example.org")];
+		let tls = json!({"type": "tls", "path": "/assets/app-1234.js", "candidates": [good, pinned]});
+		let read = read(&profile_of(vec![faketls(0x41, three), tls, faketls(0x31, two()), obfs()], Some(0x31))).unwrap();
+		assert_eq!(read.transports.len(), 3);
+		assert_eq!(read.places, [Place {transport: 0, candidates: vec![1, 2]}, Place {transport: 1, candidates: vec![1]}, Place {transport: 3, candidates: vec![0]}]);
+		assert_eq!(read.dropped, [Dropped {transport: 0, count: 1, cause: Cause::Candidate}, Dropped {transport: 1, count: 1, cause: Cause::Candidate}, Dropped {transport: 2, count: 1, cause: Cause::KeyOfProfile}]);
+		// A hint names the document's places: the ones that were left out name nothing, and the others name what the profile holds now.
+		let found: Vec<_> = (0..4).flat_map(|transport| (0..3).map(move |candidate| (transport, candidate))).filter_map(|(transport, candidate)| read.find(transport, candidate).map(|at| ((transport, candidate), at))).collect();
+		assert_eq!(found, [((0, 1), (0, 0)), ((0, 2), (0, 1)), ((1, 1), (1, 0)), ((3, 0), (2, 0))]);
+		// And the other way, from what the profile holds to what the document wrote.
+		assert_eq!([read.document_place(0, 0), read.document_place(0, 1), read.document_place(1, 0), read.document_place(2, 0), read.document_place(2, 1), read.document_place(3, 0)], [Some((0, 1)), Some((0, 2)), Some((1, 1)), Some((3, 0)), None, None]);
+	}
+
+	#[test]
+	fn every_drop_has_a_cause_and_a_count() {
+		let bad = borrowed("192.0.2.10:443", "");
+		let mut with_member = faketls(0x42, two());
+		with_member["path"] = json!("/x");
+		let mut no_key = faketls(0x43, two());
+		no_key.as_object_mut().unwrap().remove("transport_public_key");
+		let read = read(&profile_of(vec![faketls(0x41, vec![bad.clone(), bad.clone()]), with_member, no_key, faketls(0x44, two()), faketls(0x44, two()), faketls(0x45, two()), obfs()], Some(0x31))).unwrap();
+		assert_eq!(read.dropped, [Dropped {transport: 0, count: 2, cause: Cause::NoCandidates}, Dropped {transport: 1, count: 1, cause: Cause::Faketls}, Dropped {transport: 2, count: 1, cause: Cause::Faketls}, Dropped {transport: 3, count: 1, cause: Cause::KeyTwice}, Dropped {transport: 4, count: 1, cause: Cause::KeyTwice}]);
+		assert_eq!(read.places.iter().map(|place| place.transport).collect::<Vec<_>>(), [5, 6]);
+		assert_eq!(read.dropped.iter().map(|drop| drop.cause.word()).collect::<Vec<_>>(), ["no_candidates", "faketls", "faketls", "key_twice", "key_twice"]);
+		// A transport that is left out for its key keeps no record of the candidates it lost before.
+		let mut halved = two();
+		halved[0] = borrowed("192.0.2.10:443", "");
+		let read = self::read(&profile_of(vec![faketls(0x31, halved), obfs()], Some(0x31))).unwrap();
+		assert_eq!(read.dropped, [Dropped {transport: 0, count: 1, cause: Cause::KeyOfProfile}]);
+		// A profile that lost nothing says so.
+		let whole = self::read(&profile_of(vec![faketls(0x41, two()), obfs()], Some(0x31))).unwrap();
+		assert!(whole.dropped.is_empty() && whole.find(1, 0) == Some((1, 0)));
+	}
 }

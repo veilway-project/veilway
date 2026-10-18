@@ -303,7 +303,7 @@ impl Node {
 	}
 
 	/// What the client library needs to reach the node: the candidate, which is the tap in front of it, and the node's key.
-	fn target(&self, link: &Link) -> Target {Target::FakeTls {candidate: Front {address: self.front.addr, sni: Some(NAME.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}, client: faketls::client(link).unwrap()}}
+	fn target(&self, link: &Link) -> Target {Target::FakeTls {candidate: Front {address: self.front.addr, sni: Some(NAME.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}, client: faketls::client(link, &link.node.unwrap())}}
 
 	fn env(&self, ahead: i64) -> Env {
 		let time = self.time;
@@ -327,7 +327,7 @@ async fn eventually(what: &str, done: impl Fn() -> bool) {
 }
 
 /// What device `n` holds for the inbound, with the transport key of the node it is made for.
-fn link(n: usize, transport: &[u8; 32]) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(transport)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}}}
+fn link(n: usize, transport: &[u8; 32]) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(transport)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()}}
 
 /// The WireGuard layer of device `n` as the library asks for it: a handshake initiation while the tunnel has no session, a keepalive once it has, which `up` says.
 fn wireguard(n: usize) -> (Arc<Mutex<Tunn>>, Arc<std::sync::atomic::AtomicBool>, Source) {

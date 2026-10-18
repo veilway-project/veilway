@@ -149,6 +149,13 @@ async fn answer_hosts(id: String, allow: Vec<String>, decline: Vec<String>) -> R
 #[tauri::command]
 async fn set_lan(id: String, on: bool) -> Result<Value, String> {call_branded(Call::SetLan {subscription: id, on}).await}
 
+/// Whether the transports in alpha are on, and turning them on or off. The window shows the warning and has the user confirm before it asks for on.
+#[tauri::command]
+async fn get_alpha() -> Result<Value, String> {host::call(Call::Alpha).await}
+
+#[tauri::command]
+async fn set_alpha(on: bool) -> Result<Value, String> {host::call(Call::SetAlpha {on}).await}
+
 /// Asks for the VPN consent (the system's own dialog, once), then starts the service. The service starts the connection, and what happens after that comes back as events. The first call blocks the window's request until the user has answered the dialog.
 #[tauri::command]
 async fn connect(vpn: State<'_, Arc<Vpn>>, subscription: String, profile: String, options: Options) -> Result<Value, String> {
@@ -337,7 +344,7 @@ pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

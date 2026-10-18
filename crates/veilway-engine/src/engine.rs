@@ -116,6 +116,7 @@ fn count(transport: &Transport) -> usize {
 	match transport {
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.len(),
 		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
+		Transport::FakeTls {candidates, ..} => candidates.len(),
 	}
 }
 
@@ -205,10 +206,10 @@ impl Core {
 		let (consent, declined, stream_first) = self.settings.store.answers(&self.store_key);
 		(self.standing.consent, self.kept.declined, self.kept.stream_first) = (consent, declined, stream_first);
 	}
-	/// Whether a transport may be used now: it is of the best class the profile lists, or the user agreed to its class. Asked of the session in hand as well, so that a class withdrawn while the tunnel runs ends it.
+	/// Whether a transport may be used now: `alpha_transports` allows it, and it is of the best class of those the profile lists that it allows, or the user agreed to its class. Asked of the session in hand as well, so that a class withdrawn or the setting turned off while the tunnel runs ends it.
 	pub(crate) fn allowed(&self, transport: usize) -> bool {
-		let class = choice::class(&self.transports[transport]);
-		self.transports.iter().map(choice::class).min().is_some_and(|best| class == best) || self.standing.consent.contains(&class)
+		let (class, alpha) = (choice::class(&self.transports[transport]), self.settings.store.alpha_transports());
+		choice::usable(&self.transports[transport], alpha) && (self.transports.iter().filter(|listed| choice::usable(listed, alpha)).map(choice::class).min().is_some_and(|best| class == best) || self.standing.consent.contains(&class))
 	}
 	pub(crate) fn stream_first(&self) -> bool {self.kept.stream_first.unwrap_or(self.profile.stream_first)}
 	fn sleep(&self, wait: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
@@ -300,9 +301,12 @@ impl Core {
 				if rested == Rested::Stop {return}
 			}
 			self.answers();
-			let plan = choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix());
+			let alpha = self.settings.store.alpha_transports();
+			let plan = choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), alpha);
 			if plan.order.is_empty() {
-				self.change(State::Failed, Some(Say::NothingToTry));
+				// Alpha is the reason only if turning it on would give something to try.
+				let alpha_off = !alpha && !choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), true).order.is_empty();
+				self.change(State::Failed, Some(if alpha_off {Say::AlphaOff} else {Say::NothingToTry}));
 				match self.rest(Duration::from_secs(365 * 86_400)).await {
 					Rested::Stop => return,
 					_ => continue 'campaign,
@@ -409,6 +413,7 @@ impl Core {
 		let found = match &self.transports[transport] {
 			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| skipped(self.consented, dial, &self.networks)),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
+			Transport::FakeTls {candidates, ..} => candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
 		};
 		found.unwrap_or(false)
 	}
@@ -441,7 +446,7 @@ impl Core {
 	}
 	fn open(&self, transport: usize, candidate: usize, env: &Env) -> Result<Session, Ended> {
 		#[allow(unused_mut)]
-		let Some(mut target) = Target::of(&self.transports[transport], candidate) else {return Err(Ended::Unreachable(Unreachable::Connect))};
+		let Some(mut target) = Target::of(&self.transports[transport], candidate, &self.link) else {return Err(Ended::Unreachable(Unreachable::Connect))};
 		if let Some(redirect) = &self.settings.hooks.redirect {
 			match &mut target {
 				Target::UdpObfs(address) => *address = redirect(*address),
@@ -464,7 +469,7 @@ impl Core {
 	}
 	// One attempt: one candidate, or two raced. A candidate that wins is carried for as long as its session lasts.
 	async fn attempt(&mut self, transport: usize, picks: Vec<usize>, added: &[usize]) -> Done {
-		let state = self.connecting(Some(Attempt {transport, candidates: picks.clone()}), None);
+		let state = self.connecting(Some(Attempt {transport: self.profile.places.get(transport).map_or(transport, |place| place.transport), candidates: picks.iter().map(|pick| self.profile.document_place(transport, *pick).map_or(*pick, |(_, candidate)| candidate)).collect()}), None);
 		self.status.connection = Connection::of(&self.transports[transport], picks[0]);
 		self.change(state, self.reason);
 		if matches!(self.transports[transport], Transport::Udp(_)) {

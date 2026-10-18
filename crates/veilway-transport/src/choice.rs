@@ -41,7 +41,7 @@ pub enum Class {Cover, NoCover, Exposed, Plain}
 
 pub fn class(transport: &Transport) -> Class {
 	match transport {
-		Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..) => Class::Cover,
+		Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => Class::Cover,
 		Transport::UdpObfs(_) => Class::NoCover,
 		Transport::Udp(_) => Class::Plain,
 	}
@@ -61,8 +61,17 @@ pub fn digest(transports: &[Transport]) -> u64 {
 			Transport::Ws(stream) => (3, &[][..], Some(stream)),
 			Transport::Fronted(stream) => (4, &[][..], Some(stream)),
 			Transport::FrontedShaped(stream, _) => (5, &[][..], Some(stream)),
+			Transport::FakeTls {..} => (6, &[][..], None),
 		};
 		take(&[kind]);
+		// A new key, a new address or a new site is another transport too.
+		if let Transport::FakeTls {key, candidates} = transport {
+			take(key);
+			for candidate in candidates {
+				take(candidate.address.address().to_string().as_bytes());
+				take(candidate.sni.as_bytes());
+			}
+		}
 		// A shape that changes is another transport for everything that is remembered about this one.
 		if let Transport::FrontedShaped(_, shape) = transport {take(shape.to_string().as_bytes())}
 		for endpoint in endpoints {take(endpoint.address().to_string().as_bytes())}
@@ -137,17 +146,21 @@ fn sound(network: &mut Network, standing: &mut Standing, profile: u64, now: u64)
 	standing.consent.truncate(KEPT);
 }
 
+/// Whether a transport may be used under the client's `alpha_transports` setting: "No `faketls` candidate is dialed until it is on." Every other transport may.
+pub fn usable(transport: &Transport, alpha: bool) -> bool {alpha || !matches!(transport, Transport::FakeTls {..})}
+
 /// The transports of a profile a client may try now, in the order to try them, and the classes it must ask about before it may use them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {pub order: Vec<usize>, pub ask: Vec<Class>}
 
 /// "The client uses a transport of a lower class than the best class in the profile only when the user has agreed to that class for this profile. This covers the first attempt as well as fallback."
 /// The order is the provider's. The transport that last worked on this network comes first, and with `stream_first` "the client tries every cover transport before any other". Where the two disagree `stream_first` wins. A transport that is set aside is left out, unless that would leave none: "The last transport of a profile that the client is allowed to use is never set aside."
-pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, standing: &Standing, now: u64) -> Plan {
+/// A `faketls` transport is left out while `alpha` is off, and the best class is then the best of the others: the profile is planned as if it did not list it.
+pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, standing: &Standing, now: u64, alpha: bool) -> Plan {
 	let (mut network, mut standing) = (network.clone(), standing.clone());
 	sound(&mut network, &mut standing, digest(transports), now);
-	let Some(best) = transports.iter().map(class).min() else {return Plan::default()};
-	let (mut ask, mut order): (Vec<Class>, Vec<usize>) = (transports.iter().map(class).filter(|class| *class > best && !standing.consent.contains(class)).collect(), (0..transports.len()).filter(|at| class(&transports[*at]) == best || standing.consent.contains(&class(&transports[*at]))).collect());
+	let Some(best) = transports.iter().filter(|transport| usable(transport, alpha)).map(class).min() else {return Plan::default()};
+	let (mut ask, mut order): (Vec<Class>, Vec<usize>) = (transports.iter().filter(|transport| usable(transport, alpha)).map(class).filter(|class| *class > best && !standing.consent.contains(class)).collect(), (0..transports.len()).filter(|at| usable(&transports[*at], alpha) && (class(&transports[*at]) == best || standing.consent.contains(&class(&transports[*at])))).collect());
 	ask.sort();
 	ask.dedup();
 	if let Some(first) = network.worked.and_then(|(worked, _, _)| order.iter().position(|at| *at == worked)) {order[..=first].rotate_right(1)}
@@ -341,6 +354,7 @@ mod tests {
 			"udp-obfs" => Transport::UdpObfs(vec![Dial::parse("192.0.2.10:51821").unwrap()]),
 			"tls" => Transport::Tls(Stream {path: "/assets/app-1.js".into(), candidates: Vec::new()}),
 			"ws" => Transport::Ws(Stream {path: "/assets/app-2.js".into(), candidates: Vec::new()}),
+			"faketls" => Transport::FakeTls {key: [0x45; 32], candidates: Vec::new()},
 			_ => Transport::Fronted(Stream {path: "/assets/app-3.js".into(), candidates: Vec::new()}),
 		}).collect()
 	}
@@ -357,17 +371,29 @@ mod tests {
 	#[test]
 	fn a_lower_class_needs_the_users_yes_for_the_first_attempt_too() {
 		let (listed, network, mut standing) = (transports(&["udp-obfs", "tls", "udp", "fronted"]), Network::default(), Standing::default());
-		assert_eq!(plan(&listed, false, &network, &standing, NOW), Plan {order: vec![1, 3], ask: vec![Class::NoCover, Class::Plain]});
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false), Plan {order: vec![1, 3], ask: vec![Class::NoCover, Class::Plain]});
 		// Agreeing to one class is not agreeing to another, and the provider's order holds once the user agreed.
 		standing.consent.push(Class::NoCover);
-		assert_eq!(plan(&listed, false, &network, &standing, NOW), Plan {order: vec![0, 1, 3], ask: vec![Class::Plain]});
-		assert_eq!(plan(&listed, true, &network, &standing, NOW).order, [1, 3, 0]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false), Plan {order: vec![0, 1, 3], ask: vec![Class::Plain]});
+		assert_eq!(plan(&listed, true, &network, &standing, NOW, false).order, [1, 3, 0]);
 		standing.consent.push(Class::Plain);
-		assert_eq!(plan(&listed, false, &network, &standing, NOW), Plan {order: vec![0, 1, 2, 3], ask: vec![]});
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false), Plan {order: vec![0, 1, 2, 3], ask: vec![]});
 		// A profile whose best class is not cover needs no question for that class.
-		assert_eq!(plan(&transports(&["udp-obfs", "udp"]), false, &network, &Standing::default(), NOW), Plan {order: vec![0], ask: vec![Class::Plain]});
-		assert_eq!(plan(&[], false, &network, &standing, NOW), Plan::default());
+		assert_eq!(plan(&transports(&["udp-obfs", "udp"]), false, &network, &Standing::default(), NOW, false), Plan {order: vec![0], ask: vec![Class::Plain]});
+		assert_eq!(plan(&[], false, &network, &standing, NOW, false), Plan::default());
 		assert!(Class::Cover < Class::NoCover && Class::NoCover < Class::Exposed && Class::Exposed < Class::Plain);
+	}
+
+	#[test]
+	fn a_faketls_transport_is_never_planned_while_alpha_transports_is_off() {
+		let (listed, network) = (transports(&["faketls", "udp-obfs"]), Network::default());
+		// Off: the profile is planned as if it had `udp-obfs` alone, which is then its best class and needs no question.
+		assert_eq!(plan(&listed, false, &network, &Standing::default(), NOW, false), Plan {order: vec![1], ask: vec![]});
+		assert_eq!(plan(&transports(&["faketls"]), false, &network, &Standing::default(), NOW, false), Plan::default());
+		// On: `faketls` is a cover transport and comes first, and `udp-obfs` needs the user's yes.
+		assert_eq!(plan(&listed, false, &network, &Standing::default(), NOW, true), Plan {order: vec![0], ask: vec![Class::NoCover]});
+		assert_eq!((usable(&listed[0], false), usable(&listed[0], true), usable(&listed[1], false)), (false, true, true));
+		assert_eq!(class(&listed[0]), Class::Cover);
 	}
 
 	#[test]
@@ -375,17 +401,17 @@ mod tests {
 		let listed = transports(&["tls", "ws", "udp-obfs", "fronted"]);
 		let (mut network, standing) = (Network {profile: digest(&listed), ..Network::default()}, Standing {profile: digest(&listed), consent: vec![Class::NoCover], ..Standing::default()});
 		network.worked = Some((2, 0, NOW - 100));
-		assert_eq!(plan(&listed, false, &network, &standing, NOW).order, [2, 0, 1, 3]);
-		assert_eq!(plan(&listed, true, &network, &standing, NOW).order, [0, 1, 3, 2]);
-		assert_eq!(plan(&listed, false, &network, &standing, NOW - 100 + WEEK).order, [0, 1, 2, 3]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false).order, [2, 0, 1, 3]);
+		assert_eq!(plan(&listed, true, &network, &standing, NOW, false).order, [0, 1, 3, 2]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW - 100 + WEEK, false).order, [0, 1, 2, 3]);
 		network.worked = Some((3, 1, NOW));
-		assert_eq!(plan(&listed, true, &network, &standing, NOW).order, [3, 0, 1, 2]);
+		assert_eq!(plan(&listed, true, &network, &standing, NOW, false).order, [3, 0, 1, 2]);
 		network.aside = vec![(3, None, NOW + 50), (0, Some(1), NOW + 50)];
-		assert_eq!(plan(&listed, false, &network, &standing, NOW).order, [0, 1, 2]);
-		assert_eq!(plan(&listed, false, &network, &standing, NOW + 50).order, [3, 0, 1, 2]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false).order, [0, 1, 2]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW + 50, false).order, [3, 0, 1, 2]);
 		// Every transport but one set aside, and consent for that one withdrawn: an allowed transport is still given.
 		network.aside = vec![(0, None, NOW + 50), (1, None, NOW + 50), (3, None, NOW + 50)];
-		assert_eq!((plan(&listed, false, &network, &standing, NOW).order, plan(&listed, false, &network, &Standing {consent: Vec::new(), ..standing.clone()}, NOW).order), (vec![2], vec![3, 0, 1]));
+		assert_eq!((plan(&listed, false, &network, &standing, NOW, false).order, plan(&listed, false, &network, &Standing {consent: Vec::new(), ..standing.clone()}, NOW, false).order), (vec![2], vec![3, 0, 1]));
 	}
 
 	#[test]
@@ -470,15 +496,15 @@ mod tests {
 		}
 		fallback(&mut network, profile, &[0, 1], 0, true, 1, 0, ahead, &mut random).unwrap();
 		outcome(&mut network, &mut standing, profile, 1, 3, None, ahead, &mut random).unwrap();
-		assert_eq!(plan(&listed, false, &network, &standing, ahead).order, [1]);
+		assert_eq!(plan(&listed, false, &network, &standing, ahead, false).order, [1]);
 		// The clock is set right: everything is free again, and the candidate remembered from the future is no memory.
-		assert_eq!(plan(&listed, false, &network, &standing, NOW).order, [0, 1]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false).order, [0, 1]);
 		assert!(matches!(candidates(&mut network, profile, 0, 16, &[], false, 7, NOW), Pick::Try(picked) if picked.len() == 2));
 		assert_eq!((network.aside.len(), network.tried.len(), network.worked), (0, 2, None));
 		// The worst a file can hold.
 		let mut network = Network {profile, worked: Some((0, 0, u64::MAX)), aside: vec![(0, Some(0), u64::MAX), (0, None, u64::MAX), (1, None, NOW + HOUR + 1)], tried: vec![(0, 0, u64::MAX); 6], silent: Some((0, u64::MAX))};
 		let mut standing = Standing {profile, refusals: u32::MAX, rows: vec![(0, 0, u32::MAX); 3], losses: u32::MAX, opened: Some(u64::MAX), short: u32::MAX, offset: Some((i64::MIN, u64::MAX)), ..Standing::default()};
-		assert_eq!((plan(&listed, false, &network, &standing, NOW).order, clock(NOW, &standing)), (vec![0, 1], NOW));
+		assert_eq!((plan(&listed, false, &network, &standing, NOW, false).order, clock(NOW, &standing)), (vec![0, 1], NOW));
 		assert!(matches!(candidates(&mut network, profile, 0, 4, &[], false, 7, NOW), Pick::Try(_)));
 		for ended in [REFUSED, LOST, NO_ROUTE, None, Some(Ended::Closed(End::Unanswered))] {outcome(&mut network, &mut standing, profile, 0, 0, ended, NOW, &mut random).unwrap();}
 		assert!(network.aside.iter().all(|(_, _, until)| *until <= NOW + HOUR));
@@ -494,9 +520,9 @@ mod tests {
 		let (mut network, mut standing) = (Network {profile: digest(&before), ..Network::default()}, Standing {profile: digest(&before), consent: vec![Class::NoCover], ..Standing::default()});
 		outcome(&mut network, &mut standing, digest(&before), 1, 0, None, NOW, &mut random).unwrap();
 		outcome(&mut network, &mut standing, digest(&before), 0, 0, NO_ROUTE, NOW, &mut random).unwrap();
-		assert_eq!(plan(&before, false, &network, &standing, NOW + 1).order, [1, 0]);
+		assert_eq!(plan(&before, false, &network, &standing, NOW + 1, false).order, [1, 0]);
 		// In the new list place 1 is `tls`: it is not promoted for what `udp-obfs` did, and its candidate 0 is not marked for what another candidate did. The user's yes to the class holds.
-		assert_eq!(plan(&after, false, &network, &standing, NOW + 1), Plan {order: vec![0, 1, 2], ask: vec![]});
+		assert_eq!(plan(&after, false, &network, &standing, NOW + 1, false), Plan {order: vec![0, 1, 2], ask: vec![]});
 		assert!(matches!(candidates(&mut network, digest(&after), 1, 1, &[], false, 7, NOW + 1), Pick::Try(picked) if picked == [0]));
 		outcome(&mut network, &mut standing, digest(&after), 1, 0, REFUSED, NOW + 1, &mut random).unwrap();
 		assert_eq!((network.worked, network.aside.len(), standing.consent.clone(), standing.profile), (None, 0, vec![Class::NoCover], digest(&after)));
@@ -670,20 +696,20 @@ mod tests {
 		let listed = transports(&["tls", "ws", "fronted"]);
 		let (profile, standing) = (digest(&listed), Standing {profile: digest(&listed), ..Standing::default()});
 		let mut network = Network {profile, ..Network::default()};
-		let order = plan(&listed, false, &network, &standing, NOW).order;
+		let order = plan(&listed, false, &network, &standing, NOW, false).order;
 		let wait = fallback(&mut network, profile, &order, 0, true, 1, 0, NOW, &mut random).unwrap();
 		assert!((2..=10).contains(&wait.as_secs()), "{wait:?}");
-		let order = plan(&listed, false, &network, &standing, NOW).order;
+		let order = plan(&listed, false, &network, &standing, NOW, false).order;
 		assert_eq!(order, [1, 2]);
 		// A transport whose candidates only refused is passed and not marked: "A refusal never sets a transport aside."
 		fallback(&mut network, profile, &order, 1, false, 2, 0, NOW, &mut random).unwrap();
-		assert_eq!(plan(&listed, false, &network, &standing, NOW).order, [1, 2]);
+		assert_eq!(plan(&listed, false, &network, &standing, NOW, false).order, [1, 2]);
 		fallback(&mut network, profile, &order, 1, true, 2, 0, NOW, &mut random).unwrap();
-		let order = plan(&listed, false, &network, &standing, NOW).order;
+		let order = plan(&listed, false, &network, &standing, NOW, false).order;
 		// The third of the round, and the last the client may use: it stays, and the backoff between rounds follows.
 		let wait = fallback(&mut network, profile, &order, 2, true, 3, 1, NOW, &mut random).unwrap();
 		assert!((15..=45).contains(&wait.as_secs()), "{wait:?}");
-		assert_eq!((plan(&listed, false, &network, &standing, NOW).order, plan(&listed, false, &network, &standing, NOW + HOUR).order), (vec![2], vec![0, 1, 2]));
+		assert_eq!((plan(&listed, false, &network, &standing, NOW, false).order, plan(&listed, false, &network, &standing, NOW + HOUR, false).order), (vec![2], vec![0, 1, 2]));
 		assert!((450..=1_350).contains(&round_wait(40, &mut random).unwrap().as_secs()));
 		assert!((1..=5).contains(&connection_wait(&mut random).unwrap().as_secs()));
 	}

@@ -5,7 +5,7 @@ import {asksPrivate, call, type BundleReview, type Offer, type PrivateAsk, type 
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void, onBundle: (review: BundleReview) => void}) {
-	const {t} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
+	const {t, locale} = useD(),[text, setText] = useState(""), [offer, setOffer] = useState<Offer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const bundle = () => run(call("bundle_pick"), found => { if (found) onBundle(found); });
@@ -39,7 +39,7 @@ export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: 
 				{review.endpoint_changed && <Banner tone="warning" title={t("import.review.endpointTitle")}>{t("import.review.endpoint")}</Banner>}
 				{review.replaces && <Banner tone="info" title={t("import.review.replaces")}/>}
 				{review.moving && <Banner tone="warning" title={t("import.review.moveTitle")}>{t(review.moving.check === "plain" ? "import.review.movePlain" : review.moving.check === "pinned" ? "import.review.movePinned" : "import.review.move", {from: review.moving.from ?? "", host: review.moving.host})}</Banner>}
-				<List label={t("import.review.connections")}>{preview.profiles.map(profile => <ListRow key={profile.id} title={profile.name} detail={t("import.review.exits", {count: profile.exits.length})}/>)}</List>
+				<List label={t("import.review.connections")}>{preview.profiles.map(profile => <ListRow key={profile.id} title={profile.name} detail={[t("import.review.exits", {count: profile.exits.length}), profile.left_out ? t("profile.leftOut") : null].filter(Boolean).join(locale === "fa" ? "، " : ", ")}/>)}</List>
 				{review.left_out.length > 0 && <p className="vw-muted vw-small">{t("import.review.leftOut", {count: review.left_out.length})}</p>}
 				{terms && <div className="d-terms"><p>{t("import.review.terms", {provider: preview.provider})}</p><div className="d-actions d-start">{([["terms.terms", preview.terms], ["terms.privacy", preview.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" icon="external" onClick={() => call("open_link", {url}).catch(setError)}>{t(label)}</Button>)}</div></div>}
 				{failure}

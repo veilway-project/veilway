@@ -152,7 +152,7 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 			out.pop()
 		}
 	}));
-	let (to, mut carrier) = match (&dialled.transports[transport], Target::of(&dialled.transports[transport], candidate)) {
+	let (to, mut carrier) = match (&dialled.transports[transport], Target::of(&dialled.transports[transport], candidate, &dialled.link)) {
 		(_, Some(target)) => match Session::open(&dialled.link, target, env, source.clone()) {
 			Ok(session) => (SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), Carrier::Native(session)),
 			// What the client's side refuses before it dials is a fault of the link's entry in the config, which validation does not let through. It is said, and held against the candidate like one that cannot be reached.
@@ -274,11 +274,12 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 		// Sessions in a row that opened and ended before `choice::LIVED`.
 		let (mut rounds, mut quick) = (0u32, 0u32);
 		loop {
-			let (order, mut tried) = (choice::plan(&dialled.transports, false, &network, &standing, now()).order, 0u32);
+			let (order, mut tried) = (choice::plan(&dialled.transports, false, &network, &standing, now(), false).order, 0u32);
 			for transport in order.iter().copied() {
 				let (count, mut passed) = (match &dialled.transports[transport] {
 					Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
 					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
+					Transport::FakeTls {candidates, ..} => candidates.len(),
 				}, Vec::new());
 				tried += 1;
 				let unreachable = loop {

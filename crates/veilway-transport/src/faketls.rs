@@ -9,6 +9,7 @@ use crate::mlkem;
 use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
 use boring::ssl::HandshakeError;
 use ring::signature;
+use std::collections::HashMap;
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,8 +41,12 @@ static REUSED: AtomicU64 = AtomicU64::new(0);
 /// How many hellos were refused because their `X` was one of the last 4,096 sealed: a fault of the random source, and never expected to be above 0.
 pub fn reused() -> u64 {REUSED.load(Ordering::Relaxed)}
 
-/// The one `Client` of a link, shared by every attempt and every connection of it: its memory of sealed key shares is the backstop of "Every seal gets a fresh `x`" only if it outlives the attempt. None for a link without a node transport key.
-pub fn client(link: &Link) -> Option<Arc<Mutex<Client>>> {link.node.map(|node| Arc::new(Mutex::new(Client::new(&node, link.secret.expose(), &link.inbound, &link.device))))}
+/// The `Client`s of a link by the key of their `faketls` transport. Clones share them, so a link that is cloned for every attempt keeps one client for each key.
+#[derive(Clone, Default)]
+pub struct Clients(Arc<Mutex<HashMap<[u8; 32], Arc<Mutex<Client>>>>>);
+
+/// The one `Client` of a link for `node`, the key of one of its `faketls` transports, shared by every attempt and every connection to that key: its memory of sealed key shares is the backstop of "Every seal gets a fresh `x`" only if it outlives the attempt. Each `faketls` transport has its own key, and never the profile's `transport_public_key`.
+pub fn client(link: &Link, node: &[u8; 32]) -> Arc<Mutex<Client>> {link.borrowed.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).entry(*node).or_insert_with(|| Arc::new(Mutex::new(Client::new(node, link.secret.expose(), &link.inbound, &link.device)))).clone()}
 
 /// What BoringSSL wrote: the hello goes nowhere, and the handshake is stopped where it would wait for the server.
 struct Capture(Vec<u8>);

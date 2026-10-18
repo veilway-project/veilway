@@ -86,6 +86,10 @@ pub enum Call {
 	Connect { subscription: String, profile: String, options: Options },
 	/// "Let apps reach devices on this network" for one subscription, saved and used from the next connect. The local network goes through the tunnel unless this is on.
 	SetLan { subscription: String, on: bool },
+	/// Whether the user turned on the transports in alpha (`alpha_transports`). Gives `{"alpha": bool}`.
+	Alpha,
+	/// Turns them on or off, saved and used from the next attempt. The window shows `ALPHA_WARNING` and has the user confirm before it asks for on.
+	SetAlpha { on: bool },
 	/// The answer to the question the helper last pushed.
 	Answer { yes: bool },
 	Disconnect,
@@ -170,7 +174,7 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Alpha, Call::SetAlpha {on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);

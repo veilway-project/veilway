@@ -569,7 +569,7 @@ impl Plan {
 						}
 					})).collect::<Option<Vec<_>>>().ok_or_else(stale)?;
 					inbounds.push(Inbound {tag: name.clone(), private_key: private.expose().0, public_key: identity, native: None, veilway: false, pools: Vec::new(), mtu, transports: Vec::new(), dns: 0, traffic: was_inbound.get(name.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(), tunnel: tunnels.next().ok_or_else(stale)?, link: Some(l)});
-					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}}, transports})))
+					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}, borrowed: Default::default()}, transports})))
 				}
 				_ => return Err(stale()),
 			};

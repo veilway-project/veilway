@@ -516,7 +516,7 @@ impl Core {
 					}
 					self.status.notices = shown;
 				}
-				// Hints are always an empty list in version 1, and what a node names is no candidate that the profile does not have already: nothing is done with them.
+				// Hints are always an empty list in version 1, and what a node names is no candidate that the profile does not have already: nothing is done with them. A hint names the places the document wrote, which `Profile::find` turns into the profile's own.
 				Heard::Hints(_) => {}
 				Heard::Answer(message) => self.answered(c, carrier, message, now),
 			}
