@@ -844,7 +844,7 @@ mod tests {
 	fn a_failure_of_the_disk_is_not_called_a_fingerprint_that_did_not_match() {
 		let dir = scratch("steps");
 		let exe = b"x".to_vec();
-		let archive = archive(&dir, &[("xray", &exe, false)]);
+		let archive = archive(&dir, &[(if cfg!(windows) {"xray.exe"} else {"xray"}, &exe, false)]);
 		let mut wrong = pin(&archive, &exe);
 		wrong.archive = "0".repeat(64).leak();
 		assert_eq!(Step::of_install(&install(&dir.join("addons"), &archive, &wrong).unwrap_err()), Step::Check);
