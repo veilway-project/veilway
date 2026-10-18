@@ -61,6 +61,8 @@ fluke-hpack={package="veilway-hpack", version="0.3.1-veilway.1", path="vendor/fl
 boring-sys="5.3"
 # Wipes the secrets of the `faketls` handshake (the key agreement results, the traffic secrets, the ML-KEM private key) when they are done with. It is a crate the tree already has (argon2, hpke and the RustCrypto crates bring it), so `cargo deny` sees no new package, and it is what those crates wipe their own keys with.
 zeroize="1"
+# P-256 arithmetic for the leaf key of `faketls` in `veilway-proto`, the scalar times the generator and nothing else. Pure Rust (RustCrypto).
+p256={version="0.13", default-features=false, features=["arithmetic"]}
 # Argon2id for the sealed subscription file, as a plain function over bytes the caller drew. Pure Rust, no features beyond heap memory.
 argon2={version="0.5", default-features=false, features=["alloc"]}
 

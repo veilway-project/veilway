@@ -8,7 +8,7 @@
 //!
 //! `Node::open` is steps 1 to 6 of "Verifying". A hello that is not a proof gets `Outcome::Stranger`, and one whose carrier opens but fails a later check gets `Outcome::Refused`: both are answered alike on the wire, and nothing here tells the caller which step failed. `Opened::accept` is steps 7 to 9. `Client::carry` seals the carrier of a hello the caller has built with the X25519 share `X` of a fresh key `x`.
 use crate::{keys::{Borrowed, BinderKey, Device, TagKey, Tags, FAKETLS_AAD}, replay::{Decision, Kind, Replay, Verdict}, NoRandom, Random};
-use boring::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcPoint, PointConversionForm}, nid::Nid};
+use p256::elliptic_curve::{bigint::{Encoding, NonZero, U384}, sec1::ToEncodedPoint, PrimeField};
 use ring::aead;
 use std::collections::VecDeque;
 use subtle::ConstantTimeEq;
@@ -124,18 +124,14 @@ fn pkcs8(scalar: &[u8], public: &[u8]) -> Vec<u8> {[&[0x30, 0x81, 0x87, 0x02, 0x
 
 /// The node's leaf key for `seed` (borrowed-site page, "The throwaway leaf"): `d = (c mod (n - 1)) + 1`, with `c` the seed as a big-endian integer and `n` the group order. Returns the key as PKCS#8 and its public point in the uncompressed form. A seed drawn at random gives a key that matches nothing the client computes.
 pub fn leaf_key(seed: &[u8; 40]) -> Option<(Vec<u8>, Vec<u8>)> {
-	let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).ok()?;
-	let mut ctx = BigNumContext::new().ok()?;
-	let mut modulus = BigNum::from_slice(&ORDER).ok()?;
-	modulus.sub_word(1).ok()?;
-	let mut scalar = BigNum::new().ok()?;
-	let value = BigNum::from_slice(seed).ok()?;
-	scalar.nnmod(&value, &modulus, &mut ctx).ok()?;
-	scalar.add_word(1).ok()?;
-	let mut point = EcPoint::new(&group).ok()?;
-	point.mul_generator(&group, &scalar, &mut ctx).ok()?;
-	let public = point.to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut ctx).ok()?;
-	Some((pkcs8(&scalar.to_vec_padded(32).ok()?, &public), public))
+	let (mut wide, mut order) = ([0u8; 48], [0u8; 48]);
+	wide[8..].copy_from_slice(seed);
+	order[16..].copy_from_slice(&ORDER);
+	let modulus = NonZero::new(U384::from_be_slice(&order).wrapping_sub(&U384::ONE)).into_option()?;
+	let scalar: [u8; 32] = U384::from_be_slice(&wide).rem(&modulus).wrapping_add(&U384::ONE).to_be_bytes()[16..].try_into().ok()?;
+	let secret = p256::Scalar::from_repr(scalar.into()).into_option()?;
+	let public = (p256::ProjectivePoint::GENERATOR * secret).to_affine().to_encoded_point(false).as_bytes().to_vec();
+	Some((pkcs8(&scalar, &public), public))
 }
 
 /// What the node makes of a complete ClientHello.

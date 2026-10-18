@@ -377,3 +377,26 @@ async fn a_clock_the_device_got_wrong_is_put_right_by_the_offset_the_environment
 	session.close().await;
 	assert!(server.await.unwrap().finished);
 }
+
+// The leaf key of `veilway-proto` is pure Rust; BoringSSL, which this crate builds anyway, computes the same `d = (c mod (n - 1)) + 1` and its public point.
+#[test]
+fn the_leaf_key_matches_what_boringssl_computes() {
+	use boring::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcPoint, PointConversionForm}, nid::Nid};
+	let order = BigNum::from_hex_str("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551").unwrap();
+	for fill in [0u8, 1, 0x7f, 0xff] {
+		let mut seed = [fill; 40];
+		seed[0] ^= 0x5a;
+		seed[39] = 7;
+		let (group, mut ctx) = (EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap(), BigNumContext::new().unwrap());
+		let (mut modulus, mut scalar) = (BigNum::new().unwrap(), BigNum::new().unwrap());
+		modulus.checked_sub(&order, &BigNum::from_u32(1).unwrap()).unwrap();
+		scalar.nnmod(&BigNum::from_slice(&seed).unwrap(), &modulus, &mut ctx).unwrap();
+		scalar.add_word(1).unwrap();
+		let mut point = EcPoint::new(&group).unwrap();
+		point.mul_generator(&group, &scalar, &mut ctx).unwrap();
+		let (pkcs8, public) = leaf_key(&seed).unwrap();
+		assert_eq!(public, point.to_bytes(&group, PointConversionForm::UNCOMPRESSED, &mut ctx).unwrap());
+		assert_eq!(&pkcs8[36..68], &scalar.to_vec_padded(32).unwrap()[..]);
+	}
+	assert!(leaf_key(&[0xff; 40]).is_some());
+}
