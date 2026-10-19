@@ -816,7 +816,8 @@ panel_config() {
 	"node_socket": "/run/veilway/control.sock",
 	"trusted_proxies": ["127.0.0.1", "::1"],
 	"allowed_hosts": [],
-	"secure_cookies": true
+	"secure_cookies": true,
+	"two_step": "on"
 }
 EOF
 	chown root:veilway-panel "$f"
