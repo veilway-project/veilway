@@ -374,6 +374,8 @@ The installer's `--domain` setup can route a node's `ws`, `fronted` or `fronted-
 
 The panel fetches a `tls` transport's certificate pin from the node (the node's status already reports it) and puts it in the profile, so a `tls` profile works without the operator adding the pin by hand. `crates/veilway-core/tests/ws.rs` (`whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_gives`) and its `tls` twin fail now and then under CI load: make them wait on a condition instead of a fixed time.
 
+Outbound chaining: an outbound and a node link get one optional `via` naming another outbound, so a `socks5` outbound can dial through another (any length) and a link can reach the other node through a proxy when the direct path is blocked. A loop or a missing name is a config error. TCP transports of a link go through any `socks5` outbound; UDP ones need the proxy's UDP ASSOCIATE and are refused with a clear error otherwise. Spec page first, then code, tests and the panel's forms.
+
 Split tunneling in the apps, chosen per subscription and kept on the device: by app (Android through `VpnService` allowed and disallowed apps; Linux by putting the chosen programs in a cgroup that the policy routing and the kill switch know; Windows by WFP filters on the program's path; macOS by address and name only, since per-app needs a NetworkExtension) and by address or name on every platform (routes plus the node-side DNS memory). Two modes: everything through the tunnel except the chosen ones, or only the chosen ones. The kill switch keeps blocking whatever is meant for the tunnel while it is down, and a provider can forbid the second mode in the signed profile.
 
 ## Shapes of `fronted` (after the alpha)
