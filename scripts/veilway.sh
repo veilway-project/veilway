@@ -832,7 +832,8 @@ panel_summary() {
 	fi
 	if [ "$DRY" != 1 ] && has_systemd; then
 		for i in 1 2 3 4 5 6 7 8 9 10; do
-			token="$(journalctl -u veilway-panel --no-pager -o cat 2>/dev/null | sed -n 's/^Setup token (one time): //p' | tail -n 1 || true)"
+			# Only this run of the panel: a token printed by an earlier run, or an earlier install, is no longer valid.
+			token="$(journalctl -u veilway-panel _SYSTEMD_INVOCATION_ID="$(systemctl show -p InvocationID --value veilway-panel 2>/dev/null)" --no-pager -o cat 2>/dev/null | sed -n 's/^Setup token (one time): //p' | tail -n 1 || true)"
 			[ -n "$token" ] && break
 			sleep 1
 		done
