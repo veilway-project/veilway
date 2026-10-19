@@ -745,6 +745,23 @@
         "transport_secret": {
           "$ref": "#/$defs/TransportSecret",
           "description": "The secret the two nodes agreed on when they were paired. It never travels."
+        },
+        "via": {
+          "description": "On the node that dials: the tag of a `socks5` outbound whose chain the TCP transports of the link go through. `udp` and `udp-obfs` are not usable through it.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
         }
       },
       "required": [
@@ -1093,6 +1110,23 @@
               "description": "A secret. No diagnostic, log line or `Debug` output shows it.",
               "maxLength": 255,
               "minLength": 1,
+              "type": "string"
+            },
+            "via": {
+              "description": "The tag of another `socks5` outbound. The connection to `server` goes through that outbound first, and a chain of them may be up to 8 long. SOCKS5 is plain text: each proxy of the chain sees the user name and password of the proxies after it, the CONNECT targets and the bytes of the flows. A link's payload stays protected by its TLS end to end.",
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
               "type": "string"
             }
           },

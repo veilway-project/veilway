@@ -530,6 +530,54 @@ async fn tcp_reaches_the_responder_through_the_socks5(){
 	assert_eq!(seen.lock().unwrap().as_slice(), ["93.184.216.34:80"], "socks5 did not observe the CONNECT");
 }
 
+/// The outbound of the exit is a chain: `second` goes through `first`. `first` is asked for `second`'s address and relays what follows raw, so the greeting and the CONNECT of `second` come over its stream, as on a real chain.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn tcp_through_a_chain_of_two_socks5_proxies_goes_through_both_in_order(){
+	let (backend, hits)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (second, second_seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let (first, first_seen)=socks5_proxy(dns_responder().await, second, echo, false).await;
+	let mut setup=setup(first);
+	setup.doc["outbounds"]=json!([{"tag":"first", "type":"socks5", "server":first.to_string()}, {"tag":"second", "type":"socks5", "server":second.to_string(), "via":"first"}]);
+	setup.doc["exits"][0]["backend"]["outbound"]=json!("second");
+	let node=launch(setup).await;
+	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
+	handshake(&mut client, [93, 184, 216, 34], 40001, 80).await;
+	let mut got=Vec::new();
+	while got.len()<GREETING.len(){
+		let Some(packet)=client.recv_ip(Duration::from_secs(5)).await else{break};
+		if let Some((_, payload))=parse_tcp(&packet){got.extend_from_slice(&payload)}
+	}
+	assert_eq!(got, GREETING, "peer did not receive the upstream bytes");
+	assert_eq!(hits.load(Ordering::SeqCst), 1);
+	assert_eq!(first_seen.lock().unwrap().as_slice(), [format!("127.0.0.1:{}", second.port())], "the first proxy did not see the hop to the second");
+	assert_eq!(second_seen.lock().unwrap().as_slice(), ["93.184.216.34:80"], "the second proxy did not see the CONNECT of the flow");
+}
+
+/// A chain carries no UDP ASSOCIATE: a port 53 query falls back to TCP through both proxies, and other UDP is refused by the exit's policy without an association at either proxy.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn udp_through_a_chain_of_socks5_proxies_is_never_associated(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (second, second_seen)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let (first, first_seen)=socks5_proxy(dns_responder().await, second, echo, false).await;
+	let mut setup=setup(first);
+	setup.doc["outbounds"]=json!([{"tag":"first", "type":"socks5", "server":first.to_string()}, {"tag":"second", "type":"socks5", "server":second.to_string(), "via":"first"}]);
+	setup.doc["exits"][0]["backend"]["outbound"]=json!("second");
+	let node=launch(setup).await;
+	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
+	client.send_ip(&ip_udp(PEER_A, [9, 9, 9, 9], 40022, 53, b"\x12\x34\x01\x00fake-query")).await;
+	let reply=client.recv_ip(Duration::from_secs(5)).await.expect("no dns reply through the chain");
+	let PayloadSlice::Udp(payload)=PacketHeaders::from_ip_slice(&reply).unwrap().payload else{panic!("not udp")};
+	assert_eq!(payload, DNS_ANSWER);
+	client.send_ip(&ip_udp(PEER_A, [198, 51, 100, 7], 40023, 4000, b"not-dns")).await;
+	assert!(client.recv_ip(Duration::from_secs(1)).await.is_none_or(|packet| packet[9] == 1), "udp outside dns got an answer through a chain");
+	let first_seen=first_seen.lock().unwrap().clone();
+	let second_seen=second_seen.lock().unwrap().clone();
+	assert!(first_seen.iter().chain(&second_seen).all(|target| !target.starts_with("associate")), "a chain was asked for an association: {first_seen:?} {second_seen:?}");
+	assert_eq!(second_seen, ["9.9.9.9:53"], "the dns query did not leave the chain as a tcp connect");
+}
+
 /// A stranger flooding replayed handshake initiations must not steal peer A's endpoint. Past the rate limit
 /// those forgeries draw a cookie reply, and the cookie path is the one that used to move the endpoint.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
@@ -769,7 +817,7 @@ async fn an_idle_tcp_flow_lives_exactly_as_long_as_tcp_idle_secs(){
 
 #[test]
 fn egress_never_dials_directly(){
-	let (mut dirs, mut decoy_dials, mut site_dials, mut origins_built)=(vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")], 0, 0, 0);
+	let (mut dirs, mut proxy_dials, mut decoy_dials, mut site_dials, mut origins_built)=(vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")], 0, 0, 0, 0);
 	while let Some(dir)=dirs.pop(){
 		for entry in std::fs::read_dir(&dir).unwrap(){
 			let path=entry.unwrap().path();
@@ -780,14 +828,16 @@ fn egress_never_dials_directly(){
 			// A file's own unit tests dial their in-test servers; only the code above them runs on a node.
 			let whole=std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
 			let text=whole.split("#[cfg(test)]\nmod tests").next().unwrap_or_default();
-			// The only TcpStream dial allowed for a user's traffic is the control connection to the proxy itself, and the only other
+			// The only TcpStream dial allowed for a user's traffic is the control connection to the proxy itself (the first proxy of a chain, which is the one the node dials, in `associate` and in `dial`), and the only other
 			// sockets that reach out belong to the `direct` outbound, which lives in one file.
 			// The stream listener dials one more place, and no user's traffic goes there: the decoy origin of its config, which is the operator's own web server and the one address a stranger's bytes are handed to.
 			// So does the `faketls` listener: the site of its config, which is the one address a stranger's bytes are handed to, and the one place the early connection of every accepted connection goes.
 			for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
+				let proxy=path.ends_with("engine/flows.rs")&&(line.trim()=="let mut control = TcpStream::connect((up.host.as_str(), up.port)).await?;"||line.trim()=="let mut control = TcpStream::connect((hops[0].host.as_str(), hops[0].port)).await?;");
 				let decoy=path.ends_with("engine/stream.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(to))");
 				let site=path.ends_with("engine/faketls.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(site))");
-				assert!(line.contains("up.addr")|| decoy|| site, "{} dials {} without the proxy", path.display(), line.trim());
+				assert!(proxy|| decoy|| site, "{} dials {} without the proxy", path.display(), line.trim());
+				proxy_dials+=proxy as usize;
 				decoy_dials+=decoy as usize;
 				site_dials+=site as usize;
 			}
@@ -801,7 +851,7 @@ fn egress_never_dials_directly(){
 			}
 		}
 	}
-	assert_eq!((decoy_dials, site_dials, origins_built), (1, 1, 1));
+	assert_eq!((proxy_dials, decoy_dials, site_dials, origins_built), (2, 1, 1, 1));
 }
 
 async fn close_reaches_upstream(server_closes:bool, sport:u16)->bool{

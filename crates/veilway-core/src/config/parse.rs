@@ -336,7 +336,7 @@ impl Config {
 				for key in ["username", "password"] {
 					if !marked(outbound, key) {continue}
 					let kept = tag.as_ref().zip(server.as_ref()).and_then(|(tag, server)| running.outbounds.iter().find_map(|was| match was {
-						Outbound::Socks5 {tag: of, server: at, username, password} if of == tag && at == server => if key == "username" {username.as_ref()} else {password.as_ref()},
+						Outbound::Socks5 {tag: of, server: at, username, password, ..} if of == tag && at == server => if key == "username" {username.as_ref()} else {password.as_ref()},
 						_ => None,
 					}));
 					match kept {

@@ -1,6 +1,7 @@
 //! Node links at run time (node links page, "Lifetime"): what the node knows of each link, the state it reports, and the task that dials a link this node dials.
 //! On the wire a link is nothing new: "one device session on a native transport, with WireGuard inside". The node that is dialled has the link as a peer of a `veilway` inbound, and everything the listeners do for a device they do for it. The node that dials has a tunnel for the link alone, whose one peer is the other node, and reaches it with the client's side of the transports (`veilway-transport`), by the client's rules for candidates, refusals and waits (`choice`), with no user to ask: "the listener's operator decided which transports the offer lists, and the dialler's operator accepted them at pairing".
 //! What a link carries is not here: `chain` is the entry half, and the exit half is the path every decrypted packet takes, with the link's own limits.
+use super::flows::{self, Stop};
 use super::inbound::{Tunnel, Via};
 use super::plan::{Dialled, Plan};
 use super::{Shared, Traffic};
@@ -14,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use veilway_proto::subscription::payload::Transport;
 use veilway_transport::choice::{self, Class, Network, Next, Pick, Standing};
-use veilway_transport::{End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
+use veilway_transport::{connector, End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
 use veilway_wg::MAX_PACKET;
 
 /// "Up: a WireGuard handshake completed within the last 180 s."
@@ -69,10 +70,12 @@ pub struct State {
 	attempt: Mutex<(Option<Status>, Option<(usize, usize)>)>,
 	/// When the system last refused an outer packet of the link for its size.
 	warned: Mutex<Option<Instant>>,
+	/// The cause a proxy chain last gave for not carrying the link, None while it carries it. Each change is logged once.
+	chain: Mutex<Option<String>>,
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default()}}
 }
 
 impl State {
@@ -93,6 +96,17 @@ impl State {
 	}
 
 	fn tried(&self, failed: Option<Status>, at: Option<(usize, usize)>) {*self.attempt.lock().unwrap_or_else(|e| e.into_inner()) = (failed, at)}
+
+	/// What the chain of the link did on its last dial: `None` when it carried the connection, else the cause. Logged at info when it changes.
+	fn carried(&self, tag: &str, cause: Option<String>) {
+		let mut last = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+		if *last == cause {return}
+		match &cause {
+			Some(cause) => tracing::info!("link {tag}: the chain does not carry the link: {cause}"),
+			None => tracing::info!("link {tag}: the chain carries the link again"),
+		}
+		*last = cause;
+	}
 }
 
 impl Shared {
@@ -136,8 +150,22 @@ enum Carrier {Native(Session), Plain(UdpSocket)}
 
 /// One session to one candidate, from the dial to its end. `opened` is told once, when the session is one: a chunk of the node opened on a native transport, and a datagram of the other node authenticated on plain `udp`.
 #[allow(clippy::too_many_arguments)]
-async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &State, queue: &mut mpsc::Receiver<Vec<u8>>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
+async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &Arc<State>, queue: &mut mpsc::Receiver<Vec<u8>>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
 	let (key, mut made) = (dialled.link.inbound, Vec::new());
+	// "Through an outbound": the stream TCP transports dial over is the proxy chain's. The chain's failure is what the transport is told, by where it stopped and whether it timed out there.
+	let connect = dialled.via.clone().map(|via| connector({let (state, tag) = (state.clone(), tag.to_string()); move |to, deadline| {let (via, state, tag) = (via.clone(), state.clone(), tag.clone()); async move {
+		match flows::dial_until(&via, to, deadline).await {
+			Ok(stream) => {state.carried(&tag, None); Ok(stream)}
+			Err(failure) => {
+				state.carried(&tag, Some(failure.describe()));
+				Err(match (&failure.stop, failure.timeout) {
+					(Stop::First(_), _) | (Stop::Hop(_), true) => End::Offline.into(),
+					(Stop::Hop(_), false) | (Stop::Target, false) => Ended::Unreachable(Unreachable::Connect),
+					(Stop::Target, true) => Ended::Unreachable(Unreachable::Timeout),
+				})
+			}
+		}
+	}}}));
 	let source: Source = Arc::new(Mutex::new({
 		let tunnel = tunnel.clone();
 		// "A keepalive of a tunnel that is already up, or else a fresh handshake initiation."
@@ -152,7 +180,7 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 			out.pop()
 		}
 	}));
-	let (to, mut carrier) = match (&dialled.transports[transport], Target::of(&dialled.transports[transport], candidate, &dialled.link)) {
+	let (to, mut carrier) = match (&dialled.transports[transport], Target::of(&dialled.transports[transport], candidate, &dialled.link).map(|target| target.via(connect.clone()))) {
 		(_, Some(target)) => match Session::open(&dialled.link, target, env, source.clone()) {
 			Ok(session) => (SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), Carrier::Native(session)),
 			// What the client's side refuses before it dials is a fault of the link's entry in the config, which validation does not let through. It is said, and held against the candidate like one that cannot be reached.
@@ -266,6 +294,8 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 		let _dialling = dialling;
 		// There is no user to ask, so every class of transport the other node listed is agreed to.
 		let (mut network, mut standing, profile) = (Network::default(), Standing {consent: vec![Class::Cover, Class::NoCover, Class::Exposed, Class::Plain], ..Standing::default()}, choice::digest(&dialled.transports));
+		let udp = dialled.transports.iter().filter(|transport| matches!(transport, Transport::Udp(_) | Transport::UdpObfs(_))).count();
+		if dialled.via.is_some() && udp > 0 {tracing::info!("link {tag}: {udp} udp transport(s) of the other node are not usable through via, and are skipped")}
 		let (mut seed, offset, key, clock) = ([0u8; 8], Arc::new(AtomicI64::new(0)), dialled.link.inbound, shared.now);
 		let _ = random(&mut seed);
 		let now = move || clock().unix_timestamp().max(0) as u64;
@@ -274,7 +304,8 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 		// Sessions in a row that opened and ended before `choice::LIVED`.
 		let (mut rounds, mut quick) = (0u32, 0u32);
 		loop {
-			let (order, mut tried) = (choice::plan(&dialled.transports, false, &network, &standing, now(), false).order, 0u32);
+			let (mut order, mut tried) = (choice::plan(&dialled.transports, false, &network, &standing, now(), false).order, 0u32);
+			order.retain(|transport| dialled.via.is_none() || !matches!(dialled.transports[*transport], Transport::Udp(_) | Transport::UdpObfs(_)));
 			for transport in order.iter().copied() {
 				let (count, mut passed) = (match &dialled.transports[transport] {
 					Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),

@@ -30,6 +30,8 @@ pub const MAX_INBOUNDS: usize = 64;
 pub const MAX_XRAY_INBOUNDS: usize = 16;
 pub const MAX_TRANSPORTS: usize = 8;
 pub const MAX_OUTBOUNDS: usize = 256;
+/// The most `socks5` outbounds one `via` chain may hold, counting the outbound that starts it.
+pub const MAX_CHAIN: usize = 8;
 pub const MAX_EXITS: usize = 256;
 pub const MAX_GROUPS: usize = 256;
 pub const MAX_RULES: usize = 4096;

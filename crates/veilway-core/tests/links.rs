@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
+use veilway_core::config::Config;
 use veilway_core::engine::link::Status;
 use veilway_core::{Engine, Options, Reason};
 use veilway_proto::subscription::payload::Padding;
@@ -284,17 +285,20 @@ impl Peer {
 /// A link up between two engines, and a user on the entry.
 struct Linked {entry: Engine, exit: Engine, user: Peer, pair: Pair, _site: Site}
 
-async fn linked(test: &'static str, forward: bool, over: Over, time: Time) -> Linked {
+/// `edit` changes the entry's document before it starts, for a test that puts a proxy chain in front of the link.
+async fn linked(test: &'static str, forward: bool, over: Over, edit: impl FnOnce(&mut Value), time: Time) -> Linked {
 	let (dir, site) = (scratch(test), site().await);
 	let (pin, roots) = certify(&dir.join(if forward {"exit"} else {"entry"}));
 	let (home, pair) = (listen(), Pair {forward, over, at: SocketAddr::new(outward(), port()), pin, origin: site.addr});
 	// The node that is dialled starts first, so the first dial finds it.
 	let exit_doc = pair.exit(socks().await);
+	let mut entry_doc = pair.entry(home);
+	edit(&mut entry_doc);
 	let (entry, exit) = if forward {
 		let exit = run(&exit_doc, &dir.join("exit"), time, &roots).await;
-		(run(&pair.entry(home), &dir.join("entry"), time, &roots).await, exit)
+		(run(&entry_doc, &dir.join("entry"), time, &roots).await, exit)
 	} else {
-		let entry = run(&pair.entry(home), &dir.join("entry"), time, &roots).await;
+		let entry = run(&entry_doc, &dir.join("entry"), time, &roots).await;
 		(entry, run(&exit_doc, &dir.join("exit"), time, &roots).await)
 	};
 	for (node, name) in [(&entry, "entry"), (&exit, "exit")] {
@@ -332,7 +336,7 @@ async fn carries(mut net: Linked, base: u16) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forward_link_over_udp_obfs_carries_a_users_traffic_out_of_the_exit() {
 	let time = time!();
-	let net = linked("links-forward-obfs", true, Over::Obfs, time).await;
+	let net = linked("links-forward-obfs", true, Over::Obfs, |_| {}, time).await;
 	let (entry, exit) = (&net.entry.links()[0], &net.exit.links()[0]);
 	assert_eq!((entry.entry, entry.listener, exit.entry, exit.listener, entry.transport.map(|(name, ..)| name), exit.transport, entry.exit.as_deref()), (true, false, false, true, Some("udp-obfs"), None, Some("far")));
 	carries(net, 40000).await;
@@ -341,15 +345,82 @@ async fn a_forward_link_over_udp_obfs_carries_a_users_traffic_out_of_the_exit() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forward_link_over_tls_carries_a_users_traffic_out_of_the_exit() {
 	let time = time!();
-	let net = linked("links-forward-tls", true, Over::Tls, time).await;
+	let net = linked("links-forward-tls", true, Over::Tls, |_| {}, time).await;
 	assert_eq!(net.entry.links()[0].transport.map(|(name, ..)| name), Some("tls"));
 	carries(net, 41000).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forward_link_over_tls_through_a_socks5_outbound_comes_up_and_carries_a_users_traffic() {
+	let time = time!();
+	let (hop, asked) = forwarder(None).await;
+	let net = linked("links-via-tls", true, Over::Tls, |doc| {doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "hop", "type": "socks5", "server": hop.to_string()})); doc["links"][0]["via"] = json!("hop")}, time).await;
+	assert_eq!(net.entry.links()[0].transport.map(|(name, ..)| name), Some("tls"));
+	let exit = net.pair.at.to_string();
+	assert!(asked.lock().unwrap().contains(&exit), "the proxy was not asked for the exit at {exit}: {:?}", asked.lock().unwrap());
+	carries(net, 42000).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_whose_chain_refuses_one_candidate_moves_on_to_the_next() {
+	let time = time!();
+	let (hop, asked) = forwarder(None).await;
+	let refused = SocketAddr::new(outward(), port());
+	let net = linked("links-via-refused", true, Over::Tls, |doc| {
+		doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "hop", "type": "socks5", "server": hop.to_string()}));
+		doc["links"][0]["via"] = json!("hop");
+		let real = doc["links"][0]["peer"]["transports"][0]["candidates"][0].clone();
+		let mut first = real.clone();
+		first["address"] = json!(refused.to_string());
+		doc["links"][0]["peer"]["transports"][0]["candidates"] = json!([first, real]);
+	}, time).await;
+	assert_eq!(net.entry.links()[0].transport.map(|(name, ..)| name), Some("tls"));
+	let exit = net.pair.at.to_string();
+	assert!(asked.lock().unwrap().contains(&exit), "the chain was never asked for the exit at {exit}: {:?}", asked.lock().unwrap());
+	carries(net, 42100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_that_changes_the_via_of_a_link_dials_through_the_new_chain() {
+	let time = time!();
+	let (first, first_asked) = forwarder(None).await;
+	let (second, second_asked) = forwarder(None).await;
+	let net = linked("links-via-reload", true, Over::Tls, |doc| {
+		doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "first", "type": "socks5", "server": first.to_string()}));
+		doc["links"][0]["via"] = json!("first");
+	}, time).await;
+	let exit = net.pair.at.to_string();
+	assert!(first_asked.lock().unwrap().contains(&exit), "the first chain was not used at all");
+	let home = net.entry.snapshot().config.inbounds[0].transports[0].listen();
+	let mut doc = net.pair.entry(home);
+	doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "first", "type": "socks5", "server": first.to_string()}));
+	doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "second", "type": "socks5", "server": second.to_string()}));
+	doc["links"][0]["via"] = json!("second");
+	net.entry.reload(doc.to_string().into_bytes(), None).await.unwrap();
+	let deadline = Instant::now() + Duration::from_secs(20);
+	while !second_asked.lock().unwrap().contains(&exit) {
+		assert!(Instant::now() < deadline, "the link did not dial through the new chain within 20 s: {:?}", second_asked.lock().unwrap());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	net.entry.shutdown().await;
+	net.exit.shutdown().await;
+}
+
+/// A link over `udp-obfs` alone cannot go through a proxy chain, and the config check says so instead of letting the link wait for nothing.
+#[test]
+fn a_udp_only_link_with_via_is_reported_by_the_config_check() {
+	let mut entry = Pair {forward: true, over: Over::Obfs, at: SocketAddr::new(outward(), port()), pin: [0; 32], origin: "127.0.0.1:9".parse().unwrap()}.entry(listen());
+	entry["outbounds"].as_array_mut().unwrap().push(json!({"tag": "hop", "type": "socks5", "server": "127.0.0.1:1080"}));
+	entry["links"][0]["via"] = json!("hop");
+	let report = Config::parse(entry.to_string().as_bytes()).unwrap().validate(false);
+	assert!(report.errors.iter().any(|error| error.path == "links[0].via" && error.message.contains("tls or ws")), "{:#?}", report.errors);
+	assert!(report.warnings.iter().any(|warning| warning.path == "links[0].peer.transports[0]" && warning.message.contains("not usable through via")), "{:#?}", report.warnings);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reverse_link_over_udp_obfs_carries_a_users_traffic_out_of_the_exit() {
 	let time = time!();
-	let net = linked("links-reverse-obfs", false, Over::Obfs, time).await;
+	let net = linked("links-reverse-obfs", false, Over::Obfs, |_| {}, time).await;
 	let (entry, exit) = (&net.entry.links()[0], &net.exit.links()[0]);
 	assert_eq!((entry.entry, entry.listener, exit.entry, exit.listener, exit.transport.map(|(name, ..)| name)), (true, true, false, false, Some("udp-obfs")));
 	carries(net, 42000).await;
@@ -358,7 +429,7 @@ async fn a_reverse_link_over_udp_obfs_carries_a_users_traffic_out_of_the_exit() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_reverse_link_over_tls_carries_a_users_traffic_out_of_the_exit() {
 	let time = time!();
-	let net = linked("links-reverse-tls", false, Over::Tls, time).await;
+	let net = linked("links-reverse-tls", false, Over::Tls, |_| {}, time).await;
 	carries(net, 43000).await;
 }
 
@@ -561,7 +632,7 @@ async fn a_link_that_is_down_answers_unreachable_and_comes_back_by_itself() {
 async fn a_reload_that_removes_the_link_cuts_it_within_a_second() {
 	let time = time!();
 	for (forward, remover, test) in [(true, "exit", "links-removed-1"), (true, "entry", "links-removed-2"), (false, "exit", "links-removed-3"), (false, "entry", "links-removed-4")] {
-		let mut net = linked(test, forward, Over::Obfs, time).await;
+		let mut net = linked(test, forward, Over::Obfs, |_| {}, time).await;
 		assert_eq!(net.user.leaves(PUBLIC, 47000).await.as_deref(), Some("main"));
 		let (node, home) = (if remover == "exit" {&net.exit} else {&net.entry}, net.entry.snapshot().config.inbounds[0].transports[0].listen());
 		let mut doc = if remover == "exit" {net.pair.exit(socks().await)} else {net.pair.entry(home)};

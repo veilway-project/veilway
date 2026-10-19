@@ -40,7 +40,7 @@ fn table() -> Table<Device<u32>> {
 	table
 }
 
-fn front(address: std::net::SocketAddr) -> Front {Front {address, sni: Some(SITE.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}}
+fn front(address: std::net::SocketAddr) -> Front {Front {address, sni: Some(SITE.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default(), connect: None}}
 
 fn env() -> Env {Env {device: Arc::new(|| NOW), now: Arc::new(|| NOW), roots: Arc::new(RootCertStore::empty()), socket: None}}
 

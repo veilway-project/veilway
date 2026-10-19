@@ -96,7 +96,7 @@ pub struct Host {
 	/// The tunnel of each node link this node dials, by the tag of its place among the inbounds of a plan, with what it was made for: the link's key, the other node's key and the MTU. A link that keeps all three keeps its tunnel and its sessions.
 	shapes: HashMap<String, ([u8; 32], [u8; 32], u16)>,
 	/// The task that dials each link, by the link's tag, with what it dials: the tunnel, the link's id and keys and secret, its MTU and the other node's transports. Anything else is a new task.
-	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64))>,
+	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64, Option<Arc<plan::Upstream>>))>,
 	/// The tunnels of the config in force that are enabled, by tag.
 	forwards: HashMap<String, Forward>,
 }
@@ -387,7 +387,7 @@ impl Host {
 		let mut diallers = std::mem::take(&mut self.diallers);
 		for link in plan.links.iter().filter(|link| link.denied.is_none()) {
 			let (Some(dialled), tunnel) = (&link.dialled, &plan.inbounds[link.inbound].tunnel) else {continue};
-			let shape = (link.id, link.key, link.identity, link.secret, link.mtu, veilway_transport::choice::digest(&dialled.transports));
+			let shape = (link.id, link.key, link.identity, link.secret, link.mtu, veilway_transport::choice::digest(&dialled.transports), dialled.via.clone());
 			let kept = diallers.remove(&link.tag).filter(|(_, _, was, of)| Arc::ptr_eq(was, tunnel) && *of == shape);
 			let running = kept.unwrap_or_else(|| {
 				tracing::info!("link {}: dialling the other node, over {} transport(s) in its order", link.tag, dialled.transports.len());

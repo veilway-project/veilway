@@ -152,7 +152,7 @@ fn source() -> Source {
 	})))
 }
 
-fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false, self_signed: false, http2: Default::default()}}
+fn front(address: SocketAddr, sni: &str, pins: &[[u8; 32]]) -> Front {Front {address, sni: Some(sni.into()), host: "node.test".into(), verify_name: None, pins: pins.to_vec(), ech: false, self_signed: false, http2: Default::default(), connect: None}}
 
 fn ws(candidate: Front) -> Target {Target::Ws {path: PATH.into(), candidate}}
 

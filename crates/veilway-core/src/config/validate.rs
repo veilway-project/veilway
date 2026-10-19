@@ -316,6 +316,23 @@ impl Config {
 				_ => {}
 			}
 		}
+		// Outbound chaining, "Outbounds": the named outbound must be a socks5 one, following `via` from any outbound must not come back to it, and a chain holds at most `MAX_CHAIN` of them.
+		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..})), _ => None};
+		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
+			let Outbound::Socks5 {via: Some(via), ..} = outbound else {continue};
+			match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
+				None => r.error(format!("outbounds[{i}].via"), "expected the tag of an outbound, found a tag no outbound has"),
+				Some(Outbound::Direct {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
+				Some(Outbound::Socks5 {..}) => {}
+			}
+			let (mut at, mut chain) = (i, vec![i]);
+			while let Some(to) = via_of(at) {
+				if chain.contains(&to) {r.error(format!("outbounds[{i}].via"), "expected no loop: following via from this outbound comes back to one it passes through"); break}
+				chain.push(to);
+				if chain.len() > MAX_CHAIN {r.error(format!("outbounds[{i}].via"), format!("expected a chain of at most {MAX_CHAIN} socks5 outbounds")); break}
+				at = to;
+			}
+		}
 		if self.exits.len() > MAX_EXITS {r.error("exits", format!("expected at most {MAX_EXITS} exits"))}
 		let exit_tags = tags(&mut r, "exits", self.exits.iter().map(|exit| exit.tag.as_str()));
 		let mut interfaces: HashMap<&str, usize> = HashMap::new();
@@ -336,6 +353,8 @@ impl Config {
 				Backend::Netstack(netstack) => {
 					let outbound = outbound_tags.get(netstack.outbound.as_str()).map(|o| &self.outbounds[*o]);
 					let direct = matches!(outbound, Some(Outbound::Direct {..}));
+					// A chain carries no UDP, and `direct` would send that UDP from this node's own address around the chain.
+					if matches!(outbound, Some(Outbound::Socks5 {via: Some(_), ..})) && netstack.unsupported.udp == Some(Policy::Direct) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject, drop or a via to another exit: this outbound is a chain of proxies, which carry no UDP, and direct would send that UDP from this node's own address, around the chain")}
 					if outbound.is_none() {r.error(format!("{at}.backend.outbound"), "expected the tag of an outbound, found a tag no outbound has")}
 					if direct && netstack.proxy_only == Some(true) {r.error(format!("{at}.backend.proxy_only"), "expected false or no key: a direct outbound has no proxy")}
 					if netstack.tcp_idle_secs.is_some_and(|secs| !(MIN_TCP_IDLE_SECS..=MAX_TCP_IDLE_SECS).contains(&secs)) {r.error(format!("{at}.backend.tcp_idle_secs"), format!("expected an integer from {MIN_TCP_IDLE_SECS} to {MAX_TCP_IDLE_SECS}"))}
@@ -505,6 +524,14 @@ impl Config {
 			if dialled == dials {r.error(format!("links[{i}]"), "expected either `inbound` with `public_key`, on the node the link connects to, or `peer` with `private_key`, on the node that dials")}
 			if dialled != link.public_key.is_some() {r.error(at("public_key"), "expected `inbound` and `public_key` together, or neither")}
 			if dials != link.private_key.is_some() {r.error(at("private_key"), "expected `peer` and `private_key` together, or neither")}
+			if let Some(via) = &link.via {
+				if !dials {r.error(at("via"), "expected no via on a link this node is dialled for: the node only listens on it")}
+				match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
+					None => r.error(at("via"), "expected the tag of an outbound, found a tag no outbound has"),
+					Some(Outbound::Direct {..}) => r.error(at("via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
+					Some(Outbound::Socks5 {..}) => {}
+				}
+			}
 			if !link_ids.insert(link.id.0) {r.error(at("id"), "expected an id no other link has")}
 			// "Validation refuses a link whose key is also a device's." A link is known on both nodes by the WireGuard public key the dialling node made for it, so no two links share one either.
 			if let Some(identity) = link.identity() {
@@ -595,6 +622,13 @@ impl Config {
 				if link.quota_period.is_some() && link.quota_bytes.is_none() {r.error(at("quota_period"), "needs quota_bytes")}
 			}
 			let Some(peer) = &link.peer else {continue};
+			// "UDP transports are skipped through a via": a UDP transport cannot pass through a TCP chain, so a link needs one tls or ws transport to be usable at all.
+			if link.via.is_some() {
+				for (j, transport) in peer.transports.iter().enumerate() {
+					if matches!(transport.kind, LinkTransportType::Udp | LinkTransportType::UdpObfs) {r.warning(format!("links[{i}].peer.transports[{j}]"), "skipped: not usable through via, since a UDP transport cannot pass through a TCP chain")}
+				}
+				if !peer.transports.iter().any(|transport| matches!(transport.kind, LinkTransportType::Tls | LinkTransportType::Ws)) {r.error(at("via"), "expected a tls or ws transport in peer.transports: udp and udp-obfs are not usable through via, and the link lists no other")}
+			}
 			if inbound_keys.contains_key(&peer.inbound_public_key.0) {r.error(at("peer.inbound_public_key"), "expected the key of the other node's inbound, found the public key of an inbound of this node")}
 			if !(1..=MAX_TRANSPORTS).contains(&peer.transports.len()) {r.error(at("peer.transports"), format!("expected 1 to {MAX_TRANSPORTS} transports"))}
 			let mut dialled_at: Vec<(String, SocketAddr)> = Vec::new();

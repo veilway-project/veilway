@@ -97,7 +97,8 @@ pub async fn greet(control: &mut TcpStream, up: &Upstream) -> anyhow::Result<()>
 
 /// Opens a UDP ASSOCIATE on `up` and returns the control connection that owns it plus a socket connected to the relay. The association lives exactly as long as the returned TcpStream.
 pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> {
-	let mut control = TcpStream::connect(up.addr.as_str()).await?;
+	anyhow::ensure!(up.via.is_none(), "a chain of proxies carries no udp");
+	let mut control = TcpStream::connect((up.host.as_str(), up.port)).await?;
 	greet(&mut control, up).await?;
 	control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
 	let mut head = [0u8; 4];
@@ -127,38 +128,91 @@ pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> 
 	Ok((control, relay))
 }
 
-/// The only way out of a `socks5` outbound. Every byte a flow sends through one leaves through this SOCKS5 CONNECT. The time up to the end of the greeting is the proxy's own, since the CONNECT and the destination come after it, and it is what `up.latency` keeps.
-pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<TcpStream> {
-	let connect = async {
-		let started = Instant::now();
-		let mut control = TcpStream::connect(up.addr.as_str()).await?;
-		greet(&mut control, up).await?;
-		up.latency.set(started.elapsed());
-		let mut request = vec![5, 1, 0];
-		request.extend_from_slice(&udp_header(dst)[3..]);
-		control.write_all(&request).await?;
-		let mut head = [0u8; 4];
-		control.read_exact(&mut head).await?;
-		anyhow::ensure!(head[0] == 5, "upstream did not answer socks5");
-		anyhow::ensure!(head[1] == 0, "upstream refused connect with reply {}", head[1]);
-		let rest = match head[3] {
-			1 => 6,
-			4 => 18,
-			3 => {
-				let mut len = [0u8; 1];
-				control.read_exact(&mut len).await?;
-				usize::from(len[0]) + 2
-			}
-			a => anyhow::bail!("upstream bound to address type {a}, which we do not speak"),
-		};
-		let mut bound = vec![0u8; rest];
-		control.read_exact(&mut bound).await?;
-		Ok::<_, anyhow::Error>(control)
-	};
-	match tokio::time::timeout(DIAL_TIMEOUT, connect).await {
-		Ok(r) => r,
-		Err(_) => anyhow::bail!("socks5 connect timed out"),
+/// A SOCKS5 CONNECT on `control` to `host` and `port`, a literal address or a name the proxy resolves, and the reply read in full.
+async fn connect_to(control: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
+	let mut request = vec![5, 1, 0];
+	match host.parse::<IpAddr>() {
+		Ok(ip) => request.extend_from_slice(&udp_header(SocketAddr::new(ip, port))[3..]),
+		Err(_) => {
+			anyhow::ensure!(host.len() < 256, "a host name of {} bytes does not fit socks5", host.len());
+			request.extend_from_slice(&[3, host.len() as u8]);
+			request.extend_from_slice(host.as_bytes());
+			request.extend_from_slice(&port.to_be_bytes());
+		}
 	}
+	control.write_all(&request).await?;
+	let mut head = [0u8; 4];
+	control.read_exact(&mut head).await?;
+	anyhow::ensure!(head[0] == 5, "upstream did not answer socks5");
+	anyhow::ensure!(head[1] == 0, "upstream refused connect with reply {}", head[1]);
+	let rest = match head[3] {
+		1 => 6,
+		4 => 18,
+		3 => {
+			let mut len = [0u8; 1];
+			control.read_exact(&mut len).await?;
+			usize::from(len[0]) + 2
+		}
+		a => anyhow::bail!("upstream bound to address type {a}, which we do not speak"),
+	};
+	let mut bound = vec![0u8; rest];
+	control.read_exact(&mut bound).await?;
+	Ok(())
+}
+
+/// Where a connection through a chain stopped: at the first proxy, at a proxy after it (by its tag), or at the destination.
+pub enum Stop<'a> {First(&'a str), Hop(&'a str), Target}
+
+/// A connection through a chain that did not come out: where it stopped, whether it timed out there, and the cause. None of it holds a credential.
+pub struct Failure<'a> {pub stop: Stop<'a>, pub timeout: bool, pub error: anyhow::Error}
+
+impl Failure<'_> {
+	/// The line the node logs: where the chain stopped, and why.
+	pub fn describe(&self) -> String {
+		let at = match self.stop {
+			Stop::First(tag) => format!("the first proxy {tag} was not reached or did not let the node in"),
+			Stop::Hop(tag) => format!("proxy {tag} of the chain did not carry the connection"),
+			Stop::Target => "the destination did not connect through the chain".to_string(),
+		};
+		format!("{at}, {}: {}", if self.timeout {"timed out"} else {"failed"}, self.error)
+	}
+}
+
+/// The only way out of a `socks5` outbound. Every byte a flow sends through one leaves through this SOCKS5 CONNECT. With a `via` the proxies of the chain are reached one after another, the innermost dialled from the node and each next one by a CONNECT over the stream of the one before it, each with its own greeting and credentials, and the destination is the last CONNECT. The time up to the end of the outermost greeting is the chain's own, and it is what `up.latency` keeps.
+pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<TcpStream> {
+	dial_until(up, dst, tokio::time::Instant::now() + DIAL_TIMEOUT).await.map_err(|failure| failure.error)
+}
+
+/// `dial`, before `deadline`, with the failure kept whole: a link's transport needs to know which proxy failed and whether it timed out there.
+pub async fn dial_until(up: &Upstream, dst: SocketAddr, deadline: tokio::time::Instant) -> Result<TcpStream, Failure<'_>> {
+	let mut stop = Stop::First(&up.tag);
+	match tokio::time::timeout_at(deadline, walk(up, dst, &mut stop)).await {
+		Ok(Ok(control)) => Ok(control),
+		Ok(Err(error)) => Err(Failure {stop, timeout: false, error}),
+		Err(_) => Err(Failure {stop, timeout: true, error: anyhow::anyhow!("socks5 connect timed out")}),
+	}
+}
+
+async fn walk<'a>(up: &'a Upstream, dst: SocketAddr, stop: &mut Stop<'a>) -> anyhow::Result<TcpStream> {
+	let started = Instant::now();
+	let mut hops = vec![up];
+	let mut at = up;
+	while let Some(via) = at.via.as_deref() {
+		hops.push(via);
+		at = via;
+	}
+	hops.reverse();
+	let mut control = TcpStream::connect((hops[0].host.as_str(), hops[0].port)).await?;
+	greet(&mut control, hops[0]).await?;
+	for hop in &hops[1..] {
+		*stop = Stop::Hop(&hop.tag);
+		connect_to(&mut control, &hop.host, hop.port).await?;
+		greet(&mut control, hop).await?;
+	}
+	up.latency.set(started.elapsed());
+	*stop = Stop::Target;
+	connect_to(&mut control, &dst.ip().to_string(), dst.port()).await?;
+	Ok(control)
 }
 
 /// A TCP connection to `target` from the node itself, from the address `bind` when the outbound has one.
@@ -323,6 +377,15 @@ async fn direct_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrie
 async fn udp_relay<S: Datagrams>(shared: &Shared, exit: usize, tag: &str, mut stream: S, up: &Upstream, dst: SocketAddr, mtu: u16, plan: &Plan, pin: Option<(&Key, u64)>) -> Option<S> {
 	let state = &plan.exits[exit].state;
 	if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|since| since.elapsed() < UDP_RETRY) {return Some(stream)}
+	// A chain carries no UDP ASSOCIATE, so none is asked for: the exit is marked as without UDP, once logged, and the policy decides every flow, as for a proxy that refused one.
+	if up.via.is_some() {
+		if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).replace(Instant::now()).is_none() {
+			state.udp_flips.fetch_add(1, Ordering::Relaxed);
+			shared.publish(Event::ExitUdpChanged {exit: tag.to_string(), udp: false});
+			tracing::info!("exit {tag}: its outbound is a chain of proxies, which carry no udp, so udp follows the exit's `unsupported.udp` policy");
+		}
+		return Some(stream);
+	}
 	let (mut control, relay) = match tokio::time::timeout(ASSOCIATE_TIMEOUT, associate(up)).await {
 		Ok(Ok(v)) => {
 			if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).take().is_some() {

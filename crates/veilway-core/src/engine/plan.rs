@@ -22,11 +22,11 @@ use veilway_proto::subscription::payload::{self, Candidate, Dial, Stream};
 use veilway_proto::subscription::Secret;
 use veilway_proto::{faketls, proof, udp_obfs, NoRandom};
 
-/// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`.
-pub struct Upstream {pub addr: String, pub auth: Option<(String, String)>, pub latency: Arc<Latency>}
+/// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`. `via` is the proxy the connection to this one goes through, which may have one of its own.
+pub struct Upstream {pub tag: String, pub host: String, pub port: u16, pub auth: Option<(String, String)>, pub latency: Arc<Latency>, pub via: Option<Arc<Upstream>>}
 
-/// Equal when they name the same proxy with the same credentials: what was measured of it does not count.
-impl PartialEq for Upstream {fn eq(&self, other: &Upstream) -> bool {self.addr == other.addr && self.auth == other.auth}}
+/// Equal when they name the same proxy with the same credentials and chain: what was measured of it does not count.
+impl PartialEq for Upstream {fn eq(&self, other: &Upstream) -> bool {self.tag == other.tag && self.host == other.host && self.port == other.port && self.auth == other.auth && self.via == other.via}}
 
 impl Eq for Upstream {}
 
@@ -43,20 +43,27 @@ impl Latency {
 #[derive(PartialEq, Eq)]
 pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
 
+impl Upstream {
+	/// The proxy of the `socks5` outbound `tag` names, behind the chain its `via` keys give. Validation has refused a loop and a chain longer than `MAX_CHAIN`, so this ends.
+	fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Upstream> {
+		let config::Outbound::Socks5 {server, username, password, via, ..} = outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Socks5 {tag: name, ..} if name == tag))? else {return None};
+		Some(Upstream {
+			tag: tag.to_string(),
+			host: match &server.host {config::Host::Ip(ip) => ip.to_string(), config::Host::Name(name) => name.clone()},
+			port: server.port,
+			auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
+			latency: latency.get(tag)?.clone(),
+			via: match via {Some(via) => Some(Arc::new(Upstream::of(outbounds, latency, via)?)), None => None},
+		})
+	}
+}
+
 impl Outbound {
-	/// An outbound of the config as the engine dials through it.
-	pub fn of(outbound: &config::Outbound, latency: Arc<Latency>) -> Outbound {
-		match outbound {
-			config::Outbound::Direct {bind, ..} => Outbound::Direct {bind: bind.map(|ip| ip.0)},
-			config::Outbound::Socks5 {server, username, password, ..} => Outbound::Socks5(Upstream {
-				addr: match &server.host {
-					config::Host::Ip(IpAddr::V6(v6)) => format!("[{v6}]:{}", server.port),
-					config::Host::Ip(IpAddr::V4(v4)) => format!("{v4}:{}", server.port),
-					config::Host::Name(name) => format!("{name}:{}", server.port),
-				},
-				auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
-				latency,
-			}),
+	/// The outbound `tag` names, as the engine dials through it.
+	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Outbound> {
+		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} if name == tag))? {
+			config::Outbound::Direct {bind, ..} => Some(Outbound::Direct {bind: bind.map(|ip| ip.0)}),
+			config::Outbound::Socks5 {..} => Upstream::of(outbounds, latency, tag).map(Outbound::Socks5),
 		}
 	}
 }
@@ -292,7 +299,7 @@ pub struct Device {
 }
 
 /// What a node dials a link with: the link as the client's side of the transports takes it, and the other node's transports in its order of preference.
-pub struct Dialled {pub link: veilway_transport::Link, pub transports: Vec<payload::Transport>}
+pub struct Dialled {pub link: veilway_transport::Link, pub transports: Vec<payload::Transport>, pub via: Option<Arc<Upstream>>}
 
 /// One enabled node link of the config. A link is known on both nodes by `identity`, the WireGuard public key the dialling node made for it.
 pub struct Link {
@@ -433,7 +440,6 @@ impl Plan {
 		let index = |names: Vec<&str>| names.into_iter().enumerate().map(|(i, name)| (name.to_string(), i)).collect::<HashMap<String, usize>>();
 		let find = |map: &HashMap<String, usize>, name: &str| map.get(name).copied().ok_or_else(stale);
 		let find_all = |map: &HashMap<String, usize>, names: &Option<Vec<String>>| names.as_ref().map(|names| names.iter().map(|name| find(map, name)).collect::<anyhow::Result<Vec<usize>>>()).transpose();
-		let outbound_tags = index(config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => tag.as_str()}).collect());
 		let (exit_tags, inbound_tags) = (index(config.exits.iter().map(|exit| exit.tag.as_str()).collect()), index(config.inbounds.iter().map(|inbound| inbound.tag.as_str()).collect()));
 		let (group_names, user_names) = (index(config.groups.iter().map(String::as_str).collect()), index(config.users.iter().map(|user| user.name.as_str()).collect()));
 		let fallback = |policy: &Option<Policy>, default: Fallback| -> anyhow::Result<Fallback> {
@@ -451,7 +457,7 @@ impl Plan {
 		for exit in &config.exits {
 			let backend = match &exit.backend {
 				config::Backend::Netstack(netstack) => Backend::Netstack {
-					outbound: Outbound::of(&config.outbounds[find(&outbound_tags, &netstack.outbound)?], latency.get(&netstack.outbound).cloned().ok_or_else(stale)?),
+					outbound: Outbound::of(&config.outbounds, &latency, &netstack.outbound).ok_or_else(stale)?,
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
 					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,
@@ -569,7 +575,7 @@ impl Plan {
 						}
 					})).collect::<Option<Vec<_>>>().ok_or_else(stale)?;
 					inbounds.push(Inbound {tag: name.clone(), private_key: private.expose().0, public_key: identity, native: None, veilway: false, pools: Vec::new(), mtu, transports: Vec::new(), dns: 0, traffic: was_inbound.get(name.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(), tunnel: tunnels.next().ok_or_else(stale)?, link: Some(l)});
-					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}, borrowed: Default::default()}, transports})))
+					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}, borrowed: Default::default()}, transports, via: match &written.via {Some(tag) => Some(Arc::new(Upstream::of(&config.outbounds, &latency, tag).ok_or_else(stale)?)), None => None}})))
 				}
 				_ => return Err(stale()),
 			};

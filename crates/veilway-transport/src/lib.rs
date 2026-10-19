@@ -38,11 +38,14 @@ use ring::rand::{SecureRandom, SystemRandom};
 use rustls::RootCertStore;
 use socket2::SockRef;
 use std::fmt;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -66,6 +69,12 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// What a caller does to every socket of a session after it is made and before it is connected, for TCP and UDP alike: keep it out of its own tunnel, bind it to an interface, mark it for its firewall. A failure ends the attempt as `End::Offline`, and nothing is dialled.
 pub type Hook = Arc<dyn Fn(SockRef<'_>) -> std::io::Result<()> + Send + Sync>;
+
+/// Dials one address on the caller's behalf, through a proxy chain, before the deadline of the attempt: the stream a TCP transport of a link with a `via` runs over. It replaces the socket and its hook. What it fails with is the caller's classification of the failure: `End::Offline` where the node's own path failed, `Unreachable::Connect` where a candidate or a proxy after the first refused, and `Unreachable::Timeout` where the destination did not answer in time.
+pub type Connect = Arc<dyn Fn(SocketAddr, Instant) -> Pin<Box<dyn Future<Output = Result<TcpStream, Ended>> + Send>> + Send + Sync>;
+
+/// A `Connect` from a function that dials one address before a deadline.
+pub fn connector<F: Future<Output = Result<TcpStream, Ended>> + Send + 'static>(dial: impl Fn(SocketAddr, Instant) -> F + Send + Sync + 'static) -> Connect {Arc::new(move |to, deadline| Box::pin(dial(to, deadline)))}
 
 /// What a session asks of the WireGuard layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +142,12 @@ pub struct Front {
 	pub self_signed: bool,
 	/// `http2` of the candidate: whether the client offers `h2`, and whether `tls` and `ws` first try WebSocket over HTTP/2.
 	pub http2: Http2,
+	/// Set by `Target::via`: the TCP connection to `address` comes from this instead of a socket of the device's own.
+	pub connect: Option<Connect>,
 }
 
 impl Front {
-	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some(), self_signed: candidate.self_signed, http2: candidate.http2}}
+	pub fn of(candidate: &Candidate) -> Self {Self {address: candidate.address.address(), sni: candidate.sni.clone(), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), pins: candidate.pins.clone(), ech: candidate.ech.is_some(), self_signed: candidate.self_signed, http2: candidate.http2, connect: None}}
 }
 
 impl fmt::Debug for Front {
@@ -157,6 +168,11 @@ pub enum Target {
 }
 
 impl Target {
+	/// Makes a stream target dial through `connect` (a link whose `via` names a proxy chain). A UDP target is left as it is.
+	pub fn via(mut self, connect: Option<Connect>) -> Self {
+		if let (Some(connect), Self::Tls {candidate, ..} | Self::Ws {candidate, ..} | Self::Fronted {candidate, ..} | Self::FrontedShaped {candidate, ..}) = (connect, &mut self) {candidate.connect = Some(connect)}
+		self
+	}
 	/// Endpoint or candidate `at` of a transport of a profile, for `link`. None for plain `udp`, which is not served here, and for a place the transport does not have.
 	/// A `faketls` target is made with the key of its own transport, and never with `Link::node`.
 	pub fn of(transport: &Transport, at: usize, link: &Link) -> Option<Self> {
@@ -169,7 +185,7 @@ impl Target {
 			Transport::FrontedShaped(stream, shape) => Self::FrontedShaped {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?), shape: shape.clone()},
 			Transport::FakeTls {key, candidates} => {
 				let found = candidates.get(at)?;
-				Self::FakeTls {candidate: Front {address: found.address.address(), sni: Some(found.sni.clone()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}, client: faketls::client(link, key)}
+				Self::FakeTls {candidate: Front {address: found.address.address(), sni: Some(found.sni.clone()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default(), connect: None}, client: faketls::client(link, key)}
 			}
 		})
 	}

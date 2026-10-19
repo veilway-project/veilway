@@ -5,7 +5,7 @@
 //! and the two requests to a decoy origin (the node asks it for its page from inside a listener, and never for the path of a transport).
 use serde_json::json;
 use std::collections::hash_map::RandomState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -86,7 +86,8 @@ async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duratio
 async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Duration) -> Vec<Line> {
 	let (config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..}) = outbound;
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
-	match Outbound::of(outbound, Arc::default()) {
+	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), tag) else {return Vec::new()};
+	match route {
 		Outbound::Direct {bind} => {
 			// The engine passes over a server of the other family than the outbound is bound to, see `resolver`.
 			let Some((at, target)) = servers.iter().copied().enumerate().find(|(_, server)| bind.is_none_or(|bind| bind.is_ipv4() == server.is_ipv4())) else {
@@ -103,10 +104,19 @@ async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Dur
 			let udp = answered(&format!("a DNS query to dns.servers[{at}] over UDP"), &query, udp.0, udp.1, wait, Status::Fail, hint);
 			vec![line(tcp.0, "outbound", subject("tcp"), tcp.1), line(udp.0, "outbound", subject("udp"), udp.1)]
 		}
+		// A chain is dialled the way the engine dials it, every proxy greeted in turn, so the line names the proxy that failed and never a credential.
+		Outbound::Socks5(up) if up.via.is_some() => {
+			let started = Instant::now();
+			let tcp = match probe::dial_until(&up, servers[0], tokio::time::Instant::now() + wait).await {
+				Ok(_) => (Status::Ok, format!("the chain connected to dns.servers[0] over TCP in {} ms, and every proxy of it took the node in", started.elapsed().as_millis())),
+				Err(failure) => (Status::Fail, format!("{}: check the `via` of this outbound and the outbounds it goes through, each of which is checked on its own", failure.describe())),
+			};
+			vec![line(tcp.0, "outbound", format!("{tag}, tcp"), tcp.1), line(Status::Skipped, "outbound", format!("{tag}, udp"), "a chain of proxies carries no UDP, so none is tried")]
+		}
 		Outbound::Socks5(up) => {
 			let skipped = |from: usize, why: &str| STEPS[from..].iter().map(|step| line(Status::Skipped, "outbound", subject(step), why)).collect::<Vec<Line>>();
 			let (target, mut lines) = (servers[0], Vec::new());
-			let mut control = match timeout(wait, TcpStream::connect(up.addr.as_str())).await {
+			let mut control = match timeout(wait, TcpStream::connect((up.host.as_str(), up.port))).await {
 				Ok(Ok(control)) => control,
 				reached => {
 					lines.push(line(Status::Fail, "outbound", subject(STEPS[0]), format!("the proxy is not reached ({}): check its `server` and that it runs and takes connections from this host", if let Ok(Err(e)) = reached {e.to_string()} else {format!("no connection within {} s", wait.as_secs())})));

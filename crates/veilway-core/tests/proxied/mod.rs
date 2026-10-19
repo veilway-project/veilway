@@ -139,6 +139,33 @@ pub async fn socks() -> SocketAddr {
 	addr
 }
 
+/// A SOCKS5 proxy without authentication that dials what each CONNECT asks for, relays it, and says what it was asked for as `host:port`. A CONNECT to `refuse` is answered with a refusal instead. IPv4 targets only.
+pub async fn forwarder(refuse: Option<SocketAddr>) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	let seen = Arc::new(Mutex::new(Vec::new()));
+	let asked = seen.clone();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut client, _)) = listener.accept().await else {return};
+			let asked = asked.clone();
+			tokio::spawn(async move {
+				let (mut hello, mut head, mut target) = ([0u8; 2], [0u8; 4], [0u8; 6]);
+				if client.read_exact(&mut hello).await.is_err() {return}
+				let mut methods = vec![0u8; usize::from(hello[1])];
+				if client.read_exact(&mut methods).await.is_err() || client.write_all(&[5, 0]).await.is_err() || client.read_exact(&mut head).await.is_err() || head[3] != 1 || client.read_exact(&mut target).await.is_err() {return}
+				let at = SocketAddr::from(([target[0], target[1], target[2], target[3]], u16::from_be_bytes([target[4], target[5]])));
+				asked.lock().unwrap().push(at.to_string());
+				let connected = if Some(at) == refuse {None} else {TcpStream::connect(at).await.ok()};
+				let Some(mut upstream) = connected else {let _ = client.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).await; return};
+				if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {return}
+				let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+			});
+		}
+	});
+	(addr, seen)
+}
+
 /// The operator's own web site. `seen` holds what the hand-written one read of every connection, the PROXY protocol header included.
 pub struct Site {pub addr: SocketAddr, pub connections: Arc<AtomicUsize>, pub requests: Arc<AtomicUsize>, pub written: Arc<AtomicUsize>, pub seen: Arc<Mutex<Vec<Vec<u8>>>>, task: JoinHandle<()>}
 

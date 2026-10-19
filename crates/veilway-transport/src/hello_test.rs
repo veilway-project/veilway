@@ -70,7 +70,7 @@ fn ja3(hello: &Hello) -> String {
 
 async fn flight(sni: Option<&str>, h2: bool) -> Hello {
 	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let front = Front {address: listener.local_addr().unwrap(), sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins: vec![[7; 32]], ech: false, self_signed: true, http2: Default::default()};
+	let front = Front {address: listener.local_addr().unwrap(), sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins: vec![[7; 32]], ech: false, self_signed: true, http2: Default::default(), connect: None};
 	let dialled = tokio::spawn(async move {tls::dial(&front, &Arc::new(RootCertStore::empty()), &None, Instant::now() + Duration::from_secs(5), h2).await.is_err()});
 	let (mut peer, _) = listener.accept().await.unwrap();
 	let mut record = vec![0; 5];

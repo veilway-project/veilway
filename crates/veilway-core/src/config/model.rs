@@ -1130,6 +1130,10 @@ pub enum Outbound {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		#[schemars(length(min = 1, max = MAX_CREDENTIAL_BYTES))]
 		password: Option<Secret<String>>,
+		/// The tag of another `socks5` outbound. The connection to `server` goes through that outbound first, and a chain of them may be up to 8 long. SOCKS5 is plain text: each proxy of the chain sees the user name and password of the proxies after it, the CONNECT targets and the bytes of the flows. A link's payload stays protected by its TLS end to end.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern(TAG_PATTERN))]
+		via: Option<String>,
 	},
 }
 
@@ -1139,16 +1143,16 @@ enum OutboundType {Direct, Socks5}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
 		match keys.kind {
-			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind}),
+			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind}),
 			OutboundType::Socks5 => {
 				only("socks5", &[("bind", keys.bind.is_some())])?;
-				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password})
+				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password, via: keys.via})
 			}
 		}
 	}
@@ -1520,6 +1524,10 @@ pub struct Link {
 	/// On the node that dials: the other node's keys and transports.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub peer: Option<LinkPeer>,
+	/// On the node that dials: the tag of a `socks5` outbound whose chain the TCP transports of the link go through. `udp` and `udp-obfs` are not usable through it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub via: Option<String>,
 	/// On the exit half: the exit the link leaves through when no rule names one. Without it that is `routing.default`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(pattern(TAG_PATTERN))]

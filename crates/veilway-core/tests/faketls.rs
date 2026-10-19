@@ -303,7 +303,7 @@ impl Node {
 	}
 
 	/// What the client library needs to reach the node: the candidate, which is the tap in front of it, and the node's key.
-	fn target(&self, link: &Link) -> Target {Target::FakeTls {candidate: Front {address: self.front.addr, sni: Some(NAME.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default()}, client: faketls::client(link, &link.node.unwrap())}}
+	fn target(&self, link: &Link) -> Target {Target::FakeTls {candidate: Front {address: self.front.addr, sni: Some(NAME.into()), host: String::new(), verify_name: None, pins: Vec::new(), ech: false, self_signed: false, http2: Default::default(), connect: None}, client: faketls::client(link, &link.node.unwrap())}}
 
 	fn env(&self, ahead: i64) -> Env {
 		let time = self.time;

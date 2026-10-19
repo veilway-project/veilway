@@ -70,15 +70,20 @@ pub(crate) fn name(candidate: &Front) -> Result<ServerName<'static>, Refuse> {
 /// The `Host` of a request to a candidate: its `host`, with the port of the dial address when that is not the one `https` implies.
 pub(crate) fn host(candidate: &Front) -> String {if candidate.address.port() == 443 {candidate.host.clone()} else {format!("{}:{}", candidate.host, candidate.address.port())}}
 
-/// A TCP connection to the candidate's address before `deadline`, with the caller's hook run on the socket first and `TCP_NODELAY` on. The same `Offline` rule as `dial`'s: no route, no socket or a failed hook says nothing about the candidate.
+/// A TCP connection to the candidate's address before `deadline`, with the caller's hook run on the socket first and `TCP_NODELAY` on. The same `Offline` rule as `dial`'s: no route, no socket or a failed hook says nothing about the candidate. With `Front::connect` the connection comes from it, and its failure is what it says (see `Connect`).
 pub(crate) async fn tcp(candidate: &Front, hook: &Option<Hook>, deadline: Instant) -> Result<TcpStream, Ended> {
-	let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
-	if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
-	let stream = match timeout_at(deadline, socket.connect(candidate.address)).await {
-		Ok(Ok(stream)) => stream,
-		Ok(Err(error)) if matches!(error.kind(), ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::AddrNotAvailable | ErrorKind::NetworkDown) => return Err(End::Offline.into()),
-		Ok(Err(_)) => return Err(Ended::Unreachable(Unreachable::Connect)),
-		Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
+	let stream = match &candidate.connect {
+		Some(connect) => connect(candidate.address, deadline).await?,
+		None => {
+			let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
+			if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
+			match timeout_at(deadline, socket.connect(candidate.address)).await {
+				Ok(Ok(stream)) => stream,
+				Ok(Err(error)) if matches!(error.kind(), ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::AddrNotAvailable | ErrorKind::NetworkDown) => return Err(End::Offline.into()),
+				Ok(Err(_)) => return Err(Ended::Unreachable(Unreachable::Connect)),
+				Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
+			}
+		}
 	};
 	let _ = stream.set_nodelay(true);
 	Ok(stream)

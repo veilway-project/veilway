@@ -146,7 +146,7 @@ async fn net(test: &'static str, time: Time, change: impl FnOnce(&mut Value)) ->
 fn link(n: usize) -> Link {Link {inbound: public(&NODE), device: public(&KEYS[n]), secret: Secret::new(secret(n)), node: Some(proof::public_key(&TRANSPORT)), mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive: 20_000..=40_000}, borrowed: Default::default()}}
 
 impl Net {
-	fn front(&self, address: SocketAddr, pinned: bool) -> Front {Front {address, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: if pinned {vec![self.pin]} else {Vec::new()}, ech: false, self_signed: false, http2: Default::default()}}
+	fn front(&self, address: SocketAddr, pinned: bool) -> Front {Front {address, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: if pinned {vec![self.pin]} else {Vec::new()}, ech: false, self_signed: false, http2: Default::default(), connect: None}}
 
 	/// The target of a transport by its name. `ws` is pinned here, as a client's is that reaches the operator's own web server.
 	fn target(&self, kind: &str) -> Target {
@@ -454,7 +454,7 @@ async fn a_node_that_was_killed_refuses_until_its_clock_passes_its_floor() {
 	let behind = listen();
 	for (transport, addr) in doc["inbounds"][0]["transports"].as_array_mut().unwrap().iter_mut().zip([behind, behind, obfs, tls]) {transport["listen"] = json!(addr.to_string())}
 	let again = start(&doc, &dir, time).await.unwrap();
-	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false, http2: Default::default()}});
+	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false, http2: Default::default(), connect: None}});
 	// A refusal on the stream, with the date of a clock that is right, and silence on `udp-obfs`: neither marks anything.
 	let (mut refused, mut silent) = (peer(0, &link(0), on_tls.clone(), 1, env.clone(), wireguard(0)), peer(1, &link(1), Target::UdpObfs(obfs), 1, env.clone(), wireguard(1)));
 	let ended = refused.ended().await;
@@ -489,7 +489,7 @@ async fn a_node_that_restarted_takes_the_proof_and_not_the_keepalive_and_nothing
 	let behind = listen();
 	for (transport, addr) in doc["inbounds"][0]["transports"].as_array_mut().unwrap().iter_mut().zip([behind, behind, listen(), tls]) {transport["listen"] = json!(addr.to_string())}
 	let again = start(&doc, &dir, time).await.unwrap();
-	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false, http2: Default::default()}});
+	let (env, on_tls) = (Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots, socket: None}, Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: Some("node.test".into()), host: "node.test".into(), verify_name: None, pins: vec![pin], ech: false, self_signed: false, http2: Default::default(), connect: None}});
 	// The device's tunnel is up as far as the device knows, so its session opens with a keepalive. The node takes the proof, cannot place the keepalive, and says nothing until its own 10 s are over.
 	let (started, mut forgotten) = (Instant::now(), peer(0, &link(0), on_tls.clone(), 1, env.clone(), (tunn.clone(), up.clone(), source.clone())));
 	let ended = forgotten.ended().await;
@@ -690,7 +690,7 @@ async fn a_node_makes_its_own_certificate_and_a_profile_that_pins_it_reaches_the
 	#[cfg(unix)]
 	for path in [&made.files.key, &made.files.cert] {assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777, 0o600, "{path:?}")}
 	// A device whose profile pins that key alone reaches its tunnel, with no server name and with one, and no root of any kind is asked for.
-	let candidate = |pins: Vec<[u8; 32]>, sni: Option<&str>, self_signed: bool| Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins, ech: false, self_signed, http2: Default::default()}};
+	let candidate = |pins: Vec<[u8; 32]>, sni: Option<&str>, self_signed: bool| Target::Tls {path: TLS_PATH.into(), candidate: Front {address: tls, sni: sni.map(str::to_owned), host: "node.test".into(), verify_name: None, pins, ech: false, self_signed, http2: Default::default(), connect: None}};
 	let env = |roots: RootCertStore| Env {device: Arc::new(move || time.secs()), now: Arc::new(move || time.secs()), roots: Arc::new(roots), socket: None};
 	for (n, sni) in [(0, None), (1, Some("node.test"))] {
 		let mut device = peer(n, &link(n), candidate(vec![made.pin], sni, true), 1, env(RootCertStore::empty()), wireguard(n));
