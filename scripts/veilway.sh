@@ -1162,12 +1162,12 @@ do_version() {
 }
 
 menu() {
-	local c
+	local c a
 	header
 	while true; do
 		printf '  %s1%s Install    %s2%s Update     %s3%s Status     %s4%s Logs\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
 		printf '  %s5%s Restart    %s6%s Check      %s7%s Doctor     %s8%s Backup\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
-		printf '  %s9%s Restore    %s10%s Uninstall %s0%s Quit\n\n' "$B" "$Z" "$B" "$Z" "$B" "$Z"
+		printf '  %s9%s Restore    %s10%s Uninstall %s11%s Add-ons  %s0%s Quit\n\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
 		c="$(ask "Choose:" 0)"
 		case "$c" in
 			1) do_install "" ;;
@@ -1180,6 +1180,11 @@ menu() {
 			8) do_backup ;;
 			9) do_restore "$(ask "Backup file:" "")" ;;
 			10) do_uninstall ;;
+			11)
+				do_addon xray status
+				if [ -x "$ADDON_DIR/xray/xray" ]; then a="$(ask "Remove the Xray add-on, or leave it? [leave]" leave)"; else a="$(ask "Install the Xray add-on, or leave it? [leave]" leave)"; fi
+				case "$a" in install | remove) do_addon xray "$a" ;; leave | "") ;; *) warn "answer install, remove or leave" ;; esac
+				;;
 			0 | q | "") return 0 ;;
 			*) warn "pick a number from the list" ;;
 		esac
