@@ -11,9 +11,9 @@ categories=["network-programming", "os::macos-apis"]
 exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [dependencies]
-veilway-engine={path="../veilway-engine", version="0.2.2"}
-veilway-proto={path="../veilway-proto", version="0.2.2"}
-veilway-transport={path="../veilway-transport", version="0.2.2"}
+veilway-engine={path="../veilway-engine", version="0.2.3"}
+veilway-proto={path="../veilway-proto", version="0.2.3"}
+veilway-transport={path="../veilway-transport", version="0.2.3"}
 tokio.workspace=true
 tracing.workspace=true
 anyhow.workspace=true
