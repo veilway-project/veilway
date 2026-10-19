@@ -1,0 +1,42 @@
+name: installer-refresh
+# Started by hand on main: signs scripts/veilway.sh as it is on main and replaces veilway.sh and its .minisig in an existing release, for installer fixes that do not need a new version.
+# The signature names the release's tag and the file, as release.yml signs it, so the installer's checks stay the same.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to update, e.g. v0.2.1-alpha"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Sign and upload veilway.sh
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-z0-9.]+)?$ ]] || { echo "::error::not a release tag: $TAG"; exit 1; }
+          gh release view "$TAG" --json tagName >/dev/null
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "::error::RELEASE_SIGNING_KEY is not set"; exit 1; }
+          bash -n scripts/veilway.sh
+          sudo apt-get update -q
+          sudo apt-get install -y -q minisign
+          umask 077
+          trap 'rm -f "$RUNNER_TEMP/minisign.key"' EXIT
+          printf "%s\n" "$RELEASE_SIGNING_KEY" > "$RUNNER_TEMP/minisign.key"
+          mkdir -p out
+          cp scripts/veilway.sh out/veilway.sh
+          minisign -S -s "$RUNNER_TEMP/minisign.key" -m out/veilway.sh -t "veilway $TAG veilway.sh" </dev/null
+          gh release upload "$TAG" out/veilway.sh out/veilway.sh.minisig --clobber
+          echo "replaced veilway.sh in $TAG with main at $GITHUB_SHA"
