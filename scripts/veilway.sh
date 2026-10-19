@@ -1131,10 +1131,11 @@ do_uninstall() {
 	need_root
 	confirm "Remove Veilway binaries, units and users? Backups in $BACKUP_DIR stay." || die "cancelled"
 	do_backup || true
-	svc stop veilway-mirror.service || true; svc disable veilway-mirror.service || true
-	svc stop veilway.service || true; svc stop veilway-panel.service || true
-	svc disable veilway.service || true; svc disable veilway-panel.service || true; svc disable --now veilway-panel-update.path || true
-	svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true; svc disable veilway-xray.socket || true
+	# Only the units this server has, so parts that were never installed print nothing.
+	for u in veilway-mirror.service veilway.service veilway-panel.service veilway-panel-update.path veilway-panel-update.service veilway-xray.socket veilway-xray.service; do
+		[ -e "$UNIT_DIR/$u" ] || continue
+		svc stop "$u" || true; svc disable "$u" 2>/dev/null || true
+	done
 	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
