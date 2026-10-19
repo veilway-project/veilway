@@ -12,7 +12,7 @@ exclude=["tests/", "examples/", "proptest-regressions/"]
 
 # The control API is served on a unix socket and nowhere else, so on other systems this crate is empty.
 [target.'cfg(unix)'.dependencies]
-veilway-core={path="../veilway-core", version="0.2.1"}
+veilway-core={path="../veilway-core", version="0.2.2"}
 tokio.workspace=true
 serde.workspace=true
 serde_json.workspace=true
@@ -27,8 +27,8 @@ hyper-util.workspace=true
 socket2.workspace=true
 
 [target.'cfg(unix)'.dev-dependencies]
-veilway-wg={path="../veilway-wg", version="0.2.1"}
-veilway-proto={path="../veilway-proto", version="0.2.1"}
+veilway-wg={path="../veilway-wg", version="0.2.2"}
+veilway-proto={path="../veilway-proto", version="0.2.2"}
 boringtun.workspace=true
 etherparse.workspace=true
 tracing-subscriber.workspace=true
