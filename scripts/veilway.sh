@@ -898,8 +898,10 @@ do_install() {
 	if [ -z "$DOMAIN" ] && [ -z "$WEB" ] && { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
 		if confirm "Set up a web server with HTTPS for the panel now? It needs a domain name that points at this server."; then
 			DOMAIN="$(ask "Domain name:" "")"
-			WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
-			HTTPS_PORT="$(web_state https_port)"; HTTPS_PORT="$(ask "HTTPS port? [${HTTPS_PORT:-443}]" "${HTTPS_PORT:-443}")"
+			if [ -n "$DOMAIN" ]; then
+				WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
+				HTTPS_PORT="$(web_state https_port)"; HTTPS_PORT="$(ask "HTTPS port? [${HTTPS_PORT:-443}]" "${HTTPS_PORT:-443}")"
+			else info "no domain name given: no web server is set up"; fi
 		fi
 	fi
 	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || die "--web needs --domain"
