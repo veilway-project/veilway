@@ -15,8 +15,8 @@ exclude=["tests/", "examples/", "proptest-regressions/"]
 bench=["veilway-proto/bench"]
 
 [dependencies]
-veilway-wg={path="../veilway-wg", version="0.2.3"}
-veilway-proto={path="../veilway-proto", version="0.2.3"}
+veilway-wg={path="../veilway-wg", version="0.2.4"}
+veilway-proto={path="../veilway-proto", version="0.2.4"}
 tokio.workspace=true
 anyhow.workspace=true
 serde.workspace=true
@@ -35,7 +35,7 @@ socket2.workspace=true
 tokio-rustls.workspace=true
 rustls.workspace=true
 # The client side of the native transports, which a node link this node dials is opened with, and the root certificates its TLS is validated against when no other roots are given.
-veilway-transport={path="../veilway-transport", version="0.2.3"}
+veilway-transport={path="../veilway-transport", version="0.2.4"}
 webpki-roots.workspace=true
 # The self-signed certificate of a `tls` transport with `self_signed`: made with rcgen, whose crates the tree already has, and read back with x509-parser, which the binary already links, for the name it keeps and the dates it is renewed by.
 rcgen.workspace=true
