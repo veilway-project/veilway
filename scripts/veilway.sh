@@ -599,6 +599,7 @@ install_node() {
 	fetch_and_install node
 	prepare_node_dir
 	node_unit
+	install_self
 	daemon_reload
 	if [ "$DRY" = 1 ]; then
 		dry "write $CONF_DIR/config.example.json from the release tag"
@@ -678,7 +679,7 @@ EOF
 		"    proxy_set_header X-Forwarded-For \$remote_addr; }"
 }
 
-# The root update service runs this copy, so what it runs is not a file the panel's user can reach. A piped run has no file of its own, so the same script is fetched from where it came from.
+# Saves the installer as $SELF for later runs. The root update service runs this copy, so what it runs is not a file the panel's user can reach. A piped run has no file of its own, so the signed script of the release is fetched instead.
 install_self() {
 	local src="$0" tag
 	if [ "$DRY" = 1 ]; then dry "install this script as $SELF"; return 0; fi
@@ -743,6 +744,28 @@ EOF
 }
 
 # Run by the root service. The request carries no input: only the exact word "panel" counts, and it is deleted before anything runs. No version, path or argument is taken from it.
+# Every update also replaces the saved installer with the one signed in the same release, so installer fixes reach servers installed earlier. The new copy is used from the next run.
+update_self() {
+	local tag cur vf
+	if [ "$DRY" = 1 ]; then dry "download veilway.sh and veilway.sh.minisig of the core release, verify them and install them as $SELF"; return 0; fi
+	release_tag "$CORE_REPO" "$NODE_PUBKEY" veilway
+	tag="$TAG_OUT"
+	cur="$(installed_version installer)"
+	if [ -n "$cur" ] && [ "$cur" != "$tag" ] && semver_lower "$tag" "$cur" && [ "$ALLOW_DOWNGRADE" = 0 ]; then warn "the installer of $tag is older than the saved one of $cur: kept the saved one"; return 0; fi
+	download_verified "$CORE_REPO" "$NODE_PUBKEY" veilway.sh "$tag" veilway
+	head -n 2 "$TMP/veilway.sh" | grep -q 'Veilway installer and manager' || die "the fetched installer script is not the expected file"
+	if cmp -s "$TMP/veilway.sh" "$SELF"; then info "the saved installer is the one of $tag"
+	else
+		install -d -m 0755 "$(dirname "$SELF")"
+		install -m 0755 -o root -g root "$TMP/veilway.sh" "$SELF.new"
+		mv -f "$SELF.new" "$SELF"
+		step "updated $SELF to the installer of $tag, used from the next run"
+	fi
+	install -d -m 0755 "$VER_DIR"
+	vf="$(mktemp "$VER_DIR/.installer.XXXXXX")"
+	printf '%s\n' "$tag" >"$vf"; chmod 0644 "$vf"; mv -f "$vf" "$VER_DIR/installer.version"
+}
+
 do_panel_update_request() {
 	local req="$UPDATE_DIR/request" word=""
 	need_root
@@ -975,6 +998,7 @@ do_update() {
 			svc restart veilway-panel.service
 		else info "panel is not installed, skipped"; fi
 	fi
+	update_self
 	warn "a node restart drops every live tunnel for a moment"
 }
 
