@@ -1129,7 +1129,7 @@ do_restore() {
 
 do_uninstall() {
 	need_root
-	confirm "Remove Veilway binaries, units and users? Backups in $BACKUP_DIR stay." || die "cancelled"
+	confirm "Remove Veilway binaries, units, users and this installer? Backups in $BACKUP_DIR stay." || die "cancelled"
 	do_backup || true
 	# Only the units this server has, so parts that were never installed print nothing.
 	for u in veilway-mirror.service veilway.service veilway-panel.service veilway-panel-update.path veilway-panel-update.service veilway-xray.socket veilway-xray.service; do
@@ -1144,7 +1144,10 @@ do_uninstall() {
 		has userdel && { act userdel veilway 2>/dev/null || true; act userdel veilway-panel 2>/dev/null || true; act userdel veilway-xray 2>/dev/null || true; act userdel veilway-mirror 2>/dev/null || true; }
 		has deluser && ! has userdel && { act deluser veilway 2>/dev/null || true; act deluser veilway-panel 2>/dev/null || true; act deluser veilway-xray 2>/dev/null || true; act deluser veilway-mirror 2>/dev/null || true; }
 	else info "config and data kept"; fi
-	[ ! -f "$WEB_STATE" ] || info "the web server setup stays: remove it with: sudo bash veilway.sh uninstall web"
+	act rm -rf "$UPDATE_DIR"
+	# The script and its state stay while the web server setup does, since only they can remove that setup.
+	if [ -f "$WEB_STATE" ]; then act rm -f "$VER_DIR"/*.version; info "the web server setup stays, and so does $SELF: remove both with: sudo bash $SELF uninstall web, then sudo rm -r $SELF $VER_DIR"
+	else act rm -rf "$VER_DIR" "$SELF"; fi
 	step "uninstalled. Backups are in $BACKUP_DIR"
 }
 
