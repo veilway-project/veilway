@@ -53,6 +53,8 @@ const ROTATED: [u8; 32] = [0x52; 32];
 /// The path of the `tls` transport, which the origin serves nothing at.
 const PATH: &str = "/assets/app-3f9c2e71.js";
 const SECOND: Duration = Duration::from_secs(1);
+// Bounds a wait for something that must come: it only ends a test that is already broken, so a slow runner gets all the time it needs.
+const DEADLINE: Duration = Duration::from_secs(30);
 /// What a quiet connection is given to stay quiet in.
 const QUIET: Duration = Duration::from_millis(500);
 /// What a connection to a port nobody listens at is given to be refused in: Windows retries the SYN for about two seconds before it reports the refusal, where Linux and macOS refuse at once. The node's own limit is 5 s.
@@ -375,7 +377,7 @@ impl Node {
 
 /// Waits for something the engine does on its own time.
 async fn eventually(what: &str, done: impl Fn() -> bool) {
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + Duration::from_secs(30);
 	while !done() {
 		assert!(Instant::now() < deadline, "{what}");
 		tokio::time::sleep(Duration::from_millis(20)).await;
@@ -388,7 +390,7 @@ fn upgrade(path: &str, token: &str) -> Vec<u8> {format!("GET {path}?{token} HTTP
 /// One thing a peer does to a connection.
 enum Step {Send(Vec<u8>), Wait(u64), Finish}
 
-/// Does `steps` to a connection and then reads it to its end. What came, and whether the connection was closed from the other side before nothing had come for `patience`.
+/// Does `steps` to a connection and then reads it to its end. What came, and whether the connection was closed from the other side before nothing had come for `patience` after the first byte, or for `DEADLINE` before it.
 async fn play<S: AsyncRead + AsyncWrite + Unpin>(mut io: S, steps: &[Step], patience: Duration) -> (Vec<u8>, bool) {
 	let (mut got, mut buf) = (Vec::new(), vec![0u8; 65536]);
 	for step in steps {
@@ -402,7 +404,7 @@ async fn play<S: AsyncRead + AsyncWrite + Unpin>(mut io: S, steps: &[Step], pati
 		}
 	}
 	loop {
-		match timeout(patience, io.read(&mut buf)).await {
+		match timeout(if got.is_empty() {DEADLINE} else {patience}, io.read(&mut buf)).await {
 			Ok(Ok(count)) if count > 0 => got.extend_from_slice(&buf[..count]),
 			Ok(_) => return (got, true),
 			Err(_) => return (got, false),
@@ -443,7 +445,7 @@ impl Device {
 		let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
 		let end = loop {
 			if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {break end + 4}
-			match timeout(Duration::from_secs(4), io.read(&mut buf)).await {
+			match timeout(DEADLINE, io.read(&mut buf)).await {
 				Ok(Ok(count)) if count > 0 => head.extend_from_slice(&buf[..count]),
 				_ => break head.len(),
 			}
@@ -505,7 +507,7 @@ impl Device {
 		if !self.open(at).await.starts_with("HTTP/1.1 101 ") {return false}
 		let init = self.initiation();
 		self.put(&[&init]).await;
-		let Some(answer) = self.chunk(SECOND).await else {return false};
+		let Some(answer) = self.chunk(DEADLINE).await else {return false};
 		let (Some(response), mut out) = (answer.first(), vec![0u8; 2048]) else {return false};
 		let TunnResult::WriteToNetwork(keepalive) = self.tunn.decapsulate(None, response, &mut out) else {panic!("the first answer held no handshake response")};
 		let keepalive = keepalive.to_vec();
@@ -560,7 +562,7 @@ impl Device {
 		(ack.ack, ack.acknowledgment_number) = (true, answer.sequence_number.wrapping_add(1));
 		PacketBuilder::ipv4(address(n), PUBLIC, 64).tcp_header(ack).write(&mut out, &[]).unwrap();
 		self.send(&out).await;
-		let (_, said) = segment(&self.recv(Duration::from_secs(3), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (80, sport) && !data.is_empty())).await?)?;
+		let (_, said) = segment(&self.recv(DEADLINE, |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (80, sport) && !data.is_empty())).await?)?;
 		let (mut rst, mut out) = (TcpHeader::new(sport, 80, 1001, 0), Vec::new());
 		rst.rst = true;
 		PacketBuilder::ipv4(address(n), PUBLIC, 64).tcp_header(rst).write(&mut out, &[]).unwrap();
@@ -593,14 +595,14 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 	assert_eq!((a.chunk(QUIET).await, node.totals().pending, node.totals().sessions), (None, 1, 0));
 	let init = a.initiation();
 	a.put(&[&init]).await;
-	let first = a.chunk(SECOND).await.expect("no first answer");
+	let first = a.chunk(DEADLINE).await.expect("no first answer");
 	assert_eq!((first.len(), first[0].len(), first[0][0]), (1, 92, 2));
 	let mut out = vec![0u8; 2048];
 	let TunnResult::WriteToNetwork(keepalive) = a.tunn.decapsulate(None, &first[0], &mut out) else {panic!("no handshake response")};
 	let keepalive = keepalive.to_vec();
 	a.put(&[&keepalive]).await;
 	// "The node answers a chunk that held only a WireGuard keepalive with one padding-only chunk, the echo, after the echo delay."
-	assert_eq!(a.chunk(Duration::from_secs(4)).await, Some(Vec::new()), "a lone keepalive was not echoed");
+	assert_eq!(a.chunk(DEADLINE).await, Some(Vec::new()), "a lone keepalive was not echoed");
 	assert_eq!(a.leaves(40000).await.as_deref(), Some("main"));
 	// The control channel at the gateway: the opening exchange under the device's transport secret, inside the tunnel that came over `tls`.
 	let (mut syn, mut out, sport, started) = (TcpHeader::new(41000, PORT, 5000, 65535), Vec::new(), 41000, Instant::now());
@@ -617,7 +619,7 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 		a.send(&out).await;
 		seq = seq.wrapping_add(up.len() as u32);
 		up.clear();
-		let (tcp, data) = segment(&a.recv(Duration::from_secs(3), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the control channel went quiet")).unwrap();
+		let (tcp, data) = segment(&a.recv(DEADLINE, |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the control channel went quiet")).unwrap();
 		ack = tcp.sequence_number.wrapping_add(data.len() as u32);
 		let mut input = &data[..];
 		if let Some(opened) = opening.receive(started.elapsed(), &mut input, &mut up).expect("the node broke the opening exchange") {break (opened, input.to_vec())}
@@ -636,7 +638,7 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 			Some(NodeMessage::ProbeToken {..}) => panic!("a probe run was started over tls"),
 			Some(_) => rest = input.to_vec(),
 			None => {
-				let (tcp, data) = segment(&a.recv(Duration::from_secs(3), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the probe run was not answered")).unwrap();
+				let (tcp, data) = segment(&a.recv(DEADLINE, |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (PORT, sport) && !data.is_empty() && tcp.sequence_number == ack)).await.expect("the probe run was not answered")).unwrap();
 				ack = tcp.sequence_number.wrapping_add(data.len() as u32);
 				rest = [input, &data[..]].concat();
 			}
@@ -727,6 +729,7 @@ async fn whoever_is_not_a_user_gets_from_the_node_exactly_what_the_origin_gives(
 	// The cases are not all silence: the origin answered most of them, and the node passed each answer on.
 	assert!(answered >= 22, "only {answered} cases were answered at all");
 	// The spent proof, the removed device and the changed proof were three kinds of refusal inside the node, and one answer outside it.
+	eventually("the node did not count what the cases did", || {let totals = node.totals(); (totals.refused_seen, totals.proofs_accepted, totals.decoy_down) == (1, 1, 0) && (totals.stranger_syntax, totals.stranger_origin, totals.stranger_slow, totals.stranger_proof, totals.relays, totals.relayed, totals.undecided) == (7, 2, 0, 18, 28, 0, 0)}).await;
 	let totals = node.totals();
 	assert_eq!((totals.refused_seen, totals.proofs_accepted, totals.decoy_down), (1, 1, 0), "{totals:?}");
 	// Seven were no request line a user could send, two never finished theirs and were decided when the origin gave them up, long before the node's own limit, and eighteen were complete lines that proved nothing. All twenty-eight were relayed.
@@ -978,6 +981,7 @@ async fn a_session_carries_only_the_tunnel_of_the_device_its_proof_named() {
 	assert!(a.open(time.secs()).await.starts_with("HTTP/1.1 101 "));
 	let foreign = b.initiation();
 	a.put(&[&foreign]).await;
+	eventually("the foreign initiation was not counted", || node.totals().tunnel == 1 && node.totals().pending == 1).await;
 	assert_eq!((a.chunk(QUIET).await, a.closed, node.totals().pending, node.totals().tunnel), (None, false, 1, 1));
 	// B's own session is B's: its tunnel comes up there, and A's pending session is not helped by it.
 	b.connect(time).await;
@@ -985,10 +989,12 @@ async fn a_session_carries_only_the_tunnel_of_the_device_its_proof_named() {
 	// A data packet of B's tunnel on A's session is nobody's either.
 	let stray = b.sealed(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 7, 0, 3, 10, 7, 0, 1]);
 	a.put(&[&stray]).await;
+	eventually("the stray packet was not counted", || node.totals().tunnel == 2).await;
 	assert_eq!((a.chunk(QUIET).await, node.totals().tunnel, node.totals().pending), (None, 2, 1));
 	// "A pending session that is not established within the first tunnel packet deadline is ended."
 	time.ahead.fetch_add(11, Ordering::SeqCst);
 	assert!(a.ends(2 * SECOND).await);
+	eventually("the pending session was not counted as ended", || node.totals().ended_deadline == 1 && node.totals().pending == 0).await;
 	assert_eq!((node.totals().ended_deadline, node.totals().pending, node.totals().sessions), (1, 0, 1));
 	node.engine.shutdown().await;
 }
@@ -1017,7 +1023,7 @@ async fn pressure_from_strangers_lands_on_strangers() {
 	eventually("the pool did not displace its oldest", || node.totals().undecided == 4 && node.totals().stranger_displaced == 2).await;
 	let _more = (node.dial(from(5)).await, node.dial(from(6)).await, node.dial(from(7)).await);
 	eventually("a handshake was not displaced", || node.totals().handshake_displaced == 1).await;
-	assert_eq!(timeout(SECOND, stalled.read(&mut [0u8; 16])).await.unwrap().unwrap(), 0, "a displaced handshake was not closed");
+	assert_eq!(timeout(DEADLINE, stalled.read(&mut [0u8; 16])).await.unwrap().unwrap(), 0, "a displaced handshake was not closed");
 	// "Relayed: the relayed connection that has been idle longest is closed. If none has been idle for the time in the table of numbers, the oldest is closed." The pool of three is full by now, and `first` is its oldest.
 	eventually("the relayed pool is not full, or closed nobody for room", || node.totals().relayed == 3 && node.totals().relays_evicted == 1).await;
 	let (rest, closed) = play(first, &[], SECOND).await;
@@ -1049,7 +1055,7 @@ async fn the_relayed_connection_that_was_idle_longest_makes_room() {
 	let mut three = node.dial(Ipv4Addr::LOCALHOST.into()).await;
 	three.write_all(get).await.unwrap();
 	assert!(three.read(&mut answer).await.unwrap() > 0);
-	assert_eq!(timeout(SECOND, two.read(&mut answer)).await.map(|read| read.unwrap_or(0)).unwrap_or(1), 0, "the idlest connection was not the one that was closed");
+	assert_eq!(timeout(DEADLINE, two.read(&mut answer)).await.map(|read| read.unwrap_or(0)).unwrap_or(1), 0, "the idlest connection was not the one that was closed");
 	one.write_all(get).await.unwrap();
 	assert!(one.read(&mut answer).await.unwrap() > 0);
 	assert_eq!((node.totals().relays_evicted, node.totals().relayed), (1, 2));
@@ -1088,7 +1094,7 @@ async fn the_limits_of_a_device_hold_across_udp_obfs_and_tls() {
 		let init = a.initiation();
 		let (sock, mut tx, mut rx) = obfs(0, &init, datagrams, time.secs()).await;
 		let (mut packet, mut scratch, mut out) = (vec![0u8; 2048], Vec::new(), vec![0u8; 2048]);
-		let (count, _) = timeout(SECOND, sock.recv_from(&mut packet)).await.expect("no first answer over udp-obfs").unwrap();
+		let (count, _) = timeout(DEADLINE, sock.recv_from(&mut packet)).await.expect("no first answer over udp-obfs").unwrap();
 		let response = rx.open(&packet[..count], &mut scratch).unwrap().expect("a padding-only first answer").to_vec();
 		let TunnResult::WriteToNetwork(keepalive) = a.tunn.decapsulate(None, &response, &mut out) else {panic!("no handshake response")};
 		let (keepalive, mut sealed) = (keepalive.to_vec(), Vec::new());
@@ -1112,7 +1118,7 @@ async fn the_limits_of_a_device_hold_across_udp_obfs_and_tls() {
 	assert_eq!((node.engine.obfs().sessions, node.totals().sessions, node.totals().pending), (4, 4, 1));
 	let init = ninth.initiation();
 	ninth.put(&[&init]).await;
-	assert!(ninth.chunk(SECOND).await.is_some_and(|answer| answer.len() == 1));
+	assert!(ninth.chunk(DEADLINE).await.is_some_and(|answer| answer.len() == 1));
 	eventually("the ninth session displaced nothing", || node.engine.obfs().ended_displaced == 1).await;
 	assert_eq!((node.engine.obfs().sessions, node.totals().sessions, node.totals().ended_displaced), (3, 5, 0));
 	node.engine.shutdown().await;
@@ -1125,18 +1131,19 @@ async fn a_session_lives_by_its_chunks_and_ends_when_it_is_idle() {
 	let node = launch("idle", time, |_| {}).await;
 	let mut a = node.device(0);
 	a.connect(time).await;
-	assert_eq!(a.chunk(Duration::from_secs(4)).await, Some(Vec::new()), "the keepalive that ended the handshake was not echoed");
-	// Two hundred seconds of silence, a padding-only chunk, two hundred more: the session is still there, because the chunk was activity.
+	assert_eq!(a.chunk(DEADLINE).await, Some(Vec::new()), "the keepalive that ended the handshake was not echoed");
+	// Two hundred seconds of silence, a padding-only chunk, two hundred more: the session is still there, because the chunk was activity. The keepalive behind the chunk is echoed only once the chunk is handled, so the clock moves after that echo.
 	node.advance(200).await;
 	a.put(&[]).await;
-	tokio::time::sleep(Duration::from_millis(300)).await;
+	let keepalive = a.sealed(&[]);
+	a.put(&[&keepalive]).await;
+	assert!(a.chunk(DEADLINE).await.is_some(), "the keepalive behind the padding-only chunk was not echoed");
 	node.advance(200).await;
-	tokio::time::sleep(Duration::from_millis(1300)).await;
-	assert_eq!((node.totals().sessions, a.closed), (1, false));
 	// An idle keepalive of the device gets a chunk back: the echo, "unless it sent something else in that time", which the keepalive of the node's own WireGuard may be.
 	let keepalive = a.sealed(&[]);
 	a.put(&[&keepalive]).await;
-	assert!(a.chunk(Duration::from_secs(4)).await.is_some_and(|chunk| chunk.iter().all(|datagram| datagram.len() == 32)));
+	assert!(a.chunk(DEADLINE).await.is_some_and(|chunk| chunk.iter().all(|datagram| datagram.len() == 32)));
+	assert_eq!((node.totals().sessions, a.closed), (1, false));
 	// Three hundred seconds with nothing end it, with the one close.
 	node.advance(301).await;
 	assert!(a.ends(2 * SECOND).await);
@@ -1180,7 +1187,7 @@ async fn what_a_session_does_not_allow_ends_it_the_same_way() {
 	a.io.as_mut().unwrap().write_all(&ping).await.unwrap();
 	let (mut read, pong) = (vec![0u8; 4096], [&[0x8a, 11][..], b"still there"].concat());
 	while !a.buf.windows(pong.len()).any(|window| window == pong) {
-		let count = timeout(Duration::from_secs(4), a.io.as_mut().unwrap().read(&mut read)).await.expect("no pong").unwrap();
+		let count = timeout(DEADLINE, a.io.as_mut().unwrap().read(&mut read)).await.expect("no pong").unwrap();
 		a.buf.extend_from_slice(&read[..count]);
 	}
 	let token = node.device(0).prover.prove(Name::Tls, time.secs(), &mut random).unwrap().token;
@@ -1403,7 +1410,7 @@ async fn a_reload_keeps_what_is_as_it_was_and_ends_what_is_not() {
 	// The transport goes: its listener closes with every connection it holds, and the address is free again.
 	let (free, was) = (listen(), node.addr);
 	node.reload(|doc| doc["inbounds"][0]["transports"] = json!([{"type": "udp", "listen": free.to_string()}])).await;
-	assert_eq!(timeout(SECOND, stranger.read(&mut answer)).await.map(|read| read.unwrap_or(0)).unwrap_or(1), 0, "a relayed connection outlived its listener");
+	assert_eq!(timeout(DEADLINE, stranger.read(&mut answer)).await.map(|read| read.unwrap_or(0)).unwrap_or(1), 0, "a relayed connection outlived its listener");
 	eventually("the listener is still there", || std::net::TcpStream::connect(was).is_err()).await;
 	assert_eq!((node.totals().sessions, node.totals().pending, node.totals().relayed, node.totals().undecided), (0, 0, 0, 0));
 	node.engine.shutdown().await;

@@ -37,7 +37,7 @@ async fn a_device_reaches_its_tunnel_through_the_operators_web_server() {
 	let keepalive = a.confirm(&first[0]);
 	a.put(&[&keepalive]).await;
 	// "The node answers a chunk that held only a WireGuard keepalive with one padding-only chunk, the echo, after the echo delay."
-	assert_eq!(a.chunk(Duration::from_secs(4)).await, Some(Vec::new()), "a lone keepalive was not echoed");
+	assert_eq!(a.chunk(Duration::from_secs(30)).await, Some(Vec::new()), "a lone keepalive was not echoed");
 	assert_eq!(a.leaves(40000).await.as_deref(), Some("main"));
 	a.control(41000).await;
 	// Usage is counted, the session is one of the native `ws`, and its source is the visitor the reverse proxy named. Nothing of the user's reached the origin: a `ws` listener takes no field of its upgrade answer from it, and opens a connection there only for a request that is no user's.
@@ -173,6 +173,7 @@ async fn whoever_is_not_a_user_gets_through_the_node_exactly_what_the_origin_giv
 	assert_eq!(answered, count - 4);
 	// The session of the stranger's two requests is as it was: its client's next request is its next request.
 	assert!(p.poll(&[]).await.is_ok(), "{}", p.answer);
+	eventually("the node did not count what the cases did", || {let totals = node.totals(); (totals.refused_seen, totals.proofs_accepted, totals.decoy_down, totals.decoys, totals.stranger_session, totals.stranger_body, totals.stranger_head) == (1, 2, 0, 0, 1, 1, 1) && totals.forwards >= count as u64 - 4 && totals.forwards_unframed >= 12}).await;
 	let totals = node.totals();
 	assert_eq!((totals.refused_seen, totals.proofs_accepted, totals.decoy_down, totals.decoys, totals.stranger_session, totals.stranger_body, totals.stranger_head), (1, 2, 0, 0, 1, 1, 1), "{totals:?}");
 	assert!(totals.forwards >= count as u64 - 4 && totals.forwards_unframed >= 12 && totals.forwards_cut == 0, "{totals:?}");
@@ -317,7 +318,7 @@ async fn answers_without_a_body_a_last_answer_and_a_stale_connection() {
 	let (mut io, expected) = (dial(node.addr, PROXY).await, "HTTP/1.1 204 No Content\r\nServer: s\r\n\r\nHTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
 	io.write_all(&[ask("/none"), ask("/same"), forwarded(b"HEAD /page HTTP/1.1\r\nHost: node.test\r\n\r\n", "198.51.100.7"), ask("/page")].concat()).await.unwrap();
 	let mut got = vec![0u8; expected.len()];
-	tokio::time::timeout(2 * SECOND, io.read_exact(&mut got)).await.expect("the answers did not all come").unwrap();
+	tokio::time::timeout(Duration::from_secs(30), io.read_exact(&mut got)).await.expect("the answers did not all come").unwrap();
 	assert_eq!((String::from_utf8_lossy(&got).as_ref(), node.site.connections.load(Ordering::SeqCst), node.totals().forwards_unframed), (expected, 1, 0));
 	// The kept connection is closed by the origin as the next request reaches it: the request is sent once more on a new one, and the proxy sees an answer and nothing else.
 	io.write_all(&ask("/stale")).await.unwrap();
@@ -614,6 +615,7 @@ async fn a_session_carries_only_the_tunnel_of_the_device_its_proof_named() {
 	assert!(a.open(time.secs()).await.starts_with("HTTP/1.1 101 "));
 	let foreign = b.initiation();
 	a.put(&[&foreign]).await;
+	eventually("the foreign initiation was not counted", || node.totals().tunnel == 1 && node.totals().pending == 1).await;
 	assert_eq!((a.chunk(QUIET).await, a.closed, node.totals().pending, node.totals().tunnel), (None, false, 1, 1));
 	// B's own session is B's: its tunnel comes up there, and A's pending session is not helped by it.
 	b.connect(time).await;
@@ -621,10 +623,12 @@ async fn a_session_carries_only_the_tunnel_of_the_device_its_proof_named() {
 	// A data packet of B's tunnel on A's session is nobody's either.
 	let stray = b.sealed(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 10, 7, 0, 3, 10, 7, 0, 1]);
 	a.put(&[&stray]).await;
+	eventually("the stray packet was not counted", || node.totals().tunnel == 2).await;
 	assert_eq!((a.chunk(QUIET).await, node.totals().tunnel, node.totals().pending), (None, 2, 1));
 	// "A pending session that is not established within the first tunnel packet deadline is ended."
 	time.ahead.fetch_add(11, Ordering::SeqCst);
 	assert!(a.ends(2 * SECOND).await);
+	eventually("the pending session was not counted as ended", || node.totals().ended_deadline == 1 && node.totals().pending == 0).await;
 	assert_eq!((node.totals().ended_deadline, node.totals().pending, node.totals().sessions), (1, 0, 1));
 	node.engine.shutdown().await;
 }
@@ -644,7 +648,7 @@ async fn strangers_hold_half_the_proxy_pool_at_the_most_and_no_user_is_cut_for_t
 		io.write_all(&forwarded(b"GET /slow HTTP/1.1\r\nHost: node.test\r\n\r\n", from)).await.unwrap();
 		io
 	};
-	let cut = |mut io: tokio::net::TcpStream| async move {matches!(tokio::time::timeout(SECOND, io.read(&mut [0u8; 64])).await, Ok(Ok(0) | Err(_)))};
+	let cut = |mut io: tokio::net::TcpStream| async move {matches!(tokio::time::timeout(Duration::from_secs(30), io.read(&mut [0u8; 64])).await, Ok(Ok(0) | Err(_)))};
 	// A visitor's third request closes the connection of its first, at once and with no answer. The other visitor's are not touched. Each request is with the origin before the next is sent, so that which is the oldest is known.
 	let first = waiting("198.51.100.1").await;
 	eventually("the request did not reach the origin", || node.totals().decoys == 1).await;
@@ -714,11 +718,13 @@ async fn a_session_lives_by_its_chunks_and_ends_when_it_is_idle_or_broken() {
 	let (mut a, mut b) = (node.device(0), node.device(1));
 	a.connect(time).await;
 	b.connect(time).await;
-	// What a device sent is with the node before the clock moves.
-	tokio::time::sleep(Duration::from_millis(300)).await;
+	// What a device sent is with the node before the clock moves: each connect ends with a keepalive that the node echoes, and the echo comes after the chunks before it were handled.
+	assert!(a.chunk(Duration::from_secs(30)).await.is_some() && b.chunk(Duration::from_secs(30)).await.is_some());
 	node.advance(200).await;
 	a.put(&[]).await;
-	tokio::time::sleep(Duration::from_millis(300)).await;
+	let keepalive = a.sealed(&[]);
+	a.put(&[&keepalive]).await;
+	assert!(a.chunk(Duration::from_secs(30)).await.is_some(), "the keepalive after the padding-only chunk was not echoed");
 	node.advance(150).await;
 	let (idle, kept) = (b.ends(3 * SECOND).await, !a.ends(QUIET).await);
 	assert_eq!((idle, kept, node.totals().ended_idle, node.totals().sessions), (true, true, 1, 1), "{:?}", node.totals());

@@ -43,8 +43,8 @@ const ROTATED: [u8; 32] = [0x62; 32];
 const NAME: &str = "www.example.com";
 const PAGE: &str = "<html>the borrowed site</html>\n";
 const SECOND: Duration = Duration::from_secs(1);
-/// What a quiet connection is given to stay quiet in.
-const QUIET: Duration = Duration::from_millis(500);
+// Bounds a wait for something that must come: it only ends a test that is already broken, so a slow runner gets all the time it needs.
+const DEADLINE: Duration = Duration::from_secs(30);
 const PLAIN: Kind = Kind::Packet {flow: 0, control: false};
 /// How long the probes of a test node wait: the site of a test answers at once and ends a connection that is idle after 250 ms.
 const QUICK: Patience = Patience {gap: Duration::from_millis(10), collect: Duration::from_millis(60), idle: Duration::from_millis(600), reaction: Duration::from_millis(600)};
@@ -319,7 +319,7 @@ impl Node {
 /// Waits for something the engine does on its own time.
 async fn eventually(what: &str, done: impl Fn() -> bool) {
 	// Windows answers a connect to a closed loopback port only after its SYN retries, about 2 s each, so the probes of a site that is down take longer there.
-	let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) {40} else {8});
+	let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) {40} else {30});
 	while !done() {
 		assert!(Instant::now() < deadline, "{what}");
 		tokio::time::sleep(Duration::from_millis(20)).await;
@@ -435,7 +435,7 @@ impl Peer {
 		(ack.ack, ack.acknowledgment_number) = (true, answer.sequence_number.wrapping_add(1));
 		PacketBuilder::ipv4(address(self.n), PUBLIC, 64).tcp_header(ack).write(&mut out, &[]).unwrap();
 		self.send(&out);
-		let (_, said) = segment(&self.recv(Duration::from_secs(6), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (80, sport) && !data.is_empty())).await?)?;
+		let (_, said) = segment(&self.recv(Duration::from_secs(30), |packet| segment(packet).is_some_and(|(tcp, data)| (tcp.source_port, tcp.destination_port) == (80, sport) && !data.is_empty())).await?)?;
 		let (mut rst, mut out) = (TcpHeader::new(sport, 80, 1001, 0), Vec::new());
 		rst.rst = true;
 		PacketBuilder::ipv4(address(self.n), PUBLIC, 64).tcp_header(rst).write(&mut out, &[]).unwrap();
@@ -453,7 +453,7 @@ impl Peer {
 	}
 }
 
-/// Sends `bytes` to `to` and reads until the connection ends or nothing came for `patience`. What came, and whether the other end closed.
+/// Sends `bytes` to `to` and reads until the connection ends or nothing came for `patience` after the first byte, which may take `DEADLINE` to come. What came, and whether the other end closed.
 async fn ask(to: SocketAddr, bytes: &[u8], patience: Duration) -> (Vec<u8>, bool) {
 	let (mut io, mut got, mut buf) = (TcpStream::connect(to).await.unwrap(), Vec::new(), vec![0u8; 65536]);
 	if !bytes.is_empty() {
@@ -461,7 +461,7 @@ async fn ask(to: SocketAddr, bytes: &[u8], patience: Duration) -> (Vec<u8>, bool
 		let _ = io.flush().await;
 	}
 	loop {
-		match timeout(patience, io.read(&mut buf)).await {
+		match timeout(if got.is_empty() {DEADLINE} else {patience}, io.read(&mut buf)).await {
 			Ok(Ok(count)) if count > 0 => got.extend_from_slice(&buf[..count]),
 			Ok(_) => return (got, true),
 			Err(_) => return (got, false),
@@ -514,7 +514,7 @@ async fn ask_twice(to: SocketAddr, first: &[u8], second: &[u8], patience: Durati
 	let (mut io, mut buf) = (TcpStream::connect(to).await.unwrap(), vec![0u8; 65536]);
 	io.write_all(first).await.unwrap();
 	let (mut one, mut two) = (Vec::new(), Vec::new());
-	while let Ok(Ok(count)) = timeout(patience, io.read(&mut buf)).await {
+	while let Ok(Ok(count)) = timeout(if one.is_empty() {DEADLINE} else {patience}, io.read(&mut buf)).await {
 		if count == 0 {return (one, two, true)}
 		one.extend_from_slice(&buf[..count]);
 	}
@@ -659,7 +659,7 @@ async fn bytes_that_are_no_hello_get_what_the_site_sends_and_the_way_it_closes()
 		("nothing at all", Vec::new()),
 	];
 	for (what, bytes) in &inputs {
-		let (direct, through) = (ask(node.site.addr, bytes, QUIET).await, ask(node.addr, bytes, QUIET).await);
+		let (direct, through) = (ask(node.site.addr, bytes, Duration::from_millis(1500)).await, ask(node.addr, bytes, Duration::from_millis(1500)).await);
 		assert_eq!(direct, through, "{what}: the site gave one answer and the node another");
 	}
 	// A hello that is cut short is held for 3 s and then handed to the site as it was, and the site's timers run from there.
@@ -801,6 +801,7 @@ async fn a_spent_budget_for_the_site_closes_a_stranger_and_never_a_user() {
 		asks.push(tokio::spawn(async move {ask(to, b"GET / HTTP/1.1\r\n\r\n", Duration::from_secs(2)).await}));
 	}
 	for ask in asks {ask.await.unwrap();}
+	eventually("the connections of strangers were not all counted", || node.totals().early_connections + node.totals().early_skipped == 80).await;
 	let totals = node.totals();
 	assert!(totals.early_skipped >= 1 && totals.site_budget >= 1 && totals.early_connections + totals.early_skipped == 80, "{totals:?}");
 	// All of them are one source, of which the node relays 8 at once and closes the oldest for the next.
@@ -965,7 +966,7 @@ async fn a_replayer_that_goes_silent_after_the_flight_gets_the_reaction_of_a_sit
 	let hello = recorded(&node).await;
 	let shown = probe(node.site.addr, NAME, Mode::Wait, time.secs(), QUICK).await.unwrap().idle.expect("the site ends an idle connection");
 	let started = Instant::now();
-	let (answer, closed) = ask(node.addr, &hello, Duration::from_millis(1800)).await;
+	let (answer, closed) = ask(node.addr, &hello, Duration::from_secs(10)).await;
 	// Not a bare close at the handshake deadline of 10 s: the alert the site sent when it ended an idle connection, then the end, at about the time it did.
 	assert!(closed && started.elapsed() < Duration::from_secs(5), "closed: {closed} after {:?}", started.elapsed());
 	let (size, ..) = shown.alert.expect("the site sends an alert");

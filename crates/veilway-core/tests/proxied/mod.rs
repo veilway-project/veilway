@@ -670,7 +670,7 @@ pub fn forwarded(request: &[u8], from: &str) -> Vec<u8> {
 
 /// Waits for something the engine does on its own time.
 pub async fn eventually(what: &str, done: impl Fn() -> bool) {
-	let deadline = Instant::now() + Duration::from_secs(8);
+	let deadline = Instant::now() + Duration::from_secs(30);
 	while !done() {
 		assert!(Instant::now() < deadline, "{what}");
 		tokio::time::sleep(Duration::from_millis(20)).await;
@@ -887,7 +887,7 @@ impl Device {
 		if !self.open(at).await.starts_with("HTTP/1.1 101 ") {return false}
 		let init = self.initiation();
 		self.put(&[&init]).await;
-		let Some(answer) = self.chunk(2 * SECOND).await else {return false};
+		let Some(answer) = self.chunk(Duration::from_secs(30)).await else {return false};
 		let Some(response) = answer.first() else {return false};
 		let keepalive = self.confirm(response);
 		self.put(&[&keepalive]).await;
