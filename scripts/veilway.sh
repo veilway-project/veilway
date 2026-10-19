@@ -697,7 +697,7 @@ install_self() {
 	step "installed $SELF"
 }
 
-# The panel runs unprivileged and never updates itself. It writes the word "panel" to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
+# The panel runs unprivileged and never updates itself. It writes the word "panel", "node" or "both" to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
 updater_units() {
 	act install -d -m 0770 -o root -g veilway-panel "$UPDATE_DIR"
 	act install -d -m 0700 -o root -g root "$BACKUP_DIR"
@@ -714,7 +714,7 @@ WantedBy=multi-user.target
 EOF
 	write_unit "$UNIT_DIR/veilway-panel-update.service" <<EOF
 [Unit]
-Description=Veilway panel update, started by a request from the panel
+Description=Veilway update of the panel, the node or both, started by a request from the panel
 Documentation=https://github.com/$PANEL_REPO
 After=network-online.target
 Wants=network-online.target
@@ -726,7 +726,7 @@ TimeoutStartSec=15min
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
 ProtectSystem=strict
-ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -$BACKUP_DIR -$UPDATE_DIR
+ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -$BACKUP_DIR -$UPDATE_DIR -$CONF_DIR
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -771,10 +771,10 @@ do_panel_update_request() {
 	need_root
 	if [ -f "$req" ] && [ ! -L "$req" ]; then word="$(timeout 5 head -c 16 -- "$req" 2>/dev/null | tr -d '\n' || true)"; fi
 	rm -f -- "$req"
-	[ "$word" = panel ] || { warn "the update request was not the word panel: ignored"; return 0; }
+	case "$word" in panel | node | both) ;; *) warn "the update request was not panel, node or both: ignored"; return 0 ;; esac
 	# A service has no terminal to answer a question on: the admin said yes in the panel.
 	ASSUME_YES=1
-	do_update panel
+	do_update "$word"
 }
 
 install_panel() {
