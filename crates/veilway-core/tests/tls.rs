@@ -650,6 +650,8 @@ async fn a_device_reaches_its_tunnel_and_everything_of_the_engine_works_over_it(
 	assert_eq!((peers.len(), peers[0].over, peers[0].handshake.is_some()), (1, Some(Over::Tls), true));
 	assert_eq!((totals.proofs_accepted, totals.established, totals.sessions, totals.pending, totals.relays, totals.undecided, control.authenticated), (1, 1, 1, 0, 0, 0, 1), "{totals:?}");
 	assert!(node.engine.user("a").unwrap().up_bytes > 0 && node.engine.user("a").unwrap().down_bytes > 0);
+	// The connection the node opened for the user is counted by the origin on its own time.
+	eventually("the origin did not see the node's second connection", || node.site.connections.load(Ordering::SeqCst) >= 2).await;
 	assert_eq!((node.site.requests.load(Ordering::SeqCst), node.site.connections.load(Ordering::SeqCst)), (1, 2));
 	// "Either side ends a session with a WebSocket Close frame with status 1000 and no reason": the device's is answered with the node's, and the connection ends.
 	let mut close = Vec::new();
