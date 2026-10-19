@@ -39,6 +39,7 @@ Update this block at the end of every work session.
 - `v0.2.1-alpha` is released (2026-10-18) for the core and the panel together, after `v0.2.0-alpha` shipped without a panel release.
 - `v0.2.2-alpha` (2026-10-19), core and panel: the panel updates the node as well as itself, every installer update replaces the saved installer with the signed one of the release, and installer fixes (the HTTPS port question, an empty domain, the setup token of an earlier run, uninstall).
 - `v0.2.3-alpha` (2026-10-19), core and panel: `via` for proxy chains of `socks5` outbounds (up to 8) and for node links through an outbound, in the panel as Through; the timing tests of `tls`, `ws` and `faketls` wait on conditions. The outbound chaining item of v0.3.0 is done.
+- `v0.2.4-alpha` (2026-10-19), panel changes with the core raised to match: Xray caps only the profiles that share its address, Xray in the add-inbound choice, a layout direction setting (panel, docs, website), the config version label, right-to-left fixes on the Nodes and Tunnels pages.
 - `v0.2.0-alpha` is released (2026-10-18), with the alpha gate passing and CI green on every platform. Next action: v0.3.0, the first beta (see its section): the clients on real macOS and Windows machines, split tunneling, the store builds, and an outside review of borrowed-site mode.
 - Builds, tests and anything else that runs go in Docker containers, not on the host.
 - Open decisions waiting on the owner: see "Decisions the owner still owes"
