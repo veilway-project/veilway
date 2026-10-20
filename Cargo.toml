@@ -18,7 +18,8 @@ clap={version="4", features=["derive"]}
 tracing="0.1"
 tracing-subscriber={version="0.3", features=["env-filter"]}
 futures-util={version="0.3", default-features=false, features=["sink"]}
-tokio-tungstenite={version="0.30", features=["rustls-tls-webpki-roots"]}
+# Only the rustls connector, no root store of its own: the ws client passes one built from webpki-roots 1, so the deprecated webpki-roots 0.26 shim is never pulled in.
+tokio-tungstenite={version="0.30", features=["__rustls-tls"]}
 tokio-rustls={version="0.26", default-features=false, features=["ring", "tls12"]}
 rustls={version="0.23", default-features=false, features=["ring", "std", "tls12", "logging"]}
 rcgen="0.14"
@@ -51,7 +52,7 @@ hpke={version="=0.14.1", default-features=false, features=["x25519", "chacha"]}
 subtle={version="2.6", default-features=false}
 # X25519 for the one key agreement of node link pairing, as a plain function over bytes the caller drew. It is the version `hpke` brings already, and no feature of it is on.
 x25519-dalek={version="3", default-features=false}
-# The Mozilla root certificates, which the TLS of a node link's dialler is validated against. `tokio-tungstenite` brings the same crate already.
+# The Mozilla root certificates, which the TLS of a node link's dialler and of the ws client is validated against.
 webpki-roots="1"
 # The archive of the Xray-core add-on: one entry is read out of it, inflated under a cap. Only deflate with the pure Rust zlib-rs backend is on, so no encryption, bzip2, zstd, xz or time code comes in, and the archives are checked against a pin before they are opened.
 zip={version="9.0", default-features=false, features=["deflate-flate2-zlib-rs"]}

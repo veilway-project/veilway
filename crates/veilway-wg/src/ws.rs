@@ -271,9 +271,11 @@ pub async fn run_client_on(sock:UdpSocket, url:String, insecure:bool)->anyhow::R
 /// TLS SNI and the HTTP Host header still come from `url`, so only the A/AAAA lookup is skipped.
 pub async fn run_client_to(sock:UdpSocket, url:String, insecure:bool, addr:Option<SocketAddr>)->anyhow::Result<()>{
 	let _=rustls::crypto::ring::default_provider().install_default();
-	let connector=if insecure{
-		Some(Connector::Rustls(Arc::new(rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth())))
-	}else{None};
+	let connector=Some(Connector::Rustls(Arc::new(if insecure{
+		rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth()
+	}else{
+		rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore{roots:webpki_roots::TLS_SERVER_ROOTS.to_vec()}).with_no_client_auth()
+	})));
 	let sock=Arc::new(sock);
 	info!(listen=%sock.local_addr()?, %url, insecure, dial=?addr, "bridge listening");
 	let (mut peers, mut buf)=(HashMap::<SocketAddr, mpsc::Sender<Bytes>>::new(), [0u8; MAX_DATAGRAM]);
