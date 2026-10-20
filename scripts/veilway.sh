@@ -1043,7 +1043,7 @@ do_status() {
 do_admin() {
 	local name="${2:-}" pw pw2
 	[ -x "$BIN_DIR/veilway-panel" ] && [ -f "$CONF_DIR/panel.json" ] || die "no panel is installed here"
-	if [ "${1:-list}" = list ]; then as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" 2>/dev/null || die "this panel cannot list its admins: update it to v0.2.5 or later"; return 0; fi
+	if [ "${1:-list}" = list ]; then as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" || die "the admins could not be listed: the reason is above, and a panel older than v0.2.5 does not have this command"; return 0; fi
 	[ "$1" = reset ] || die "try: admin list, or admin reset <username>"
 	[ -n "$name" ] || name="$(ask "Username:" "")"
 	[ -n "$name" ] || die "give the username: admin reset <username>"
@@ -1075,8 +1075,8 @@ do_restart() {
 node_flags() { printf '%s\n' --config "$NODE_DIR/config.json" --state "$STATE_DIR/veilway-state.json" --replay "$STATE_DIR/veilway-replay" --api /run/veilway/control.sock; }
 
 as_mirror_user() { setpriv --reuid veilway-mirror --regid veilway-mirror --clear-groups "$@"; }
-# The panel's own user, so the database and its log files keep their owner.
-as_panel_user() { setpriv --reuid veilway-panel --regid veilway-panel --clear-groups "$@"; }
+# The panel's own user and groups, as its service has them, so the database and its log files keep their owner.
+as_panel_user() { setpriv --reuid veilway-panel --regid veilway-panel --groups veilway "$@"; }
 
 as_mirror() {
 	if [ "$(id -u)" = 0 ] && has setpriv; then as_mirror_user "$BIN_DIR/veilway" "$@"
