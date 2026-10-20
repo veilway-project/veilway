@@ -11,7 +11,7 @@ categories=["network-programming", "cryptography"]
 exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [dependencies]
-veilway-proto={path="../veilway-proto", version="0.2.6"}
+veilway-proto={path="../veilway-proto", version="0.2.7"}
 tokio.workspace=true
 # The handshake of `tls`, `ws` and `fronted` is BoringSSL's, configured as Chrome's (`fingerprint.rs`). rustls stays for the certificate checks (`tls.rs`), which are the same as the node's and the subscription page's.
 boring={version="5.3", default-features=false}
