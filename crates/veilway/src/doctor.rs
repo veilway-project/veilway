@@ -74,8 +74,8 @@ fn answered(asked: &str, query: &[u8], outcome: Option<io::Result<Vec<u8>>>, too
 async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duration) -> Vec<Line> {
 	let (query, started) = (question(), Instant::now());
 	let (udp, tcp) = tokio::join!(
-		async {(timeout(wait, probe::ask_udp(None, target, &query)).await.ok(), started.elapsed())},
-		async {(timeout(wait, async {probe::framed(&mut probe::connect_from(None, target).await?, &query).await}).await.ok(), started.elapsed())},
+		async {(timeout(wait, probe::ask_udp(None, None, target, &query)).await.ok(), started.elapsed())},
+		async {(timeout(wait, async {probe::framed(&mut probe::connect_from(None, None, target).await?, &query).await}).await.ok(), started.elapsed())},
 	);
 	let (silent, advice) = if direct {(Status::Fail, "an exit that leaves directly asks this server over UDP, so its lookups fail or wait for the next server. Check the address and the firewall, or name another server")} else {(Status::Warn, "the node itself does not reach it. No exit of this config leaves directly, so what counts is whether each proxy reaches it, which the outbound lines say")};
 	let (udp, tcp) = (answered("a query from the node over UDP", &query, udp.0, udp.1, wait, silent, advice), answered("a query from the node over TCP", &query, tcp.0, tcp.1, wait, Status::Warn, "an answer too long for one datagram is asked for again over TCP, and an exit through a SOCKS5 proxy asks over TCP only. Use a server that answers over both"));
@@ -88,13 +88,14 @@ async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Dur
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
 	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), tag) else {return Vec::new()};
 	match route {
-		Outbound::Direct {bind} => {
+		Outbound::Direct {bind, interface} => {
+			if let Some(name) = interface.as_deref().filter(|name| !probe::has_interface(name)) {return vec![line(Status::Fail, "outbound", tag, format!("tied to the network interface {name}, which this host does not have: check `ip link`, or remove its `interface`"))]}
 			// The engine passes over a server of the other family than the outbound is bound to, see `resolver`.
 			let Some((at, target)) = servers.iter().copied().enumerate().find(|(_, server)| bind.is_none_or(|bind| bind.is_ipv4() == server.is_ipv4())) else {
 				return vec![line(Status::Warn, "outbound", tag, "no DNS server of the config has an address of the family this outbound is bound to, so no name resolves through it: add a server of that family to dns.servers")];
 			};
-			let (tcp, udp) = tokio::join!(async {(timeout(wait, probe::connect_from(bind, target)).await, started.elapsed())}, async {(timeout(wait, probe::ask_udp(bind, target, &query)).await.ok(), started.elapsed())});
-			let hint = if bind.is_some() {"check that its `bind` address is one of this host's and has a route out"} else {"check the route and the firewall of this host"};
+			let (tcp, udp) = tokio::join!(async {(timeout(wait, probe::connect_from(bind, interface.as_deref(), target)).await, started.elapsed())}, async {(timeout(wait, probe::ask_udp(bind, interface.as_deref(), target, &query)).await.ok(), started.elapsed())});
+			let hint = if interface.is_some() {"check that its `interface` is up and has a route out"} else if bind.is_some() {"check that its `bind` address is one of this host's and has a route out"} else {"check the route and the firewall of this host"};
 			let tcp = match tcp.0 {
 				Ok(Ok(_)) => (Status::Ok, format!("connected to dns.servers[{at}] in {} ms", tcp.1.as_millis())),
 				Ok(Err(e)) if e.kind() == io::ErrorKind::ConnectionRefused => (Status::Warn, format!("the host of dns.servers[{at}] refused the connection in {} ms: the way out works and that server takes no TCP, see its dns line", tcp.1.as_millis())),

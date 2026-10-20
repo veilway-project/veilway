@@ -38,7 +38,8 @@ security-framework="3"
 schemars="1"
 time={version="0.3.36", default-features=false, features=["std", "parsing", "formatting"]}
 ring="0.17"
-socket2="0.6"
+# `all` for binding a socket to a network interface by name (`bind_device`, `bind_device_by_index_v4`).
+socket2={version="0.6", features=["all"]}
 libc="0.2.150"
 # Only `net` is used. `time` is there because rustix 1.1 does not build its socket options without the time types that feature brings.
 rustix={version="1", default-features=false, features=["std", "net", "time"]}

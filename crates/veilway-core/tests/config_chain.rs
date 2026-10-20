@@ -131,3 +131,22 @@ fn a_link_through_a_chain_needs_a_stream_transport_to_be_usable() {
 	assert!(report.errors.is_empty(), "{:#?}", report.errors);
 	assert!(report.warnings.iter().any(|warning| warning.path == "links[1].peer.transports[0]" && warning.message.contains("not usable through via")), "{:#?}", report.warnings);
 }
+
+#[test]
+fn a_direct_outbound_may_be_tied_to_a_network_interface_of_the_host() {
+	let mut doc = base();
+	doc["outbounds"][0]["interface"] = json!("eth1.100");
+	let report = check(&doc);
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	let parsed = Config::parse(doc.to_string().as_bytes()).unwrap();
+	assert!(matches!(&parsed.outbounds[0], Outbound::Direct {interface: Some(name), ..} if name == "eth1.100"), "{:?}", parsed.outbounds[0]);
+	refused(base, "outbounds[0].interface", "expected 1 to 15 characters", |doc| doc["outbounds"][0]["interface"] = json!("a-name-too-long-0"));
+	refused(base, "outbounds[0].interface", "starting with a letter or digit", |doc| doc["outbounds"][0]["interface"] = json!(".."));
+	refused(base, "outbounds[0].interface", "back into the tunnel", |doc| {
+		doc["outbounds"][0]["interface"] = json!("veilway0");
+		doc["exits"] = json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "second"}}, {"tag": "wired", "backend": {"type": "l3"}}]);
+	});
+	let mut doc = base();
+	doc["outbounds"][1]["interface"] = json!("eth1");
+	assert!(Config::parse(doc.to_string().as_bytes()).is_err(), "a socks5 outbound takes no interface: it always dials the proxy from the node's own route");
+}

@@ -5,6 +5,7 @@ use super::{dns, netstack, Event, Shared};
 use etherparse::PacketBuilder;
 use ipstack::{IpStackStream, IpStackUdpStream};
 use ring::rand::{SecureRandom, SystemRandom};
+use socket2::{SockRef, Socket};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ pub(super) const HOLD_MARGIN: Duration = Duration::from_secs(10);
 /// How long the handler of a UDP flow keeps reading datagrams the stack had already taken when the flow's decision changed.
 const DRAIN: Duration = Duration::from_millis(100);
 /// From the node's own address, whichever the host picks: the outbound of `"direct"` in an `unsupported` policy, and of the DNS queries the node sends for an l3 exit.
-pub(super) static AROUND: Outbound = Outbound::Direct {bind: None};
+pub(super) static AROUND: Outbound = Outbound::Direct {bind: None, interface: None};
 
 /// A UDP flow as the code that carries it out of the node sees it, one datagram to a call. The tunnel's flows are streams of the userspace stack, and those of the Xray hop are queues.
 pub(super) trait Datagrams {
@@ -216,10 +217,44 @@ async fn walk<'a>(up: &'a Upstream, dst: SocketAddr, stop: &mut Stop<'a>) -> any
 }
 
 /// A TCP connection to `target` from the node itself, from the address `bind` when the outbound has one.
-pub async fn connect_from(bind: Option<IpAddr>, target: SocketAddr) -> std::io::Result<TcpStream> {
+pub async fn connect_from(bind: Option<IpAddr>, interface: Option<&str>, target: SocketAddr) -> std::io::Result<TcpStream> {
 	let socket = if target.is_ipv4() {TcpSocket::new_v4()?} else {TcpSocket::new_v6()?};
+	if let Some(name) = interface {tie(&SockRef::from(&socket), name, target.is_ipv4())?}
 	if let Some(bind) = bind {socket.bind(SocketAddr::new(bind, 0))?}
 	socket.connect(target).await
+}
+
+/// Whether this system can tie a socket to a network interface by name.
+pub const INTERFACES: bool = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"));
+
+/// Ties a socket to the network interface `name`, so what it sends leaves there whatever the routing table says: SO_BINDTODEVICE on Linux, IP_BOUND_IF and IPV6_BOUND_IF on macOS.
+fn tie(socket: &Socket, name: &str, v4: bool) -> std::io::Result<()> {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{let _ = v4; socket.bind_device(Some(name.as_bytes()))}
+	#[cfg(target_os = "macos")]
+	{
+		let index = index_of(name).ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, format!("no network interface is called {name}")))?;
+		if v4 {socket.bind_device_by_index_v4(Some(index))} else {socket.bind_device_by_index_v6(Some(index))}
+	}
+	#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+	{let _ = (socket, v4); Err(std::io::Error::new(std::io::ErrorKind::Unsupported, format!("tying a socket to the interface {name} needs Linux or macOS")))}
+}
+
+/// Whether the host has the network interface `name` now.
+pub fn has_interface(name: &str) -> bool {
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	{std::path::Path::new("/sys/class/net").join(name).exists()}
+	#[cfg(target_os = "macos")]
+	{index_of(name).is_some()}
+	#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+	{let _ = name; false}
+}
+
+#[cfg(target_os = "macos")]
+fn index_of(name: &str) -> Option<std::num::NonZeroU32> {
+	let name = std::ffi::CString::new(name).ok()?;
+	// SAFETY: `name` is a NUL-terminated string that lives through the call, and if_nametoindex only reads it.
+	std::num::NonZeroU32::new(unsafe {libc::if_nametoindex(name.as_ptr())})
 }
 
 /// Runs one accepted flow of the device `from` to its end: through the outbound of `exit`, until either side closes or the flow has been quiet for the exit's idle time.
@@ -250,7 +285,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 						Ok(mut remote) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
 						Err(e) => return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {e}", plan.show(target)),
 					},
-					Outbound::Direct {bind} => match tokio::time::timeout(DIAL_TIMEOUT, connect_from(*bind, target)).await {
+					Outbound::Direct {bind, interface} => match tokio::time::timeout(DIAL_TIMEOUT, connect_from(*bind, interface.as_deref(), target)).await {
 						Ok(Ok(mut remote)) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
 						Ok(Err(e)) => return tracing::debug!("exit {tag}: tcp to {}: direct connect failed: {}", plan.show(target), e.kind()),
 						Err(_) => return tracing::debug!("exit {tag}: tcp to {}: direct connect timed out", plan.show(target)),
@@ -301,8 +336,8 @@ pub(super) async fn udp_exit<S: Datagrams>(shared: &Shared, plan: &Plan, user: u
 	loop {
 		let up = match outbound {
 			Outbound::Socks5(up) => up,
-			Outbound::Direct {bind} => {
-				direct_udp(&mut stream, plan, tag, carrier, *bind, target, mtu, overhead).await;
+			Outbound::Direct {bind, interface} => {
+				direct_udp(&mut stream, plan, tag, carrier, *bind, interface.as_deref(), target, mtu, overhead).await;
 				return None;
 			}
 		};
@@ -321,7 +356,7 @@ pub(super) async fn udp_exit<S: Datagrams>(shared: &Shared, plan: &Plan, user: u
 			// The exit a `via` hands the flow to must be in the user's `exits` like the one the rules chose, see `Shared::ingress`.
 			Fallback::Via(next) if plan.users[user].entitled.as_ref().is_some_and(|list| !list.contains(&next)) => refused(Reason::Entitlement, true),
 			Fallback::Via(next) => match &plan.exits[next].backend {
-				Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind)}, ..} if bind.is_ipv4() != target.is_ipv4() => refused(Reason::Unsupported, true),
+				Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind), ..}, ..} if bind.is_ipv4() != target.is_ipv4() => refused(Reason::Unsupported, true),
 				Backend::Netstack {outbound, ..} => (Decision::Exit {exit, by: By::Via(next)}, Some((outbound, next))),
 				Backend::L3 {..} => (Decision::Exit {exit, by: By::Via(next)}, None),
 				Backend::Block | Backend::Chain {..} => refused(Reason::Unsupported, true),
@@ -339,10 +374,11 @@ pub(super) async fn udp_exit<S: Datagrams>(shared: &Shared, plan: &Plan, user: u
 
 /// A UDP flow sent from a socket of the node's own to `target`, until the flow's side ends.
 #[allow(clippy::too_many_arguments)]
-async fn direct_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrier: usize, bind: Option<IpAddr>, target: SocketAddr, mtu: u16, overhead: usize) {
+#[allow(clippy::too_many_arguments)]
+async fn direct_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrier: usize, bind: Option<IpAddr>, interface: Option<&str>, target: SocketAddr, mtu: u16, overhead: usize) {
 	let local = bind.unwrap_or(if target.is_ipv4() {Ipv4Addr::UNSPECIFIED.into()} else {Ipv6Addr::UNSPECIFIED.into()});
 	let socket = match UdpSocket::bind(SocketAddr::new(local, 0)).await {
-		Ok(socket) if socket.connect(target).await.is_ok() => socket,
+		Ok(socket) if interface.is_none_or(|name| tie(&SockRef::from(&socket), name, target.is_ipv4()).is_ok()) && socket.connect(target).await.is_ok() => socket,
 		_ => return tracing::debug!("exit {tag}: udp to {}: no local socket", plan.show(target)),
 	};
 	let cap = usize::from(mtu).saturating_sub(UDP_OVERHEAD);
@@ -464,9 +500,10 @@ pub async fn framed<S: AsyncRead + AsyncWrite + Unpin>(remote: &mut S, query: &[
 pub fn answers(query: &[u8], answer: &[u8]) -> bool {answer.len() >= dns::HEADER && answer.get(..2) == query.get(..2) && answer[2] & 0x80 != 0}
 
 /// One query to `target` over UDP from the node itself, and the first datagram that answers it. Anything else that arrives on the socket is not the answer. An error is: the server's host said that nothing listens there.
-pub async fn ask_udp(bind: Option<IpAddr>, target: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+pub async fn ask_udp(bind: Option<IpAddr>, interface: Option<&str>, target: SocketAddr, query: &[u8]) -> std::io::Result<Vec<u8>> {
 	let local = bind.unwrap_or(if target.is_ipv4() {Ipv4Addr::UNSPECIFIED.into()} else {Ipv6Addr::UNSPECIFIED.into()});
 	let socket = UdpSocket::bind(SocketAddr::new(local, 0)).await?;
+	if let Some(name) = interface {tie(&SockRef::from(&socket), name, target.is_ipv4())?}
 	socket.connect(target).await?;
 	socket.send(query).await?;
 	let mut answer = vec![0u8; DNS_UDP_ANSWER];
@@ -490,9 +527,9 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 	let exchange = async {
 		let answer = match outbound {
 			Outbound::Socks5(up) => framed(&mut dial(up, target).await.ok()?, query).await.ok()?,
-			Outbound::Direct {bind} => {
-				let answer = ask_udp(*bind, target, query).await.ok()?;
-				if answer.len() < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {framed(&mut connect_from(*bind, target).await.ok()?, query).await.ok()?}
+			Outbound::Direct {bind, interface} => {
+				let answer = ask_udp(*bind, interface.as_deref(), target, query).await.ok()?;
+				if answer.len() < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {framed(&mut connect_from(*bind, interface.as_deref(), target).await.ok()?, query).await.ok()?}
 			}
 		};
 		answers(query, &answer).then_some(answer)
@@ -568,5 +605,18 @@ mod tests {
 		let mut domain = datagram.clone();
 		domain[3] = 3;
 		assert!(unwrap_udp(&domain).is_none(), "a domain reply was accepted");
+	}
+
+	// The loopback interface is on every Linux host, so a socket tied to it reaches a listener on 127.0.0.1 and one tied to an interface that does not exist is refused before it sends.
+	#[cfg(target_os = "linux")]
+	#[tokio::test]
+	async fn a_socket_tied_to_an_interface_leaves_there_and_a_missing_one_fails() {
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let target = listener.local_addr().unwrap();
+		assert!(has_interface("lo") && !has_interface("veilway-none"));
+		assert!(connect_from(None, Some("lo"), target).await.is_ok(), "a socket tied to lo did not reach 127.0.0.1");
+		assert!(connect_from(None, Some("veilway-none"), target).await.is_err(), "a socket tied to a missing interface connected");
+		let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		assert!(ask_udp(None, Some("veilway-none"), echo.local_addr().unwrap(), b"query").await.is_err(), "a datagram socket tied to a missing interface was made");
 	}
 }

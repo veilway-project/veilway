@@ -302,9 +302,12 @@ impl Config {
 		}
 		if self.outbounds.len() > MAX_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_OUTBOUNDS} outbounds"))}
 		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} => tag.as_str()}));
+		let tunnels: Vec<&str> = self.exits.iter().filter_map(|exit| if let Backend::L3(l3) = &exit.backend {Some(l3.interface.as_deref().unwrap_or(DEFAULT_INTERFACE))} else {None}).collect();
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
 			match outbound {
 				Outbound::Direct {bind: Some(Ip(ip)), ..} if ip.is_unspecified() => r.error(format!("outbounds[{i}].bind"), "expected a local address, not a wildcard"),
+				Outbound::Direct {interface: Some(name), ..} if !(1..=MAX_INTERFACE_BYTES).contains(&name.len()) || !name.as_bytes()[0].is_ascii_alphanumeric() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) => r.error(format!("outbounds[{i}].interface"), format!("expected 1 to {MAX_INTERFACE_BYTES} characters from letters, digits, _, - and ., starting with a letter or digit")),
+				Outbound::Direct {interface: Some(name), ..} if tunnels.contains(&name.as_str()) => r.error(format!("outbounds[{i}].interface"), "expected a network interface of the host, found the one an l3 exit makes: this outbound's traffic would go back into the tunnel"),
 				Outbound::Socks5 {username, password, ..} => {
 					if username.is_some() != password.is_some() {r.error(format!("outbounds[{i}]"), "expected username and password together, or neither")}
 					for (key, secret) in [("username", username), ("password", password)] {

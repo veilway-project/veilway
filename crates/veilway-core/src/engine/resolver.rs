@@ -140,7 +140,7 @@ pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user:
 	};
 	let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {return Step::Skipped};
 	// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
-	if matches!(outbound, Some(Outbound::Direct {bind: Some(bind)}) if bind.is_ipv4() != server.is_ipv4()) {return Step::Skipped}
+	if matches!(outbound, Some(Outbound::Direct {bind: Some(bind), ..}) if bind.is_ipv4() != server.is_ipv4()) {return Step::Skipped}
 	// A `chain` exit counts the query once it went into a link, which it does not while no link is up.
 	if outbound.is_some() {plan.exits[exit].traffic.up(message.len())}
 	let found = match outbound {

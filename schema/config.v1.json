@@ -1039,6 +1039,11 @@
             "bind": {
               "$ref": "#/$defs/Ip"
             },
+            "interface": {
+              "description": "A network interface of the host by name, such as \"eth1\". Every socket of this outbound is tied to it, so its traffic leaves there whatever the routing table says. Linux and macOS only.",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$",
+              "type": "string"
+            },
             "tag": {
               "not": {
                 "enum": [

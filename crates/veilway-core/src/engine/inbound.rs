@@ -246,7 +246,7 @@ impl Shared {
 					// "The engine also refuses, at the moment it decides a flow, to send a packet that arrived from a link into a link."
 					Backend::Chain {..} if linked.is_some() => Decision::Refuse {reason: Reason::Gate, reset: true},
 					Backend::L3 {..} | Backend::Chain {..} => Decision::Exit {exit, by: By::Backend},
-					Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind)}, ..} if bind.is_ipv4() != key.dst.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
+					Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind), ..}, ..} if bind.is_ipv4() != key.dst.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
 					// Whether the proxy relays UDP is only known once the flow's handler has asked it, so the `udp` policy is applied there, see `flows::run`.
 					Backend::Netstack {..} if transport => Decision::Exit {exit, by: By::Backend},
 					Backend::Netstack {icmp_echo, other, ..} => match if matches!((key.protocol, icmp), (Protocol::ICMP, Some((netstack::ECHO_REQUEST_V4, 0))) | (Protocol::ICMPV6, Some((netstack::ECHO_REQUEST_V6, 0)))) {*icmp_echo} else {*other} {

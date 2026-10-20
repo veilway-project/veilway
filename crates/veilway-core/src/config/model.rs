@@ -1118,6 +1118,10 @@ pub enum Outbound {
 		tag: String,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		bind: Option<Ip>,
+		/// A network interface of the host by name, such as "eth1". Every socket of this outbound is tied to it, so its traffic leaves there whatever the routing table says. Linux and macOS only.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern("^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$"))]
+		interface: Option<String>,
 	},
 	#[schemars(extend("dependentRequired" = {"username": ["password"], "password": ["username"]}))]
 	Socks5 {
@@ -1143,15 +1147,15 @@ enum OutboundType {Direct, Socks5}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
 		match keys.kind {
-			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind}),
+			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
 			OutboundType::Socks5 => {
-				only("socks5", &[("bind", keys.bind.is_some())])?;
+				only("socks5", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())])?;
 				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password, via: keys.via})
 			}
 		}

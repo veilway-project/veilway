@@ -304,6 +304,13 @@ impl Host {
 			};
 			forwards.push((written, bound));
 		}
+		// A missing interface may come later, a PPP or VPN link for one, so it is a warning here and each flow fails until it is there. A system that cannot tie a socket to an interface at all is refused.
+		for exit in &plan.exits {
+			if let Backend::Netstack {outbound: Outbound::Direct {interface: Some(name), ..}, ..} = &exit.backend {
+				if !super::flows::INTERFACES {anyhow::bail!("exit `{}` leaves through an outbound tied to the network interface {name}, which needs Linux or macOS: remove its `interface`, or run the node on Linux", exit.tag)}
+				if !super::flows::has_interface(name) {tracing::warn!("exit {}: its outbound is tied to the network interface {name}, which this host does not have now, so its flows fail until it does", exit.tag)}
+			}
+		}
 		// Return traffic finds its interface by the routes of the pools, and two interfaces cannot both have those. Telling them apart takes policy routing, which is not built.
 		let wanted = {
 			let mut wired = plan.exits.iter().enumerate().filter_map(|(at, exit)| if let Backend::L3 {interface, masquerade} = &exit.backend {Some((at, exit, interface, masquerade))} else {None});

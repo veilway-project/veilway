@@ -41,7 +41,7 @@ impl Latency {
 }
 
 #[derive(PartialEq, Eq)]
-pub enum Outbound {Direct {bind: Option<IpAddr>}, Socks5(Upstream)}
+pub enum Outbound {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks5(Upstream)}
 
 impl Upstream {
 	/// The proxy of the `socks5` outbound `tag` names, behind the chain its `via` keys give. Validation has refused a loop and a chain longer than `MAX_CHAIN`, so this ends.
@@ -62,7 +62,7 @@ impl Outbound {
 	/// The outbound `tag` names, as the engine dials through it.
 	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Outbound> {
 		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} if name == tag))? {
-			config::Outbound::Direct {bind, ..} => Some(Outbound::Direct {bind: bind.map(|ip| ip.0)}),
+			config::Outbound::Direct {bind, interface, ..} => Some(Outbound::Direct {bind: bind.map(|ip| ip.0), interface: interface.clone()}),
 			config::Outbound::Socks5 {..} => Upstream::of(outbounds, latency, tag).map(Outbound::Socks5),
 		}
 	}

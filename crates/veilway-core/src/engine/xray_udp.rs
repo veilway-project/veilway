@@ -141,7 +141,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 	};
 	let Backend::Netstack {udp_idle, ..} = &plan.exits[exit].backend else {return None};
 	// The tunnel refuses a destination of the other family than the exit's address the same way.
-	if matches!(outbound, Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != ip.is_ipv4()) {
+	if matches!(outbound, Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4()) {
 		shared.count(Reason::Unsupported);
 		tracing::debug!("xray hop: user {user}: udp to {shown}: the exit's address is of the other family");
 		return Some(Reason::Unsupported);

@@ -387,8 +387,8 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 	};
 	let dialled = match outbound {
 		Outbound::Socks5(up) => tokio::time::timeout(DIAL, flows::dial(up, dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result),
-		Outbound::Direct {bind: Some(bind)} if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
-		Outbound::Direct {bind} => tokio::time::timeout(DIAL, flows::connect_from(*bind, dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|e| anyhow::anyhow!("{}", e.kind()))),
+		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
+		Outbound::Direct {bind, interface} => tokio::time::timeout(DIAL, flows::connect_from(*bind, interface.as_deref(), dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|e| anyhow::anyhow!("{}", e.kind()))),
 	};
 	let mut remote = match dialled {
 		Ok(remote) => remote,
