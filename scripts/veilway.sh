@@ -14,6 +14,7 @@
 #   sudo bash veilway.sh uninstall relay   remove what install relay added
 #   sudo bash veilway.sh uninstall web   remove the web server setup that --domain added
 #   sudo bash veilway.sh panel-prefix [/new-path]   move the admin pages to a new path, random when none is given
+#   sudo bash veilway.sh admin [list | reset <username>]   show the panel's admins, or give one a new password
 #   bash veilway.sh mirror-sync <folder> [--version vX.Y.Z]   copy a release and its signatures into <folder> in GitHub's layout, to serve or carry
 #   Flags: --dry-run (print what would happen, change nothing), --yes (no questions), --version <tag>,
 #          --allow-downgrade (install a --version older than the installed one),
@@ -1013,7 +1014,7 @@ unit_state() {
 }
 
 do_status() {
-	local v
+	local v prefix host port line
 	header
 	printf '  %s%-14s %-34s %s%s\n' "$B" "Part" "State" "Version" "$Z"
 	printf '  %s%s%s\n' "$D" "$(rule 62)" "$Z"
@@ -1027,7 +1028,31 @@ do_status() {
 	printf '  %-14s %-34s %s\n' "config" "$([ -f "$NODE_DIR/config.json" ] && echo present || echo missing)" "$NODE_DIR/config.json"
 	printf '  %-14s %-34s %s\n' "state" "$([ -d "$STATE_DIR" ] && echo present || echo missing)" "$STATE_DIR"
 	printf '  %-14s %-34s %s\n' "backups" "$(find "$BACKUP_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ') files" "$BACKUP_DIR"
+	if [ -r "$CONF_DIR/panel.json" ]; then
+		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		host="$(web_state domain)"; port="$(web_state https_port)"
+		[ -z "$host" ] || [ -z "$port" ] || [ "$port" = 443 ] || host="$host:$port"
+		printf '\n  %-14s %s\n' "admin pages" "https://${host:-your-domain}$prefix/"
+		printf '  %-14s %s\n' "subscriptions" "$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		[ -x "$BIN_DIR/veilway-panel" ] && as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" 2>/dev/null | while IFS= read -r line; do printf '  %-14s %s\n' "admin" "$line"; done
+	fi
 	printf '\n'
+}
+
+# Lists the panel's admins, or gives one a new password from this console, for an operator locked out of the panel. Their sessions end; the authenticator stays.
+do_admin() {
+	local name="${2:-}" pw pw2
+	[ -x "$BIN_DIR/veilway-panel" ] && [ -f "$CONF_DIR/panel.json" ] || die "no panel is installed here"
+	if [ "${1:-list}" = list ]; then as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" 2>/dev/null || die "this panel cannot list its admins: update it to v0.2.5 or later"; return 0; fi
+	[ "$1" = reset ] || die "try: admin list, or admin reset <username>"
+	[ -n "$name" ] || name="$(ask "Username:" "")"
+	[ -n "$name" ] || die "give the username: admin reset <username>"
+	if [ "$DRY" = 1 ]; then dry "set a new password for $name"; return 0; fi
+	[ -r /dev/tty ] || die "no terminal to ask for the password on"
+	read -r -s -p "  New password for $name (12 characters or more): " pw </dev/tty; printf '\n'
+	read -r -s -p "  The same again: " pw2 </dev/tty; printf '\n'
+	[ "$pw" = "$pw2" ] || die "the two passwords differ, nothing was changed"
+	printf '%s\n' "$pw" | as_panel_user "$BIN_DIR/veilway-panel" reset-password "$name" --config "$CONF_DIR/panel.json" || die "the password was not changed"
 }
 
 do_logs() {
@@ -1050,6 +1075,8 @@ do_restart() {
 node_flags() { printf '%s\n' --config "$NODE_DIR/config.json" --state "$STATE_DIR/veilway-state.json" --replay "$STATE_DIR/veilway-replay" --api /run/veilway/control.sock; }
 
 as_mirror_user() { setpriv --reuid veilway-mirror --regid veilway-mirror --clear-groups "$@"; }
+# The panel's own user, so the database and its log files keep their owner.
+as_panel_user() { setpriv --reuid veilway-panel --regid veilway-panel --clear-groups "$@"; }
 
 as_mirror() {
 	if [ "$(id -u)" = 0 ] && has setpriv; then as_mirror_user "$BIN_DIR/veilway" "$@"
@@ -1167,7 +1194,8 @@ menu() {
 	while true; do
 		printf '  %s1%s Install    %s2%s Update     %s3%s Status     %s4%s Logs\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
 		printf '  %s5%s Restart    %s6%s Check      %s7%s Doctor     %s8%s Backup\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
-		printf '  %s9%s Restore    %s10%s Uninstall %s11%s Add-ons  %s0%s Quit\n\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
+		printf '  %s9%s Restore    %s10%s Uninstall %s11%s Add-ons  %s12%s Admins\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
+		printf '  %s0%s Quit\n\n' "$B" "$Z"
 		c="$(ask "Choose:" 0)"
 		case "$c" in
 			1) do_install "" ;;
@@ -1184,6 +1212,11 @@ menu() {
 				do_addon xray status
 				if [ -x "$ADDON_DIR/xray/xray" ]; then a="$(ask "Remove the Xray add-on, or leave it? [leave]" leave)"; else a="$(ask "Install the Xray add-on, or leave it? [leave]" leave)"; fi
 				case "$a" in install | remove) do_addon xray "$a" ;; leave | "") ;; *) warn "answer install, remove or leave" ;; esac
+				;;
+			12)
+				do_admin list
+				a="$(ask "Username to give a new password, or empty to leave:" "")"
+				[ -z "$a" ] || do_admin reset "$a"
 				;;
 			0 | q | "") return 0 ;;
 			*) warn "pick a number from the list" ;;
@@ -1820,7 +1853,8 @@ main() {
 		version) do_version ;;
 		addon) header; do_addon "${args[0]:-}" "${args[1]:-install}" ;;
 		panel-prefix) header; do_panel_prefix "${args[0]:-}" ;;
-		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, panel-prefix, mirror-sync, uninstall, version" ;;
+		admin) do_admin "${args[0]:-list}" "${args[1]:-}" ;;
+		*) die "unknown command \"$cmd\": try install, update, status, logs, restart, check, doctor, backup, restore, panel-prefix, admin, mirror-sync, uninstall, version" ;;
 	esac
 }
 
