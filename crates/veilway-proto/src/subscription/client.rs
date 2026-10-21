@@ -552,6 +552,8 @@ impl Held {
 	fn request(&self, op: Op) -> Option<Request> {self.origin.as_ref().map(|(link, device)| Request::new(link.token().clone(), self.keys().iter().map(SigningKey::kid).collect(), device.public, device.secret.clone(), op))}
 	/// The request of a refresh, or `None` for a subscription that cannot refresh. When it goes out is the caller's, under "When a fetch happens".
 	pub fn fetch(&self) -> Option<Request> {self.request(Op::Fetch)}
+	/// The request that removes this device from the provider when the user removes the subscription, or `None` for a whole document, which took no place.
+	pub fn leave(&self) -> Option<Request> {self.request(Op::Leave)}
 	/// A `confirm` with another name, which "replaces it".
 	pub fn rename(&self, name: Option<DeviceName>) -> Option<Request> {self.request(Op::Confirm(name))}
 	// The refresh URLs of the last good document with whether the user has confirmed the host and port of each. The main endpoint needs no confirmation. A subscription with no link has none: it cannot refresh, whatever its document lists.

@@ -589,6 +589,8 @@ struct StoredWire {#[serde(default)] origin: Option<OriginWire>, keys: Vec<Strin
 /// The most subscriptions a vault holds and the most it reads.
 pub const HELD_MAX: usize = 64;
 const VAULT_MAX: usize = 4 * BODY_MAX * 16;
+/// How long removing a subscription waits for the provider to take the device's `leave`.
+const LEAVE_WAIT: Duration = Duration::from_secs(10);
 
 fn array<const N: usize>(text: &str) -> Option<[u8; N]> {STANDARD.decode(text).ok()?.try_into().ok()}
 
@@ -813,6 +815,8 @@ impl Fetcher {
 		let (Some(endpoint), Some(request)) = (endpoint, request) else {return};
 		if let Err(error) = ask(self, &request, endpoint, trust, keys, allowed, clock()).await {tracing::info!(?error, "a request of the import could not be sent");}
 	}
+	/// The user removes the subscription `id`: see `Library::leave_over`.
+	pub async fn leave(&self, library: &mut Library, id: &veilway_proto::subscription::payload::Id) -> io::Result<bool> {library.leave_over(self, id).await}
 	/// Refreshes the subscription at `at` and says where the answer came from. The caller decides when ("When a fetch happens"). See `Library::refresh_over` for the order and what ends a refresh.
 	pub async fn refresh_from(&self, library: &mut Library, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {library.refresh_over(self, at, now).await}
 	/// `refresh_from` for a caller that does not show where the answer came from.
@@ -841,6 +845,20 @@ impl From<ImportError> for RefreshFailed {
 
 impl Library {
 	/// Refreshes the subscription at `at` through `wire`, trying the places in the order of "Order and rate": the endpoint of a confirmed move, the main endpoint, then the confirmed `refresh_urls` in the document's order, then the confirmed static mirrors. A subscription that came as a whole document cannot refresh. Each place gets a request of its own, sealed to the gateway keys it follows, and a document from the endpoint of a move is checked against the move (`Held::refresh_moved`).
+	/// The user removes the subscription `id`: first `leave` to the endpoints of the subscription, in the order a refresh tries them and never to a static mirror, so that the provider removes the device and frees its place, then everything held of it, as `remove`. Best effort and short: a provider that does not take it within `LEAVE_WAIT` keeps the device until its own cleanup or its operator removes it, and the subscription is removed all the same.
+	pub async fn leave_over(&mut self, wire: &impl Wire, id: &veilway_proto::subscription::payload::Id) -> io::Result<bool> {
+		let leaving = self.held.iter().find(|held| held.id() == id).and_then(|held| held.leave().map(|request| (request, held.targets().into_iter().map(|target| (target.url.clone(), target.pins.to_vec(), target.keys.to_vec())).collect::<Vec<_>>(), held.private_addresses().to_vec())));
+		if let Some((request, targets, allowed)) = leaving {
+			let told = timeout(LEAVE_WAIT, async {
+				for (url, pins, keys) in &targets {
+					if ask(wire, &request, url, &Trust::of(pins), keys, &allowed, clock()).await.is_ok() {return true}
+				}
+				false
+			}).await.unwrap_or(false);
+			if told {tracing::info!("the provider was told that this device left the subscription")} else {tracing::info!("the provider could not be told that this device left the subscription: its place stays until the provider removes it")}
+		}
+		self.remove(id)
+	}
 	/// The refresh ends at the first accepted answer from the endpoint or a relay mirror (a newer document or the same bytes again), at a newer document from a static mirror, or at a signed refusal that verifies, wherever it came from. Everything else is a failure of that place and the next is tried: from a static mirror that includes the held document again ("this mirror has nothing newer", no successful refresh), an older one, a 404 and a file that does not open, none of which is a revocation. The reason of a failed refresh is the endpoint's (the last place before the static mirrors), and a static mirror changes it only to ask about a private address.
 	pub async fn refresh_over(&mut self, wire: &impl Wire, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {
 		let Some(held) = self.held.get(at) else {return Err(ImportError::Subscription(Failure::HasLink).into())};
@@ -1213,6 +1231,21 @@ mod tests {
 		assert_eq!((failed.error.code(), failed.static_asked, fake.asked().len()), (Code::AccountDisabled, 1, 3));
 		// A refusal is not stored as a document: what was held is held.
 		assert_eq!(library.held[0].document(), listed(1));
+	}
+
+	#[test]
+	fn removing_a_subscription_tells_the_provider_where_it_can_and_removes_it_all_the_same() {
+		let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+		let mut library = library("leave", imported());
+		let id = library.held[0].id().clone();
+		let fake = Fake::new(vec![("POST sub.example.com", Err(FetchError::Connect)), ("POST relay.example.net", ok(listed(1))), ("GET files.example.net", Ok(file(BASE, &listed(1))))]);
+		assert!(runtime.block_on(library.leave_over(&fake, &id)).unwrap());
+		// The endpoint, then the relay mirror, which took it. A static mirror cannot take a request and is never asked.
+		assert_eq!((fake.asked(), library.held.len()), (vec!["POST sub.example.com".to_owned(), "POST relay.example.net".to_owned()], 0));
+		let mut library = self::library("leave", imported());
+		let fake = Fake::new(Vec::new());
+		assert!(runtime.block_on(library.leave_over(&fake, &id)).unwrap() && library.held.is_empty());
+		assert!(!runtime.block_on(library.leave_over(&fake, &id)).unwrap());
 	}
 
 	#[test]

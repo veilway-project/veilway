@@ -28,6 +28,8 @@ pub enum Op {
 	Confirm(Option<DeviceName>),
 	/// Frees a pending place. "`release` never removes a confirmed device."
 	Release,
+	/// The user removed the subscription from the app: the device is removed, confirmed or pending, and its place is free.
+	Leave,
 }
 
 // The one body a request has: the members in the order of the page's table, with no white space. `t` is the device's clock when the request is sealed.
@@ -36,6 +38,7 @@ fn written(token: &Token, t: u64, kids: &[Kid], device_public_key: &[u8; 32], de
 		Op::Fetch => ("fetch", None),
 		Op::Confirm(name) => ("confirm", name.as_ref()),
 		Op::Release => ("release", None),
+		Op::Leave => ("leave", None),
 	};
 	// A string cannot fail to be written as JSON.
 	let name = name.map_or(String::new(), |name| format!(",\"device_name\":{}", serde_json::to_string(name.as_str()).unwrap_or_default()));
@@ -99,6 +102,7 @@ impl Received {
 			let op = match (members.string("op", 7).ok()??, members.string("device_name", usize::MAX).ok()?) {
 				("fetch", None) => Op::Fetch,
 				("release", None) => Op::Release,
+				("leave", None) => Op::Leave,
 				("confirm", None) => Op::Confirm(None),
 				("confirm", Some(name)) => Op::Confirm(Some(DeviceName::typed(name)?)),
 				_ => return None,

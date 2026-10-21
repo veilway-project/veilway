@@ -782,6 +782,9 @@ fn the_request_byte_for_byte_and_what_an_endpoint_refuses() {
 	assert_eq!((review.fingerprint(), review.replaces(), review.origin(), review.refreshes(), review.subscription().provider.as_str()), (key(0x11).fingerprint(), false, KeyOrigin::Device, true, "Example Provider"));
 	let Accepted {held, replaces, confirm, ..} = review.accept(DeviceName::typed("phone\u{200b}"), &[]).unwrap();
 	assert_eq!((confirm.unwrap().body(NOW), replaces, held.fetch().unwrap().body(NOW), held.rename(None).unwrap().op().clone()), (seed("fuzz_sub_request/confirm"), None, seed("fuzz_sub_request/fetch"), Op::Confirm(None)));
+	// Removing the subscription from the app: `leave`, which the endpoint reads as one.
+	let leave = held.leave().unwrap().body(NOW);
+	assert_eq!((Received::read(&leave).unwrap().op().clone(), Received::read(&leave).unwrap().canonical()), (Op::Leave, leave.clone()));
 	// Declining, and giving up before an answer: the same `release`.
 	assert_eq!((self::review(&seed("fuzz_sub_envelope/document")[1..], &[]).unwrap().decline().unwrap().body(NOW), fetching.abandon().body(NOW)), (seed("fuzz_sub_request/release"), seed("fuzz_sub_request/release")));
 	// The endpoint's side reads what a client writes, as another type than the one a client sends, and knows the one body it has.

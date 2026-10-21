@@ -241,10 +241,10 @@ proptest! {
 	}
 
 	#[test]
-	fn a_request_reads_back_as_it_was_written(t in 0..9_007_199_254_740_992u64, token in any::<[u8; 16]>(), kids in vec(any::<[u8; 8]>(), 1..=2), device in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), op in 0..3usize, name in option::of(any::<String>()), at in any::<Index>(), byte in any::<u8>()) {
+	fn a_request_reads_back_as_it_was_written(t in 0..9_007_199_254_740_992u64, token in any::<[u8; 16]>(), kids in vec(any::<[u8; 8]>(), 1..=2), device in any::<[u8; 32]>(), secret in any::<[u8; 16]>(), op in 0..4usize, name in option::of(any::<String>()), at in any::<Index>(), byte in any::<u8>()) {
 		prop_assume!(kids.len() == 1 || kids[0] != kids[1]);
 		let (device, name) = (public_key(&device), name.and_then(|name| DeviceName::typed(&name)).filter(|_| op == 1));
-		let body = format!("{{\"v\":1,\"t\":{t},\"token\":\"{}\",\"kids\":[{}],\"device_public_key\":\"{}\",\"device_secret\":\"{}\",\"op\":\"{}\"{}}}", url_base64(&token), kids.iter().map(|kid| format!("\"{}\"", url_base64(kid))).collect::<Vec<_>>().join(","), std_base64(&device), url_base64(&secret), ["fetch", "confirm", "release"][op], name.as_ref().map_or(String::new(), |name| format!(",\"device_name\":{}", serde_json::to_string(name.as_str()).unwrap())));
+		let body = format!("{{\"v\":1,\"t\":{t},\"token\":\"{}\",\"kids\":[{}],\"device_public_key\":\"{}\",\"device_secret\":\"{}\",\"op\":\"{}\"{}}}", url_base64(&token), kids.iter().map(|kid| format!("\"{}\"", url_base64(kid))).collect::<Vec<_>>().join(","), std_base64(&device), url_base64(&secret), ["fetch", "confirm", "release", "leave"][op], name.as_ref().map_or(String::new(), |name| format!(",\"device_name\":{}", serde_json::to_string(name.as_str()).unwrap())));
 		let request = Received::read(body.as_bytes()).unwrap();
 		prop_assert_eq!((String::from_utf8(request.canonical()).unwrap(), request.t(), request.token().expose(), request.device_public_key(), request.device_secret().expose(), request.kids().iter().map(|kid| kid.bytes()).collect::<Vec<_>>()), (body.clone(), t, &token, &device, &secret, kids));
 		// One byte changed: refused, or another request that is written back as it reads.
