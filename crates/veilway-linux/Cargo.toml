@@ -11,9 +11,9 @@ categories=["network-programming", "os::linux-apis"]
 exclude=["tests/", "examples/", "proptest-regressions/"]
 
 [dependencies]
-veilway-engine={path="../veilway-engine", version="0.2.9"}
-veilway-proto={path="../veilway-proto", version="0.2.9"}
-veilway-transport={path="../veilway-transport", version="0.2.9"}
+veilway-engine={path="../veilway-engine", version="0.2.10"}
+veilway-proto={path="../veilway-proto", version="0.2.10"}
+veilway-transport={path="../veilway-transport", version="0.2.10"}
 tokio.workspace=true
 tracing.workspace=true
 anyhow.workspace=true
@@ -31,6 +31,6 @@ ring.workspace=true
 
 [dev-dependencies]
 # The gate's setup tool (examples/gate_setup.rs) makes a node's config and a signed subscription for it.
-veilway-wg={path="../veilway-wg", version="0.2.9"}
+veilway-wg={path="../veilway-wg", version="0.2.10"}
 rcgen.workspace=true
 base64.workspace=true
