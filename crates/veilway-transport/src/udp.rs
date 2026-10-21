@@ -11,12 +11,13 @@ use rustix::net::sockopt;
 use socket2::SockRef;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::RangeInclusive;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, sleep_until, Instant};
 use veilway_proto::chunk::{ChunkError, Padding};
 use veilway_proto::session::{LIVENESS, LONE_KEEPALIVE};
-use veilway_proto::udp_obfs::{self, Client, Receiver, Sender, OLD_READABLE, OVERHEAD, RETRIES};
+use veilway_proto::udp_obfs::{self, Client, Receiver, Sender, DATA_MIN, OLD_READABLE, OVERHEAD, RETRIES};
 
 /// What one call to the machine works with: the clock (`Clock`) and the moment, the WireGuard layer, and where the packets to send are put.
 pub struct Io<'a> {pub time: u64, pub now: Instant, pub source: &'a mut (dyn FnMut(Want) -> Option<Vec<u8>> + Send), pub out: &'a mut Vec<Vec<u8>>}
@@ -31,15 +32,17 @@ struct Attempt {started: Instant, tries: Vec<Live>}
 struct Held {datagram: Vec<u8>, at: Instant, idle: bool}
 
 /// The client state machine of one `udp-obfs` session and the sessions that follow it at the same node.
-pub struct Machine {client: Client, bounds: (u32, u32), keepalive: RangeInclusive<u32>, max: usize, live: Option<Live>, old: Vec<(Receiver, Instant)>, attempt: Option<Attempt>, spare: Option<(Vec<Live>, Instant)>, idle: Instant, awaiting: Option<Instant>, held: Option<Held>, established: bool, scratch: Vec<u8>, dropped: u64}
+pub struct Machine {client: Client, bounds: (u32, u32), keepalive: RangeInclusive<u32>, max: usize, full: usize, live: Option<Live>, old: Vec<(Receiver, Instant)>, attempt: Option<Attempt>, spare: Option<(Vec<Live>, Instant)>, idle: Instant, awaiting: Option<Instant>, held: Option<Held>, established: bool, scratch: Vec<u8>, dropped: u64}
 
 // When the next opening packet of an attempt is due, if one is.
 fn retry(attempt: &Attempt) -> Option<Instant> {RETRIES.get(..attempt.tries.len()).map(|waits| attempt.started + waits.iter().sum::<Duration>())}
 
 impl Machine {
-	pub fn new(link: &Link, now: Instant) -> Self {Self {client: Client::new(link.secret.expose(), &link.inbound), bounds: (link.padding.wide_max, link.padding.normal_max), keepalive: link.padding.keepalive.clone(), max: usize::from(link.mtu) + OVERHEAD, live: None, old: Vec::new(), attempt: None, spare: None, idle: now, awaiting: None, held: None, established: false, scratch: Vec::new(), dropped: 0}}
+	pub fn new(link: &Link, now: Instant) -> Self {Self {client: Client::new(link.secret.expose(), &link.inbound), bounds: (link.padding.wide_max, link.padding.normal_max), keepalive: link.padding.keepalive.clone(), max: usize::from(link.mtu) + OVERHEAD, full: usize::from(link.mtu) + OVERHEAD, live: None, old: Vec::new(), attempt: None, spare: None, idle: now, awaiting: None, held: None, established: false, scratch: Vec::new(), dropped: 0}}
 	/// Whether a chunk of the node has opened on a session of this machine.
 	pub fn established(&self) -> bool {self.established}
+	/// The tunnel's MTU now: no packet is padded above it and 62 bytes, and never above the profile's `mtu` and 62.
+	pub fn room(&mut self, mtu: u16) {self.max = (usize::from(mtu) + OVERHEAD).min(self.full)}
 	/// Datagrams that were not sent since the last call: no session to carry them, or a size no packet of this link holds.
 	pub fn dropped(&mut self) -> u64 {std::mem::take(&mut self.dropped)}
 	/// Sends an opening packet around `datagram`. `fresh` starts a new attempt, with its own 1, 2 and 4 s. Otherwise the packet is one more of the attempt that runs.
@@ -102,15 +105,17 @@ impl Machine {
 			self.held = Some(Held {datagram: datagram.to_vec(), at: io.now + pause(&LONE_KEEPALIVE)?, idle: false});
 			return Ok(());
 		}
-		self.seal(datagram, wide(kind, datagram), io)
+		// A probe is sealed with no padding at all: the packet is the probe's size and 62 bytes, whatever the tunnel's MTU is now.
+		let max = if kind == Kind::Probe {datagram.len() + 2 + DATA_MIN} else {self.max};
+		self.seal(datagram, wide(kind, datagram), max, io)
 	}
 	// A data packet on the session in use: "While it waits for the first answer of a new session, the client keeps sending and receiving on the session it had."
-	fn seal(&mut self, datagram: &[u8], wide: bool, io: &mut Io) -> Result<(), End> {
+	fn seal(&mut self, datagram: &[u8], wide: bool, max: usize, io: &mut Io) -> Result<(), End> {
 		let (Some(live), mut packet) = (&mut self.live, Vec::new()) else {
 			self.dropped += 1;
 			return Ok(());
 		};
-		match live.tx.seal(Some(datagram), wide, self.max, &mut random, &mut packet) {
+		match live.tx.seal(Some(datagram), wide, max, &mut random, &mut packet) {
 			Ok(()) => io.out.push(packet),
 			Err(ChunkError::Random) => return Err(End::Random),
 			Err(ChunkError::Number) => return Err(End::Exhausted),
@@ -125,7 +130,7 @@ impl Machine {
 		self.old.retain(|(_, until)| io.now < *until);
 		if self.spare.as_ref().is_some_and(|(_, until)| io.now >= *until) {self.spare = None}
 		if let Some(held) = self.held.take_if(|held| io.now >= held.at) {
-			self.seal(&held.datagram, false, io)?;
+			self.seal(&held.datagram, false, self.max, io)?;
 			if held.idle && self.live.is_some() {self.awaiting.get_or_insert(io.now + LIVENESS);}
 		}
 		if let Some(attempt) = &self.attempt {
@@ -195,7 +200,10 @@ pub(crate) async fn run(port: &mut Port, link: &Link, to: SocketAddr) -> Ended {
 				Ok(())
 			}
 			Event::Packet(Err(_)) => Ok(()),
-			Event::Send(datagram, kind) => machine.send(&datagram, kind, &mut io),
+			Event::Send(datagram, kind) => {
+				machine.room(port.shared.room.load(Ordering::Relaxed));
+				machine.send(&datagram, kind, &mut io)
+			}
 			// The moment the network changes is a moment without a route as often as not: that is the device's state and no verdict on the node.
 			Event::Ask(Some(Ask::Moved)) => match bound(to, &hook).await {
 				Ok(fresh) => {
@@ -383,6 +391,32 @@ mod tests {
 		assert_eq!(ended, Ended::Closed(End::Lost));
 		assert_eq!((now - sent, out.len()), (LIVENESS + ATTEMPT, 7));
 		assert!(out[3..].iter().all(|packet| node(packet).0[0] == 1));
+	}
+
+	#[test]
+	fn a_lower_tunnel_mtu_caps_the_padding_and_a_probe_carries_none() {
+		let (start, mut asked, mut out) = (Instant::now(), (0, 0), Vec::new());
+		let mut machine = Machine::new(&link(), start);
+		let mut ask = source(&mut asked);
+		machine.moved(&mut Io {time: TIME, now: start, source: &mut ask, out: &mut out}).unwrap();
+		let (_, mut tx, mut rx) = node(&out[0]);
+		machine.received(&answer(&mut tx, Some(&[2; 92])), start).unwrap();
+		// The probes found 1080: wide or not, no packet is padded above 1080 and 62 bytes, and a datagram of that size still goes.
+		machine.room(1080);
+		let mut scratch = Vec::new();
+		for round in 0..200u32 {
+			let mut io = Io {time: TIME, now: start, source: &mut ask, out: &mut out};
+			machine.send(&[4; 900], Kind::Packet {flow: 7, control: round % 2 == 0}, &mut io).unwrap();
+		}
+		machine.send(&[4; 1112], Kind::Packet {flow: 7, control: false}, &mut Io {time: TIME, now: start, source: &mut ask, out: &mut out}).unwrap();
+		assert!(out[1..].iter().all(|packet| packet.len() <= 1080 + 62 && rx.open(packet, &mut scratch).is_ok()) && out.len() == 202);
+		// A probe above the tunnel's MTU goes at its own size, the probe and 62 bytes, and a room above the profile's is held to it.
+		machine.send(&[4; 1422], Kind::Probe, &mut Io {time: TIME, now: start, source: &mut ask, out: &mut out}).unwrap();
+		machine.send(&[4; 1032], Kind::Probe, &mut Io {time: TIME, now: start, source: &mut ask, out: &mut out}).unwrap();
+		assert_eq!((out[202].len(), out[203].len()), (1422 + 30, 1032 + 30));
+		machine.room(1500);
+		machine.send(&[4; 1423], Kind::Packet {flow: 7, control: false}, &mut Io {time: TIME, now: start, source: &mut ask, out: &mut out}).unwrap();
+		assert_eq!((out.len(), machine.dropped()), (204, 1));
 	}
 
 	#[test]

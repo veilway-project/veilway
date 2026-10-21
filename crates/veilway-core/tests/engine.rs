@@ -770,7 +770,7 @@ async fn a_node_that_drops_the_device_on_a_reload_ends_the_session_and_the_engin
 	stopped.tunnel.stop().await;
 }
 
-// "The client takes its MTU from the signed profile. Path MTU discovery can lower it, never raise it, and never below 1280." What the node says is bounded by the profile's, and the probing settles at a size the node takes.
+// "The client takes its MTU from the signed profile. Path MTU discovery can lower it, never raise it, and never below 1280, or 1080 on a tunnel whose addresses are all IPv4." What the node says is bounded by the profile's, and the probing settles at a size the node takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_mtu_is_lowered_to_what_the_node_and_the_probes_allow_and_never_raised() {
 	let time = time!();
@@ -787,6 +787,23 @@ async fn the_mtu_is_lowered_to_what_the_node_and_the_probes_allow_and_never_rais
 	// The node took the size the device set, and a packet that fits it passes. Where fragmentation cannot be prohibited the device walks nothing and sets nothing, and the node's size is the inbound's, which is the same.
 	if DONT_FRAGMENT {eventually("the node did not take the device's MTU", || net.engine.peers(Some("a")).first().is_some_and(|peer| peer.mtu == Some(1300))).await}
 	assert!(run.ping(1300, 1).await);
+	run.tunnel.stop().await;
+}
+
+// A path that carries less than 1280 and the overhead of `udp-obfs`, made by hand: run as root with `VEILWAY_TEST_PATH=1350` after `nft add table inet path; nft add chain inet path o "{ type filter hook output priority -300; }"; nft add rule inet path o oifname lo meta l4proto udp ip length gt 1350 drop`. On a tunnel of IPv4 alone the walk goes below 1280 to the largest size of the table that fits, and padding never makes a packet the path drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tunnel_of_ipv4_alone_works_on_a_path_below_1280_and_its_overhead() {
+	let Some(limit) = std::env::var("VEILWAY_TEST_PATH").ok().and_then(|limit| limit.parse::<u16>().ok()) else {return};
+	let time = time!();
+	let net = net("engine-small-path", time, |doc| doc["inbounds"][0]["mtu"] = json!(1390)).await;
+	let library = library(&net, "small-path", &payload(time, vec![profile(&net, 0, &["udp-obfs"])])).await;
+	let mut run = Run::new(start(&net, net.settings("small-path"), &library, PRIVATE).unwrap(), 0);
+	run.connected().await;
+	let fits = veilway_proto::control::PROBE_SIZES.into_iter().filter(|size| size + 62 + 28 <= limit).max().unwrap();
+	let status = run.until("the size that fits was not found", Duration::from_secs(40), |status| status.control && status.mtu == fits).await;
+	assert!(status.mtu < 1280);
+	eventually("the node did not take the device's MTU", || net.engine.peers(Some("a")).first().is_some_and(|peer| peer.mtu == Some(fits))).await;
+	for seq in 1..=20 {assert!(run.ping(usize::from(fits), seq).await)}
 	run.tunnel.stop().await;
 }
 
@@ -1280,7 +1297,7 @@ async fn a_node_that_says_a_higher_mtu_than_the_one_in_force_does_not_raise_the_
 	run.connected().await;
 	run.until("the size was not found", Duration::from_secs(20), |status| status.mtu == 1300 && (status.counters.probes >= 1 || !DONT_FRAGMENT)).await;
 	let session = |mtu| NodeMessage::Session(Session {node_time: time.secs(), mtu, v4: Some(Addresses {device: [10, 7, 0, 2].into(), gateway: [10, 7, 0, 1].into()}), v6: None});
-	for message in [NodeMessage::MtuResult {mtu: 1390}, NodeMessage::MtuResult {mtu: 1300}, session(1390), session(1500), NodeMessage::MtuResult {mtu: 1279}, NodeMessage::MtuResult {mtu: 0}] {run.tunnel.inject(message)}
+	for message in [NodeMessage::MtuResult {mtu: 1390}, NodeMessage::MtuResult {mtu: 1300}, session(1390), session(1500), NodeMessage::MtuResult {mtu: 1079}, NodeMessage::MtuResult {mtu: 0}] {run.tunnel.inject(message)}
 	tokio::time::sleep(Duration::from_secs(1)).await;
 	assert_eq!(run.tunnel.status().mtu, 1300);
 	// A lower size, in the same two ways, is taken, so the path was live.

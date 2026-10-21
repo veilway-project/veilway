@@ -30,10 +30,12 @@ pub const EXITS_PER_MESSAGE: usize = 64;
 pub const EXITS_MAX: usize = 256;
 pub const NOTICES_MAX: usize = 4;
 pub const HINTS_MAX: usize = 16;
-/// The smallest tunnel MTU, and the smallest probe size.
+/// The smallest tunnel MTU and probe size of a tunnel that carries IPv6, which needs 1280, and the smallest `mtu` of a profile.
 pub const MTU_MIN: u16 = 1280;
-/// "MTU probe sizes: the profile's `mtu`, and those of 1280, 1320, 1360, 1390, 1420 and 1440 that are below it."
-pub const PROBE_SIZES: [u16; 6] = [1280, 1320, 1360, 1390, 1420, 1440];
+/// The smallest tunnel MTU and probe size of a tunnel where the device and the gateways have IPv4 addresses only. It lets a datagram transport work on a path that cannot carry 1280 and the transport's overhead.
+pub const MTU_MIN_V4: u16 = 1080;
+/// "MTU probe sizes: the profile's `mtu`, and those of 1080, 1160, 1240, 1280, 1320, 1360, 1390, 1420 and 1440 that are below it and not below the tunnel's smallest MTU."
+pub const PROBE_SIZES: [u16; 9] = [1080, 1160, 1240, 1280, 1320, 1360, 1390, 1420, 1440];
 /// A client clamps the integers of `usage` to this before showing them ("What a malicious node can do"). `Usage::clamped` does it.
 pub const USAGE_CLAMP: u64 = 9_007_199_254_740_991;
 
@@ -725,11 +727,14 @@ pub fn catalogue(entries: &[Exit]) -> Result<Vec<NodeMessage>, EncodeError> {
 	Ok((0..parts).map(|part| NodeMessage::Exits {last: part + 1 == parts, entries: entries.iter().skip(part * EXITS_PER_MESSAGE).take(EXITS_PER_MESSAGE).cloned().collect()}).collect())
 }
 
-/// The sizes a client probes, in order: the profile's `mtu`, then the sizes of the table below it, largest first ("MTU discovery", step 4). Empty for an `mtu` below 1280.
-pub fn probe_sizes(mtu: u16) -> impl Iterator<Item = u16> {(mtu >= MTU_MIN).then_some(mtu).into_iter().chain(PROBE_SIZES.into_iter().rev().filter(move |size| *size < mtu))}
+/// The smallest tunnel MTU: 1280 when the device or a gateway has an IPv6 address, 1080 otherwise.
+pub fn mtu_floor(v6: bool) -> u16 {if v6 {MTU_MIN} else {MTU_MIN_V4}}
+
+/// The sizes a client probes, in order: the profile's `mtu`, then the sizes of the table below it down to `floor`, largest first ("MTU discovery", step 4). Empty for an `mtu` below `floor`.
+pub fn probe_sizes(mtu: u16, floor: u16) -> impl Iterator<Item = u16> {(mtu >= floor).then_some(mtu).into_iter().chain(PROBE_SIZES.into_iter().rev().filter(move |size| *size < mtu && *size >= floor))}
 
 // The UDP payload of a probe whose inner IP packet is `size` bytes: the packet has no IP options and no extension headers, so its headers are 28 bytes on IPv4 and 48 on IPv6.
-fn probe_payload(size: u16, v6: bool) -> Option<usize> {(size >= MTU_MIN).then(|| usize::from(size) - if v6 {48} else {28})}
+fn probe_payload(size: u16, v6: bool) -> Option<usize> {(size >= mtu_floor(v6)).then(|| usize::from(size) - if v6 {48} else {28})}
 
 /// Appends the UDP payload of an MTU probe whose inner IP packet is exactly `size` bytes: the token, `seq`, then the filler of zero bytes, `size` - 37 of them on IPv4 and `size` - 57 on IPv6 ("MTU discovery").
 pub fn probe(token: &Token, seq: u8, size: u16, v6: bool, out: &mut Vec<u8>) -> Result<(), EncodeError> {
@@ -1248,10 +1253,12 @@ mod tests {
 
 	#[test]
 	fn probes() {
-		assert_eq!(probe_sizes(1390).collect::<Vec<_>>(), [1390, 1360, 1320, 1280]);
-		assert_eq!(probe_sizes(1500).collect::<Vec<_>>(), [1500, 1440, 1420, 1390, 1360, 1320, 1280]);
-		assert_eq!(probe_sizes(1280).collect::<Vec<_>>(), [1280]);
-		assert_eq!(probe_sizes(1279).count(), 0);
+		assert_eq!(probe_sizes(1390, MTU_MIN).collect::<Vec<_>>(), [1390, 1360, 1320, 1280]);
+		assert_eq!(probe_sizes(1500, MTU_MIN).collect::<Vec<_>>(), [1500, 1440, 1420, 1390, 1360, 1320, 1280]);
+		assert_eq!(probe_sizes(1280, MTU_MIN).collect::<Vec<_>>(), [1280]);
+		assert_eq!(probe_sizes(1279, MTU_MIN).count(), 0);
+		assert_eq!(probe_sizes(1390, MTU_MIN_V4).collect::<Vec<_>>(), [1390, 1360, 1320, 1280, 1240, 1160, 1080]);
+		assert_eq!(probe_sizes(1079, MTU_MIN_V4).count(), 0);
 		let token = Token([0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7]);
 		let mut out = Vec::new();
 		probe(&token, 3, 1280, false, &mut out).unwrap();
@@ -1262,7 +1269,10 @@ mod tests {
 		assert_eq!(read_probe(&out[..out.len() - 4], 1280, false), Err(DecodeError::Length));
 		assert_eq!(read_probe(&out, 1280, true), Err(DecodeError::Length));
 		assert_eq!(read_probe(&out, 1281, false), Err(DecodeError::Length));
-		assert_eq!(read_probe(&out[..1279 - 28], 1279, false), Err(DecodeError::Length));
+		// Below the smallest MTU of its family a probe has no size: 1080 on IPv4 and 1280 on IPv6.
+		assert_eq!(read_probe(&out[..1079 - 28], 1079, false), Err(DecodeError::Length));
+		assert_eq!(read_probe(&out[..1279 - 48], 1279, true), Err(DecodeError::Length));
+		assert_eq!(read_probe(&out[..1080 - 28], 1080, false), Ok((token, 3)));
 		for at in [9, 700, out.len() - 1] {
 			let mut changed = out.clone();
 			changed[at] = 1;

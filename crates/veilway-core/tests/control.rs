@@ -752,13 +752,13 @@ async fn a_device_probes_its_mtu_sets_it_and_gets_nothing_larger_from_then_on() 
 	assert_eq!(second.answer(&mut a).await, Some(NodeMessage::Error {code: ErrorCode::NotApplicable, answers: kind::PROBE_DOWN}));
 	// The probes are the channel's own traffic, and no `usage` is pushed for them.
 	assert_eq!((channel.next(&mut a, Duration::from_millis(1500)).await, channel.usage.len()), (None, 0));
-	// `set_mtu` inside its bounds is taken, and outside them changes nothing.
-	for (asked, in_force) in [(1280, 1280), (9000, 1280), (1279, 1280), (1300, 1300), (1421, 1300), (1280, 1280)] {
+	// `set_mtu` inside its bounds is taken, and outside them changes nothing. The device has IPv4 addresses only, so its tunnel goes down to 1080.
+	for (asked, in_force) in [(1280, 1280), (9000, 1280), (1079, 1280), (1300, 1300), (1279, 1279), (1280, 1280)] {
 		channel.ask(&mut a, ClientMessage::SetMtu {mtu: asked}).await;
 		assert_eq!(channel.answer(&mut a).await, Some(NodeMessage::MtuResult {mtu: in_force}), "set_mtu {asked}");
 	}
 	channel.ask(&mut a, ClientMessage::Refresh).await;
-	assert_eq!((channel.snapshot(&mut a).await.0.mtu, node.engine.peers(Some("a"))[0].mtu, node.engine.control().mtus_set), (1280, Some(1280), 3));
+	assert_eq!((channel.snapshot(&mut a).await.0.mtu, node.engine.peers(Some("a"))[0].mtu, node.engine.control().mtus_set), (1280, Some(1280), 4));
 	// A datagram the node's stack builds for the device, larger than its MTU: fragmented by the node as its sender, never sent whole and never dropped.
 	a.send(&udp(A, PUBLIC, 45002, 9000, &[7; 1380])).await;
 	let (payload, sizes) = datagram(&mut a, PUBLIC, 9000).await;

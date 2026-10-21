@@ -13,7 +13,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::{Instant, MissedTickBehavior};
-use veilway_proto::control::{self, ByeReason, ClientMessage, ExitStatus, NodeMessage, Period, MTU_CONFIRM, MTU_MIN, MTU_REMEMBERED, OPEN_DELAY, PROBE_RUN_INTERVAL, SET_EXIT_BURST, SET_EXIT_REFILL};
+use veilway_proto::control::{self, ByeReason, ClientMessage, ExitStatus, NodeMessage, Period, MTU_CONFIRM, MTU_REMEMBERED, OPEN_DELAY, PROBE_RUN_INTERVAL, SET_EXIT_BURST, SET_EXIT_REFILL};
 use veilway_proto::opening::OpenError;
 use veilway_proto::{session, uniform};
 use veilway_proto::subscription::payload::Transport;
@@ -29,6 +29,8 @@ impl Carrier {
 			Self::Plain(socket, _) => {let _ = socket.try_send(&datagram);}
 		}
 	}
+	// The tunnel's MTU now, so that `udp-obfs` pads nothing above it.
+	fn room(&self, mtu: u16) {if let Self::Native(session) = self {session.room(mtu)}}
 	async fn recv(&mut self) -> Result<Vec<u8>, Ended> {
 		match self {
 			Self::Native(session) => session.recv().await,
@@ -105,8 +107,8 @@ fn next_period(period: Period, start: u64) -> Option<u64> {
 	}
 }
 
-/// Whether what the node said of the MTU is taken: lower than the size now in force, and inside 1280 and the profile's.
-fn lowered(current: u16, said: u16, profile: u16) -> bool {said < current && (MTU_MIN..=profile).contains(&said)}
+/// Whether what the node said of the MTU is taken: lower than the size now in force, and inside the tunnel's smallest MTU and the profile's.
+fn lowered(current: u16, said: u16, floor: u16, profile: u16) -> bool {said < current && (floor..=profile).contains(&said)}
 
 /// Whether a packet out of the tunnel is for this device: its destination is one of the addresses of the signed profile. A node can send what it likes inside the tunnel, a packet for a host on the device's own network, a broadcast or a loopback address among it, and on a device that forwards (a tethered phone, a router) the platform would carry it there.
 fn for_device(packet: &[u8], addresses: &[IpAddr]) -> bool {ip::destination(packet).is_some_and(|destination| addresses.contains(&destination))}
@@ -145,6 +147,7 @@ impl Core {
 		(self.warn, self.status.out_of_date, self.status.exits) = (None, false, Vec::new());
 		// A size found or lowered by an earlier session or another transport is not this session's, unless it was found for this transport on this network not long ago: then the session starts at that size, and the walk confirms it. Otherwise it starts from the profile's.
 		self.mtu_set(self.remembered(transport).unwrap_or(self.profile.mtu));
+		carrier.room(self.status.mtu);
 		if opened {self.opened(&mut c)}
 		let mut tick = tokio::time::interval(Duration::from_millis(250));
 		tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -162,6 +165,7 @@ impl Core {
 				},
 				_ = tick.tick() => self.tick(&mut c, &carrier),
 			}
+			carrier.room(self.status.mtu);
 			if c.bye {break (Ended::Closed(End::Peer), Why::Bye)}
 			if c.replan {break (Ended::Closed(End::Asked), Why::Again)}
 			if let Some(error) = c.broken.take() {break (error, Why::Over)}
@@ -263,10 +267,10 @@ impl Core {
 		}
 		self.counters.packets_sent += 1;
 		self.counters.bytes_sent += packet.len() as u64;
-		self.encapsulate(c, carrier, &packet, false);
+		self.encapsulate(c, carrier, &packet, false, false);
 	}
 	// Writes one IP packet into the tunnel. "The client starts a new WireGuard handshake when it sends a packet on a tunnel whose last handshake is older than the client rekey point."
-	fn encapsulate(&mut self, c: &mut Carry, carrier: &Carrier, packet: &[u8], control: bool) {
+	fn encapsulate(&mut self, c: &mut Carry, carrier: &Carrier, packet: &[u8], control: bool, probe: bool) {
 		let (rekey, datagram) = {
 			let mut wire = self.wire.lock();
 			let rekey = if wire.due() {wire.initiation()} else {None};
@@ -274,12 +278,12 @@ impl Core {
 		};
 		if let Some(rekey) = rekey {carrier.send(rekey, Kind::Handshake)}
 		if let Some(datagram) = datagram {
-			let kind = if matches!(datagram.first(), Some(1..=3)) {Kind::Handshake} else {Kind::Packet {flow: flow(packet), control}};
+			let kind = if matches!(datagram.first(), Some(1..=3)) {Kind::Handshake} else if probe {Kind::Probe} else {Kind::Packet {flow: flow(packet), control}};
 			carrier.send(datagram, kind);
 		}
 	}
 	// Sends the packets the control channel or the probe wrote.
-	fn sent(&mut self, c: &mut Carry, carrier: &Carrier, packets: Vec<Vec<u8>>, control: bool) {for packet in packets {self.encapsulate(c, carrier, &packet, control)}}
+	fn sent(&mut self, c: &mut Carry, carrier: &Carrier, packets: Vec<Vec<u8>>, control: bool) {for packet in packets {self.encapsulate(c, carrier, &packet, control, false)}}
 	fn moved(&mut self, c: &mut Carry, carrier: &Carrier) {
 		// "An address inside one of the device's own networks" is not dialled at any connect, but a private one after the user's yes to a private address: the session to one that is skipped is ended.
 		if self.own(c.transport, c.candidate) {
@@ -376,7 +380,7 @@ impl Core {
 			if c.walk.is_none() && c.walk_at.is_some_and(|at| now >= at) {
 				c.walk_at = None;
 				let remembered = self.remembered(c.transport);
-				let (walk, actions) = Walk::start(self.profile.mtu, remembered.or(Some(self.status.mtu)), pick(PORTS.0, PORTS.1) as u16, now);
+				let (walk, actions) = Walk::start(self.profile.mtu, self.floor(), remembered.or(Some(self.status.mtu)), pick(PORTS.0, PORTS.1) as u16, now);
 				c.walk = Some(walk);
 				self.walked(c, carrier, actions);
 			}
@@ -419,7 +423,7 @@ impl Core {
 					let (local, gateway, port) = (self.profile.device.addresses.first().copied(), self.profile.gateways.first().copied(), c.walk.as_ref().map_or(0, Walk::port));
 					let mut payload = Vec::new();
 					let packet = local.zip(gateway).filter(|_| control::probe(&token, seq, size, gateway.is_some_and(|gateway| gateway.is_ipv6()), &mut payload).is_ok()).and_then(|(local, gateway)| ip::udp((local, port), (gateway, control::PORT), &payload));
-					if let Some(packet) = packet {self.encapsulate(c, carrier, &packet, false)}
+					if let Some(packet) = packet {self.encapsulate(c, carrier, &packet, false, true)}
 				}
 				mtu::Action::Done(outcome) => {
 					c.walk = None;
@@ -451,15 +455,17 @@ impl Core {
 	}
 	// The size found for a transport on the network the device is on, if it is not more than a week old.
 	fn remembered(&self, transport: usize) -> Option<u16> {self.kept.mtus.iter().find(|found| found.network == self.net_key && found.transport == transport && self.unix().saturating_sub(found.when) <= MTU_REMEMBERED.as_secs()).map(|found| found.mtu)}
+	// The tunnel's smallest MTU: 1280 when the device or a gateway has an IPv6 address, and 1080 when the tunnel is IPv4 alone.
+	fn floor(&self) -> u16 {control::mtu_floor(self.profile.device.addresses.iter().chain(&self.profile.gateways).any(IpAddr::is_ipv6))}
 	// The size the probes found: confirmed in both directions, and never above the profile's.
 	fn mtu_set(&mut self, mtu: u16) {
-		if (MTU_MIN..=self.profile.mtu).contains(&mtu) && mtu != self.status.mtu {
+		if (self.floor()..=self.profile.mtu).contains(&mtu) && mtu != self.status.mtu {
 			self.status.mtu = mtu;
 			let _ = self.events.send(Event::Mtu(mtu));
 		}
 	}
 	// What the node says of the MTU, in `session` and in `mtu_result`: "Lowers the tunnel MTU to it. A value outside the bound is ignored." A value that is not lower is nothing the client takes, so that a node cannot raise the tunnel above what the probes found and black-hole every full-size packet; and one that comes unasked is the same.
-	fn mtu_said(&mut self, said: u16) {if lowered(self.status.mtu, said, self.profile.mtu) {self.mtu_set(said)}}
+	fn mtu_said(&mut self, said: u16) {if lowered(self.status.mtu, said, self.floor(), self.profile.mtu) {self.mtu_set(said)}}
 	fn control_failed(&mut self, c: &mut Carry, failure: Failure) {
 		self.counters.control_failed += 1;
 		self.status.control = false;
@@ -576,10 +582,12 @@ mod tests {
 	// "Lowers the tunnel MTU to it." What the node says is taken only when it is lower than the size in force, and inside the bounds.
 	#[test]
 	fn the_node_can_lower_the_mtu_and_never_raise_it() {
-		assert!(lowered(1390, 1300, 1390) && lowered(1390, 1280, 1390));
-		// The same size, a higher one (the whole point: after the probes found 1300 on a path that carries no more), one below 1280 and one above the profile's.
-		assert!(!lowered(1300, 1300, 1390) && !lowered(1300, 1420, 1390) && !lowered(1300, 1390, 1390));
-		assert!(!lowered(1390, 1279, 1390) && !lowered(1500, 1450, 1390) && !lowered(1390, 0, 1390));
+		assert!(lowered(1390, 1300, 1280, 1390) && lowered(1390, 1280, 1280, 1390));
+		// The same size, a higher one (the whole point: after the probes found 1300 on a path that carries no more), one below the tunnel's smallest MTU and one above the profile's.
+		assert!(!lowered(1300, 1300, 1280, 1390) && !lowered(1300, 1420, 1280, 1390) && !lowered(1300, 1390, 1280, 1390));
+		assert!(!lowered(1390, 1279, 1280, 1390) && !lowered(1500, 1450, 1280, 1390) && !lowered(1390, 0, 1280, 1390));
+		// On a tunnel of IPv4 alone the floor is 1080.
+		assert!(lowered(1390, 1080, 1080, 1390) && !lowered(1390, 1079, 1080, 1390));
 	}
 
 	// A node can send what it likes inside the tunnel; the platform gets what is for the device.

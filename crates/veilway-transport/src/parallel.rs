@@ -86,7 +86,7 @@ fn pass(port: &Port, members: &[(usize, Member, bool)], datagram: Vec<u8>, kind:
 		// Before the first connection is established there is one, and the handshake that establishes it goes there.
 		_ if ready().next().is_none() => members.first(),
 		Kind::Packet {flow, ..} => ready().max_by_key(|(number, _, _)| [flow.to_le_bytes(), (*number as u32).to_le_bytes()].concat().iter().fold(0x811c_9dc5u32, |hash, byte| (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193))),
-		Kind::Handshake => ready().next(),
+		Kind::Handshake | Kind::Probe => ready().next(),
 		Kind::Stalled => ready().max_by_key(|(_, member, _)| member.last.lock().ok().and_then(|last| *last)),
 	};
 	if !to.is_some_and(|(_, member, _)| member.out.try_send((datagram, kind)).is_ok()) {port.dropped(1)}

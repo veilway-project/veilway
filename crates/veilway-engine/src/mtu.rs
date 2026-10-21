@@ -4,7 +4,7 @@
 //! A remembered size (7 days, per network and transport) is confirmed first with one probe in each direction, and a confirmation that fails starts the walk from the top of the table. The node answers a run of probes at most once a minute and takes at most 16 probes in each direction; the walk is built never to ask for more than that.
 //! What the node says is hostile input: a token, a size or a sequence number that is not the one asked for is ignored, and the result is never above the profile's `mtu`, whatever the node says.
 use tokio::time::Instant;
-use veilway_proto::control::{self, ClientMessage, ErrorCode, NodeMessage, Token, MTU_MIN, PROBES, PROBE_WAIT};
+use veilway_proto::control::{self, ClientMessage, ErrorCode, NodeMessage, Token, PROBES, PROBE_WAIT};
 
 /// What the walk asks its driver to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +43,8 @@ enum Step {
 
 pub struct Walk {
 	profile: u16,
+	// The tunnel's smallest MTU, from the families of its addresses.
+	floor: u16,
 	// Sizes still to try, in order, and the one being tried.
 	sizes: Vec<u16>,
 	size: u16,
@@ -57,9 +59,9 @@ pub struct Walk {
 }
 
 impl Walk {
-	/// Starts a run. `profile` is the signed profile's `mtu`, `remembered` the size confirmed first, if one is held, and `port` the UDP port the downstream probes come to.
-	pub fn start(profile: u16, remembered: Option<u16>, port: u16, now: Instant) -> (Self, Vec<Action>) {
-		let walk = Self {profile, sizes: Vec::new(), size: 0, token: None, seq: 0, step: Step::Token, up: 0, down: 0, port, due: Some(now + PROBE_WAIT * 2), remembered};
+	/// Starts a run. `profile` is the signed profile's `mtu`, `floor` the tunnel's smallest MTU, `remembered` the size confirmed first, if one is held, and `port` the UDP port the downstream probes come to.
+	pub fn start(profile: u16, floor: u16, remembered: Option<u16>, port: u16, now: Instant) -> (Self, Vec<Action>) {
+		let walk = Self {profile, floor, sizes: Vec::new(), size: 0, token: None, seq: 0, step: Step::Token, up: 0, down: 0, port, due: Some(now + PROBE_WAIT * 2), remembered};
 		(walk, vec![Action::Send(ClientMessage::ProbeStart)])
 	}
 	pub fn port(&self) -> u16 {self.port}
@@ -97,8 +99,8 @@ impl Walk {
 				self.token = Some(*token);
 				let top = self.profile.min(*max_size);
 				// The remembered size is confirmed first, and the table below the top follows it.
-				let mut sizes: Vec<u16> = control::probe_sizes(top).collect();
-				if let Some(held) = self.remembered.filter(|held| (MTU_MIN..=top).contains(held)) {sizes.retain(|size| *size != held); sizes.insert(0, held)}
+				let mut sizes: Vec<u16> = control::probe_sizes(top, self.floor).collect();
+				if let Some(held) = self.remembered.filter(|held| (self.floor..=top).contains(held)) {sizes.retain(|size| *size != held); sizes.insert(0, held)}
 				self.sizes = sizes;
 				self.next(now)
 			}
@@ -130,13 +132,14 @@ impl Walk {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use veilway_proto::control::{MTU_MIN, MTU_MIN_V4};
 
 	const TOKEN: Token = Token([7; 8]);
 
 	// Drives a walk against a path that carries packets up to `limit` bytes in each direction, or `up` and `down` separately.
-	fn run(profile: u16, remembered: Option<u16>, up_limit: u16, down_limit: u16) -> (Outcome, usize, usize) {
+	fn run(profile: u16, floor: u16, remembered: Option<u16>, up_limit: u16, down_limit: u16) -> (Outcome, usize, usize) {
 		let mut now = Instant::now();
-		let (mut walk, todo) = Walk::start(profile, remembered, 51000, now);
+		let (mut walk, todo) = Walk::start(profile, floor, remembered, 51000, now);
 		let (mut ups, mut downs) = (0, 0);
 		let mut queue = std::collections::VecDeque::from(todo);
 		loop {
@@ -166,41 +169,48 @@ mod tests {
 
 	#[test]
 	fn a_path_that_carries_the_profiles_size_costs_two_probes() {
-		assert_eq!(run(1390, None, 1500, 1500), (Outcome::Found(1390), 1, 1));
+		assert_eq!(run(1390, MTU_MIN, None, 1500, 1500), (Outcome::Found(1390), 1, 1));
 	}
 
 	#[test]
 	fn the_walk_goes_down_the_table_and_the_result_is_the_largest_that_passed_both_ways() {
 		// 1390 and 1360 pass up and not down, 1320 passes both.
-		assert_eq!(run(1390, None, 1500, 1330).0, Outcome::Found(1320));
-		assert_eq!(run(1440, None, 1365, 1500).0, Outcome::Found(1360));
-		assert_eq!(run(1440, None, 1300, 1300).0, Outcome::Found(1280));
+		assert_eq!(run(1390, MTU_MIN, None, 1500, 1330).0, Outcome::Found(1320));
+		assert_eq!(run(1440, MTU_MIN, None, 1365, 1500).0, Outcome::Found(1360));
+		assert_eq!(run(1440, MTU_MIN, None, 1300, 1300).0, Outcome::Found(1280));
 		// A size fails after a lost probe and one lost retry, and nothing is asked for more than 16 times in a direction.
-		let (outcome, ups, downs) = run(1440, None, 1300, 1300);
+		let (outcome, ups, downs) = run(1440, MTU_MIN, None, 1300, 1300);
 		assert!((ups, downs) <= (PROBES, PROBES) && ups > downs, "{ups} {downs}");
 		assert_eq!(outcome, Outcome::Found(1280));
-		assert_eq!(run(1440, None, 1279, 1500).0, Outcome::Failed);
-		assert_eq!(run(1280, None, 1500, 1500), (Outcome::Found(1280), 1, 1));
+		assert_eq!(run(1440, MTU_MIN, None, 1279, 1500).0, Outcome::Failed);
+		assert_eq!(run(1280, MTU_MIN, None, 1500, 1500), (Outcome::Found(1280), 1, 1));
 		// The result is never above the profile's, whatever the node allows.
-		assert_eq!(run(1300, None, 1500, 1500).0, Outcome::Found(1300));
+		assert_eq!(run(1300, MTU_MIN, None, 1500, 1500).0, Outcome::Found(1300));
+		// A tunnel with IPv4 addresses only goes on below 1280, down to 1080, within the 16 probes from a profile of 1420.
+		assert_eq!(run(1390, MTU_MIN_V4, None, 1250, 1250).0, Outcome::Found(1240));
+		let (outcome, ups, downs) = run(1420, MTU_MIN_V4, None, 1100, 1100);
+		assert!((outcome, ups <= PROBES, downs) == (Outcome::Found(1080), true, 1), "{outcome:?} {ups} {downs}");
+		assert_eq!(run(1390, MTU_MIN_V4, None, 1079, 1500).0, Outcome::Failed);
+		assert_eq!(run(1390, MTU_MIN_V4, Some(1160), 1500, 1500), (Outcome::Found(1160), 1, 1));
+		assert_eq!(run(1390, MTU_MIN, Some(1160), 1500, 1500), (Outcome::Found(1390), 1, 1));
 	}
 
 	#[test]
 	fn a_remembered_size_is_confirmed_first_and_a_failed_confirmation_starts_the_walk() {
-		assert_eq!(run(1390, Some(1320), 1500, 1500), (Outcome::Found(1320), 1, 1));
+		assert_eq!(run(1390, MTU_MIN, Some(1320), 1500, 1500), (Outcome::Found(1320), 1, 1));
 		// The path got worse since: the walk goes from the top, and the confirmed size is not tried a second time.
-		let (outcome, ups, _) = run(1390, Some(1360), 1340, 1340);
+		let (outcome, ups, _) = run(1390, MTU_MIN, Some(1360), 1340, 1340);
 		assert_eq!(outcome, Outcome::Found(1320));
 		assert!(ups <= PROBES);
 		// A remembered size outside what the profile may be is no size to confirm.
-		assert_eq!(run(1390, Some(1500), 1500, 1500), (Outcome::Found(1390), 1, 1));
-		assert_eq!(run(1390, Some(900), 1500, 1500), (Outcome::Found(1390), 1, 1));
+		assert_eq!(run(1390, MTU_MIN, Some(1500), 1500, 1500), (Outcome::Found(1390), 1, 1));
+		assert_eq!(run(1390, MTU_MIN, Some(900), 1500, 1500), (Outcome::Found(1390), 1, 1));
 	}
 
 	#[test]
 	fn what_the_node_says_out_of_turn_or_wrong_is_ignored() {
 		let now = Instant::now();
-		let (mut walk, _) = Walk::start(1390, None, 51000, now);
+		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
 		// Before the token nothing else counts.
 		assert!(walk.message(&NodeMessage::ProbeAck {seq: 1, size: 1390}, now).is_empty());
 		assert!(walk.arrived(&TOKEN, 1, 1390).is_empty());
@@ -223,11 +233,11 @@ mod tests {
 	fn the_nodes_refusals_end_the_run_without_a_result() {
 		let now = Instant::now();
 		for (code, outcome) in [(ErrorCode::NotApplicable, Outcome::NotApplicable), (ErrorCode::Busy, Outcome::Later), (ErrorCode::RateLimited, Outcome::Later)] {
-			let (mut walk, _) = Walk::start(1390, None, 51000, now);
+			let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
 			assert_eq!(walk.message(&NodeMessage::Error {code, answers: control::kind::PROBE_START}, now), vec![Action::Done(outcome)]);
 		}
 		// An error that answers another request is not the answer to this one, and a token that never comes ends the run.
-		let (mut walk, _) = Walk::start(1390, None, 51000, now);
+		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
 		assert!(walk.message(&NodeMessage::Error {code: ErrorCode::Busy, answers: control::kind::SET_MTU}, now).is_empty());
 		assert!(walk.poll(now).is_empty());
 		assert_eq!(walk.poll(now + PROBE_WAIT * 2), vec![Action::Done(Outcome::Later)]);

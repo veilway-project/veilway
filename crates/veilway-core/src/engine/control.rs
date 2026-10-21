@@ -3,7 +3,7 @@
 //! A connection that breaks any of it is closed with no message and counted.
 use super::icmp;
 use super::netstack::Packet;
-use super::plan::{Action, Backend, Holder, Plan, User};
+use super::plan::{Action, Backend, Device, Holder, Plan, User};
 use super::route::{Decision, Key, CLOSED_IDLE};
 use super::{Over, Shared};
 use crate::config::{NoticeSeverity, Protocol, QuotaPeriod};
@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch, Notify};
-use veilway_proto::control::{self, kind, Addresses, ByeReason, ClientMessage, ErrorCode, ExitStatus, Load, NodeMessage, Period, Severity, Token, AUTHENTICATED, DEVICE_MTU_LIFE, MESSAGE_BURST, MESSAGE_REFILL, MTU_MIN, PORT, PREFACE, PROBES, PROBE_RUN_INTERVAL, PROBE_TOKEN_LIFE, SET_EXIT_BURST, SET_EXIT_REFILL, UNAUTHENTICATED};
+use veilway_proto::control::{self, kind, Addresses, ByeReason, ClientMessage, ErrorCode, ExitStatus, Load, NodeMessage, Period, Severity, Token, AUTHENTICATED, DEVICE_MTU_LIFE, MESSAGE_BURST, MESSAGE_REFILL, PORT, PREFACE, PROBES, PROBE_RUN_INTERVAL, PROBE_TOKEN_LIFE, SET_EXIT_BURST, SET_EXIT_REFILL, UNAUTHENTICATED};
 use veilway_proto::keys::ControlKey;
 use veilway_proto::opening::{NodeOpening, OpenError, DEADLINE};
 use veilway_proto::NoRandom;
@@ -217,6 +217,9 @@ impl State {
 
 fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| NoRandom)}
 
+/// The smallest MTU of a device's tunnel: 1280 when it has an IPv6 address, as IPv6 needs, and 1080 when it has IPv4 addresses only.
+fn floor(device: &Device) -> u16 {control::mtu_floor(device.addresses.iter().any(IpAddr::is_ipv6))}
+
 /// One message appended to what a connection writes next. A message this crate cannot write is one no client would read: it is left out and said once, since nothing a device sent can cause it.
 fn put(out: &mut Vec<u8>, message: &NodeMessage) {
 	if let Err(e) = message.encode(out) {tracing::error!("control channel: a message of type {:#04x} could not be written and was left out: {e}", message.kind())}
@@ -326,7 +329,7 @@ impl Shared {
 		// The size of a probe is that of its whole IP packet, and a packet with options or extension headers has not the payload a probe of its size has, so `read_probe` refuses it.
 		let confirmed = u16::try_from(raw.len()).ok().and_then(|size| control::read_probe(raw.get(packet.upper + 8..)?, size, packet.src.is_ipv6()).ok().map(|(token, seq)| (token, seq, size))).is_some_and(|(token, seq, size)| {
 			let mut inner = device.control.inner();
-			let Some(run) = inner.as_mut().and_then(|inner| inner.run.as_mut()).filter(|run| run.token == token && run.gateway == packet.dst && run.started.elapsed() < PROBE_TOKEN_LIFE && run.up < PROBES && (MTU_MIN..=run.max).contains(&size)) else {return false};
+			let Some(run) = inner.as_mut().and_then(|inner| inner.run.as_mut()).filter(|run| run.token == token && run.gateway == packet.dst && run.started.elapsed() < PROBE_TOKEN_LIFE && run.up < PROBES && (floor(device)..=run.max).contains(&size)) else {return false};
 			run.up += 1;
 			run.to.try_send(Push::Ack {seq, size}).is_ok()
 		});
@@ -526,8 +529,8 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					});
 					match run {
 						None => put(&mut out, &NodeMessage::Error {code: ErrorCode::NotApplicable, answers: kind::PROBE_DOWN}),
-						// Control channel page, "MTU discovery": "the node accepts a `size` from 1280 to `max_size` and nothing else". The page names no answer for another size, so it is taken for a malformed body, and so is port 0, which no datagram can be sent to.
-						Some((_, max)) if !(MTU_MIN..=max).contains(&size) || port == 0 => return End::Malformed,
+						// Control channel page, "MTU discovery": "the node accepts a `size` from the tunnel's smallest MTU to `max_size` and nothing else". The page names no answer for another size, so it is taken for a malformed body, and so is port 0, which no datagram can be sent to.
+						Some((_, max)) if !(floor(&plan.devices[from.device])..=max).contains(&size) || port == 0 => return End::Malformed,
 						Some((token, _)) => {
 							// "A downstream probe goes only to the requesting device's own tunnel address": the address this connection came from, from the gateway it came to.
 							let (mut payload, mut raw) = (Vec::new(), Vec::with_capacity(usize::from(size)));
@@ -546,8 +549,8 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					}
 				}
 				Some(Some(ClientMessage::SetMtu {mtu})) => {
-					// "`set_mtu` is accepted from 1280 to the inbound's `mtu`." One outside that changes nothing, and the answer says what is in force.
-					if (MTU_MIN..=plan.inbounds[from.inbound].mtu).contains(&mtu) {
+					// "`set_mtu` is accepted from the tunnel's smallest MTU to the inbound's `mtu`." One outside that changes nothing, and the answer says what is in force.
+					if (floor(&plan.devices[from.device])..=plan.inbounds[from.inbound].mtu).contains(&mtu) {
 						counters.mtus_set.fetch_add(1, Ordering::Relaxed);
 						let was = state.mtu.swap(mtu, Ordering::Relaxed);
 						// The identifications of the packets that are fragmented from here on start where nobody can guess.

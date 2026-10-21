@@ -42,7 +42,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -215,6 +215,8 @@ pub enum Kind {
 	Handshake,
 	/// A handshake initiation WireGuard's own timer made "because the node stopped answering". On `udp-obfs` it travels in an opening packet. On a stream it is a handshake message that wants a chunk back within the liveness limit, or the session is lost, and with several connections it goes on the one a chunk was last heard on.
 	Stalled,
+	/// An MTU probe of the control channel: sent as it is, with no padding, since a probe that left larger than it was made would confirm nothing.
+	Probe,
 }
 
 /// Why a session is not, or is no longer, one.
@@ -366,7 +368,7 @@ pub struct Numbers {
 	pub heard: Option<Instant>,
 }
 
-pub(crate) struct Shared {datagram: usize, sent: AtomicU64, received: AtomicU64, dropped: AtomicU64, heard: Mutex<Option<Instant>>}
+pub(crate) struct Shared {datagram: usize, room: AtomicU16, sent: AtomicU64, received: AtomicU64, dropped: AtomicU64, heard: Mutex<Option<Instant>>}
 
 pub(crate) enum Ask {Close, Moved}
 
@@ -498,7 +500,7 @@ impl Session {
 	/// The same over up to `connections` connections of `tls`, `ws` or `faketls`, the profile's `parallel`: "Each connection is its own session with its own proof and keys, for the same device", the second and later ones opened "one at a time, each after a delay drawn uniformly from 1 to 5 s". Every other transport has one.
 	pub fn parallel(link: &Link, target: Target, connections: u8, env: Env, source: Source) -> Result<Session, Refuse> {
 		check(link, &target, &env)?;
-		let ((input, inbox), shared) = (mpsc::channel(INBOX), Arc::new(Shared {datagram: (usize::from(link.mtu) + 32).min(MAX_ITEM), sent: AtomicU64::new(0), received: AtomicU64::new(0), dropped: AtomicU64::new(0), heard: Mutex::new(None)}));
+		let ((input, inbox), shared) = (mpsc::channel(INBOX), Arc::new(Shared {datagram: (usize::from(link.mtu) + 32).min(MAX_ITEM), room: AtomicU16::new(link.mtu), sent: AtomicU64::new(0), received: AtomicU64::new(0), dropped: AtomicU64::new(0), heard: Mutex::new(None)}));
 		Ok(Session {member: launch(link.clone(), target, usize::from(connections.clamp(1, 4)), env, source, input, shared.clone()), input: inbox, shared})
 	}
 	/// Hands one WireGuard datagram to the session. False when it was dropped because the queue is full or the session is over: "Drop, do not queue." Nothing is ever sent outside the session.
@@ -528,6 +530,8 @@ impl Session {
 	}
 	/// The device's network interface or address changed. `udp-obfs` sends an opening packet from a new socket. A stream transport loses its connection by itself and says so.
 	pub fn moved(&self) {let _ = self.member.ask.send(Ask::Moved);}
+	/// The tunnel's MTU now, the profile's or a lower one the probes found. `udp-obfs` pads no packet above it and 62 bytes, so that padding never makes a packet the path drops.
+	pub fn room(&self, mtu: u16) {self.shared.room.store(mtu, Ordering::Relaxed)}
 	pub fn state(&self) -> State {*self.member.state.borrow()}
 	/// The state as something to wait on.
 	pub fn watch(&self) -> watch::Receiver<State> {self.member.state.clone()}
