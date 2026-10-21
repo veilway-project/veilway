@@ -107,9 +107,6 @@ fn next_period(period: Period, start: u64) -> Option<u64> {
 	}
 }
 
-/// The exit the device leaves through, as the catalogue tells it: the one it chose, and otherwise the user's configured exit while it works, then the first exit that works, which is the node's own rule for a device without a choice. None before a catalogue came.
-fn in_use(exits: &[ExitView]) -> Option<String> {exits.iter().find(|exit| exit.selected).or_else(|| exits.iter().find(|exit| exit.configured && exit.working)).or_else(|| exits.iter().find(|exit| exit.working)).or_else(|| exits.iter().find(|exit| exit.configured)).map(|exit| exit.tag.clone())}
-
 /// Whether what the node said of the MTU is taken: lower than the size now in force, and inside the tunnel's smallest MTU and the profile's.
 fn lowered(current: u16, said: u16, floor: u16, profile: u16) -> bool {said < current && (floor..=profile).contains(&said)}
 
@@ -135,7 +132,7 @@ impl Core {
 		self.wire.lock().settle();
 		c.opened = true;
 		if let Some(connection) = &mut self.status.connection {connection.since = Some(now)}
-		let exit = in_use(&self.status.exits);
+		let exit = self.status.exits.iter().find(|exit| exit.selected).or_else(|| self.status.exits.iter().find(|exit| exit.configured)).map(|exit| exit.tag.clone());
 		self.change(crate::status::State::Connected {exit}, None);
 		let _ = self.events.send(Event::Opened);
 		self.save();
@@ -534,7 +531,7 @@ impl Core {
 	}
 	// The tag of the exit in use is the state's: the selected one, or else the configured one.
 	fn exit_shown(&mut self) {
-		if let crate::status::State::Connected {exit} = &mut self.status.state {*exit = in_use(&self.status.exits)}
+		if let crate::status::State::Connected {exit} = &mut self.status.state {*exit = self.status.exits.iter().find(|exit| exit.selected).or_else(|| self.status.exits.iter().find(|exit| exit.configured)).map(|exit| exit.tag.clone())}
 	}
 	fn answered(&mut self, c: &mut Carry, carrier: &Carrier, message: NodeMessage, now: Instant) {
 		match message {
@@ -591,16 +588,6 @@ mod tests {
 		assert!(!lowered(1390, 1279, 1280, 1390) && !lowered(1500, 1450, 1280, 1390) && !lowered(1390, 0, 1280, 1390));
 		// On a tunnel of IPv4 alone the floor is 1080.
 		assert!(lowered(1390, 1080, 1080, 1390) && !lowered(1390, 1079, 1080, 1390));
-	}
-
-	#[test]
-	fn without_a_choice_the_exit_in_use_is_the_configured_one_while_it_works_then_the_first_that_works() {
-		let exit = |tag: &str, selected, configured, working| ExitView {tag: tag.into(), name: tag.into(), country: None, all_protocols: false, selected, configured, working, load: control::Load::Unknown};
-		assert_eq!(in_use(&[exit("de", false, true, true), exit("nl", false, false, true)]).as_deref(), Some("de"));
-		assert_eq!(in_use(&[exit("de", false, true, false), exit("fr", false, false, false), exit("nl", false, false, true)]).as_deref(), Some("nl"));
-		assert_eq!(in_use(&[exit("de", false, true, false), exit("nl", false, false, false)]).as_deref(), Some("de"));
-		assert_eq!(in_use(&[exit("de", false, true, false), exit("nl", true, false, false)]).as_deref(), Some("nl"));
-		assert_eq!(in_use(&[]), None);
 	}
 
 	// A node can send what it likes inside the tunnel; the platform gets what is for the device.

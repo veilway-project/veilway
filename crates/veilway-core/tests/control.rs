@@ -1219,11 +1219,14 @@ async fn pushed_exits(channel: &mut Channel, client: &mut Client, budget: Durati
 	None
 }
 
-// "Automatic" on a node: a device that chose no exit leaves through the user's configured one, and while its proxy does not let the node in, through the first exit that works and that the user may use. The channel says when an exit stops and starts working, and the node tries the proxy again by itself.
+// "Automatic" on a node: a device that chose no exit leaves through the user's configured one, and while its proxy does not let the node in, through the first exit of `routing.fallback` that works and that the user may use. The catalogue marks the exit it leaves through, and comes again when an exit stops and starts working. The node tries the proxy again by itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_without_a_choice_leaves_through_a_working_exit_while_its_own_is_down_and_comes_back() {
 	let dead = std::net::TcpListener::bind(ANY).unwrap().local_addr().unwrap();
-	let node = launch(|doc| doc["outbounds"][0]["server"] = json!(dead.to_string()), None).await;
+	let node = launch(|doc| {
+		doc["outbounds"][0]["server"] = json!(dead.to_string());
+		doc["routing"]["fallback"] = json!(["alt"]);
+	}, None).await;
 	let mut events = node.engine.events();
 	let mut a = Client::connect(KEY_A, node.addr).await;
 	let mut channel = Channel::of_a(&mut a, 50000).await;
@@ -1233,18 +1236,18 @@ async fn a_device_without_a_choice_leaves_through_a_working_exit_while_its_own_i
 	tokio::time::sleep(Duration::from_millis(5500)).await;
 	assert!(Tcp::open(&mut a, A, PUBLIC, 40003, 80).await.is_some());
 	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(5)).await.expect("no catalogue was pushed when the exit went down");
-	assert_eq!(exits.iter().map(|exit| (exit.tag.as_str(), exit.configured, exit.selected, exit.working)).collect::<Vec<_>>(), [("main", true, false, false), ("alt", false, false, true)]);
+	assert_eq!(exits.iter().map(|exit| (exit.tag.as_str(), exit.configured, exit.selected, exit.working)).collect::<Vec<_>>(), [("main", false, false, false), ("alt", true, false, true)]);
 	assert!(node.engine.exit_health()[0].proxy_down.is_some());
 	// The device has chosen nothing, so it leaves through `alt` meanwhile. User b may use `main` alone and stays on it.
 	assert_eq!(leaves(&mut a, A, 40004, 80).await.1, "alt");
 	let mut b = Client::connect(KEY_B, node.addr).await;
-	assert!(Tcp::open(&mut b, B, PUBLIC, 40005, 80).await.is_some());
+	assert!(Tcp::open(&mut b, B, PUBLIC, 40005, 81).await.is_some());
 	tokio::time::sleep(Duration::from_millis(500)).await;
-	assert_eq!(node.alt.lock().unwrap().as_slice(), &["93.184.216.34:80".to_string()][..]);
+	assert!(!node.alt.lock().unwrap().iter().any(|target| target.ends_with(":81")));
 	// The proxy comes back on the same address, and the node's own check finds it within its 30 s.
 	let (_, seen) = proxy("main", dead).await;
 	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(40)).await.expect("no catalogue was pushed when the exit came back");
-	assert!(exits.iter().all(|exit| exit.working));
+	assert_eq!(exits.iter().map(|exit| (exit.tag.as_str(), exit.configured, exit.working)).collect::<Vec<_>>(), [("main", true, true), ("alt", false, true)]);
 	assert_eq!(leaves(&mut a, A, 40006, 80).await.1, "main");
 	assert_eq!(seen.lock().unwrap().as_slice(), &["93.184.216.34:80".to_string()][..]);
 	let mut told = Vec::new();

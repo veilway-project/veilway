@@ -412,6 +412,16 @@ impl Config {
 		}
 		let default_exit = exit_tags.get(self.routing.default.as_str()).copied();
 		if default_exit.is_none() {r.error("routing.default", "expected the tag of an exit, found a tag no exit has")}
+		if self.routing.fallback.len() > 16 {r.error("routing.fallback", "expected at most 16 exits")}
+		for (i, tag) in self.routing.fallback.iter().enumerate().take(16) {
+			let at = format!("routing.fallback[{i}]");
+			match exit_tags.get(tag.as_str()) {
+				None => r.error(at, "expected the tag of an exit, found a tag no exit has"),
+				Some(exit) if matches!(self.exits[*exit].backend, Backend::Block {..}) => r.error(at, "a block exit carries nothing, so it is no exit to fall back to"),
+				Some(_) if self.routing.fallback[..i].contains(tag) => r.error(at, "this exit is in the list already"),
+				Some(_) => {}
+			}
+		}
 		// The bit sets below index exits, groups and inbounds, so they are only used when those sections are within their limits.
 		let small = self.exits.len() <= MAX_EXITS && self.groups.len() <= MAX_GROUPS && self.inbounds.len() <= MAX_INBOUNDS;
 		let number = |ip: IpAddr| match ip {

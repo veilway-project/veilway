@@ -392,6 +392,8 @@ pub struct Plan {
 	pub devices: Vec<Device>,
 	pub exits: Vec<Exit>,
 	pub default_exit: usize,
+	/// `routing.fallback`: the exits a device without a selection may leave through while its own is not working, in order.
+	pub fallback: Vec<usize>,
 	pub rules: Vec<Rule>,
 	/// Every inbound pool with its inbound, gateway address included.
 	pub pools: Vec<(IpNet, usize)>,
@@ -660,6 +662,7 @@ impl Plan {
 			shown: previous.shown.clone(),
 			hijack: config.dns.hijack != Some(false),
 			default_exit: find(&exit_tags, &config.routing.default)?,
+			fallback: config.routing.fallback.iter().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<Vec<usize>>>()?,
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),
 			l3: None,
 			notices: config.notices.iter().map(|notice| (notice.severity, notice.text.clone())).collect(),
@@ -696,11 +699,11 @@ impl Plan {
 		}
 	}
 
-	/// The exit of a user's device that chose none: the user's `exit`, then `routing.default`. While that one is not working, the first exit of the config that works and that the user may use, and the configured one again once it works. When none works it stays the configured one.
+	/// The exit of a user's device that chose none: the user's `exit`, then `routing.default`. While that one is not working, the first exit of `routing.fallback` that works and that the user may use, and the configured one again once it works. Without a fallback that works, or with none in the config, it stays the configured one: nothing goes round a link that is down unless the operator said where to.
 	pub fn automatic(&self, user: usize) -> usize {
 		let configured = self.users[user].exit.unwrap_or(self.default_exit);
 		if self.working(configured) {return configured}
-		(0..self.exits.len()).find(|at| self.users[user].entitled.as_ref().is_none_or(|list| list.contains(at)) && self.working(*at)).unwrap_or(configured)
+		self.fallback.iter().copied().find(|at| *at != configured && self.users[user].entitled.as_ref().is_none_or(|list| list.contains(at)) && self.working(*at)).unwrap_or(configured)
 	}
 
 	/// The exit the action `"user"` means for a device that chose `tag` on the control channel: that exit while it is one the user may use, otherwise `automatic`.

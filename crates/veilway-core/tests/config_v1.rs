@@ -1279,3 +1279,11 @@ fn the_user_and_rule_limits_validate_quickly() {
 	// Only a release build is held to the bound: an unoptimized build is several times slower by nature.
 	if !cfg!(debug_assertions) {assert!(validated.as_millis() < 500, "validation took {validated:?}")}
 }
+
+#[test]
+fn routing_fallback_names_exits_once_and_no_block_exit() {
+	clean(|doc| doc["routing"]["fallback"] = json!(["open", "node"]));
+	error_at("routing.fallback[0]", |doc| doc["routing"]["fallback"] = json!(["nowhere"]));
+	error_at("routing.fallback[1]", |doc| doc["routing"]["fallback"] = json!(["open", "open"]));
+	error_at("routing.fallback[0]", |doc| doc["routing"]["fallback"] = json!(["sink"]));
+}

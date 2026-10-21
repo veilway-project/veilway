@@ -1275,6 +1275,28 @@
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
           "type": "string"
         },
+        "fallback": {
+          "description": "The exits a device without a choice of exit may leave through while its own exit is not working, in the order they are tried, each only when its user may use it. Without it a device stays on its exit whatever happens to it, which is what an entry node needs: nothing goes round a link that is down.",
+          "items": {
+            "not": {
+              "enum": [
+                "all",
+                "any",
+                "block",
+                "reject",
+                "drop",
+                "local",
+                "direct",
+                "user"
+              ]
+            },
+            "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 16,
+          "type": "array",
+          "uniqueItems": true
+        },
         "rules": {
           "items": {
             "$ref": "#/$defs/Rule"

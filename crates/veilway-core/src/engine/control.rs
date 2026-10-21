@@ -296,8 +296,8 @@ impl Shared {
 		let (device, inbound) = (&plan.devices[from.device], &plan.inbounds[from.inbound]);
 		let (user, chosen) = (&plan.users[device.user], device.control.selected());
 		let pair = |v4: bool| device.addresses.iter().copied().find(|address| address.is_ipv4() == v4 && inbound.pools.iter().any(|pool| pool.contains(address))).zip(inbound.pools.iter().map(|pool| pool.addr()).find(|gateway| gateway.is_ipv4() == v4));
-		// "The user's configured exit" is read as the exit a device without a selection leaves through: the user's `exit`, or `routing.default` for a user without one.
-		let configured = user.exit.unwrap_or(plan.default_exit);
+		// "The user's configured exit" is the exit a device without a selection leaves through: the user's `exit`, or `routing.default` for a user without one, and while that is not working the exit of `routing.fallback` it leaves through instead.
+		let configured = plan.automatic(device.user);
 		Sent {
 			mtu: plan.mtu_of(from),
 			v4: if let Some((IpAddr::V4(device), IpAddr::V4(gateway))) = pair(true) {Some(Addresses {device, gateway})} else {None},

@@ -1296,6 +1296,10 @@ impl<'de> Deserialize<'de> for Backend {
 pub struct Routing {
 	#[schemars(pattern(TAG_PATTERN))]
 	pub default: String,
+	/// The exits a device without a choice of exit may leave through while its own exit is not working, in the order they are tried, each only when its user may use it. Without it a device stays on its exit whatever happens to it, which is what an entry node needs: nothing goes round a link that is down.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = 16), inner(pattern(TAG_PATTERN)))]
+	pub fallback: Vec<String>,
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_RULES))]
 	pub rules: Vec<Rule>,
