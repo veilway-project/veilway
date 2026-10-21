@@ -90,6 +90,8 @@ pub enum Event {
 	UserRestored {user: String},
 	/// The upstream of an exit stopped relaying UDP (`udp` false) or relays it again.
 	ExitUdpChanged {exit: String, udp: bool},
+	/// The proxy of an exit stopped letting the node in (`working` false), or lets it in again. Devices without a selection leave through another exit meanwhile.
+	ExitWorkingChanged {exit: String, working: bool},
 	/// The operator started a user's quota count over, see `Engine::reset_usage`. With `totals` what the user sent and received in all went back to zero as well.
 	/// A user who was out of quota is let in by it, which is a `UserRestored` right behind this.
 	UsageReset {user: String, totals: bool},
@@ -171,6 +173,10 @@ pub struct ExitHealth {
 	pub interface_down: Option<Option<Duration>>,
 	/// How often the interface of an l3 exit switched between up and down.
 	pub interface_flips: u64,
+	/// For an exit through a SOCKS5 proxy: how long the proxy has not let the node in. None while it does, and for every other exit.
+	pub proxy_down: Option<Duration>,
+	/// How often such an exit switched between working and not.
+	pub proxy_flips: u64,
 }
 
 /// What `start` needs besides the config document.
@@ -250,6 +256,17 @@ pub struct ExitState {
 	no_udp: Mutex<Option<Instant>>,
 	/// Switches between "relays udp" and "does not", in either direction.
 	udp_flips: AtomicU64,
+	/// Since when the proxy of a `socks5` exit has not let the node in. Meanwhile the exit is not working, and devices without a selection leave through another exit. It goes when the proxy lets the node in again, which a check every `flows::DOWN_RETRY` tries.
+	down: Mutex<Option<Instant>>,
+	/// Connections in a row the proxy did not let in, and when the first of them was.
+	failing: Mutex<(u32, Option<Instant>)>,
+	/// Switches between working and not working, in either direction.
+	down_flips: AtomicU64,
+}
+
+impl ExitState {
+	/// False while the proxy of a `socks5` exit does not let the node in.
+	pub fn working(&self) -> bool {self.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()}
 }
 
 /// One user's counters as `Engine::counters` gives them.
@@ -527,7 +544,7 @@ impl Engine {
 		let plan = self.plan();
 		plan.exits.iter().enumerate().map(|(at, exit)| {
 			let health = plan.l3.as_ref().filter(|(wired, _)| *wired == at).map(|(_, port)| &port.health);
-			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed))}
+			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed)), proxy_down: exit.state.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), proxy_flips: exit.state.down_flips.load(Ordering::Relaxed)}
 		}).collect()
 	}
 

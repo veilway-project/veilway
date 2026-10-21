@@ -803,6 +803,10 @@ pub struct UsageReset {pub user: String, pub totals: bool}
 #[derive(Serialize, JsonSchema)]
 pub struct ExitUdpChanged {pub exit: String, pub udp: bool}
 
+/// The data of an `exit_working_changed` event: the proxy of an exit stopped letting the node in (`working` false), or lets it in again. Devices without a choice of exit leave through another exit meanwhile.
+#[derive(Serialize, JsonSchema)]
+pub struct ExitWorkingChanged {pub exit: String, pub working: bool}
+
 /// The data of a `lagged` event: this many events, the ones whose ids are missing before the next event, never reached the reader. It was too slow for them, or the node made them faster than it keeps them for anybody. It has no id.
 #[derive(Serialize, JsonSchema)]
 pub struct Lagged {pub missed: u64}

@@ -25,6 +25,7 @@ export interface EventData {
 	user_restored: Schemas["UserRestored"];
 	usage_reset: Schemas["UsageReset"];
 	exit_udp_changed: Schemas["ExitUdpChanged"];
+	exit_working_changed: Schemas["ExitWorkingChanged"];
 	stats: Schemas["Stats"];
 	lagged: Schemas["Lagged"];
 }
@@ -40,7 +41,7 @@ export interface FetchResponse {
 export type Fetch = (url: string, init: {method: string, headers: Record<string, string>, body?: string, signal?: AbortSignal}) => Promise<FetchResponse>;
 /** The most one line of the event stream may hold before the client gives up on it. */
 const MAX_LINE = 1 << 20;
-const EVENTS = new Set<string>(["config_applied", "config_refused", "user_cut_off", "user_restored", "usage_reset", "exit_udp_changed", "stats", "lagged"]);
+const EVENTS = new Set<string>(["config_applied", "config_refused", "user_cut_off", "user_restored", "usage_reset", "exit_udp_changed", "exit_working_changed", "stats", "lagged"]);
 
 /** Every answer that is not a success, and an answer the client could not read. */
 export class VeilwayError extends Error {

@@ -25,6 +25,7 @@ const GATEWAY: [u8; 4] = [10, 7, 0, 1];
 const A: [u8; 4] = [10, 7, 0, 2];
 const B: [u8; 4] = [10, 7, 0, 3];
 const PUBLIC: [u8; 4] = [93, 184, 216, 34];
+const ANY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 const GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1);
 const A6: Ipv6Addr = Ipv6Addr::new(0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 2);
 const PUBLIC6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111);
@@ -50,8 +51,8 @@ fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {
 }
 
 /// A SOCKS5 proxy without authentication. A CONNECT is answered with `name` and then held open, and one to port 7000 gets 6000 more bytes behind the name. A UDP ASSOCIATE echoes every datagram with `echo:` in front, and every target asked for is recorded.
-async fn proxy(name: &'static str) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
-	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+async fn proxy(name: &'static str, at: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+	let listener = TcpListener::bind(at).await.unwrap();
 	let (addr, seen) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
 	let recorder = seen.clone();
 	tokio::spawn(async move {
@@ -131,7 +132,7 @@ fn parsed(doc: &Value) -> Config {
 
 /// Starts a node on `document` after `change` had its way with it. The usage pushes of its control channel come 300 to 600 ms apart, so no test waits a minute for one.
 async fn launch(change: impl FnOnce(&mut Value), state: Option<PathBuf>) -> Node {
-	let ((main, seen_main), (alt, seen_alt), addr) = (proxy("main").await, proxy("alt").await, listen());
+	let ((main, seen_main), (alt, seen_alt), addr) = (proxy("main", ANY).await, proxy("alt", ANY).await, listen());
 	let mut doc = document(main, alt, addr);
 	change(&mut doc);
 	let engine = veilway_core::start(&parsed(&doc), Options {state, usage_push: 300..=600, ..Options::new("")}).await.unwrap();
@@ -1203,4 +1204,51 @@ fn the_new_keys_are_validated_and_their_secrets_are_shown_to_nobody() {
 	let warned: Vec<String> = parsed(&unused).validate(false).warnings.iter().map(|warning| warning.path.clone()).filter(|path| path.contains("secrets") || path == "notices").collect();
 	assert_eq!(warned, ["users[0].devices[0].transport_secrets", "users[1].devices[0].transport_secrets", "notices"]);
 	assert_eq!(veilway_core::config::transport_secret().unwrap().len(), 44);
+}
+
+/// The next whole catalogue the node pushes on the channel, within `budget`, with every `usage` between kept.
+async fn pushed_exits(channel: &mut Channel, client: &mut Client, budget: Duration) -> Option<Vec<control::Exit>> {
+	let (mut catalogue, deadline) = (Catalogue::default(), Instant::now() + budget);
+	while let Some(message) = channel.next(client, deadline.saturating_duration_since(Instant::now())).await {
+		match message {
+			NodeMessage::Exits {last, entries} => if let Some(exits) = catalogue.add(last, entries).unwrap() {return Some(exits)},
+			NodeMessage::Usage(pushed) => channel.usage.push(pushed),
+			other => panic!("{other:?} was pushed"),
+		}
+	}
+	None
+}
+
+// "Automatic" on a node: a device that chose no exit leaves through the user's configured one, and while its proxy does not let the node in, through the first exit that works and that the user may use. The channel says when an exit stops and starts working, and the node tries the proxy again by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_without_a_choice_leaves_through_a_working_exit_while_its_own_is_down_and_comes_back() {
+	let dead = std::net::TcpListener::bind(ANY).unwrap().local_addr().unwrap();
+	let node = launch(|doc| doc["outbounds"][0]["server"] = json!(dead.to_string()), None).await;
+	let mut events = node.engine.events();
+	let mut a = Client::connect(KEY_A, node.addr).await;
+	let mut channel = Channel::of_a(&mut a, 50000).await;
+	assert!(channel.snapshot(&mut a).await.1.iter().all(|exit| exit.working));
+	// Proxy connections that fail in a row, the last at least 5 s after the first: the exit is not working, and the channel says so unasked.
+	for sport in [40001, 40002] {assert!(Tcp::open(&mut a, A, PUBLIC, sport, 80).await.is_some())}
+	tokio::time::sleep(Duration::from_millis(5500)).await;
+	assert!(Tcp::open(&mut a, A, PUBLIC, 40003, 80).await.is_some());
+	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(5)).await.expect("no catalogue was pushed when the exit went down");
+	assert_eq!(exits.iter().map(|exit| (exit.tag.as_str(), exit.configured, exit.selected, exit.working)).collect::<Vec<_>>(), [("main", true, false, false), ("alt", false, false, true)]);
+	assert!(node.engine.exit_health()[0].proxy_down.is_some());
+	// The device has chosen nothing, so it leaves through `alt` meanwhile. User b may use `main` alone and stays on it.
+	assert_eq!(leaves(&mut a, A, 40004, 80).await.1, "alt");
+	let mut b = Client::connect(KEY_B, node.addr).await;
+	assert!(Tcp::open(&mut b, B, PUBLIC, 40005, 80).await.is_some());
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(node.alt.lock().unwrap().as_slice(), &["93.184.216.34:80".to_string()][..]);
+	// The proxy comes back on the same address, and the node's own check finds it within its 30 s.
+	let (_, seen) = proxy("main", dead).await;
+	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(40)).await.expect("no catalogue was pushed when the exit came back");
+	assert!(exits.iter().all(|exit| exit.working));
+	assert_eq!(leaves(&mut a, A, 40006, 80).await.1, "main");
+	assert_eq!(seen.lock().unwrap().as_slice(), &["93.184.216.34:80".to_string()][..]);
+	let mut told = Vec::new();
+	while let Ok(event) = events.try_recv() {if let Event::ExitWorkingChanged {exit, working} = event {told.push((exit, working))}}
+	assert_eq!(told, [("main".to_string(), false), ("main".to_string(), true)]);
+	assert_eq!(node.engine.exit_health()[0].proxy_flips, 2);
 }

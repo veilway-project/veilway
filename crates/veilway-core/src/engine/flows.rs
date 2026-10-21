@@ -1,5 +1,6 @@
 //! What happens to a TCP or UDP flow once the userspace stack has accepted it: it is re-dialled through the outbound of the exit its routing decision named.
 use super::plan::{Backend, Fallback, Holder, Outbound, Plan, Upstream};
+use super::ExitState;
 use super::route::{By, Decision, Key, Reason, CLOSED_IDLE};
 use super::{dns, netstack, Event, Shared};
 use etherparse::PacketBuilder;
@@ -26,6 +27,11 @@ pub(super) const UDP_OVERHEAD: usize = 28;
 pub(super) const UDP_OVERHEAD_V6: usize = 48;
 /// How long a failed UDP ASSOCIATE keeps an exit on the tcp-only path before it is tried again, so a proxy without udp costs one attempt a minute while one that only hiccuped gets its udp back without a restart.
 const UDP_RETRY: Duration = Duration::from_secs(60);
+/// Connections in a row that a `socks5` exit's proxy did not let in, the first at least `DOWN_AFTER` before the last, after which the exit is not working. One that is let in clears it.
+const DOWN_FAILURES: u32 = 3;
+const DOWN_AFTER: Duration = Duration::from_secs(5);
+/// How often the proxy of an exit that is not working is tried again, with the greetings of its chain and no destination, since the devices that left through it go elsewhere meanwhile.
+const DOWN_RETRY: Duration = Duration::from_secs(30);
 /// How much longer than its handler's idle time a flow stays in the table, so the handler always ends first.
 pub(super) const HOLD_MARGIN: Duration = Duration::from_secs(10);
 /// How long the handler of a UDP flow keeps reading datagrams the stack had already taken when the flow's decision changed.
@@ -187,14 +193,72 @@ pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<TcpStream> {
 /// `dial`, before `deadline`, with the failure kept whole: a link's transport needs to know which proxy failed and whether it timed out there.
 pub async fn dial_until(up: &Upstream, dst: SocketAddr, deadline: tokio::time::Instant) -> Result<TcpStream, Failure<'_>> {
 	let mut stop = Stop::First(&up.tag);
-	match tokio::time::timeout_at(deadline, walk(up, dst, &mut stop)).await {
+	match tokio::time::timeout_at(deadline, walk(up, Some(dst), &mut stop)).await {
 		Ok(Ok(control)) => Ok(control),
 		Ok(Err(error)) => Err(Failure {stop, timeout: false, error}),
 		Err(_) => Err(Failure {stop, timeout: true, error: anyhow::anyhow!("socks5 connect timed out")}),
 	}
 }
 
-async fn walk<'a>(up: &'a Upstream, dst: SocketAddr, stop: &mut Stop<'a>) -> anyhow::Result<TcpStream> {
+/// Whether the proxies of `up` let the node in: the connection and the greetings of the chain, and no CONNECT to any destination.
+pub async fn reach(up: &Upstream) -> Result<(), String> {
+	let mut stop = Stop::First(&up.tag);
+	let walked = tokio::time::timeout(DIAL_TIMEOUT, walk(up, None, &mut stop)).await;
+	walked.map_err(|_| Failure {stop: Stop::First(&up.tag), timeout: true, error: anyhow::anyhow!("socks5 greeting timed out")}.describe()).and_then(|walked| walked.map(drop).map_err(|error| Failure {stop, timeout: false, error}.describe()))
+}
+
+/// What one connection through the proxy of `exit` said of it: `Ok` when the proxy let the node in, whatever the destination did after. `DOWN_FAILURES` in a row and the exit is not working, and one connection let in and it works again. Each switch is logged, published and told to the control channels, and a check of the proxy runs while the exit is down.
+pub(super) fn heard(shared: &Arc<Shared>, plan: &Plan, exit: usize, reached: Result<(), String>) {
+	let (state, tag) = (&plan.exits[exit].state, plan.exits[exit].tag.as_str());
+	let now = Instant::now();
+	let flipped = match reached {
+		Ok(()) => {
+			*state.failing.lock().unwrap_or_else(|e| e.into_inner()) = (0, None);
+			let since = state.down.lock().unwrap_or_else(|e| e.into_inner()).take();
+			if let Some(since) = since {tracing::info!("exit {tag}: its proxy lets the node in again after {}s, so it counts as working and devices without a choice of exit leave through it again", since.elapsed().as_secs())}
+			since.is_some()
+		}
+		Err(why) => {
+			let mut failing = state.failing.lock().unwrap_or_else(|e| e.into_inner());
+			failing.0 = failing.0.saturating_add(1);
+			let first = *failing.1.get_or_insert(now);
+			let mut down = state.down.lock().unwrap_or_else(|e| e.into_inner());
+			if down.is_none() && failing.0 >= DOWN_FAILURES && now - first >= DOWN_AFTER {
+				*down = Some(now);
+				tracing::info!("exit {tag}: its proxy did not let the node in {} times in a row over {}s, so it counts as not working and devices without a choice of exit leave through another; trying it again every {}s: {why}", failing.0, (now - first).as_secs(), DOWN_RETRY.as_secs());
+				drop(down);
+				keep(shared, &plan.exits[exit].state);
+				true
+			} else {
+				tracing::debug!("exit {tag}: its proxy did not let the node in: {why}");
+				false
+			}
+		}
+	};
+	if flipped {
+		state.down_flips.fetch_add(1, Ordering::Relaxed);
+		shared.publish(Event::ExitWorkingChanged {exit: tag.to_string(), working: state.working()});
+		shared.control.health.send_modify(|moved| *moved = moved.wrapping_add(1));
+	}
+}
+
+// Tries the proxy of an exit that is not working every `DOWN_RETRY`, until it lets the node in, or the exit is gone from the plan in force, or the engine is.
+fn keep(shared: &Arc<Shared>, state: &Arc<ExitState>) {
+	let (shared, state) = (Arc::downgrade(shared), Arc::downgrade(state));
+	tokio::spawn(async move {
+		loop {
+			tokio::time::sleep(DOWN_RETRY).await;
+			let (Some(shared), Some(held)) = (shared.upgrade(), state.upgrade()) else {return};
+			let plan = shared.plan();
+			let Some(exit) = plan.exits.iter().position(|exit| Arc::ptr_eq(&exit.state, &held)).filter(|_| !held.working()) else {return};
+			let Backend::Netstack {outbound: Outbound::Socks5(up), ..} = &plan.exits[exit].backend else {return};
+			let reached = reach(up).await;
+			heard(&shared, &plan, exit, reached);
+		}
+	});
+}
+
+async fn walk<'a>(up: &'a Upstream, dst: Option<SocketAddr>, stop: &mut Stop<'a>) -> anyhow::Result<TcpStream> {
 	let started = Instant::now();
 	let mut hops = vec![up];
 	let mut at = up;
@@ -212,6 +276,7 @@ async fn walk<'a>(up: &'a Upstream, dst: SocketAddr, stop: &mut Stop<'a>) -> any
 	}
 	up.latency.set(started.elapsed());
 	*stop = Stop::Target;
+	let Some(dst) = dst else {return Ok(control)};
 	connect_to(&mut control, &dst.ip().to_string(), dst.port()).await?;
 	Ok(control)
 }
@@ -281,9 +346,16 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 		match (stream, outbound) {
 			(IpStackStream::Tcp(mut stream), outbound) => {
 				let copied = match outbound {
-					Outbound::Socks5(up) => match dial(up, target).await {
-						Ok(mut remote) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
-						Err(e) => return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {e}", plan.show(target)),
+					Outbound::Socks5(up) => match dial_until(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await {
+						Ok(mut remote) => {
+							heard(&shared, &plan, carrier, Ok(()));
+							tokio::io::copy_bidirectional(&mut stream, &mut remote).await
+						}
+						Err(failure) => {
+							// A destination that does not connect says nothing against the proxy, which let the node in to ask.
+							heard(&shared, &plan, carrier, if matches!(failure.stop, Stop::Target) {Ok(())} else {Err(failure.describe())});
+							return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {}", plan.show(target), failure.error);
+						}
 					},
 					Outbound::Direct {bind, interface} => match tokio::time::timeout(DIAL_TIMEOUT, connect_from(*bind, interface.as_deref(), target)).await {
 						Ok(Ok(mut remote)) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,

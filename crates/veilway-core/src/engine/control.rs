@@ -81,6 +81,8 @@ pub(super) struct Channel {
 	pub(super) counters: Counters,
 	/// The generation of the plan in force. Every open connection looks at its snapshot again when it moves.
 	pub(super) plans: watch::Sender<u64>,
+	/// Moves when an exit starts or stops working between reloads, so that every open connection looks at its catalogue again.
+	pub(super) health: watch::Sender<u64>,
 	/// The devices with a connection or an MTU of their own, each with the last moment it was seen to have a WireGuard session. Only these are looked at when the engine sweeps.
 	watched: Mutex<HashMap<[u8; 32], (Arc<State>, Instant)>>,
 	/// `Options::usage_push`.
@@ -88,7 +90,7 @@ pub(super) struct Channel {
 }
 
 impl Channel {
-	pub(super) fn new(usage_push: RangeInclusive<u32>) -> Channel {Channel {counters: Counters::default(), plans: watch::Sender::new(0), watched: Mutex::default(), usage_push}}
+	pub(super) fn new(usage_push: RangeInclusive<u32>) -> Channel {Channel {counters: Counters::default(), plans: watch::Sender::new(0), health: watch::Sender::new(0), watched: Mutex::default(), usage_push}}
 
 	/// When the next `usage` of a connection is due at the earliest: "not sooner than a time drawn uniformly from 30 to 90 s after the last one". A random source that fails gives the longest wait.
 	fn next_usage(&self) -> Instant {Instant::now() + Duration::from_millis(veilway_proto::uniform(*self.usage_push.start(), *self.usage_push.end(), &mut random).unwrap_or(*self.usage_push.end()).into())}
@@ -307,14 +309,7 @@ impl Shared {
 				all_protocols: matches!(exit.backend, Backend::L3 {..}),
 				selected: chosen.as_deref() == Some(exit.tag.as_str()),
 				configured: at == configured,
-				// "What 'working' means for each backend is not defined yet" (control channel page, "Open questions"). Here: an l3 exit whose interface is up, a netstack exit always, a block exit never.
-				working: match exit.backend {
-					Backend::Netstack {..} => true,
-					Backend::L3 {..} => plan.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
-					Backend::Block => false,
-					// A chain exit works while one of its links is up.
-					Backend::Chain {ref links} => links.iter().any(|link| plan.up(*link)),
-				},
+				working: plan.working(at),
 				// Nothing measures load yet.
 				load: Load::Unknown,
 			}).collect(),
@@ -364,7 +359,7 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 	let (plan, accepted, counters) = (shared.plan(), Instant::now(), &shared.control.counters);
 	let Some(from) = plan.by_address.get(&key.src).copied().filter(|from| plan.devices[from.device].public_key == device && plan.control(from.inbound, key.dst)) else {return};
 	let (state, secrets, tag, inbound) = (plan.devices[from.device].control.clone(), plan.devices[from.device].secrets.clone(), plan.inbounds[from.inbound].tag.clone(), plan.inbounds[from.inbound].public_key);
-	let (who, mut reloads) = (format!("user {} device {}", plan.users[plan.devices[from.device].user].name, plan.devices[from.device].name), shared.control.plans.subscribe());
+	let (who, mut reloads, mut health) = (format!("user {} device {}", plan.users[plan.devices[from.device].user].name, plan.devices[from.device].name), shared.control.plans.subscribe(), shared.control.health.subscribe());
 	drop(plan);
 	counters.accepted.fetch_add(1, Ordering::Relaxed);
 	let ((to, mut pushes), closed, authenticated) = (mpsc::channel(PUSHES), Arc::new(Notify::new()), AtomicBool::new(false));
@@ -600,9 +595,9 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					}
 					None => return End::Closed,
 				},
-				// "A new `session`, `exits` or `notices` is sent when a reload changed it for this device", and only then.
-				changed = reloads.changed() => {
-					if changed.is_err() {return End::Gone}
+				// "A new `session`, `exits` or `notices` is sent when a reload changed it for this device", and only then, or when an exit started or stopped working.
+				changed = async {tokio::select! {changed = reloads.changed() => changed.is_ok(), changed = health.changed() => changed.is_ok()}} => {
+					if !changed {return End::Gone}
 					let plan = shared.plan();
 					let Some(from) = plan.by_address.get(&key.src).copied().filter(|from| plan.devices[from.device].public_key == device && plan.control(from.inbound, key.dst)) else {return End::Gone};
 					let (now, was) = (shared.snapshot(&plan, from), sent.as_ref());

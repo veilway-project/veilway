@@ -1560,7 +1560,7 @@ fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	for status in ["404", "422", "400", "413", "415"] {assert!(reset["responses"].get(status).is_some(), "a usage reset has no {status}")}
 	assert_eq!((&reset["requestBody"]["required"], &reset["requestBody"]["content"]["application/json"]["schema"], &OPENAPI["components"]["schemas"]["ResetUsage"]["required"]), (&json!(false), &json!({"$ref": "#/components/schemas/ResetUsage"}), &Value::Null));
 	assert_eq!(OPENAPI["paths"]["/v1/events"]["get"]["responses"]["200"]["content"].as_object().unwrap().keys().collect::<Vec<_>>(), ["text/event-stream"]);
-	assert_eq!(OPENAPI["x-events"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["config_applied", "config_refused", "exit_udp_changed", "lagged", "stats", "usage_reset", "user_cut_off", "user_restored"]);
+	assert_eq!(OPENAPI["x-events"].as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(), ["config_applied", "config_refused", "exit_udp_changed", "exit_working_changed", "lagged", "stats", "usage_reset", "user_cut_off", "user_restored"]);
 	// Every reference leads to a schema, and no schema has a place for a secret.
 	let text = OPENAPI.to_string();
 	for reference in text.split("\"$ref\":\"").skip(1).map(|rest| &rest[..rest.find('"').unwrap()]) {

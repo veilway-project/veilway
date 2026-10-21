@@ -479,6 +479,11 @@ export interface components {
             exit: string;
             udp: boolean;
         };
+        /** @description The data of an `exit_working_changed` event: the proxy of an exit stopped letting the node in (`working` false), or lets it in again. Devices without a choice of exit leave through another exit meanwhile. */
+        ExitWorkingChanged: {
+            exit: string;
+            working: boolean;
+        };
         Exits: {
             exits: components["schemas"]["Exit"][];
         };

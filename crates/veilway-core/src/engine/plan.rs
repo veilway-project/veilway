@@ -686,8 +686,25 @@ impl Plan {
 	/// The exit `tag` chooses for a device: an exit of this plan with that tag which the device's user may use. None for no tag, and for a tag that chooses nothing under this plan.
 	pub fn chosen(&self, device: usize, tag: Option<&str>) -> Option<usize> {tag.and_then(|tag| self.exits.iter().position(|exit| exit.tag == tag)).filter(|exit| self.users[self.devices[device].user].entitled.as_ref().is_none_or(|list| list.contains(exit)))}
 
-	/// The exit the action `"user"` means for a device that chose `tag` on the control channel: that exit while it is one the user may use, then the user's `exit`, then `routing.default`.
-	pub fn exit_with(&self, device: usize, tag: Option<&str>) -> usize {self.chosen(device, tag).or(self.users[self.devices[device].user].exit).unwrap_or(self.default_exit)}
+	/// Whether exit `at` works as far as the node knows: a netstack exit while its proxy, when it has one, lets the node in, an l3 exit while its interface is up, a chain exit while one of its links is up, and a block exit never.
+	pub fn working(&self, at: usize) -> bool {
+		match &self.exits[at].backend {
+			Backend::Netstack {..} => self.exits[at].state.working(),
+			Backend::L3 {..} => self.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
+			Backend::Chain {links} => links.iter().any(|link| self.up(*link)),
+			Backend::Block => false,
+		}
+	}
+
+	/// The exit of a user's device that chose none: the user's `exit`, then `routing.default`. While that one is not working, the first exit of the config that works and that the user may use, and the configured one again once it works. When none works it stays the configured one.
+	pub fn automatic(&self, user: usize) -> usize {
+		let configured = self.users[user].exit.unwrap_or(self.default_exit);
+		if self.working(configured) {return configured}
+		(0..self.exits.len()).find(|at| self.users[user].entitled.as_ref().is_none_or(|list| list.contains(at)) && self.working(*at)).unwrap_or(configured)
+	}
+
+	/// The exit the action `"user"` means for a device that chose `tag` on the control channel: that exit while it is one the user may use, otherwise `automatic`.
+	pub fn exit_with(&self, device: usize, tag: Option<&str>) -> usize {self.chosen(device, tag).unwrap_or_else(|| self.automatic(self.devices[device].user))}
 
 	/// The exit the action `"user"` means for a device right now.
 	pub fn exit_of(&self, device: usize) -> usize {self.exit_with(device, self.devices[device].control.selected().as_deref())}

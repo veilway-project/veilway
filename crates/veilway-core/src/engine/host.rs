@@ -773,6 +773,7 @@ impl Host {
 		// An exit that is not what it was has an upstream nothing is known about.
 		for (was, at) in old.exits.iter().zip(&exits) {
 			if at.is_none() && was.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() && tags.contains_key(was.tag.as_str()) {shared.publish(Event::ExitUdpChanged {exit: was.tag.clone(), udp: true})}
+			if at.is_none() && was.state.down.lock().unwrap_or_else(|e| e.into_inner()).take().is_some() && tags.contains_key(was.tag.as_str()) {shared.publish(Event::ExitWorkingChanged {exit: was.tag.clone(), working: true})}
 		}
 		for (was, reason) in old.devices.iter().filter(|was| was.link.is_none()).filter_map(|was| cut.get(&was.public_key).map(|(reason, _)| (was, reason))).take(MAX_NAMES_LOGGED) {
 			tracing::info!("user {} device {}: cut off, {reason}: its session keys and its flows are gone and the user's dns memory is cleared", old.users[was.user].name, was.name);

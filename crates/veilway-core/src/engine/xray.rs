@@ -443,7 +443,7 @@ pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, 
 	// A name asked for, or one the user resolved to this address through the node's resolver: an address alone is matched by domain rules the way the tunnel does it.
 	let exit = match route::evaluate(plan, usize::MAX, at, ip, protocol, port, None, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))) || plan.users[at].state.names().matches(ip, patterns, Instant::now())) {
 		Action::Exit(exit) => *exit,
-		Action::User => plan.users[at].exit.unwrap_or(plan.default_exit),
+		Action::User => plan.automatic(at),
 		Action::Block | Action::Reject => return Err((Reason::Rule, "refused by a rule".to_string())),
 	};
 	let tag = plan.exits[exit].tag.as_str();

@@ -254,6 +254,8 @@ mod linux {
 								health.flips.fetch_add(1, Ordering::Relaxed);
 							}
 						}
+						// The exit is not working now: every control channel looks at its catalogue again, and devices without a choice of exit leave through another.
+						shared.control.health.send_modify(|moved| *moved = moved.wrapping_add(1));
 						tracing::warn!("exit {}: down, what is routed to it is answered as unreachable and the node tries again in {}s: {why:#}", wanted.tag, RETRY_FIRST.as_secs());
 						let (mut wait, mut tries) = (RETRY_FIRST, 0u32);
 						loop {
@@ -267,6 +269,7 @@ mod linux {
 									*device.lock().unwrap_or_else(|e| e.into_inner()) = Some(up);
 									let since = health.down.lock().unwrap_or_else(|e| e.into_inner()).take();
 									health.flips.fetch_add(1, Ordering::Relaxed);
+									shared.control.health.send_modify(|moved| *moved = moved.wrapping_add(1));
 									tracing::info!("exit {}: up again after {}s down and {tries} tries", wanted.tag, since.map_or(0, |since| since.elapsed().as_secs()));
 									break;
 								}

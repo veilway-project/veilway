@@ -429,6 +429,7 @@ pub(crate) fn frame(id: u64, event: veilway_core::Event) -> Frame {
 		veilway_core::Event::UserCutOff {user, reason} => ("user_cut_off", serde_json::to_string(&model::UserCutOff {user, reason: reason.into()})),
 		veilway_core::Event::UserRestored {user} => ("user_restored", serde_json::to_string(&model::UserRestored {user})),
 		veilway_core::Event::ExitUdpChanged {exit, udp} => ("exit_udp_changed", serde_json::to_string(&model::ExitUdpChanged {exit, udp})),
+		veilway_core::Event::ExitWorkingChanged {exit, working} => ("exit_working_changed", serde_json::to_string(&model::ExitWorkingChanged {exit, working})),
 		veilway_core::Event::UsageReset {user, totals} => ("usage_reset", serde_json::to_string(&model::UsageReset {user, totals})),
 	};
 	Frame {id, kind, data: Some(data.unwrap_or_default().into())}
@@ -442,6 +443,7 @@ pub(crate) fn event_schemas(schemas: &mut SchemaGenerator) -> Vec<(&'static str,
 		("user_cut_off", schemas.subschema_for::<model::UserCutOff>()),
 		("user_restored", schemas.subschema_for::<model::UserRestored>()),
 		("exit_udp_changed", schemas.subschema_for::<model::ExitUdpChanged>()),
+		("exit_working_changed", schemas.subschema_for::<model::ExitWorkingChanged>()),
 		("usage_reset", schemas.subschema_for::<model::UsageReset>()),
 		("stats", schemas.subschema_for::<model::Stats>()),
 		("lagged", schemas.subschema_for::<model::Lagged>()),
