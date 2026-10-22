@@ -405,6 +405,31 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	Ok(())
 }
 
+/// `veilway remove`.
+#[derive(Args)]
+pub struct Remove {
+	/// Which subscription, when more than one is held: the start of its id
+	#[arg(long)] subscription: Option<String>,
+	/// Where the client keeps its vault, as for `connect`
+	#[arg(long)] data_dir: Option<PathBuf>,
+}
+
+pub async fn remove(args: Remove) -> anyhow::Result<()> {
+	let data = data_dir(args.data_dir)?;
+	// The lock `connect` holds for as long as it runs: a subscription in use is not removed under it.
+	let _lock = state::lock(&Options::default().run_dir).await?;
+	let (mut library, _) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
+	let id = match &args.subscription {
+		Some(prefix) => library.held().iter().find(|held| held.id().as_str().starts_with(prefix.as_str())).ok_or_else(|| anyhow!("No subscription starts with {prefix}."))?,
+		None if library.held().len() == 1 => &library.held()[0],
+		None if library.held().is_empty() => bail!("There is no subscription to remove."),
+		None => bail!("More than one subscription is held, pick one with --subscription: {}", library.held().iter().map(|held| format!("{} ({})", short(held.id()), held.subscription().provider.as_str())).collect::<Vec<_>>().join(", ")),
+	}.id().clone();
+	Fetcher::new(default_roots(), None).leave(&mut library, &id).await.context("the subscription could not be removed")?;
+	println!("Removed. The provider was asked to free this device's place.");
+	Ok(())
+}
+
 pub async fn disconnect() -> anyhow::Result<()> {
 	let options = Options::default();
 	// A client that runs is asked to stop, which it does the clean way. Only when none holds the lock is there anything to clean up by hand, and the lock is then taken for it: a client that starts meanwhile finds it held, and this command never touches what a running one has made.

@@ -95,6 +95,9 @@ enum Command {
 	/// Show the connection in plain words. Exit status: 0 a connection runs, 3 none does
 	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 	Status,
+	/// Remove a subscription from this device. The provider is told first, so that its panel removes the device and frees its place, and the subscription is removed whether or not the provider answers. Not while a connection runs
+	#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+	Remove(client::Remove),
 	/// Run by the LaunchDaemon at boot: put the kill switch back if a connection that did not stop left it to be restored
 	#[cfg(target_os = "macos")]
 	#[command(hide = true)]
@@ -464,6 +467,8 @@ async fn main() -> anyhow::Result<()> {
 		Command::Disconnect => client::disconnect().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 		Command::Status => std::process::exit(client::show()),
+		#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+		Command::Remove(args) => client::remove(args).await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		#[cfg(target_os = "macos")]
 		Command::Restore => client::restore().await.inspect_err(|error| eprintln!("error: {error}")).or_else(|_| std::process::exit(1)),
 		#[cfg(unix)]
