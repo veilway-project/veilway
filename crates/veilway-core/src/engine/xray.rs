@@ -451,6 +451,8 @@ pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, 
 	match &plan.exits[exit].backend {
 		Backend::Netstack {outbound, ..} => Ok((exit, outbound)),
 		Backend::Block => Err((Reason::BlockExit, format!("exit {tag} blocks"))),
+		// The gateways of an upstream's profile are the engine's own, as they are for the flows of the tunnels: no flow of a user goes there through that exit, whichever way it came in.
+		Backend::Chain {links} if plan.reaches_upstream(links, ip) => Err((Reason::Gate, format!("exit {tag} is an upstream, and the address is a gateway of its profile"))),
 		_ => Err((Reason::Unsupported, format!("exit {tag} is not a netstack exit, which is all the add-on can use"))),
 	}
 }
@@ -490,8 +492,41 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 
 #[cfg(test)]
 mod tests {
-	use super::{PIN, RELEASE};
+	use super::{exit_for, PIN, RELEASE};
+	use crate::config::Config;
+	use crate::engine::inbound::{Peers, Tunnel};
+	use crate::engine::plan::Plan;
+	use crate::engine::upstream::UpstreamState;
+	use crate::engine::Reason;
+	use serde_json::json;
+	use std::sync::Arc;
+	use tokio::sync::mpsc;
 	use veilway_proto::xray::{self, PINS};
+	use veilway_wg::Wg;
+
+	// The add-on's hop is held to the gate of an upstream exit as the tunnel is: a destination that is a gateway of the profile is counted as the gate's refusal, and what else is routed to an upstream exit is refused as unsupported, since the add-on can only use `netstack` exits.
+	#[test]
+	fn a_flow_of_the_add_on_to_a_gateway_of_an_upstream_is_refused_by_the_gate_and_nothing_else_leaves_through_it() {
+		let config = Config::parse(json!({
+			"version": 1,
+			"dns": {"servers": ["1.1.1.1:53"]},
+			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&[0x11; 32]), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
+			"outbounds": [{"tag": "plain", "type": "direct"}],
+			"exits": [{"tag": "up", "backend": {"type": "upstream", "upstream": "b"}}, {"tag": "near", "backend": {"type": "netstack", "outbound": "plain"}}],
+			"routing": {"default": "up", "rules": []},
+			"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}],
+			"upstreams": [{"tag": "b", "link": "veilway://sub/sub.example.com/s#v1.a.b.c", "signing_key": "0000 0000 0000 0000 0000 0000 0000 0000", "private_key": veilway_wg::encode_key(&[0x61; 32]), "device_secret": "RERERERERERERERERERERA"}]
+		}).to_string().as_bytes()).unwrap();
+		let inbound = &config.inbounds[0];
+		let (to_stack, _) = mpsc::channel(1);
+		let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
+		let state = UpstreamState::new("b", [1; 16], [2; 32]);
+		state.known_gateways(&["203.0.113.1".parse().unwrap()]);
+		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[state]).unwrap();
+		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 6, 80, None), Err((Reason::Gate, _))));
+		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 17, 47873, Some("gateway.example.org")), Err((Reason::Gate, _))));
+		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None), Err((Reason::Unsupported, _))));
+	}
 
 	// The node and the apps name one Xray: the release, the executable of this architecture and the archives of the installer.
 	#[test]

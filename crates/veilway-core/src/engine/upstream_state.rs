@@ -27,6 +27,13 @@ pub type State = BTreeMap<String, ([u8; 32], [u8; 16], Stored)>;
 
 fn bad(message: &'static str) -> io::Error {io::Error::new(io::ErrorKind::InvalidData, message)}
 
+/// The hash that joins a document to the link text and the device's public key it was fetched for.
+pub fn bind(link: &str, public: &[u8; 32]) -> [u8; 32] {
+	let mut hash = Context::new(&SHA256);
+	for part in [&b"veilway v1 upstream state"[..], &(link.len() as u64).to_le_bytes(), link.as_bytes(), public] {hash.update(part)}
+	hash.finish().as_ref().try_into().expect("SHA-256 is 32 bytes")
+}
+
 fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
 
 fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
@@ -66,9 +73,7 @@ impl UpstreamFile {
 	pub fn new(path: impl Into<PathBuf>) -> Arc<Self> {Arc::new(Self {path: path.into(), writing: Mutex::new(())})}
 	/// The vault of the upstream `tag`, joined to the origin the config gives it. The entry is bound to a hash of the link and the device's public key: a config that points the tag at another subscription or another device finds nothing held, and does not read the document of the old one.
 	pub fn vault(self: &Arc<Self>, tag: &str, link: &str, private: Secret<32>, secret: DeviceSecret) -> UpstreamVault {
-		let mut hash = Context::new(&SHA256);
-		for part in [&b"veilway v1 upstream state"[..], &(link.len() as u64).to_le_bytes(), link.as_bytes(), &proof::public_key(private.expose())] {hash.update(part)}
-		let bound: [u8; 32] = hash.finish().as_ref().try_into().expect("SHA-256 is 32 bytes");
+		let bound = bind(link, &proof::public_key(private.expose()));
 		// The id of an upstream that held a document under this binding stays; any other is drawn now, and written with the first document. A file that cannot be read is no reason not to have an id: the first write says why.
 		let id = self.read().ok().and_then(|state| state.get(tag).filter(|(was, ..)| *was == bound).map(|(_, id, _)| *id)).or_else(|| {let mut id = [0u8; 16]; random(&mut id).ok().map(|_| id)}).unwrap_or([0u8; 16]);
 		UpstreamVault {file: self.clone(), tag: tag.to_owned(), bound, id, origin: (link.to_owned(), private, secret)}

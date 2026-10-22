@@ -6,6 +6,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use veilway_core::config::{self, Key, QuotaPeriod};
+use veilway_core::engine::upstream::{Phase, Report as Carrying, Reviewing};
 use veilway_core::{CutOff, Totals};
 
 /// A public key the way a config writes it.
@@ -759,6 +760,209 @@ pub struct Link {
 
 #[derive(Serialize, JsonSchema)]
 pub struct Links {pub links: Vec<Link>}
+
+/// What the operator hands the node to look at the subscription of another provider: the link, and the WireGuard private key and the device secret the panel made for this node's device. The node uses them to fetch and never says them back. `via` is the tag of a `direct` or `socks5` outbound of the running config to reach the provider through, and `allow_private` is the setting the review judges the profiles by.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamPreviewRequest {pub link: String, pub private_key: String, pub device_secret: String, #[serde(default)] pub via: Option<String>, #[serde(default)] pub allow_private: bool}
+
+// Written out by hand, like `ResetUsage`: it is read by the node, where a field may be left out.
+impl JsonSchema for UpstreamPreviewRequest {
+	fn schema_name() -> Cow<'static, str> {"UpstreamPreviewRequest".into()}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "What the node needs to fetch the subscription of another provider with a device the panel made. The key and the secret are used for the fetch and are never in any answer, log or error.", "properties": {
+		"link": {"type": "string", "description": "A native veilway://sub/ link. Carried, file, legacy and plain-address forms are refused."},
+		"private_key": {"type": "string", "description": "The WireGuard private key of the device, 44 characters of standard base64 as a config writes a key."},
+		"device_secret": {"type": "string", "description": "The device secret, 16 bytes as 22 characters of base64url."},
+		"via": {"type": "string", "description": "The tag of a direct or socks5 outbound of the running config the provider is reached through. Left out: from the node itself."},
+		"allow_private": {"type": "boolean", "default": false, "description": "Whether the node is to be allowed to dial private addresses of the profiles. It decides which profiles the review marks as refused."}
+	}, "required": ["link", "private_key", "device_secret"], "additionalProperties": false})}
+}
+
+/// The answer to a preview: the document the provider sent, verified under the key of the link, as the operator reads it before saying yes. Fetching it took a place at the provider. The place is given back when the preview is declined or runs out, and made permanent by the config that names the same link and device within `expires_in_secs`.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamPreview {
+	pub id: String,
+	/// How long the node keeps the document for the config that names it.
+	pub expires_in_secs: u64,
+	/// The provider's own name for itself, shown as its claim next to the fingerprint.
+	pub provider: String,
+	/// The fingerprint of the key the document is signed with, which is the one in the link and the one for `signing_key` of the config.
+	pub fingerprint: String,
+	pub serial: u64,
+	/// When the document stops being current, in Unix seconds.
+	pub expires_at: i64,
+	pub quota: Option<UpstreamQuota>,
+	/// When the account ends, in Unix seconds. Null for never or unknown.
+	pub account_expires_at: Option<i64>,
+	/// How many devices the account may have, null for no limit or unknown, and how many the document lists.
+	pub device_limit: Option<u16>,
+	pub devices: usize,
+	/// The classes of transports the profiles list: the operator's consent is asked for each besides `cover`.
+	pub classes: Vec<config::UpstreamClass>,
+	pub profiles: Vec<UpstreamProfile>,
+}
+
+/// What the provider says an account has used and has. A quota of 0 is none.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamQuota {pub used_bytes: u64, pub quota_bytes: u64}
+
+/// One profile of a provider's document.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamProfile {
+	pub id: String,
+	pub name: String,
+	/// In the provider's order.
+	pub transports: Vec<Transport>,
+	pub classes: Vec<config::UpstreamClass>,
+	/// What a censor can see, worked out by the node.
+	pub rating: config::Rating,
+	/// Private addresses the profile names to dial.
+	pub private_addresses: Vec<String>,
+	pub mtu: u16,
+	/// The exits the provider lists for the profile, by tag and name.
+	pub exits: Vec<UpstreamExit>,
+	/// Why this node would not use the profile under the request's settings. Null when it would.
+	pub refused: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamExit {pub tag: String, pub name: String}
+
+/// The kind of transport the node's names for a transport of a document stand for.
+fn transport_of(name: &str) -> Transport {
+	match name {
+		"udp" => Transport::Udp,
+		"udp-obfs" => Transport::UdpObfs,
+		"tls" => Transport::Tls,
+		"ws" => Transport::Ws,
+		"fronted" => Transport::Fronted,
+		"fronted-shaped" => Transport::FrontedShaped,
+		"faketls" => Transport::FakeTls,
+		_ => Transport::WsPlain,
+	}
+}
+
+impl From<&Reviewing> for UpstreamPreview {
+	fn from(reviewing: &Reviewing) -> UpstreamPreview {
+		UpstreamPreview {
+			id: reviewing.id.clone(), expires_in_secs: reviewing.ttl.as_secs(), provider: reviewing.provider.clone(), fingerprint: reviewing.fingerprint.clone(), serial: reviewing.serial,
+			expires_at: reviewing.expires_at as i64,
+			quota: reviewing.quota.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes}),
+			account_expires_at: Some(reviewing.account_expires_at as i64).filter(|at| *at > 0),
+			device_limit: Some(reviewing.device_limit).filter(|limit| *limit > 0),
+			devices: reviewing.devices,
+			classes: reviewing.classes.clone(),
+			profiles: reviewing.profiles.iter().map(|profile| UpstreamProfile {
+				id: profile.id.clone(), name: profile.name.clone(), transports: profile.transports.iter().map(|name| transport_of(name)).collect(), classes: profile.classes.clone(), rating: profile.rating,
+				private_addresses: profile.private.iter().map(ToString::to_string).collect(), mtu: profile.mtu,
+				exits: profile.exits.iter().map(|(tag, name)| UpstreamExit {tag: tag.clone(), name: name.clone()}).collect(),
+				refused: profile.refused.clone(),
+			}).collect(),
+		}
+	}
+}
+
+/// What a decline of a preview did: the provider was told to release the place.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamDeclined {pub id: String}
+
+/// What the node is doing for one upstream. Nothing in it is a key, a secret, a token or the link.
+#[derive(Serialize, JsonSchema)]
+pub struct Upstream {
+	pub tag: String,
+	pub state: UpstreamStatus,
+	/// Plain words for why the state is what it is. Empty while it is up.
+	pub reason: String,
+	/// Seconds the upstream has been in `state`.
+	pub state_secs: u64,
+	pub provider: Option<String>,
+	/// The profile in use, and the transport it is connected over.
+	pub profile: Option<String>,
+	pub transport: Option<Transport>,
+	/// The exit of the provider in use, and the exits it offers.
+	pub exit: Option<String>,
+	pub offered_exits: Vec<String>,
+	/// What the provider says to the device, as plain text.
+	pub notices: Vec<String>,
+	pub quota: Option<UpstreamQuota>,
+	/// When the document stops being current and when it was last refreshed, in Unix seconds.
+	pub expires_at: Option<i64>,
+	pub refreshed_at: Option<i64>,
+	/// Why the last refresh failed. Null once one has gone through.
+	pub refresh_error: Option<String>,
+	/// The largest packet the carrier takes now. Null until a profile is in use.
+	pub mtu: Option<u16>,
+	/// A move of the provider's endpoint, and refresh hosts, that the provider announced and the operator has not confirmed. The old endpoint and hosts are used meanwhile.
+	pub pending_move: Option<String>,
+	pub pending_hosts: Vec<String>,
+	pub counters: UpstreamCounters,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamStatus {Fetching, Connecting, Up, Down}
+
+/// Totals since the node started, or since the upstream first ran.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamCounters {
+	/// Packets handed to the provider's tunnel, and packets it had no room or no session for.
+	pub sent: u64,
+	pub unsent: u64,
+	/// Flows refused because the upstream was down.
+	pub refused: u64,
+	/// Packets out of the tunnel that answered no live flow of a device, and were dropped.
+	pub dropped: u64,
+	/// Changes between up and not up, and starts of the tunnel over again.
+	pub state_flips: u64,
+	pub starts: u64,
+	pub refreshes: u64,
+	pub refresh_failures: u64,
+	pub traffic: Traffic,
+}
+
+impl From<Carrying> for Upstream {
+	fn from(report: Carrying) -> Upstream {
+		Upstream {
+			tag: report.tag,
+			state: match report.phase {Phase::Fetching => UpstreamStatus::Fetching, Phase::Connecting => UpstreamStatus::Connecting, Phase::Up => UpstreamStatus::Up, Phase::Down => UpstreamStatus::Down},
+			reason: report.reason, state_secs: report.since.as_secs(), provider: report.provider, profile: report.profile,
+			transport: report.transport.map(transport_of), exit: report.exit, offered_exits: report.offered, notices: report.notices,
+			quota: report.usage.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes}),
+			expires_at: report.expires_at.map(|at| at as i64), refreshed_at: report.refreshed_at.map(|at| at as i64), refresh_error: report.refresh_error,
+			mtu: Some(report.mtu).filter(|mtu| *mtu > 0), pending_move: report.pending_move, pending_hosts: report.pending_hosts,
+			counters: UpstreamCounters {sent: report.sent, unsent: report.unsent, refused: report.refused, dropped: report.dropped, state_flips: report.flips, starts: report.starts, refreshes: report.refreshes, refresh_failures: report.refresh_failures, traffic: report.traffic.into()},
+		}
+	}
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct Upstreams {pub upstreams: Vec<Upstream>}
+
+/// What a removal did. `confirmed` says whether the provider took the word that the device left; when it did not, the place stays until the provider removes it. The upstream is not run again by a config that still names it.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamRemoved {pub tag: String, pub confirmed: bool}
+
+/// What a confirmation of the operator is for. A body that is left out confirms both.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamConfirm {#[serde(default, rename = "move")] pub moving: Option<bool>, #[serde(default)] pub hosts: Option<bool>}
+
+// Written out by hand, like `ResetUsage`.
+impl JsonSchema for UpstreamConfirm {
+	fn schema_name() -> Cow<'static, str> {"UpstreamConfirm".into()}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "What the operator confirms: the move of the provider's endpoint the node reported as pending, and the refresh hosts it reported. A field that is left out is false when the other one is given, and the body may be left out altogether, which confirms both.", "properties": {
+		"move": {"type": "boolean", "description": "Follow the move to the new endpoint: the next refresh tries it first."},
+		"hosts": {"type": "boolean", "description": "Take the new refresh hosts and static mirrors the provider announced."}
+	}, "additionalProperties": false})}
+}
+
+/// What a confirmation did: false for each thing that did not wait for it.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamConfirmed {pub moved: bool, pub hosts: bool}
+
+/// The tag of an upstream the node was asked to connect again.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamRetried {pub tag: String}
 
 /// The data of a `config_applied` event.
 #[derive(Serialize, JsonSchema)]

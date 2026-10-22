@@ -383,12 +383,14 @@ pub struct Shared {
 	certificates: Mutex<Vec<certificate::Made>>,
 	/// The tunnels that run, in the order of the config, with what each counts.
 	tunnels: Mutex<Vec<(String, Arc<tunnel::State>)>>,
+	/// The subscriptions of other providers the operator was shown, which wait for the config that names them, see `upstream`.
+	previews: upstream::Previews,
 }
 
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default()}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), previews: upstream::Previews::new(upstream::Hooks::default())}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -617,6 +619,27 @@ impl Engine {
 	/// Asks the tunnel of the upstream `tag` to connect now, as the user's "connect again" does for a client: false when the config that runs has no such upstream.
 	pub fn upstream_again(&self, tag: &str) -> bool {self.plan().upstreams().iter().find(|state| state.tag == tag).map(|state| state.again()).is_some()}
 
+	/// Fetches the subscription of another provider with the device the operator made, for the operator to look at before a config names it, see `upstream::preview`. The fetch takes a place at the provider, and runs to its end whether or not whoever asked keeps waiting.
+	pub async fn upstream_preview(&self, request: upstream::PreviewRequest) -> Result<upstream::Reviewing, upstream::PreviewError> {
+		let (shared, snapshot) = (self.shared.clone(), self.snapshot());
+		tokio::spawn(async move {upstream::preview(&shared, &snapshot.config.outbounds, request).await}).await.unwrap_or_else(|_| Err(upstream::PreviewError::Provider("the fetch did not finish".into())))
+	}
+
+	/// The operator declines the preview `id`: the provider releases the place. False when no such preview waits.
+	pub async fn upstream_decline(&self, id: &str) -> bool {upstream::decline(&self.shared, id).await}
+
+	/// The operator removes the upstream `tag`: the provider is told the device left, for at most ten seconds, and the document is removed from the state file. Whether the provider confirmed. None when the config in force has no such upstream.
+	pub async fn upstream_leave(&self, tag: &str) -> Option<bool> {
+		let (state, vault, reach, hooks) = self.host.lock().await.release_upstream(tag)?;
+		Some(upstream::leave(&self.shared, &state, &vault, reach.as_ref(), &hooks).await)
+	}
+
+	/// The operator's yes to a move of the provider's endpoint and to new refresh hosts, see `UpstreamState::confirm`. None when the config in force has no such upstream.
+	pub async fn upstream_confirm(&self, tag: &str, moving: bool, hosts: bool) -> Option<io::Result<(bool, bool)>> {
+		let state = self.plan().upstreams().into_iter().find(|state| state.tag == tag)?;
+		Some(state.confirm(moving, hosts).await)
+	}
+
 	/// Starts the quota count of the user called `name` over at the operator's word: `used_bytes` is 0 and `period_start` is the start of the quota period the clock is in, or 0 for a user without a `quota_period`.
 	/// What the user sent and received in all is a record of the node and not of the quota, so it stays unless `totals` is set, which zeroes those four counters as well. Nothing else of the user is touched: sessions, flows and DNS memory stay.
 	/// A user who was out of quota is let in before this returns, through the same path as a quota period that starts over, with no reload. The state file is written before this returns as well,
@@ -726,7 +749,9 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	});
 	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER}).collect(), ..Plan::default()};
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
-	let shared = Arc::new(Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots));
+	let mut shared = Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots);
+	shared.previews = upstream::Previews::new(options.upstream.clone());
+	let shared = Arc::new(shared);
 	shared.faketls.set_patience(options.probes);
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let dir = options.dir.clone();

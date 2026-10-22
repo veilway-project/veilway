@@ -209,6 +209,108 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/upstreams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Every enabled upstream, the subscription of another provider that an exit uses, with its state and the reason, the provider's name, the profile, transport and exit in use, its quota and notices as plain text, the largest packet it takes, when its document was last refreshed and why a refresh failed, a move of the provider's endpoint or new refresh hosts that wait for the operator, and its counters. No key, no secret and no link. */
+        get: operations["listUpstreams"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/upstreams/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Fetches the subscription of another provider from this node, with the device the body gives, and shows what the document holds. The fetch is the enrollment: it takes a place at the provider, so the provider sees this node's address and never the panel's. The document is verified under the key in the link, kept in memory for ten minutes under the id, and nothing is written to the config or the state file. A config that names the same link and device within that time takes the document and makes the place permanent without asking the provider again. At most four previews wait. The private key and the device secret are never in an answer. */
+        post: operations["previewUpstream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/upstreams/preview/{id}/decline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Says no to a preview: the provider is told to release the place the preview took, and the node keeps nothing. */
+        post: operations["declinePreview"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/upstreams/{tag}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. The upstream stops, and a config that still names it does not start it again; apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything. */
+        delete: operations["removeUpstream"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/upstreams/{tag}/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting. */
+        post: operations["confirmUpstream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/upstreams/{tag}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Asks the upstream to connect again now, at the operator's word: every wait it was in starts over. */
+        post: operations["retryUpstream"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/users": {
         parameters: {
             query?: never;
@@ -1271,6 +1373,191 @@ export interface components {
              */
             window: number;
         };
+        /** @description What the node is doing for one upstream. Nothing in it is a key, a secret, a token or the link. */
+        Upstream: {
+            counters: components["schemas"]["UpstreamCounters"];
+            /** @description The exit of the provider in use, and the exits it offers. */
+            exit: string | null;
+            /**
+             * Format: int64
+             * @description When the document stops being current and when it was last refreshed, in Unix seconds.
+             */
+            expires_at: number | null;
+            /**
+             * Format: uint16
+             * @description The largest packet the carrier takes now. Null until a profile is in use.
+             */
+            mtu: number | null;
+            /** @description What the provider says to the device, as plain text. */
+            notices: string[];
+            offered_exits: string[];
+            pending_hosts: string[];
+            /** @description A move of the provider's endpoint, and refresh hosts, that the provider announced and the operator has not confirmed. The old endpoint and hosts are used meanwhile. */
+            pending_move: string | null;
+            /** @description The profile in use, and the transport it is connected over. */
+            profile: string | null;
+            provider: string | null;
+            quota: components["schemas"]["UpstreamQuota"] | null;
+            /** @description Plain words for why the state is what it is. Empty while it is up. */
+            reason: string;
+            /** @description Why the last refresh failed. Null once one has gone through. */
+            refresh_error: string | null;
+            /** Format: int64 */
+            refreshed_at: number | null;
+            state: components["schemas"]["UpstreamStatus"];
+            /**
+             * Format: uint64
+             * @description Seconds the upstream has been in `state`.
+             */
+            state_secs: number;
+            tag: string;
+            transport: components["schemas"]["Transport"] | null;
+        };
+        /** @description A class of transports the operator allows an upstream to use, as the client engine ranks them from strongest to weakest. `cover` is always allowed. */
+        UpstreamClass: "cover" | "no_cover" | "exposed" | "plain";
+        /** @description What the operator confirms: the move of the provider's endpoint the node reported as pending, and the refresh hosts it reported. A field that is left out is false when the other one is given, and the body may be left out altogether, which confirms both. */
+        UpstreamConfirm: {
+            /** @description Take the new refresh hosts and static mirrors the provider announced. */
+            hosts?: boolean;
+            /** @description Follow the move to the new endpoint: the next refresh tries it first. */
+            move?: boolean;
+        };
+        /** @description What a confirmation did: false for each thing that did not wait for it. */
+        UpstreamConfirmed: {
+            hosts: boolean;
+            moved: boolean;
+        };
+        /** @description Totals since the node started, or since the upstream first ran. */
+        UpstreamCounters: {
+            /**
+             * Format: uint64
+             * @description Packets out of the tunnel that answered no live flow of a device, and were dropped.
+             */
+            dropped: number;
+            /** Format: uint64 */
+            refresh_failures: number;
+            /** Format: uint64 */
+            refreshes: number;
+            /**
+             * Format: uint64
+             * @description Flows refused because the upstream was down.
+             */
+            refused: number;
+            /**
+             * Format: uint64
+             * @description Packets handed to the provider's tunnel, and packets it had no room or no session for.
+             */
+            sent: number;
+            /** Format: uint64 */
+            starts: number;
+            /**
+             * Format: uint64
+             * @description Changes between up and not up, and starts of the tunnel over again.
+             */
+            state_flips: number;
+            traffic: components["schemas"]["Traffic"];
+            /** Format: uint64 */
+            unsent: number;
+        };
+        /** @description What a decline of a preview did: the provider was told to release the place. */
+        UpstreamDeclined: {
+            id: string;
+        };
+        UpstreamExit: {
+            name: string;
+            tag: string;
+        };
+        /** @description The answer to a preview: the document the provider sent, verified under the key of the link, as the operator reads it before saying yes. Fetching it took a place at the provider. The place is given back when the preview is declined or runs out, and made permanent by the config that names the same link and device within `expires_in_secs`. */
+        UpstreamPreview: {
+            /**
+             * Format: int64
+             * @description When the account ends, in Unix seconds. Null for never or unknown.
+             */
+            account_expires_at: number | null;
+            /** @description The classes of transports the profiles list: the operator's consent is asked for each besides `cover`. */
+            classes: components["schemas"]["UpstreamClass"][];
+            /**
+             * Format: uint16
+             * @description How many devices the account may have, null for no limit or unknown, and how many the document lists.
+             */
+            device_limit: number | null;
+            /** Format: uint */
+            devices: number;
+            /**
+             * Format: int64
+             * @description When the document stops being current, in Unix seconds.
+             */
+            expires_at: number;
+            /**
+             * Format: uint64
+             * @description How long the node keeps the document for the config that names it.
+             */
+            expires_in_secs: number;
+            /** @description The fingerprint of the key the document is signed with, which is the one in the link and the one for `signing_key` of the config. */
+            fingerprint: string;
+            id: string;
+            profiles: components["schemas"]["UpstreamProfile"][];
+            /** @description The provider's own name for itself, shown as its claim next to the fingerprint. */
+            provider: string;
+            quota: components["schemas"]["UpstreamQuota"] | null;
+            /** Format: uint64 */
+            serial: number;
+        };
+        /** @description What the node needs to fetch the subscription of another provider with a device the panel made. The key and the secret are used for the fetch and are never in any answer, log or error. */
+        UpstreamPreviewRequest: {
+            /**
+             * @description Whether the node is to be allowed to dial private addresses of the profiles. It decides which profiles the review marks as refused.
+             * @default false
+             */
+            allow_private: boolean;
+            /** @description The device secret, 16 bytes as 22 characters of base64url. */
+            device_secret: string;
+            /** @description A native veilway://sub/ link. Carried, file, legacy and plain-address forms are refused. */
+            link: string;
+            /** @description The WireGuard private key of the device, 44 characters of standard base64 as a config writes a key. */
+            private_key: string;
+            /** @description The tag of a direct or socks5 outbound of the running config the provider is reached through. Left out: from the node itself. */
+            via?: string;
+        };
+        /** @description One profile of a provider's document. */
+        UpstreamProfile: {
+            classes: components["schemas"]["UpstreamClass"][];
+            /** @description The exits the provider lists for the profile, by tag and name. */
+            exits: components["schemas"]["UpstreamExit"][];
+            id: string;
+            /** Format: uint16 */
+            mtu: number;
+            name: string;
+            /** @description Private addresses the profile names to dial. */
+            private_addresses: string[];
+            /** @description What a censor can see, worked out by the node. */
+            rating: components["schemas"]["Rating"];
+            /** @description Why this node would not use the profile under the request's settings. Null when it would. */
+            refused: string | null;
+            /** @description In the provider's order. */
+            transports: components["schemas"]["Transport"][];
+        };
+        /** @description What the provider says an account has used and has. A quota of 0 is none. */
+        UpstreamQuota: {
+            /** Format: uint64 */
+            quota_bytes: number;
+            /** Format: uint64 */
+            used_bytes: number;
+        };
+        /** @description What a removal did. `confirmed` says whether the provider took the word that the device left; when it did not, the place stays until the provider removes it. The upstream is not run again by a config that still names it. */
+        UpstreamRemoved: {
+            confirmed: boolean;
+            tag: string;
+        };
+        /** @description The tag of an upstream the node was asked to connect again. */
+        UpstreamRetried: {
+            tag: string;
+        };
+        /** @enum {string} */
+        UpstreamStatus: "fetching" | "connecting" | "up" | "down";
+        Upstreams: {
+            upstreams: components["schemas"]["Upstream"][];
+        };
         /** @description The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it. */
         UsageReset: {
             totals: boolean;
@@ -1958,6 +2245,385 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Status"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    listUpstreams: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Upstreams"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    previewUpstream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpstreamPreviewRequest"];
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamPreview"];
+                };
+            };
+            /** @description The body is not one JSON document, or could not be read to its end. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not read within 30 seconds. Nothing was fetched: once the node has begun to fetch, the answer waits for the provider and is never this one. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description Four previews already wait. Nothing was fetched. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is larger than 4 MiB. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not sent as application/json. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description A part of the body is not what a preview takes, or names an outbound the running config does not have. Nothing was fetched. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The provider could not be asked, or its answer did not pass the checks, for instance because it is signed by another key than the link's, or the account has no device place left. The code is provider_failed and the message says why in plain words. Nothing was kept. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    declinePreview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamDeclined"];
+                };
+            };
+            /** @description No preview of that id waits: it was declined, a config took it, or it ran out. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    removeUpstream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamRemoved"];
+                };
+            };
+            /** @description The running config has no upstream of that tag. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    confirmUpstream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UpstreamConfirm"];
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamConfirmed"];
+                };
+            };
+            /** @description The body is not one JSON document, or could not be read to its end. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The running config has no upstream of that tag. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The request was not finished within 30 seconds. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is larger than 4 MiB. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not sent as application/json. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is JSON and not what a confirmation takes. Nothing was changed. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description state_unwritten: the state file of the upstreams could not be written, so the answer is not kept. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    retryUpstream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamRetried"];
+                };
+            };
+            /** @description The running config has no upstream of that tag. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             /** @description The request was not finished within 30 seconds. */

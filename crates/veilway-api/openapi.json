@@ -2502,6 +2502,560 @@
         ],
         "type": "object"
       },
+      "Upstream": {
+        "description": "What the node is doing for one upstream. Nothing in it is a key, a secret, a token or the link.",
+        "properties": {
+          "counters": {
+            "$ref": "#/components/schemas/UpstreamCounters"
+          },
+          "exit": {
+            "description": "The exit of the provider in use, and the exits it offers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "description": "When the document stops being current and when it was last refreshed, in Unix seconds.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mtu": {
+            "description": "The largest packet the carrier takes now. Null until a profile is in use.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "notices": {
+            "description": "What the provider says to the device, as plain text.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "offered_exits": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pending_hosts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "pending_move": {
+            "description": "A move of the provider's endpoint, and refresh hosts, that the provider announced and the operator has not confirmed. The old endpoint and hosts are used meanwhile.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "profile": {
+            "description": "The profile in use, and the transport it is connected over.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "quota": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamQuota"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "description": "Plain words for why the state is what it is. Empty while it is up.",
+            "type": "string"
+          },
+          "refresh_error": {
+            "description": "Why the last refresh failed. Null once one has gone through.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refreshed_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/UpstreamStatus"
+          },
+          "state_secs": {
+            "description": "Seconds the upstream has been in `state`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tag": {
+            "type": "string"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Transport"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "tag",
+          "state",
+          "reason",
+          "state_secs",
+          "provider",
+          "profile",
+          "transport",
+          "exit",
+          "offered_exits",
+          "notices",
+          "quota",
+          "expires_at",
+          "refreshed_at",
+          "refresh_error",
+          "mtu",
+          "pending_move",
+          "pending_hosts",
+          "counters"
+        ],
+        "type": "object"
+      },
+      "UpstreamClass": {
+        "description": "A class of transports the operator allows an upstream to use, as the client engine ranks them from strongest to weakest. `cover` is always allowed.",
+        "oneOf": [
+          {
+            "const": "cover",
+            "description": "`tls`, `ws`, `fronted` and `faketls`: they look like web traffic.",
+            "type": "string"
+          },
+          {
+            "const": "no_cover",
+            "description": "`udp-obfs`: no cover, but not recognizable by its bytes.",
+            "type": "string"
+          },
+          {
+            "const": "exposed",
+            "description": "`ws-plain`: a WebSocket on plain HTTP, whose handshake can be seen.",
+            "type": "string"
+          },
+          {
+            "const": "plain",
+            "description": "`udp`: plain WireGuard.",
+            "type": "string"
+          }
+        ]
+      },
+      "UpstreamConfirm": {
+        "additionalProperties": false,
+        "description": "What the operator confirms: the move of the provider's endpoint the node reported as pending, and the refresh hosts it reported. A field that is left out is false when the other one is given, and the body may be left out altogether, which confirms both.",
+        "properties": {
+          "hosts": {
+            "description": "Take the new refresh hosts and static mirrors the provider announced.",
+            "type": "boolean"
+          },
+          "move": {
+            "description": "Follow the move to the new endpoint: the next refresh tries it first.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "UpstreamConfirmed": {
+        "description": "What a confirmation did: false for each thing that did not wait for it.",
+        "properties": {
+          "hosts": {
+            "type": "boolean"
+          },
+          "moved": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "moved",
+          "hosts"
+        ],
+        "type": "object"
+      },
+      "UpstreamCounters": {
+        "description": "Totals since the node started, or since the upstream first ran.",
+        "properties": {
+          "dropped": {
+            "description": "Packets out of the tunnel that answered no live flow of a device, and were dropped.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refresh_failures": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refreshes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refused": {
+            "description": "Flows refused because the upstream was down.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sent": {
+            "description": "Packets handed to the provider's tunnel, and packets it had no room or no session for.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "starts": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state_flips": {
+            "description": "Changes between up and not up, and starts of the tunnel over again.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "traffic": {
+            "$ref": "#/components/schemas/Traffic"
+          },
+          "unsent": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sent",
+          "unsent",
+          "refused",
+          "dropped",
+          "state_flips",
+          "starts",
+          "refreshes",
+          "refresh_failures",
+          "traffic"
+        ],
+        "type": "object"
+      },
+      "UpstreamDeclined": {
+        "description": "What a decline of a preview did: the provider was told to release the place.",
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "UpstreamExit": {
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "name"
+        ],
+        "type": "object"
+      },
+      "UpstreamPreview": {
+        "description": "The answer to a preview: the document the provider sent, verified under the key of the link, as the operator reads it before saying yes. Fetching it took a place at the provider. The place is given back when the preview is declined or runs out, and made permanent by the config that names the same link and device within `expires_in_secs`.",
+        "properties": {
+          "account_expires_at": {
+            "description": "When the account ends, in Unix seconds. Null for never or unknown.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "classes": {
+            "description": "The classes of transports the profiles list: the operator's consent is asked for each besides `cover`.",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamClass"
+            },
+            "type": "array"
+          },
+          "device_limit": {
+            "description": "How many devices the account may have, null for no limit or unknown, and how many the document lists.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "devices": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "expires_at": {
+            "description": "When the document stops being current, in Unix seconds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "expires_in_secs": {
+            "description": "How long the node keeps the document for the config that names it.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fingerprint": {
+            "description": "The fingerprint of the key the document is signed with, which is the one in the link and the one for `signing_key` of the config.",
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/UpstreamProfile"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "description": "The provider's own name for itself, shown as its claim next to the fingerprint.",
+            "type": "string"
+          },
+          "quota": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamQuota"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "serial": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "expires_in_secs",
+          "provider",
+          "fingerprint",
+          "serial",
+          "expires_at",
+          "quota",
+          "account_expires_at",
+          "device_limit",
+          "devices",
+          "classes",
+          "profiles"
+        ],
+        "type": "object"
+      },
+      "UpstreamPreviewRequest": {
+        "additionalProperties": false,
+        "description": "What the node needs to fetch the subscription of another provider with a device the panel made. The key and the secret are used for the fetch and are never in any answer, log or error.",
+        "properties": {
+          "allow_private": {
+            "default": false,
+            "description": "Whether the node is to be allowed to dial private addresses of the profiles. It decides which profiles the review marks as refused.",
+            "type": "boolean"
+          },
+          "device_secret": {
+            "description": "The device secret, 16 bytes as 22 characters of base64url.",
+            "type": "string"
+          },
+          "link": {
+            "description": "A native veilway://sub/ link. Carried, file, legacy and plain-address forms are refused.",
+            "type": "string"
+          },
+          "private_key": {
+            "description": "The WireGuard private key of the device, 44 characters of standard base64 as a config writes a key.",
+            "type": "string"
+          },
+          "via": {
+            "description": "The tag of a direct or socks5 outbound of the running config the provider is reached through. Left out: from the node itself.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "link",
+          "private_key",
+          "device_secret"
+        ],
+        "type": "object"
+      },
+      "UpstreamProfile": {
+        "description": "One profile of a provider's document.",
+        "properties": {
+          "classes": {
+            "items": {
+              "$ref": "#/components/schemas/UpstreamClass"
+            },
+            "type": "array"
+          },
+          "exits": {
+            "description": "The exits the provider lists for the profile, by tag and name.",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamExit"
+            },
+            "type": "array"
+          },
+          "id": {
+            "type": "string"
+          },
+          "mtu": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "private_addresses": {
+            "description": "Private addresses the profile names to dial.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "rating": {
+            "$ref": "#/components/schemas/Rating",
+            "description": "What a censor can see, worked out by the node."
+          },
+          "refused": {
+            "description": "Why this node would not use the profile under the request's settings. Null when it would.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transports": {
+            "description": "In the provider's order.",
+            "items": {
+              "$ref": "#/components/schemas/Transport"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "transports",
+          "classes",
+          "rating",
+          "private_addresses",
+          "mtu",
+          "exits",
+          "refused"
+        ],
+        "type": "object"
+      },
+      "UpstreamQuota": {
+        "description": "What the provider says an account has used and has. A quota of 0 is none.",
+        "properties": {
+          "quota_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used_bytes",
+          "quota_bytes"
+        ],
+        "type": "object"
+      },
+      "UpstreamRemoved": {
+        "description": "What a removal did. `confirmed` says whether the provider took the word that the device left; when it did not, the place stays until the provider removes it. The upstream is not run again by a config that still names it.",
+        "properties": {
+          "confirmed": {
+            "type": "boolean"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "confirmed"
+        ],
+        "type": "object"
+      },
+      "UpstreamRetried": {
+        "description": "The tag of an upstream the node was asked to connect again.",
+        "properties": {
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag"
+        ],
+        "type": "object"
+      },
+      "UpstreamStatus": {
+        "enum": [
+          "fetching",
+          "connecting",
+          "up",
+          "down"
+        ],
+        "type": "string"
+      },
+      "Upstreams": {
+        "properties": {
+          "upstreams": {
+            "items": {
+              "$ref": "#/components/schemas/Upstream"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "upstreams"
+        ],
+        "type": "object"
+      },
       "UsageReset": {
         "description": "The data of a `usage_reset` event: the user's quota count was started over through the API, and with `totals` their traffic counters went back to zero as well. A user who was out of quota gets a `user_restored` right behind it.",
         "properties": {
@@ -3424,6 +3978,446 @@
           }
         },
         "summary": "What runs: the version, the config in force and how much of everything there is."
+      }
+    },
+    "/v1/upstreams": {
+      "get": {
+        "operationId": "listUpstreams",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Upstreams"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Every enabled upstream, the subscription of another provider that an exit uses, with its state and the reason, the provider's name, the profile, transport and exit in use, its quota and notices as plain text, the largest packet it takes, when its document was last refreshed and why a refresh failed, a move of the provider's endpoint or new refresh hosts that wait for the operator, and its counters. No key, no secret and no link."
+      }
+    },
+    "/v1/upstreams/preview": {
+      "post": {
+        "operationId": "previewUpstream",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamPreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamPreview"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not read within 30 seconds. Nothing was fetched: once the node has begun to fetch, the answer waits for the provider and is never this one."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "Four previews already wait. Nothing was fetched."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "A part of the body is not what a preview takes, or names an outbound the running config does not have. Nothing was fetched."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The provider could not be asked, or its answer did not pass the checks, for instance because it is signed by another key than the link's, or the account has no device place left. The code is provider_failed and the message says why in plain words. Nothing was kept."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Fetches the subscription of another provider from this node, with the device the body gives, and shows what the document holds. The fetch is the enrollment: it takes a place at the provider, so the provider sees this node's address and never the panel's. The document is verified under the key in the link, kept in memory for ten minutes under the id, and nothing is written to the config or the state file. A config that names the same link and device within that time takes the document and makes the place permanent without asking the provider again. At most four previews wait. The private key and the device secret are never in an answer."
+      }
+    },
+    "/v1/upstreams/preview/{id}/decline": {
+      "post": {
+        "operationId": "declinePreview",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamDeclined"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "No preview of that id waits: it was declined, a config took it, or it ran out."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Says no to a preview: the provider is told to release the place the preview took, and the node keeps nothing."
+      }
+    },
+    "/v1/upstreams/{tag}": {
+      "delete": {
+        "operationId": "removeUpstream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamRemoved"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no upstream of that tag. Nothing was changed."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. The upstream stops, and a config that still names it does not start it again; apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything."
+      }
+    },
+    "/v1/upstreams/{tag}/confirm": {
+      "post": {
+        "operationId": "confirmUpstream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamConfirm"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConfirmed"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no upstream of that tag. Nothing was changed."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is JSON and not what a confirmation takes. Nothing was changed."
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "state_unwritten: the state file of the upstreams could not be written, so the answer is not kept."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting."
+      }
+    },
+    "/v1/upstreams/{tag}/retry": {
+      "post": {
+        "operationId": "retryUpstream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamRetried"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no upstream of that tag. Nothing was changed."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The request was not finished within 30 seconds."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Asks the upstream to connect again now, at the operator's word: every wait it was in starts over."
       }
     },
     "/v1/users": {

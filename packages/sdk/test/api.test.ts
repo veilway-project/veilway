@@ -94,3 +94,28 @@ test("the event stream parser reads ids, comments, CRLF and lagged", async () =>
 	for await (const event of new Client(double, "http://x").events()) seen.push(event);
 	assert.deepEqual(seen, [{id: "7", event: "user_restored", data: {user: "a"}}, {id: undefined, event: "lagged", data: {missed: 3}}]);
 });
+
+test("the upstream calls go to the routes of the node with the bodies it takes", async () => {
+	const seen: string[] = [];
+	const fake: Fetch = async (url, init) => {
+		seen.push(init.method + " " + new URL(url).pathname + " " + (init.body ?? ""));
+		return {status: 200, headers: {get: () => null}, text: async () => "{\"upstreams\": [], \"tag\": \"b\"}", body: null};
+	};
+	const stubbed = new Client(fake, "http://veilway");
+	assert.deepEqual(await stubbed.listUpstreams(), []);
+	await stubbed.previewUpstream({link: "l", private_key: "k", device_secret: "s", allow_private: true});
+	await stubbed.declinePreview("a/b");
+	await stubbed.removeUpstream("b");
+	await stubbed.confirmUpstream("b");
+	await stubbed.confirmUpstream("b", {move: true});
+	await stubbed.retryUpstream("b");
+	assert.deepEqual(seen, [
+		"GET /v1/upstreams ",
+		"POST /v1/upstreams/preview {\"link\":\"l\",\"private_key\":\"k\",\"device_secret\":\"s\",\"allow_private\":true}",
+		"POST /v1/upstreams/preview/a%2Fb/decline ",
+		"DELETE /v1/upstreams/b ",
+		"POST /v1/upstreams/b/confirm {}",
+		"POST /v1/upstreams/b/confirm {\"move\":true}",
+		"POST /v1/upstreams/b/retry ",
+	]);
+});

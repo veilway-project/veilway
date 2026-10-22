@@ -13,14 +13,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
-use veilway_core::engine::upstream::{Hooks, Phase};
+use veilway_core::engine::upstream::{Hooks, Phase, PreviewError, PreviewRequest};
 use veilway_core::{Engine, Options, Reason};
 use veilway_engine::import::Resolve;
 use veilway_engine::Redirect;
@@ -97,7 +97,13 @@ fn certify() -> (Arc<RootCertStore>, Arc<ServerConfig>) {
 fn http(status: &str, body: &[u8]) -> Vec<u8> {[format!("HTTP/1.1 {status}\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n").as_bytes(), body].concat()}
 
 /// The subscription endpoint of a provider: it answers every request with the signed document the provider has at that moment, and counts the requests that fetched one.
-struct Provider {addr: SocketAddr, fetches: Arc<Mutex<u32>>, roots: Arc<RootCertStore>, link: String, fingerprint: String, signer: Arc<AtomicU8>, task: tokio::task::JoinHandle<()>}
+struct Provider {
+	addr: SocketAddr, fetches: Arc<Mutex<u32>>, roots: Arc<RootCertStore>, link: String, fingerprint: String, signer: Arc<AtomicU8>,
+	/// The serial of the document, the seeds of the keys it lists besides the signer's (none: the signer's alone), whether it answers a fetch with a refusal, members merged into the document, and the profile.
+	serial: Arc<AtomicU64>, listed: Arc<Mutex<Vec<u8>>>, refusing: Arc<AtomicBool>, extra: Arc<Mutex<Value>>, profile: Arc<Mutex<Value>>,
+	/// The operation of every request that reached it, and every host name the node asked its resolver for.
+	ops: Arc<Mutex<Vec<&'static str>>>, asked: Arc<Mutex<Vec<String>>>, task: tokio::task::JoinHandle<()>,
+}
 
 impl Drop for Provider {
 	fn drop(&mut self) {self.task.abort()}
@@ -107,14 +113,15 @@ impl Provider {
 	async fn start(time: Time, profile: Value) -> Provider {
 		let (roots, config) = certify();
 		let (gateway, fetches, profile, which) = (Arc::new(Mutex::new(Gateway::new(&[(1, gateway_private())], 0, &mut entropy).unwrap())), Arc::new(Mutex::new(0u32)), Arc::new(Mutex::new(profile)), Arc::new(AtomicU8::new(0x11)));
+		let (serial, listed, refusing, extra, ops) = (Arc::new(AtomicU64::new(1)), Arc::new(Mutex::new(Vec::<u8>::new())), Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(json!({}))), Arc::new(Mutex::new(Vec::<&'static str>::new())));
 		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-		let addr = listener.local_addr().unwrap();
+		let (addr, base) = (listener.local_addr().unwrap(), time.secs() - 10);
 		let task = tokio::spawn({
-			let (fetches, profile, which) = (fetches.clone(), profile.clone(), which.clone());
+			let (fetches, profile, which, serial, listed, refusing, extra, ops) = (fetches.clone(), profile.clone(), which.clone(), serial.clone(), listed.clone(), refusing.clone(), extra.clone(), ops.clone());
 			async move {
 				loop {
 					let Ok((stream, _)) = listener.accept().await else {return};
-					let (acceptor, gateway, fetches, profile, which) = (TlsAcceptor::from(config.clone()), gateway.clone(), fetches.clone(), profile.clone(), which.clone());
+					let (acceptor, gateway, fetches, profile, which, serial, listed, refusing, extra, ops) = (TlsAcceptor::from(config.clone()), gateway.clone(), fetches.clone(), profile.clone(), which.clone(), serial.clone(), listed.clone(), refusing.clone(), extra.clone(), ops.clone());
 					tokio::spawn(async move {
 						let Ok(mut tls) = acceptor.accept(stream).await else {return};
 						let (mut buffer, mut chunk) = (Vec::new(), [0u8; 4096]);
@@ -139,12 +146,20 @@ impl Provider {
 						let key = signing(which.load(Ordering::SeqCst));
 						let pair = signer(which.load(Ordering::SeqCst));
 						let sign = |payload: &Value| envelope::seal(&key, &serde_json::to_vec(payload).unwrap(), |signed| pair.sign(signed).as_ref().try_into().unwrap());
-						let envelope = if matches!(received.op(), Op::Release) {
+						ops.lock().unwrap().push(match received.op() {Op::Fetch => "fetch", Op::Confirm(_) => "confirm", Op::Release => "release", Op::Leave => "leave"});
+						let envelope = if matches!(received.op(), Op::Release | Op::Leave) {
 							sign(&json!({"v": 1, "subscription_id": ID, "issued_at": issued, "refusal": "released"}))
+						} else if refusing.load(Ordering::SeqCst) {
+							sign(&json!({"v": 1, "subscription_id": ID, "issued_at": issued, "refusal": "disabled"}))
 						} else {
 							if matches!(received.op(), Op::Fetch) {*fetches.lock().unwrap() += 1}
-							let profile = profile.lock().unwrap().clone();
-							sign(&json!({"v": 1, "subscription_id": ID, "serial": 1, "issued_at": issued, "expires_at": issued + 30 * 86_400, "signing_keys": [b64(key.bytes())], "provider": {"name": "Test provider"}, "profiles": [profile], "gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}]}))
+							let (profile, listed) = (profile.lock().unwrap().clone(), listed.lock().unwrap().clone());
+							let keys: Vec<String> = if listed.is_empty() {vec![b64(key.bytes())]} else {listed.iter().map(|seed| b64(signing(*seed).bytes())).collect()};
+							// The same serial is the same bytes, and a newer one is issued later: a refresh that finds nothing new is no fork.
+							let (serial, issued) = (serial.load(Ordering::SeqCst), base + serial.load(Ordering::SeqCst));
+							let mut document = json!({"v": 1, "subscription_id": ID, "serial": serial, "issued_at": issued, "expires_at": issued + 30 * 86_400, "signing_keys": keys, "provider": {"name": "Test provider"}, "profiles": [profile], "gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}]});
+							for (member, value) in extra.lock().unwrap().as_object().unwrap() {document[member.as_str()] = value.clone()}
+							sign(&document)
 						};
 						let _ = tls.write_all(&http("200 OK", &reply.seal(envelope.as_bytes(), &mut entropy).unwrap())).await;
 						let _ = tls.shutdown().await;
@@ -153,15 +168,28 @@ impl Provider {
 			}
 		});
 		let link = format!("veilway://sub/sub.example.com/s#v1.{}.{}.{}", b64url(signing(0x11).bytes()), b64url(&gateway_key().link()), b64url(&[0x55; 16]));
-		Provider {addr, fetches, roots, link, fingerprint: signing(0x11).fingerprint().to_string(), signer: which, task}
+		Provider {addr, fetches, roots, link, fingerprint: signing(0x11).fingerprint().to_string(), signer: which, serial, listed, refusing, extra, profile, ops, asked: Arc::default(), task}
 	}
 
 	fn fetched(&self) -> u32 {*self.fetches.lock().unwrap()}
 
+	/// How many requests of the operation `op` reached the provider.
+	fn requests(&self, op: &str) -> usize {self.ops.lock().unwrap().iter().filter(|seen| **seen == op).count()}
+
+	/// The provider's next document: `serial`, the transports of its one profile, and members to merge into the document.
+	fn publish(&self, serial: u64, transports: Vec<Value>, extra: Value) {
+		self.profile.lock().unwrap()["transports"] = json!(transports);
+		*self.extra.lock().unwrap() = extra;
+		self.serial.store(serial, Ordering::SeqCst);
+	}
+
 	/// Where `sub.example.com` is, for the fetch of A.
 	fn resolver(&self) -> Resolve {
-		let at = self.addr;
-		Arc::new(move |_, _| Box::pin(async move {Ok(vec![at])}))
+		let (at, asked) = (self.addr, self.asked.clone());
+		Arc::new(move |host, _| {
+			asked.lock().unwrap().push(host);
+			Box::pin(async move {Ok(vec![at])})
+		})
 	}
 }
 
@@ -211,20 +239,20 @@ impl Real {
 }
 
 /// What a test starts node A with.
-struct Setup {time: Time, dir: PathBuf, provider: Provider, redirect: Redirect, allow: Vec<&'static str>, exit: Option<&'static str>, private: bool}
+struct Setup {time: Time, dir: PathBuf, provider: Provider, redirect: Redirect, allow: Vec<&'static str>, exit: Option<&'static str>, private: bool, refresh: Option<Duration>, preview: Option<Duration>, tag: &'static str}
 
 impl Setup {
-	fn new(time: Time, dir: PathBuf, provider: Provider, redirect: Redirect) -> Setup {Setup {time, dir, provider, redirect, allow: vec!["no_cover", "plain"], exit: None, private: true}}
+	fn new(time: Time, dir: PathBuf, provider: Provider, redirect: Redirect) -> Setup {Setup {time, dir, provider, redirect, allow: vec!["no_cover", "plain"], exit: None, private: true, refresh: None, preview: None, tag: "b"}}
 
 	/// The document of node A: two users on a plain WireGuard inbound, an exit through the upstream `b`, and one that leaves from A itself and which nothing may reach but a rule that names it.
 	fn document(&self, home: SocketAddr) -> Value {
-		let mut upstream = json!({"tag": "b", "link": self.provider.link, "signing_key": self.provider.fingerprint, "private_key": text(&DEVICE), "device_secret": b64url(&ACCOUNT), "allow": self.allow, "allow_private": self.private});
+		let mut upstream = json!({"tag": self.tag, "link": self.provider.link, "signing_key": self.provider.fingerprint, "private_key": text(&DEVICE), "device_secret": b64url(&ACCOUNT), "allow": self.allow, "allow_private": self.private});
 		if let Some(exit) = self.exit {upstream["exit"] = json!(exit)}
 		json!({
 			"version": 1, "dns": {"servers": ["1.1.1.1:53"]},
 			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": text(&ENTRY), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": home.to_string()}]}],
 			"outbounds": [{"tag": "plain", "type": "direct"}],
-			"exits": [{"tag": "up", "backend": {"type": "upstream", "upstream": "b"}}, {"tag": "near", "backend": {"type": "netstack", "outbound": "plain"}}],
+			"exits": [{"tag": "up", "backend": {"type": "upstream", "upstream": self.tag}}, {"tag": "near", "backend": {"type": "netstack", "outbound": "plain"}}],
 			"routing": {"default": "up", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}]},
 			"users": [
 				{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": text(&public(&ALICE)), "addresses": ["10.7.0.2"]}]},
@@ -235,7 +263,7 @@ impl Setup {
 	}
 
 	async fn start(&self, doc: &Value) -> Engine {
-		let hooks = Hooks {resolve: Some(self.provider.resolver()), retry: Some(Duration::from_secs(1)), redirect: Some(self.redirect.clone())};
+		let hooks = Hooks {resolve: Some(self.provider.resolver()), retry: Some(Duration::from_secs(1)), refresh: self.refresh, preview: self.preview, redirect: Some(self.redirect.clone())};
 		seed(&self.dir.join("replay"), self.time.secs() - 100, self.time.secs() - 100);
 		logging();
 		veilway_core::start(&parsed(doc), Options {now: self.time.now, replay: Some(self.dir.join("replay")), upstreams: Some(self.dir.join("upstreams.state")), upstream: hooks, roots: Some(self.provider.roots.clone()), ..Options::new(&self.dir)}).await.unwrap_or_else(|e| panic!("node A did not start: {e:#}"))
@@ -690,12 +718,53 @@ async fn a_document_signed_by_another_key_is_not_taken() {
 	a.shutdown().await;
 }
 
-// A `via` that is a proxy: the fetch goes through it, and a profile of datagram transports alone, which cannot, is not used.
+/// A SOCKS5 proxy that connects every CONNECT to `target`, whatever it asks for, and writes down what it was asked for: `host:port` for a name and for an address alike.
+async fn lookup_proxy(target: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let (addr, seen) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
+	let asked = seen.clone();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut client, _)) = listener.accept().await else {return};
+			let asked = asked.clone();
+			tokio::spawn(async move {
+				let (mut hello, mut head) = ([0u8; 2], [0u8; 4]);
+				if client.read_exact(&mut hello).await.is_err() {return}
+				let mut methods = vec![0u8; usize::from(hello[1])];
+				if client.read_exact(&mut methods).await.is_err() || client.write_all(&[5, 0]).await.is_err() || client.read_exact(&mut head).await.is_err() {return}
+				let host = match head[3] {
+					1 => {
+						let mut ip = [0u8; 4];
+						if client.read_exact(&mut ip).await.is_err() {return}
+						std::net::Ipv4Addr::from(ip).to_string()
+					}
+					3 => {
+						let mut length = [0u8; 1];
+						if client.read_exact(&mut length).await.is_err() {return}
+						let mut name = vec![0u8; usize::from(length[0])];
+						if client.read_exact(&mut name).await.is_err() {return}
+						String::from_utf8_lossy(&name).into_owned()
+					}
+					_ => return,
+				};
+				let mut port = [0u8; 2];
+				if client.read_exact(&mut port).await.is_err() {return}
+				asked.lock().unwrap().push(format!("{host}:{}", u16::from_be_bytes(port)));
+				let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {return};
+				if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {return}
+				let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+			});
+		}
+	});
+	(addr, seen)
+}
+
+// A `via` that is a proxy: the provider's name is looked up by the proxy and never by the node's own resolver, the fetch goes through it, and a profile of datagram transports alone, which cannot, is not used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_via_sends_the_fetch_through_the_proxy_and_the_datagram_transports_are_not_used_through_it() {
+async fn a_via_that_is_a_proxy_looks_the_provider_up_itself_and_the_datagram_transports_are_not_used_through_it() {
 	let time = time!();
 	let provider = Provider::start(time, profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [FAKE_OBFS]})])).await;
-	let (hop, asked) = forwarder(None).await;
+	let (hop, asked) = lookup_proxy(provider.addr).await;
 	let (dir, home) = (scratch("up-via-a"), listen());
 	let setup = Setup::new(time, dir, provider, redirect(&[]));
 	let mut doc = setup.document(home);
@@ -707,7 +776,274 @@ async fn a_via_sends_the_fetch_through_the_proxy_and_the_datagram_transports_are
 		assert!(Instant::now() < deadline, "{:?}\n{}", a.upstreams(), lines("upstream").join("\n"));
 		tokio::time::sleep(Duration::from_millis(50)).await;
 	}
-	assert!(asked.lock().unwrap().contains(&setup.provider.addr.to_string()), "the proxy was not asked for the endpoint: {:?}", asked.lock().unwrap());
-	assert_eq!((setup.provider.fetched(), a.upstreams()[0].sent), (1, 0));
+	assert!(!asked.lock().unwrap().is_empty() && asked.lock().unwrap().iter().all(|at| at == "sub.example.com:443"), "the proxy was not asked for the name of the provider, and for nothing else: {:?}", asked.lock().unwrap());
+	assert!(setup.provider.asked.lock().unwrap().is_empty(), "the node's own resolver was asked for {:?}", setup.provider.asked.lock().unwrap());
+	assert_eq!(a.upstreams()[0].sent, 0);
+	a.shutdown().await;
+}
+
+/// Waits until `done` holds, for as long as an upstream is given to move, and says what the upstream was doing when it did not.
+async fn until(engine: &Engine, what: &str, done: impl Fn() -> bool) {
+	let deadline = Instant::now() + UP;
+	while !done() {
+		assert!(Instant::now() < deadline, "{what}: {:?}\n{}", engine.upstreams(), lines("upstream").join("\n"));
+		tokio::time::sleep(Duration::from_millis(50)).await;
+	}
+}
+
+/// What is read of the keys the state file holds for the upstream `tag`, as base64.
+fn kept_keys(dir: &std::path::Path, tag: &str) -> Vec<String> {
+	let value: Value = serde_json::from_slice(&std::fs::read(dir.join("upstreams.state")).unwrap()).unwrap();
+	value["upstreams"][tag]["held"][0]["keys"].as_array().map(|keys| keys.iter().map(|key| key.as_str().unwrap().to_owned()).collect()).unwrap_or_default()
+}
+
+/// Nothing the operator or the provider gave the node in secret may be in a line the node logs or a word it says: the link, its token, the device's key and secret, and the transport secret of the device.
+fn assert_clean(what: &str, said: &str, provider: &Provider) {
+	for secret in [provider.link.clone(), b64url(&[0x55; 16]), text(&DEVICE), b64url(&ACCOUNT), text(&secret(5))] {assert!(!said.contains(&secret), "{what} holds a secret: {secret}")}
+}
+
+// A refresh that changes nothing the tunnel was made from leaves it alone. One that changes the candidates makes the tunnel again, and the addresses are checked again: a loopback candidate takes the exit down and nothing is dialled, and a later document without it brings the exit back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_that_changes_the_candidates_makes_the_tunnel_again_and_checks_the_addresses_again() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let loopback = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let (dir, home) = (scratch("up-refresh-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, hand.redirect());
+	setup.refresh = Some(Duration::from_secs(1));
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let first = a.upstreams().remove(0);
+	// A new document that renames the profile and leaves its keys, addresses and candidates alone: the tunnel is not touched.
+	setup.provider.profile.lock().unwrap()["name"] = json!("Renamed");
+	setup.provider.publish(2, hand.transports(), json!({}));
+	until(&a, "the renamed document was not taken", || a.upstreams()[0].refreshes >= first.refreshes + 2).await;
+	let renamed = a.upstreams().remove(0);
+	assert_eq!((renamed.starts, renamed.flips, renamed.phase), (first.starts, first.flips, Phase::Up), "a document that changes nothing the tunnel was made from restarted it");
+	// A second candidate for the tunnel: it is made again from the new document.
+	setup.provider.publish(3, vec![json!({"type": "udp", "endpoints": [FAKE_UDP, "10.99.0.3:5003"]})], json!({}));
+	until(&a, "the tunnel was not made again", || a.upstreams()[0].starts > first.starts).await;
+	until_phase(&a, Phase::Up, UP).await;
+	// A candidate on the node's own loopback is a document the reader refuses: the refresh fails, the tunnel goes on, and no datagram goes there.
+	let failures = a.upstreams()[0].refresh_failures;
+	setup.provider.publish(4, vec![json!({"type": "udp", "endpoints": [FAKE_UDP, loopback.local_addr().unwrap().to_string()]})], json!({}));
+	until(&a, "the document with a loopback candidate was not refused", || a.upstreams()[0].refresh_failures > failures).await;
+	assert!(timeout(Duration::from_millis(1500), loopback.recv_from(&mut [0u8; 64])).await.is_err(), "the node dialled the loopback address of a refreshed profile");
+	assert_eq!(phase(&a).0, Phase::Up);
+	// A candidate inside the node's own pool reads, and is the node's to refuse: the profile is not used, the exit is down, and nothing is dialled there.
+	setup.provider.publish(5, vec![json!({"type": "udp", "endpoints": [FAKE_UDP, "10.7.0.50:5003"]})], json!({}));
+	until(&a, "the exit was not taken down", || phase(&a).0 == Phase::Down && phase(&a).1.contains("inbound pool")).await;
+	assert_eq!(phase(&a).0, Phase::Down);
+	// The provider takes it out again, and the next refresh brings the exit back: nothing latched.
+	setup.provider.publish(6, hand.transports(), json!({}));
+	until_phase(&a, Phase::Up, UP).await;
+	a.shutdown().await;
+}
+
+// A signing key rotates only under a key that is held, and the node keeps the rotation: a restart finds the new keys and fetches nothing. A document signed by a key that was never held is refused, and the exit goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rotation_under_a_held_key_is_taken_and_kept_and_a_key_that_was_never_held_is_refused() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-rotate-a"), listen());
+	let mut setup = Setup::new(time, dir.clone(), provider, hand.redirect());
+	setup.refresh = Some(Duration::from_secs(1));
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let (old, new, stranger) = (b64(signing(0x11).bytes()), b64(signing(0x33).bytes()), b64(signing(0x22).bytes()));
+	assert_eq!(kept_keys(&dir, "b"), [old.clone()]);
+	// The held key lists a second one.
+	*setup.provider.listed.lock().unwrap() = vec![0x11, 0x33];
+	setup.provider.publish(2, hand.transports(), json!({}));
+	until(&a, "the rotation was not kept", || kept_keys(&dir, "b") == [old.clone(), new.clone()]).await;
+	// The new key signs, and lists itself alone.
+	setup.provider.signer.store(0x33, Ordering::SeqCst);
+	*setup.provider.listed.lock().unwrap() = vec![0x33];
+	setup.provider.publish(3, hand.transports(), json!({}));
+	until(&a, "the key that was listed was not taken", || kept_keys(&dir, "b") == [new.clone()]).await;
+	assert_eq!(phase(&a).0, Phase::Up);
+	// A key nobody held signs the next document, and lists itself: refused, nothing changes.
+	let failures = a.upstreams()[0].refresh_failures;
+	setup.provider.signer.store(0x22, Ordering::SeqCst);
+	*setup.provider.listed.lock().unwrap() = vec![0x22];
+	setup.provider.publish(4, hand.transports(), json!({}));
+	until(&a, "the stranger's document was not refused", || a.upstreams()[0].refresh_failures > failures).await;
+	let report = a.upstreams().remove(0);
+	assert!(report.refresh_error.as_deref().is_some_and(|reason| reason.contains("signed")), "{report:?}");
+	assert_eq!((kept_keys(&dir, "b"), report.phase), (vec![new.clone()], Phase::Up), "a key that was never held changed what is kept, or took the exit down");
+	assert!(!kept_keys(&dir, "b").contains(&stranger));
+	// A restart finds the rotated keys and asks the provider for nothing.
+	setup.provider.signer.store(0x33, Ordering::SeqCst);
+	*setup.provider.listed.lock().unwrap() = vec![0x33];
+	setup.provider.publish(3, hand.transports(), json!({}));
+	let fetched = setup.provider.fetched();
+	a.shutdown().await;
+	setup.refresh = None;
+	let again = setup.start(&setup.document(listen())).await;
+	until_phase(&again, Phase::Up, UP).await;
+	assert_eq!((setup.provider.fetched(), kept_keys(&dir, "b")), (fetched, vec![new]));
+	again.shutdown().await;
+}
+
+// A move of the endpoint and refresh hosts the provider announces are held until the operator says yes: the old endpoint is used meanwhile, the status shows what waits, and a yes makes a refresh try the new endpoint first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_and_new_hosts_wait_for_the_operator_and_the_old_endpoint_is_used_meanwhile() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-move-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, hand.redirect());
+	setup.refresh = Some(Duration::from_secs(1));
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	setup.provider.publish(2, hand.transports(), json!({"main_endpoint": {"url": "https://moved.example.com/s", "gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}]}, "refresh_urls": ["https://mirror.example.net/s"]}));
+	until(&a, "the move and the hosts were not reported", || a.upstreams()[0].pending_move.is_some() && !a.upstreams()[0].pending_hosts.is_empty()).await;
+	let waiting = a.upstreams().remove(0);
+	assert_eq!((waiting.phase, waiting.pending_move.as_deref().is_some_and(|moving| moving.contains("moved.example.com")), waiting.pending_hosts.iter().all(|host| host.contains("mirror.example.net"))), (Phase::Up, true, true), "{waiting:?}");
+	// Several refreshes later: only the old endpoint was ever asked for.
+	let refreshes = waiting.refreshes;
+	until(&a, "no refresh went by", || a.upstreams()[0].refreshes >= refreshes + 3).await;
+	let asked = setup.provider.asked.lock().unwrap().clone();
+	assert!(!asked.is_empty() && asked.iter().all(|host| host == "sub.example.com"), "an endpoint nobody confirmed was asked for: {asked:?}");
+	// The operator says yes to both, once, and then nothing waits.
+	assert_eq!(a.upstream_confirm("b", true, true).await.unwrap().unwrap(), (true, true));
+	let confirmed = a.upstreams().remove(0);
+	assert_eq!((confirmed.pending_move, confirmed.pending_hosts.len()), (None, 0));
+	until(&a, "the confirmed move was not tried", || setup.provider.asked.lock().unwrap().iter().any(|host| host == "moved.example.com")).await;
+	assert_eq!(a.upstream_confirm("b", true, true).await.unwrap().unwrap(), (false, false));
+	assert!(a.upstream_confirm("nobody", true, true).await.is_none());
+	assert_eq!(phase(&a).0, Phase::Up);
+	a.shutdown().await;
+}
+
+// A refusal takes the exit down with a reason and a count, is tried again at the pace of a refusal, and the exit comes back the moment a refresh goes through. The state changes are in the log once each, with no secret in them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_takes_the_exit_down_and_the_refresh_that_lifts_it_brings_it_back() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-refused-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, hand.redirect());
+	(setup.refresh, setup.tag) = (Some(Duration::from_secs(1)), "refused");
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	assert_eq!(a.upstreams()[0].flips, 1);
+	let fetches = setup.provider.requests("fetch");
+	setup.provider.refusing.store(true, Ordering::SeqCst);
+	until(&a, "the refusal did not take the exit down", || phase(&a).0 == Phase::Down && phase(&a).1.contains("could not be refreshed")).await;
+	let down = a.upstreams().remove(0);
+	assert_eq!((down.flips, down.refresh_failures >= 1, down.refresh_error.is_some()), (2, true, true), "{down:?}");
+	// It is asked again, over and over, and stays down meanwhile.
+	until(&a, "the refusal was not tried again", || setup.provider.requests("fetch") >= fetches + 4).await;
+	assert_eq!(phase(&a).0, Phase::Down);
+	let said = lines("upstream refused:");
+	assert_eq!(said.iter().filter(|line| line.contains("could not be refreshed")).count(), 2, "each change of state is logged once, here as the refresh's word and as the state's: {said:?}");
+	setup.provider.refusing.store(false, Ordering::SeqCst);
+	until_phase(&a, Phase::Up, UP).await;
+	let back = a.upstreams().remove(0);
+	assert_eq!((back.flips, back.refresh_error.clone()), (3, None), "{back:?}");
+	assert!(lines("upstream refused:").iter().any(|line| line.contains("refreshed again")));
+	for line in lines("upstream") {assert_clean("a log line", &line, &setup.provider)}
+	assert_clean("the report", &format!("{back:?}"), &setup.provider);
+	a.shutdown().await;
+}
+
+/// A request to look at the provider's subscription with the device of node A, under the token `token` in the link: 0x55 is the one the config names, and another is another place at the provider.
+fn asking(setup: &Setup, token: u8) -> PreviewRequest {PreviewRequest {link: setup.provider.link.replace(&b64url(&[0x55; 16]), &b64url(&[token; 16])), private_key: text(&DEVICE), device_secret: b64url(&ACCOUNT), via: None, allow_private: true}}
+
+/// The config of node A without the upstream, for the preview tests: the operator looks at a provider before any config names it.
+fn bare(setup: &Setup, home: SocketAddr) -> Value {
+	let mut doc = setup.document(home);
+	doc["exits"].as_array_mut().unwrap().remove(0);
+	doc["routing"]["default"] = json!("near");
+	doc["upstreams"] = json!([]);
+	doc
+}
+
+// The operator looks at a provider before a config names it: the node fetches with the device the panel made, shows what the document holds without a secret in it, and the config that follows takes the document it fetched, confirms the place, and fetches nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preview_fetches_for_the_operator_and_the_config_that_follows_takes_its_document_without_asking_again() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-preview-a"), listen());
+	let setup = Setup::new(time, dir.clone(), provider, hand.redirect());
+	let a = setup.start(&bare(&setup, home)).await;
+	assert!(a.upstreams().is_empty());
+	let reviewing = a.upstream_preview(asking(&setup, 0x55)).await.unwrap();
+	assert_eq!((reviewing.provider.as_str(), reviewing.fingerprint.as_str(), reviewing.profiles.len(), reviewing.serial), ("Test provider", setup.provider.fingerprint.as_str(), 1, 1));
+	let profile = &reviewing.profiles[0];
+	assert_eq!((profile.id.as_str(), profile.transports.as_slice(), profile.mtu, profile.refused.as_deref()), ("home", &["udp"][..], 1390, None));
+	assert_eq!((profile.classes.as_slice(), profile.exits.len(), profile.private.len()), (&[veilway_core::config::UpstreamClass::Plain][..], 2, 1), "{profile:?}");
+	assert_eq!((setup.provider.requests("fetch"), setup.provider.requests("confirm")), (1, 0));
+	assert_clean("the review", &format!("{reviewing:?}"), &setup.provider);
+	// Nothing was written: no state file, no config change.
+	assert!(!dir.join("upstreams.state").exists());
+	// The config that names the same link and device takes the document, and the place becomes permanent.
+	a.reload(setup.document(home).to_string().into_bytes(), None).await.unwrap();
+	until_phase(&a, Phase::Up, UP).await;
+	assert_eq!((setup.provider.requests("fetch"), setup.provider.requests("confirm")), (1, 1), "the provider was asked for the document again, or never told it was taken");
+	assert!(!a.upstream_decline(&reviewing.id).await, "a preview a config took is still waiting");
+	assert_eq!(setup.provider.requests("release"), 0);
+	a.shutdown().await;
+}
+
+// A preview the operator declines frees its place at the provider, and so does one nobody answers, after its time. At most four wait at once, and a fifth is refused with nothing fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declined_preview_and_one_nobody_answers_give_their_place_back_and_no_more_than_four_wait() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-decline-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, hand.redirect());
+	setup.preview = Some(Duration::from_secs(3));
+	let a = setup.start(&bare(&setup, home)).await;
+	let first = a.upstream_preview(asking(&setup, 0x55)).await.unwrap();
+	assert!(a.upstream_decline(&first.id).await && !a.upstream_decline(&first.id).await);
+	assert_eq!(setup.provider.requests("release"), 1);
+	let mut ids = Vec::new();
+	for key in 0x62..0x66 {ids.push(a.upstream_preview(asking(&setup, key)).await.unwrap().id)}
+	assert_eq!(a.upstream_preview(asking(&setup, 0x66)).await.unwrap_err(), PreviewError::Full);
+	assert_eq!(setup.provider.requests("fetch"), 5, "a fifth preview asked the provider");
+	until(&a, "the previews nobody answered were not released", || setup.provider.requests("release") == 5).await;
+	for id in ids {assert!(!a.upstream_decline(&id).await)}
+	for bad in [PreviewRequest {link: "https://example.org/s".into(), ..asking(&setup, 0x55)}, PreviewRequest {private_key: "not a key".into(), ..asking(&setup, 0x55)}, PreviewRequest {device_secret: "short".into(), ..asking(&setup, 0x55)}, PreviewRequest {via: Some("nowhere".into()), ..asking(&setup, 0x55)}] {
+		assert!(matches!(a.upstream_preview(bad).await, Err(PreviewError::Invalid(_))));
+	}
+	assert_eq!(setup.provider.requests("fetch"), 5);
+	a.shutdown().await;
+}
+
+// The operator removes an upstream through the API: the provider is told the device left, the state file loses the document, and a config that still names it does not enrol it again. A reload that merely drops an upstream tells the provider nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_an_upstream_tells_the_provider_and_a_reload_that_drops_one_does_not() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-leave-a"), listen());
+	let setup = Setup::new(time, dir.clone(), provider, hand.redirect());
+	let doc = setup.document(home);
+	let a = setup.start(&doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	assert!(a.upstream_leave("nobody").await.is_none());
+	assert_eq!(a.upstream_leave("b").await, Some(true));
+	assert_eq!(setup.provider.requests("leave"), 1);
+	assert!(!String::from_utf8_lossy(&std::fs::read(dir.join("upstreams.state")).unwrap()).contains("document"), "the document of a removed device is still in the state file");
+	assert!(phase(&a).0 == Phase::Down && phase(&a).1.contains("removed this device"), "{:?}", phase(&a));
+	a.reload(doc.to_string().into_bytes(), None).await.unwrap();
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	assert_eq!((phase(&a).0, setup.provider.fetched(), setup.provider.requests("confirm")), (Phase::Down, 1, 1), "a removed device enrolled itself anew");
+	a.shutdown().await;
+	let (dir, home) = (scratch("up-leave-b"), listen());
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let setup = Setup::new(time, dir.clone(), provider, hand.redirect());
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	a.reload(bare(&setup, home).to_string().into_bytes(), None).await.unwrap();
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert_eq!(setup.provider.requests("leave"), 0, "a reload told the provider the device left");
+	assert!(!String::from_utf8_lossy(&std::fs::read(dir.join("upstreams.state")).unwrap()).contains("document"), "the document of an upstream that is gone is still in the state file");
 	a.shutdown().await;
 }

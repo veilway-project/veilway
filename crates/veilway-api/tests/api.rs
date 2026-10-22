@@ -396,7 +396,7 @@ async fn eventually(what: &str, done: impl AsyncFn() -> bool) {
 
 /// A valid version 1 document with every kind of secret in it, and what a test needs to be a device of it: inbound `home` on 10.7.0.1/16 over UDP, users `a` (10.7.0.2), `b` (10.7.0.3) and `c` (10.7.0.4, with a preshared key),
 /// exit `main` through a SOCKS5 outbound with a user name and a password, and exit `sink`. A test changes `doc` before `launch`.
-struct Setup {doc: Value, private: [u8; 32], keys: [[u8; 32]; 3], preshared: [u8; 32], listen: SocketAddr, seen: Arc<Mutex<Vec<String>>>, limits: Limits, mode: u32}
+struct Setup {doc: Value, private: [u8; 32], keys: [[u8; 32]; 3], preshared: [u8; 32], listen: SocketAddr, seen: Arc<Mutex<Vec<String>>>, limits: Limits, mode: u32, upstream: Option<(veilway_core::engine::upstream::Hooks, Arc<rustls::RootCertStore>)>}
 
 async fn setup() -> Setup {
 	let (proxy, seen) = socks5_proxy(tcp_responder().await).await;
@@ -413,7 +413,7 @@ async fn setup() -> Setup {
 		"users": [user("a", &keys[0], "10.7.0.2"), user("b", &keys[1], "10.7.0.3"), user("c", &keys[2], "10.7.0.4")]
 	});
 	doc["users"][2]["devices"][0]["preshared_key"] = json!(veilway_wg::encode_key(&preshared));
-	Setup {doc, private, keys, preshared, listen, seen, limits: Limits::default(), mode: 0o600}
+	Setup {doc, private, keys, preshared, listen, seen, limits: Limits::default(), mode: 0o600, upstream: None}
 }
 
 /// The four secrets of a document `setup` made.
@@ -424,10 +424,14 @@ fn secrets(doc: &Value) -> Vec<String> {
 struct Node {engine: Arc<Engine>, server: Server, dir: PathBuf, socket: PathBuf, file: PathBuf, addr: SocketAddr, public: [u8; 32], keys: [[u8; 32]; 3], preshared: [u8; 32], seen: Arc<Mutex<Vec<String>>>, doc: Value, limits: Limits}
 
 /// Starts the engine on the config file at `file`, the way `veilway run` does, and serves the API next to it.
-async fn start(dir: &Path, limits: &Limits) -> (Arc<Engine>, Server) {
+async fn start(dir: &Path, limits: &Limits) -> (Arc<Engine>, Server) {begin(dir, limits, None).await}
+
+/// `start` for a node that takes the subscriptions of other providers: with what the test puts in place of its network for them, and the roots their certificates lead to.
+async fn begin(dir: &Path, limits: &Limits, upstream: Option<(veilway_core::engine::upstream::Hooks, Arc<rustls::RootCertStore>)>) -> (Arc<Engine>, Server) {
 	let (config, report) = veilway_core::config::load(&dir.join("config.json"), false);
 	let config = config.unwrap_or_else(|| panic!("the config file is not valid: {:#?}", report.errors));
-	let engine = Arc::new(veilway_core::start(&config, Options {revision: report.revision, allow_readable: true, state: Some(dir.join("state.json")), replay: Some(dir.join("replay")), ..Options::new(dir)}).await.unwrap());
+	let (hooks, roots) = upstream.unzip();
+	let engine = Arc::new(veilway_core::start(&config, Options {revision: report.revision, allow_readable: true, state: Some(dir.join("state.json")), replay: Some(dir.join("replay")), upstreams: Some(dir.join("upstreams.state")), upstream: hooks.unwrap_or_default(), roots, ..Options::new(dir)}).await.unwrap());
 	let server = veilway_api::serve(engine.clone(), ApiOptions {socket: dir.join("veilway.sock"), config: dir.join("config.json"), limits: limits.clone()}).unwrap();
 	(engine, server)
 }
@@ -441,7 +445,7 @@ async fn launch(setup: Setup) -> Node {
 	let file = dir.join("config.json");
 	std::fs::write(&file, format!("{:#}\n", setup.doc)).unwrap();
 	std::fs::set_permissions(&file, std::fs::Permissions::from_mode(setup.mode)).unwrap();
-	let (engine, server) = start(&dir, &setup.limits).await;
+	let (engine, server) = begin(&dir, &setup.limits, setup.upstream.clone()).await;
 	Node {engine, server, socket: dir.join("veilway.sock"), file, dir, addr: setup.listen, public: veilway_wg::public_key(&setup.private), keys: setup.keys, preshared: setup.preshared, seen: setup.seen, doc: setup.doc, limits: setup.limits}
 }
 
@@ -540,6 +544,17 @@ async fn every_route_answers() {
 	ask("GET", "/v1/links");
 	assert_eq!(get(&node.socket, "/v1/inbounds").await.json["inbounds"][0]["tag"], json!("home"));
 	ask("GET", "/v1/inbounds");
+	// A node without upstreams lists none, and an upstream or a preview it does not have is not found. The routes that do something are asked against a provider, see the test of the upstream routes.
+	assert_eq!(get(&node.socket, "/v1/upstreams").await.json, json!({"upstreams": []}));
+	ask("GET", "/v1/upstreams");
+	for (method, path, body) in [("POST", "/v1/upstreams/preview/nobody/decline", None), ("DELETE", "/v1/upstreams/nobody", None), ("POST", "/v1/upstreams/nobody/confirm", None), ("POST", "/v1/upstreams/nobody/retry", None)] {
+		let none = call(&node.socket, method, path, &[], body).await;
+		ask(method, path);
+		assert_eq!((none.status, none.code()), (404, if path.contains("preview") {"preview_not_found"} else {"upstream_not_found"}), "{method} {path}");
+	}
+	let refused = call(&node.socket, "POST", "/v1/upstreams/preview", &[JSON], Some(Body::from("{}"))).await;
+	ask("POST", "/v1/upstreams/preview");
+	assert_eq!((refused.status, refused.code()), (422, "body_invalid"), "{}", refused.json);
 	assert_eq!(exits.json["exits"].as_array().map(Vec::len), Some(2));
 	let (main, sink) = (&exits.json["exits"][0], &exits.json["exits"][1]);
 	assert_eq!((&main["tag"], &main["name"], &main["backend"], &main["outbound"], &main["udp"], &main["udp_down_secs"], &main["udp_flips"]), (&json!("main"), &json!("Main"), &json!("netstack"), &json!("proxy"), &json!(true), &Value::Null, &json!(0)), "{main}");
@@ -1536,7 +1551,7 @@ async fn the_node_names_its_public_addresses_and_refuses_one_with_a_port() {
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();
@@ -1551,7 +1566,9 @@ fn the_openapi_document_has_every_route_and_nothing_dangling() {
 			}
 			let takes = |name: &str, place: &str| operation["parameters"].as_array().unwrap().iter().any(|parameter| parameter["name"] == name && parameter["in"] == place && parameter["required"] == true);
 			// A reset of the replay memory is the one request that changes something and has nothing to say: there is one replay memory and one thing a reset does to it.
-			assert_eq!((takes("name", "path"), takes("If-Match", "header"), operation.get("requestBody").is_some()), (path.contains("{name}"), method == "put", method != "get" && path != "/v1/replay/reset"), "{method} {path}");
+			// The routes of the upstreams take a path parameter of their own, and a body when they are asked for one: a preview and a confirmation.
+			let body = method != "get" && method != "delete" && path != "/v1/replay/reset" && !path.ends_with("/decline") && !path.ends_with("/retry");
+			assert_eq!((takes("name", "path"), takes("If-Match", "header"), operation.get("requestBody").is_some(), takes("tag", "path"), takes("id", "path")), (path.contains("{name}"), method == "put", body, path.contains("{tag}"), path.contains("{id}")), "{method} {path}");
 		}
 	}
 	for status in ["409", "422", "428", "400", "413", "415"] {assert!(OPENAPI["paths"]["/v1/config"]["put"]["responses"].get(status).is_some(), "an apply has no {status}")}
@@ -1566,9 +1583,11 @@ fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	for reference in text.split("\"$ref\":\"").skip(1).map(|rest| &rest[..rest.find('"').unwrap()]) {
 		assert!(OPENAPI.pointer(reference.trim_start_matches('#')).is_some(), "{reference} leads nowhere");
 	}
-	for schema in OPENAPI["components"]["schemas"].as_object().unwrap().values() {
-		for secret in ["private_key", "preshared_key", "username", "password"] {assert!(schema["properties"].get(secret).is_none(), "a schema has a field for a {secret}")}
+	// The one schema with a place for a key is what the node is given to look at a provider with, and it is read by the node and never written.
+	for (name, schema) in OPENAPI["components"]["schemas"].as_object().unwrap().iter().filter(|(name, _)| *name != "UpstreamPreviewRequest") {
+		for secret in ["private_key", "preshared_key", "username", "password", "device_secret", "link"] {assert!(schema["properties"].get(secret).is_none(), "the schema {name} has a field for a {secret}")}
 	}
+	assert_eq!(text.matches("UpstreamPreviewRequest\"}").count(), 1, "the request that holds a key is used in more than one place");
 }
 
 #[test]
@@ -1577,4 +1596,199 @@ fn the_committed_openapi_document_is_what_the_code_produces() {
 	if std::env::var_os("VEILWAY_WRITE_OPENAPI").is_some() {std::fs::write(&path, veilway_api::openapi()).unwrap()}
 	let committed = std::fs::read_to_string(&path).unwrap_or_default().replace("\r\n", "\n");
 	assert!(committed == veilway_api::openapi(), "crates/veilway-api/openapi.json is out of date. Write it again with: VEILWAY_WRITE_OPENAPI=1 cargo test -p veilway-api --test api the_committed");
+}
+
+const DEVICE: [u8; 32] = [0x61; 32];
+const ACCOUNT: [u8; 16] = [0x44; 16];
+const NODE: [u8; 32] = [0x10; 32];
+const TRANSPORT: [u8; 32] = [0x51; 32];
+const TOKEN: [u8; 16] = [0x55; 16];
+
+fn b64url(bytes: &[u8]) -> String {base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)}
+
+fn b64(bytes: &[u8]) -> String {base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)}
+
+fn entropy(bytes: &mut [u8]) -> Result<(), veilway_proto::NoRandom> {ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), bytes).map_err(|_| veilway_proto::NoRandom)}
+
+fn gateway_private() -> [u8; 32] {std::array::from_fn(|index| 0x40 + index as u8)}
+
+fn gateway_key() -> veilway_proto::subscription::exchange::GatewayKey {veilway_proto::subscription::exchange::GatewayKey::new(1, veilway_proto::proof::public_key(&gateway_private())).unwrap()}
+
+/// A provider's subscription endpoint of the test's own: a TLS server for `sub.example.com` that opens every sealed request, counts it by its operation, and answers with a signed document of one profile for the device of the tests (or a signed release for a release and a leave).
+struct Provider {addr: SocketAddr, roots: Arc<rustls::RootCertStore>, link: String, ops: Arc<Mutex<Vec<&'static str>>>, task: tokio::task::JoinHandle<()>}
+
+impl Drop for Provider {
+	fn drop(&mut self) {self.task.abort()}
+}
+
+impl Provider {
+	async fn start() -> Provider {
+		use ring::signature::{Ed25519KeyPair, KeyPair};
+		use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+		use veilway_proto::subscription::envelope::{self, SigningKey};
+		use veilway_proto::subscription::exchange::Gateway;
+		use veilway_proto::subscription::fetch::Op;
+		let made = rcgen::generate_simple_self_signed(vec!["sub.example.com".to_string()]).unwrap();
+		let (mut roots, der, crypto) = (rustls::RootCertStore::empty(), CertificateDer::from(made.cert.der().to_vec()), Arc::new(rustls::crypto::ring::default_provider()));
+		roots.add(der.clone()).unwrap();
+		let mut config = rustls::ServerConfig::builder_with_provider(crypto).with_safe_default_protocol_versions().unwrap().with_no_client_auth().with_single_cert(vec![der], PrivateKeyDer::try_from(made.signing_key.serialize_der()).unwrap()).unwrap();
+		config.alpn_protocols = vec![b"http/1.1".to_vec()];
+		let (pair, ops, gateway) = (Arc::new(Ed25519KeyPair::from_seed_unchecked(&[0x11; 32]).unwrap()), Arc::new(Mutex::new(Vec::<&'static str>::new())), Arc::new(Mutex::new(Gateway::new(&[(1, gateway_private())], 0, &mut entropy).unwrap())));
+		let key = SigningKey::new(pair.public_key().as_ref().try_into().unwrap()).unwrap();
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let (addr, acceptor) = (listener.local_addr().unwrap(), tokio_rustls::TlsAcceptor::from(Arc::new(config)));
+		let issued = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 10;
+		let profile = json!({
+			"type": "veilway", "id": "home", "name": "Home", "inbound_public_key": veilway_wg::encode_key(&veilway_wg::public_key(&NODE)),
+			"device": {"public_key": veilway_wg::encode_key(&veilway_wg::public_key(&DEVICE)), "transport_secrets": [veilway_wg::encode_key(&[0xa5; 32])], "addresses": ["10.8.0.2"]},
+			"gateways": ["10.8.0.1"], "mtu": 1390, "transport_public_key": veilway_wg::encode_key(&veilway_proto::proof::public_key(&TRANSPORT)),
+			"transports": [{"type": "udp", "endpoints": ["10.99.0.2:5002"]}],
+			"exits": [{"tag": "main", "name": "Main exit"}, {"tag": "alt", "name": "alt"}],
+		});
+		let task = tokio::spawn({
+			let (pair, key, ops, gateway) = (pair.clone(), key.clone(), ops.clone(), gateway.clone());
+			async move {
+				loop {
+					let Ok((stream, _)) = listener.accept().await else {return};
+					let (acceptor, pair, key, ops, gateway, profile) = (acceptor.clone(), pair.clone(), key.clone(), ops.clone(), gateway.clone(), profile.clone());
+					tokio::spawn(async move {
+						let Ok(mut tls) = acceptor.accept(stream).await else {return};
+						let (mut buffer, mut chunk) = (Vec::new(), [0u8; 4096]);
+						let end = loop {
+							if let Some(end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {break end + 4}
+							match tls.read(&mut chunk).await {
+								Ok(count) if count > 0 => buffer.extend_from_slice(&chunk[..count]),
+								_ => return,
+							}
+						};
+						let head = String::from_utf8_lossy(&buffer[..end]).into_owned();
+						let length = head.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap_or(0))).unwrap_or(0);
+						while buffer.len() < end + length {
+							match tls.read(&mut chunk).await {
+								Ok(count) if count > 0 => buffer.extend_from_slice(&chunk[..count]),
+								_ => return,
+							}
+						}
+						let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+						let opened = gateway.lock().unwrap().open(&buffer[end..end + length], now, || true).expect("the node sealed a request the gateway cannot open");
+						let (received, reply) = (opened.request.expect("the node wrote a request the gateway cannot read"), opened.reply);
+						ops.lock().unwrap().push(match received.op() {Op::Fetch => "fetch", Op::Confirm(_) => "confirm", Op::Release => "release", Op::Leave => "leave"});
+						let sign = |payload: &Value| envelope::seal(&key, &serde_json::to_vec(payload).unwrap(), |signed| pair.sign(signed).as_ref().try_into().unwrap());
+						let envelope = if matches!(received.op(), Op::Release | Op::Leave) {
+							sign(&json!({"v": 1, "subscription_id": "test-subscription-0001", "issued_at": now - 10, "refusal": "released"}))
+						} else {
+							sign(&json!({"v": 1, "subscription_id": "test-subscription-0001", "serial": 1, "issued_at": issued, "expires_at": issued + 30 * 86_400, "signing_keys": [b64(key.bytes())], "provider": {"name": "Test provider"}, "profiles": [profile], "gateway_keys": [{"id": 1, "key": b64(gateway_key().public())}], "usage": {"used_bytes": 10, "quota_bytes": 1000, "period": "monthly", "period_start": 0, "expires_at": 0, "device_limit": 3}}))
+						};
+						let body = reply.seal(envelope.as_bytes(), &mut entropy).unwrap();
+						let _ = tls.write_all(&[&b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"[..], &body[..]].concat()).await;
+						let _ = tls.shutdown().await;
+					});
+				}
+			}
+		});
+		let link = format!("veilway://sub/sub.example.com/s#v1.{}.{}.{}", b64url(key.bytes()), b64url(&gateway_key().link()), b64url(&TOKEN));
+		Provider {addr, roots: Arc::new(roots), link, ops, task}
+	}
+
+	fn requests(&self, op: &str) -> usize {self.ops.lock().unwrap().iter().filter(|seen| **seen == op).count()}
+
+	fn fingerprint(&self) -> String {
+		match veilway_proto::subscription::link::Link::parse(&self.link).unwrap() {
+			veilway_proto::subscription::link::Link::Native(native) => native.key().fingerprint().to_string(),
+			_ => unreachable!("the link of the provider is a native one"),
+		}
+	}
+}
+
+// The upstream routes against a real provider: a preview shows the document and holds no secret, a decline frees the place, the config that names the same link and device takes the document, and the status, the confirmation, the retry and the removal each answer what the document of the OpenAPI promises. No answer and no log line holds the link, its token, the private key or the device secret.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_upstream_is_previewed_declined_taken_listed_confirmed_retried_and_removed_and_no_answer_holds_its_secrets() {
+	let provider = Provider::start().await;
+	let (device_key, account) = (veilway_wg::encode_key(&DEVICE), b64url(&ACCOUNT));
+	SECRETS.lock().unwrap().extend([provider.link.clone(), b64url(&TOKEN), device_key.clone(), account.clone(), veilway_wg::encode_key(&[0xa5; 32])]);
+	let mut prepared = setup().await;
+	let at = provider.addr;
+	prepared.upstream = Some((veilway_core::engine::upstream::Hooks {resolve: Some(Arc::new(move |_, _| Box::pin(async move {Ok(vec![at])}))), ..Default::default()}, provider.roots.clone()));
+	let node = launch(prepared).await;
+	let post = |path: String, body: Option<Value>| {
+		let socket = node.socket.clone();
+		async move {
+			match body {
+				Some(body) => call(&socket, "POST", &path, &[JSON], Some(Body::from(body.to_string()))).await,
+				None => call(&socket, "POST", &path, &[], None).await,
+			}
+		}
+	};
+	let ask = json!({"link": provider.link, "private_key": device_key, "device_secret": account, "allow_private": true});
+	assert_eq!(get(&node.socket, "/v1/upstreams").await.json, json!({"upstreams": []}));
+	// What a preview takes is checked before anything is fetched, and what is wrong is never quoted.
+	for (bad, why) in [(json!([1]), "an array"), (json!({"link": provider.link}), "fields missing"), (json!({"link": provider.link, "private_key": device_key, "device_secret": account, "extra": 1}), "an unknown field"), (json!({"link": provider.link, "private_key": "not a key", "device_secret": account}), "a key that is no key"), (json!({"link": provider.link, "private_key": device_key, "device_secret": "short"}), "a short secret"), (json!({"link": "https://example.org/s", "private_key": device_key, "device_secret": account}), "a legacy link"), (json!({"link": provider.link, "private_key": device_key, "device_secret": account, "via": "nowhere"}), "an outbound that is not there")] {
+		let refused = post("/v1/upstreams/preview".into(), Some(bad)).await;
+		assert_eq!((refused.status, refused.code()), (422, "body_invalid"), "{why}: {}", refused.json);
+	}
+	assert_eq!(provider.requests("fetch"), 0, "something was fetched for a body that was refused");
+	// A body that is not JSON at all is the HTTP layer's, as everywhere.
+	assert_eq!(call(&node.socket, "POST", "/v1/upstreams/preview", &[JSON], Some(Body::from("{"))).await.status, 400);
+	// The same preview where the operator did not allow private addresses: the review says the profile would be refused, and nothing else changes. A preview of the same link and device again takes the place of the one before.
+	let strict = post("/v1/upstreams/preview".into(), Some(json!({"link": provider.link, "private_key": device_key, "device_secret": account}))).await;
+	assert_eq!(strict.status, 200);
+	assert!(strict.json["profiles"][0]["refused"].as_str().is_some_and(|why| why.contains("private")), "{}", strict.json);
+	let preview = post("/v1/upstreams/preview".into(), Some(ask.clone())).await;
+	assert_eq!(preview.status, 200, "{}", preview.json);
+	let (shown, id) = (&preview.json, preview.json["id"].as_str().unwrap().to_string());
+	assert_eq!((&shown["provider"], &shown["fingerprint"], &shown["serial"], &shown["expires_in_secs"], &shown["quota"], &shown["device_limit"], &shown["classes"]), (&json!("Test provider"), &json!(provider.fingerprint()), &json!(1), &json!(600), &json!({"used_bytes": 10, "quota_bytes": 1000}), &json!(3), &json!(["plain"])), "{shown}");
+	let profile = &shown["profiles"][0];
+	assert_eq!((&profile["id"], &profile["name"], &profile["transports"], &profile["rating"], &profile["private_addresses"], &profile["mtu"], &profile["refused"], profile["exits"].as_array().map(Vec::len)), (&json!("home"), &json!("Home"), &json!(["udp"]), &json!("detectable"), &json!(["10.99.0.2"]), &json!(1390), &Value::Null, Some(2)), "{profile}");
+	assert_eq!((provider.requests("fetch"), provider.requests("confirm")), (2, 0));
+	// Declining frees the place, once.
+	let declined = post(format!("/v1/upstreams/preview/{id}/decline"), None).await;
+	assert_eq!((declined.status, &declined.json["id"], provider.requests("release")), (200, &json!(id), 1), "{}", declined.json);
+	let again = post(format!("/v1/upstreams/preview/{id}/decline"), None).await;
+	assert_eq!((again.status, again.code()), (404, "preview_not_found"));
+	// A preview a config takes: the node applies the config that names the same link and device, fetches nothing, and confirms the place.
+	let _ = post("/v1/upstreams/preview/nobody/decline".into(), None).await;
+	let taken = post("/v1/upstreams/preview".into(), Some(ask.clone())).await;
+	assert_eq!(taken.status, 200);
+	let fetched = provider.requests("fetch");
+	let (mut doc, revision) = node.shown().await;
+	doc["exits"].as_array_mut().unwrap().push(json!({"tag": "up", "backend": {"type": "upstream", "upstream": "b"}}));
+	doc["upstreams"] = json!([{"tag": "b", "link": provider.link, "signing_key": provider.fingerprint(), "private_key": device_key, "device_secret": account, "allow": ["plain"], "allow_private": true}]);
+	let applied = send(&node.socket, "PUT", "/v1/config", Some(&revision), &doc).await;
+	assert_eq!(applied.status, 200, "{}", applied.json);
+	let mut listed = get(&node.socket, "/v1/upstreams").await;
+	let deadline = Instant::now() + Duration::from_secs(30);
+	while listed.json["upstreams"][0]["state"] == "fetching" || listed.json["upstreams"][0]["profile"].is_null() || provider.requests("confirm") == 0 {
+		assert!(Instant::now() < deadline, "{}", listed.json);
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		listed = get(&node.socket, "/v1/upstreams").await;
+	}
+	assert_eq!(provider.requests("fetch"), fetched, "the document of the preview was fetched again");
+	let status = &listed.json["upstreams"][0];
+	assert_eq!((&status["tag"], &status["provider"], &status["profile"], &status["pending_move"], &status["pending_hosts"], &status["refresh_error"], &status["quota"]), (&json!("b"), &json!("Test provider"), &json!("home"), &Value::Null, &json!([]), &Value::Null, &json!({"used_bytes": 10, "quota_bytes": 1000})), "{status}");
+	assert!(status["state"] == "connecting" || status["state"] == "down", "{status}");
+	assert_eq!((status["counters"]["refreshes"].is_u64(), status["counters"]["starts"].as_u64() >= Some(1)), (true, true), "{status}");
+	// Nothing waits for the operator, and the routes say so.
+	for body in [None, Some(json!({})), Some(json!({"move": true})), Some(json!({"move": true, "hosts": false}))] {
+		let confirmed = post("/v1/upstreams/b/confirm".into(), body).await;
+		assert_eq!((confirmed.status, &confirmed.json), (200, &json!({"moved": false, "hosts": false})));
+	}
+	for bad in [json!({"mov": true}), json!({"move": "yes"}), json!([true])] {
+		let refused = post("/v1/upstreams/b/confirm".into(), Some(bad)).await;
+		assert_eq!((refused.status, refused.code()), (422, "body_invalid"));
+	}
+	let retried = post("/v1/upstreams/b/retry".into(), None).await;
+	assert_eq!((retried.status, &retried.json), (200, &json!({"tag": "b"})));
+	// Removal tells the provider, and the upstream stays down and out of the state file.
+	let removed = call(&node.socket, "DELETE", "/v1/upstreams/b", &[], None).await;
+	assert_eq!((removed.status, &removed.json, provider.requests("leave")), (200, &json!({"tag": "b", "confirmed": true}), 1), "{}", removed.json);
+	let listed = get(&node.socket, "/v1/upstreams").await;
+	assert!(listed.json["upstreams"][0]["state"] == "down" && listed.json["upstreams"][0]["reason"].as_str().unwrap().contains("removed this device"), "{}", listed.json);
+	assert!(!std::fs::read_to_string(node.dir.join("upstreams.state")).unwrap().contains("document"));
+	// An upstream the config does not have is one the routes do not know.
+	for (method, path) in [("DELETE", "/v1/upstreams/nobody"), ("POST", "/v1/upstreams/nobody/retry"), ("POST", "/v1/upstreams/nobody/confirm"), ("DELETE", "/v1/upstreams/%ff")] {
+		let none = call(&node.socket, method, path, &[], None).await;
+		assert_eq!((none.status, none.code()), (404, "upstream_not_found"), "{method} {path}");
+	}
+	no_secret_logged();
+	node.end().await;
 }

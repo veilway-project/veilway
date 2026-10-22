@@ -32,3 +32,9 @@ veilway-proto={path="../veilway-proto", version="0.2.14"}
 boringtun.workspace=true
 etherparse.workspace=true
 tracing-subscriber.workspace=true
+# The tests of the upstream routes are served by a provider of their own: a TLS endpoint that opens the sealed requests of the node and signs its answers.
+rcgen.workspace=true
+rustls.workspace=true
+tokio-rustls.workspace=true
+ring.workspace=true
+base64.workspace=true

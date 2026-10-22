@@ -191,9 +191,12 @@ pub async fn dial(up: &Upstream, dst: SocketAddr) -> anyhow::Result<TcpStream> {
 }
 
 /// `dial`, before `deadline`, with the failure kept whole: a link's transport needs to know which proxy failed and whether it timed out there.
-pub async fn dial_until(up: &Upstream, dst: SocketAddr, deadline: tokio::time::Instant) -> Result<TcpStream, Failure<'_>> {
+pub async fn dial_until(up: &Upstream, dst: SocketAddr, deadline: tokio::time::Instant) -> Result<TcpStream, Failure<'_>> {dial_host_until(up, dst.ip().to_string(), dst.port(), deadline).await}
+
+/// `dial_until` to a host that is an address or a name the last proxy of the chain looks up itself.
+pub async fn dial_host_until(up: &Upstream, host: String, port: u16, deadline: tokio::time::Instant) -> Result<TcpStream, Failure<'_>> {
 	let mut stop = Stop::First(&up.tag);
-	match tokio::time::timeout_at(deadline, walk(up, Some(dst), &mut stop)).await {
+	match tokio::time::timeout_at(deadline, walk(up, Some((host, port)), &mut stop)).await {
 		Ok(Ok(control)) => Ok(control),
 		Ok(Err(error)) => Err(Failure {stop, timeout: false, error}),
 		Err(_) => Err(Failure {stop, timeout: true, error: anyhow::anyhow!("socks5 connect timed out")}),
@@ -258,7 +261,7 @@ fn keep(shared: &Arc<Shared>, state: &Arc<ExitState>) {
 	});
 }
 
-async fn walk<'a>(up: &'a Upstream, dst: Option<SocketAddr>, stop: &mut Stop<'a>) -> anyhow::Result<TcpStream> {
+async fn walk<'a>(up: &'a Upstream, dst: Option<(String, u16)>, stop: &mut Stop<'a>) -> anyhow::Result<TcpStream> {
 	let started = Instant::now();
 	let mut hops = vec![up];
 	let mut at = up;
@@ -276,8 +279,8 @@ async fn walk<'a>(up: &'a Upstream, dst: Option<SocketAddr>, stop: &mut Stop<'a>
 	}
 	up.latency.set(started.elapsed());
 	*stop = Stop::Target;
-	let Some(dst) = dst else {return Ok(control)};
-	connect_to(&mut control, &dst.ip().to_string(), dst.port()).await?;
+	let Some((host, port)) = dst else {return Ok(control)};
+	connect_to(&mut control, &host, port).await?;
 	Ok(control)
 }
 

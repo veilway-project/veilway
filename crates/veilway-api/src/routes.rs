@@ -22,6 +22,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
+use veilway_core::engine::upstream::{PreviewError, PreviewRequest};
 use veilway_core::engine::link::Status;
 use veilway_core::{Denied, Over, Reason, Reset};
 
@@ -31,6 +32,9 @@ const CONFIG: &str = "/v1/config";
 const USERS: &str = "/v1/users/";
 const RESET: &str = "/usage/reset";
 const REPLAY_RESET: &str = "/v1/replay/reset";
+const UPSTREAMS: &str = "/v1/upstreams";
+/// A preview fetches from a provider, which takes as long as the provider does. It keeps the time itself, see `preview_upstream`.
+const PREVIEW: &str = "/v1/upstreams/preview";
 /// How many times the body limit a request may send before the node stops taking its body off the connection.
 const DRAIN: usize = 4;
 
@@ -272,6 +276,70 @@ async fn reset_replay(State(api): State<Arc<Api>>) -> Response {
 
 async fn stats(State(api): State<Arc<Api>>) -> Response {json(StatusCode::OK, &api.stats())}
 
+fn no_upstream() -> Response {Failure::new(StatusCode::NOT_FOUND, "upstream_not_found", "The running config has no upstream of that tag. Nothing was changed.").into_response()}
+
+async fn upstreams(State(api): State<Arc<Api>>) -> Response {json(StatusCode::OK, &model::Upstreams {upstreams: api.engine.upstreams().into_iter().map(model::Upstream::from).collect()})}
+
+/// Looks at the subscription of another provider with the device the body gives, see `Engine::upstream_preview`. The fetch takes a place at the provider and runs to its end whether or not this request is still there: a preview nobody takes is given back after ten minutes.
+async fn preview_upstream(State(api): State<Arc<Api>>, request: Request) -> Response {
+	let bytes = match tokio::time::timeout(api.limits.request, document(&api, request, false)).await {
+		Ok(Ok(bytes)) => bytes,
+		Ok(Err(failure)) => return failure.into_response(),
+		Err(_) => return Failure::late(&api).into_response(),
+	};
+	// Only an object is a body, and what is wrong with it is never quoted: it holds a private key.
+	let Some(asked) = serde_json::from_slice::<serde_json::Value>(&bytes).ok().filter(serde_json::Value::is_object).and_then(|body| serde_json::from_value::<model::UpstreamPreviewRequest>(body).ok()) else {return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "body_invalid", "The body of a preview is an object with link, private_key and device_secret, and at most via and allow_private. Nothing was fetched.").into_response()};
+	match api.engine.upstream_preview(PreviewRequest {link: asked.link, private_key: asked.private_key, device_secret: asked.device_secret, via: asked.via, allow_private: asked.allow_private}).await {
+		Ok(reviewing) => json(StatusCode::OK, &model::UpstreamPreview::from(&reviewing)),
+		Err(PreviewError::Invalid(why)) => Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "body_invalid", format!("{why}. Nothing was fetched.")).into_response(),
+		Err(PreviewError::Provider(why)) => Failure::new(StatusCode::BAD_GATEWAY, "provider_failed", format!("The provider could not be asked, or its answer did not pass the checks: {why}")).into_response(),
+		Err(PreviewError::Full) => Failure::new(StatusCode::CONFLICT, "previews_full", "Four previews already wait for a config, or for an answer. Decline one, or wait for one to run out. Nothing was fetched.").into_response(),
+	}
+}
+
+/// The operator says no to a preview: the provider is told to release the place.
+async fn decline_preview(State(api): State<Arc<Api>>, id: Result<Path<String>, PathRejection>) -> Response {
+	match id {
+		Ok(Path(id)) if api.engine.upstream_decline(&id).await => json(StatusCode::OK, &model::UpstreamDeclined {id}),
+		_ => Failure::new(StatusCode::NOT_FOUND, "preview_not_found", "No preview of that id waits. It was declined, taken by a config, or ran out.").into_response(),
+	}
+}
+
+/// Removes an upstream: the provider is told the device left, for at most ten seconds, and its document leaves the state file. A config that is applied afterwards without the upstream finishes the removal; a reload alone, without this call, never tells the provider anything.
+async fn remove_upstream(State(api): State<Arc<Api>>, tag: Result<Path<String>, PathRejection>) -> Response {
+	let Ok(Path(tag)) = tag else {return no_upstream()};
+	match api.engine.upstream_leave(&tag).await {
+		Some(confirmed) => json(StatusCode::OK, &model::UpstreamRemoved {tag, confirmed}),
+		None => no_upstream(),
+	}
+}
+
+async fn confirm_upstream(State(api): State<Arc<Api>>, tag: Result<Path<String>, PathRejection>, request: Request) -> Response {
+	let bytes = match tokio::time::timeout(api.limits.request, document(&api, request, true)).await {
+		Ok(Ok(bytes)) => bytes,
+		Ok(Err(failure)) => return failure.into_response(),
+		Err(_) => return Failure::late(&api).into_response(),
+	};
+	let Some(asked) = (if bytes.is_empty() {Some(model::UpstreamConfirm::default())} else {serde_json::from_slice::<serde_json::Value>(&bytes).ok().filter(serde_json::Value::is_object).and_then(|body| serde_json::from_value::<model::UpstreamConfirm>(body).ok())}) else {return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "body_invalid", "The body of a confirmation is an object with at most move and hosts, which are true or false. Nothing was changed.").into_response()};
+	let Ok(Path(tag)) = tag else {return no_upstream()};
+	let (moving, hosts) = match (asked.moving, asked.hosts) {
+		(None, None) => (true, true),
+		(moving, hosts) => (moving.unwrap_or(false), hosts.unwrap_or(false)),
+	};
+	match api.engine.upstream_confirm(&tag, moving, hosts).await {
+		None => no_upstream(),
+		Some(Ok((moved, hosts))) => json(StatusCode::OK, &model::UpstreamConfirmed {moved, hosts}),
+		Some(Err(_)) => Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "state_unwritten", "The answer could not be written to the state file of the upstreams, so it is not kept.").into_response(),
+	}
+}
+
+async fn retry_upstream(State(api): State<Arc<Api>>, tag: Result<Path<String>, PathRejection>) -> Response {
+	match tag {
+		Ok(Path(tag)) if api.engine.upstream_again(&tag) => json(StatusCode::OK, &model::UpstreamRetried {tag}),
+		_ => no_upstream(),
+	}
+}
+
 async fn sessions(State(api): State<Arc<Api>>) -> Response {
 	json(StatusCode::OK, &model::Sessions {sessions: api.engine.peers(None).into_iter().filter_map(|peer| Some(model::Session {
 		handshake_age_secs: peer.handshake?.as_secs(),
@@ -417,7 +485,7 @@ pub(crate) async fn not_allowed() -> Response {Failure::new(StatusCode::METHOD_N
 /// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force. So does a usage reset, see `reset_usage`, and a reset of the replay memory, which the node gives up on by itself.
 pub(crate) async fn deadline(State(api): State<Arc<Api>>, request: Request, next: Next) -> Response {
 	let path = request.uri().path();
-	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && (path == REPLAY_RESET || path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET)))) {return next.run(request).await}
+	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && (path == REPLAY_RESET || path == PREVIEW || path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET)))) {return next.run(request).await}
 	tokio::time::timeout(api.limits.request, next.run(request)).await.unwrap_or_else(|_| Failure::late(&api).into_response())
 }
 
@@ -472,6 +540,11 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 	let mut reset = route::<model::User, _, _>(schemas, Method::POST, "/v1/users/{name}/usage/reset", "resetUsage", "Starts a user's quota count over: used_bytes is 0 and period_start is the start of the quota period the node's clock is in, or 0 for a user without a quota_period. A user who was out of quota may connect again at once, with no reload. traffic stays as it is unless the body says {\"totals\": true}, and the body may be left out. The state file is written before the answer. The same request again changes nothing more. The answer is the user as GET /v1/users/{name} gives them.", reset_usage, true, &[(StatusCode::NOT_FOUND, "The running config has no user of that name. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a usage reset takes. Nothing was changed.")]);
 	reset.body = Some((schemas.subschema_for::<model::ResetUsage>(), false));
 	for response in reset.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was changed: once the node has begun the reset, the answer waits for it and is never this one."}
+	let mut preview = route::<model::UpstreamPreview, _, _>(schemas, Method::POST, PREVIEW, "previewUpstream", "Fetches the subscription of another provider from this node, with the device the body gives, and shows what the document holds. The fetch is the enrollment: it takes a place at the provider, so the provider sees this node's address and never the panel's. The document is verified under the key in the link, kept in memory for ten minutes under the id, and nothing is written to the config or the state file. A config that names the same link and device within that time takes the document and makes the place permanent without asking the provider again. At most four previews wait. The private key and the device secret are never in an answer.", preview_upstream, true, &[(StatusCode::UNPROCESSABLE_ENTITY, "A part of the body is not what a preview takes, or names an outbound the running config does not have. Nothing was fetched."), (StatusCode::BAD_GATEWAY, "The provider could not be asked, or its answer did not pass the checks, for instance because it is signed by another key than the link's, or the account has no device place left. The code is provider_failed and the message says why in plain words. Nothing was kept."), (StatusCode::CONFLICT, "Four previews already wait. Nothing was fetched.")]);
+	preview.body = Some((schemas.subschema_for::<model::UpstreamPreviewRequest>(), true));
+	for response in preview.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was fetched: once the node has begun to fetch, the answer waits for the provider and is never this one."}
+	let mut confirm = route::<model::UpstreamConfirmed, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/confirm", "confirmUpstream", "Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting.", confirm_upstream, true, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a confirmation takes. Nothing was changed."), (StatusCode::INTERNAL_SERVER_ERROR, "state_unwritten: the state file of the upstreams could not be written, so the answer is not kept.")]);
+	confirm.body = Some((schemas.subschema_for::<model::UpstreamConfirm>(), false));
 	vec![
 		route::<model::Status, _, _>(schemas, Method::GET, "/v1/status", "status", "What runs: the version, the config in force and how much of everything there is.", status, false, &[]),
 		route::<model::Running, _, _>(schemas, Method::GET, "/v1/config", "getConfig", "The running config with every secret replaced by the marker \"<redacted>\", and its revision, which is also the ETag.", running, false, &[]),
@@ -487,6 +560,12 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::Exits, _, _>(schemas, Method::GET, "/v1/exits", "listExits", "Every exit with what the node knows of its upstream, and its counters.", exits, false, &[]),
 		route::<model::Inbounds, _, _>(schemas, Method::GET, "/v1/inbounds", "listInbounds", "Every inbound of the running config with its WireGuard public key, the public half of its node transport key, and the rating of each transport: what a censor can see of a profile of it. No private key.", inbounds, false, &[]),
 		route::<model::Links, _, _>(schemas, Method::GET, "/v1/links", "listLinks", "Every enabled node link with its state and its counters. No key and no secret.", links, false, &[]),
+		route::<model::Upstreams, _, _>(schemas, Method::GET, UPSTREAMS, "listUpstreams", "Every enabled upstream, the subscription of another provider that an exit uses, with its state and the reason, the provider's name, the profile, transport and exit in use, its quota and notices as plain text, the largest packet it takes, when its document was last refreshed and why a refresh failed, a move of the provider's endpoint or new refresh hosts that wait for the operator, and its counters. No key, no secret and no link.", upstreams, false, &[]),
+		preview,
+		route::<model::UpstreamDeclined, _, _>(schemas, Method::POST, "/v1/upstreams/preview/{id}/decline", "declinePreview", "Says no to a preview: the provider is told to release the place the preview took, and the node keeps nothing.", decline_preview, false, &[(StatusCode::NOT_FOUND, "No preview of that id waits: it was declined, a config took it, or it ran out.")]),
+		route::<model::UpstreamRemoved, _, _>(schemas, Method::DELETE, "/v1/upstreams/{tag}", "removeUpstream", "Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. The upstream stops, and a config that still names it does not start it again; apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything.", remove_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
+		confirm,
+		route::<model::UpstreamRetried, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/retry", "retryUpstream", "Asks the upstream to connect again now, at the operator's word: every wait it was in starts over.", retry_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
 		stream,
 		route::<BTreeMap<String, serde_json::Value>, _, _>(schemas, Method::GET, "/v1/openapi.json", "openapi", "This document.", openapi, false, &[]),
 	]

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
+use veilway_engine::import::Named;
 use veilway_proto::subscription::payload::Transport;
 use veilway_transport::choice::{self, Class, Network, Next, Pick, Standing};
 use veilway_transport::{connector, Connect, End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
@@ -157,6 +158,26 @@ pub(super) fn through(via: Arc<Upstream>, carried: impl Fn(Option<String>) + Sen
 				}
 			}
 		}
+	})
+}
+
+/// `through` for a host name: the last proxy of the chain looks the name up, so the node's own resolver never sees it. What the chain says of a dial is told to `carried` as in `through`.
+pub(super) fn through_name(via: Arc<Upstream>, carried: impl Fn(Option<String>) + Send + Sync + 'static) -> Named {
+	let carried = Arc::new(carried);
+	Arc::new(move |host, port, deadline| {
+		let (via, carried) = (via.clone(), carried.clone());
+		Box::pin(async move {
+			match flows::dial_host_until(&via, host, port, deadline).await {
+				Ok(stream) => {
+					carried(None);
+					Ok(stream)
+				}
+				Err(failure) => {
+					carried(Some(failure.describe()));
+					Err(std::io::Error::other("the chain did not carry the connection"))
+				}
+			}
+		})
 	})
 }
 

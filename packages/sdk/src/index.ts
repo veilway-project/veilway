@@ -12,6 +12,11 @@ export type Replay = Schemas["Replay"];
 export type Session = Schemas["Session"];
 export type Exit = Schemas["Exit"];
 export type Link = Schemas["Link"];
+export type Upstream = Schemas["Upstream"];
+export type UpstreamPreview = Schemas["UpstreamPreview"];
+export type UpstreamPreviewRequest = Schemas["UpstreamPreviewRequest"];
+export type UpstreamConfirmed = Schemas["UpstreamConfirmed"];
+export type UpstreamRemoved = Schemas["UpstreamRemoved"];
 export type InboundInfo = Schemas["InboundInfo"];
 export type Problem = Schemas["Problem"];
 /** A config v1 document. The generated schema calls it an object nobody can fill in, so the client takes any object and the node does the checking. */
@@ -103,6 +108,24 @@ export class Client {
 
 	/** Every enabled node link with its state and its counters. */
 	async listLinks(): Promise<Link[]> {return (await this.json<{links: Link[]}>("GET", "/v1/links")).links}
+
+	/** Every enabled upstream, the subscription of another provider that an exit uses: its state and why, the provider, the profile, transport and exit in use, quota, notices as plain text, the refresh state, a move of the provider's endpoint or new refresh hosts that wait for `confirmUpstream`, and its counters. No key, no secret and no link. */
+	async listUpstreams(): Promise<Upstream[]> {return (await this.json<{upstreams: Upstream[]}>("GET", "/v1/upstreams")).upstreams}
+
+	/** Fetches the subscription of another provider from the node with the device the request gives, which takes a place at the provider, and returns what the document holds. The node keeps the document for `expires_in_secs` for the config that names the same link and device, so that the provider is not asked again; `declinePreview` gives the place back. At most four wait. Throws `body_invalid` (422) for a request the node cannot read, `provider_failed` (502) when the provider cannot be asked or its answer fails the checks, and `previews_full` (409). */
+	previewUpstream(request: UpstreamPreviewRequest): Promise<UpstreamPreview> {return this.json("POST", "/v1/upstreams/preview", {}, request)}
+
+	/** Says no to a preview: the provider is told to release the place. Throws `preview_not_found` for one that was declined, taken by a config or ran out. */
+	declinePreview(id: string): Promise<{id: string}> {return this.json("POST", "/v1/upstreams/preview/" + encodeURIComponent(id) + "/decline")}
+
+	/** Removes an upstream: the provider is told that the device left, for at most ten seconds, and `confirmed` says whether it took the word. The upstream stops and a config that still names it does not start it again: apply a config without it to finish. */
+	removeUpstream(tag: string): Promise<UpstreamRemoved> {return this.json("DELETE", "/v1/upstreams/" + encodeURIComponent(tag))}
+
+	/** Confirms the move of the provider's endpoint and the new refresh hosts that `listUpstreams` reports as pending. Without options both are confirmed; with them a field that is left out is false. The answer says what had been waiting. */
+	confirmUpstream(tag: string, options: {move?: boolean, hosts?: boolean} = {}): Promise<UpstreamConfirmed> {return this.json("POST", "/v1/upstreams/" + encodeURIComponent(tag) + "/confirm", {}, options)}
+
+	/** Asks the upstream to connect again now: every wait it was in starts over. */
+	retryUpstream(tag: string): Promise<{tag: string}> {return this.json("POST", "/v1/upstreams/" + encodeURIComponent(tag) + "/retry")}
 
 	/** The event stream. It ends when the node closes it or when `signal` aborts, and throws when the node refuses it or sends something that is not an event. Event names this client does not know are skipped. */
 	async *events(signal?: AbortSignal): AsyncGenerator<NodeEvent, void, undefined> {

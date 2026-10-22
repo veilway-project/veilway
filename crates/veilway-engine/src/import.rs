@@ -381,11 +381,16 @@ pub struct Fetcher {
 	pub socket: Option<Hook>,
 	/// Dials the connection through a proxy chain in place of a socket of the fetcher, which `socket` is not applied to.
 	pub connect: Option<Connect>,
+	/// Dials a host name through a proxy chain that looks the name up itself: the fetcher then never resolves a name, so the resolver of the machine does not see which provider it asks. IP literals still go through `connect`.
+	pub named: Option<Named>,
 }
+
+/// Dials `host` and `port` before the deadline.
+pub type Named = Arc<dyn Fn(String, u16, Instant) -> Pin<Box<dyn Future<Output = io::Result<tokio::net::TcpStream>> + Send>> + Send + Sync>;
 
 impl Fetcher {
 	/// A fetcher with the system's resolver and the roots it is given.
-	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket, connect: None}}
+	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket, connect: None, named: None}}
 	/// One `POST` of `body` to `url` (the 1,073 bytes of a sealed request, `application/octet-stream`), and the body of the answer. See the head of this module for what it does and refuses. `allowed` is the private addresses the user said yes to, and `now` the device's clock, which only a message about the clocks uses.
 	/// "A native answer and a static file take the time limit of their size", and the answer is read to the largest of the five sizes and not past it.
 	pub async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
@@ -399,33 +404,36 @@ impl Fetcher {
 	async fn exchange(&self, url: &Url, trust: &Trust, body: Option<&[u8]>, allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
 		let started = Instant::now();
 		let (host, port, literal, plain) = (url.host().to_owned(), url.port(), url.literal(), url.is_plain());
-		// An IP literal is dialled as it is, with no lookup, and held to the same refusals as any address the system's resolver gives.
-		let addresses = match literal {
-			Some(ip) if dialable(ip) => vec![SocketAddr::new(ip, port)],
-			Some(_) => return Err(FetchError::Resolve),
-			None => (self.resolve)(host.clone(), port).await.map_err(|_| FetchError::Resolve)?,
-		};
-		// A private address is dialled only if the user said yes to that very address, so a name that now comes to another one asks again. What is left out is what the question shows.
-		let (addresses, withheld): (Vec<SocketAddr>, Vec<SocketAddr>) = addresses.into_iter().partition(|address| !private(address.ip()) || allowed.contains(&address.ip()));
-		if addresses.is_empty() {
-			let mut shown = Vec::new();
-			for address in withheld.iter().take(8) {if !shown.contains(&address.ip()) {shown.push(address.ip())}}
-			return Err(if shown.is_empty() {FetchError::Resolve} else {FetchError::Private {host, addresses: shown}});
-		}
 		let mut stream = None;
-		for address in addresses.into_iter().take(4) {
-			if let Some(connect) = &self.connect {
-				if let Ok(connected) = connect(address, Instant::now() + CONNECT_TIMEOUT).await {
+		// A name asked for through a proxy chain is looked up by the last proxy of the chain, so that the node's own resolver never sees it.
+		if let (Some(named), None) = (&self.named, literal) {stream = named(host.clone(), port, Instant::now() + CONNECT_TIMEOUT).await.ok()} else {
+			// An IP literal is dialled as it is, with no lookup, and held to the same refusals as any address the system's resolver gives.
+			let addresses = match literal {
+				Some(ip) if dialable(ip) => vec![SocketAddr::new(ip, port)],
+				Some(_) => return Err(FetchError::Resolve),
+				None => (self.resolve)(host.clone(), port).await.map_err(|_| FetchError::Resolve)?,
+			};
+			// A private address is dialled only if the user said yes to that very address, so a name that now comes to another one asks again. What is left out is what the question shows.
+			let (addresses, withheld): (Vec<SocketAddr>, Vec<SocketAddr>) = addresses.into_iter().partition(|address| !private(address.ip()) || allowed.contains(&address.ip()));
+			if addresses.is_empty() {
+				let mut shown = Vec::new();
+				for address in withheld.iter().take(8) {if !shown.contains(&address.ip()) {shown.push(address.ip())}}
+				return Err(if shown.is_empty() {FetchError::Resolve} else {FetchError::Private {host, addresses: shown}});
+			}
+			for address in addresses.into_iter().take(4) {
+				if let Some(connect) = &self.connect {
+					if let Ok(connected) = connect(address, Instant::now() + CONNECT_TIMEOUT).await {
+						stream = Some(connected);
+						break;
+					}
+					continue;
+				}
+				let socket = if address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| FetchError::Connect)?;
+				if let Some(hook) = &self.socket {hook(socket2::SockRef::from(&socket)).map_err(|_| FetchError::Connect)?}
+				if let Ok(Ok(connected)) = timeout(CONNECT_TIMEOUT, socket.connect(address)).await {
 					stream = Some(connected);
 					break;
 				}
-				continue;
-			}
-			let socket = if address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| FetchError::Connect)?;
-			if let Some(hook) = &self.socket {hook(socket2::SockRef::from(&socket)).map_err(|_| FetchError::Connect)?}
-			if let Ok(Ok(connected)) = timeout(CONNECT_TIMEOUT, socket.connect(address)).await {
-				stream = Some(connected);
-				break;
 			}
 		}
 		let stream = stream.ok_or(FetchError::Connect)?;
