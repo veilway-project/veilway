@@ -2734,7 +2734,7 @@
   "info": {
     "description": "HTTP/1.1 and JSON on the unix socket of a node. Whoever can open the socket is the administrator: there is no other authentication. Every answer that is not a success has the shape of ErrorBody. No answer and no event holds a secret.",
     "title": "Veilway control API",
-    "version": "0.2.11"
+    "version": "0.2.12"
   },
   "openapi": "3.1.0",
   "paths": {
