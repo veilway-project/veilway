@@ -22,6 +22,7 @@ pub mod resolver;
 pub mod route;
 pub mod stream;
 pub mod tunnel;
+pub mod upstream;
 pub mod upstream_state;
 pub mod usage;
 pub mod xray;
@@ -208,10 +209,14 @@ pub struct Options {
 	pub xray_socket: Option<PathBuf>,
 	/// How long the probes of the site of a `faketls` transport wait at each step. Tests replace it so as not to wait that long.
 	pub probes: veilway_transport::probe::Patience,
+	/// The state file of the upstreams, which keeps the signed document of each with its keys, see `upstream_state`. It is not relative to `dir`. A config with an enabled upstream is not started, and not reloaded into, without one that the node can write.
+	pub upstreams: Option<PathBuf>,
+	/// What a test puts in place of the node's own network for the upstreams.
+	pub upstream: upstream::Hooks,
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None, probes: Default::default()}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None, probes: Default::default(), upstreams: None, upstream: Default::default()}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -446,6 +451,7 @@ impl Engine {
 		// Xray goes first: it is killed and awaited before anything else is let go, so it never serves a user the node has stopped counting.
 		self.xray.0.notify_one();
 		let _ = tokio::time::timeout(Duration::from_secs(10), &mut self.xray.1).await;
+		self.host.lock().await.stop_upstreams();
 		if self.shared.dismiss() > 0 {tokio::time::sleep(control::BYE_WAIT).await}
 		let wired = self.l3.lock().unwrap_or_else(|e| e.into_inner()).take();
 		if let Some(wired) = wired {wired.running.close().await}
@@ -590,7 +596,7 @@ impl Engine {
 	/// Every enabled node link of the config that runs, in its order, with its state and its numbers. No key and no secret.
 	pub fn links(&self) -> Vec<LinkReport> {
 		let plan = self.plan();
-		plan.links.iter().enumerate().map(|(at, link)| {
+		plan.links.iter().enumerate().filter(|(_, link)| matches!(link.carrier, plan::Carrier::Paired)).map(|(at, link)| {
 			let (status, since) = link.state.status();
 			LinkReport {
 				tag: link.tag.clone(), id: link.id, entry: link.entry, listener: link.listener, status, since, handshake: plan.handshake(at),
@@ -604,6 +610,12 @@ impl Engine {
 			}
 		}).collect()
 	}
+
+	/// Every enabled upstream of the config that runs, in its order, with its state, its reason when it is not up and its numbers. No key, no secret and no link.
+	pub fn upstreams(&self) -> Vec<upstream::Report> {self.plan().upstreams().iter().map(|state| state.report()).collect()}
+
+	/// Asks the tunnel of the upstream `tag` to connect now, as the user's "connect again" does for a client: false when the config that runs has no such upstream.
+	pub fn upstream_again(&self, tag: &str) -> bool {self.plan().upstreams().iter().find(|state| state.tag == tag).map(|state| state.again()).is_some()}
 
 	/// Starts the quota count of the user called `name` over at the operator's word: `used_bytes` is 0 and `period_start` is the start of the quota period the clock is in, or 0 for a user without a `quota_period`.
 	/// What the user sent and received in all is a record of the node and not of the quota, so it stays unless `totals` is set, which zeroes those four counters as well. Nothing else of the user is touched: sessions, flows and DNS memory stay.
@@ -718,7 +730,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	shared.faketls.set_patience(options.probes);
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
 	let dir = options.dir.clone();
-	let mut host = Host::new(options.dir);
+	let mut host = Host::new(options.dir).with_upstreams(options.upstreams, options.upstream);
 	let staged = match host.prepare(&shared, &store.current().config, &[]).await {
 		Ok(staged) => staged,
 		Err(e) => {

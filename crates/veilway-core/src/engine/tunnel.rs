@@ -306,7 +306,7 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 		state.count(Count::Down);
 		return reset(&stream);
 	};
-	let (id, mtu, address) = (plan.links[link].id, plan.links[link].mtu, plan.links[link].addresses.iter().copied().find(|address| address.is_ipv4() == target.is_ipv4()));
+	let (id, mtu, address) = (plan.links[link].id, plan.links[link].mtu(), plan.links[link].address(target.is_ipv4()));
 	drop(plan);
 	let Some(address) = address else {
 		state.count(Count::Down);
@@ -537,12 +537,12 @@ async fn datagrams(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, socket: Arc
 				};
 				session.budget.sent(n);
 				let of = &plan.links[link];
-				let Some(address) = of.addresses.iter().copied().find(|address| address.is_ipv4() == target.is_ipv4()) else {
+				let Some(address) = of.address(target.is_ipv4()) else {
 					state.count(Count::Down);
 					continue;
 				};
 				// "A datagram larger than the link carries is dropped and counted."
-				if n + if target.is_ipv4() {28} else {48} > usize::from(of.mtu) {
+				if n + if target.is_ipv4() {28} else {48} > usize::from(of.mtu()) {
 					state.count(Count::Dropped);
 					continue;
 				}

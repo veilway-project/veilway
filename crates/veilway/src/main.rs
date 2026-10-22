@@ -287,7 +287,9 @@ async fn main() -> anyhow::Result<()> {
 			// "In a file of its own, next to the usage state file and separate from it."
 			let state = state.unwrap_or_else(|| dir.join("veilway-state.json"));
 			let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
-			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), addons: Some(addons), xray_socket: Some(xray_socket), ..Options::new(dir)}).await?);
+			// The signed documents of the upstreams and their held keys, in a file of its own next to the usage state file.
+			let upstreams = state.with_file_name("upstreams.state");
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), upstreams: Some(upstreams), addons: Some(addons), xray_socket: Some(xray_socket), ..Options::new(dir)}).await?);
 			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
 			#[cfg(unix)]
 			let (control, mut events) = (if no_api {None} else {

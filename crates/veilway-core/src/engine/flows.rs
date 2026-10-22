@@ -293,7 +293,7 @@ pub async fn connect_from(bind: Option<IpAddr>, interface: Option<&str>, target:
 pub const INTERFACES: bool = cfg!(any(target_os = "linux", target_os = "android", target_os = "macos"));
 
 /// Ties a socket to the network interface `name`, so what it sends leaves there whatever the routing table says: SO_BINDTODEVICE on Linux, IP_BOUND_IF and IPV6_BOUND_IF on macOS.
-fn tie(socket: &Socket, name: &str, v4: bool) -> std::io::Result<()> {
+pub(super) fn tie(socket: &Socket, name: &str, v4: bool) -> std::io::Result<()> {
 	#[cfg(any(target_os = "linux", target_os = "android"))]
 	{let _ = v4; socket.bind_device(Some(name.as_bytes()))}
 	#[cfg(target_os = "macos")]

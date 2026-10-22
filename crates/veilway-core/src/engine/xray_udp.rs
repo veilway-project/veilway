@@ -519,7 +519,7 @@ mod tests {
 		let inbound = &config.inbounds[0];
 		let (to_stack, _) = mpsc::channel(1);
 		let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
-		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel]).unwrap();
+		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[]).unwrap();
 		let shared = Arc::new(Shared::new(plan, |_| false, time::OffsetDateTime::now_utc, None, None, veilway_proto::control::USAGE_PUSH, Arc::new(rustls::RootCertStore::empty())));
 		let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 		let at = listener.local_addr().unwrap();

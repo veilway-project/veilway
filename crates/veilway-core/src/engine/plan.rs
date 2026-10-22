@@ -2,6 +2,7 @@
 //! What the node learns while it runs (counters, name memory, tunnels) hangs off the plan and is handed from one plan to the next by tag, user name or public key, so a change of order or membership loses nothing that survives it.
 use super::inbound::Tunnel;
 use super::route;
+use super::upstream::UpstreamState;
 use super::{control, icmp, l3, link, usage, ExitState, Traffic, UserState};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, LinkTransportType, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_LINK_FLOWS, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
@@ -309,8 +310,17 @@ pub struct Device {
 /// What a node dials a link with: the link as the client's side of the transports takes it, and the other node's transports in its order of preference.
 pub struct Dialled {pub link: veilway_transport::Link, pub transports: Vec<payload::Transport>, pub via: Option<Arc<Upstream>>}
 
-/// One enabled node link of the config. A link is known on both nodes by `identity`, the WireGuard public key the dialling node made for it.
+/// What carries the packets of a link.
+pub enum Carrier {
+	/// A node link: a WireGuard tunnel of this node, whose one peer is the other node.
+	Paired,
+	/// An upstream: another provider's subscription, run by the client engine inside this node. The link has the device addresses of the upstream profile and its id, and the engine's own MTU walk lowers its MTU.
+	Upstream(Arc<UpstreamState>),
+}
+
+/// One enabled node link of the config, or the link an upstream is. A link is known on both nodes by `identity`, the WireGuard public key the dialling node made for it. An upstream has none of the fields of a tunnel (`inbound` is past the end of `Plan::inbounds`, and every key is zero): everything that reads those goes through `carrier` first.
 pub struct Link {
+	pub carrier: Carrier,
 	pub tag: String,
 	pub id: [u8; 16],
 	/// Whether this node is the one the link connects to, and whether it is the entry half.
@@ -339,6 +349,19 @@ pub struct Link {
 	pub denied: Option<Denied>,
 	pub dialled: Option<Arc<Dialled>>,
 	pub state: Arc<link::State>,
+}
+
+impl Link {
+	/// The largest packet the link carries. For an upstream it is the profile's, lowered by what the engine found.
+	pub fn mtu(&self) -> u16 {if let Carrier::Upstream(upstream) = &self.carrier {upstream.mtu()} else {self.mtu}}
+
+	/// The entry's address in the link for one family: what a packet into the link is sent from.
+	pub fn address(&self, v4: bool) -> Option<IpAddr> {
+		if let Carrier::Upstream(upstream) = &self.carrier {upstream.addresses().iter().copied().find(|address| address.is_ipv4() == v4)} else {self.addresses.iter().copied().find(|address| address.is_ipv4() == v4)}
+	}
+
+	/// Whether `ip` is the entry's address in the link: the one destination a packet out of the link may have.
+	pub fn owns(&self, ip: IpAddr) -> bool {if let Carrier::Upstream(upstream) = &self.carrier {upstream.addresses().contains(&ip)} else {self.addresses.contains(&ip)}}
 }
 
 /// Where a tunnel address lives: the device and its inbound.
@@ -438,7 +461,8 @@ pub struct Plan {
 impl Plan {
 	/// Compiles a validated config. `now` decides which users have expired, `tunnels` holds the tunnel of each inbound in the order of the config,
 	/// and `previous` is the plan in force, whose counters, name memory and other state go to whatever keeps its tag, user name or public key.
-	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>) -> anyhow::Result<Plan> {
+	/// `upstreams` is the state of each enabled upstream of the config, which the plan makes the carrier of its link and of the exit that names it.
+	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>, upstreams: &[Arc<UpstreamState>]) -> anyhow::Result<Plan> {
 		let stale = || anyhow!("the config names something it does not define; it was not validated");
 		// A link this node dials has a tunnel of its own, behind those of the inbounds and in the order of `links`.
 		let wanted: Vec<&config::Link> = config.links.iter().filter(|link| link.enabled != Some(false)).collect();
@@ -612,13 +636,26 @@ impl Plan {
 			}
 			if written.listener() && denied.is_none() {by_link.insert(identity, l);}
 			// What the node learnt of a link stays with it while it is the same link: the same id under the same key.
-			links.push(Link {tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, mtu, device, user, allow_private: written.allow_private == Some(true), exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
+			links.push(Link {carrier: Carrier::Paired, tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, mtu, device, user, allow_private: written.allow_private == Some(true), exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
 		}
-		// A `chain` exit names its links by tag. One that is not enabled is not among them, and an exit left with none is down.
+		// An enabled upstream is a link after the node links, with no tunnel of the plan behind it: its carrier is the engine of its state. The tag of a link is looked for among the node links alone from here on.
+		let paired = links.len();
+		for written in config.upstreams.iter().filter(|upstream| upstream.on()) {
+			let upstream = upstreams.iter().find(|upstream| upstream.tag == written.tag).ok_or_else(stale)?;
+			links.push(Link {carrier: Carrier::Upstream(upstream.clone()), tag: written.tag.clone(), id: upstream.id, listener: false, entry: true, inbound: usize::MAX, key: [0; 32], identity: [0; 32], secret: [0; 32], addresses: Vec::new(), dialler: Vec::new(), mtu: 0, device: None, user: None, allow_private: written.allow_private == Some(true), exit: None, denied: None, dialled: None, state: upstream.link.clone()});
+		}
+		// A `chain` exit names its links by tag. One that is not enabled is not among them, and an exit left with none is down. An `upstream` exit is the link of its upstream, and down while the upstream is.
 		for (e, exit) in config.exits.iter().enumerate() {
-			if let (config::Backend::Chain(chain), Backend::Chain {links: of}) = (&exit.backend, &mut exits[e].backend) {
-				*of = chain.links.iter().filter_map(|tag| links.iter().position(|link| link.tag == *tag)).collect();
-				for l in of.iter() {links[*l].exit = Some(e)}
+			match (&exit.backend, &mut exits[e].backend) {
+				(config::Backend::Chain(chain), Backend::Chain {links: of}) => {
+					*of = chain.links.iter().filter_map(|tag| links[..paired].iter().position(|link| link.tag == *tag)).collect();
+					for l in of.iter() {links[*l].exit = Some(e)}
+				}
+				(config::Backend::Upstream(upstream), Backend::Chain {links: of}) => {
+					*of = links[paired..].iter().position(|link| link.tag == upstream.upstream).map(|at| at + paired).into_iter().collect();
+					for l in of.iter() {links[*l].exit = Some(e)}
+				}
+				_ => {}
 			}
 		}
 		// "Only devices of a user who is enabled, not expired and not over quota, with an address on this inbound, are in the table", which is every device of this plan that has the inbound, and every link this node is dialled for through it.
@@ -651,7 +688,7 @@ impl Plan {
 				inbound: find_all(&inbound_tags, &rule.inbound)?,
 				user: find_all(&user_names, &rule.user)?,
 				group: find_all(&group_names, &rule.group)?,
-				link: rule.link.as_ref().map(|tags| tags.iter().filter_map(|tag| links.iter().position(|link| link.tag == *tag)).collect()),
+				link: rule.link.as_ref().map(|tags| tags.iter().filter_map(|tag| links[..paired].iter().position(|link| link.tag == *tag)).collect()),
 				ip: rule.ip.as_ref().map(|list| list.iter().map(|entry| Ok(match entry {
 					IpEntry::Net(net) => IpMatch::Net(*net),
 					IpEntry::Private => IpMatch::Private,
@@ -751,12 +788,23 @@ impl Plan {
 
 	/// How long ago the tunnel of a link last completed a handshake. None for a link without a session.
 	pub fn handshake(&self, link: usize) -> Option<Duration> {
+		if let Carrier::Upstream(upstream) = &self.links[link].carrier {return upstream.carrying()}
 		let (link, peers) = (&self.links[link], self.inbounds[self.links[link].inbound].tunnel.lock());
 		peers.wg.index(&link.key).and_then(|peer| peers.wg.time_since_last_handshake(peer))
 	}
 
 	/// "Up: a WireGuard handshake completed within the last 180 s."
-	pub fn up(&self, link: usize) -> bool {self.links[link].denied.is_none() && self.handshake(link).is_some_and(|age| age < link::UP)}
+	/// An upstream is up while its tunnel is connected and, when the config names an exit of the provider, that exit is the one in use.
+	pub fn up(&self, link: usize) -> bool {
+		if let Carrier::Upstream(upstream) = &self.links[link].carrier {return upstream.up()}
+		self.links[link].denied.is_none() && self.handshake(link).is_some_and(|age| age < link::UP)
+	}
+
+	/// Whether `dst` is a gateway of the profile of an upstream among `links`, the links of an exit: where the engine of the upstream keeps its control channel and its probes, and where no flow of a user goes through that exit, on any port. The address is the provider's to name, so it is refused for the flows of its own exit alone: a provider that names an address it does not hold takes nothing from the flows of any other exit.
+	pub fn reaches_upstream(&self, links: &[usize], dst: IpAddr) -> bool {links.iter().any(|link| matches!(&self.links[*link].carrier, Carrier::Upstream(upstream) if upstream.gateways().contains(&dst)))}
+
+	/// The state of every enabled upstream of this plan, in the order of the config.
+	pub fn upstreams(&self) -> Vec<Arc<UpstreamState>> {self.links.iter().filter_map(|link| if let Carrier::Upstream(upstream) = &link.carrier {Some(upstream.clone())} else {None}).collect()}
 
 	/// A destination or DNS name for a log line: shown only when the config's `log.destinations` allows it.
 	pub fn show(&self, destination: impl Display) -> String {if self.shown.load(Ordering::Relaxed) {destination.to_string()} else {"<hidden>".to_string()}}

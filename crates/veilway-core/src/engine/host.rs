@@ -3,12 +3,16 @@
 use super::icmp::{self, Kind};
 use super::inbound::{self, Peers, Tunnel};
 use super::netstack::{self, PacketDev};
-use super::plan::{self, Backend, Denied, Fallback, Holder, Outbound, Plan, User};
+use super::plan::{self, Backend, Carrier, Denied, Fallback, Holder, Outbound, Plan, User};
 use super::route::{self, By, Decision, Ended, Key};
 use super::limits::Clock;
+use super::upstream::{self, UpstreamState};
+use super::upstream_state::{UpstreamFile, UpstreamVault};
 use super::{certificate, control, faketls, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use crate::config::{loops, Certificate, Config, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use etherparse::PacketBuilder;
 use ipnet::IpNet;
 use ipstack::{IpStack, IpStackConfig, TcpConfig};
@@ -28,6 +32,7 @@ use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use veilway_proto::control::{ByeReason, NodeMessage, PORT};
+use veilway_proto::subscription::{DeviceSecret, Secret};
 use veilway_wg::ws::{self, TlsFiles};
 use veilway_wg::Wg;
 
@@ -99,6 +104,10 @@ pub struct Host {
 	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64, Option<Arc<plan::Upstream>>))>,
 	/// The tunnels of the config in force that are enabled, by tag.
 	forwards: HashMap<String, Forward>,
+	/// The state file of the upstreams, with what a test puts in place of the node's own network for them. None for a node that was given no path.
+	upstream_file: Option<(Arc<UpstreamFile>, upstream::Hooks)>,
+	/// The task of each upstream that runs, by tag, with the config it runs and its state. An upstream that is the same, with the same state, keeps its task and its tunnel through a reload.
+	upstreams: HashMap<String, (Upstream, Option<upstream::Reach>, Arc<UpstreamState>, Task)>,
 }
 
 /// What `prepare` took for a config that is not in force yet. Dropping it gives all of it back.
@@ -123,6 +132,8 @@ pub struct Staged {
 	/// The tunnels that are new or changed, with their defaults written out, each with the socket it listens on.
 	forwards: Vec<(Forwarded, tunnel::Bound)>,
 	l3: Option<Wired>,
+	/// The upstreams of the config that are enabled, each with the config it runs, how the node reaches its provider, its state and the vault of its document.
+	upstreams: Vec<(Upstream, Option<upstream::Reach>, Arc<UpstreamState>, UpstreamVault)>,
 }
 
 /// A bound socket that is not listening yet. IPv6 sockets are always IPv6-only, so a wildcard address of one family never takes the port of the other.
@@ -174,7 +185,16 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new(), upstream_file: None, upstreams: HashMap::new()}}
+
+	/// Ends the task of every upstream, and with it its tunnel: the node is going away, and a device of a provider should not stay connected from a node that is not there.
+	pub fn stop_upstreams(&mut self) {self.upstreams.clear()}
+
+	/// Gives the host the state file of the upstreams. A config with an enabled upstream is not started, and not reloaded into, without one.
+	pub fn with_upstreams(mut self, path: Option<PathBuf>, hooks: upstream::Hooks) -> Host {
+		self.upstream_file = path.map(|path| (UpstreamFile::new(path), hooks));
+		self
+	}
 
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
@@ -196,7 +216,17 @@ impl Host {
 				tunnel
 			}
 		}).collect();
-		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels)?;
+		// The upstreams: a state for each enabled one, the one it has now where the tag, the link and the device are the same.
+		let mut upstreams = Vec::new();
+		for (i, written) in config.upstreams.iter().enumerate().filter(|(_, written)| written.on()) {
+			let (file, _) = self.upstream_file.as_ref().ok_or_else(|| anyhow!("upstreams[{i}]: upstream `{}` needs the state file of the upstreams, and the node was started without a path for one", written.tag))?;
+			let secret: [u8; 16] = URL_SAFE_NO_PAD.decode(written.device_secret.expose()).ok().and_then(|bytes| bytes.try_into().ok()).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))?;
+			let vault = file.vault(&written.tag, written.link.expose(), Secret::new(written.private_key.expose().0), DeviceSecret::new(secret));
+			let state = self.upstreams.get(&written.tag).map(|(_, _, state, _)| state).filter(|state| state.bound() == vault.bound()).cloned().unwrap_or_else(|| UpstreamState::new(&written.tag, vault.id(), vault.bound()));
+			upstreams.push((written.effective(), None, state, vault));
+		}
+		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>())?;
+		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
 		for (tunnel, ..) in &fresh {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
 			for device in plan.devices.iter().filter(|device| device.inbounds.contains(&at)) {peers.add(device.public_key, device.preshared_key)}
@@ -366,12 +396,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, l3: staged})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, l3: staged, upstreams})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, l3} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, l3, upstreams} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -389,10 +419,10 @@ impl Host {
 			self.tunnels.insert(tunnel.tag.clone(), Running {tunnel, _tasks: tasks, loopback: None});
 		}
 		self.tunnels.retain(|tag, _| plan.inbounds.iter().any(|inbound| inbound.tag == *tag));
-		self.shapes = plan.links.iter().filter_map(|link| Some((plan.inbounds[link.inbound].tag.clone(), (plan.inbounds[link.inbound].private_key, link.key, link.mtu))).filter(|_| link.dialled.is_some())).collect();
+		self.shapes = plan.links.iter().filter(|link| link.dialled.is_some()).map(|link| (plan.inbounds[link.inbound].tag.clone(), (plan.inbounds[link.inbound].private_key, link.key, link.mtu))).collect();
 		// A link this node dials is dialled while it is enabled and not cut off. One that is the same link through the same tunnel keeps its task and its session, and any other task ends here, with its session.
 		let mut diallers = std::mem::take(&mut self.diallers);
-		for link in plan.links.iter().filter(|link| link.denied.is_none()) {
+		for link in plan.links.iter().filter(|link| link.denied.is_none() && link.dialled.is_some()) {
 			let (Some(dialled), tunnel) = (&link.dialled, &plan.inbounds[link.inbound].tunnel) else {continue};
 			let shape = (link.id, link.key, link.identity, link.secret, link.mtu, veilway_transport::choice::digest(&dialled.transports), dialled.via.clone());
 			let kept = diallers.remove(&link.tag).filter(|(_, _, was, of)| Arc::ptr_eq(was, tunnel) && *of == shape);
@@ -404,6 +434,21 @@ impl Host {
 			self.diallers.insert(link.tag.clone(), running);
 		}
 		for tag in diallers.keys() {tracing::info!("link {tag}: no longer dialled")}
+		// An upstream runs while it is enabled. One that is the same upstream with the same state keeps its task and its tunnel, and any other task ends here, with its session. The entry of an upstream that is gone leaves the state file, so that its transport secrets do not stay in it.
+		let mut running = std::mem::take(&mut self.upstreams);
+		if let Some((file, hooks)) = &self.upstream_file {
+			let tags: Vec<String> = upstreams.iter().map(|(written, ..)| written.tag.clone()).collect();
+			for (written, reach, state, vault) in upstreams {
+				let kept = running.remove(&written.tag).filter(|(was, was_reach, was_state, _)| *was == written && *was_reach == reach && Arc::ptr_eq(was_state, &state));
+				let task = kept.map(|(.., task)| task).unwrap_or_else(|| {
+					tracing::info!("upstream {}: running the provider's subscription as the carrier of an exit", written.tag);
+					Task(upstream::run(shared, written.clone(), reach.clone(), state.clone(), vault, hooks.clone()))
+				});
+				self.upstreams.insert(written.tag.clone(), (written, reach, state, task));
+			}
+			if let Err(error) = file.retain(&tags.iter().map(String::as_str).collect::<Vec<_>>()) {tracing::warn!("the state file of the upstreams could not be cleaned of the upstreams that are gone: {error}")}
+		}
+		for tag in running.keys() {tracing::info!("upstream {tag}: no longer run")}
 		for (tunnel, addr, socket) in loopbacks {
 			if let Some(running) = self.tunnels.get_mut(&tunnel.tag) {running.loopback = Some((addr, socket.clone(), Task(inbound::read(shared, tunnel, socket, Over::Ws))))}
 		}
@@ -597,7 +642,7 @@ impl Host {
 	/// the config that runs is compiled again at the present time, with the counts as they are now, and switched to.
 	pub fn expire(&mut self, shared: &Arc<Shared>) {
 		let (Some(config), old) = (&self.config, shared.plan()) else {return};
-		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect()) {
+		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect(), &old.upstreams()) {
 			Ok(mut plan) => {
 				plan.l3 = old.l3.clone();
 				self.switch(shared, plan, false);
@@ -710,15 +755,15 @@ impl Host {
 				}
 			}
 			// A link is a peer while it is the same link through the same tunnel. Any other loses its sessions here: "The sessions and the tunnel are dropped within one second on the node that removed it."
-			for was in old.links.iter().filter(|was| was.denied.is_none()) {
+			for was in old.links.iter().filter(|was| was.denied.is_none() && matches!(was.carrier, Carrier::Paired)) {
 				let tunnel = &old.inbounds[was.inbound].tunnel;
-				let stays = plan.links.iter().any(|is| is.denied.is_none() && is.id == was.id && is.key == was.key && is.identity == was.identity && is.secret == was.secret && is.addresses == was.addresses && Arc::ptr_eq(&plan.inbounds[is.inbound].tunnel, tunnel));
+				let stays = plan.links.iter().any(|is| is.denied.is_none() && matches!(is.carrier, Carrier::Paired) && is.id == was.id && is.key == was.key && is.identity == was.identity && is.secret == was.secret && is.addresses == was.addresses && Arc::ptr_eq(&plan.inbounds[is.inbound].tunnel, tunnel));
 				if !stays {
 					tunnel.lock().wg.remove_peer(&was.key);
 					tracing::info!("link {}: its sessions are dropped: the link was removed, changed or cut off", was.tag);
 				}
 			}
-			for link in plan.links.iter().filter(|link| link.denied.is_none()) {
+			for link in plan.links.iter().filter(|link| link.denied.is_none() && matches!(link.carrier, Carrier::Paired)) {
 				let mut peers = plan.inbounds[link.inbound].tunnel.lock();
 				if peers.wg.index(&link.key).is_none() {peers.add(link.key, None)}
 			}

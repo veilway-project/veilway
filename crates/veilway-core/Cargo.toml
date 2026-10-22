@@ -13,6 +13,8 @@ exclude=["tests/", "examples/", "proptest-regressions/"]
 [features]
 # The stream listener over pipes in memory, for the fuzz target and the crate's own tests. No build of a node turns it on.
 bench=["veilway-proto/bench"]
+# Where the addresses of a provider's profile really are, for the tests of the upstreams: a profile cannot name loopback, so a test says where its documents' addresses lead. No build of a node turns it on.
+upstream-tests=["veilway-engine/testing"]
 
 [dependencies]
 veilway-wg={path="../veilway-wg", version="0.2.14"}
@@ -55,7 +57,7 @@ rustix.workspace=true
 # The client engine runs against the node in tests/engine.rs.
 veilway-engine={path="../veilway-engine", features=["testing", "unencrypted-vault"]}
 # The crate's own tests are built with the listener over pipes in memory.
-veilway-core={path=".", features=["bench"]}
+veilway-core={path=".", features=["bench", "upstream-tests"]}
 boringtun.workspace=true
 # The tests of `udp-obfs` read the node's log: a state in which honest clients are refused has to be said.
 tracing-subscriber.workspace=true

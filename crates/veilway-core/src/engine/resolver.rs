@@ -129,6 +129,7 @@ pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user:
 		_ if gate::refused(server.ip(), &plan.pools) || (shared.is_local)(server.ip()) => Some(Reason::Gate),
 		_ if plan.users[user].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) => Some(Reason::Entitlement),
 		(_, Backend::Block) => Some(Reason::BlockExit),
+		(_, Backend::Chain {links}) if plan.reaches_upstream(links, server.ip()) => Some(Reason::Gate),
 		_ => None,
 	};
 	if let Some(reason) = refusal {return Step::Refused(reason)}

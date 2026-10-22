@@ -3,7 +3,7 @@
 //! What a link carries is not here: `chain` is the entry half, and the exit half is the path every decrypted packet takes, with the link's own limits.
 use super::flows::{self, Stop};
 use super::inbound::{Tunnel, Via};
-use super::plan::{Dialled, Plan};
+use super::plan::{self, Dialled, Plan, Upstream};
 use super::{Shared, Traffic};
 use crate::config::random;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use veilway_proto::subscription::payload::Transport;
 use veilway_transport::choice::{self, Class, Network, Next, Pick, Standing};
-use veilway_transport::{connector, End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
+use veilway_transport::{connector, Connect, End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
 use veilway_wg::MAX_PACKET;
 
 /// "Up: a WireGuard handshake completed within the last 180 s."
@@ -113,7 +113,7 @@ impl Shared {
 	/// Once a second: holds every link's state against its tunnel and says each change, "logged at info with the link's tag, and counted". Nothing is latched: a link is up again the moment its tunnel has a handshake, with no action by anyone.
 	pub(super) fn check_links(&self) {
 		let plan = self.plan();
-		for (at, link) in plan.links.iter().enumerate() {
+		for (at, link) in plan.links.iter().enumerate().filter(|(_, link)| matches!(link.carrier, plan::Carrier::Paired)) {
 			let (state, now, up) = (&link.state, Instant::now(), plan.up(at));
 			let quiet = {
 				let mut heard = state.heard.lock().unwrap_or_else(|e| e.into_inner());
@@ -136,6 +136,30 @@ impl Shared {
 	}
 }
 
+/// The dial of the stream of a TCP transport through the proxy chain `via`, before the deadline of the attempt. `carried` is told after every dial whether the chain carried the connection, with the cause when it did not, and the failure is classified as the transport wants it: where the chain stopped, and whether it timed out there.
+pub(super) fn through(via: Arc<Upstream>, carried: impl Fn(Option<String>) + Send + Sync + 'static) -> Connect {
+	let carried = Arc::new(carried);
+	connector(move |to, deadline| {
+		let (via, carried) = (via.clone(), carried.clone());
+		async move {
+			match flows::dial_until(&via, to, deadline).await {
+				Ok(stream) => {
+					carried(None);
+					Ok(stream)
+				}
+				Err(failure) => {
+					carried(Some(failure.describe()));
+					Err(match (&failure.stop, failure.timeout) {
+						(Stop::First(_), _) | (Stop::Hop(_), true) => End::Offline.into(),
+						(Stop::Hop(_), false) | (Stop::Target, false) => Ended::Unreachable(Unreachable::Connect),
+						(Stop::Target, true) => Ended::Unreachable(Unreachable::Timeout),
+					})
+				}
+			}
+		}
+	})
+}
+
 /// The way into the session of a link this node dials. The tunnel of the link sends through it whatever it has for the other node, and a datagram that finds no room is dropped and counted.
 pub struct Dialler {out: mpsc::Sender<Vec<u8>>, pub unsent: AtomicU64}
 
@@ -153,19 +177,7 @@ enum Carrier {Native(Session), Plain(UdpSocket)}
 async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &Arc<State>, queue: &mut mpsc::Receiver<Vec<u8>>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
 	let (key, mut made) = (dialled.link.inbound, Vec::new());
 	// "Through an outbound": the stream TCP transports dial over is the proxy chain's. The chain's failure is what the transport is told, by where it stopped and whether it timed out there.
-	let connect = dialled.via.clone().map(|via| connector({let (state, tag) = (state.clone(), tag.to_string()); move |to, deadline| {let (via, state, tag) = (via.clone(), state.clone(), tag.clone()); async move {
-		match flows::dial_until(&via, to, deadline).await {
-			Ok(stream) => {state.carried(&tag, None); Ok(stream)}
-			Err(failure) => {
-				state.carried(&tag, Some(failure.describe()));
-				Err(match (&failure.stop, failure.timeout) {
-					(Stop::First(_), _) | (Stop::Hop(_), true) => End::Offline.into(),
-					(Stop::Hop(_), false) | (Stop::Target, false) => Ended::Unreachable(Unreachable::Connect),
-					(Stop::Target, true) => Ended::Unreachable(Unreachable::Timeout),
-				})
-			}
-		}
-	}}}));
+	let connect = dialled.via.clone().map(|via| through(via, {let (state, tag) = (state.clone(), tag.to_string()); move |cause| state.carried(&tag, cause)}));
 	let source: Source = Arc::new(Mutex::new({
 		let tunnel = tunnel.clone();
 		// "A keepalive of a tunnel that is already up, or else a fresh handshake initiation."

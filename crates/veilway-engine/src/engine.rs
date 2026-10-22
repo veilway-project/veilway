@@ -304,7 +304,8 @@ impl Core {
 			}
 			self.answers();
 			let alpha = self.settings.store.alpha_transports();
-			let plan = choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), alpha);
+			let mut plan = choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), alpha);
+			if self.settings.connect.is_some() {plan.order.retain(|at| !matches!(self.transports[*at], Transport::Udp(_) | Transport::UdpObfs(_)))}
 			if plan.order.is_empty() {
 				// Alpha is the reason only if turning it on would give something to try.
 				let alpha_off = !alpha && !choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), true).order.is_empty();
@@ -463,6 +464,7 @@ impl Core {
 				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::WsPlain {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} | Target::FakeTls {candidate, ..} => candidate.address = redirect(candidate.address),
 			}
 		}
+		let target = target.via(self.settings.connect.clone());
 		Session::parallel(&self.link, target, self.profile.parallel, env.clone(), self.wire.source()).map_err(|refuse| {
 			tracing::warn!(transport, candidate, ?refuse, "a candidate cannot be dialled as the profile has it");
 			// A root store that is empty is a fault of the device, and no verdict on a candidate.

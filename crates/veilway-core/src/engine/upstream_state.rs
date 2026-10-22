@@ -1,6 +1,7 @@
 //! The state file of the upstreams: what the client engine of each upstream holds between runs, for the `Vault` of its `Library`.
 //! Two things are kept apart. The link, the device's private key and the device secret are the operator's config (they are `Secret`s there), and the vault joins them to what is read here, so they are never written to this file. What the file holds is the last good signed document of each upstream with its keys (and what the operator answered about hosts and moves), and the document carries the per-device transport secrets, so the file is as secret as the config is.
 //! The node refuses to read or replace a file that is not a regular file of its own user, or that group or others can read, and says why: a file that a stranger can read has leaked its secrets, and one that a stranger could write could hand the node a document of their choosing. Nothing is repaired or moved aside. A write is a new file beside it, synced, moved over, with the directory synced. What is read is read as hostile input: size bounded, the shape checked, and every document verified under its held keys again by `Held::restore` when the `Library` opens.
+use crate::config::random;
 use ring::digest::{Context, SHA256};
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -21,16 +22,16 @@ const TAG_MAX: usize = 128;
 pub const FILE_MAX: usize = UPSTREAMS_MAX * 2 * BODY_MAX + 4096;
 const VERSION: u64 = 1;
 
-/// What is held for one upstream: the hash that binds it to its link and device, and the stored subscription without its origin.
-pub type State = BTreeMap<String, ([u8; 32], Stored)>;
+/// What is held for one upstream: the hash that binds it to its link and device, the id of the upstream as a carrier (16 random bytes drawn when the upstream first held a document, so that nothing about the link or the device is in it), and the stored subscription without its origin.
+pub type State = BTreeMap<String, ([u8; 32], [u8; 16], Stored)>;
 
 fn bad(message: &'static str) -> io::Error {io::Error::new(io::ErrorKind::InvalidData, message)}
 
 fn hex(bytes: &[u8]) -> String {bytes.iter().map(|byte| format!("{byte:02x}")).collect()}
 
-fn unhex(text: &str) -> Option<[u8; 32]> {
-	if text.len() != 64 || !text.is_ascii() {return None}
-	let mut bytes = [0u8; 32];
+fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
+	if text.len() != N * 2 || !text.is_ascii() {return None}
+	let mut bytes = [0u8; N];
 	for (index, byte) in bytes.iter_mut().enumerate() {*byte = u8::from_str_radix(&text[index * 2..index * 2 + 2], 16).ok()?}
 	Some(bytes)
 }
@@ -44,16 +45,17 @@ pub fn parse(bytes: &[u8]) -> io::Result<State> {
 	let mut state = State::new();
 	for (tag, entry) in upstreams {
 		if tag.is_empty() || tag.len() > TAG_MAX {return Err(bad("a tag in the file is empty or too long"))}
-		let bound = entry.get("bound").and_then(serde_json::Value::as_str).and_then(unhex).ok_or(bad("an entry has no binding"))?;
+		let bound = entry.get("bound").and_then(serde_json::Value::as_str).and_then(unhex::<32>).ok_or(bad("an entry has no binding"))?;
+		let id = entry.get("id").and_then(serde_json::Value::as_str).and_then(unhex::<16>).ok_or(bad("an entry has no id"))?;
 		let held = entry.get("held").filter(|held| held.as_array().is_some_and(|held| held.len() == 1)).ok_or(bad("an entry does not hold exactly one subscription"))?;
-		if let Some(stored) = read_vault(&serde_json::to_vec(held).map_err(|_| bad("an entry cannot be read"))?)?.into_iter().next() {state.insert(tag.clone(), (bound, Stored {origin: None, ..stored}));}
+		if let Some(stored) = read_vault(&serde_json::to_vec(held).map_err(|_| bad("an entry cannot be read"))?)?.into_iter().next() {state.insert(tag.clone(), (bound, id, Stored {origin: None, ..stored}));}
 	}
 	Ok(state)
 }
 
 /// The bytes of the file for `state`. The origin of every stored subscription is left out.
 pub fn encode(state: &State) -> Vec<u8> {
-	let upstreams: serde_json::Map<String, serde_json::Value> = state.iter().map(|(tag, (bound, stored))| (tag.clone(), serde_json::json!({"bound": hex(bound), "held": serde_json::from_slice::<serde_json::Value>(&write_vault(&[Stored {origin: None, ..stored.clone()}])).unwrap_or_default()}))).collect();
+	let upstreams: serde_json::Map<String, serde_json::Value> = state.iter().map(|(tag, (bound, id, stored))| (tag.clone(), serde_json::json!({"bound": hex(bound), "id": hex(id), "held": serde_json::from_slice::<serde_json::Value>(&write_vault(&[Stored {origin: None, ..stored.clone()}])).unwrap_or_default()}))).collect();
 	serde_json::to_vec(&serde_json::json!({"version": VERSION, "upstreams": upstreams})).unwrap_or_default()
 }
 
@@ -66,7 +68,10 @@ impl UpstreamFile {
 	pub fn vault(self: &Arc<Self>, tag: &str, link: &str, private: Secret<32>, secret: DeviceSecret) -> UpstreamVault {
 		let mut hash = Context::new(&SHA256);
 		for part in [&b"veilway v1 upstream state"[..], &(link.len() as u64).to_le_bytes(), link.as_bytes(), &proof::public_key(private.expose())] {hash.update(part)}
-		UpstreamVault {file: self.clone(), tag: tag.to_owned(), bound: hash.finish().as_ref().try_into().expect("SHA-256 is 32 bytes"), origin: (link.to_owned(), private, secret)}
+		let bound: [u8; 32] = hash.finish().as_ref().try_into().expect("SHA-256 is 32 bytes");
+		// The id of an upstream that held a document under this binding stays; any other is drawn now, and written with the first document. A file that cannot be read is no reason not to have an id: the first write says why.
+		let id = self.read().ok().and_then(|state| state.get(tag).filter(|(was, ..)| *was == bound).map(|(_, id, _)| *id)).or_else(|| {let mut id = [0u8; 16]; random(&mut id).ok().map(|_| id)}).unwrap_or([0u8; 16]);
+		UpstreamVault {file: self.clone(), tag: tag.to_owned(), bound, id, origin: (link.to_owned(), private, secret)}
 	}
 	/// Reads the file. A file that is not there is nothing held. One that is not a regular file of the node's own user, that group or others can read, or that is larger than `FILE_MAX` is an error and is left as it is.
 	pub fn read(&self) -> io::Result<State> {
@@ -104,18 +109,26 @@ impl UpstreamFile {
 }
 
 /// The `Vault` of one upstream's `Library`. It holds at most one subscription, the upstream's own.
-pub struct UpstreamVault {file: Arc<UpstreamFile>, tag: String, bound: [u8; 32], origin: (String, Secret<32>, DeviceSecret)}
+#[derive(Clone)]
+pub struct UpstreamVault {file: Arc<UpstreamFile>, tag: String, bound: [u8; 32], id: [u8; 16], origin: (String, Secret<32>, DeviceSecret)}
+
+impl UpstreamVault {
+	/// The hash that joins this vault to its link and device: two vaults with the same one are the same upstream.
+	pub fn bound(&self) -> [u8; 32] {self.bound}
+	/// The id of the upstream as a carrier.
+	pub fn id(&self) -> [u8; 16] {self.id}
+}
 
 impl Vault for UpstreamVault {
 	fn load(&self) -> io::Result<Vec<Stored>> {
-		Ok(self.file.read()?.remove(&self.tag).filter(|(bound, _)| *bound == self.bound).map(|(_, stored)| Stored {origin: Some(self.origin.clone()), ..stored}).into_iter().collect())
+		Ok(self.file.read()?.remove(&self.tag).filter(|(bound, ..)| *bound == self.bound).map(|(.., stored)| Stored {origin: Some(self.origin.clone()), ..stored}).into_iter().collect())
 	}
 	fn save(&self, held: &[Stored]) -> io::Result<()> {
 		let _writing = self.file.writing.lock().unwrap_or_else(PoisonError::into_inner);
 		let mut state = self.file.read()?;
 		match held {
 			[] => {state.remove(&self.tag);}
-			[one] => {state.insert(self.tag.clone(), (self.bound, one.clone()));}
+			[one] => {state.insert(self.tag.clone(), (self.bound, self.id, one.clone()));}
 			_ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "an upstream holds one subscription")),
 		}
 		if state.len() > UPSTREAMS_MAX {return Err(io::Error::new(io::ErrorKind::InvalidInput, "more upstreams than a node has"))}

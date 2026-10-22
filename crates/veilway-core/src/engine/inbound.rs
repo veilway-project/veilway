@@ -245,6 +245,8 @@ impl Shared {
 					Backend::Block => Decision::Refuse {reason: Reason::BlockExit, reset: false},
 					// "The engine also refuses, at the moment it decides a flow, to send a packet that arrived from a link into a link."
 					Backend::Chain {..} if linked.is_some() => Decision::Refuse {reason: Reason::Gate, reset: true},
+					// The gateway of an upstream's profile is the engine's own: its control channel and its probes are there, and no flow of a user shares a tuple with them.
+					Backend::Chain {links} if plan.reaches_upstream(links, key.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 					Backend::L3 {..} | Backend::Chain {..} => Decision::Exit {exit, by: By::Backend},
 					Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind), ..}, ..} if bind.is_ipv4() != key.dst.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
 					// Whether the proxy relays UDP is only known once the flow's handler has asked it, so the `udp` policy is applied there, see `flows::run`.

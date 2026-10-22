@@ -29,7 +29,7 @@ use veilway_proto::subscription::sealed_file::{self, OpenError, SealError};
 use veilway_proto::subscription::payload::{dialable, private, PayloadError, Reason};
 use veilway_proto::subscription::{DeviceSecret, Secret, Url, BODY_MAX};
 use veilway_transport::http;
-use veilway_transport::Hook;
+use veilway_transport::{Connect, Hook};
 
 /// How the name of an endpoint is looked up: once per fetch, by the resolver in force. The default is the system's, with the refusals of the page applied to what it returns. A caller that puts its own in (the tunnel's resolver, a test) is the one that applies them.
 pub type Resolve = Arc<dyn Fn(String, u16) -> Pin<Box<dyn Future<Output = io::Result<Vec<SocketAddr>>> + Send>> + Send + Sync>;
@@ -375,11 +375,17 @@ impl Code {
 
 /// What the fetches of an import are made with. Cloning it shares the roots.
 #[derive(Clone)]
-pub struct Fetcher {pub roots: Arc<rustls::RootCertStore>, pub resolve: Resolve, pub socket: Option<Hook>}
+pub struct Fetcher {
+	pub roots: Arc<rustls::RootCertStore>,
+	pub resolve: Resolve,
+	pub socket: Option<Hook>,
+	/// Dials the connection through a proxy chain in place of a socket of the fetcher, which `socket` is not applied to.
+	pub connect: Option<Connect>,
+}
 
 impl Fetcher {
 	/// A fetcher with the system's resolver and the roots it is given.
-	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket}}
+	pub fn new(roots: Arc<rustls::RootCertStore>, socket: Option<Hook>) -> Self {Self {roots, resolve: system_resolver(), socket, connect: None}}
 	/// One `POST` of `body` to `url` (the 1,073 bytes of a sealed request, `application/octet-stream`), and the body of the answer. See the head of this module for what it does and refuses. `allowed` is the private addresses the user said yes to, and `now` the device's clock, which only a message about the clocks uses.
 	/// "A native answer and a static file take the time limit of their size", and the answer is read to the largest of the five sizes and not past it.
 	pub async fn post(&self, url: &Url, trust: &Trust, body: &[u8], allowed: &[IpAddr], now: u64) -> Result<Answer, FetchError> {
@@ -408,6 +414,13 @@ impl Fetcher {
 		}
 		let mut stream = None;
 		for address in addresses.into_iter().take(4) {
+			if let Some(connect) = &self.connect {
+				if let Ok(connected) = connect(address, Instant::now() + CONNECT_TIMEOUT).await {
+					stream = Some(connected);
+					break;
+				}
+				continue;
+			}
 			let socket = if address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| FetchError::Connect)?;
 			if let Some(hook) = &self.socket {hook(socket2::SockRef::from(&socket)).map_err(|_| FetchError::Connect)?}
 			if let Ok(Ok(connected)) = timeout(CONNECT_TIMEOUT, socket.connect(address)).await {

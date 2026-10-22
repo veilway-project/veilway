@@ -5,7 +5,7 @@ use super::{dns, flows, tunnel};
 use super::icmp::Kind;
 use super::netstack::{self, Fit, Packet, ECHO_REPLY_V4, ECHO_REPLY_V6, ECHO_REQUEST_V4, ECHO_REQUEST_V6};
 use super::obfs::Room;
-use super::plan::{Backend, Holder, Plan};
+use super::plan::{Backend, Carrier, Holder, Plan};
 use super::route::{By, Decision, Flows, Key, Reason, FLOW_IDLE, MAX_FLOWS};
 use super::{l3, Shared};
 use crate::config::{random, Protocol};
@@ -427,6 +427,12 @@ impl Shared {
 	/// Sends one IP packet into link `link`, which must be up. False when it went nowhere: the tunnel has no session with the other node, or no way to it.
 	pub(super) async fn into_link(&self, plan: &Plan, link: usize, packet: &[u8]) -> bool {
 		let (of, mut out) = (&plan.links[link], Vec::new());
+		// The packet goes to the engine of the upstream, which carries it to the provider under its own WireGuard.
+		if let Carrier::Upstream(upstream) = &of.carrier {
+			let sent = upstream.send(packet);
+			if sent {of.state.traffic.up(packet.len())}
+			return sent;
+		}
 		let tunnel = &plan.inbounds[of.inbound].tunnel;
 		let route = {
 			let mut peers = tunnel.lock();
@@ -436,7 +442,7 @@ impl Shared {
 		};
 		let Some(route) = route else {return false};
 		let unsent = tunnel.unsent.load(std::sync::atomic::Ordering::Relaxed);
-		for datagram in &out {route.send(tunnel, datagram, false, Room::Mtu(of.mtu)).await}
+		for datagram in &out {route.send(tunnel, datagram, false, Room::Mtu(of.mtu())).await}
 		// A link's inbound carries links alone, so a send the system refused on it now was one of this link's: the size warning.
 		if of.listener && tunnel.unsent.load(std::sync::atomic::Ordering::Relaxed) > unsent {of.state.warn(&of.tag)}
 		of.state.traffic.up(packet.len());
@@ -478,6 +484,7 @@ impl Shared {
 			None => {
 				let Some(link) = links.iter().copied().filter(|at| plan.up(*at)).max_by_key(|at| self.nat.rank(&key, &plan.links[*at].id)) else {
 					// "While it is down, every flow routed to it is refused with the ICMP error or reset that an unreachable exit gives, new and live flows alike, and the refusal is counted. Nothing routed to it leaves through another exit."
+					for at in links {if let Carrier::Upstream(upstream) = &plan.links[*at].carrier {upstream.refused()}}
 					return self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await;
 				};
 				match self.nat.map(&key, ident, id, plan.links[link].id, ports, &self.flows) {
@@ -487,13 +494,13 @@ impl Shared {
 			}
 		};
 		let of = &plan.links[link];
-		let Some(address) = of.addresses.iter().copied().find(|address| address.is_ipv4() == packet.src.is_ipv4()) else {return self.refuse(plan, from, &raw, packet, Reason::Unsupported, true).await};
+		let Some(address) = of.address(packet.src.is_ipv4()) else {return self.refuse(plan, from, &raw, packet, Reason::Unsupported, true).await};
 		// "Nothing is fragmented for a link, in either direction. A packet that does not fit the link is dropped, and its sender gets the ICMP error with the link's MTU: the user's device from the entry."
-		if raw.len() > usize::from(of.mtu) {
+		if raw.len() > usize::from(of.mtu()) {
 			self.count(Reason::TooBig);
-			return self.icmp_error(plan, from, &raw, packet, Kind::TooBig(of.mtu)).await;
+			return self.icmp_error(plan, from, &raw, packet, Kind::TooBig(of.mtu())).await;
 		}
-		clamp(&mut raw, packet, of.mtu);
+		clamp(&mut raw, packet, of.mtu());
 		rewrite(&mut raw, packet, true, address, ports.then_some(port));
 		fields(&mut raw, packet);
 		if packet.protocol == Protocol::TCP && raw.get(packet.upper + 13).is_some_and(|flags| flags & 0x05 != 0) {self.flows.track(&key, id, FLOW_IDLE, true)}
@@ -512,7 +519,7 @@ impl Shared {
 		let Some(packet) = netstack::parse(&raw) else {return lost(Reason::Unparsable)};
 		if packet.fragment {return lost(Reason::Fragment)}
 		raw.truncate(packet.len);
-		if !of.addresses.contains(&packet.dst) {return lost(Reason::NoFlow)}
+		if !of.owns(packet.dst) {return lost(Reason::NoFlow)}
 		// Destination unreachable, time exceeded and parameter problem, and for ICMPv6 packet too big as well: found by the packet they quote, which is one the entry sent.
 		let error = matches!((packet.protocol, packet.icmp), (Protocol::ICMP, Some((3 | 11 | 12, _))) | (Protocol::ICMPV6, Some((1..=4, _))));
 		let found = if error {
@@ -563,7 +570,7 @@ impl Shared {
 			}
 			None => {
 				rewrite(&mut raw, &packet, false, key.src, echo.or((packet.sport != 0 || packet.dport != 0).then_some(key.sport)));
-				clamp(&mut raw, &packet, of.mtu);
+				clamp(&mut raw, &packet, of.mtu());
 				// A flow no handler watches lives by what its packets say, as one through an l3 exit does.
 				let (idle, closing) = match packet.protocol {
 					Protocol::TCP => (l3::TCP_IDLE, raw.get(packet.upper + 13).is_some_and(|flags| flags & 0x05 != 0)),
@@ -588,13 +595,13 @@ impl Shared {
 		let Backend::Chain {links} = &plan.exits[exit].backend else {return None};
 		let link = links.iter().copied().filter(|at| plan.up(*at)).max_by_key(|at| self.nat.rank(&Key {protocol: Protocol::UDP, src: server.ip(), dst: server.ip(), sport: 53, dport: server.port()}, &plan.links[*at].id))?;
 		let of = &plan.links[link];
-		let address = of.addresses.iter().copied().find(|address| address.is_ipv4() == server.is_ipv4())?;
+		let address = of.address(server.is_ipv4())?;
 		// The query goes out under an id the node draws for it, as every lookup of the node's resolver does, and only a response under that id is the answer.
 		let (mut asked, mut id) = (query.to_vec(), [0u8; 2]);
 		random(&mut id).ok()?;
 		asked.get_mut(..2)?.copy_from_slice(&id);
 		// The answer comes back as one datagram, which the exit drops when it is larger than the link: a query that offers more than the link carries offers what it carries, so the server truncates what would not fit.
-		dns::edns(&mut asked, of.mtu.saturating_sub(if server.is_ipv4() {28} else {48}));
+		dns::edns(&mut asked, of.mtu().saturating_sub(if server.is_ipv4() {28} else {48}));
 		let (port, answer) = self.nat.own(of.id, server)?;
 		let mut raw = Vec::new();
 		let built = match (address, server.ip()) {
@@ -602,7 +609,7 @@ impl Shared {
 			(IpAddr::V6(from), IpAddr::V6(to)) => etherparse::PacketBuilder::ipv6(from.octets(), to.octets(), HOPS).udp(port, server.port()).write(&mut raw, &asked),
 			_ => return None,
 		};
-		let sent = built.is_ok() && raw.len() <= usize::from(of.mtu) && self.into_link(plan, link, &raw).await;
+		let sent = built.is_ok() && raw.len() <= usize::from(of.mtu()) && self.into_link(plan, link, &raw).await;
 		if sent {plan.exits[exit].traffic.up(query.len())}
 		let answer = if sent {tokio::time::timeout(LOOKUP, answer).await.ok().and_then(Result::ok)} else {None};
 		self.nat.forget(of.id, Protocol::UDP, server, port);
