@@ -260,6 +260,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="upstream_state"
+path="fuzz_targets/upstream_state.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="engine_store"
 path="fuzz_targets/engine_store.rs"
 test=false

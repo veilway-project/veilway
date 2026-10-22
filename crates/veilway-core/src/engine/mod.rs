@@ -22,6 +22,7 @@ pub mod resolver;
 pub mod route;
 pub mod stream;
 pub mod tunnel;
+pub mod upstream_state;
 pub mod usage;
 pub mod xray;
 mod xray_owner;
