@@ -2,6 +2,33 @@
 
 This document is binding. Protocol, panel and client code is reviewed against it, and a change that breaks an invariant in section 7 is a bug even if every test passes. It was first written before any of the new design existed. The core engine of `PLAN.md` Phase 1 is now built up to live reload (config v1, several inbounds, routing rules, the `netstack` and `l3` exits, the node's resolver), and the parts about it describe code. The native protocol, the panel and the multi-platform client do not exist yet, so the rest still describes requirements, not results.
 
+## At a glance
+
+A one-page summary. The sections below are the reference, and where they differ from this page they win.
+
+**Who uses it.** People on censored or hostile networks who reach the internet through a node that someone they trust runs. The provider (the node and panel operator) is trusted with their traffic; the network in between is not.
+
+**What we protect, in order** (section 3):
+1. That a person or an address uses Veilway at all (AS1), and that a node stays reachable (AS2). On a censored network this comes before everything else.
+2. What goes through the tunnel and who it goes to, from anyone on the path (AS3, AS4).
+3. The keys: device keys, node and transport keys, the provider's signing and gateway keys, subscription links (AS5, AS6).
+4. The panel, the node host, the client device, and the release and update keys (AS7, AS9 to AS11).
+5. Users of one node from each other (AS12).
+
+**Who we defend against** (section 5): a censor that inspects traffic and actively probes servers; a provider who turns malicious; hostile subscriptions, theme files and links; a stolen panel session; a hostile peer inside the tunnel or a hostile upstream proxy; an attacker on the update path or the local network; the supply chain; the hosts of mirrors and the Xray add-on.
+
+**The rules that hold whatever the config says** (section 7, binding, each with a test):
+- A listener says nothing to a stranger that the decoy site would not say, and a stranger cannot tell a user's path from a refusal by bytes or timing.
+- A proof is accepted once, also across a restart.
+- No cryptography is written here; only reviewed libraries.
+- Transport keys are separate from WireGuard keys, per device where they can be, and revocable.
+- Every packet from a device is checked for its own source address before anything else, and the always-refused destinations are refused before any rule.
+- Everything read from the network, a subscription, a theme or a provider is treated as hostile and fails closed (section 6 lists every parser).
+
+**What we do not promise** (section 9): beating an observer who sees both ends; protection when a device, node or panel is itself compromised; anonymity from the provider; that a user cannot be recognized across sessions; that any transport is undetectable (only that named probes did not detect it on a given date); stopping abuse of an exit; security of the Xray protocols beyond the upstream software; surviving a large denial-of-service attack or a seized unlocked device; isolation between users that the operator's own rules turn off.
+
+**Where to look next.** What is not finished: section 8. Questions still open in the protocol: section 10. How this document stays true: section 11.
+
 ## 1. How to read this
 
 **Status labels.** Every mechanism carries one of four labels.
