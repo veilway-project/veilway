@@ -649,7 +649,7 @@ async fn decide(ctx: &Arc<Ctx>, id: u32, fields: Fields, ended: bool, rx: mpsc::
 	let target = [b"GET ".as_slice(), get(b":path").unwrap_or_default(), b" HTTP/1.1\r\n"].concat();
 	let candidate = get(b":method") == Some(b"CONNECT") && get(b":protocol") == Some(b"websocket") && !ended && fields.iter().map(|(name, value)| name.len() + value.len() + 4).sum::<usize>() <= HEAD_MAX && Line::parse(&target).is_some();
 	let line = if candidate {target} else {b"GET /a HTTP/1.1\r\n".to_vec()};
-	let proved = prove(&ctx.shared, &ctx.listener, &ctx.served, &line, &[], |route| candidate && ctx.modern && route.over == Over::Tls, ctx.peer.ip(), place.as_ref()).await;
+	let proved = prove(&ctx.shared, &ctx.listener, &ctx.served, &line, &[], &[], |route| candidate && ctx.modern && route.over == Over::Tls, ctx.peer.ip(), place.as_ref()).await;
 	match proved {
 		Ok(accepted) => {
 			drop(place);

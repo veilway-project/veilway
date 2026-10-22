@@ -311,6 +311,7 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 					Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
 					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 					Transport::FakeTls {candidates, ..} => candidates.len(),
+					Transport::WsPlain {stream, ..} => stream.candidates.len(),
 				}, Vec::new());
 				tried += 1;
 				let unreachable = loop {

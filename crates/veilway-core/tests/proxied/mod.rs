@@ -855,9 +855,12 @@ impl Device {
 	}
 
 	/// The same on a connection that is there already: one with TLS on it, to a `tls` transport.
-	pub async fn open_on(&mut self, mut io: Box<dyn Wire>, path: &str, name: Name, at: u64) -> String {
+	pub async fn open_on(&mut self, io: Box<dyn Wire>, path: &str, name: Name, at: u64) -> String {self.open_with(io, name, at, |token| upgrade(path, token)).await}
+
+	/// The same with the whole request made from the token by `request`: a transport that carries it elsewhere than in the query.
+	pub async fn open_with(&mut self, mut io: Box<dyn Wire>, name: Name, at: u64, request: impl FnOnce(&str) -> Vec<u8>) -> String {
 		let proof = self.prover.prove(name, at, &mut random).unwrap();
-		io.write_all(&forwarded(&upgrade(path, &proof.token), &self.named)).await.unwrap();
+		io.write_all(&forwarded(&request(&proof.token), &self.named)).await.unwrap();
 		let _ = io.flush().await;
 		let (mut head, mut buf) = (Vec::new(), vec![0u8; 4096]);
 		let end = loop {

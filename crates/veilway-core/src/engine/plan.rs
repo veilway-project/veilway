@@ -176,6 +176,8 @@ pub struct Native {
 	pub node: udp_obfs::Node,
 	/// Set for an inbound with a transport that takes the stream proof.
 	pub prover: Option<Arc<Prover>>,
+	/// One for each `ws-plain` transport of the inbound, each with the keys of its own.
+	pub plain: Vec<Arc<Prover>>,
 	/// Whether the inbound has a `udp-obfs` transport, whose opening packets name a device by an epoch tag.
 	epochs: bool,
 	/// Set for an inbound with `faketls` transports, one for each, whose hellos name a device by an hour tag.
@@ -191,11 +193,17 @@ pub struct Native {
 
 impl Native {
 	/// `now` is the wall clock in Unix seconds, which decides the epochs of the first table.
-	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, epochs: bool, prover: Option<Arc<Prover>>, borrowed: Vec<Arc<Borrowed>>, now: u64) -> Native {
-		let native = Native {node: udp_obfs::Node::new(inbound), prover, epochs, borrowed, wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, hour: 0, table: keys::Table::new(), collisions: 0}))};
+	pub fn new(inbound: &[u8; 32], padding: Option<config::Padding>, mtu: u16, keys: Vec<Arc<Derived>>, epochs: bool, prover: Option<Arc<Prover>>, plain: Vec<Arc<Prover>>, borrowed: Vec<Arc<Borrowed>>, now: u64) -> Native {
+		let native = Native {node: udp_obfs::Node::new(inbound), prover, plain, epochs, borrowed, wide: padding.and_then(|padding| padding.wide).map_or(WIDE_DEFAULT, u32::from), normal: padding.and_then(|padding| padding.normal).map_or(NORMAL_DEFAULT, u32::from), mtu, keys, tags: RwLock::new(Arc::new(Tags {epoch: 0, hour: 0, table: keys::Table::new(), collisions: 0}))};
 		native.swap(native.build(now));
 		native
 	}
+
+	/// What opens the tokens of a route: the prover of the inbound for a route with no keys of its own, and for a `ws-plain` route the one made with its keys. None when this plan has none for them, as when a route outlives its plan for a moment.
+	pub fn prover_for(&self, keys: &[[u8; 32]]) -> Option<&Arc<Prover>> {if keys.is_empty() {self.prover.as_ref()} else {self.plain.iter().find(|prover| prover.keys == keys)}}
+
+	/// Whether a node transport key opens tokens of this inbound now.
+	pub fn holds(&self, key: &[u8; 32]) -> bool {self.prover.iter().chain(&self.plain).any(|prover| prover.keys.contains(key))}
 
 	/// The table for the epochs around `now`. It costs one HMAC for each tag that was not computed before, so it runs away from the packet path.
 	/// "Each entry knows which kind it is. A device tag is valid only in a stream proof, an epoch tag only on an opening packet and an hour tag only in a `faketls` hello": a kind of tag no transport of the inbound asks for is not in the table at all.
@@ -204,7 +212,7 @@ impl Native {
 		let hour = faketls::hour(now);
 		let hours = [hour.saturating_sub(1), hour, hour + 1];
 		for derived in &self.keys {
-			if self.prover.is_some() && !table.device(derived.named, derived.device.clone()) {collisions += 1}
+			if (self.prover.is_some() || !self.plain.is_empty()) && !table.device(derived.named, derived.device.clone()) {collisions += 1}
 			// The first epochs of all time name the same epoch twice, and a tag is in the table once.
 			for (at, tag) in derived.tags(epochs).into_iter().enumerate().filter(|_| self.epochs) {
 				if !epochs[..at].contains(&epochs[at]) && !table.epoch(tag, derived.device.clone()) {collisions += 1}
@@ -623,8 +631,13 @@ impl Plan {
 				// The transport keys open tokens only where a transport of the inbound takes them. What opens them is the plan before's while the keys are the same keys in the same order.
 				let secret: Vec<[u8; 32]> = inbound.transport_keys.iter().flatten().filter(|_| inbound.proved()).map(|key| key.0).collect();
 				let prover = if secret.is_empty() {None} else if let Some(kept) = previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()?.prover.as_ref()).find(|kept| kept.keys == secret) {Some(kept.clone())} else {Some(Arc::new(Prover::new(&secret, &public)?))};
+				// Each `ws-plain` transport has its own keys, and so its own prover, kept the same way.
+				let plain = inbound.transports.iter().filter_map(|transport| if let Transport::WsPlain {transport_keys, ..} = transport {Some(transport_keys.iter().map(|key| key.0).collect::<Vec<_>>())} else {None}).map(|secret| match previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()).flat_map(|native| &native.plain).find(|kept| kept.keys == secret) {
+					Some(kept) => Ok(kept.clone()),
+					None => Prover::new(&secret, &public).map(Arc::new),
+				}).collect::<anyhow::Result<Vec<_>>>()?;
 				let borrowed = inbound.transports.iter().filter_map(|transport| if let Transport::FakeTls {transport_key, ..} = transport {Some(Borrowed::new(transport_key.0, &public).map(Arc::new))} else {None}).collect::<anyhow::Result<Vec<_>>>()?;
-				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, inbound.enveloped(), prover, borrowed, now.unix_timestamp().max(0) as u64));
+				inbounds[i].native = Some(Native::new(&public, inbound.padding, inbounds[i].mtu, keys, inbound.enveloped(), prover, plain, borrowed, now.unix_timestamp().max(0) as u64));
 			}
 			Ok(())
 		};

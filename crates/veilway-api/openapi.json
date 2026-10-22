@@ -2149,7 +2149,8 @@
           "tls",
           "fronted",
           "fronted-shaped",
-          "faketls"
+          "faketls",
+          "ws-plain"
         ],
         "type": "string"
       },

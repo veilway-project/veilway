@@ -130,6 +130,10 @@ fn sound(read: &Subscription) {
 					assert!(profile.transport_public_key != Some(*key) && candidates.iter().all(|candidate| is_host(&candidate.sni)));
 					candidates.iter().map(|candidate| candidate.address).collect()
 				}
+				Transport::WsPlain {key, cookie, stream} => {
+					assert!(profile.transport_public_key != Some(*key) && (1..=32).contains(&cookie.len()) && stream.path.len() >= 12 && stream.candidates.iter().all(|candidate| candidate.sni.is_none() && candidate.verify_name.is_none() && candidate.pins.is_empty() && candidate.ech.is_none() && is_host(&candidate.host)));
+					stream.candidates.iter().map(|candidate| candidate.address).collect()
+				}
 			};
 			assert!((1..=CANDIDATES_MAX).contains(&dials.len()));
 			for address in dials.iter().map(|dial| dial.address()) {assert!(address.port() != 0 && !address.ip().is_loopback() && !address.ip().is_unspecified() && !address.ip().is_multicast() && !address.ip().to_canonical().is_loopback() && address.ip().to_canonical() == address.ip(), "{address}")}

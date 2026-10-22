@@ -609,7 +609,7 @@ impl Bench {
 		for (device, _) in devices {peers.add(*device, None)}
 		let (state, keys) = (State::default(), devices.iter().flat_map(|(device, secrets)| secrets.iter().map(|secret| Arc::new(Derived::new(secret, &public, device)))).collect());
 		let listener = state.listen(Arc::new(Tunnel::new("bench".to_string(), peers, mpsc::channel(1).0)), cap);
-		Bench {listener, state, limits: limits::State::default(), native: Native::new(&public, None, 1390, keys, true, None, Vec::new(), now), replay: Guard::unwritten(1024, now), work: Work::default()}
+		Bench {listener, state, limits: limits::State::default(), native: Native::new(&public, None, 1390, keys, true, None, Vec::new(), Vec::new(), now), replay: Guard::unwritten(1024, now), work: Work::default()}
 	}
 
 	/// One datagram from `from` at the wall clock `now`, in Unix milliseconds. What the node would send back to `from`, and how many IP packets came out of the tunnel.

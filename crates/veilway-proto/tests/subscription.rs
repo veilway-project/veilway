@@ -351,6 +351,7 @@ fn judge(name: &str, document: &Value, want: Want) {
 				Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.iter().map(|dial| dial.address().to_string()).collect::<Vec<_>>(),
 				Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
 				Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
+				Transport::WsPlain {stream, ..} => stream.candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
 			}).collect::<Vec<_>>();
 			let [gone] = read.profiles[0].dropped[..] else {panic!("{name}: {:?}", read.profiles[0].dropped)};
 			assert_eq!((gone.count, gone.cause, read.profiles[1].dropped.is_empty()), (1, Cause::NoCandidates, true), "{name}");

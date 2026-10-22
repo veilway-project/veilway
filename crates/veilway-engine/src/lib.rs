@@ -285,6 +285,7 @@ fn addresses(transport: &Transport) -> Vec<veilway_proto::subscription::payload:
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.clone(),
 		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 		Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
+		Transport::WsPlain {stream, ..} => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 	}
 }
 

@@ -149,7 +149,7 @@ impl Config {
 				let at = format!("{at}.transports[{j}]");
 				// Protocol overview, "Config and profile fields this draft assumes": "On a `veilway` inbound, `ws` is the native format and has no `tls` key." It is told from the `ws` of a `wireguard` inbound by its decoy, and neither is ever taken for the other.
 				if inbound.kind == InboundType::Veilway && matches!(transport, Transport::Ws {..}) {r.error(format!("{at}.type"), "expected a ws transport with a decoy and trusted_proxies: the ws of a veilway inbound is the native format behind the operator's own web server, and not the ws of a wireguard inbound")}
-				if let Transport::UdpObfs {limits, ..} | Transport::Tls {limits, ..} | Transport::WsNative {limits, ..} | Transport::Fronted {limits, ..} | Transport::FrontedShaped {limits, ..} = transport {
+				if let Transport::UdpObfs {limits, ..} | Transport::Tls {limits, ..} | Transport::WsNative {limits, ..} | Transport::WsPlain {limits, ..} | Transport::Fronted {limits, ..} | Transport::FrontedShaped {limits, ..} = transport {
 					// Every device of a `veilway` inbound has the transport secret the envelope and the proof are keyed with. A device of a `wireguard` inbound has none.
 					if inbound.kind != InboundType::Veilway {r.error(format!("{at}.type"), "expected \"udp\" or a \"ws\" without a decoy: udp-obfs, tls, fronted and the ws with a decoy are transports of a veilway inbound, whose devices have the transport secrets they are keyed with")}
 					if limits.and_then(|limits| limits.sessions).is_some_and(|sessions| !(1..=MAX_SESSIONS).contains(&sessions)) {r.error(format!("{at}.limits.sessions"), format!("expected an integer from 1 to {MAX_SESSIONS}"))}
@@ -187,7 +187,7 @@ impl Config {
 						if set.is_some() {r.error(format!("{at}.limits.{key}"), "expected no such key: it is a pool of the proxy path, and a tls listener has only direct peers")}
 					}
 				}
-				if let Transport::Tls {path, decoy, limits, ..} | Transport::WsNative {path, decoy, limits, ..} | Transport::Fronted {path, decoy, limits, ..} | Transport::FrontedShaped {path, decoy, limits, ..} = transport {
+				if let Transport::Tls {path, decoy, limits, ..} | Transport::WsNative {path, decoy, limits, ..} | Transport::WsPlain {path, decoy, limits, ..} | Transport::Fronted {path, decoy, limits, ..} | Transport::FrontedShaped {path, decoy, limits, ..} = transport {
 					// The characters are those the request line test passes on, and the length is "Request path: at least 12 characters".
 					if !path.starts_with('/') || !(MIN_PROOF_PATH_BYTES..=MAX_WS_PATH_BYTES).contains(&path.len()) || !path.bytes().all(|b| b.is_ascii_alphanumeric() || b"._~/-".contains(&b)) || path.split('/').any(|part| part == "..") {
 						r.error(format!("{at}.path"), format!("expected a path that starts with /, is {MIN_PROOF_PATH_BYTES} to {MAX_WS_PATH_BYTES} bytes from A-Z a-z 0-9 . _ ~ / - and has no .. component"));
@@ -449,6 +449,18 @@ impl Config {
 				let Transport::FakeTls {transport_key, ..} = transport else {continue};
 				let at = format!("inbounds[{i}].transports[{j}].transport_key");
 				if wireguard.contains(&transport_key.0) {r.error(at, "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(transport_key.0) {r.error(at, "expected a key of its own: the key of a faketls transport equals no other transport key of the node, so that a leak of it opens nothing else")}
+			}
+		}
+		// Transports page, "ws-plain", "Its own transport key": the keys of a `ws-plain` transport are its own, because its proofs travel where the whole path can record them. One or two, never the same twice, and none is a WireGuard key or a key of another transport or inbound. Its path is not a path of a covered transport of the same inbound.
+		for (i, inbound) in self.inbounds.iter().enumerate().take(MAX_INBOUNDS) {
+			for (j, transport) in inbound.transports.iter().enumerate().take(MAX_TRANSPORTS) {
+				let Transport::WsPlain {path: plain, transport_keys, ..} = transport else {continue};
+				let at = format!("inbounds[{i}].transports[{j}].transport_keys");
+				if !(1..=MAX_TRANSPORT_KEYS).contains(&transport_keys.len()) {r.error(&at, format!("expected 1 or {MAX_TRANSPORT_KEYS} transport keys"))}
+				for (k, key) in transport_keys.iter().enumerate().take(MAX_TRANSPORT_KEYS) {
+					if wireguard.contains(&key.0) {r.error(format!("{at}[{k}]"), "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(key.0) {r.error(format!("{at}[{k}]"), "expected a key of its own: the keys of a ws-plain transport equal no other transport key of the node, and are not given twice, so that a leak of one opens nothing else")}
+				}
+				if inbound.transports.iter().take(MAX_TRANSPORTS).any(|other| match other {Transport::Tls {path, ..} | Transport::Ws {path, ..} => path == plain, Transport::WsPlain {..} => false, other => other.proxied().is_some_and(|proxied| proxied.path == plain)}) {r.error(format!("inbounds[{i}].transports[{j}].path"), "expected a path no tls, ws or fronted transport of the inbound uses: a profile refuses a ws-plain transport whose path is a covered one")}
 			}
 		}
 		// Per user: the exits they are entitled to, their groups, and the inbounds their devices live in.

@@ -217,7 +217,7 @@ impl Host {
 				match transport {
 					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
 					Transport::Udp {..} | Transport::UdpObfs {..} => {}
-					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} | Transport::FrontedShaped {listen, decoy, ..} => {
+					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::WsPlain {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} | Transport::FrontedShaped {listen, decoy, ..} => {
 						if !self.tls.contains_key(&listen.0) && !listeners.iter().any(|(addr, _)| *addr == listen.0) {
 							listeners.push((listen.0, bind(listen.0, Type::STREAM, self.released.contains(&listen.0)).await.and_then(|socket| {
 								socket.listen(1024)?;
@@ -422,7 +422,7 @@ impl Host {
 						});
 						routes.entry(listen.0).or_default().push((path.clone(), tls.clone(), inbound.tunnel.clone(), id));
 					}
-					Transport::Tls {..} | Transport::WsNative {..} | Transport::Fronted {..} | Transport::FrontedShaped {..} | Transport::FakeTls {..} => {}
+					Transport::Tls {..} | Transport::WsNative {..} | Transport::WsPlain {..} | Transport::Fronted {..} | Transport::FrontedShaped {..} | Transport::FakeTls {..} => {}
 				}
 			}
 		}
@@ -434,6 +434,7 @@ impl Host {
 				let (route, limits) = match transport {
 					Transport::Tls {path, limits, ..} => (stream::Route::tls(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(true)), *limits),
 					Transport::WsNative {path, limits, ..} => (stream::Route::ws(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(false)), *limits),
+					Transport::WsPlain {path, limits, transport_keys, ..} => (stream::Route::ws_plain(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(false), transport_keys.iter().map(|key| key.0).collect()), *limits),
 					Transport::Fronted {path, limits, ..} => (stream::Route::fronted(path.clone(), inbound.tunnel.clone()), *limits),
 					Transport::FrontedShaped {path, limits, shape, ..} => match shape.resolve() {
 						Ok(shape) => (stream::Route::fronted_shaped(path.clone(), inbound.tunnel.clone(), Arc::new(shape)), *limits),

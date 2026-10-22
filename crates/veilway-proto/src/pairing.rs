@@ -161,6 +161,8 @@ pub fn transports_json(transports: &[Transport]) -> String {
 		Transport::Tls(tls) => stream("tls", tls),
 		Transport::Ws(ws) => stream("ws", ws),
 		Transport::Fronted(fronted) => stream("fronted", fronted),
+		// No link lists it either: `listed` refuses the type, so this text is never read back.
+		Transport::WsPlain {stream: plain, ..} => stream("ws-plain", plain),
 		// No link lists it: `listed` refuses the type, so this text is never read back.
 		Transport::FrontedShaped(fronted, _) => stream("fronted-shaped", fronted),
 		// Nor this one, for the same reason.
@@ -181,7 +183,7 @@ pub fn transports(text: &[u8]) -> Result<Vec<Transport>, CodeError> {
 fn listed(item: &json::Json) -> Result<Transport, CodeError> {
 	let written = Members::of(item).and_then(|members| members.list("candidates", 0..=usize::MAX).ok().flatten()).map(<[_]>::len);
 	payload::transport(item).ok().and_then(|read| read.transport).filter(|transport| match transport {
-		Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => false,
+		Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} | Transport::WsPlain {..} => false,
 		Transport::Tls(stream) | Transport::Ws(stream) if written != Some(stream.candidates.len()) => false,
 		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none() && !candidate.self_signed),
 		_ => true,
@@ -260,6 +262,7 @@ impl Offer {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.clone(),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 			Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
+			Transport::WsPlain {stream, ..} => stream.candidates.iter().map(|candidate| candidate.address).collect(),
 		}).map(|dial| (dial.address(), dial.private())).collect()
 	}
 	/// The object of the offer as the code carried it.

@@ -1932,6 +1932,62 @@
         },
         {
           "additionalProperties": false,
+          "description": "The native WebSocket session over plain HTTP, behind the operator's own web server, for a `veilway` inbound: `ws` without TLS between the client and the front. The token travels in a `Cookie` field under the inbound's `upgrade_cookie`, the proof names the transport `ws-plain`, and the keys are its own, not the inbound's. The upgrade answer sets no cookie.",
+          "properties": {
+            "client_address_header": {
+              "pattern": "^[A-Za-z0-9-]{1,64}$",
+              "type": "string"
+            },
+            "decoy": {
+              "$ref": "#/$defs/Decoy"
+            },
+            "limits": {
+              "$ref": "#/$defs/TransportLimits"
+            },
+            "listen": {
+              "$ref": "#/$defs/Addr"
+            },
+            "path": {
+              "description": "The path a proof arrives on, as the web server in front hands it on, which the origin must answer as it answers any other path.",
+              "pattern": "^/[A-Za-z0-9._~/-]{11,255}$",
+              "type": "string"
+            },
+            "transport_keys": {
+              "description": "The private halves of this transport's own keys: one, or two while the key is rotated (the new one first, then the old). A proof is tried against both, and profiles carry the public half of the first. No other key of the node may be one of them.",
+              "items": {
+                "$ref": "#/$defs/TransportKey"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "trusted_proxies": {
+              "items": {
+                "$ref": "#/$defs/Proxy"
+              },
+              "maxItems": 64,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "ws-plain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "listen",
+            "path",
+            "decoy",
+            "trusted_proxies",
+            "transport_keys"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Polling with HTTP requests through a CDN that allows nothing better, behind the operator's own web server, for a `veilway` inbound. Its keys are those of the native `ws`.",
           "properties": {
             "client_address_header": {

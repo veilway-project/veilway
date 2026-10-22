@@ -117,6 +117,7 @@ fn count(transport: &Transport) -> usize {
 		Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.len(),
 		Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 		Transport::FakeTls {candidates, ..} => candidates.len(),
+		Transport::WsPlain {stream, ..} => stream.candidates.len(),
 	}
 }
 
@@ -414,6 +415,7 @@ impl Core {
 			Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) => endpoints.get(candidate).map(|dial| skipped(self.consented, dial, &self.networks)),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
 			Transport::FakeTls {candidates, ..} => candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
+			Transport::WsPlain {stream, ..} => stream.candidates.get(candidate).map(|found| skipped(self.consented, &found.address, &self.networks)),
 		};
 		found.unwrap_or(false)
 	}

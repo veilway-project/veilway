@@ -236,16 +236,19 @@ impl Subscription {
 	/// Only the profiles' addresses, which is not the set a cap is computed from: the pinned endpoints of the link and of `refresh_urls` that are IP literals count too, and only the client knows the link. A cap uses `Held::datagram_addresses` or `Review::datagram_addresses`.
 	pub fn profile_datagram_addresses(&self) -> HashSet<IpAddr> {self.profiles.iter().flat_map(|profile| &profile.transports).flat_map(|transport| if let Transport::Udp(endpoints) | Transport::UdpObfs(endpoints) = transport {&endpoints[..]} else {&[]}).map(|dial| dial.address().ip()).collect()}
 	/// The cover candidates whose address is in `datagram`, by their places in `profiles`, in the transports and in the lists of candidates as they are held (`Profile::document_place` gives the places the document wrote), as (profile, transport, candidate): "a cover transport whose address is also the address of a `udp` or `udp-obfs` endpoint is capped at Detectable". `datagram` is the set a cap is computed from, `Held::datagram_addresses` or `Review::datagram_addresses`. A `faketls` candidate is a cover candidate and is compared like any other.
+	/// A cover candidate is also in the answer when its address or a name it uses (`host`, `sni`) is the address or the `host` of a `ws-plain` candidate of the subscription: "a covered transport that shares either with a `ws-plain` transport is capped at Detectable".
 	pub fn capped(&self, datagram: &HashSet<IpAddr>) -> Vec<(usize, usize, usize)> {
+		let plain: Vec<&Candidate> = self.profiles.iter().flat_map(|profile| &profile.transports).filter_map(|transport| if let Transport::WsPlain {stream, ..} = transport {Some(stream)} else {None}).flat_map(|stream| &stream.candidates).collect();
+		let shared = |dial: &Dial, names: &[&str]| plain.iter().any(|other| other.address.address().ip() == dial.address().ip() || names.iter().any(|name| name.eq_ignore_ascii_case(&other.host)));
 		let mut found = Vec::new();
 		for (at, profile) in self.profiles.iter().enumerate() {
 			for (place, transport) in profile.transports.iter().enumerate() {
-				let addresses: Vec<Dial> = match transport {
-					Transport::Udp(_) | Transport::UdpObfs(_) => Vec::new(),
-					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| candidate.address).collect(),
-					Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| candidate.address).collect(),
+				let addresses: Vec<(Dial, bool)> = match transport {
+					Transport::Udp(_) | Transport::UdpObfs(_) | Transport::WsPlain {..} => Vec::new(),
+					Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.iter().map(|candidate| (candidate.address, shared(&candidate.address, &[&candidate.host, candidate.sni.as_deref().unwrap_or_default()]))).collect(),
+					Transport::FakeTls {candidates, ..} => candidates.iter().map(|candidate| (candidate.address, shared(&candidate.address, &[&candidate.sni]))).collect(),
 				};
-				found.extend(addresses.iter().enumerate().filter(|(_, dial)| datagram.contains(&dial.address().ip())).map(|(candidate, _)| (at, place, candidate)));
+				found.extend(addresses.iter().enumerate().filter(|(_, (dial, shared))| *shared || datagram.contains(&dial.address().ip())).map(|(candidate, _)| (at, place, candidate)));
 			}
 		}
 		found
@@ -318,8 +321,12 @@ pub enum Cause {
 	Faketls,
 	/// A `faketls` key equal to the profile's `transport_public_key`.
 	KeyOfProfile,
-	/// A `faketls` key that another `faketls` transport has too. Neither is kept.
+	/// A `faketls` or `ws-plain` key that another one of those has too. Neither is kept.
 	KeyTwice,
+	/// A `ws-plain` transport without a key or a cookie that read, with a member it must not have (`appearance` in version 1), or whose candidates or path did not read.
+	WsPlain,
+	/// A `ws-plain` transport whose host or path is one that a covered transport of the profile uses.
+	Separation,
 }
 
 impl Cause {
@@ -330,6 +337,8 @@ impl Cause {
 			Self::Faketls => "faketls",
 			Self::KeyOfProfile => "key_of_profile",
 			Self::KeyTwice => "key_twice",
+			Self::WsPlain => "ws_plain",
+			Self::Separation => "separation",
 		}
 	}
 }
@@ -388,6 +397,8 @@ pub enum Transport {
 	FrontedShaped(Stream, Shape),
 	/// Borrowed-site mode (borrowed-site page), alpha: `key` is the public key of this transport's own key on the node, `T_pub`, and the candidates are in the provider's order.
 	FakeTls {key: [u8; 32], candidates: Vec<Borrowed>},
+	/// WebSocket without TLS (transports page, `ws-plain`): `key` is the public half of the transport's own key on the node, `cookie` is the name the token travels under, and the candidates have an address and a `host` and nothing else.
+	WsPlain {key: [u8; 32], cookie: String, stream: Stream},
 }
 
 /// A candidate of a `faketls` transport: the node's address, and in `sni` the name of the site the node borrows, never the node's own.
@@ -557,6 +568,7 @@ impl fmt::Debug for Transport {
 			Self::Fronted(stream) => write!(f, "Fronted({} candidates)", stream.candidates.len()),
 			Self::FrontedShaped(stream, _) => write!(f, "FrontedShaped({} candidates)", stream.candidates.len()),
 			Self::FakeTls {candidates, ..} => write!(f, "FakeTls({} candidates)", candidates.len()),
+			Self::WsPlain {stream, ..} => write!(f, "WsPlain({} candidates)", stream.candidates.len()),
 		}
 	}
 }
@@ -703,7 +715,7 @@ pub(crate) fn addresses(members: Members, name: &'static str) -> Named<Vec<IpAdd
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Pins {Required, Allowed, Forbidden}
+enum Pins {Required, Allowed, Forbidden, Plain}
 
 // What a `faketls` transport and its candidates do not have: there is no front, no path and no certificate to check but the one the client derives. One of them refuses the candidate it is on, or the transport when it is on the transport.
 const BORROWED_NOT: [&str; 8] = ["path", "host", "verify_name", "ech", "pins", "self_signed", "http2", "shape"];
@@ -713,6 +725,11 @@ fn host<'a>(members: Members<'a>, name: &'static str) -> Named<Option<&'a str>> 
 fn candidate(value: &Json, rule: Pins) -> Named<Candidate> {
 	let members = Members::of(value).ok_or("candidates")?;
 	let address = Dial::parse(need("address", members.string("address", STRING_MAX))?).ok_or("address")?;
+	// A `ws-plain` candidate has an address and a `host` for the Host field: there is no TLS to name, check or pin.
+	if rule == Pins::Plain {
+		if let Some(name) = ["sni", "verify_name", "pins", "ech", "self_signed", "http2"].into_iter().find(|name| members.get(name).is_some()) {return Err(name)}
+		return Ok(Candidate {address, sni: None, host: need("host", host(members, "host"))?.to_owned(), verify_name: None, ech: None, pins: Vec::new(), self_signed: false, http2: Http2::Fetch});
+	}
 	// "`self_signed` on a candidate of any other transport, or a value that is not a boolean, refuses that candidate." Only `tls` requires pins.
 	let self_signed = members.boolean("self_signed")?;
 	if self_signed.is_some() && rule != Pins::Required {return Err("self_signed")}
@@ -777,6 +794,12 @@ pub(crate) fn transport(value: &Json) -> Result<Read, Fault> {
 			let (found, places, left) = stream(Pins::Forbidden)?;
 			made(found.map(|stream| Transport::FrontedShaped(stream, shape)), places, left)
 		}
+		// A `ws-plain` transport is refused, and left out, for an `appearance` (no value is defined in version 1), for a key or a `cookie` that does not read, for a path that does not read and for a list with no candidate that reads. The cookie is 1 to 32 characters of `A-Z a-z 0-9 _ -`.
+		"ws-plain" => {
+			let (key, cookie) = (members.string("transport_public_key", 44).ok().flatten().and_then(public), members.string("cookie", 32).ok().flatten().filter(|cookie| !cookie.is_empty() && cookie.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')));
+			let (Some(key), Some(cookie), None, Ok((Some(stream), places, left))) = (key, cookie, members.get("appearance"), stream(Pins::Plain)) else {return Ok(Read {transport: None, places: Vec::new(), dropped: Some((Cause::WsPlain, 1))})};
+			made(Some(Transport::WsPlain {key, cookie: cookie.to_owned(), stream}), places, left)
+		}
 		// A `faketls` transport is refused, and left out, for a member it must not have, for a `transport_public_key` that is missing or does not read, and for a `candidates` that is not a list of 1 to 16. Its key is a public key of X25519 like the profile's, so one of small order is refused too.
 		"faketls" => {
 			let (key, list) = (members.string("transport_public_key", 44).ok().flatten().and_then(public), members.list("candidates", 1..=CANDIDATES_MAX).ok().flatten());
@@ -819,13 +842,24 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	if gateways.len() != device.addresses.len() || gateways.iter().zip(&device.addresses).any(|(gateway, address)| gateway.is_ipv4() != address.is_ipv4() || gateway == address) {return Err(Fault::Member("gateways"))}
 	let transport_public_key = key32(members, "transport_public_key", public)?;
 	// "A `faketls` key equal to the profile's `transport_public_key` or to another `faketls` transport's key refuses that `faketls` transport only." Of two with one key neither is kept: nothing says which of them has it right.
-	let borrowed: Vec<[u8; 32]> = kept.iter().filter_map(|(transport, _)| if let Transport::FakeTls {key, ..} = transport {Some(*key)} else {None}).collect();
+	// A `ws-plain` key is held to the same two rules: it is a key of its own.
+	let borrowed: Vec<[u8; 32]> = kept.iter().filter_map(|(transport, _)| if let Transport::FakeTls {key, ..} | Transport::WsPlain {key, ..} = transport {Some(*key)} else {None}).collect();
 	kept.retain(|(transport, place)| {
-		let Transport::FakeTls {key, ..} = transport else {return true};
+		let (Transport::FakeTls {key, ..} | Transport::WsPlain {key, ..}) = transport else {return true};
 		let cause = if transport_public_key == Some(*key) {Cause::KeyOfProfile} else if borrowed.iter().filter(|other| *other == key).count() > 1 {Cause::KeyTwice} else {return true};
 		// What was recorded of its candidates is moot once the transport itself is gone.
 		dropped.retain(|drop| drop.transport != place.transport);
 		dropped.push(Dropped {transport: place.transport, count: 1, cause});
+		false
+	});
+	// "A `ws-plain` transport may not use a host or a path that any `tls`, `ws` or `fronted` candidate uses": the transport is refused, the covered ones stay.
+	let covered: Vec<&Stream> = kept.iter().filter_map(|(transport, _)| if let Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) = transport {Some(stream)} else {None}).collect();
+	let apart: Vec<bool> = kept.iter().map(|(transport, _)| !matches!(transport, Transport::WsPlain {stream, ..} if covered.iter().any(|other| other.path == stream.path || other.candidates.iter().any(|used| stream.candidates.iter().any(|plain| used.host.eq_ignore_ascii_case(&plain.host) || used.sni.as_ref().is_some_and(|sni| sni.eq_ignore_ascii_case(&plain.host))))))).collect();
+	let mut apart = apart.into_iter();
+	kept.retain(|(_, place)| {
+		if apart.next() == Some(true) {return true}
+		dropped.retain(|drop| drop.transport != place.transport);
+		dropped.push(Dropped {transport: place.transport, count: 1, cause: Cause::Separation});
 		false
 	});
 	dropped.sort_by_key(|drop| drop.transport);
@@ -1097,5 +1131,67 @@ mod tests {
 		// A profile that lost nothing says so.
 		let whole = self::read(&profile_of(vec![faketls(0x41, two()), obfs()], Some(0x31))).unwrap();
 		assert!(whole.dropped.is_empty() && whole.find(1, 0) == Some((1, 0)));
+	}
+
+	fn plain(fill: u8, path: &str, host: &str) -> Value {json!({"type": "ws-plain", "transport_public_key": key(fill), "cookie": "sid_1-A", "path": path, "candidates": [{"address": "192.0.2.40:80", "host": host}]})}
+	fn covered(kind: &str, path: &str, host: &str) -> Value {json!({"type": kind, "path": path, "candidates": [{"address": "192.0.2.41:443", "sni": host, "host": host}]})}
+
+	#[test]
+	fn a_ws_plain_transport_reads_with_its_own_key_and_a_cookie() {
+		let Some(Transport::WsPlain {key: node, cookie, stream}) = kept(plain(0x51, "/plain/upgrade-1", "plain.example.com")) else {panic!("not read")};
+		assert_eq!((node, cookie.as_str(), stream.path.as_str(), stream.candidates.len()), (proof::public_key(&[0x51; 32]), "sid_1-A", "/plain/upgrade-1", 1));
+		assert!(stream.candidates[0].sni.is_none() && stream.candidates[0].pins.is_empty() && stream.candidates[0].host == "plain.example.com");
+		let read = read(&profile_of(vec![plain(0x51, "/plain/upgrade-1", "plain.example.com")], None)).unwrap();
+		assert_eq!((read.transports.len(), read.transport_public_key), (1, None));
+	}
+
+	#[test]
+	fn a_ws_plain_transport_that_does_not_read_is_left_out_alone() {
+		let mut cases = Vec::new();
+		let cookie = |value: Value| {let mut transport = plain(0x51, "/plain/upgrade-1", "plain.example.com"); transport["cookie"] = value; transport};
+		cases.extend(["", "has space", "semi;colon", "quote\"d", "equals=x", "a".repeat(33).as_str(), "caf\u{e9}"].map(|bad| cookie(json!(bad))));
+		cases.extend([cookie(json!(5)), cookie(Value::Null)]);
+		let mut missing = plain(0x51, "/plain/upgrade-1", "plain.example.com");
+		missing.as_object_mut().unwrap().remove("cookie");
+		cases.push(missing);
+		let mut no_key = plain(0x51, "/plain/upgrade-1", "plain.example.com");
+		no_key.as_object_mut().unwrap().remove("transport_public_key");
+		cases.push(no_key);
+		let mut appearance = plain(0x51, "/plain/upgrade-1", "plain.example.com");
+		appearance["appearance"] = json!("anything");
+		cases.push(appearance);
+		for member in ["sni", "verify_name", "ech", "pins", "self_signed", "http2"] {
+			let mut with = plain(0x51, "/plain/upgrade-1", "plain.example.com");
+			with["candidates"][0][member] = json!("x");
+			cases.push(with);
+		}
+		let mut no_host = plain(0x51, "/plain/upgrade-1", "plain.example.com");
+		no_host["candidates"][0].as_object_mut().unwrap().remove("host");
+		cases.push(no_host);
+		cases.push(plain(0x51, "/short", "plain.example.com"));
+		cases.push(plain(0x51, "/plain/upgrade-1", "Plain.example.com"));
+		for (at, case) in cases.into_iter().enumerate() {
+			let read = read(&profile_of(vec![case, obfs()], Some(0x31))).unwrap();
+			assert_eq!((read.transports.len(), read.dropped.iter().map(|drop| drop.cause).collect::<Vec<_>>()), (1, vec![Cause::WsPlain]), "case {at}");
+		}
+	}
+
+	#[test]
+	fn a_ws_plain_key_is_a_key_of_its_own() {
+		let read = read(&profile_of(vec![plain(0x31, "/plain/upgrade-1", "plain.example.com"), plain(0x52, "/plain/upgrade-2", "plain.example.org"), plain(0x53, "/plain/upgrade-3", "plain.example.net"), plain(0x53, "/plain/upgrade-4", "plain.example.dev"), faketls(0x52, two()), obfs()], Some(0x31))).unwrap();
+		assert_eq!(read.dropped.iter().map(|drop| (drop.transport, drop.cause)).collect::<Vec<_>>(), [(0, Cause::KeyOfProfile), (1, Cause::KeyTwice), (2, Cause::KeyTwice), (3, Cause::KeyTwice), (4, Cause::KeyTwice)]);
+	}
+
+	#[test]
+	fn a_ws_plain_host_or_path_that_a_covered_transport_uses_refuses_the_ws_plain_transport() {
+		for (kind, plain_path, plain_host, covered_path, covered_host) in [("tls", "/a/shared-path", "plain.example.com", "/a/shared-path", "front.example.com"), ("ws", "/plain/upgrade-1", "front.example.com", "/covered/path-1", "front.example.com"), ("fronted", "/plain/upgrade-1", "front.example.com", "/covered/path-1", "front.example.com")] {
+			let mut covered = covered(kind, covered_path, covered_host);
+			if kind == "tls" {covered["candidates"][0]["pins"] = json!([pin()])}
+			let plain = plain(0x51, plain_path, plain_host);
+			let read = read(&profile_of(vec![covered, plain, obfs()], Some(0x31))).unwrap();
+			assert_eq!((read.transports.len(), read.dropped.iter().map(|drop| (drop.transport, drop.cause)).collect::<Vec<_>>()), (2, vec![(1, Cause::Separation)]), "{kind} {plain_host}");
+		}
+		let fine = read(&profile_of(vec![covered("ws", "/covered/path-1", "front.example.com"), plain(0x51, "/plain/upgrade-1", "plain.example.com"), obfs()], Some(0x31))).unwrap();
+		assert!(fine.dropped.is_empty() && fine.transports.len() == 3);
 	}
 }

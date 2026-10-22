@@ -316,7 +316,7 @@ impl State {
 		for seat in seats {
 			let at = plan.inbound_of(&seat.tunnel);
 			// "When a node transport key is removed, sessions opened with it are dropped within one second, by the same path": removing it is the operator's one answer to a key that leaked.
-			let keyed = seat.key.is_none_or(|key| at.and_then(|at| plan.inbounds[at].native.as_ref()?.prover.as_ref()).is_some_and(|prover| prover.keys.contains(&key)));
+			let keyed = seat.key.is_none_or(|key| at.and_then(|at| plan.inbounds[at].native.as_ref()).is_some_and(|native| native.holds(&key)));
 			// A node link this node is dialled for is held to the same: the session of a link that was removed or changed ends with it.
 			if cut(&seat.device) || !keyed || !at.is_some_and(|at| plan.holds(at, &seat.device, &seat.secret.0)) {
 				seat.end(Ended::Revoked);

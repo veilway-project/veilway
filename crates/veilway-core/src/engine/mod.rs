@@ -107,6 +107,8 @@ pub enum Over {
 	Tls,
 	/// The native `ws` of a `veilway` inbound, behind the operator's web server.
 	WsNative,
+	/// The `ws-plain` transport of a `veilway` inbound: the native `ws` session over plain HTTP, with its token in a cookie.
+	WsPlain,
 	Fronted,
 	/// The `fronted-shaped` transport of a `veilway` inbound.
 	FrontedShaped,

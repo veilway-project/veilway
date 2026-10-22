@@ -314,6 +314,17 @@ impl Config {
 				if let Some(Json::Arr(list)) = inbound.get_mut("transports") {
 					for (t, transport) in list.iter_mut().enumerate() {
 						let Json::Obj(transport) = transport else {continue};
+						// The keys of a `ws-plain` transport are named among the keys of the `ws-plain` transports of the running inbound.
+						if let Some(Json::Arr(list)) = transport.get_mut("transport_keys") {
+							for (k, key) in list.iter_mut().enumerate() {
+								let Json::Str(value) = key else {continue};
+								if !value.starts_with("<redacted") {continue}
+								match was.into_iter().flat_map(|was| &was.transports).flat_map(|kept| if let Transport::WsPlain {transport_keys, ..} = kept {&transport_keys[..]} else {&[]}).find(|kept| super::reload::marker(&kept.0) == *value) {
+									Some(kept) => *value = STANDARD.encode(kept.0),
+									None => report.error(format!("inbounds[{i}].transports[{t}].transport_keys[{k}]"), "expected a transport key: the marker of one names a key of a ws-plain transport of the running inbound with this tag, as the config that was read shows it, and that inbound has none this marker names. A key that is new has to be sent itself"),
+								}
+							}
+						}
 						let Some(Json::Str(value)) = transport.get_mut("transport_key").filter(|value| matches!(&**value, Json::Str(value) if value.starts_with("<redacted"))) else {continue};
 						match was.into_iter().flat_map(|was| &was.transports).find_map(|kept| match kept {Transport::FakeTls {transport_key, ..} if super::reload::marker(&transport_key.0) == *value => Some(transport_key), _ => None}) {
 							Some(kept) => *value = STANDARD.encode(kept.0),

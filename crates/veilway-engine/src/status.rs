@@ -202,6 +202,8 @@ impl Connection {
 			Transport::Ws(stream) => ("ws", stream),
 			Transport::Fronted(stream) => ("fronted", stream),
 			Transport::FrontedShaped(stream, _) => ("fronted-shaped", stream),
+			// The client half of `ws-plain` comes next: nothing dials it yet, so there is no connection to show.
+			Transport::WsPlain {..} => return None,
 		};
 		let found = stream.candidates.get(candidate)?;
 		let check = if found.self_signed {Check::PinnedSelfSigned} else if found.pins.is_empty() {Check::Public} else {Check::PublicAndPin};

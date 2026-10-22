@@ -18,10 +18,11 @@ const OBFS_OPEN: &[u8] = b"veilway v1 udp-obfs open\0";
 const OBFS_C2S: &[u8] = b"veilway v1 udp-obfs c2s\0";
 const OBFS_S2C: &[u8] = b"veilway v1 udp-obfs s2c\0";
 pub(crate) const CONTROL_AUTH: &[u8] = b"veilway v1 control auth\0";
-// The stream proof: the start of the HPKE `info`, the three names that follow it, and the exporter contexts.
+// The stream proof: the start of the HPKE `info`, the names that follow it, and the exporter contexts.
 pub(crate) const PROOF: &[u8] = b"veilway v1 proof\0";
 pub(crate) const TLS: &[u8] = b"tls\0";
 pub(crate) const WS: &[u8] = b"ws\0";
+pub(crate) const WS_PLAIN: &[u8] = b"ws-plain\0";
 pub(crate) const FRONTED: &[u8] = b"fronted\0";
 pub(crate) const FRONTED_SHAPED: &[u8] = b"fronted-shaped\0";
 pub(crate) const BINDER: &[u8] = b"veilway v1 binder\0";

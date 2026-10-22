@@ -44,6 +44,7 @@ pub fn class(transport: &Transport) -> Class {
 		Transport::Tls(_) | Transport::Ws(_) | Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => Class::Cover,
 		Transport::UdpObfs(_) => Class::NoCover,
 		Transport::Udp(_) => Class::Plain,
+		Transport::WsPlain {..} => Class::Exposed,
 	}
 }
 
@@ -62,6 +63,7 @@ pub fn digest(transports: &[Transport]) -> u64 {
 			Transport::Fronted(stream) => (4, &[][..], Some(stream)),
 			Transport::FrontedShaped(stream, _) => (5, &[][..], Some(stream)),
 			Transport::FakeTls {..} => (6, &[][..], None),
+			Transport::WsPlain {stream, ..} => (7, &[][..], Some(stream)),
 		};
 		take(&[kind]);
 		// A new key, a new address or a new site is another transport too.
@@ -147,7 +149,8 @@ fn sound(network: &mut Network, standing: &mut Standing, profile: u64, now: u64)
 }
 
 /// Whether a transport may be used under the client's `alpha_transports` setting: "No `faketls` candidate is dialed until it is on." Every other transport may.
-pub fn usable(transport: &Transport, alpha: bool) -> bool {alpha || !matches!(transport, Transport::FakeTls {..})}
+// The client half of `ws-plain` is not built yet, so no build dials it.
+pub fn usable(transport: &Transport, alpha: bool) -> bool {!matches!(transport, Transport::WsPlain {..}) && (alpha || !matches!(transport, Transport::FakeTls {..}))}
 
 /// The transports of a profile a client may try now, in the order to try them, and the classes it must ask about before it may use them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

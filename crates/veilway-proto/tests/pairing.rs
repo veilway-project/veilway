@@ -64,6 +64,7 @@ proptest! {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),
 			Transport::FakeTls {candidates, ..} => candidates.len(),
+			Transport::WsPlain {stream, ..} => stream.candidates.len(),
 		}).sum::<usize>());
 		let (answer, dialler) = pastes.answer(&offer, now + lifetime, &mut seeded(seeds.1)).unwrap();
 		prop_assert_eq!(answer.len(), ANSWER_CHARS);

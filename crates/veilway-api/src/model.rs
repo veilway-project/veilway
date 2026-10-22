@@ -600,7 +600,7 @@ impl From<veilway_core::ReplayStatus> for Replay {
 /// The transport a device came over, as the config names it: `ws` is the relay of a `wireguard` inbound, and on a `veilway` inbound the native WebSocket session behind the operator's web server.
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted, #[serde(rename = "fronted-shaped")] FrontedShaped, #[serde(rename = "faketls")] FakeTls}
+pub enum Transport {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted, #[serde(rename = "fronted-shaped")] FrontedShaped, #[serde(rename = "faketls")] FakeTls, #[serde(rename = "ws-plain")] WsPlain}
 
 /// A device with a live session on one inbound. The address the device connects from is not part of it.
 #[derive(Serialize, JsonSchema)]

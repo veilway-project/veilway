@@ -399,7 +399,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let mut origins = HashSet::new();
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
-			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..} | Transport::FrontedShaped {path, decoy: origin, ..}) = transport else {continue};
+			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::WsPlain {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..} | Transport::FrontedShaped {path, decoy: origin, ..}) = transport else {continue};
 			// The answer to a `fronted` request is no upgrade and takes no field from the origin.
 			let wanted = if matches!(transport, Transport::Fronted {..} | Transport::FrontedShaped {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
 			if origins.insert((origin.origin.host(), path.clone())) {lines.extend(decoy(&format!("inbound {}, transports[{t}].decoy", inbound.tag), origin, path, &wanted, wait).await)}

@@ -117,6 +117,20 @@ pub fn field_once<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 	found
 }
 
+/// The value of the cookie `name` for a head with exactly one `Cookie` field that holds exactly one cookie of that name, which is how a `ws-plain` request carries its token. The field is `name=value` pairs joined by `; `, and a pair that is not `token=value` makes the whole field unreadable. The value is returned only when it is 1 or more characters of `A-Z a-z 0-9 _ -`: no quote, no blank, no `=`, no padding.
+/// `None` for a head with no `Cookie` field, with two, with two cookies of that name, with a malformed pair, or with a value outside that alphabet. The caller does not tell these apart: all of them are "not a user".
+pub fn cookie_once<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+	let mut found = None;
+	for (at, pair) in field_once(head, b"cookie")?.split(|byte| *byte == b';').enumerate() {
+		let pair = if at == 0 {pair} else {pair.strip_prefix(b" ")?};
+		let equals = pair.iter().position(|byte| *byte == b'=')?;
+		let (cookie, value) = (&pair[..equals], &pair[equals + 1..]);
+		if cookie.is_empty() || !cookie.iter().all(|byte| token(*byte)) {return None}
+		if cookie == name && found.replace(value).is_some() {return None}
+	}
+	found.filter(|value| !value.is_empty() && value.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-'))
+}
+
 /// The address a trusted proxy says a request came from: "the rightmost address in the header named by `client_address_header` that is not itself inside `trusted_proxies`. If the header is absent or unreadable, it is the peer", which is None here.
 /// `name` is the header's name and `trusted` says whether an address is inside `trusted_proxies`. Fields of that name are one list in the order they stand in. An entry is an address as it is written, an IPv6 address also inside brackets, and an IPv4 address inside an IPv6 one is the IPv4 address.
 /// An entry that is no address, to the right of every address that is not a proxy's, makes the header unreadable. What stands to the left of the answer is whatever a visitor sent to the first proxy, and is never read.
@@ -289,6 +303,21 @@ mod tests {
 	use super::*;
 
 	fn body(head: &str) -> Option<Framing> {request(head.as_bytes()).body}
+
+	#[test]
+	fn a_token_is_read_from_one_cookie_of_one_field_and_nowhere_else() {
+		let head = |fields: &str| format!("GET /p HTTP/1.1\r\nHost: a\r\n{fields}\r\n");
+		let read = |fields: &str| cookie_once(head(fields).as_bytes(), b"sid").map(<[u8]>::to_vec);
+		assert_eq!(read("Cookie: sid=abc_-9\r\n"), Some(b"abc_-9".to_vec()));
+		assert_eq!(read("cookie:\tsid=abc \r\n"), Some(b"abc".to_vec()));
+		assert_eq!(read("Cookie: a=b; sid=abc; c=d\r\n"), Some(b"abc".to_vec()));
+		for fields in [
+			"", "Cookie: other=abc\r\n", "Cookie: SID=abc\r\n", "Cookie: sid=abc\r\nCookie: sid=abc\r\n", "Cookie: sid=abc\r\nCookie: x=y\r\n", "Cookie: sid=abc; sid=abc\r\n", "Cookie: sid=abc; sid=def\r\n",
+			"Cookie: sid=\r\n", "Cookie: sid=\"abc\"\r\n", "Cookie: sid=ab c\r\n", "Cookie: sid=abc=\r\n", "Cookie: sid=abc;\r\n", "Cookie: sid=abc;x=y\r\n", "Cookie: sid=abc;  x=y\r\n", "Cookie: sid=abc; \r\n", "Cookie: ; sid=abc\r\n",
+			"Cookie: sid=abc; novalue\r\n", "Cookie: sid=abc; =x\r\n", "Cookie: sid=abc; a b=c\r\n", "Cookie: sid=abc,def\r\n", "Cookie: sid=ab\u{e9}\r\n", "Cookie: sid=abc\r\n x\r\n", "Cookie : sid=abc\r\n", "Cookie sid=abc\r\n", "Cookie: sid=a\0b\r\n",
+		] {assert_eq!(read(fields), None, "{fields:?}")}
+		assert_eq!(cookie_once(b"GET /p HTTP/1.1\r\nCookie: sid=abc\r\n", b"sid"), None);
+	}
 
 	#[test]
 	fn a_request_ends_where_its_head_says_and_nowhere_else() {

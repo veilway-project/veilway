@@ -352,25 +352,30 @@ pub struct Route {
 	pub method: Method,
 	pub over: Over,
 	pub transport: Transport,
-	/// `upgrade_cookie` and `upgrade_headers` of its inbound.
+	/// `upgrade_cookie` and `upgrade_headers` of its inbound. On a `ws-plain` route the cookie is the one the token is read from, and none is set.
 	pub cookie: String,
 	pub headers: Vec<String>,
+	/// The private halves of the keys of a `ws-plain` route, which tell its prover from the inbound's. Empty on every other route.
+	pub keys: Vec<[u8; 32]>,
 	/// The shape of a `fronted-shaped` route, which decides how its requests are read and answered.
 	pub shape: Option<Arc<Shape>>,
 }
 
 impl Route {
 	/// The route of a `tls` transport.
-	pub fn tls(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Tls, method: Method::Get, over: Over::Tls, transport: Transport::Tls, cookie, headers, shape: None}}
+	pub fn tls(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Tls, method: Method::Get, over: Over::Tls, transport: Transport::Tls, cookie, headers, keys: Vec::new(), shape: None}}
 
 	/// The route of a native `ws` transport: the session of `tls`, opened by a request that came through the operator's web server.
-	pub fn ws(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Ws, method: Method::Get, over: Over::WsNative, transport: Transport::Ws, cookie, headers, shape: None}}
+	pub fn ws(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>) -> Route {Route {id: 0, path, tunnel, name: Name::Ws, method: Method::Get, over: Over::WsNative, transport: Transport::Ws, cookie, headers, keys: Vec::new(), shape: None}}
+
+	/// The route of a `ws-plain` transport: the session of the native `ws`, opened by a request whose token is in a cookie, with a proof that names `ws-plain` and keys of the transport's own. The answer sets no cookie.
+	pub fn ws_plain(path: String, tunnel: Arc<Tunnel>, cookie: String, headers: Vec<String>, keys: Vec<[u8; 32]>) -> Route {Route {id: 0, path, tunnel, name: Name::WsPlain, method: Method::Get, over: Over::WsPlain, transport: Transport::Ws, cookie, headers, keys, shape: None}}
 
 	/// The route of a `fronted` transport, whose requests are `POST`s and whose answers are no upgrade.
-	pub fn fronted(path: String, tunnel: Arc<Tunnel>) -> Route {Route {id: 0, path, tunnel, name: Name::Fronted, method: Method::Post, over: Over::Fronted, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), shape: None}}
+	pub fn fronted(path: String, tunnel: Arc<Tunnel>) -> Route {Route {id: 0, path, tunnel, name: Name::Fronted, method: Method::Post, over: Over::Fronted, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), keys: Vec::new(), shape: None}}
 
 	/// The route of a `fronted-shaped` transport: requests in the shape it names, in a method that may be any, and answers that are no upgrade. Its proofs carry a name of their own, so none of another transport's opens here.
-	pub fn fronted_shaped(path: String, tunnel: Arc<Tunnel>, shape: Arc<Shape>) -> Route {Route {id: 0, path, tunnel, name: Name::FrontedShaped, method: Method::Other, over: Over::FrontedShaped, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), shape: Some(shape)}}
+	pub fn fronted_shaped(path: String, tunnel: Arc<Tunnel>, shape: Arc<Shape>) -> Route {Route {id: 0, path, tunnel, name: Name::FrontedShaped, method: Method::Other, over: Over::FrontedShaped, transport: Transport::Fronted, cookie: String::new(), headers: Vec::new(), keys: Vec::new(), shape: Some(shape)}}
 }
 
 /// The pools of one listener (transports page, "Node capacity numbers").
@@ -756,10 +761,13 @@ impl Listener {
 				answer.extend_from_slice(format!("{}: {}, {:02} {} {} {:02}:{:02}:{:02} GMT\r\n", known.map_or(name.as_str(), |(spelled, _)| spelled), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][usize::from(now.weekday().number_days_from_monday())], now.day(), ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][usize::from(u8::from(now.month())) - 1], now.year(), now.hour(), now.minute(), now.second()).as_bytes());
 			} else if let Some((spelled, value)) = known {answer.extend_from_slice(format!("{spelled}: {value}\r\n").as_bytes())}
 		}
-		// "One `Set-Cookie` field. Its value is random base64url text of a random length. It carries no meaning. It exists so that the answer's length varies."
-		random(&mut cookie).ok()?;
-		let length = uniform(*COOKIE.start(), *COOKIE.end(), &mut random).ok()? as usize;
-		answer.extend_from_slice(format!("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\nSet-Cookie: {}={}\r\n\r\n", websocket::accept(key), route.cookie, &URL_SAFE_NO_PAD.encode(cookie)[..length]).as_bytes());
+		// "One `Set-Cookie` field. Its value is random base64url text of a random length. It carries no meaning. It exists so that the answer's length varies." A `ws-plain` answer has none: a path that watches the cookie would read it, and a value that the client never sends back is a tell.
+		let jar = if route.over == Over::WsPlain {String::new()} else {
+			random(&mut cookie).ok()?;
+			let length = uniform(*COOKIE.start(), *COOKIE.end(), &mut random).ok()? as usize;
+			format!("Set-Cookie: {}={}\r\n", route.cookie, &URL_SAFE_NO_PAD.encode(cookie)[..length])
+		};
+		answer.extend_from_slice(format!("Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n{jar}\r\n", websocket::accept(key)).as_bytes());
 		Some(answer)
 	}
 }
@@ -900,7 +908,7 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 	};
 	// 5. "Evaluate, at the end of the request line."
 	let proved = match line {
-		Ok(line) => prove(&shared, &listener, &served, &buf[..line], &[], |route| user && route.over == Over::Tls, peer.ip(), Some(&place)).await.map(|accepted| (line, accepted)),
+		Ok(line) => prove(&shared, &listener, &served, &buf[..line], &[], &[], |route| user && route.over == Over::Tls, peer.ip(), Some(&place)).await.map(|accepted| (line, accepted)),
 		Err(why) => Err(why),
 	};
 	match proved {
@@ -970,19 +978,21 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 /// The path is compared with every path of the listener, and the token is opened under the keys of every route of the listener, whichever path the line has: the work of a line does not say which path it had, or whether it had one of them.
 /// What that work does not make equal is on the transports page under "Timing", and nothing is added here to hide it.
 /// A line that passed steps 1 to 4 is a device's, and `place` is given up for it: from there on the connection is no stranger's, and no stranger's connection displaces it.
+/// `head` is the whole head of a request of the proxy path, and empty where there is none: a `ws-plain` route reads its token from the one cookie of it, and a request with anything in its query is not a user's there.
 /// `able` says of a route whether a line on this connection can be a user's on it at all, by what is known besides the line: the kind of peer, and on the proxy path the head of the request. On the proxy path "a `GET` for a `ws` path or a `POST` for a `fronted` path can be a user's", and `from` is the source its proxy named.
-async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], targets: &[Option<Target<'_>>], able: impl Fn(&Route) -> bool, from: IpAddr, place: Option<&Place>) -> Result<Accepted, Stranger> {
+async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line: &[u8], head: &[u8], targets: &[Option<Target<'_>>], able: impl Fn(&Route) -> bool, from: IpAddr, place: Option<&Place>) -> Result<Accepted, Stranger> {
 	let Some(line) = Line::parse_any(line) else {return Err(Stranger::Syntax)};
 	let (plan, paths): (Arc<Plan>, Vec<&[u8]>) = (shared.plan(), served.routes.iter().map(|route| route.path.as_bytes()).collect());
 	let (at, query) = (line.path_among(&paths), line.query.unwrap_or_default());
 	let natives: Vec<Option<(&Native, Arc<Tags>)>> = served.routes.iter().map(|route| plan.inbound_of(&route.tunnel).and_then(|inbound| plan.inbounds[inbound].native.as_ref()).map(|native| (native, native.tags()))).collect();
 	let mut found = None;
 	for (index, (route, native)) in served.routes.iter().zip(&natives).enumerate() {
-		let Some((prover, tags)) = native.as_ref().and_then(|(native, tags)| Some((native.prover.as_ref()?, tags))) else {continue};
+		let Some((prover, tags)) = native.as_ref().and_then(|(native, tags)| Some((native.prover_for(&route.keys)?, tags))) else {continue};
 		// A route with a shape reads its own target: the text of a proof is the one of an opening request in the form of the shape, and a later request is no proof. The others take the query of the line on their path and with their method, and none of them takes a line over 4,096 bytes.
 		let candidate = match (&route.shape, targets.get(index)) {
 			(Some(_), Some(Some(target))) => if let Who::Opening(token) = target.who {Some(token)} else {None},
 			(Some(_), _) => None,
+			(None, _) if route.over == Over::WsPlain => (able(route) && at == Some(index) && line.method == route.method && line.query.is_none()).then(|| http::cookie_once(head, route.cookie.as_bytes())).flatten(),
 			(None, _) => (able(route) && at == Some(index) && line.method == route.method).then_some(query),
 		};
 		if let Ok(opened) = prover.node.open(candidate.map(|_| route.name), candidate.unwrap_or(query), &tags.table) {found = Some((index, opened))}
@@ -995,7 +1005,7 @@ async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line:
 	// It remembers the node transport key its token opened under as well as the device secret: its chunk keys come from that key too, so the session ends when the config no longer has it.
 	let polled = matches!(route.over, Over::Fronted | Over::FrontedShaped).then(|| (listener.polled.clone(), served.front.as_ref().map_or(0, |front| front.fronted)));
 	let shaped = route.shape.as_ref().map(|_| (listener.shaped_pool.clone(), served.front.as_ref().map_or(0, |front| front.shaped)));
-	let seat = Seat::new(opened.device.public, opened.device.id, native.prover.as_ref().and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), polled.as_ref().map(|(polled, _)| polled.clone()), shaped.as_ref().map(|(shaped, _)| shaped.clone()), listener.counters.ended.clone(), route.transport.idle(), now.ms);
+	let seat = Seat::new(opened.device.public, opened.device.id, native.prover_for(&route.keys).and_then(|prover| prover.keys.get(opened.key).copied()), route.tunnel.clone(), listener.pool.clone(), polled.as_ref().map(|(polled, _)| polled.clone()), shaped.as_ref().map(|(shaped, _)| shaped.clone()), listener.counters.ended.clone(), route.transport.idle(), now.ms);
 	let (mut writes, mut waiting): (_, Option<(Instant, Held)>) = (replay.writes(), None);
 	loop {
 		// A write that ends after the rule was asked is one this proof has not seen yet, and wakes it.
@@ -1511,7 +1521,7 @@ async fn front(shared: Arc<Shared>, listener: Arc<Listener>, io: Stream, peer: S
 			// What no route of the listener could accept gets the decoy's answer at once, as on a listener without shaped routes: a line over the longest any route allows for its method, and a method that no shaped route has.
 			Ok(_) if parsed.is_none() && Scanner::new().feed(line) != Scan::Line(request.line) => Err(Stranger::Syntax),
 			Ok(_) if parsed.is_some_and(|parsed| !(matches!(parsed.method, Method::Get | Method::Post) && request.line <= LINE_MAX) && !served.routes.iter().any(|route| route.shape.as_ref().is_some_and(|shape| shape.up.method.as_bytes() == parsed.verb && request.line <= shape.line_max()))) => Err(Stranger::Syntax),
-			Ok(_) => prove(&shared, &listener, &served, line, &targets, able, source, None).await,
+			Ok(_) => prove(&shared, &listener, &served, line, &buf[..end], &targets, able, source, None).await,
 		};
 		// 4. A request of a shaped route that is a user's: the opening request of a proof that was accepted, or a later request whose `sid` is a session of this listener, on the route of that session.
 		let (proved, shaped_ask) = match proved {
@@ -2090,6 +2100,7 @@ impl Bench {
 		let routes: Vec<Route> = inbound.transports.iter().filter_map(|transport| match transport {
 			crate::config::Transport::Tls {path, ..} => Some(Route::tls(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(true))),
 			crate::config::Transport::WsNative {path, ..} => Some(Route::ws(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(false))),
+			crate::config::Transport::WsPlain {path, transport_keys, ..} => Some(Route::ws_plain(path.clone(), tunnel.clone(), cookie.clone(), inbound.upgrade_headers(false), transport_keys.iter().map(|key| key.0).collect())),
 			crate::config::Transport::Fronted {path, ..} => Some(Route::fronted(path.clone(), tunnel.clone())),
 			crate::config::Transport::FrontedShaped {path, shape, ..} => shape.resolve().ok().map(|shape| Route::fronted_shaped(path.clone(), tunnel.clone(), Arc::new(shape))),
 			_ => None,

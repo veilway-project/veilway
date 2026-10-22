@@ -177,7 +177,8 @@ impl Target {
 	/// A `faketls` target is made with the key of its own transport, and never with `Link::node`.
 	pub fn of(transport: &Transport, at: usize, link: &Link) -> Option<Self> {
 		Some(match transport {
-			Transport::Udp(_) => return None,
+			// The client half of `ws-plain` comes next: until then a profile's `ws-plain` transport is not served here.
+			Transport::Udp(_) | Transport::WsPlain {..} => return None,
 			Transport::UdpObfs(endpoints) => Self::UdpObfs(endpoints.get(at)?.address()),
 			Transport::Tls(stream) => Self::Tls {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::Ws(stream) => Self::Ws {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
