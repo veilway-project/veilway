@@ -406,7 +406,11 @@ impl Fetcher {
 		let (host, port, literal, plain) = (url.host().to_owned(), url.port(), url.literal(), url.is_plain());
 		let mut stream = None;
 		// A name asked for through a proxy chain is looked up by the last proxy of the chain, so that the node's own resolver never sees it.
-		if let (Some(named), None) = (&self.named, literal) {stream = named(host.clone(), port, Instant::now() + CONNECT_TIMEOUT).await.ok()} else {
+		if let (Some(named), None) = (&self.named, literal) {
+			// Plain HTTP through a proxy chain that looks the name up gives a hostile name nothing to check and anyone on the path the answer: it is refused.
+			if plain {return Err(FetchError::Resolve)}
+			stream = named(host.clone(), port, Instant::now() + CONNECT_TIMEOUT).await.ok()
+		} else {
 			// An IP literal is dialled as it is, with no lookup, and held to the same refusals as any address the system's resolver gives.
 			let addresses = match literal {
 				Some(ip) if dialable(ip) => vec![SocketAddr::new(ip, port)],

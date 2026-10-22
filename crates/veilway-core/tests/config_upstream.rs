@@ -21,7 +21,7 @@ fn secret(byte: u8) -> String {sealed(&[byte; 16])}
 
 fn upstream(tag: &str, signing: u8, token: u8, device: u8) -> Value {
 	let (text, fingerprint) = link(signing, token);
-	json!({"tag": tag, "link": text, "signing_key": fingerprint, "private_key": key(device), "device_secret": secret(device)})
+	json!({"tag": tag, "link": text, "signing_key": fingerprint, "private_key": key(device), "device_secret": secret(device), "exit": "main"})
 }
 
 fn good() -> Value {
@@ -31,7 +31,7 @@ fn good() -> Value {
 		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": key(0x11), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
 		"outbounds": [
 			{"tag": "plain", "type": "direct"},
-			{"tag": "proxy", "type": "socks5", "server": "127.0.0.1:1080"}
+			{"tag": "proxy", "type": "socks5", "server": "198.51.100.7:1080"}
 		],
 		"exits": [
 			{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}},
@@ -149,6 +149,36 @@ fn tags_are_checked_like_other_tags() {
 	error_at("upstreams[0].tag", |d| d["upstreams"][0]["tag"] = json!("direct"));
 	error_at("upstreams[0].profile", |d| d["upstreams"][0]["profile"] = json!("Not A Profile"));
 	error_at("upstreams[0].exit", |d| d["upstreams"][0]["exit"] = json!("x".repeat(65)));
+}
+
+#[test]
+fn the_tag_of_the_preview_route_is_refused() {
+	error_at("upstreams[0].tag", |d| {
+		d["upstreams"][0]["tag"] = json!("preview");
+		d["exits"][1]["backend"]["upstream"] = json!("preview");
+	});
+}
+
+#[test]
+fn a_via_that_is_a_proxy_on_this_host_is_refused() {
+	for server in ["127.0.0.1:1080", "0.0.0.0:1080", "169.254.1.1:1080", "[::1]:1080", "[fe80::1]:1080"] {
+		error_at("upstreams[0].via", |d| {
+			d["outbounds"][1]["server"] = json!(server);
+			d["upstreams"][0]["via"] = json!("proxy");
+		});
+	}
+	error_at("upstreams[0].via", |d| {
+		d["outbounds"].as_array_mut().unwrap().push(json!({"tag": "hop", "type": "socks5", "server": "127.0.0.1:1081"}));
+		d["outbounds"][1]["via"] = json!("hop");
+		d["upstreams"][0]["via"] = json!("proxy");
+	});
+}
+
+#[test]
+fn an_upstream_exit_with_a_fallback_and_an_upstream_without_an_exit_are_warned_about() {
+	let report = check(&with(|d| d["routing"]["fallback"] = json!(["main"])));
+	assert!(report.errors.is_empty() && report.warnings.iter().any(|w| w.path == "exits[1]" && w.message.contains("fallback")), "{report:#?}");
+	warning_at("upstreams[0].exit", |d| {d["upstreams"][0].as_object_mut().unwrap().remove("exit");});
 }
 
 #[test]

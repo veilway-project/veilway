@@ -141,6 +141,17 @@ impl Nat {
 		if let Some((device, user)) = charged {flows.unecho(&device, &user)}
 	}
 
+	/// Gives up every translation inside `link`, for a link whose session and addresses are about to be made again, and says which flows held one so that the caller can end them: their next packets are decided afresh, against what the link is then.
+	pub fn end_link(&self, link: &[u8; 16], flows: &Flows) -> Vec<(Key, u64)> {
+		let mut table = self.lock();
+		let fars: Vec<Far> = table.back.keys().filter(|far| far.link == *link).copied().collect();
+		let owned = fars.iter().filter_map(|far| match table.back.get(far)?.owner {Owner::Flow(key, _, id, _) => Some((key, id)), Owner::Own(_) | Owner::Tunnel(..) => None}).collect();
+		let charged: Vec<([u8; 32], Arc<str>)> = fars.iter().filter_map(|far| table.release(far, Instant::now())).collect();
+		drop(table);
+		for (device, user) in charged {flows.unecho(&device, &user)}
+		owned
+	}
+
 	/// Makes a translation for a flow inside `link`. `ports` says whether its protocol has ports or echo identifiers to draw.
 	pub fn map(&self, key: &Key, ident: u32, id: u64, link: [u8; 16], ports: bool, flows: &Flows) -> Result<u16, Unmapped> {
 		let held = if ident != 0 {self.lock().echoes.get(key).copied().unwrap_or(0)} else {0};

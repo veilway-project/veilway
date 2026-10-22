@@ -876,6 +876,8 @@ pub struct Upstream {
 	/// Seconds the upstream has been in `state`.
 	pub state_secs: u64,
 	pub provider: Option<String>,
+	/// The fingerprint of the signing key the document in force is signed under. After the provider rotated its key this is the new one, which `signing_key` and the link in the upstream's config do not name until the operator confirms it.
+	pub signing_key: Option<String>,
 	/// The profile in use, and the transport it is connected over.
 	pub profile: Option<String>,
 	pub transport: Option<Transport>,
@@ -925,7 +927,7 @@ impl From<Carrying> for Upstream {
 		Upstream {
 			tag: report.tag,
 			state: match report.phase {Phase::Fetching => UpstreamStatus::Fetching, Phase::Connecting => UpstreamStatus::Connecting, Phase::Up => UpstreamStatus::Up, Phase::Down => UpstreamStatus::Down},
-			reason: report.reason, state_secs: report.since.as_secs(), provider: report.provider, profile: report.profile,
+			reason: report.reason, state_secs: report.since.as_secs(), provider: report.provider, signing_key: report.signing_key, profile: report.profile,
 			transport: report.transport.map(transport_of), exit: report.exit, offered_exits: report.offered, notices: report.notices,
 			quota: report.usage.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes}),
 			expires_at: report.expires_at.map(|at| at as i64), refreshed_at: report.refreshed_at.map(|at| at as i64), refresh_error: report.refresh_error,

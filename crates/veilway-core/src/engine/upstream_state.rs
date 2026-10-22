@@ -25,6 +25,10 @@ const VERSION: u64 = 1;
 /// What is held for one upstream: the hash that binds it to its link and device, the id of the upstream as a carrier (16 random bytes drawn when the upstream first held a document, so that nothing about the link or the device is in it), and the stored subscription without its origin.
 pub type State = BTreeMap<String, ([u8; 32], [u8; 16], Stored)>;
 
+/// What the file holds: the documents, and a tombstone for each upstream the operator removed while a config still names it (its tag and the binding it was removed under). A tombstone keeps the node from enrolling that device again after a restart, and goes once a config is in force that no longer names the tag with that binding.
+#[derive(Debug, Default, PartialEq)]
+pub struct Content {pub held: State, pub left: BTreeMap<String, [u8; 32]>}
+
 fn bad(message: &'static str) -> io::Error {io::Error::new(io::ErrorKind::InvalidData, message)}
 
 /// The hash that joins a document to the link text and the device's public key it was fetched for.
@@ -44,12 +48,21 @@ fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
 }
 
 /// Reads the bytes of the file. Not JSON, a shape that is not this one, an entry count or a tag out of bounds, or a size past `FILE_MAX` is an error. JSON that is not an object of this version (an older or a newer file) is nothing held, which the next write replaces. An entry whose stored subscription is not one is left out, as `read_vault` leaves it out.
-pub fn parse(bytes: &[u8]) -> io::Result<State> {
+pub fn parse(bytes: &[u8]) -> io::Result<Content> {
 	if bytes.len() > FILE_MAX {return Err(bad("the file is larger than any upstream state"))}
 	let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| bad("the file is not JSON"))?;
-	let Some(upstreams) = value.get("version").and_then(serde_json::Value::as_u64).filter(|version| *version == VERSION).and_then(|_| value.get("upstreams")).and_then(serde_json::Value::as_object) else {return Ok(State::new())};
+	let Some(upstreams) = value.get("version").and_then(serde_json::Value::as_u64).filter(|version| *version == VERSION).and_then(|_| value.get("upstreams")).and_then(serde_json::Value::as_object) else {return Ok(Content::default())};
 	if upstreams.len() > UPSTREAMS_MAX {return Err(bad("the file holds more upstreams than a node has"))}
 	let mut state = State::new();
+	let mut left = BTreeMap::new();
+	if let Some(marked) = value.get("left") {
+		let marked = marked.as_object().ok_or(bad("the removed upstreams are not an object"))?;
+		if marked.len() > UPSTREAMS_MAX {return Err(bad("the file marks more removed upstreams than a node has"))}
+		for (tag, bound) in marked {
+			if tag.is_empty() || tag.len() > TAG_MAX {return Err(bad("a tag in the file is empty or too long"))}
+			left.insert(tag.clone(), bound.as_str().and_then(unhex::<32>).ok_or(bad("a removed upstream has no binding"))?);
+		}
+	}
 	for (tag, entry) in upstreams {
 		if tag.is_empty() || tag.len() > TAG_MAX {return Err(bad("a tag in the file is empty or too long"))}
 		let bound = entry.get("bound").and_then(serde_json::Value::as_str).and_then(unhex::<32>).ok_or(bad("an entry has no binding"))?;
@@ -57,13 +70,14 @@ pub fn parse(bytes: &[u8]) -> io::Result<State> {
 		let held = entry.get("held").filter(|held| held.as_array().is_some_and(|held| held.len() == 1)).ok_or(bad("an entry does not hold exactly one subscription"))?;
 		if let Some(stored) = read_vault(&serde_json::to_vec(held).map_err(|_| bad("an entry cannot be read"))?)?.into_iter().next() {state.insert(tag.clone(), (bound, id, Stored {origin: None, ..stored}));}
 	}
-	Ok(state)
+	Ok(Content {held: state, left})
 }
 
-/// The bytes of the file for `state`. The origin of every stored subscription is left out.
-pub fn encode(state: &State) -> Vec<u8> {
+/// The bytes of the file for `content`. The origin of every stored subscription is left out.
+pub fn encode(content: &Content) -> Vec<u8> {
+	let (state, left) = (&content.held, content.left.iter().map(|(tag, bound)| (tag.clone(), serde_json::Value::String(hex(bound)))).collect::<serde_json::Map<_, _>>());
 	let upstreams: serde_json::Map<String, serde_json::Value> = state.iter().map(|(tag, (bound, id, stored))| (tag.clone(), serde_json::json!({"bound": hex(bound), "id": hex(id), "held": serde_json::from_slice::<serde_json::Value>(&write_vault(&[Stored {origin: None, ..stored.clone()}])).unwrap_or_default()}))).collect();
-	serde_json::to_vec(&serde_json::json!({"version": VERSION, "upstreams": upstreams})).unwrap_or_default()
+	serde_json::to_vec(&serde_json::json!({"version": VERSION, "upstreams": upstreams, "left": left})).unwrap_or_default()
 }
 
 /// The file, shared by the vaults of all upstreams. A write reads the file again under the lock and changes its own entry only, so the vaults do not undo one another.
@@ -75,18 +89,18 @@ impl UpstreamFile {
 	pub fn vault(self: &Arc<Self>, tag: &str, link: &str, private: Secret<32>, secret: DeviceSecret) -> UpstreamVault {
 		let bound = bind(link, &proof::public_key(private.expose()));
 		// The id of an upstream that held a document under this binding stays; any other is drawn now, and written with the first document. A file that cannot be read is no reason not to have an id: the first write says why.
-		let id = self.read().ok().and_then(|state| state.get(tag).filter(|(was, ..)| *was == bound).map(|(_, id, _)| *id)).or_else(|| {let mut id = [0u8; 16]; random(&mut id).ok().map(|_| id)}).unwrap_or([0u8; 16]);
+		let id = self.read().ok().and_then(|content| content.held.get(tag).cloned()).filter(|(was, ..)| *was == bound).map(|(_, id, _)| id).or_else(|| {let mut id = [0u8; 16]; random(&mut id).ok().map(|_| id)}).unwrap_or([0u8; 16]);
 		UpstreamVault {file: self.clone(), tag: tag.to_owned(), bound, id, origin: (link.to_owned(), private, secret)}
 	}
 	/// Reads the file. A file that is not there is nothing held. One that is not a regular file of the node's own user, that group or others can read, or that is larger than `FILE_MAX` is an error and is left as it is.
-	pub fn read(&self) -> io::Result<State> {
+	pub fn read(&self) -> io::Result<Content> {
 		let mut options = OpenOptions::new();
 		options.read(true);
 		#[cfg(unix)]
 		std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NOFOLLOW | libc::O_NONBLOCK);
 		let file = match options.open(&self.path) {
 			Ok(file) => file,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(State::new()),
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Content::default()),
 			#[cfg(unix)]
 			Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Err(bad("the upstream state file is a link, not a regular file")),
 			Err(error) => return Err(error),
@@ -103,13 +117,22 @@ impl UpstreamFile {
 		file.take(FILE_MAX as u64 + 1).read_to_end(&mut bytes)?;
 		parse(&bytes)
 	}
-	/// Drops the entries of upstreams that are no longer in the config, so that a removed upstream does not leave its transport secrets in the file.
-	pub fn retain(&self, tags: &[&str]) -> io::Result<()> {
+	/// Drops the entries of upstreams that are no longer in the config, so that a removed upstream does not leave its transport secrets in the file, and the tombstones that no upstream of the config has with their binding any more. `upstreams` is each upstream of the config with its binding.
+	pub fn retain(&self, upstreams: &[(&str, [u8; 32])]) -> io::Result<()> {
 		let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
-		let mut state = self.read()?;
-		let before = state.len();
-		state.retain(|tag, _| tags.contains(&tag.as_str()));
-		if state.len() == before {Ok(())} else {write_atomic(&self.path, &encode(&state))}
+		let mut content = self.read()?;
+		let before = (content.held.len(), content.left.len());
+		content.held.retain(|tag, _| upstreams.iter().any(|(named, _)| named == tag));
+		content.left.retain(|tag, bound| upstreams.contains(&(tag.as_str(), *bound)));
+		if before == (content.held.len(), content.left.len()) {Ok(())} else {write_atomic(&self.path, &encode(&content))}
+	}
+	/// Marks the upstream `tag` under `bound` as removed by the operator, before the provider is told: whatever happens next, a restart does not enrol the device again.
+	pub fn mark_left(&self, tag: &str, bound: [u8; 32]) -> io::Result<()> {
+		let _writing = self.writing.lock().unwrap_or_else(PoisonError::into_inner);
+		let mut content = self.read()?;
+		content.left.insert(tag.to_owned(), bound);
+		if content.left.len() > UPSTREAMS_MAX {return Err(io::Error::new(io::ErrorKind::InvalidInput, "more removed upstreams than a node has"))}
+		write_atomic(&self.path, &encode(&content))
 	}
 }
 
@@ -122,22 +145,24 @@ impl UpstreamVault {
 	pub fn bound(&self) -> [u8; 32] {self.bound}
 	/// The id of the upstream as a carrier.
 	pub fn id(&self) -> [u8; 16] {self.id}
+	/// Whether the operator removed this upstream under this very binding: it is not enrolled, fetched or run until a config that no longer names it that way has been in force. A file that cannot be read says nothing, and then nothing can be fetched either, since the library cannot open.
+	pub fn left(&self) -> bool {self.file.read().is_ok_and(|content| content.left.get(&self.tag) == Some(&self.bound))}
 }
 
 impl Vault for UpstreamVault {
 	fn load(&self) -> io::Result<Vec<Stored>> {
-		Ok(self.file.read()?.remove(&self.tag).filter(|(bound, ..)| *bound == self.bound).map(|(.., stored)| Stored {origin: Some(self.origin.clone()), ..stored}).into_iter().collect())
+		Ok(self.file.read()?.held.remove(&self.tag).filter(|(bound, ..)| *bound == self.bound).map(|(.., stored)| Stored {origin: Some(self.origin.clone()), ..stored}).into_iter().collect())
 	}
 	fn save(&self, held: &[Stored]) -> io::Result<()> {
 		let _writing = self.file.writing.lock().unwrap_or_else(PoisonError::into_inner);
-		let mut state = self.file.read()?;
+		let mut content = self.file.read()?;
 		match held {
-			[] => {state.remove(&self.tag);}
-			[one] => {state.insert(self.tag.clone(), (self.bound, self.id, one.clone()));}
+			[] => {content.held.remove(&self.tag);}
+			[one] => {content.held.insert(self.tag.clone(), (self.bound, self.id, one.clone()));}
 			_ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "an upstream holds one subscription")),
 		}
-		if state.len() > UPSTREAMS_MAX {return Err(io::Error::new(io::ErrorKind::InvalidInput, "more upstreams than a node has"))}
-		write_atomic(&self.file.path, &encode(&state))
+		if content.held.len() > UPSTREAMS_MAX {return Err(io::Error::new(io::ErrorKind::InvalidInput, "more upstreams than a node has"))}
+		write_atomic(&self.file.path, &encode(&content))
 	}
 }
 
@@ -216,10 +241,31 @@ mod tests {
 		assert_eq!(Library::open(Box::new(other)).unwrap().0.held().len(), 0);
 		vault(&file, "b").save(&[imported().stored()]).unwrap();
 		assert_eq!(opened(&file), (1, 0));
-		file.retain(&["b"]).unwrap();
+		file.retain(&[("b", vault(&file, "b").bound())]).unwrap();
 		assert_eq!(opened(&file), (0, 0));
 		file.retain(&[]).unwrap();
-		assert!(file.read().unwrap().is_empty());
+		assert!(file.read().unwrap().held.is_empty());
+	}
+
+	#[test]
+	fn a_removed_upstream_stays_removed_until_a_config_no_longer_names_it_that_way() {
+		let dir = scratch("left");
+		let file = written(&dir);
+		let path = dir.join("upstreams.state");
+		let here = vault(&file, "a");
+		assert!(!here.left());
+		file.mark_left("a", here.bound()).unwrap();
+		let other = file.vault("a", &link(), Secret::new([0x34; 32]), DeviceSecret::new(SECRET));
+		assert!(here.left() && !vault(&file, "b").left() && !other.left());
+		assert_eq!(parse(&fs::read(&path).unwrap()).unwrap().left.len(), 1);
+		file.retain(&[("a", here.bound())]).unwrap();
+		assert!(here.left());
+		file.retain(&[("a", other.bound())]).unwrap();
+		assert!(!here.left() && file.read().unwrap().held.len() == 1);
+		for bad in [&b"{\"version\":1,\"upstreams\":{},\"left\":[]}"[..], b"{\"version\":1,\"upstreams\":{},\"left\":{\"a\":\"00\"}}"] {
+			fs::write(&path, bad).unwrap();
+			assert!(file.read().is_err());
+		}
 	}
 
 	#[test]

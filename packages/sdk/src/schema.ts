@@ -216,7 +216,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Every enabled upstream, the subscription of another provider that an exit uses, with its state and the reason, the provider's name, the profile, transport and exit in use, its quota and notices as plain text, the largest packet it takes, when its document was last refreshed and why a refresh failed, a move of the provider's endpoint or new refresh hosts that wait for the operator, and its counters. No key, no secret and no link. */
+        /** Every enabled upstream, the subscription of another provider that an exit uses, with its state and the reason, the provider's name, the profile, transport and exit in use, its quota and notices as plain text, the largest packet it takes, the fingerprint of the signing key its document is signed under, when its document was last refreshed and why a refresh failed, a move of the provider's endpoint or new refresh hosts that wait for the operator, and its counters. No key, no secret and no link. */
         get: operations["listUpstreams"];
         put?: never;
         post?: never;
@@ -270,7 +270,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. The upstream stops, and a config that still names it does not start it again; apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything. */
+        /** Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. When it did not, the document stays in the state file and the same call again tells the provider again; the answer is 404 only when the running config has no such upstream, so a removal that was not confirmed can be retried while the config still names it. The upstream stops, and a config that still names it does not start it again, not even after a restart (a tombstone in the state file keeps it down until a config that no longer names it that way has been in force); apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything. */
         delete: operations["removeUpstream"];
         options?: never;
         head?: never;
@@ -1404,6 +1404,8 @@ export interface components {
             refresh_error: string | null;
             /** Format: int64 */
             refreshed_at: number | null;
+            /** @description The fingerprint of the signing key the document in force is signed under. After the provider rotated its key this is the new one, which `signing_key` and the link in the upstream's config do not name until the operator confirms it. */
+            signing_key: string | null;
             state: components["schemas"]["UpstreamStatus"];
             /**
              * Format: uint64

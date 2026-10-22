@@ -350,6 +350,9 @@ impl Config {
 		let mut chained: HashMap<usize, usize> = HashMap::new();
 		if self.upstreams.len() > MAX_UPSTREAMS {r.error("upstreams", format!("expected at most {MAX_UPSTREAMS} upstreams"))}
 		let upstream_tags = tags(&mut r, "upstreams", self.upstreams.iter().take(MAX_UPSTREAMS).map(|upstream| upstream.tag.as_str()));
+		for (i, upstream) in self.upstreams.iter().enumerate().take(MAX_UPSTREAMS) {
+			if upstream.tag == "preview" {r.error(format!("upstreams[{i}].tag"), "expected a tag that is not `preview`: the control API's /v1/upstreams/preview is the route that previews a provider, so an upstream of that tag could not be removed, retried or confirmed")}
+		}
 		let mut upstreamed: HashMap<usize, usize> = HashMap::new();
 		for (i, exit) in self.exits.iter().enumerate().take(MAX_EXITS) {
 			let at = format!("exits[{i}]");
@@ -723,6 +726,14 @@ impl Config {
 			if secret == REDACTED {r.error(at("device_secret"), "expected a secret, found the marker the control API shows in the place of one: write the secret itself")} else if !URL_SAFE_NO_PAD.decode(secret).is_ok_and(|bytes| bytes.len() == 16 && URL_SAFE_NO_PAD.encode(bytes) == *secret) {r.error(at("device_secret"), "expected 16 bytes as 22 characters of base64url")}
 			if let Some(via) = &upstream.via {
 				if !outbound_tags.contains_key(via.as_str()) {r.error(at("via"), "expected the tag of a direct or socks5 outbound, found a tag no outbound has")}
+				let mut hop = outbound_tags.get(via.as_str()).copied();
+				for _ in 0..MAX_CHAIN {
+					let Some(proxy) = hop else {break};
+					if let Outbound::Socks5 {server: HostPort {host: Host::Ip(ip), ..}, ..} = &self.outbounds[proxy] {
+						if ip.is_loopback() || ip.is_unspecified() || match ip {IpAddr::V4(v4) => v4.is_link_local(), IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80} {r.error(at("via"), "expected proxies that are not on a loopback, unspecified or link-local address: the names the provider's document gives (its endpoint, its refresh hosts) are looked up by the proxy, and a proxy on this host would let that document reach the node's own services"); break}
+					}
+					hop = via_of(proxy);
+				}
 			}
 			for (key, value) in [("profile", &upstream.profile), ("exit", &upstream.exit)] {
 				if value.as_deref().is_some_and(|value| !ident(value, false)) {r.error(at(key), TAG_RULE)}
@@ -732,8 +743,10 @@ impl Config {
 			match upstreamed.get(&i) {
 				None => r.warning(format!("upstreams[{i}]"), "never used: no exit with an upstream backend names this upstream"),
 				Some(e) if !used.contains(self.exits[*e].tag.as_str()) => r.warning(format!("exits[{e}]"), "never used: no rule, routing.default, routing.fallback or user names this exit"),
+				Some(e) if self.routing.fallback.iter().any(|tag| *tag != self.exits[*e].tag) => r.warning(format!("exits[{e}]"), "an upstream exit and routing.fallback: users routed here fall back to routing.fallback while the provider is down, and their traffic then leaves by a route the provider's exit was meant to replace"),
 				Some(_) => {}
 			}
+			if upstream.exit.is_none() {r.warning(at("exit"), "no exit of the provider is named: the provider's own default exit is used, and the provider can change which one that is")}
 		}
 		if self.public_addresses.len() > MAX_PUBLIC_ADDRESSES {r.error("public_addresses", format!("expected at most {MAX_PUBLIC_ADDRESSES} addresses"))}
 		for (i, address) in self.public_addresses.iter().enumerate() {if self.public_addresses[..i].contains(address) {r.error(format!("public_addresses[{i}]"), "expected an address that is not listed before")}}

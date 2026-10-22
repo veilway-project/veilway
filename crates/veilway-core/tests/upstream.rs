@@ -147,6 +147,7 @@ impl Provider {
 						let pair = signer(which.load(Ordering::SeqCst));
 						let sign = |payload: &Value| envelope::seal(&key, &serde_json::to_vec(payload).unwrap(), |signed| pair.sign(signed).as_ref().try_into().unwrap());
 						ops.lock().unwrap().push(match received.op() {Op::Fetch => "fetch", Op::Confirm(_) => "confirm", Op::Release => "release", Op::Leave => "leave"});
+						if matches!(received.op(), Op::Leave) && refusing.load(Ordering::SeqCst) {return}
 						let envelope = if matches!(received.op(), Op::Release | Op::Leave) {
 							sign(&json!({"v": 1, "subscription_id": ID, "issued_at": issued, "refusal": "released"}))
 						} else if refusing.load(Ordering::SeqCst) {
@@ -720,7 +721,9 @@ async fn a_document_signed_by_another_key_is_not_taken() {
 
 /// A SOCKS5 proxy that connects every CONNECT to `target`, whatever it asks for, and writes down what it was asked for: `host:port` for a name and for an address alike.
 async fn lookup_proxy(target: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
-	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	// A proxy on loopback is refused by the config, so it listens on the address this machine has towards the network (connecting a datagram socket sends nothing).
+	let own = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|socket| socket.connect("10.255.255.254:9").and_then(|_| socket.local_addr())).unwrap().ip();
+	let listener = TcpListener::bind(SocketAddr::new(own, 0)).await.unwrap();
 	let (addr, seen) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
 	let asked = seen.clone();
 	tokio::spawn(async move {
@@ -1035,7 +1038,14 @@ async fn removing_an_upstream_tells_the_provider_and_a_reload_that_drops_one_doe
 	a.reload(doc.to_string().into_bytes(), None).await.unwrap();
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	assert_eq!((phase(&a).0, setup.provider.fetched(), setup.provider.requests("confirm")), (Phase::Down, 1, 1), "a removed device enrolled itself anew");
+	// A restart with the same config finds the tombstone: the device is not enrolled again, and the removal can still be asked for, not answered as unknown.
 	a.shutdown().await;
+	let again = setup.start(&setup.document(listen())).await;
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	assert_eq!((phase(&again).0, setup.provider.requests("fetch"), setup.provider.requests("confirm")), (Phase::Down, 1, 1), "a restart enrolled a removed device anew: {:?}", phase(&again));
+	assert!(phase(&again).1.contains("removed this device"), "{:?}", phase(&again));
+	assert!(again.upstream_leave("b").await.is_some(), "a removal that is still in the config was answered as unknown");
+	again.shutdown().await;
 	let (dir, home) = (scratch("up-leave-b"), listen());
 	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
 	let setup = Setup::new(time, dir.clone(), provider, hand.redirect());
@@ -1045,5 +1055,49 @@ async fn removing_an_upstream_tells_the_provider_and_a_reload_that_drops_one_doe
 	tokio::time::sleep(Duration::from_secs(2)).await;
 	assert_eq!(setup.provider.requests("leave"), 0, "a reload told the provider the device left");
 	assert!(!String::from_utf8_lossy(&std::fs::read(dir.join("upstreams.state")).unwrap()).contains("document"), "the document of an upstream that is gone is still in the state file");
+	a.shutdown().await;
+}
+
+// A removal the provider does not confirm keeps the document, so the same call again tells the provider again, and the upstream is never answered as unknown while the config names it. A config without the upstream clears the tombstone, and a config that names it again enrols it anew.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_the_provider_did_not_confirm_can_be_sent_again_and_a_config_without_the_upstream_clears_it() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-leave-c"), listen());
+	let setup = Setup::new(time, dir.clone(), provider, hand.redirect());
+	let doc = setup.document(home);
+	let a = setup.start(&doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	setup.provider.refusing.store(true, Ordering::SeqCst);
+	assert_eq!(a.upstream_leave("b").await, Some(false));
+	assert!(String::from_utf8_lossy(&std::fs::read(dir.join("upstreams.state")).unwrap()).contains("document"), "the document went although the provider did not confirm");
+	setup.provider.refusing.store(false, Ordering::SeqCst);
+	assert_eq!(a.upstream_leave("b").await, Some(true));
+	assert_eq!(setup.provider.requests("leave"), 2);
+	assert!(!String::from_utf8_lossy(&std::fs::read(dir.join("upstreams.state")).unwrap()).contains("document"));
+	let tombstones = |dir: &std::path::Path| serde_json::from_slice::<Value>(&std::fs::read(dir.join("upstreams.state")).unwrap()).unwrap()["left"].as_object().unwrap().len();
+	assert_eq!(tombstones(&dir), 1);
+	a.reload(bare(&setup, home).to_string().into_bytes(), None).await.unwrap();
+	assert_eq!(tombstones(&dir), 0, "a config without the upstream left its tombstone");
+	a.reload(doc.to_string().into_bytes(), None).await.unwrap();
+	until_phase(&a, Phase::Up, UP).await;
+	assert_eq!(setup.provider.requests("confirm"), 2, "the upstream was not enrolled anew");
+	a.shutdown().await;
+}
+
+// No more than four places at the provider are taken at once, even when the previews ask together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn previews_that_ask_together_take_no_more_than_four_places() {
+	let time = time!();
+	let hand = Hand::start().await;
+	let provider = Provider::start(time, profile(&HAND, hand.transports())).await;
+	let (dir, home) = (scratch("up-preview-c"), listen());
+	let setup = Setup::new(time, dir, provider, hand.redirect());
+	let a = setup.start(&bare(&setup, home)).await;
+	let answers = tokio::join!(a.upstream_preview(asking(&setup, 0x62)), a.upstream_preview(asking(&setup, 0x63)), a.upstream_preview(asking(&setup, 0x64)), a.upstream_preview(asking(&setup, 0x65)), a.upstream_preview(asking(&setup, 0x66)), a.upstream_preview(asking(&setup, 0x67)));
+	let answers = [answers.0, answers.1, answers.2, answers.3, answers.4, answers.5];
+	let (kept, full) = (answers.iter().filter(|answer| answer.is_ok()).count(), answers.iter().filter(|answer| matches!(answer, Err(PreviewError::Full))).count());
+	assert_eq!((kept, full, setup.provider.requests("fetch")), (4, 2, 4), "{:?}", answers.iter().map(|answer| answer.as_ref().map(|_| ())).collect::<Vec<_>>());
 	a.shutdown().await;
 }

@@ -108,8 +108,8 @@ pub struct Host {
 	upstream_file: Option<(Arc<UpstreamFile>, upstream::Hooks)>,
 	/// The task of each upstream that runs, by tag, with the config it runs and its state. An upstream that is the same, with the same state, keeps its task and its tunnel through a reload.
 	upstreams: HashMap<String, (Upstream, Option<upstream::Reach>, Arc<UpstreamState>, Task)>,
-	/// The upstreams the operator removed through the API while the config in force still names them, by tag, with what their state is bound to. None of them runs again until a config that does not name them, or names another link or device, has been in force: a removed device must not enrol itself anew.
-	left: HashMap<String, [u8; 32]>,
+	/// The upstreams the operator removed through the API while the config in force still names them, by tag, with what is needed to tell the provider again. None of them runs again until a config that does not name them, or names another link or device, has been in force: a removed device must not enrol itself anew. The state file carries the same fact as a tombstone, so a restart finds it too.
+	left: HashMap<String, (Upstream, Option<upstream::Reach>, Arc<UpstreamState>)>,
 }
 
 /// What `prepare` took for a config that is not in force yet. Dropping it gives all of it back.
@@ -192,14 +192,15 @@ impl Host {
 	/// Ends the task of every upstream, and with it its tunnel: the node is going away, and a device of a provider should not stay connected from a node that is not there.
 	pub fn stop_upstreams(&mut self) {self.upstreams.clear()}
 
-	/// Takes the upstream `tag` off the host for its removal: its task ends, with its tunnel, and a config that still names it does not start it again, see `left`. With it what the removal needs. None when the config in force has no such upstream running.
+	/// Takes the upstream `tag` off the host for its removal: its task ends, with its tunnel, a tombstone in the state file keeps it from being enrolled again, and a config that still names it does not start it, see `left`. With it what the removal needs. The same call again after a removal that the provider did not confirm gives the same, so the provider can be told again. None when the config in force has no such upstream.
 	pub fn release_upstream(&mut self, tag: &str) -> Option<(Arc<UpstreamState>, UpstreamVault, Option<upstream::Reach>, upstream::Hooks)> {
-		let (written, reach, state, task) = self.upstreams.remove(tag)?;
-		drop(task);
 		let (file, hooks) = self.upstream_file.as_ref()?;
+		let (written, reach, state) = self.upstreams.get(tag).map(|(written, reach, state, _)| (written.clone(), reach.clone(), state.clone())).or_else(|| self.left.get(tag).cloned())?;
 		let secret: [u8; 16] = URL_SAFE_NO_PAD.decode(written.device_secret.expose()).ok().and_then(|bytes| bytes.try_into().ok())?;
 		let vault = file.vault(&written.tag, written.link.expose(), Secret::new(written.private_key.expose().0), DeviceSecret::new(secret));
-		self.left.insert(tag.to_owned(), state.bound());
+		self.upstreams.remove(tag);
+		if let Err(error) = file.mark_left(tag, state.bound()) {tracing::warn!("upstream {tag}: the removal could not be written to the state file, so a restart may enrol the device again: {error}")}
+		self.left.insert(tag.to_owned(), (written, reach.clone(), state.clone()));
 		Some((state, vault, reach, hooks.clone()))
 	}
 
@@ -450,11 +451,12 @@ impl Host {
 		// An upstream runs while it is enabled. One that is the same upstream with the same state keeps its task and its tunnel, and any other task ends here, with its session. The entry of an upstream that is gone leaves the state file, so that its transport secrets do not stay in it.
 		let mut running = std::mem::take(&mut self.upstreams);
 		if let Some((file, hooks)) = &self.upstream_file {
-			let tags: Vec<String> = upstreams.iter().map(|(written, ..)| written.tag.clone()).collect();
-			self.left.retain(|tag, bound| upstreams.iter().any(|(written, _, state, _)| written.tag == *tag && state.bound() == *bound));
+			let kept: Vec<(String, [u8; 32])> = upstreams.iter().map(|(written, _, state, _)| (written.tag.clone(), state.bound())).collect();
+			self.left.clear();
 			for (written, reach, state, vault) in upstreams {
-				if self.left.get(&written.tag) == Some(&state.bound()) {
+				if vault.left() {
 					state.down("the operator removed this device from the provider: remove the upstream from the config");
+					self.left.insert(written.tag.clone(), (written, reach, state));
 					continue;
 				}
 				let kept = running.remove(&written.tag).filter(|(was, was_reach, was_state, _)| *was == written && *was_reach == reach && Arc::ptr_eq(was_state, &state));
@@ -464,7 +466,7 @@ impl Host {
 				});
 				self.upstreams.insert(written.tag.clone(), (written, reach, state, task));
 			}
-			if let Err(error) = file.retain(&tags.iter().map(String::as_str).collect::<Vec<_>>()) {tracing::warn!("the state file of the upstreams could not be cleaned of the upstreams that are gone: {error}")}
+			if let Err(error) = file.retain(&kept.iter().map(|(tag, bound)| (tag.as_str(), *bound)).collect::<Vec<_>>()) {tracing::warn!("the state file of the upstreams could not be cleaned of the upstreams that are gone: {error}")}
 		}
 		for tag in running.keys() {tracing::info!("upstream {tag}: no longer run")}
 		for (tunnel, addr, socket) in loopbacks {

@@ -16,7 +16,7 @@ use socket2::{Domain, SockAddr, SockRef};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -143,6 +143,8 @@ pub struct Report {
 	pub starts: u64,
 	/// The provider's name for itself, as its document says, cleaned of control and direction characters.
 	pub provider: Option<String>,
+	/// The fingerprint of the signing key the document in force is signed under. After a rotation it is the new one, which the config's `signing_key` and link do not name.
+	pub signing_key: Option<String>,
 	/// When the document held stops being current, and when it was last refreshed, in Unix seconds.
 	pub expires_at: Option<u64>,
 	pub refreshed_at: Option<u64>,
@@ -171,7 +173,10 @@ struct Live {
 	/// What the proxy chain of `via` last said of a dial: None while it carries, else the cause.
 	chain: Option<String>,
 	provider: Option<String>,
+	signing_key: Option<String>,
 	expires: Option<u64>,
+	/// When a refresh was last tried, whatever it came to. It is kept here and not by the task, so that a provider that ends the tunnel often cannot keep the refresh from ever being due.
+	attempted: Instant,
 	/// What the document says the account has used and has, which is what the status shows until the provider's control channel says more.
 	document_usage: Option<(u64, u64)>,
 	refreshed: Option<u64>,
@@ -219,7 +224,7 @@ impl UpstreamState {
 	/// A state for the upstream `tag`, whose link and device are bound by `bound` (see `UpstreamVault::bound`).
 	pub fn new(tag: &str, id: [u8; 16], bound: [u8; 32]) -> Arc<UpstreamState> {
 		let (out, inbox) = mpsc::channel(QUEUE);
-		let live = Live {phase: Phase::Fetching, reason: String::new(), since: Instant::now(), up: None, profile: None, transport: None, exit: None, offered: Vec::new(), notices: Vec::new(), usage: None, warned: false, chain: None, provider: None, expires: None, document_usage: None, refreshed: None, failing: None, refusal: None, unusable: false, moving: None, hosts: Vec::new()};
+		let live = Live {phase: Phase::Fetching, reason: String::new(), since: Instant::now(), up: None, profile: None, transport: None, exit: None, offered: Vec::new(), notices: Vec::new(), usage: None, warned: false, chain: None, provider: None, signing_key: None, expires: None, attempted: Instant::now(), document_usage: None, refreshed: None, failing: None, refusal: None, unusable: false, moving: None, hosts: Vec::new()};
 		Arc::new(UpstreamState {tag: tag.to_owned(), id, bound, link: Arc::default(), mtu: AtomicU16::new(u16::MAX), addresses: RwLock::new(Arc::from(Vec::new())), gateways: RwLock::new(Arc::from(Vec::new())), out, inbox: tokio::sync::Mutex::new(inbox), wake: tokio::sync::Notify::new(), refresh: tokio::sync::Notify::new(), library: tokio::sync::Mutex::new(None), live: Mutex::new(live), sent: AtomicU64::new(0), unsent: AtomicU64::new(0), refused: AtomicU64::new(0), flips: AtomicU64::new(0), starts: AtomicU64::new(0), refreshes: AtomicU64::new(0), refresh_failures: AtomicU64::new(0)})
 	}
 
@@ -271,7 +276,7 @@ impl UpstreamState {
 	pub fn report(&self) -> Report {
 		let live = self.live();
 		let mtu = self.mtu();
-		Report {tag: self.tag.clone(), id: self.id, phase: live.phase, reason: live.reason.clone(), since: live.since.elapsed(), profile: live.profile.clone(), transport: live.transport, exit: live.exit.clone(), offered: live.offered.clone(), notices: live.notices.clone(), usage: live.usage.or(live.document_usage), mtu: if mtu == u16::MAX {0} else {mtu}, sent: self.sent.load(Ordering::Relaxed), unsent: self.unsent.load(Ordering::Relaxed), refused: self.refused.load(Ordering::Relaxed), traffic: self.link.traffic.totals(), dropped: self.link.dropped.load(Ordering::Relaxed), flips: self.flips.load(Ordering::Relaxed), starts: self.starts.load(Ordering::Relaxed), provider: live.provider.clone(), expires_at: live.expires, refreshed_at: live.refreshed, refresh_error: live.failing.clone(), pending_move: live.moving.clone(), pending_hosts: live.hosts.clone(), refreshes: self.refreshes.load(Ordering::Relaxed), refresh_failures: self.refresh_failures.load(Ordering::Relaxed)}
+		Report {tag: self.tag.clone(), id: self.id, phase: live.phase, reason: live.reason.clone(), since: live.since.elapsed(), profile: live.profile.clone(), transport: live.transport, exit: live.exit.clone(), offered: live.offered.clone(), notices: live.notices.clone(), usage: live.usage.or(live.document_usage), mtu: if mtu == u16::MAX {0} else {mtu}, sent: self.sent.load(Ordering::Relaxed), unsent: self.unsent.load(Ordering::Relaxed), refused: self.refused.load(Ordering::Relaxed), traffic: self.link.traffic.totals(), dropped: self.link.dropped.load(Ordering::Relaxed), flips: self.flips.load(Ordering::Relaxed), starts: self.starts.load(Ordering::Relaxed), provider: live.provider.clone(), signing_key: live.signing_key.clone(), expires_at: live.expires, refreshed_at: live.refreshed, refresh_error: live.failing.clone(), pending_move: live.moving.clone(), pending_hosts: live.hosts.clone(), refreshes: self.refreshes.load(Ordering::Relaxed), refresh_failures: self.refresh_failures.load(Ordering::Relaxed)}
 	}
 
 	/// Moves to `phase` for `reason`, and says so when either changed. Packets are taken in `Phase::Up` alone.
@@ -318,6 +323,7 @@ impl UpstreamState {
 		let Some(held) = held else {return};
 		let subscription = held.subscription();
 		live.provider = Some(plain(subscription.provider.as_str(), PROVIDER_CHARS));
+		live.signing_key = held.keys().first().map(|key| key.fingerprint().to_string());
 		live.expires = Some(subscription.expires_at);
 		live.document_usage = subscription.usage.as_ref().map(|usage| (usage.used_bytes, usage.quota_bytes));
 		live.moving = held.asking().map(|asked| plain(&asked.key(), HOST_CHARS));
@@ -331,7 +337,7 @@ impl UpstreamState {
 				self.refreshes.fetch_add(1, Ordering::Relaxed);
 				let mut live = self.live();
 				if live.failing.take().is_some() | live.refusal.take().is_some() {tracing::info!("upstream {}: the subscription is refreshed again", self.tag)}
-				live.refreshed = Some(at);
+				(live.refreshed, live.attempted) = (Some(at), Instant::now());
 				Self::read(&mut live, library.held().first());
 				match refreshed {
 					Refreshed::Unchanged => Ok(None),
@@ -346,6 +352,7 @@ impl UpstreamState {
 				let refused = matches!(failed.error, ImportError::Subscription(Failure::Refused(_)));
 				let reason = format!("the subscription could not be refreshed: {}", failed.error.text());
 				let mut live = self.live();
+				live.attempted = Instant::now();
 				if live.failing.as_deref() != Some(reason.as_str()) {tracing::info!("upstream {}: {reason}", self.tag)}
 				live.failing = Some(reason.clone());
 				if refused {live.refusal = Some(reason.clone())}
@@ -373,9 +380,9 @@ impl UpstreamState {
 /// Whether `key` is the key the operator confirmed, written as its fingerprint or as the key itself.
 fn trusts(confirmed: &str, key: &SigningKey) -> bool {key.fingerprint().to_string() == confirmed || URL_SAFE_NO_PAD.encode(key.bytes()) == confirmed}
 
-/// Text from a provider for a person to read: control characters and the characters that reorder text are taken out, and what is left is cut to `most` characters.
+/// Text from a provider for a person to read: control characters, zero-width and line-separator characters and the characters that reorder text are taken out, and what is left is cut to `most` characters.
 fn plain(text: &str, most: usize) -> String {
-	text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')).take(most).collect()
+	text.chars().filter(|c| !c.is_control() && !matches!(c, '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')).take(most).collect()
 }
 
 /// Why a dial address of a provider's profile is refused, None when it may be dialled: "dial targets from the upstream profile are refused when loopback, link-local, multicast, unspecified, IPv4-mapped, the node's own addresses or its inbound pools, or private unless `allow_private`". A provider that could steer the node's dials at its own host or its networks would have the node reach what only the node can.
@@ -448,7 +455,14 @@ fn fetcher(shared: &Arc<Shared>, reach: Option<&Reach>, hooks: &Hooks, carried: 
 		Some(Reach::Socks(via)) => (fetcher.connect, fetcher.named) = (Some(link::through(via.clone(), carried.clone())), Some(link::through_name(via.clone(), carried))),
 		Some(Reach::Direct {bind, interface}) => fetcher.socket = Some(direct(*bind, interface.clone())),
 	}
-	if let Some(resolve) = &hooks.resolve {fetcher.resolve = resolve.clone()}
+	if let Some(resolve) = &hooks.resolve {fetcher.resolve = resolve.clone()} else {
+		// The system's resolver already refuses loopback and link-local. A name of the provider that comes to an address of this node itself would send the fetch at the node's own services.
+		let (inner, is_local) = (fetcher.resolve.clone(), shared.is_local);
+		fetcher.resolve = Arc::new(move |host, port| {
+			let inner = inner.clone();
+			Box::pin(async move {inner(host, port).await.map(|found| found.into_iter().filter(|address| !is_local(address.ip())).collect())})
+		});
+	}
 	fetcher
 }
 
@@ -496,6 +510,7 @@ async fn attempt(shared: &Arc<Shared>, config: &Upstream, reach: Option<&Reach>,
 		state.down(reason);
 		Ended::Lost(None)
 	};
+	if vault.left() {return fail("the operator removed this device from the provider: remove the upstream from the config".into())}
 	let Ok(SubscriptionLink::Native(native)) = SubscriptionLink::parse(config.link.expose()) else {return fail("the link of the upstream is not a native subscription link".into())};
 	if !trusts(&config.signing_key, &native.key()) {return fail("the key in the link is not the one the operator confirmed".into())}
 	let fetcher = fetcher(shared, reach, hooks, {let state = state.clone(); move |cause| state.carried(cause)});
@@ -596,9 +611,10 @@ async fn fetch(shared: &Arc<Shared>, fetcher: &Fetcher, library: &mut Library, c
 			fetcher.fetch(&fetching, library, now, &[]).await.map_err(|error| format!("the subscription could not be fetched: {}", error.text()))?
 		}
 	};
-	if reviewed.review.fingerprint().to_string() != signer {
+	let sent = reviewed.review.fingerprint().to_string();
+	if sent != signer {
 		fetcher.decline(reviewed).await;
-		return Err("the document the provider sent is not signed by the key the operator confirmed".into());
+		return Err(format!("the document the provider sent is signed by another key than the one the operator confirmed: if the provider rotated its signing key, the new key is {sent}, and the operator must confirm it and use the provider's new link"));
 	}
 	fetcher.accept(reviewed, None, library).await.map_err(|error| format!("the subscription could not be kept: {}", error.text()))?;
 	Ok(())
@@ -623,7 +639,7 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 	let (started, mut carried, mut held) = (Instant::now(), false, held.clone());
 	let (mut status, mut events, mut tick, mut pace) = (tunnel.watch(), tunnel.events(), tokio::time::interval(Duration::from_secs(1)), Pace {asked: None, idle: None});
 	// Ends with this function, and takes a refresh that is still waiting for the provider with it.
-	let (mut refreshing, mut last, mut jitter) = (tokio::task::JoinSet::<Option<Done>>::new(), Instant::now(), [0u8; 1]);
+	let (mut refreshing, mut jitter) = (tokio::task::JoinSet::<Option<Done>>::new(), [0u8; 1]);
 	let _ = random(&mut jitter);
 	loop {
 		tokio::select! {
@@ -662,7 +678,6 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 			}
 			Some(done) = refreshing.join_next() => {
 				let _ = random(&mut jitter);
-				last = Instant::now();
 				let Ok(Some((learned, fresh))) = done else {continue};
 				if let Some(fresh) = fresh {held = fresh}
 				match learned {
@@ -671,6 +686,10 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 						let changed = held.subscription().profiles.iter().find(|other| other.id == profile.id).is_none_or(|now| (&now.inbound_public_key, &now.device, &now.gateways, now.mtu, &now.transport_public_key, &now.transports, now.stream_first, now.parallel, &now.padding, now.rating_cap, now.min_control_version) != (&profile.inbound_public_key, &profile.device, &profile.gateways, profile.mtu, &profile.transport_public_key, &profile.transports, profile.stream_first, profile.parallel, &profile.padding, profile.rating_cap, profile.min_control_version));
 						if changed {
 							tracing::info!("upstream {}: the new document changes the profile in use, so the tunnel is made again from it", state.tag);
+							// No tunnel exists from here to the next start: what is routed here is refused, and the flows that ran into the old session or its gateways end, so each is judged again against the new profile.
+							state.down("the new document changes the profile in use, so the tunnel is made again");
+							let ended = shared.nat.end_link(&state.id, &shared.flows);
+							shared.flows.end(&ended, shared.plan().generation);
 							return Ended::Changed;
 						}
 					}
@@ -694,7 +713,8 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 				if pace.asked.is_some_and(|at| at.elapsed() >= ASK_AGAIN) {pace.asked = None}
 				judge(config, state, &tunnel, &now, profile, &mut pace);
 				carried |= state.up();
-				if refreshing.is_empty() && last.elapsed() >= hooks.refresh.unwrap_or_else(|| refresh_wait(held.subscription().update_interval, state.down_for(), jitter[0])) {refreshing.spawn(refresh(shared.clone(), state.clone(), fetcher.clone()));}
+				let since_refresh = state.live().attempted.elapsed();
+				if refreshing.is_empty() && since_refresh >= hooks.refresh.unwrap_or_else(|| refresh_wait(held.subscription().update_interval, state.down_for(), jitter[0])) {refreshing.spawn(refresh(shared.clone(), state.clone(), fetcher.clone()));}
 				if held.connect((shared.now)().unix_timestamp().max(0) as u64).is_err() {
 					state.down("the document is out of date, and the provider has not answered with a newer one");
 					return Ended::Held;
@@ -729,7 +749,12 @@ fn judge(config: &Upstream, state: &Arc<UpstreamState>, tunnel: &Tunnel, status:
 		live.warned = nearly;
 	}
 	let Some(wanted) = config.exit.as_deref() else {
-		state.live().exit = status.exits.iter().find(|exit| exit.selected || exit.configured).map(|exit| plain(&exit.tag, TAG_CHARS));
+		let shown = status.exits.iter().find(|exit| exit.selected || exit.configured).map(|exit| plain(&exit.tag, TAG_CHARS));
+		{
+			let mut live = state.live();
+			if shown.is_some() && live.exit != shown {tracing::info!("upstream {}: the exit of the provider in use is {}", state.tag, shown.as_deref().unwrap_or_default())}
+			live.exit = shown;
+		}
 		return state.change(Phase::Up, "");
 	};
 	// The exit the config names, or nothing: the provider's own default is never an answer. Until the provider has said which exits it offers, and until it says this one is in use, the carrier is down.
@@ -763,10 +788,17 @@ impl Vault for Nothing {
 struct Pending {id: String, bound: [u8; 32], reviewed: Reviewed, fetcher: Fetcher}
 
 /// The documents the operator has been shown and has not yet answered with a config, in memory: at most `PREVIEWS_MAX`, each for `PREVIEW_TTL`. A preview takes a place at the provider, so one that is declined or runs out is released there, and a config that names the same link and device takes its document and asks the provider for nothing.
-pub struct Previews {hooks: Hooks, pending: Mutex<Vec<Pending>>}
+pub struct Previews {hooks: Hooks, pending: Mutex<Vec<Pending>>, fetching: AtomicUsize}
+
+/// A place among the previews, taken before the provider is asked and given back when the preview is kept or fails.
+struct Slot<'a>(&'a AtomicUsize);
+
+impl Drop for Slot<'_> {
+	fn drop(&mut self) {self.0.fetch_sub(1, Ordering::Relaxed);}
+}
 
 impl Previews {
-	pub fn new(hooks: Hooks) -> Previews {Previews {hooks, pending: Mutex::new(Vec::new())}}
+	pub fn new(hooks: Hooks) -> Previews {Previews {hooks, pending: Mutex::new(Vec::new()), fetching: AtomicUsize::new(0)}}
 
 	/// The document kept for the link and device `bound` names, for the config that came to name them.
 	fn take(&self, bound: [u8; 32]) -> Option<Reviewed> {
@@ -777,6 +809,14 @@ impl Previews {
 	fn release(&self, id: &str) -> Option<Pending> {
 		let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
 		pending.iter().position(|kept| kept.id == id).map(|at| pending.remove(at))
+	}
+
+	/// Takes a place for a preview that is about to be fetched, counting the ones kept and the ones being fetched, so that no more than `PREVIEWS_MAX` places at the provider are taken at once. None when all are taken.
+	fn reserve(&self) -> Option<Slot<'_>> {
+		let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+		if pending.len() + self.fetching.load(Ordering::Relaxed) >= PREVIEWS_MAX {return None}
+		self.fetching.fetch_add(1, Ordering::Relaxed);
+		Some(Slot(&self.fetching))
 	}
 
 	/// How many previews wait.
@@ -839,7 +879,7 @@ pub struct Reviewing {
 /// Asks the provider for the document of a link with the device the operator made, which takes a place there: the fetch is the enrollment, and it is made from this node, so the provider sees the node's address and never the panel's. The document is verified under the key of the link and kept in memory under an id, for the operator's answer. Nothing is written to the config or the state file.
 pub async fn preview(shared: &Arc<Shared>, outbounds: &[config::Outbound], request: PreviewRequest) -> Result<Reviewing, PreviewError> {
 	let previews = &shared.previews;
-	if previews.waiting() >= PREVIEWS_MAX {return Err(PreviewError::Full)}
+	let slot = previews.reserve().ok_or(PreviewError::Full)?;
 	let key: config::Key = serde_json::from_value(serde_json::Value::String(request.private_key.clone())).map_err(|_| PreviewError::Invalid("private_key is not a WireGuard key"))?;
 	let secret: [u8; 16] = URL_SAFE_NO_PAD.decode(request.device_secret.as_bytes()).ok().and_then(|bytes| bytes.try_into().ok()).ok_or(PreviewError::Invalid("device_secret is not 16 bytes as 22 characters of base64url"))?;
 	let Ok(Offer::Native(offer)) = import::open(&request.link) else {return Err(PreviewError::Invalid("link is not a native veilway://sub/ subscription link"))};
@@ -869,18 +909,12 @@ pub async fn preview(shared: &Arc<Shared>, outbounds: &[config::Outbound], reque
 	};
 	let ttl = previews.hooks.preview.unwrap_or(PREVIEW_TTL);
 	let reviewing = review(&id, ttl, &reviewed, shared, request.allow_private);
-	let rejected = {
+	{
 		let mut pending = previews.pending.lock().unwrap_or_else(|e| e.into_inner());
 		// The same link and device again is the same place at the provider: the older review is replaced, not released.
 		pending.retain(|kept| kept.bound != bound);
-		if pending.len() >= PREVIEWS_MAX {Some((reviewed, fetcher))} else {
-			pending.push(Pending {id: id.clone(), bound, reviewed, fetcher});
-			None
-		}
-	};
-	if let Some((reviewed, fetcher)) = rejected {
-		fetcher.decline(reviewed).await;
-		return Err(PreviewError::Full);
+		pending.push(Pending {id: id.clone(), bound, reviewed, fetcher});
+		drop(slot);
 	}
 	tracing::info!("upstreams: a subscription was fetched for the operator to look at, and its place at the provider is kept for {} s", ttl.as_secs());
 	tokio::spawn({
@@ -942,7 +976,7 @@ fn review(id: &str, ttl: Duration, reviewed: &Reviewed, shared: &Arc<Shared>, al
 	}
 }
 
-/// The operator removes the upstream: the provider is told that this device left, for at most `LEAVE_WAIT`, and the document and its keys are removed from the state file. Whether the provider said it took the word. A config that is still in force and names the upstream does not bring it back: the task is not started again until a config that does not name it, or names another link or device, has been in force.
+/// The operator removes the upstream: the provider is told that this device left, for at most `LEAVE_WAIT`, and when it said it took the word the document and its keys are removed from the state file. When it did not, the document stays, so that the same call again can tell it again. Whether the provider said it took the word. A config that is still in force and names the upstream does not bring it back, not even after a restart: the host wrote a tombstone, and the task is not started until a config that does not name the upstream, or names another link or device, has been in force.
 pub async fn leave(shared: &Arc<Shared>, state: &Arc<UpstreamState>, vault: &UpstreamVault, reach: Option<&Reach>, hooks: &Hooks) -> bool {
 	let now = (shared.now)().unix_timestamp().max(0) as u64;
 	let fetcher = fetcher(shared, reach, hooks, {let state = state.clone(); move |cause| state.carried(cause)});
@@ -960,7 +994,9 @@ pub async fn leave(shared: &Arc<Shared>, state: &Arc<UpstreamState>, vault: &Ups
 			}
 			false
 		}).await.unwrap_or(false);
-		if let Err(error) = library.remove(&id) {tracing::warn!("upstream {}: the document could not be removed from the state file: {error}", state.tag)}
+		if told {
+			if let Err(error) = library.remove(&id) {tracing::warn!("upstream {}: the document could not be removed from the state file: {error}", state.tag)}
+		}
 	}
 	state.down("the operator removed this device from the provider: remove the upstream from the config");
 	tracing::info!("upstream {}: the operator removed the device, and the provider {}", state.tag, if told {"confirmed it"} else {"could not be told: its place stays until the provider removes it"});
@@ -994,6 +1030,7 @@ mod tests {
 	#[test]
 	fn text_from_a_provider_loses_control_and_direction_characters_and_is_cut() {
 		assert_eq!(plain("a\u{202e}b\u{0007}c\nd\u{2066}e\u{200f}f", 100), "abcdef");
+		assert_eq!(plain("a\u{200b}b\u{200c}c\u{200d}d\u{feff}e\u{2028}f\u{2029}g", 100), "abcdefg");
 		assert_eq!(plain(&"x".repeat(500), NOTICE_CHARS).chars().count(), NOTICE_CHARS);
 		assert_eq!(plain("\u{1b}[31mred", 100), "[31mred");
 	}
