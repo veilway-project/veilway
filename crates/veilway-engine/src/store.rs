@@ -66,6 +66,7 @@ struct StandingWire {
 	#[serde(default)] short: u32,
 	#[serde(default)] unanswered: bool,
 	#[serde(default)] consent: Vec<String>,
+	#[serde(default)] exposed: u64,
 	#[serde(default)] offset: Option<(i64, u64)>,
 	#[serde(default)] bare: bool,
 }
@@ -124,7 +125,7 @@ fn index(number: u64) -> Option<usize> {Some(number as usize).filter(|number| *n
 fn key_ok(key: &str) -> bool {!key.is_empty() && key.len() <= KEY_MAX && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-/.".contains(&byte))}
 
 fn read_standing(wire: StandingWire) -> Standing {
-	Standing {profile: wire.profile, refusals: wire.refusals, rows: wire.rows.into_iter().take(LIST).filter_map(|(transport, candidate, row)| Some((index(transport)?, index(candidate)?, row))).collect(), losses: wire.losses, opened: wire.opened, short: wire.short, unanswered: wire.unanswered, consent: classes(&wire.consent), offset: wire.offset, bare: wire.bare}
+	Standing {profile: wire.profile, refusals: wire.refusals, rows: wire.rows.into_iter().take(LIST).filter_map(|(transport, candidate, row)| Some((index(transport)?, index(candidate)?, row))).collect(), losses: wire.losses, opened: wire.opened, short: wire.short, unanswered: wire.unanswered, consent: classes(&wire.consent), exposed: wire.exposed, offset: wire.offset, bare: wire.bare}
 }
 
 fn read_network(wire: NetworkWire) -> Network {
@@ -158,7 +159,7 @@ pub fn encode(saved: &Saved) -> Vec<u8> {
 	let profiles = saved.profiles.iter().map(|(key, kept)| {
 		let standing = &kept.standing;
 		(key.clone(), ProfileWire {
-			standing: StandingWire {profile: standing.profile, refusals: standing.refusals, rows: standing.rows.iter().map(|(transport, candidate, row)| (*transport as u64, *candidate as u64, *row)).collect(), losses: standing.losses, opened: standing.opened, short: standing.short, unanswered: standing.unanswered, consent: standing.consent.iter().map(|class| class_word(*class).to_owned()).collect(), offset: standing.offset, bare: standing.bare},
+			standing: StandingWire {profile: standing.profile, refusals: standing.refusals, rows: standing.rows.iter().map(|(transport, candidate, row)| (*transport as u64, *candidate as u64, *row)).collect(), losses: standing.losses, opened: standing.opened, short: standing.short, unanswered: standing.unanswered, consent: standing.consent.iter().map(|class| class_word(*class).to_owned()).collect(), exposed: standing.exposed, offset: standing.offset, bare: standing.bare},
 			networks: kept.networks.iter().map(|(network, state)| (network.clone(), NetworkWire {profile: state.profile, worked: state.worked.map(|(transport, candidate, when)| (transport as u64, candidate as u64, when)), aside: state.aside.iter().map(|(transport, candidate, until)| (*transport as u64, candidate.map(|candidate| candidate as u64), *until)).collect(), tried: state.tried.iter().map(|(transport, candidate, when)| (*transport as u64, *candidate as u64, *when)).collect(), silent: state.silent.map(|(transport, since)| (transport as u64, since)), plain: state.plain.iter().map(|(transport, candidate, count, when)| (*transport as u64, *candidate as u64, *count, *when)).collect()})).collect(),
 			mtus: kept.mtus.iter().map(|found| (found.network.clone(), found.transport as u64, u64::from(found.mtu), found.when)).collect(),
 			declined: kept.declined.iter().map(|class| class_word(*class).to_owned()).collect(),
@@ -305,6 +306,15 @@ impl Store {
 			if !kept.declined.contains(&class) {kept.declined.push(class)}
 		});
 	}
+	/// Ties the answer about `Exposed` to these `ws-plain` hosts (`choice::plain_hosts`). When they are not the ones it was asked for, a yes and a no are both forgotten, so that the question comes again.
+	pub fn bind_plain(&self, key: &str, hosts: u64) {
+		self.update(key, |kept| {
+			if kept.standing.exposed == hosts {return}
+			kept.standing.consent.retain(|agreed| *agreed != Class::Exposed);
+			kept.declined.retain(|declined| *declined != Class::Exposed);
+			kept.standing.exposed = hosts;
+		});
+	}
 	/// "The answer is stored per profile and class and can be withdrawn." A withdrawn class is a declined one.
 	pub fn withdraw(&self, key: &str, class: Class) {self.decline(key, class)}
 	/// The user's own `stream_first` for a profile: with it the client tries every cover transport before any other, and the profile's own setting is not looked at. A running tunnel sees it at once.
@@ -333,7 +343,7 @@ mod tests {
 	fn classes_strategy() -> impl Strategy<Value = Vec<Class>> {proptest::sample::subsequence(vec![Class::Cover, Class::NoCover, Class::Exposed, Class::Plain], 0..=4)}
 
 	fn standing() -> impl Strategy<Value = Standing> {
-		(any::<u64>(), any::<u32>(), vec((0usize..256, 0usize..256, any::<u32>()), 0..8), any::<u32>(), proptest::option::of(any::<u64>()), any::<u32>(), any::<bool>(), classes_strategy(), proptest::option::of((any::<i64>(), any::<u64>())), any::<bool>()).prop_map(|(profile, refusals, rows, losses, opened, short, unanswered, consent, offset, bare)| Standing {profile, refusals, rows, losses, opened, short, unanswered, consent, offset, bare})
+		(any::<u64>(), any::<u32>(), vec((0usize..256, 0usize..256, any::<u32>()), 0..8), any::<u32>(), proptest::option::of(any::<u64>()), any::<u32>(), any::<bool>(), classes_strategy(), any::<u64>(), proptest::option::of((any::<i64>(), any::<u64>())), any::<bool>()).prop_map(|(profile, refusals, rows, losses, opened, short, unanswered, consent, exposed, offset, bare)| Standing {profile, refusals, rows, losses, opened, short, unanswered, consent, exposed, offset, bare})
 	}
 
 	fn network() -> impl Strategy<Value = Network> {

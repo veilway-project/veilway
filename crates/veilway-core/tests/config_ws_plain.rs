@@ -132,6 +132,30 @@ fn its_path_is_not_the_path_of_a_covered_transport_of_the_inbound() {
 }
 
 #[test]
+fn its_path_is_not_the_path_of_a_covered_transport_of_another_inbound_either() {
+	let other = |path: &str| json!({"tag": "other", "type": "veilway", "private_key": key(0x12), "address": ["10.8.0.1/24"], "upgrade_cookie": "sid", "transport_keys": [key(0x76)], "transports": [{"type": "ws", "listen": "127.0.0.1:8082", "path": path, "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"]}]});
+	error_at(&format!("{AT}.path"), |doc| doc["inbounds"].as_array_mut().unwrap().push(other("/assets/plain-3b9e41aa.js")));
+	let report = check(&with(|doc| doc["inbounds"].as_array_mut().unwrap().push(other("/assets/live-7c1d0a52.js"))));
+	assert!(!report.errors.iter().any(|e| e.path == format!("{AT}.path")), "{report:#?}");
+}
+
+#[test]
+fn it_never_shares_a_listener_with_a_transport_that_is_not_ws_plain() {
+	let on_same = |kind: &str| json!({"type": kind, "listen": "127.0.0.1:8081", "path": "/assets/live-7c1d0a52.js", "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For"});
+	for kind in ["ws", "fronted"] {
+		let report = check(&with(|doc| {
+			doc["inbounds"][0]["transport_keys"] = json!([key(0x75)]);
+			doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(on_same(kind));
+		}));
+		assert!(report.errors.iter().any(|e| e.path == "inbounds[0].transports[1].listen" && e.message.contains("ws-plain")), "{kind}: {report:#?}");
+	}
+	let report = check(&with(|doc| {
+		doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type": "ws-plain", "listen": "127.0.0.1:8081", "path": "/assets/plain-4c8f52bb.js", "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For", "transport_keys": [key(0x74)]}));
+	}));
+	assert!(report.errors.is_empty(), "{report:#?}");
+}
+
+#[test]
 fn a_change_of_its_keys_is_a_change_of_that_transport_and_nothing_else() {
 	let (old, new) = (parse(&node()).unwrap(), parse(&with(|doc| transport(doc)["transport_keys"] = json!([key(0x73), key(0x71)]))).unwrap());
 	let diff = Diff::between(&old, &new, time::OffsetDateTime::now_utc());

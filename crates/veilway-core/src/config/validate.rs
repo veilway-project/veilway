@@ -272,6 +272,8 @@ impl Config {
 						(Transport::Ws {path, tls, ..}, Transport::Ws {path: other_path, tls: other_tls, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls,
 						// One listener has one certificate, one decoy origin and one set of pools, and tells its transports apart by their paths.
 						(Transport::Tls {path, tls, decoy, limits, http2, ..}, Transport::Tls {path: other_path, tls: other_tls, decoy: other_decoy, limits: other_limits, http2: other_http2, ..}) => here.ip() != there.ip() || path == other_path || tls != other_tls || decoy != other_decoy || limits != other_limits || http2 != other_http2,
+						// "The plain listener's decoy must answer like the plain site": a covered transport on the same listener would share its decoy, so a prober could tell the ws-plain path from other plain paths.
+						_ if matches!(transport, Transport::WsPlain {..}) != matches!(other, Transport::WsPlain {..}) && !udp && !other.datagram() => true,
 						// The web server in front hands a `GET` for one path and a `POST` for another to one listener, which has one decoy origin, one list of proxies and one set of pools.
 						_ if transport.proxied().is_some() && other.proxied().is_some() => transport.proxied().zip(other.proxied()).is_none_or(|(one, two)| here.ip() != there.ip() || one.path == two.path || nested(&one, &two) || nested(&two, &one) || one.decoy != two.decoy || one.trusted != two.trusted || one.header != two.header || one.limits != two.limits),
 						_ => udp == other.datagram(),
@@ -280,6 +282,7 @@ impl Config {
 				if let Some((other, there)) = clash {
 					r.error(format!("{at}.listen"), format!("conflicts with {other}: {}", match (transport, there) {
 						_ if udp => "two udp or udp-obfs transports never share an address and port",
+						_ if matches!(transport, Transport::WsPlain {..}) != matches!(there, Transport::WsPlain {..}) && !there.datagram() => "a ws-plain transport never shares an address and port with a transport that is not ws-plain: its decoy must answer like the plain site, so that a prober cannot tell its path from other plain paths",
 						(Transport::FakeTls {..}, _) | (_, Transport::FakeTls {..}) => "a faketls transport never shares an address and port with another transport: it takes a listener of its own",
 						(Transport::Ws {..}, Transport::Ws {..}) => "two ws transports share an address and port only with different paths and identical tls",
 						(Transport::Tls {..}, Transport::Tls {..}) => "two tls transports share an address and port only with different paths and identical tls, decoy, limits and http2",
@@ -451,7 +454,7 @@ impl Config {
 				if wireguard.contains(&transport_key.0) {r.error(at, "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(transport_key.0) {r.error(at, "expected a key of its own: the key of a faketls transport equals no other transport key of the node, so that a leak of it opens nothing else")}
 			}
 		}
-		// Transports page, "ws-plain", "Its own transport key": the keys of a `ws-plain` transport are its own, because its proofs travel where the whole path can record them. One or two, never the same twice, and none is a WireGuard key or a key of another transport or inbound. Its path is not a path of a covered transport of the same inbound.
+		// Transports page, "ws-plain", "Its own transport key": the keys of a `ws-plain` transport are its own, because its proofs travel where the whole path can record them. One or two, never the same twice, and none is a WireGuard key or a key of another transport or inbound. Its path is not a path of a covered transport of any inbound of the node.
 		for (i, inbound) in self.inbounds.iter().enumerate().take(MAX_INBOUNDS) {
 			for (j, transport) in inbound.transports.iter().enumerate().take(MAX_TRANSPORTS) {
 				let Transport::WsPlain {path: plain, transport_keys, ..} = transport else {continue};
@@ -460,7 +463,7 @@ impl Config {
 				for (k, key) in transport_keys.iter().enumerate().take(MAX_TRANSPORT_KEYS) {
 					if wireguard.contains(&key.0) {r.error(format!("{at}[{k}]"), "expected a key that is not a WireGuard key of this config")} else if !node_keys.insert(key.0) {r.error(format!("{at}[{k}]"), "expected a key of its own: the keys of a ws-plain transport equal no other transport key of the node, and are not given twice, so that a leak of one opens nothing else")}
 				}
-				if inbound.transports.iter().take(MAX_TRANSPORTS).any(|other| match other {Transport::Tls {path, ..} | Transport::Ws {path, ..} => path == plain, Transport::WsPlain {..} => false, other => other.proxied().is_some_and(|proxied| proxied.path == plain)}) {r.error(format!("inbounds[{i}].transports[{j}].path"), "expected a path no tls, ws or fronted transport of the inbound uses: a profile refuses a ws-plain transport whose path is a covered one")}
+				if self.inbounds.iter().take(MAX_INBOUNDS).flat_map(|inbound| inbound.transports.iter().take(MAX_TRANSPORTS)).any(|other| match other {Transport::Tls {path, ..} | Transport::Ws {path, ..} => path == plain, Transport::WsPlain {..} => false, other => other.proxied().is_some_and(|proxied| proxied.path == plain)}) {r.error(format!("inbounds[{i}].transports[{j}].path"), "expected a path no tls, ws or fronted transport of the node uses: a profile refuses a ws-plain transport whose path is a covered one")}
 			}
 		}
 		// Per user: the exits they are entitled to, their groups, and the inbounds their devices live in.

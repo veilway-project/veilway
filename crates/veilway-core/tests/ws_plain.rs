@@ -2,7 +2,8 @@
 #[macro_use]
 mod proxied;
 use proxied::*;
-use serde_json::{json, Value};
+use serde_json::json;
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use veilway_core::Over;
@@ -12,30 +13,44 @@ const PLAIN: [u8; 32] = [0x61; 32];
 const PLAIN_ROTATED: [u8; 32] = [0x62; 32];
 const PLAIN_PATH: &str = "/assets/plain-3b9e41aa.js";
 
-/// Adds a `ws-plain` transport with these keys to the listener of `document`, which it shares with the `ws` and the `fronted` transport: the same decoy, proxies and pools.
-fn with_plain(doc: &mut Value, keys: &[[u8; 32]]) {
-	let transports = doc["inbounds"][0]["transports"].as_array_mut().unwrap();
-	let mut plain = transports[0].clone();
-	plain["type"] = json!("ws-plain");
-	plain["path"] = json!(PLAIN_PATH);
-	plain["transport_keys"] = json!(keys.iter().map(text).collect::<Vec<_>>());
-	transports.push(plain);
+/// The `ws-plain` listener of a node and the reverse proxy in front of it: a `ws-plain` transport never shares a listener with a covered one, so that its decoy answers like the plain site.
+struct Plain {at: SocketAddr, front: proxied::Front}
+
+/// Starts a node that also has a `ws-plain` transport with these keys, on a listener of its own with the same decoy, proxies and pools as the one of `document`.
+async fn launch_plain(test: &str, time: Time, keys: &[[u8; 32]]) -> (Node, Plain) {
+	let at = listen();
+	let node = launch(test, time, |doc| {
+		let transports = doc["inbounds"][0]["transports"].as_array_mut().unwrap();
+		let mut plain = transports[0].clone();
+		plain["type"] = json!("ws-plain");
+		plain["listen"] = json!(at.to_string());
+		plain["path"] = json!(PLAIN_PATH);
+		plain["transport_keys"] = json!(keys.iter().map(text).collect::<Vec<_>>());
+		transports.push(plain);
+	}).await;
+	(node, Plain {at, front: front(at).await})
 }
 
 /// The upgrade request of a client for `path`, with these header fields behind the ones of the upgrade.
 fn request(target: &str, fields: &str) -> Vec<u8> {format!("GET {target} HTTP/1.1\r\nHost: node.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {WS_KEY}\r\nSec-WebSocket-Version: 13\r\n{fields}\r\n").into_bytes()}
 
-fn plain_device(node: &Node, n: usize, key: &[u8; 32]) -> Device {Device::new(n, secret(n), key, node.front.addr)}
+fn plain_device(plain: &Plain, n: usize, key: &[u8; 32]) -> Device {Device::new(n, secret(n), key, plain.front.addr)}
+
+/// What the node answers its reverse proxy for `request` on the `ws-plain` listener, with the proxy played by the test.
+async fn hand(plain: &Plain, request: &[u8], from: &str) -> (String, bool) {
+	let (answer, closed, _) = play(dial(plain.at, PROXY).await, &[Step::Send(forwarded(request, from))], SECOND).await;
+	(String::from_utf8_lossy(&answer).into_owned(), closed)
+}
 
 /// Opens a session of device `d` on the `ws-plain` path, with the token in the cookie `sid`.
-async fn open(node: &Node, d: &mut Device, name: Name, at: u64) -> String {d.open_with(Box::new(dial(node.front.addr, CLIENT).await), name, at, |token| request(PLAIN_PATH, &format!("Cookie: sid={token}\r\n"))).await}
+async fn open(plain: &Plain, d: &mut Device, name: Name, at: u64) -> String {d.open_with(Box::new(dial(plain.front.addr, CLIENT).await), name, at, |token| request(PLAIN_PATH, &format!("Cookie: sid={token}\r\n"))).await}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reaches_its_tunnel_over_plain_http_with_its_token_in_a_cookie() {
 	let time = time!();
-	let node = launch("plain-happy", time, |doc| with_plain(doc, &[PLAIN])).await;
-	let mut a = plain_device(&node, 0, &PLAIN);
-	let answer = open(&node, &mut a, Name::WsPlain, time.secs()).await;
+	let (node, plain) = launch_plain("plain-happy", time, &[PLAIN]).await;
+	let mut a = plain_device(&plain, 0, &PLAIN);
+	let answer = open(&plain, &mut a, Name::WsPlain, time.secs()).await;
 	// The answer is the upgrade and nothing else: "The upgrade answer on a `ws-plain` listener sets no cookie."
 	let lines: Vec<&str> = answer.trim_end().split("\r\n").collect();
 	assert_eq!((lines.len(), lines[0], lines[1], lines[2], lines[3]), (4, "HTTP/1.1 101 Switching Protocols", "Upgrade: websocket", "Connection: Upgrade", "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{answer}");
@@ -55,8 +70,8 @@ async fn a_device_reaches_its_tunnel_over_plain_http_with_its_token_in_a_cookie(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn only_exactly_one_cookie_with_the_token_is_a_user_and_everything_else_goes_to_the_decoy() {
 	let time = time!();
-	let node = launch("plain-strict", time, |doc| with_plain(doc, &[PLAIN])).await;
-	let client = plain_device(&node, 0, &PLAIN);
+	let (node, plain) = launch_plain("plain-strict", time, &[PLAIN]).await;
+	let client = plain_device(&plain, 0, &PLAIN);
 	let token = || client.prover.prove(Name::WsPlain, time.secs(), &mut random).unwrap().token;
 	let t = token();
 	// Each of these carries a proof that would open, and each is refused to the decoy: the token in the query, in a cookie of another name, twice, quoted, with a blank, in two `Cookie` fields, or on another path or method.
@@ -78,13 +93,13 @@ async fn only_exactly_one_cookie_with_the_token_is_a_user_and_everything_else_go
 	];
 	for (what, bytes) in &bad {
 		let before = node.site.requests.load(Ordering::SeqCst);
-		let (answer, _) = node.hand(bytes, "198.51.100.7").await;
+		let (answer, _) = hand(&plain, bytes, "198.51.100.7").await;
 		assert!(!answer.starts_with("HTTP/1.1 101 "), "{what}: {answer}");
 		eventually(what, || node.site.requests.load(Ordering::SeqCst) == before + 1).await;
 	}
 	assert_eq!(node.totals().proofs_accepted, 0);
 	// Other cookies beside the right one do not matter, and the token had not been spent by any of the refusals.
-	let (answer, _) = node.hand(&request(PLAIN_PATH, &format!("Cookie: a=b; sid={t}; c=d\r\n")), "198.51.100.7").await;
+	let (answer, _) = hand(&plain, &request(PLAIN_PATH, &format!("Cookie: a=b; sid={t}; c=d\r\n")), "198.51.100.7").await;
 	assert!(answer.starts_with("HTTP/1.1 101 "), "{answer}");
 	assert_eq!(node.totals().proofs_accepted, 1);
 	node.engine.shutdown().await;
@@ -93,13 +108,13 @@ async fn only_exactly_one_cookie_with_the_token_is_a_user_and_everything_else_go
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_proof_for_another_transport_or_made_with_another_key_opens_nothing() {
 	let time = time!();
-	let node = launch("plain-names", time, |doc| with_plain(doc, &[PLAIN])).await;
+	let (node, plain) = launch_plain("plain-names", time, &[PLAIN]).await;
 	// Every other name in the cookie of the `ws-plain` path, and the right name with the inbound's own key.
 	for name in [Name::Tls, Name::Ws, Name::Fronted, Name::FrontedShaped] {
-		let answer = open(&node, &mut plain_device(&node, 0, &PLAIN), name, time.secs()).await;
+		let answer = open(&plain, &mut plain_device(&plain, 0, &PLAIN), name, time.secs()).await;
 		assert!(answer.starts_with("HTTP/1.1 404 "), "{name:?}: {answer}");
 	}
-	let answer = open(&node, &mut node.device(0), Name::WsPlain, time.secs()).await;
+	let answer = open(&plain, &mut node.device(0), Name::WsPlain, time.secs()).await;
 	assert!(answer.starts_with("HTTP/1.1 404 "), "{answer}");
 	// And the other way: a `ws-plain` proof is no proof on the listeners of the covered transports, in the query or the cookie, with the key of either.
 	for key in [PLAIN, TRANSPORT] {
@@ -113,7 +128,7 @@ async fn a_proof_for_another_transport_or_made_with_another_key_opens_nothing() 
 	assert!(d.open_as(POLL_PATH, Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 404 "));
 	assert_eq!(node.totals().proofs_accepted, 0);
 	// The rightly made one still opens.
-	assert!(open(&node, &mut plain_device(&node, 0, &PLAIN), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
+	assert!(open(&plain, &mut plain_device(&plain, 0, &PLAIN), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
 	node.engine.shutdown().await;
 }
 
@@ -121,18 +136,18 @@ async fn a_proof_for_another_transport_or_made_with_another_key_opens_nothing() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_keys_of_the_transport_are_rotated_without_a_gap() {
 	let time = time!();
-	let mut node = launch("plain-rotation", time, |doc| with_plain(doc, &[PLAIN])).await;
-	let mut old = plain_device(&node, 0, &PLAIN);
-	assert!(open(&node, &mut old, Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
+	let (mut node, plain) = launch_plain("plain-rotation", time, &[PLAIN]).await;
+	let mut old = plain_device(&plain, 0, &PLAIN);
+	assert!(open(&plain, &mut old, Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
 	let init = old.initiation();
 	old.put(&[&init]).await;
 	let first = old.chunk(SECOND).await.expect("no first answer");
 	let keepalive = old.confirm(&first[0]);
 	old.put(&[&keepalive]).await;
 	node.reload(|doc| doc["inbounds"][0]["transports"][2]["transport_keys"] = json!([text(&PLAIN_ROTATED), text(&PLAIN)])).await;
-	let (mut b, mut c) = (plain_device(&node, 1, &PLAIN), plain_device(&node, 2, &PLAIN_ROTATED));
+	let (mut b, mut c) = (plain_device(&plain, 1, &PLAIN), plain_device(&plain, 2, &PLAIN_ROTATED));
 	for d in [&mut b, &mut c] {
-		assert!(open(&node, d, Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
+		assert!(open(&plain, d, Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
 		let init = d.initiation();
 		d.put(&[&init]).await;
 		let first = d.chunk(SECOND).await.expect("no first answer");
@@ -144,7 +159,7 @@ async fn the_keys_of_the_transport_are_rotated_without_a_gap() {
 	node.reload(|doc| doc["inbounds"][0]["transports"][2]["transport_keys"] = json!([text(&PLAIN_ROTATED)])).await;
 	assert!(old.ends(SECOND).await && b.ends(SECOND).await && retired.elapsed() < SECOND, "the sessions of a removed transport key were still there after {:?}", retired.elapsed());
 	assert_eq!((c.leaves(40006).await.as_deref(), c.closed, node.totals().sessions, node.totals().ended_revoked), (Some("main"), false, 1, 2));
-	assert!(open(&node, &mut plain_device(&node, 3, &PLAIN), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 404 "));
-	assert!(open(&node, &mut plain_device(&node, 3, &PLAIN_ROTATED), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
+	assert!(open(&plain, &mut plain_device(&plain, 3, &PLAIN), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 404 "));
+	assert!(open(&plain, &mut plain_device(&plain, 3, &PLAIN_ROTATED), Name::WsPlain, time.secs()).await.starts_with("HTTP/1.1 101 "));
 	node.engine.shutdown().await;
 }

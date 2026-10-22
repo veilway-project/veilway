@@ -987,15 +987,18 @@ async fn prove(shared: &Arc<Shared>, listener: &Listener, served: &Served, line:
 	let natives: Vec<Option<(&Native, Arc<Tags>)>> = served.routes.iter().map(|route| plan.inbound_of(&route.tunnel).and_then(|inbound| plan.inbounds[inbound].native.as_ref()).map(|native| (native, native.tags()))).collect();
 	let mut found = None;
 	for (index, (route, native)) in served.routes.iter().zip(&natives).enumerate() {
-		let Some((prover, tags)) = native.as_ref().and_then(|(native, tags)| Some((native.prover_for(&route.keys)?, tags))) else {continue};
+		let Some((native, tags)) = native else {continue};
+		// A route that outlives its plan for a moment (a reload) has no prover: another one of the inbound does the work of a stranger's line, and nothing it opens is taken.
+		let (prover, live) = if let Some(prover) = native.prover_for(&route.keys) {(prover, true)} else if let Some(prover) = native.prover_for(&[]).or(native.plain.first()) {(prover, false)} else {continue};
 		// A route with a shape reads its own target: the text of a proof is the one of an opening request in the form of the shape, and a later request is no proof. The others take the query of the line on their path and with their method, and none of them takes a line over 4,096 bytes.
 		let candidate = match (&route.shape, targets.get(index)) {
+			_ if !live => None,
 			(Some(_), Some(Some(target))) => if let Who::Opening(token) = target.who {Some(token)} else {None},
 			(Some(_), _) => None,
 			(None, _) if route.over == Over::WsPlain => (able(route) && at == Some(index) && line.method == route.method && line.query.is_none()).then(|| http::cookie_once(head, route.cookie.as_bytes())).flatten(),
 			(None, _) => (able(route) && at == Some(index) && line.method == route.method).then_some(query),
 		};
-		if let Ok(opened) = prover.node.open(candidate.map(|_| route.name), candidate.unwrap_or(query), &tags.table) {found = Some((index, opened))}
+		if let (Ok(opened), true) = (prover.node.open(candidate.map(|_| route.name), candidate.unwrap_or(query), &tags.table), live) {found = Some((index, opened))}
 	}
 	let Some((index, mut opened)) = found else {return Err(Stranger::Proof)};
 	if let Some(place) = place {(place.table)(&place.listener).leave(place.id, place.source);}

@@ -852,16 +852,6 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 		dropped.push(Dropped {transport: place.transport, count: 1, cause});
 		false
 	});
-	// "A `ws-plain` transport may not use a host or a path that any `tls`, `ws` or `fronted` candidate uses": the transport is refused, the covered ones stay.
-	let covered: Vec<&Stream> = kept.iter().filter_map(|(transport, _)| if let Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) = transport {Some(stream)} else {None}).collect();
-	let apart: Vec<bool> = kept.iter().map(|(transport, _)| !matches!(transport, Transport::WsPlain {stream, ..} if covered.iter().any(|other| other.path == stream.path || other.candidates.iter().any(|used| stream.candidates.iter().any(|plain| used.host.eq_ignore_ascii_case(&plain.host) || used.sni.as_ref().is_some_and(|sni| sni.eq_ignore_ascii_case(&plain.host))))))).collect();
-	let mut apart = apart.into_iter();
-	kept.retain(|(_, place)| {
-		if apart.next() == Some(true) {return true}
-		dropped.retain(|drop| drop.transport != place.transport);
-		dropped.push(Dropped {transport: place.transport, count: 1, cause: Cause::Separation});
-		false
-	});
 	dropped.sort_by_key(|drop| drop.transport);
 	let (transports, places): (Vec<Transport>, Vec<Place>) = kept.into_iter().unzip();
 	// "A profile whose transports are all left out is refused."
@@ -885,6 +875,22 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	// A list of another type or of more than 4 is a member of the profile out of its range. A notice in it that does not read is left out, as one at the top level is.
 	let notices = members.list("notices", 0..=NOTICES_MAX)?.unwrap_or_default().iter().filter_map(|item| Members::of(item).and_then(notice)).collect();
 	Ok(Profile {id: id.to_owned(), name: need("name", text(members, "name", true, NAME, 4 * NAME))?, inbound_public_key: need("inbound_public_key", key32(members, "inbound_public_key", public))?, device, gateways, mtu: need("mtu", members.uint("mtu", u64::from(MTU_MIN)..=MTU_MAX))? as u16, transport_public_key, transports, places, dropped, stream_first: members.boolean("stream_first")?.unwrap_or(false), parallel: members.uint("parallel", 1..=4)?.unwrap_or(1) as u8, padding, min_control_version: members.uint("min_control_version", 1..=255)?.unwrap_or(1) as u8, rating_cap, exits, notices})
+}
+
+/// "A `ws-plain` transport may not use a host or a path that any `tls`, `ws` or `fronted` candidate of the subscription uses": the transport is refused, in whichever profile it is, and the covered ones stay. A profile left with no transport is refused.
+fn apart(profiles: Vec<(usize, Profile)>, refused: &mut Vec<RefusedProfile>) -> Vec<(usize, Profile)> {
+	let covered: Vec<(String, Vec<String>)> = profiles.iter().flat_map(|(_, profile)| &profile.transports).filter_map(|transport| if let Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) = transport {Some((stream.path.clone(), stream.candidates.iter().flat_map(|used| [Some(used.host.clone()), used.sni.clone()]).flatten().collect()))} else {None}).collect();
+	profiles.into_iter().filter_map(|(position, mut profile)| {
+		let gone: Vec<usize> = profile.transports.iter().enumerate().filter(|(_, transport)| matches!(transport, Transport::WsPlain {stream, ..} if covered.iter().any(|(path, names)| *path == stream.path || names.iter().any(|name| stream.candidates.iter().any(|plain| name.eq_ignore_ascii_case(&plain.host)))))).map(|(at, _)| at).collect();
+		for at in gone.into_iter().rev() {
+			profile.transports.remove(at);
+			let place = profile.places.remove(at);
+			profile.dropped.retain(|drop| drop.transport != place.transport);
+			profile.dropped.push(Dropped {transport: place.transport, count: 1, cause: Cause::Separation});
+		}
+		profile.dropped.sort_by_key(|drop| drop.transport);
+		if profile.transports.is_empty() {refused.push(RefusedProfile {position, id: Some(profile.id.clone()), fault: Fault::Member("transports")}); None} else {Some((position, profile))}
+	}).collect()
 }
 
 /// Reads the payload of a verified document: steps 4 to 6 of "What is checked, in order", without the checks that need the clock or the stored document, which are `client`'s.
@@ -924,6 +930,7 @@ pub fn parse(verified: &Verified) -> Result<Payload, PayloadError> {
 			Err(fault) => refused.push(RefusedProfile {position, id: Members::of(item).and_then(|members| members.string("id", 64).ok().flatten()).filter(|id| is_tag(id)).map(str::to_owned), fault}),
 		}
 	}
+	let profiles = apart(profiles, &mut refused);
 	let twice: HashSet<String> = profiles.iter().enumerate().filter(|(index, (_, profile))| profiles[..*index].iter().any(|(_, earlier)| earlier.id == profile.id)).map(|(_, (_, profile))| profile.id.clone()).collect();
 	refused.extend(profiles.iter().filter(|(_, profile)| twice.contains(&profile.id)).map(|(position, profile)| RefusedProfile {position: *position, id: Some(profile.id.clone()), fault: Fault::Duplicate}));
 	refused.sort_by_key(|profile| profile.position);
@@ -971,6 +978,8 @@ mod tests {
 		let parsed = json::parse(profile.to_string().as_bytes()).unwrap();
 		super::profile(Members::of(&parsed).unwrap())
 	}
+	// A profile as `apart` leaves it when it is the only one of the document.
+	fn apart_one(profile: &Value) -> Profile {super::apart(vec![(0, read(profile).unwrap())], &mut Vec::new()).remove(0).1}
 	// What a profile of one transport and a `udp-obfs` keeps of the first: `None` when it was left out.
 	fn kept(transport: Value) -> Option<Transport> {
 		let read = read(&profile_of(vec![transport, obfs()], Some(0x31))).unwrap();
@@ -1188,10 +1197,24 @@ mod tests {
 			let mut covered = covered(kind, covered_path, covered_host);
 			if kind == "tls" {covered["candidates"][0]["pins"] = json!([pin()])}
 			let plain = plain(0x51, plain_path, plain_host);
-			let read = read(&profile_of(vec![covered, plain, obfs()], Some(0x31))).unwrap();
+			let read = apart_one(&profile_of(vec![covered, plain, obfs()], Some(0x31)));
 			assert_eq!((read.transports.len(), read.dropped.iter().map(|drop| (drop.transport, drop.cause)).collect::<Vec<_>>()), (2, vec![(1, Cause::Separation)]), "{kind} {plain_host}");
 		}
-		let fine = read(&profile_of(vec![covered("ws", "/covered/path-1", "front.example.com"), plain(0x51, "/plain/upgrade-1", "plain.example.com"), obfs()], Some(0x31))).unwrap();
+		let fine = apart_one(&profile_of(vec![covered("ws", "/covered/path-1", "front.example.com"), plain(0x51, "/plain/upgrade-1", "plain.example.com"), obfs()], Some(0x31)));
 		assert!(fine.dropped.is_empty() && fine.transports.len() == 3);
+	}
+
+	#[test]
+	fn a_ws_plain_host_or_path_that_another_profile_uses_refuses_the_ws_plain_transport_and_a_profile_left_empty() {
+		let (mut other, mut only) = (profile_of(vec![covered("ws", "/covered/path-1", "front.example.com"), obfs()], Some(0x31)), profile_of(vec![plain(0x51, "/plain/upgrade-1", "front.example.com")], None));
+		other["id"] = json!("other");
+		let mut refused = Vec::new();
+		let kept = apart(vec![(0, read(&other).unwrap()), (1, read(&only).unwrap())], &mut refused);
+		assert_eq!((kept.len(), kept[0].1.transports.len(), refused.len(), refused[0].position), (1, 2, 1, 1));
+		only["transports"].as_array_mut().unwrap().push(obfs());
+		let kept = apart(vec![(0, read(&other).unwrap()), (1, read(&only).unwrap())], &mut refused);
+		assert_eq!((kept.len(), kept[1].1.transports.len(), kept[1].1.dropped.iter().map(|drop| drop.cause).collect::<Vec<_>>()), (2, 1, vec![Cause::Separation]));
+		let by_path = apart(vec![(0, read(&other).unwrap()), (1, read(&profile_of(vec![plain(0x51, "/covered/path-1", "plain.example.com"), obfs()], None)).unwrap())], &mut refused);
+		assert_eq!(by_path[1].1.transports.len(), 1);
 	}
 }

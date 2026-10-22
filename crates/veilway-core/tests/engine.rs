@@ -193,6 +193,7 @@ fn transport(kind: &str, net: &Net) -> Value {
 		"faketls-blocked" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x45; 32])), "candidates": [{"address": DEAD_TLS, "sni": "www.example.com"}]}),
 		"faketls" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x65; 32])), "candidates": [{"address": FAKETLS, "sni": "www.example.com"}]}),
 		"ws-plain-blocked" => json!({"type": "ws-plain", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x66; 32])), "cookie": "sid", "path": "/assets/plain-3b9e41aa.js", "candidates": [{"address": DEAD_TLS, "host": "plain.node.test"}]}),
+		"ws-plain-moved" => json!({"type": "ws-plain", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x66; 32])), "cookie": "sid", "path": "/assets/plain-3b9e41aa.js", "candidates": [{"address": DEAD_TLS, "host": "moved.node.test"}]}),
 		other => panic!("{other}"),
 	}
 }
@@ -581,6 +582,17 @@ async fn a_ws_plain_transport_has_a_question_of_its_own_that_the_yes_to_udp_obfs
 	let mut run = Run::new(start(&net, settings.clone(), &after, PRIVATE).unwrap(), 0);
 	run.connected().await;
 	run.tunnel.stop().await;
+	// The yes holds for the hosts it was given for: a refresh that changes the other transports keeps it, and one that names another host asks again.
+	let reordered = library(&net, "plain-reordered", &payload(time, vec![profile(&net, 0, &["udp-obfs", "tls", "ws-plain-blocked"])])).await;
+	start(&net, settings.clone(), &reordered, PRIVATE).unwrap().stop().await;
+	let moved = library(&net, "plain-moved", &payload(time, vec![profile(&net, 0, &["tls", "udp-obfs", "ws-plain-moved"])])).await;
+	assert_eq!(start(&net, settings.clone(), &moved, PRIVATE).err(), Some(StartError::Ask(vec![Class::Exposed])));
+	settings.store.agree(&key, Class::Exposed);
+	start(&net, settings.clone(), &moved, PRIVATE).unwrap().stop().await;
+	// Without a ws-plain transport the profile forgets the yes, so that gaining one again asks again.
+	let gone = library(&net, "plain-gone", &payload(time, vec![profile(&net, 0, &["tls", "udp-obfs"])])).await;
+	start(&net, settings.clone(), &gone, PRIVATE).unwrap().stop().await;
+	assert_eq!(start(&net, settings.clone(), &after, PRIVATE).err(), Some(StartError::Ask(vec![Class::Exposed])));
 }
 
 // "No `faketls` candidate is dialed until `alpha_transports` is on": off, a profile is used as if it had no `faketls` transport, and one with nothing else does not start.

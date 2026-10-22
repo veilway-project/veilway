@@ -202,7 +202,11 @@ impl Tunnel {
 		let capped = held.capped().iter().filter(|(of, _, _)| *of == at).count();
 		if capped > 0 {tracing::info!(profile = %profile.id, count = capped, "cover candidates share an address with a datagram endpoint of the subscription: their rating is at most Detectable")}
 		let (store_key, now) = (store::profile_key(held.id().as_str(), &profile.id), (settings.clock)());
-		let kept = settings.store.kept(&store_key);
+		let (mut kept, hosts) = (settings.store.kept(&store_key), choice::plain_hosts(&profile.transports));
+		if kept.standing.exposed != hosts {
+			settings.store.bind_plain(&store_key, hosts);
+			kept = settings.store.kept(&store_key);
+		}
 		let (stream_first, network) = (kept.stream_first.unwrap_or(profile.stream_first), kept.network(&store::network_key(settings.store.seed(), &settings.network)));
 		let plan = choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, alpha);
 		let ask: Vec<Class> = plan.ask.into_iter().filter(|class| !kept.declined.contains(class)).collect();

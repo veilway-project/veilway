@@ -94,6 +94,14 @@ pub fn digest(transports: &[Transport]) -> u64 {
 	hash
 }
 
+/// What the answer about `Exposed` is tied to: the hosts of the `ws-plain` candidates, without their case or their order, and 0 when there are none. "A profile that gains a `ws-plain` transport asks again even if the user consented to `udp-obfs`", and so does one that names another host.
+pub fn plain_hosts(transports: &[Transport]) -> u64 {
+	let mut hosts: Vec<String> = transports.iter().filter_map(|transport| if let Transport::WsPlain {stream, ..} = transport {Some(stream)} else {None}).flat_map(|stream| stream.candidates.iter().map(|candidate| candidate.host.to_ascii_lowercase())).collect();
+	hosts.sort();
+	hosts.dedup();
+	if hosts.is_empty() {0} else {hosts.iter().flat_map(|host| host.bytes().chain([0xff])).fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)) | 1}
+}
+
 /// What a client remembers of one network for one profile. A network is "identified by what the system exposes", which is the caller's to find out.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Network {
@@ -130,6 +138,8 @@ pub struct Standing {
 	pub unanswered: bool,
 	/// The classes the user agreed to for this profile. "The answer is stored per profile and class and can be withdrawn."
 	pub consent: Vec<Class>,
+	/// `plain_hosts` of the transports the answer about `Exposed` was asked for. The answer holds only for that set of hosts: another one asks again.
+	pub exposed: u64,
 	/// The clock offset a pinned candidate's `Date` gave, in seconds, and when it was taken.
 	pub offset: Option<(i64, u64)>,
 	/// The next attempt is made on the device's clock though an offset is held: a candidate without a pin refused, and an offset that has gone stale can be shed in no other way.
@@ -139,7 +149,7 @@ pub struct Standing {
 // A state as it may be used at `now` for the transports of `profile`: see the head of this module.
 fn sound(network: &mut Network, standing: &mut Standing, profile: u64, now: u64) {
 	if network.profile != profile {*network = Network {profile, ..Network::default()}}
-	if standing.profile != profile {*standing = Standing {profile, consent: std::mem::take(&mut standing.consent), ..Standing::default()}}
+	if standing.profile != profile {*standing = Standing {profile, consent: std::mem::take(&mut standing.consent), exposed: standing.exposed, ..Standing::default()}}
 	network.aside.retain(|(_, _, until)| *until > now && *until <= now.saturating_add(HOUR));
 	network.tried.retain(|(_, _, when)| *when <= now && now < when.saturating_add(HOUR));
 	network.worked = network.worked.filter(|(_, _, when)| *when <= now && now < when.saturating_add(WEEK));

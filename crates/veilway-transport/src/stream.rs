@@ -301,8 +301,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 	// The upgrade was answered and the session ended before a chunk of the node opened. Cut, it is the path's doing. Closed in order, by a Close frame or a `close_notify`, the node or what stands in front of it was reached and it is no session: a refusal, but for a session that opened with a keepalive, where it is the node's own deadline for a tunnel it does not know.
 	let told = match ended {
 		Ended::Closed(End::Peer | End::Lost) if !established && cut => Ended::Unreachable(Unreachable::Cut),
-		Ended::Closed(End::Peer | End::Lost) if !established && keepalive => End::Unanswered.into(),
 		Ended::Closed(End::Peer | End::Lost | End::Fault(_)) if !established && plain => Ended::Unreachable(Unreachable::Answered),
+		Ended::Closed(End::Peer | End::Lost) if !established && keepalive => End::Unanswered.into(),
 		Ended::Closed(End::Peer | End::Lost) if !established => Ended::Refused(Refusal {answer: Answer::Unopened, offset: None}),
 		ended => ended,
 	};
