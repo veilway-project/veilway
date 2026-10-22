@@ -149,6 +149,7 @@ fn every_category_is_reported() {
 	assert_eq!(d, Diff {
 		links: Changes::default(),
 		tunnels: Changes::default(),
+		upstreams: Changes::default(),
 		inbounds: Changes {added: names(&["lab"]), changed: names(&["home"]), removed: names(&["office"])},
 		outbounds: Changes {added: names(&["spare"]), changed: names(&["proxy"]), removed: names(&["plain"])},
 		exits: Changes {added: names(&["extra"]), changed: names(&["open"]), removed: names(&["sink"])},

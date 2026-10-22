@@ -403,6 +403,27 @@ impl Config {
 				}
 			}
 		}
+		// An upstream's three secrets stand for those of the running upstream with the same tag. The link comes first, and the two keys only stand for the running ones while the link is the running link too: a device made for one provider never goes to another.
+		if let Some(Json::Arr(upstreams)) = root.get_mut("upstreams") {
+			for (i, upstream) in upstreams.iter_mut().enumerate() {
+				let Json::Obj(upstream) = upstream else {continue};
+				let was = named(upstream, "tag").and_then(|tag| running.upstreams.iter().find(|was| was.tag == tag));
+				if marked(upstream, "link") {
+					match was {
+						Some(was) => drop(upstream.insert("link".to_string(), Json::Str(was.link.expose().clone()))),
+						None => report.error(format!("upstreams[{i}].link"), "expected a link: the marker stands for the link of the running upstream with this tag, and no upstream runs under it"),
+					}
+				}
+				let same = was.is_some_and(|was| matches!(upstream.get("link"), Some(Json::Str(link)) if link == was.link.expose()));
+				for key in ["private_key", "device_secret"] {
+					if !marked(upstream, key) {continue}
+					match was.filter(|_| same) {
+						Some(was) => drop(upstream.insert(key.to_string(), Json::Str(if key == "private_key" {STANDARD.encode(was.private_key.expose().0)} else {was.device_secret.expose().clone()}))),
+						None => report.error(format!("upstreams[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running upstream with this tag and this link, and none runs with it. For a link that is new or has changed, the {key} has to be sent itself")),
+					}
+				}
+			}
+		}
 		// A client's secret stands for the secret of the same user's client in the running Xray inbound with the same tag.
 		if let Some(Json::Obj(xray)) = root.get_mut("xray") {
 			if let Some(Json::Arr(inbounds)) = xray.get_mut("inbounds") {

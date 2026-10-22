@@ -489,7 +489,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let direct = config.exits.iter().any(|exit| match &exit.backend {
 		Backend::Netstack(netstack) => config.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Direct {tag, ..} if *tag == netstack.outbound)),
 		Backend::L3(l3) => l3.masquerade != Some(false),
-		Backend::Block {} | Backend::Chain(_) => false,
+		Backend::Block {} | Backend::Chain(_) | Backend::Upstream(_) => false,
 	});
 	let (servers, limit, mut tasks): (Arc<[SocketAddr]>, _, _) = (config.dns.servers.iter().map(|server| server.0).collect(), Arc::new(Semaphore::new(AT_ONCE)), JoinSet::new());
 	// Every server the node's resolver may ask, with where the config names it: those of `dns.servers`, then those of each set under the tag of the set. A server that two lists name is asked for each.

@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_TUNNEL_CONNECTIONS, DOMAIN_PATTERN, MAX_SITE_NAMES, MAX_SITE_RATE, DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_TUNNELS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_SOURCES, MAX_UPGRADE_HEADERS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_TUNNEL_CONNECTIONS, DOMAIN_PATTERN, MAX_SITE_NAMES, MAX_SITE_RATE, DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_TUNNELS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_SOURCES, MAX_UPGRADE_HEADERS, MAX_UPSTREAMS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -541,6 +541,10 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_LINKS))]
 	pub links: Vec<Link>,
+	/// Other providers' Veilway subscriptions this node holds one device on, each usable as an exit through `{"type": "upstream"}`. At most one exit names an upstream.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_UPSTREAMS))]
+	pub upstreams: Vec<Upstream>,
 	/// The ports of this node that are forwarded through a `chain` exit to an address on the far side of a node link, with no client.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_TUNNELS))]
@@ -1262,13 +1266,22 @@ pub struct Chain {
 	pub links: Vec<String>,
 }
 
+/// What is routed to the exit leaves through the subscription of another provider that `upstreams` names.
+#[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamExit {
+	/// The tag of an entry of `upstreams`.
+	#[schemars(pattern(TAG_PATTERN))]
+	pub upstream: String,
+}
+
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Backend {Netstack(Netstack), L3(L3), Block {}, Chain(Chain)}
+pub enum Backend {Netstack(Netstack), L3(L3), Block {}, Chain(Chain), Upstream(UpstreamExit)}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum BackendType {Netstack, L3, Block, Chain}
+enum BackendType {Netstack, L3, Block, Chain, Upstream}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1283,6 +1296,7 @@ struct BackendKeys {
 	interface: Option<String>,
 	masquerade: Option<bool>,
 	links: Option<Vec<String>>,
+	upstream: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Backend {
@@ -1291,12 +1305,13 @@ impl<'de> Deserialize<'de> for Backend {
 		let netstack = [("outbound", keys.outbound.is_some()), ("proxy_only", keys.proxy_only.is_some()), ("tcp_idle_secs", keys.tcp_idle_secs.is_some()), ("udp_idle_secs", keys.udp_idle_secs.is_some()), ("unsupported", keys.unsupported.is_some())];
 		let l3 = [("interface", keys.interface.is_some()), ("masquerade", keys.masquerade.is_some())];
 		// "A `chain` exit carries whole packets of every IP protocol, so the per-exit `unsupported` policies of the config reference do not exist for it."
-		if let BackendType::Chain = keys.kind {return only("chain", &netstack).and_then(|_| only("chain", &l3)).and_then(|_| Ok(Backend::Chain(Chain {links: keys.links.ok_or_else(|| de::Error::missing_field("links"))?})))}
+		if let BackendType::Chain = keys.kind {return only("chain", &netstack).and_then(|_| only("chain", &l3)).and_then(|_| only("chain", &[("upstream", keys.upstream.is_some())])).and_then(|_| Ok(Backend::Chain(Chain {links: keys.links.ok_or_else(|| de::Error::missing_field("links"))?})))}
+		if let BackendType::Upstream = keys.kind {return only("upstream", &netstack).and_then(|_| only("upstream", &l3)).and_then(|_| only("upstream", &[("links", keys.links.is_some())])).and_then(|_| Ok(Backend::Upstream(UpstreamExit {upstream: keys.upstream.ok_or_else(|| de::Error::missing_field("upstream"))?})))}
 		only(match keys.kind {
 			BackendType::Netstack => "netstack",
 			BackendType::L3 => "l3",
 			_ => "block",
-		}, &[("links", keys.links.is_some())])?;
+		}, &[("links", keys.links.is_some()), ("upstream", keys.upstream.is_some())])?;
 		match keys.kind {
 			BackendType::Netstack => {
 				only("netstack", &l3)?;
@@ -1602,6 +1617,69 @@ impl Link {
 		let obfs = self.peer.as_ref().is_some_and(|peer| peer.transports.iter().any(|transport| transport.kind == LinkTransportType::UdpObfs)) || self.inbound.as_ref().is_some_and(|tag| inbounds.iter().any(|inbound| inbound.tag == *tag && inbound.enveloped()));
 		self.mtu.unwrap_or(if obfs {DEFAULT_MTU_OBFS} else {DEFAULT_MTU})
 	}
+}
+
+/// A class of transports the operator allows an upstream to use, as the client engine ranks them from strongest to weakest. `cover` is always allowed.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamClass {
+	/// `tls`, `ws`, `fronted` and `faketls`: they look like web traffic.
+	Cover,
+	/// `udp-obfs`: no cover, but not recognizable by its bytes.
+	NoCover,
+	/// `ws-plain`: a WebSocket on plain HTTP, whose handshake can be seen.
+	Exposed,
+	/// `udp`: plain WireGuard.
+	Plain,
+}
+
+/// Another provider's Veilway subscription, which this node holds one device on. The node uses it as the carrier of an exit with an `upstream` backend; the other provider sees this node's address and one device, never the node's users.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Upstream {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	/// A native `veilway://sub/` link of the provider. It holds the account's token, so it is a secret. Carried, file, legacy and plain links are not accepted.
+	#[schemars(length(max = 2048))]
+	pub link: Secret<String>,
+	/// The provider's signing key the operator confirmed: its fingerprint as 8 groups of 4 hex digits with a space between them, or the key as 43 characters of base64url. The key in the link must be this one.
+	#[schemars(length(min = 39, max = 43))]
+	pub signing_key: String,
+	/// The WireGuard private key this node made for its device with the provider.
+	pub private_key: Secret<Key>,
+	/// The device secret this node made for its device with the provider: 16 bytes as 22 characters of base64url, as a link's token is written.
+	#[schemars(pattern("^[A-Za-z0-9_-]{22}$"))]
+	pub device_secret: Secret<String>,
+	/// The profile of the provider's document to use. Without it the first one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub profile: Option<String>,
+	/// The tag of the provider's exit to leave through. Without it the provider's default.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub exit: Option<String>,
+	/// The tag of a `direct` or `socks5` outbound the node reaches the provider through, for refreshing the subscription and for its TCP transports. `udp` and `udp-obfs` are not usable through a socks5 outbound.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(pattern(TAG_PATTERN))]
+	pub via: Option<String>,
+	/// The classes of transports besides `cover` that the node may use. Empty or left out: cover transports only.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = 4))]
+	pub allow: Vec<UpstreamClass>,
+	/// Whether the provider may have this node dial private addresses. Defaults to false.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub allow_private: Option<bool>,
+	/// Defaults to true. An upstream that is not enabled is validated like any other and neither fetched nor connected.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub enabled: Option<bool>,
+}
+
+impl Upstream {
+	/// Whether the node connects: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
+	/// The upstream with its defaults written out, so that two spellings of one upstream are equal.
+	pub fn effective(&self) -> Upstream {Upstream {enabled: Some(self.on()), allow_private: Some(self.allow_private == Some(true)), ..self.clone()}}
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]

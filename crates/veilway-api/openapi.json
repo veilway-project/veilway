@@ -56,7 +56,8 @@
           "netstack",
           "l3",
           "block",
-          "chain"
+          "chain",
+          "upstream"
         ],
         "type": "string"
       },

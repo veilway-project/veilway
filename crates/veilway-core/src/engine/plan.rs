@@ -478,6 +478,8 @@ impl Plan {
 				config::Backend::Block {} => Backend::Block,
 				// Filled in once the links are known, further down.
 				config::Backend::Chain(_) => Backend::Chain {links: Vec::new()},
+				// An upstream exit is planned as a chain exit with no link, which is always down and refuses what is routed to it as unreachable. The carrier that fills it comes with the next steps of the upstreams feature.
+				config::Backend::Upstream(_) => Backend::Chain {links: Vec::new()},
 			};
 			let was = was_exit.get(exit.tag.as_str());
 			exits.push(Exit {

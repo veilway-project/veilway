@@ -167,6 +167,38 @@
             "links"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "What is routed to the exit leaves through the subscription of another provider that `upstreams` names.",
+          "properties": {
+            "type": {
+              "const": "upstream",
+              "type": "string"
+            },
+            "upstream": {
+              "description": "The tag of an entry of `upstreams`.",
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "upstream"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -2301,6 +2333,149 @@
       },
       "type": "object"
     },
+    "Upstream": {
+      "additionalProperties": false,
+      "description": "Another provider's Veilway subscription, which this node holds one device on. The node uses it as the carrier of an exit with an `upstream` backend; the other provider sees this node's address and one device, never the node's users.",
+      "properties": {
+        "allow": {
+          "description": "The classes of transports besides `cover` that the node may use. Empty or left out: cover transports only.",
+          "items": {
+            "$ref": "#/$defs/UpstreamClass"
+          },
+          "maxItems": 4,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "allow_private": {
+          "description": "Whether the provider may have this node dial private addresses. Defaults to false.",
+          "type": "boolean"
+        },
+        "device_secret": {
+          "description": "The device secret this node made for its device with the provider: 16 bytes as 22 characters of base64url, as a link's token is written.",
+          "pattern": "^[A-Za-z0-9_-]{22}$",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Defaults to true. An upstream that is not enabled is validated like any other and neither fetched nor connected.",
+          "type": "boolean"
+        },
+        "exit": {
+          "description": "The tag of the provider's exit to leave through. Without it the provider's default.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "link": {
+          "description": "A native `veilway://sub/` link of the provider. It holds the account's token, so it is a secret. Carried, file, legacy and plain links are not accepted.",
+          "maxLength": 2048,
+          "type": "string"
+        },
+        "private_key": {
+          "$ref": "#/$defs/Key",
+          "description": "The WireGuard private key this node made for its device with the provider."
+        },
+        "profile": {
+          "description": "The profile of the provider's document to use. Without it the first one.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "signing_key": {
+          "description": "The provider's signing key the operator confirmed: its fingerprint as 8 groups of 4 hex digits with a space between them, or the key as 43 characters of base64url. The key in the link must be this one.",
+          "maxLength": 43,
+          "minLength": 39,
+          "type": "string"
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "via": {
+          "description": "The tag of a `direct` or `socks5` outbound the node reaches the provider through, for refreshing the subscription and for its TCP transports. `udp` and `udp-obfs` are not usable through a socks5 outbound.",
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag",
+        "link",
+        "signing_key",
+        "private_key",
+        "device_secret"
+      ],
+      "type": "object"
+    },
+    "UpstreamClass": {
+      "description": "A class of transports the operator allows an upstream to use, as the client engine ranks them from strongest to weakest. `cover` is always allowed.",
+      "oneOf": [
+        {
+          "const": "cover",
+          "description": "`tls`, `ws`, `fronted` and `faketls`: they look like web traffic.",
+          "type": "string"
+        },
+        {
+          "const": "no_cover",
+          "description": "`udp-obfs`: no cover, but not recognizable by its bytes.",
+          "type": "string"
+        },
+        {
+          "const": "exposed",
+          "description": "`ws-plain`: a WebSocket on plain HTTP, whose handshake can be seen.",
+          "type": "string"
+        },
+        {
+          "const": "plain",
+          "description": "`udp`: plain WireGuard.",
+          "type": "string"
+        }
+      ]
+    },
     "User": {
       "additionalProperties": false,
       "dependentRequired": {
@@ -2574,6 +2749,15 @@
         "$ref": "#/$defs/Tunnel"
       },
       "maxItems": 64,
+      "type": "array",
+      "uniqueItems": true
+    },
+    "upstreams": {
+      "description": "Other providers' Veilway subscriptions this node holds one device on, each usable as an exit through `{\"type\": \"upstream\"}`. At most one exit names an upstream.",
+      "items": {
+        "$ref": "#/$defs/Upstream"
+      },
+      "maxItems": 8,
       "type": "array",
       "uniqueItems": true
     },

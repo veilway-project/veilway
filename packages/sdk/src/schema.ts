@@ -283,7 +283,7 @@ export interface components {
             saved: boolean;
         };
         /** @enum {string} */
-        Backend: "netstack" | "l3" | "block" | "chain";
+        Backend: "netstack" | "l3" | "block" | "chain" | "upstream";
         /** @description Tags or names of one kind. */
         Changes: {
             added: string[];

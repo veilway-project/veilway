@@ -126,6 +126,8 @@ pub struct Diff {
 	pub links: Changes,
 	/// Tunnels, by tag. A tunnel with its defaults left out and the same with them written out are the same tunnel.
 	pub tunnels: Changes,
+	/// Upstreams, by tag. An upstream with its defaults left out and the same with them written out are the same upstream.
+	pub upstreams: Changes,
 	pub dns: bool,
 	pub log: bool,
 	pub routing_default: bool,
@@ -206,7 +208,7 @@ impl Diff {
 					l3.interface.get_or_insert_with(|| DEFAULT_INTERFACE.to_string());
 					l3.masquerade.get_or_insert(true);
 				}
-				Backend::Block {} | Backend::Chain(_) => {}
+				Backend::Block {} | Backend::Chain(_) | Backend::Upstream(_) => {}
 			}
 			exit
 		};
@@ -221,6 +223,7 @@ impl Diff {
 			users,
 			links: changes(&old.links, &new.links, |link| link.tag.as_str(), |was, is| was == is || Link {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Link {enabled: Some(is.enabled != Some(false)), ..is.clone()}),
 			tunnels: changes(&old.tunnels, &new.tunnels, |tunnel| tunnel.tag.as_str(), |was, is| was.effective() == is.effective()),
+			upstreams: changes(&old.upstreams, &new.upstreams, |upstream| upstream.tag.as_str(), |was, is| was.effective() == is.effective()),
 			dns: old.dns.servers != new.dns.servers || old.dns.hijack.unwrap_or(true) != new.dns.hijack.unwrap_or(true) || old.dns.sets != new.dns.sets,
 			// `level` and `destinations` are read with their defaults, so `Log` already holds effective values.
 			log: old.log != new.log,

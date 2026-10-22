@@ -657,7 +657,7 @@ pub struct Inbounds {
 
 #[derive(Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum Backend {Netstack, L3, Block, Chain}
+pub enum Backend {Netstack, L3, Block, Chain, Upstream}
 
 #[derive(Serialize, JsonSchema)]
 pub struct Exit {

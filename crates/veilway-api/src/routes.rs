@@ -312,6 +312,7 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 				veilway_core::config::Backend::L3(_) => model::Backend::L3,
 				veilway_core::config::Backend::Block {} => model::Backend::Block,
 				veilway_core::config::Backend::Chain(_) => model::Backend::Chain,
+				veilway_core::config::Backend::Upstream(_) => model::Backend::Upstream,
 			},
 			outbound,
 			udp: proxied.then_some(down.is_none()),

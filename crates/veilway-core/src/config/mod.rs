@@ -56,6 +56,8 @@ pub const DEFAULT_LINK_FLOWS: u32 = 16384;
 pub const MAX_LINK_FLOWS: u32 = 65536;
 /// Node links page, "Tunnels": at most 64 tunnels, 1 to 64 networks in `sources`, `max_connections` 1 to 4096 with 256 by default, and "at most 16 of them for one client address".
 pub const MAX_TUNNELS: usize = 64;
+/// Other providers' subscriptions a node uses as exits, at most this many.
+pub const MAX_UPSTREAMS: usize = 8;
 pub const MAX_TUNNEL_SOURCES: usize = 64;
 pub const MAX_TUNNEL_CONNECTIONS: u32 = 4096;
 pub const DEFAULT_TUNNEL_CONNECTIONS: u32 = 256;

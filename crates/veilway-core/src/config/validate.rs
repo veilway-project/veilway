@@ -2,13 +2,14 @@
 use super::model::{domain, ident};
 use super::*;
 use crate::engine::{gate, route};
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use veilway_proto::subscription::is_host;
+use veilway_proto::subscription::link::Link as SubscriptionLink;
 use veilway_proto::subscription::payload::dialable;
 use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
 
@@ -347,6 +348,9 @@ impl Config {
 		let links = &self.links[..self.links.len().min(MAX_LINKS)];
 		let link_tags = tags(&mut r, "links", links.iter().map(|link| link.tag.as_str()));
 		let mut chained: HashMap<usize, usize> = HashMap::new();
+		if self.upstreams.len() > MAX_UPSTREAMS {r.error("upstreams", format!("expected at most {MAX_UPSTREAMS} upstreams"))}
+		let upstream_tags = tags(&mut r, "upstreams", self.upstreams.iter().take(MAX_UPSTREAMS).map(|upstream| upstream.tag.as_str()));
+		let mut upstreamed: HashMap<usize, usize> = HashMap::new();
 		for (i, exit) in self.exits.iter().enumerate().take(MAX_EXITS) {
 			let at = format!("exits[{i}]");
 			// One filter for every text a node hands to a client, the one a client applies before it shows it (`veilway_proto::control::display`): a name it would change is refused here, so what an operator sees accepted is what a user sees.
@@ -399,6 +403,10 @@ impl Config {
 					}
 				}
 				Backend::Block {} => {}
+				Backend::Upstream(exit) => match upstream_tags.get(exit.upstream.as_str()) {
+					None => r.error(format!("{at}.backend.upstream"), "expected the tag of an upstream, found a tag no upstream has"),
+					Some(u) => if let Some(first) = upstreamed.insert(*u, i).filter(|first| *first != i) {r.error(format!("{at}.backend.upstream"), format!("expected an upstream no other exit names, found the upstream of exits[{first}]"))},
+				},
 				// "A `chain` exit may name 1 to 4 links. Each has its own keys and its own addresses", and each leads to the same node, which only the operator knows.
 				Backend::Chain(chain) => {
 					if !(1..=MAX_CHAIN_LINKS).contains(&chain.links.len()) {r.error(format!("{at}.backend.links"), format!("expected 1 to {MAX_CHAIN_LINKS} link tags"))}
@@ -628,7 +636,7 @@ impl Config {
 							match exit_tags.get(tag.as_str()) {
 								None => r.error(at(&format!("exits[{j}]")), "expected the tag of an exit, found a tag no exit has"),
 								// "A link may not leave through another link." A `via` policy never names a `chain` exit, so the list itself is all there is to hold to it.
-								Some(e) if matches!(self.exits[*e].backend, Backend::Chain(_)) => r.error(at(&format!("exits[{j}]")), "expected an exit that leaves from this node: a link may not leave through another link"),
+								Some(e) if matches!(self.exits[*e].backend, Backend::Chain(_) | Backend::Upstream(_)) => r.error(at(&format!("exits[{j}]")), "expected an exit that leaves from this node: a link may not leave through another link or an upstream"),
 								Some(e) if small => {
 									entitled.set(*e);
 									// "Validation warns when an `l3` exit that a link may use has a larger MTU than the link": the link's `mtu` counts into the MTU of that exit's interface.
@@ -687,6 +695,44 @@ impl Config {
 			// "Where a link may dial. The refusals of the subscription format hold: no loopback, link-local, unspecified or multicast address, and none of the forms that carry an IPv4 address inside an IPv6 one." A private address was shown to the operator when the link was paired, and is said again here.
 			for (here, address) in dialled_at {
 				if !dialable(address.ip()) {r.error(here, "expected an address a node may be told to dial: not loopback, link-local, unspecified, multicast, broadcast or in 0.0.0.0/8, and no IPv6 address that carries an IPv4 address")} else if pools.iter().any(|(pool, _)| pool.contains(&address.ip())) {r.error(here, "expected an address outside every inbound pool of this node")} else if pool_ranges.iter().any(|net| net.contains(&address.ip())) {r.warning(here, "a private address: the link dials inside a private network, which is right only where the two nodes share one")}
+			}
+		}
+		// Upstreams: another provider's subscription, one device of this node on it. The link is the account, so no message here repeats it.
+		let (mut upstream_tokens, mut upstream_devices) = (HashSet::new(), HashSet::new());
+		let used: HashSet<&str> = std::iter::once(self.routing.default.as_str()).chain(self.routing.fallback.iter().map(String::as_str)).chain(self.routing.rules.iter().take(MAX_RULES).filter_map(|rule| if let Action::Exit(tag) = &rule.action {Some(tag.as_str())} else {None})).chain(self.users.iter().filter_map(|user| user.exit.as_deref())).collect();
+		for (i, upstream) in self.upstreams.iter().enumerate().take(MAX_UPSTREAMS) {
+			let at = |key: &str| format!("upstreams[{i}].{key}");
+			let text = upstream.link.expose();
+			if text == REDACTED {
+				r.error(at("link"), "expected a link, found the marker the control API shows in the place of one: write the link itself");
+			} else if !text.starts_with("veilway://sub/") {
+				r.error(at("link"), "expected a native link that starts with veilway://sub/: carried, file, legacy and plain links are not accepted");
+			} else {
+				match SubscriptionLink::parse(text) {
+					Ok(SubscriptionLink::Native(native)) => {
+						if upstream.signing_key != native.key().fingerprint().to_string() && upstream.signing_key != URL_SAFE_NO_PAD.encode(native.key().bytes()) {r.error(at("signing_key"), "expected the key or the fingerprint of the key in the link: the link may carry only the provider key the operator confirmed")}
+						if !upstream_tokens.insert(*native.token().expose()) {r.error(at("link"), "expected a link whose token no other upstream has: one account is one device and one upstream")}
+					}
+					Ok(_) => r.error(at("link"), "expected a native link: carried, file and legacy links are not accepted"),
+					Err(why) => r.error(at("link"), format!("expected a native subscription link, found one that does not read ({why:?})")),
+				}
+			}
+			if upstream.signing_key.len() != 39 && upstream.signing_key.len() != 43 {r.error(at("signing_key"), "expected a fingerprint of 8 groups of 4 hex digits with a space between them, or a key of 43 characters of base64url")}
+			if upstream.private_key.expose().0 == [0; 32] {r.error(at("private_key"), "expected a key that is not all zero")} else if !upstream_devices.insert(veilway_wg::public_key(&upstream.private_key.expose().0)) {r.error(at("private_key"), "expected a key no other upstream uses: its public half names the device to the provider")}
+			let secret = upstream.device_secret.expose();
+			if secret == REDACTED {r.error(at("device_secret"), "expected a secret, found the marker the control API shows in the place of one: write the secret itself")} else if !URL_SAFE_NO_PAD.decode(secret).is_ok_and(|bytes| bytes.len() == 16 && URL_SAFE_NO_PAD.encode(bytes) == *secret) {r.error(at("device_secret"), "expected 16 bytes as 22 characters of base64url")}
+			if let Some(via) = &upstream.via {
+				if !outbound_tags.contains_key(via.as_str()) {r.error(at("via"), "expected the tag of a direct or socks5 outbound, found a tag no outbound has")}
+			}
+			for (key, value) in [("profile", &upstream.profile), ("exit", &upstream.exit)] {
+				if value.as_deref().is_some_and(|value| !ident(value, false)) {r.error(at(key), TAG_RULE)}
+			}
+			if upstream.allow.len() > 4 {r.error(at("allow"), "expected at most 4 classes")}
+			index(&mut r, |j| at(&format!("allow[{j}]")), upstream.allow.iter().take(4));
+			match upstreamed.get(&i) {
+				None => r.warning(format!("upstreams[{i}]"), "never used: no exit with an upstream backend names this upstream"),
+				Some(e) if !used.contains(self.exits[*e].tag.as_str()) => r.warning(format!("exits[{e}]"), "never used: no rule, routing.default, routing.fallback or user names this exit"),
+				Some(_) => {}
 			}
 		}
 		if self.public_addresses.len() > MAX_PUBLIC_ADDRESSES {r.error("public_addresses", format!("expected at most {MAX_PUBLIC_ADDRESSES} addresses"))}
