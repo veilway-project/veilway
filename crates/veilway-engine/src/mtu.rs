@@ -6,6 +6,9 @@
 use tokio::time::Instant;
 use veilway_proto::control::{self, ClientMessage, ErrorCode, NodeMessage, Token, PROBES, PROBE_WAIT};
 
+/// One random byte for each size a walk can probe: the profile's `mtu` and the table below it.
+pub const JITTER: usize = control::PROBE_SIZES.len() + 1;
+
 /// What the walk asks its driver to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -56,12 +59,14 @@ pub struct Walk {
 	port: u16,
 	due: Option<Instant>,
 	remembered: Option<u16>,
+	/// Random bytes of this run: each probe of the table is lowered by one of them modulo 17, so the sizes of a walk are not the same fixed list on every device and every path.
+	jitter: [u8; JITTER],
 }
 
 impl Walk {
-	/// Starts a run. `profile` is the signed profile's `mtu`, `floor` the tunnel's smallest MTU, `remembered` the size confirmed first, if one is held, and `port` the UDP port the downstream probes come to.
-	pub fn start(profile: u16, floor: u16, remembered: Option<u16>, port: u16, now: Instant) -> (Self, Vec<Action>) {
-		let walk = Self {profile, floor, sizes: Vec::new(), size: 0, token: None, seq: 0, step: Step::Token, up: 0, down: 0, port, due: Some(now + PROBE_WAIT * 2), remembered};
+	/// Starts a run. `profile` is the signed profile's `mtu`, `floor` the tunnel's smallest MTU, `remembered` the size confirmed first, if one is held, `port` the UDP port the downstream probes come to, and `jitter` random bytes of this run (zeros probe the table's own sizes).
+	pub fn start(profile: u16, floor: u16, remembered: Option<u16>, port: u16, jitter: [u8; JITTER], now: Instant) -> (Self, Vec<Action>) {
+		let walk = Self {profile, floor, sizes: Vec::new(), size: 0, token: None, seq: 0, step: Step::Token, up: 0, down: 0, port, due: Some(now + PROBE_WAIT * 2), remembered, jitter};
 		(walk, vec![Action::Send(ClientMessage::ProbeStart)])
 	}
 	pub fn port(&self) -> u16 {self.port}
@@ -99,7 +104,10 @@ impl Walk {
 				self.token = Some(*token);
 				let top = self.profile.min(*max_size);
 				// The remembered size is confirmed first, and the table below the top follows it.
-				let mut sizes: Vec<u16> = control::probe_sizes(top, self.floor).collect();
+				// The node takes any size from the floor to its maximum, so each size can come down a little: the profile's own first, then the table's, never below the floor. A remembered size stays as it was confirmed.
+				let mut sizes: Vec<u16> = control::probe_sizes(top, self.floor).enumerate().map(|(at, size)| size.saturating_sub(u16::from(self.jitter[at.min(JITTER - 1)] % 17)).max(self.floor)).collect();
+				sizes.sort_unstable_by(|a, b| b.cmp(a));
+				sizes.dedup();
 				if let Some(held) = self.remembered.filter(|held| (self.floor..=top).contains(held)) {sizes.retain(|size| *size != held); sizes.insert(0, held)}
 				self.sizes = sizes;
 				self.next(now)
@@ -139,7 +147,7 @@ mod tests {
 	// Drives a walk against a path that carries packets up to `limit` bytes in each direction, or `up` and `down` separately.
 	fn run(profile: u16, floor: u16, remembered: Option<u16>, up_limit: u16, down_limit: u16) -> (Outcome, usize, usize) {
 		let mut now = Instant::now();
-		let (mut walk, todo) = Walk::start(profile, floor, remembered, 51000, now);
+		let (mut walk, todo) = Walk::start(profile, floor, remembered, 51000, [0; JITTER], now);
 		let (mut ups, mut downs) = (0, 0);
 		let mut queue = std::collections::VecDeque::from(todo);
 		loop {
@@ -196,6 +204,21 @@ mod tests {
 	}
 
 	#[test]
+	fn random_bytes_lower_each_probe_by_at_most_16_and_never_below_the_floor_and_keep_the_order() {
+		let sizes = |jitter: [u8; JITTER], floor: u16, remembered: Option<u16>| {
+			let (mut walk, _) = Walk::start(1390, floor, remembered, 51000, jitter, Instant::now());
+			walk.message(&NodeMessage::ProbeToken {token: TOKEN, max_size: 1440}, Instant::now());
+			[vec![walk.size], walk.sizes.clone()].concat()
+		};
+		assert_eq!(sizes([0; JITTER], MTU_MIN_V4, None), vec![1390, 1360, 1320, 1280, 1240, 1160, 1080], "zeros probe the table itself");
+		let all = sizes([16; JITTER], MTU_MIN_V4, None);
+		assert_eq!(all, vec![1374, 1344, 1304, 1264, 1224, 1144, 1080], "each comes down by 16, and the last stops at the floor");
+		let mixed = sizes([33, 255, 0, 7, 16, 1, 50, 9, 9, 9], MTU_MIN, None);
+		assert!(mixed.windows(2).all(|pair| pair[0] > pair[1]) && mixed.iter().all(|size| *size >= MTU_MIN), "{mixed:?}");
+		assert_eq!(sizes([16; JITTER], MTU_MIN_V4, Some(1320))[0], 1320, "a remembered size is probed as it was confirmed");
+	}
+
+	#[test]
 	fn a_remembered_size_is_confirmed_first_and_a_failed_confirmation_starts_the_walk() {
 		assert_eq!(run(1390, MTU_MIN, Some(1320), 1500, 1500), (Outcome::Found(1320), 1, 1));
 		// The path got worse since: the walk goes from the top, and the confirmed size is not tried a second time.
@@ -210,7 +233,7 @@ mod tests {
 	#[test]
 	fn what_the_node_says_out_of_turn_or_wrong_is_ignored() {
 		let now = Instant::now();
-		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
+		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, [0; JITTER], now);
 		// Before the token nothing else counts.
 		assert!(walk.message(&NodeMessage::ProbeAck {seq: 1, size: 1390}, now).is_empty());
 		assert!(walk.arrived(&TOKEN, 1, 1390).is_empty());
@@ -233,11 +256,11 @@ mod tests {
 	fn the_nodes_refusals_end_the_run_without_a_result() {
 		let now = Instant::now();
 		for (code, outcome) in [(ErrorCode::NotApplicable, Outcome::NotApplicable), (ErrorCode::Busy, Outcome::Later), (ErrorCode::RateLimited, Outcome::Later)] {
-			let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
+			let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, [0; JITTER], now);
 			assert_eq!(walk.message(&NodeMessage::Error {code, answers: control::kind::PROBE_START}, now), vec![Action::Done(outcome)]);
 		}
 		// An error that answers another request is not the answer to this one, and a token that never comes ends the run.
-		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, now);
+		let (mut walk, _) = Walk::start(1390, MTU_MIN, None, 51000, [0; JITTER], now);
 		assert!(walk.message(&NodeMessage::Error {code: ErrorCode::Busy, answers: control::kind::SET_MTU}, now).is_empty());
 		assert!(walk.poll(now).is_empty());
 		assert_eq!(walk.poll(now + PROBE_WAIT * 2), vec![Action::Done(Outcome::Later)]);

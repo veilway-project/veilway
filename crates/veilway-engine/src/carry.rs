@@ -380,7 +380,9 @@ impl Core {
 			if c.walk.is_none() && c.walk_at.is_some_and(|at| now >= at) {
 				c.walk_at = None;
 				let remembered = self.remembered(c.transport);
-				let (walk, actions) = Walk::start(self.profile.mtu, self.floor(), remembered.or(Some(self.status.mtu)), pick(PORTS.0, PORTS.1) as u16, now);
+				let mut jitter = [0u8; crate::mtu::JITTER];
+				let _ = crate::random(&mut jitter);
+				let (walk, actions) = Walk::start(self.profile.mtu, self.floor(), remembered.or(Some(self.status.mtu)), pick(PORTS.0, PORTS.1) as u16, jitter, now);
 				c.walk = Some(walk);
 				self.walked(c, carrier, actions);
 			}
