@@ -232,6 +232,7 @@ export const en = {
 	"alpha.confirm": "Turn on",
 	"alpha.off": "This connection can only be made in a way that is still being tested, and that is switched off. Turn on Alpha transports in Settings, then connect again.",
 	"profile.leftOut": "Some addresses were left out because they could not be read.",
+	"profile.unknownType": "This subscription offers a way of connecting this app does not know. Update the app to use it.",
 	"update.title": "Version {version} is ready",
 	"update.install": "Install and restart",
 	"update.installing": "Downloading the update",

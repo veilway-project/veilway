@@ -47,6 +47,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
 			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{chosen?.profile.legacy ? [subscription.provider, t("xray.tcpUdp")].join(locale === "fa" ? "، " : ", ") : subscription.provider}</span>}</p>
 			{chosen?.profile.left_out && <p className="vw-muted vw-small">{t("profile.leftOut")}</p>}
+			{subscription?.unknown_type && <p className="vw-muted vw-small">{t("profile.unknownType")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
 			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>

@@ -160,6 +160,9 @@ pub struct SubscriptionOut {
 	/// `#rrggbb`
 	pub accent: Option<String>,
 	pub left_out: usize,
+	/// A transport of some profile is of a type this app does not know. An update may add a way of connecting.
+	#[serde(default)]
+	pub unknown_type: bool,
 	/// The user's choice to let apps reach devices on the networks the device is on outside the tunnel, for this subscription. Off unless chosen.
 	#[serde(default)]
 	pub lan_local: bool,
@@ -233,6 +236,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		logo: subscription.logo.as_ref().filter(|logo| logo.data.len() <= LOGO_BYTES_MAX).map(|logo| LogoOut {kind: logo.kind.word().into(), data: base64::engine::general_purpose::STANDARD.encode(&logo.data)}),
 		accent: subscription.accent.map(|[red, green, blue]| format!("#{red:02x}{green:02x}{blue:02x}")),
 		left_out: subscription.left_out,
+		unknown_type: subscription.has_unknown_transport(),
 		lan_local,
 		hosts: Vec::new(),
 		legacy: false,

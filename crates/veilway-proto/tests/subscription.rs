@@ -324,6 +324,8 @@ enum Want {
 	Fine,
 	// The candidate is refused and nothing else: the first profile is kept without the transport whose only candidate it was ("A transport whose candidates are all refused is left out").
 	Dropped,
+	// The same, but the transport is of a type this version does not know, and it is left out whole.
+	Unknown,
 }
 
 // A document of two profiles and every kind of provider content, in which the first profile has a stream transport of each kind.
@@ -344,7 +346,7 @@ fn judge(name: &str, document: &Value, want: Want) {
 		(Ok(Payload::Subscription(read)), Want::Profile(fault)) => assert_eq!((read.refused.iter().map(|refused| (refused.position, refused.fault)).collect::<Vec<_>>(), read.profiles.iter().map(|profile| profile.id.as_str()).collect::<Vec<_>>()), (vec![(0, fault)], vec!["other"]), "{name}"),
 		(Ok(Payload::Subscription(read)), Want::LeftOut(count)) => assert_eq!((read.left_out, read.profiles.len(), read.refused.len()), (count, 2, 0), "{name}"),
 		(Ok(Payload::Subscription(read)), Want::Fine) => assert_eq!((read.left_out, read.profiles.len(), read.refused.len()), (0, 2, 0), "{name}"),
-		(Ok(Payload::Subscription(read)), Want::Dropped) => {
+		(Ok(Payload::Subscription(read)), want @ (Want::Dropped | Want::Unknown)) => {
 			assert_eq!((read.profiles.len(), read.refused.len(), read.profiles[0].transports.len() + 1), (2, 0, read.profiles[1].transports.len()), "{name}");
 			// Which transport went, why, and that every address of the others is still there in its place.
 			let addresses = |profile: &payload::Profile| profile.transports.iter().map(|transport| match transport {
@@ -354,7 +356,7 @@ fn judge(name: &str, document: &Value, want: Want) {
 				Transport::WsPlain {stream, ..} => stream.candidates.iter().map(|candidate| candidate.address.address().to_string()).collect(),
 			}).collect::<Vec<_>>();
 			let [gone] = read.profiles[0].dropped[..] else {panic!("{name}: {:?}", read.profiles[0].dropped)};
-			assert_eq!((gone.count, gone.cause, read.profiles[1].dropped.is_empty()), (1, Cause::NoCandidates, true), "{name}");
+			assert_eq!((gone.count, gone.cause, read.profiles[1].dropped.is_empty()), (1, if matches!(want, Want::Unknown) {Cause::Unknown} else {Cause::NoCandidates}, true), "{name}");
 			let mut whole = addresses(&read.profiles[1]);
 			whole.remove(gone.transport);
 			assert_eq!(addresses(&read.profiles[0]), whole, "{name}");
@@ -366,7 +368,7 @@ fn judge(name: &str, document: &Value, want: Want) {
 
 #[test]
 fn a_hostile_document_for_every_limit_and_rule() {
-	use {Fault::Unsupported, PayloadError as E, Want::{Dropped, Fine, LeftOut, Profile, Refused}};
+	use {Fault::Unsupported, PayloadError as E, Want::{Dropped, Fine, LeftOut, Profile, Refused, Unknown}};
 	let (member, fault) = (|name: &'static str| Refused(E::Member(name)), |name: &'static str| Profile(Fault::Member(name)));
 	let (zero, one, small) = ("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=");
 	let (key1, key2, key3) = (json!(std_base64(key(0x11).bytes())), json!(std_base64(key(0x22).bytes())), json!(small));
@@ -407,7 +409,7 @@ fn a_hostile_document_for_every_limit_and_rule() {
 		// Profiles as a list.
 		("/profiles", None, member("profiles")), ("/profiles", Some(json!([])), member("profiles")), ("/profiles", Some(json!({})), member("profiles")), ("/profiles", Some(profiles(65)), member("profiles")), ("/profiles", Some(list(json!({"type": "later"}), 3)), Refused(E::Profiles)), ("/profiles", Some(list(json!(7), 2)), Refused(E::Profiles)), ("/profiles", Some(list(rich()["profiles"][0].clone(), 2)), Refused(E::Profiles)),
 		// The three unknown values of a profile, and each of its members.
-		("/profiles/0", Some(json!("profile")), fault("profiles")), ("/profiles/0/type", Some(json!("wireguard")), Profile(Unsupported)), ("/profiles/0/type", Some(json!("Veilway")), Profile(Unsupported)), ("/profiles/0/type", None, fault("type")), ("/profiles/0/type", Some(json!(1)), fault("type")), ("/profiles/0/transports/0/type", Some(json!("quic")), Profile(Unsupported)), ("/profiles/0/transports/4/type", Some(json!("quic")), Profile(Unsupported)), ("/profiles/0/transports/0/type", None, fault("type")), ("/profiles/0/future", Some(json!({"anything": [1, 2, {"deep": null}]})), Fine),
+		("/profiles/0", Some(json!("profile")), fault("profiles")), ("/profiles/0/type", Some(json!("wireguard")), Profile(Unsupported)), ("/profiles/0/type", Some(json!("Veilway")), Profile(Unsupported)), ("/profiles/0/type", None, fault("type")), ("/profiles/0/type", Some(json!(1)), fault("type")), ("/profiles/0/transports/0/type", Some(json!("quic")), Unknown), ("/profiles/0/transports/4/type", Some(json!("quic")), Unknown), ("/profiles/0/transports/0/type", None, fault("type")), ("/profiles/0/future", Some(json!({"anything": [1, 2, {"deep": null}]})), Fine),
 		("/profiles/0/id", None, fault("id")), ("/profiles/0/id", Some(json!("")), fault("id")), ("/profiles/0/id", Some(json!("Main")), fault("id")), ("/profiles/0/id", Some(json!("_main")), fault("id")), ("/profiles/0/id", Some(json!("ma in")), fault("id")), ("/profiles/0/id", Some(json!(long(64))), Fine), ("/profiles/0/id", Some(json!(long(65))), fault("id")), ("/profiles/0/id", Some(json!("direct")), Fine),
 		("/profiles/0/name", None, fault("name")), ("/profiles/0/name", Some(json!("")), fault("name")), ("/profiles/0/name", Some(json!("\u{feff}")), fault("name")), ("/profiles/0/name", Some(json!(long(9_000))), Fine),
 		("/profiles/0/inbound_public_key", None, fault("inbound_public_key")), ("/profiles/0/inbound_public_key", Some(json!(zero)), fault("inbound_public_key")), ("/profiles/0/inbound_public_key", Some(json!(&small[..43])), fault("inbound_public_key")), ("/profiles/0/inbound_public_key", Some(json!(small.replace('=', "A"))), fault("inbound_public_key")), ("/profiles/0/inbound_public_key", Some(json!(format!("{small}="))), fault("inbound_public_key")),

@@ -346,6 +346,7 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 		None => bail!("The subscription has more than one connection, pick one with --profile: {}", profiles.iter().map(|profile| format!("{} ({})", profile.id, profile.name.as_str())).collect::<Vec<_>>().join(", ")),
 	};
 	if held.standing(now()) != Standing::Current {eprintln!("This subscription is out of date. It keeps working; refresh it when you can.")}
+	if held.subscription().has_unknown_transport() {eprintln!("This subscription offers a way of connecting this app does not know. Update the app to use it.")}
 	let permit = match held.connect(now()) {
 		Ok(permit) => permit,
 		Err(stale) => if ask("This subscription expired more than 30 days ago, and the addresses and keys in it may no longer belong to the provider. Connect anyway?", &mut signals).await? {stale.confirmed()} else {bail!("Not connected.")},

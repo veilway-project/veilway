@@ -225,6 +225,8 @@ pub struct Subscription {
 }
 
 impl Subscription {
+	/// Whether a transport of any profile was left out for a type this version does not know: a newer app may use it.
+	pub fn has_unknown_transport(&self) -> bool {self.profiles.iter().any(|profile| profile.dropped.iter().any(|drop| drop.cause == Cause::Unknown))}
 	/// The text of this subscription for a notice the node of `profile` sent ("Languages" on the control channel page): the notice whose `default` is byte for byte the text the node sent, looked for "first in the `notices` of the profile it is connected through and then in the subscription's own `notices`". The app then shows `Text::pick` of it, and `None` means it shows `sent.shown_text()`.
 	/// The severity is not given: it "is always the one the node sent". The number is the place in `notices` of this subscription when the match is one of its own, which is then the same notice on the screen, "not two".
 	pub fn notice_text<'a>(&'a self, profile: &'a Profile, sent: &control::Notice) -> Option<(&'a Text, Option<usize>)> {profile.notices.iter().find(|notice| notice.text.is(&sent.text)).map(|notice| (&notice.text, None)).or_else(|| self.notices.iter().position(|notice| notice.text.is(&sent.text)).map(|place| (&self.notices[place].text, Some(place))))}
@@ -327,6 +329,8 @@ pub enum Cause {
 	WsPlain,
 	/// A `ws-plain` transport whose host or path is one that a covered transport of the profile uses.
 	Separation,
+	/// A transport type this app does not know, which a newer app may.
+	Unknown,
 }
 
 impl Cause {
@@ -339,6 +343,7 @@ impl Cause {
 			Self::KeyTwice => "key_twice",
 			Self::WsPlain => "ws_plain",
 			Self::Separation => "separation",
+			Self::Unknown => "unknown",
 		}
 	}
 }
@@ -812,7 +817,7 @@ pub(crate) fn transport(value: &Json) -> Result<Read, Fault> {
 			let left = list.len() - places.len();
 			made((!candidates.is_empty()).then_some(Transport::FakeTls {key, candidates}), places, left)
 		}
-		_ => return Err(Fault::Unsupported),
+		_ => Read {transport: None, places: Vec::new(), dropped: Some((Cause::Unknown, 1))},
 	})
 }
 
@@ -828,9 +833,11 @@ fn profile(members: Members) -> Result<Profile, Fault> {
 	// The two unknown values that mean "not supported" are looked for first, so that a profile of a later version is called that and not malformed.
 	if need("type", members.string("type", STRING_MAX))? != "veilway" {return Err(Fault::Unsupported)}
 	let read: Vec<_> = need("transports", members.list("transports", 1..=TRANSPORTS_MAX))?.iter().map(transport).collect();
-	if read.contains(&Err(Fault::Unsupported)) {return Err(Fault::Unsupported)}
+	let read = read.into_iter().collect::<Result<Vec<_>, _>>()?;
+	// "A transport of a type this version does not know is left out." A profile of nothing but those is one of a later version.
+	if read.iter().all(|read| matches!(read.dropped, Some((Cause::Unknown, _)))) {return Err(Fault::Unsupported)}
 	let (mut kept, mut dropped) = (Vec::new(), Vec::new());
-	for (at, read) in read.into_iter().collect::<Result<Vec<_>, _>>()?.into_iter().enumerate() {
+	for (at, read) in read.into_iter().enumerate() {
 		if let Some((cause, count)) = read.dropped {dropped.push(Dropped {transport: at, count, cause})}
 		if let Some(found) = read.transport {kept.push((found, Place {transport: at, candidates: read.places}))}
 	}
@@ -1041,6 +1048,17 @@ mod tests {
 		}
 		// A key on a candidate is no key of the transport: it is an unknown member there, and the transport still has none.
 		assert_eq!(kept(json!({"type": "faketls", "candidates": [{"address": "192.0.2.10:443", "sni": "www.example.com", "transport_public_key": key(0x41)}]})), None);
+	}
+
+	#[test]
+	fn a_transport_of_an_unknown_type_is_left_out_and_only_a_profile_of_those_is_unsupported() {
+		let later = json!({"type": "later", "endpoints": ["192.0.2.50:51821"]});
+		let kept = read(&profile_of(vec![later.clone(), obfs()], Some(0x31))).unwrap();
+		assert_eq!((kept.transports.len(), kept.dropped.iter().map(|drop| (drop.transport, drop.count, drop.cause)).collect::<Vec<_>>(), Cause::Unknown.word()), (1, vec![(0, 1, Cause::Unknown)], "unknown"));
+		assert_eq!(read(&profile_of(vec![later.clone(), later], Some(0x31))).err(), Some(Fault::Unsupported));
+		let mut bad = obfs();
+		bad["endpoints"] = json!([]);
+		assert_eq!(read(&profile_of(vec![json!({"type": "later"}), bad], Some(0x31))).err(), Some(Fault::Member("endpoints")));
 	}
 
 	#[test]
