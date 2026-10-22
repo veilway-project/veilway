@@ -28,7 +28,7 @@
 # whose trusted comment must read "<product> latest <tag>"; a pointer older than what is installed is refused.
 # GitHub's own "latest release" answer is the fallback only when no source has a pointer yet.
 # A mirror's layout is GitHub's: <mirror>/<owner>/<repo>/releases/download/<tag>/<asset>.
-# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480), VEILWAY_MIRRORS (mirror urls separated by spaces, after any --mirror).
+# Environment: NO_COLOR, VEILWAY_PANEL_PORT (default 8480), VEILWAY_DECOY_PORT (default 8080, where the plain site is also served on 127.0.0.1), VEILWAY_MIRRORS (mirror urls separated by spaces, after any --mirror).
 # For testing only, to run against a release server of your own (scripts/gate-alpha.sh does): VEILWAY_RELEASE_BASE
 # (default https://github.com, still https only), VEILWAY_RAW_BASE (default https://raw.githubusercontent.com),
 # VEILWAY_NODE_PUBKEY and VEILWAY_PANEL_PUBKEY (default: the key below), VEILWAY_CADDY_TLS=internal (Caddy's own CA
@@ -75,6 +75,9 @@ BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
 WEB_ROOT="/var/www/veilway-site"
 WEB_STATE="$VER_DIR/web.state"
+DECOY_PORT="${VEILWAY_DECOY_PORT:-8080}"
+case "$DECOY_PORT" in ""|*[!0-9]*) DECOY_PORT=8080 ;; esac
+DECOY_ON=0
 CADDY_SITE="/etc/caddy/conf.d/veilway-panel.caddy"
 CADDY_IMPORT="import /etc/caddy/conf.d/*.caddy"
 NGINX_SITE="/etc/nginx/conf.d/veilway-panel.conf"
@@ -851,7 +854,7 @@ panel_summary() {
 		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
 		lines+=("Open the admin pages in a browser and paste the token there." "It asks for your username, password and the terms." "")
 		lines+=("Web server: $WEB, site file $([ "$WEB" = caddy ] && echo "$CADDY_SITE" || echo "$NGINX_SITE")")
-		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site is $WEB_ROOT/index.html: edit it as you like." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
+		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site is $WEB_ROOT/index.html: edit it as you like." "  It is also served over http on 127.0.0.1:$DECOY_PORT (this machine only) for a node's decoy origin." "  A transport behind $WEB (ws, fronted) needs its path added to the site file: the panel shows the lines." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
 		if [ "$WEB" = caddy ]; then lines+=("  Caddy gets and renews the certificate for $DOMAIN by itself."); else lines+=("  certbot renews the certificate with its own timer."); fi
 		lines+=("  Port 80 must stay reachable: the certificate is checked over it.")
 		moved="$(web_state node_moved)"; [ -n "$moved" ] || [ -z "$(web_state node_443_moved)" ] || moved="443 8443"; if [ -n "$moved" ]; then read -r from to <<<"$moved"; lines+=("The node's TCP transports moved from $from to $to: publish the profiles again."); fi
@@ -1651,6 +1654,7 @@ $HTTPS_HOST {$tls
 		file_server
 	}
 }
+$([ "$DECOY_ON" = 1 ] && printf 'http://127.0.0.1:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
 EOF
 	if has_systemd && [ "$DRY" = 0 ]; then
 		if ! { if [ "$fresh" = 1 ] || ! systemctl is-active --quiet caddy.service; then svc enable caddy.service; svc restart caddy.service; else svc reload caddy.service; fi; }; then
@@ -1694,6 +1698,7 @@ $tls
 		try_files \$uri \$uri/ =404;
 	}
 }
+$([ "$DECOY_ON" = 1 ] && printf 'server {\n\tlisten 127.0.0.1:%s;\n\tserver_tokens off;\n\troot %s;\n\tlocation / {\n\t\ttry_files %s %s/ =404;\n\t}\n}' "$DECOY_PORT" "$WEB_ROOT" "\$uri" "\$uri")
 EOF
 	if has_systemd && [ "$DRY" = 0 ]; then
 		if ! nginx -t >/dev/null 2>&1; then
@@ -1740,6 +1745,8 @@ web_setup() {
 	web_free_https
 	web_pkg jq
 	web_decoy
+	if [ -n "$(ss -H -ltnp "sport = :$DECOY_PORT" | grep -vE '"(caddy|nginx)"' || true)" ]; then warn "127.0.0.1:$DECOY_PORT is used by something else here, so the plain site is not served there. A node's decoy origin needs a web page: pick another port with VEILWAY_DECOY_PORT=<port> and run this again, or point the origin at your own page."
+	else DECOY_ON=1; [ "$DRY" = 0 ] || dry "serve the same plain site over http on 127.0.0.1:$DECOY_PORT only, in the same site file, as the default decoy origin of a node's transports"; fi
 	if [ "$WEB" = caddy ]; then web_caddy "$prefix" "$sub"; else web_nginx "$prefix" "$sub"; fi
 	web_not_found
 }
