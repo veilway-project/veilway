@@ -83,12 +83,12 @@ impl Walk {
 	fn up(&mut self, now: Instant, retried: bool) -> Vec<Action> {
 		let Some(token) = self.token else {return self.end(Outcome::Later)};
 		if self.up >= PROBES {return self.end(Outcome::Failed)}
-		(self.seq, self.up, self.step, self.due) = (self.seq.wrapping_add(1), self.up + 1, Step::Up {retried}, Some(now + PROBE_WAIT));
+		(self.seq, self.up, self.step, self.due) = (self.seq.wrapping_add(1), self.up + 1, Step::Up {retried}, Some(now + self.wait()));
 		vec![Action::Probe {token, seq: self.seq, size: self.size}]
 	}
 	fn down(&mut self, now: Instant, retried: bool) -> Vec<Action> {
 		if self.down >= PROBES {return self.end(Outcome::Failed)}
-		(self.seq, self.down, self.step, self.due) = (self.seq.wrapping_add(1), self.down + 1, Step::Down {retried}, Some(now + PROBE_WAIT));
+		(self.seq, self.down, self.step, self.due) = (self.seq.wrapping_add(1), self.down + 1, Step::Down {retried}, Some(now + self.wait()));
 		vec![Action::Send(ClientMessage::ProbeDown {seq: self.seq, size: self.size, port: self.port})]
 	}
 	// The next size of the walk, or the end of it.
@@ -98,6 +98,8 @@ impl Walk {
 		self.up(now, false)
 	}
 	/// What the node said. Anything that is not the answer to the probe in hand is ignored.
+	/// The wait for the probe now going out: from three quarters of `PROBE_WAIT` up to all of it, picked from this run's random bytes and the probe's number, so a lost probe is not followed by the same pause every time. Never longer than `PROBE_WAIT`, so a walk still ends inside the node's token life.
+	fn wait(&self) -> std::time::Duration {PROBE_WAIT * 3 / 4 + PROBE_WAIT / 4 * u32::from(self.jitter[usize::from(self.seq) % JITTER] ^ self.seq.rotate_left(3)) / 255}
 	pub fn message(&mut self, message: &NodeMessage, now: Instant) -> Vec<Action> {
 		match (self.step, message) {
 			(Step::Token, NodeMessage::ProbeToken {token, max_size}) => {
@@ -216,6 +218,13 @@ mod tests {
 		let mixed = sizes([33, 255, 0, 7, 16, 1, 50, 9, 9, 9], MTU_MIN, None);
 		assert!(mixed.windows(2).all(|pair| pair[0] > pair[1]) && mixed.iter().all(|size| *size >= MTU_MIN), "{mixed:?}");
 		assert_eq!(sizes([16; JITTER], MTU_MIN_V4, Some(1320))[0], 1320, "a remembered size is probed as it was confirmed");
+	}
+
+	#[test]
+	fn the_wait_for_a_probe_varies_between_three_quarters_of_probe_wait_and_all_of_it() {
+		let waits: Vec<std::time::Duration> = (0..=255u8).map(|seq| {let (mut walk, _) = Walk::start(1390, MTU_MIN_V4, None, 51000, [0x5a, 1, 200, 255, 0, 77, 9, 130, 64, 33], Instant::now()); walk.seq = seq; walk.wait()}).collect();
+		assert!(waits.iter().all(|wait| *wait >= PROBE_WAIT * 3 / 4 && *wait <= PROBE_WAIT), "{waits:?}");
+		assert!(waits.iter().collect::<std::collections::BTreeSet<_>>().len() > 50, "the waits are spread out");
 	}
 
 	#[test]
