@@ -129,6 +129,7 @@ fn say_of(ended: &Ended) -> Option<Say> {
 		Ended::Unreachable(Unreachable::Certificate) => Some(Say::CertificateMismatch),
 		Ended::Unreachable(Unreachable::CertificateTime) => Some(Say::CertificateTime),
 		Ended::Unreachable(Unreachable::Silence) => Some(Say::Silence),
+		Ended::Unreachable(Unreachable::Answered) => Some(Say::Answered),
 		Ended::Unreachable(_) => Some(Say::Unreachable),
 		Ended::Closed(End::Offline) => Some(Say::Offline),
 		Ended::Closed(End::Random | End::Source) => Some(Say::Random),
@@ -381,6 +382,13 @@ impl Core {
 					}
 					if done.say.is_some() {self.reason = done.say}
 					// On the last transport the marks of its candidates are passed over and a candidate that failed at once comes straight back: an attempt that did not open waits at least the wait between transports, or a refused connection would be made again at once and for ever. Only the one retry of a node that forgot the tunnel goes at once.
+					// A plain candidate that was answered with no session waits out its set-aside even when it is the only transport, or its 90 s doubling would be the wait between transports.
+					if plan.order.len() == 1 {
+						for (candidate, _) in done.ended.iter().filter(|(_, ended)| *ended == Ended::Unreachable(Unreachable::Answered)) {
+							let until = self.network.aside.iter().filter(|(at, aside, _)| *at == transport && *aside == Some(*candidate)).map(|(_, _, until)| *until).max().unwrap_or(0);
+							wait = wait.max(Duration::from_secs(until.saturating_sub(self.unix())));
+						}
+					}
 					if wait.is_zero() && plan.order.len() == 1 && !done.opened && !done.ended.iter().any(|(_, ended)| *ended == Ended::Closed(End::Unanswered)) {wait = choice::transport_wait(&mut random).unwrap_or(Duration::from_secs(2))}
 					self.save();
 					if wait > Duration::ZERO {
@@ -452,7 +460,7 @@ impl Core {
 		if let Some(redirect) = &self.settings.hooks.redirect {
 			match &mut target {
 				Target::UdpObfs(address) => *address = redirect(*address),
-				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} | Target::FakeTls {candidate, ..} => candidate.address = redirect(candidate.address),
+				Target::Tls {candidate, ..} | Target::Ws {candidate, ..} | Target::WsPlain {candidate, ..} | Target::Fronted {candidate, ..} | Target::FrontedShaped {candidate, ..} | Target::FakeTls {candidate, ..} => candidate.address = redirect(candidate.address),
 			}
 		}
 		Session::parallel(&self.link, target, self.profile.parallel, env.clone(), self.wire.source()).map_err(|refuse| {

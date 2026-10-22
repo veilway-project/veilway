@@ -192,6 +192,7 @@ fn transport(kind: &str, net: &Net) -> Value {
 		"tls-blocked" => json!({"type": "tls", "path": TLS_PATH, "candidates": [{"address": DEAD_TLS, "sni": "node.test", "host": "node.test", "pins": [net.pin()]}]}),
 		"faketls-blocked" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x45; 32])), "candidates": [{"address": DEAD_TLS, "sni": "www.example.com"}]}),
 		"faketls" => json!({"type": "faketls", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x65; 32])), "candidates": [{"address": FAKETLS, "sni": "www.example.com"}]}),
+		"ws-plain-blocked" => json!({"type": "ws-plain", "transport_public_key": text(&veilway_proto::proof::public_key(&[0x66; 32])), "cookie": "sid", "path": "/assets/plain-3b9e41aa.js", "candidates": [{"address": DEAD_TLS, "host": "plain.node.test"}]}),
 		other => panic!("{other}"),
 	}
 }
@@ -552,6 +553,34 @@ async fn when_the_cover_transport_is_unreachable_the_next_one_is_tried_after_the
 	let (_, network) = &kept.networks[0];
 	assert!(network.aside.iter().any(|(transport, candidate, until)| (*transport, *candidate) == (0, None) && *until <= time.secs() + 3_700) && network.worked.is_some_and(|(transport, _, _)| transport == 1), "{network:?} {}", std::fs::read_to_string(net.dir.join("fallback.json")).unwrap());
 	assert!(logged("a transport is unreachable and set aside"));
+}
+
+// "A `ws-plain` transport has its own consent question, separate from the no-cover one, and a profile that gains a `ws-plain` transport asks again even if the user consented to `udp-obfs`."
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ws_plain_transport_has_a_question_of_its_own_that_the_yes_to_udp_obfs_does_not_answer() {
+	let time = time!();
+	let net = net("engine-plain-consent", time, |_| {}).await;
+	let (key, settings) = (format!("{ID}/home"), net.settings("plain-consent"));
+	let before = library(&net, "plain-before", &payload(time, vec![profile(&net, 0, &["tls", "udp-obfs"])])).await;
+	assert_eq!(start(&net, settings.clone(), &before, PRIVATE).err(), Some(StartError::Ask(vec![Class::NoCover])));
+	settings.store.agree(&key, Class::NoCover);
+	start(&net, settings.clone(), &before, PRIVATE).unwrap().stop().await;
+	// The refresh gains a `ws-plain` transport: the yes to `udp-obfs` stays, and the new class is asked about alone.
+	let after = library(&net, "plain-after", &payload(time, vec![profile(&net, 0, &["tls", "udp-obfs", "ws-plain-blocked"])])).await;
+	assert_eq!(start(&net, settings.clone(), &after, PRIVATE).err(), Some(StartError::Ask(vec![Class::Exposed])));
+	let said = veilway_engine::ask_text(Class::Exposed);
+	assert!(said.contains("can see this server's name and can tell that you use this app, and when and how much, now and later in its records. It cannot see what you send.") && said.contains("ties all of your device's plain connections together"), "{said}");
+	// A no is kept and the profile is used without it, over the cover transport, with the plain one never dialled.
+	settings.store.decline(&key, Class::Exposed);
+	let mut run = Run::new(start(&net, settings.clone(), &after, PRIVATE).unwrap(), 0);
+	let status = run.connected().await;
+	assert_eq!((status.connection.as_ref().map(|connection| connection.transport), status.counters.attempts), (Some("tls"), 1));
+	run.tunnel.stop().await;
+	// A yes lets it be planned, and the question does not come back.
+	settings.store.agree(&key, Class::Exposed);
+	let mut run = Run::new(start(&net, settings.clone(), &after, PRIVATE).unwrap(), 0);
+	run.connected().await;
+	run.tunnel.stop().await;
 }
 
 // "No `faketls` candidate is dialed until `alpha_transports` is on": off, a profile is used as if it had no `faketls` transport, and one with nothing else does not start.

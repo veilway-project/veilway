@@ -30,6 +30,10 @@ pub const ROUND: u32 = 3;
 pub const SILENCE: u64 = 90;
 /// How long a session must have stayed open for the reconnect wait to return to its start. A path that lets a session open and cuts it at once would otherwise be dialled again every second for ever.
 pub const LIVED: u64 = 60;
+/// "It sets the candidate aside for about 90 s" after an answer that is no session on `ws-plain`, doubling on each failure in a row up to `HOUR`.
+pub const PLAIN_ASIDE: u64 = 90;
+/// The most failures in a row a `Network` is read back with, which is far above the count at which the set-aside reached `HOUR`.
+pub const FAILS: u32 = 32;
 /// After this many sessions in a row that were lost before they had lived that long, the client moves on to the next candidate.
 pub const FLAPS: u32 = 3;
 // How many entries of a list are kept of a state that was read back: more than any honest run writes.
@@ -103,6 +107,8 @@ pub struct Network {
 	pub tried: Vec<(usize, usize, u64)>,
 	/// A datagram transport that worked here and has gone silent, and since when.
 	pub silent: Option<(usize, u64)>,
+	/// The candidates of `ws-plain` that answered with something that is no session, each with how many times in a row and when last. It is what the set-aside doubles by, and it is forgotten when a session opens, when the user asks to connect again, and two hours after the last failure.
+	pub plain: Vec<(usize, usize, u32, u64)>,
 }
 
 /// What a client keeps for a profile on every network.
@@ -139,18 +145,19 @@ fn sound(network: &mut Network, standing: &mut Standing, profile: u64, now: u64)
 	network.worked = network.worked.filter(|(_, _, when)| *when <= now && now < when.saturating_add(WEEK));
 	// A silence that was not followed up within the hour is over: the next one starts its 90 s anew.
 	network.silent = network.silent.filter(|(_, since)| *since <= now && now < since.saturating_add(HOUR));
+	network.plain.retain(|(_, _, count, when)| (1..=FAILS).contains(count) && *when <= now && now < when.saturating_add(2 * HOUR));
 	standing.offset = standing.offset.filter(|(_, taken)| *taken <= now && now - taken <= OFFSET_KEPT);
 	standing.opened = standing.opened.filter(|opened| *opened <= now);
 	// A list far longer than any run writes is no list of a run.
 	if network.aside.len() > KEPT {network.aside.clear()}
 	if network.tried.len() > KEPT {network.tried.clear()}
+	if network.plain.len() > KEPT {network.plain.clear()}
 	if standing.rows.len() > KEPT {standing.rows.clear()}
 	standing.consent.truncate(KEPT);
 }
 
 /// Whether a transport may be used under the client's `alpha_transports` setting: "No `faketls` candidate is dialed until it is on." Every other transport may.
-// The client half of `ws-plain` is not built yet, so no build dials it.
-pub fn usable(transport: &Transport, alpha: bool) -> bool {!matches!(transport, Transport::WsPlain {..}) && (alpha || !matches!(transport, Transport::FakeTls {..}))}
+pub fn usable(transport: &Transport, alpha: bool) -> bool {alpha || !matches!(transport, Transport::FakeTls {..})}
 
 /// The transports of a profile a client may try now, in the order to try them, and the classes it must ask about before it may use them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -159,6 +166,7 @@ pub struct Plan {pub order: Vec<usize>, pub ask: Vec<Class>}
 /// "The client uses a transport of a lower class than the best class in the profile only when the user has agreed to that class for this profile. This covers the first attempt as well as fallback."
 /// The order is the provider's. The transport that last worked on this network comes first, and with `stream_first` "the client tries every cover transport before any other". Where the two disagree `stream_first` wins. A transport that is set aside is left out, unless that would leave none: "The last transport of a profile that the client is allowed to use is never set aside."
 /// A `faketls` transport is left out while `alpha` is off, and the best class is then the best of the others: the profile is planned as if it did not list it.
+/// A `ws-plain` transport is never the remembered one: "A `ws-plain` candidate ... is never the remembered candidate a covered one is passed over for". It stays where the provider put it.
 pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, standing: &Standing, now: u64, alpha: bool) -> Plan {
 	let (mut network, mut standing) = (network.clone(), standing.clone());
 	sound(&mut network, &mut standing, digest(transports), now);
@@ -166,7 +174,7 @@ pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, sta
 	let (mut ask, mut order): (Vec<Class>, Vec<usize>) = (transports.iter().filter(|transport| usable(transport, alpha)).map(class).filter(|class| *class > best && !standing.consent.contains(class)).collect(), (0..transports.len()).filter(|at| usable(&transports[*at], alpha) && (class(&transports[*at]) == best || standing.consent.contains(&class(&transports[*at])))).collect());
 	ask.sort();
 	ask.dedup();
-	if let Some(first) = network.worked.and_then(|(worked, _, _)| order.iter().position(|at| *at == worked)) {order[..=first].rotate_right(1)}
+	if let Some(first) = network.worked.filter(|(worked, _, _)| transports.get(*worked).is_some_and(|transport| class(transport) != Class::Exposed)).and_then(|(worked, _, _)| order.iter().position(|at| *at == worked)) {order[..=first].rotate_right(1)}
 	if stream_first {order.sort_by_key(|at| class(&transports[*at]) != Class::Cover)}
 	let free: Vec<usize> = order.iter().copied().filter(|at| !network.aside.iter().any(|(transport, candidate, _)| transport == at && candidate.is_none())).collect();
 	Plan {order: if free.is_empty() {order} else {free}, ask}
@@ -266,6 +274,7 @@ pub fn outcome(network: &mut Network, standing: &mut Standing, profile: u64, tra
 			if bare {standing.offset = None}
 			(network.worked, network.silent, standing.refusals, standing.opened) = (Some((transport, candidate, now)), None, 0, Some(now));
 			standing.rows.clear();
+			network.plain.retain(|(at, tried, _, _)| (*at, *tried) != (transport, candidate));
 			Next::Rest
 		}
 		Some(Ended::Refused(refusal)) => {
@@ -296,6 +305,18 @@ pub fn outcome(network: &mut Network, standing: &mut Standing, profile: u64, tra
 		Some(Ended::Closed(End::Offline) | Ended::Unreachable(Unreachable::CertificateTime)) => {
 			standing.losses = standing.losses.saturating_add(1);
 			Next::Again(reconnect_wait(standing.losses, random)?)
+		}
+		// On `ws-plain` anyone on the path can write an answer, so one that is no session is unreachable at once and never a refusal: no refusal wait is touched. The candidate is set aside for 90 s, which covers a node restart, and for twice as long for each failure in a row, up to the hour. Without that a device that is over its quota or has a wrong clock would put the server's name and the cookie on the path every 90 s for ever.
+		Some(Ended::Unreachable(Unreachable::Answered)) => {
+			let failed = network.plain.iter().find(|row| (row.0, row.1) == (transport, candidate)).map_or(1, |row| row.2.saturating_add(1)).min(FAILS);
+			let until = now.saturating_add(PLAIN_ASIDE.saturating_mul(1u64.checked_shl(failed - 1).unwrap_or(u64::MAX)).min(HOUR));
+			network.plain.retain(|row| (row.0, row.1) != (transport, candidate));
+			network.plain.push((transport, candidate, failed, now));
+			network.aside.retain(|(at, aside, _)| (*at, *aside) != (transport, Some(candidate)));
+			network.aside.push((transport, Some(candidate), until));
+			network.silent = None;
+			tracing::info!(transport, candidate, failed, until, "a plain candidate was answered with no session and is set aside");
+			Next::Move(Duration::ZERO)
 		}
 		Some(Ended::Unreachable(_) | Ended::Closed(End::Unanswered)) => {
 			let until = now.saturating_add(HOUR);
@@ -329,7 +350,8 @@ pub fn outcome(network: &mut Network, standing: &mut Standing, profile: u64, tra
 pub fn fallback(network: &mut Network, profile: u64, order: &[usize], transport: usize, mark: bool, tried: u32, rounds: u32, now: u64, random: &mut Random) -> Result<Duration, NoRandom> {
 	sound(network, &mut Standing {profile, ..Standing::default()}, profile, now);
 	if mark && order.iter().any(|at| *at != transport) {
-		let until = now.saturating_add(HOUR);
+		// A transport whose candidates answered with no session on `ws-plain` is back when the first of them is, not an hour from now.
+		let until = network.plain.iter().any(|row| row.0 == transport).then(|| network.aside.iter().filter(|(at, candidate, _)| *at == transport && candidate.is_some()).map(|(_, _, until)| *until).min()).flatten().unwrap_or(now.saturating_add(HOUR));
 		network.aside.push((transport, None, until));
 		tracing::info!(transport, until, "a transport is unreachable and set aside");
 	}
@@ -338,7 +360,7 @@ pub fn fallback(network: &mut Network, profile: u64, order: &[usize], transport:
 
 /// "The user asks to connect again": every mark, every count and every wait starts over. The hour's budget of candidates stays, since it is what keeps a client from sweeping a list, and consent and the clock offset stay.
 pub fn reset(network: &mut Network, standing: &mut Standing) {
-	(network.aside, network.silent) = (Vec::new(), None);
+	(network.aside, network.silent, network.plain) = (Vec::new(), None, Vec::new());
 	(standing.refusals, standing.rows, standing.losses, standing.short, standing.unanswered, standing.bare) = (0, Vec::new(), 0, 0, false, false);
 }
 
@@ -358,6 +380,7 @@ mod tests {
 			"tls" => Transport::Tls(Stream {path: "/assets/app-1.js".into(), candidates: Vec::new()}),
 			"ws" => Transport::Ws(Stream {path: "/assets/app-2.js".into(), candidates: Vec::new()}),
 			"faketls" => Transport::FakeTls {key: [0x45; 32], candidates: Vec::new()},
+			"ws-plain" => Transport::WsPlain {key: [0x46; 32], cookie: "sid".into(), stream: Stream {path: "/assets/app-4.js".into(), candidates: Vec::new()}},
 			_ => Transport::Fronted(Stream {path: "/assets/app-3.js".into(), candidates: Vec::new()}),
 		}).collect()
 	}
@@ -368,6 +391,7 @@ mod tests {
 	const REFUSED: Option<Ended> = Some(Ended::Refused(Refusal {answer: Answer::Status(404), offset: None}));
 	const NO_ROUTE: Option<Ended> = Some(Ended::Unreachable(Unreachable::Connect));
 	const LOST: Option<Ended> = Some(Ended::Closed(End::Lost));
+	const ANSWERED: Option<Ended> = Some(Ended::Unreachable(Unreachable::Answered));
 
 	fn states() -> (Network, Standing) {(Network {profile: P, ..Network::default()}, Standing {profile: P, ..Standing::default()})}
 
@@ -505,10 +529,12 @@ mod tests {
 		assert!(matches!(candidates(&mut network, profile, 0, 16, &[], false, 7, NOW), Pick::Try(picked) if picked.len() == 2));
 		assert_eq!((network.aside.len(), network.tried.len(), network.worked), (0, 2, None));
 		// The worst a file can hold.
-		let mut network = Network {profile, worked: Some((0, 0, u64::MAX)), aside: vec![(0, Some(0), u64::MAX), (0, None, u64::MAX), (1, None, NOW + HOUR + 1)], tried: vec![(0, 0, u64::MAX); 6], silent: Some((0, u64::MAX))};
+		let mut network = Network {profile, worked: Some((0, 0, u64::MAX)), aside: vec![(0, Some(0), u64::MAX), (0, None, u64::MAX), (1, None, NOW + HOUR + 1)], tried: vec![(0, 0, u64::MAX); 6], silent: Some((0, u64::MAX)), plain: vec![(0, 0, u32::MAX, NOW), (0, 1, 0, NOW), (0, 2, 1, NOW + 1), (0, 3, 2, 0), (0, 4, 2, NOW)]};
 		let mut standing = Standing {profile, refusals: u32::MAX, rows: vec![(0, 0, u32::MAX); 3], losses: u32::MAX, opened: Some(u64::MAX), short: u32::MAX, offset: Some((i64::MIN, u64::MAX)), ..Standing::default()};
 		assert_eq!((plan(&listed, false, &network, &standing, NOW, false).order, clock(NOW, &standing)), (vec![0, 1], NOW));
 		assert!(matches!(candidates(&mut network, profile, 0, 4, &[], false, 7, NOW), Pick::Try(_)));
+		// A count of failures that no run writes, one from the future, one from long ago and one of zero are dropped, and the rest stays.
+		assert_eq!(network.plain, vec![(0, 4, 2, NOW)]);
 		for ended in [REFUSED, LOST, NO_ROUTE, None, Some(Ended::Closed(End::Unanswered))] {outcome(&mut network, &mut standing, profile, 0, 0, ended, NOW, &mut random).unwrap();}
 		assert!(network.aside.iter().all(|(_, _, until)| *until <= NOW + HOUR));
 		// A list far longer than any run writes is no list.
@@ -715,5 +741,71 @@ mod tests {
 		assert_eq!((plan(&listed, false, &network, &standing, NOW, false).order, plan(&listed, false, &network, &standing, NOW + HOUR, false).order), (vec![2], vec![0, 1, 2]));
 		assert!((450..=1_350).contains(&round_wait(40, &mut random).unwrap().as_secs()));
 		assert!((1..=5).contains(&connection_wait(&mut random).unwrap().as_secs()));
+	}
+
+	#[test]
+	fn a_plain_transport_is_usable_and_is_never_the_remembered_one_a_covered_one_is_passed_over_for() {
+		let (listed, mut standing) = (transports(&["tls", "ws-plain", "ws"]), Standing::default());
+		assert!(usable(&listed[1], false));
+		// Without the yes to its class it is not planned, and with it, it stays where the provider put it.
+		assert_eq!(plan(&listed, false, &Network::default(), &standing, NOW, false), Plan {order: vec![0, 2], ask: vec![Class::Exposed]});
+		standing.consent.push(Class::Exposed);
+		let worked = |at: usize| Network {profile: digest(&listed), worked: Some((at, 0, NOW)), ..Network::default()};
+		assert_eq!(plan(&listed, false, &Network::default(), &standing, NOW, false).order, [0, 1, 2]);
+		assert_eq!(plan(&listed, false, &worked(1), &standing, NOW, false).order, [0, 1, 2]);
+		assert_eq!(plan(&listed, false, &worked(2), &standing, NOW, false).order, [2, 0, 1]);
+		// `stream_first` puts the covered ones ahead of it too.
+		assert_eq!(plan(&transports(&["ws-plain", "tls"]), true, &Network::default(), &Standing {consent: vec![Class::Exposed], ..Standing::default()}, NOW, false).order, [1, 0]);
+		// Its question is its own: the yes to `udp-obfs` is not a yes to it.
+		let listed = transports(&["tls", "udp-obfs", "ws-plain"]);
+		let standing = Standing {consent: vec![Class::NoCover], ..Standing::default()};
+		assert_eq!(plan(&listed, false, &Network::default(), &standing, NOW, false), Plan {order: vec![0, 1], ask: vec![Class::Exposed]});
+	}
+
+	// "It sets the candidate aside for about 90 s ... The set-aside doubles on each failure in a row of the same candidate, up to the hour an unreachable candidate gets, and returns to 90 s when a session opens."
+	#[test]
+	fn a_plain_answer_that_is_no_session_sets_the_candidate_aside_90_s_doubling_to_the_hour() {
+		let (mut network, mut standing) = states();
+		let (mut now, mut waits) = (NOW, Vec::new());
+		let mark = |network: &Network, candidate: usize| network.aside.iter().find(|(at, aside, _)| (*at, *aside) == (1, Some(candidate))).map(|(_, _, until)| *until).unwrap();
+		for _ in 0..9 {
+			assert_eq!(outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, now, &mut random), Ok(Next::Move(Duration::ZERO)));
+			let until = mark(&network, 0);
+			waits.push(until - now);
+			now = until;
+		}
+		assert_eq!(waits, [90, 180, 360, 720, 1_440, 2_880, 3_600, 3_600, 3_600]);
+		// No refusal wait, count or reconnect wait was touched.
+		assert_eq!((standing.refusals, standing.rows.len(), standing.losses, standing.short), (0, 0, 0, 0));
+		// Each candidate has its own count.
+		outcome(&mut network, &mut standing, P, 1, 1, ANSWERED, now, &mut random).unwrap();
+		assert_eq!(mark(&network, 1) - now, 90);
+		// A session that opens gives the 90 s back, for that candidate alone.
+		outcome(&mut network, &mut standing, P, 1, 0, None, now, &mut random).unwrap();
+		assert_eq!(network.plain.iter().map(|row| (row.1, row.2)).collect::<Vec<_>>(), [(1, 1)]);
+		outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, now, &mut random).unwrap();
+		assert_eq!(mark(&network, 0) - now, 90);
+		// The user asking to connect again starts every count over.
+		reset(&mut network, &mut standing);
+		assert!(network.plain.is_empty() && network.aside.is_empty());
+		// Two hours without a failure and the count is forgotten.
+		outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, now, &mut random).unwrap();
+		outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, now + 90, &mut random).unwrap();
+		assert_eq!(mark(&network, 0) - (now + 90), 180);
+		outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, now + 90 + 2 * HOUR, &mut random).unwrap();
+		assert_eq!(mark(&network, 0) - (now + 90 + 2 * HOUR), 90);
+	}
+
+	#[test]
+	fn a_plain_transport_with_no_candidate_left_is_set_aside_until_its_first_candidate_is_back() {
+		let (mut network, mut standing) = states();
+		outcome(&mut network, &mut standing, P, 1, 0, ANSWERED, NOW, &mut random).unwrap();
+		outcome(&mut network, &mut standing, P, 1, 1, ANSWERED, NOW, &mut random).unwrap();
+		fallback(&mut network, P, &[0, 1], 1, true, 1, 0, NOW, &mut random).unwrap();
+		assert!(network.aside.contains(&(1, None, NOW + 90)), "{:?}", network.aside);
+		// A transport whose candidates were unreachable the usual way is still set aside for the hour.
+		outcome(&mut network, &mut standing, P, 0, 0, NO_ROUTE, NOW, &mut random).unwrap();
+		fallback(&mut network, P, &[0, 1], 0, true, 1, 0, NOW, &mut random).unwrap();
+		assert!(network.aside.contains(&(0, None, NOW + HOUR)), "{:?}", network.aside);
 	}
 }

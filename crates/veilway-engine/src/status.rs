@@ -21,6 +21,8 @@ pub enum Say {
 	Unreachable,
 	/// No answer on a transport of datagrams.
 	Silence,
+	/// On a plain connection something answered and it was no session: the network or the server, and the app cannot tell which.
+	Answered,
 	/// The device itself could not dial.
 	Offline,
 	/// The hour's budget of new addresses is spent.
@@ -54,7 +56,7 @@ pub enum Say {
 }
 
 impl Say {
-	pub const ALL: &'static [Say] = &[Self::CertificateMismatch, Self::CertificateTime, Self::Refused, Self::ClockWrong, Self::Unreachable, Self::Silence, Self::Offline, Self::BudgetSpent, Self::Lost, Self::NothingToTry, Self::AlphaOff, Self::PathTooSmall, Self::QuotaUsed, Self::Expired, Self::Disabled, Self::NodeStopping, Self::ControlUnverified, Self::ControlUnavailable, Self::AppTooOld, Self::NodeTooOld, Self::ProfileOutOfDate, Self::ClockDrift, Self::Random];
+	pub const ALL: &'static [Say] = &[Self::CertificateMismatch, Self::CertificateTime, Self::Refused, Self::ClockWrong, Self::Unreachable, Self::Silence, Self::Answered, Self::Offline, Self::BudgetSpent, Self::Lost, Self::NothingToTry, Self::AlphaOff, Self::PathTooSmall, Self::QuotaUsed, Self::Expired, Self::Disabled, Self::NodeStopping, Self::ControlUnverified, Self::ControlUnavailable, Self::AppTooOld, Self::NodeTooOld, Self::ProfileOutOfDate, Self::ClockDrift, Self::Random];
 	pub fn code(self) -> &'static str {
 		match self {
 			Self::CertificateMismatch => "certificate-mismatch",
@@ -63,6 +65,7 @@ impl Say {
 			Self::ClockWrong => "clock-wrong",
 			Self::Unreachable => "unreachable",
 			Self::Silence => "silence",
+			Self::Answered => "answered",
 			Self::Offline => "offline",
 			Self::BudgetSpent => "budget-spent",
 			Self::Lost => "lost",
@@ -90,6 +93,7 @@ impl Say {
 			Self::ClockWrong => "The clock on this device is wrong. Connections need a correct clock: check the date and time.",
 			Self::Unreachable => "Could not reach the server on this network. Trying another way.",
 			Self::Silence => "The server did not answer. It may be down or the network may be blocking it.",
+			Self::Answered => "The network or the server answered and it was not the connection. The app cannot tell which. It tries again later.",
 			Self::Offline => "This device has no working network connection.",
 			Self::BudgetSpent => "Many addresses were tried on this network in the last hour. Waiting before trying more.",
 			Self::Lost => "The connection to the server was lost. Reconnecting.",
@@ -180,7 +184,7 @@ pub struct Connection {
 	pub front: Option<String>,
 	/// The TLS server name sent, if any. On `faketls` it is the name of the site the node borrows.
 	pub server_name: Option<String>,
-	/// None on `udp`, `udp-obfs` and `faketls`, whose certificate is held to a key the client derives and to nothing a user can check.
+	/// None on `udp`, `udp-obfs` and `faketls`, whose certificate is held to a key the client derives and to nothing a user can check, and on `ws-plain`, which has no TLS and so no certificate.
 	pub check: Option<Check>,
 	pub since: Option<u64>,
 	/// The transport is in alpha (`faketls`): new, not reviewed outside the project, and it borrows a real site that has not agreed. An app says so next to the connection.
@@ -202,8 +206,10 @@ impl Connection {
 			Transport::Ws(stream) => ("ws", stream),
 			Transport::Fronted(stream) => ("fronted", stream),
 			Transport::FrontedShaped(stream, _) => ("fronted-shaped", stream),
-			// The client half of `ws-plain` comes next: nothing dials it yet, so there is no connection to show.
-			Transport::WsPlain {..} => return None,
+			Transport::WsPlain {stream, ..} => {
+				let found = stream.candidates.get(candidate)?;
+				return Some(Self {transport: "ws-plain", address: found.address.address(), host: Some(found.host.clone()).filter(|host| !host.is_empty()), front: None, server_name: None, check: None, since: None, alpha: false});
+			}
 		};
 		let found = stream.candidates.get(candidate)?;
 		let check = if found.self_signed {Check::PinnedSelfSigned} else if found.pins.is_empty() {Check::Public} else {Check::PublicAndPin};

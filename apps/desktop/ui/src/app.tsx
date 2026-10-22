@@ -14,7 +14,7 @@ import {UsagePage} from "./usage.tsx";
 const PACKS = {en, fa};
 const IDLE: Running = {connected: false, status: null, kill_switch_kept: false};
 // The engine asks in English; each known question has its own words here. Anything else is shown as the engine wrote it.
-const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe", "does not check who"], ["stale", "expired more than 30 days"], ["cover", "looks like ordinary web traffic"], ["nocover", "does not look like web traffic"], ["plain", "plain tunnel"], ["exposed", "using a tunnel"]];
+const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe", "does not check who"], ["stale", "expired more than 30 days"], ["cover", "looks like ordinary web traffic"], ["nocover", "does not look like web traffic"], ["plain", "plain tunnel"], ["exposed", "can tell that you use this app"]];
 
 // Used only until the helper's settings arrive, and when they cannot be read.
 const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true};

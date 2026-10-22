@@ -1,4 +1,4 @@
-//! The client's side of the native transports (transports page of the protocol): `udp-obfs`, `tls`, `ws`, `fronted` and `faketls`, behind one `Session`.
+//! The client's side of the native transports (transports page of the protocol): `udp-obfs`, `tls`, `ws`, `ws-plain`, `fronted` and `faketls`, behind one `Session`.
 //!
 //! A session carries WireGuard datagrams between a device and a node and nothing else. There is no WireGuard here, no TUN device, no routing, no DNS and no control channel: the caller hands datagrams in with `Session::send` and takes them out with `Session::recv`.
 //! Two things only the WireGuard layer can make are asked of it through `Source`: the datagram a session opens with ("a handshake initiation, or a keepalive of a tunnel that is already up") and the idle keepalive. The rekey point of the transports page is the WireGuard layer's own business and is not here.
@@ -11,7 +11,7 @@
 //! What is not here, and must not be read into it:
 //! - The TLS ClientHello is the one of `rustls`. It does not look like a browser's and is recognisable as this library's, and it offers `http/1.1` alone. The transports page plans a browser's TLS library configured from a fingerprint pack ("Client TLS and HTTP fingerprint"), which waits for a measurement and is not built. The header fields of the requests are a fixed short list for the same reason.
 //! - Encrypted Client Hello is not built: a candidate with `ech` is refused before anything is dialled, since dialling it without would show the name the profile meant to hide.
-//! - `ws-plain` and the appearance layer are not built. Plain `udp` is WireGuard itself and needs no transport.
+//! - The appearance layer of `ws-plain` is not built. Plain `udp` is WireGuard itself and needs no transport. `ws-plain` has no TLS: no certificate, no pin and no server name, and a session is open only when a chunk of the node has opened.
 //! - Which candidate and which transport come next, and after which wait, is decided by the functions of `choice` over state the caller keeps. Nothing here stores anything.
 //!
 //! Every byte from the network is hostile: a node, a front and the path are all in the threat model. Heads, frames and bodies are read inside fixed bounds of size and time, nothing is allocated by a length the peer chose, and no error holds a byte of input.
@@ -165,23 +165,25 @@ pub enum Target {
 	FrontedShaped {path: String, candidate: Front, shape: Shape},
 	/// A `faketls` candidate: the real site's name in `sni`, and the one `Client` of the link for the transport's key (`faketls::client`), which every attempt and every connection to that key shares.
 	FakeTls {candidate: Front, client: Arc<Mutex<FakeTlsClient>>},
+	/// A `ws-plain` candidate: the `ws` session over plain HTTP, made with the transport's own `key`, and the token in the cookie named `cookie`.
+	WsPlain {path: String, candidate: Front, key: [u8; 32], cookie: String},
 }
 
 impl Target {
 	/// Makes a stream target dial through `connect` (a link whose `via` names a proxy chain). A UDP target is left as it is.
 	pub fn via(mut self, connect: Option<Connect>) -> Self {
-		if let (Some(connect), Self::Tls {candidate, ..} | Self::Ws {candidate, ..} | Self::Fronted {candidate, ..} | Self::FrontedShaped {candidate, ..}) = (connect, &mut self) {candidate.connect = Some(connect)}
+		if let (Some(connect), Self::Tls {candidate, ..} | Self::Ws {candidate, ..} | Self::WsPlain {candidate, ..} | Self::Fronted {candidate, ..} | Self::FrontedShaped {candidate, ..}) = (connect, &mut self) {candidate.connect = Some(connect)}
 		self
 	}
 	/// Endpoint or candidate `at` of a transport of a profile, for `link`. None for plain `udp`, which is not served here, and for a place the transport does not have.
 	/// A `faketls` target is made with the key of its own transport, and never with `Link::node`.
 	pub fn of(transport: &Transport, at: usize, link: &Link) -> Option<Self> {
 		Some(match transport {
-			// The client half of `ws-plain` comes next: until then a profile's `ws-plain` transport is not served here.
-			Transport::Udp(_) | Transport::WsPlain {..} => return None,
+			Transport::Udp(_) => return None,
 			Transport::UdpObfs(endpoints) => Self::UdpObfs(endpoints.get(at)?.address()),
 			Transport::Tls(stream) => Self::Tls {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::Ws(stream) => Self::Ws {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
+			Transport::WsPlain {key, cookie, stream} => Self::WsPlain {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?), key: *key, cookie: cookie.clone()},
 			Transport::Fronted(stream) => Self::Fronted {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?)},
 			Transport::FrontedShaped(stream, shape) => Self::FrontedShaped {path: stream.path.clone(), candidate: Front::of(stream.candidates.get(at)?), shape: shape.clone()},
 			Transport::FakeTls {key, candidates} => {
@@ -196,6 +198,7 @@ impl Target {
 			Self::UdpObfs(_) => "udp-obfs",
 			Self::Tls {..} => "tls",
 			Self::Ws {..} => "ws",
+			Self::WsPlain {..} => "ws-plain",
 			Self::Fronted {..} => "fronted",
 			Self::FrontedShaped {..} => "fronted-shaped",
 			Self::FakeTls {..} => "faketls",
@@ -272,6 +275,8 @@ pub enum Unreachable {
 	Timeout,
 	/// No opening packet of `udp-obfs` was answered.
 	Silence,
+	/// On `ws-plain`, where nothing vouches for who answered: the connection was answered and it was not a session (another status, bytes that are no answer, a close or a forged frame before the node's first chunk). It is not a refusal, since the network can write it, and it touches none of the refusal waits.
+	Answered,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,7 +350,7 @@ pub enum Refuse {
 	Roots,
 	/// A `host` or a `path` with a blank, a line end, a control character or a `?` in it, which would write another request than the one meant.
 	Request,
-	/// A `faketls` candidate with a pin, a self-signed mark or a `verify_name`, none of which a borrowed site takes: the leaf is held against the key the client derives and against nothing else.
+	/// A `faketls` or `ws-plain` candidate with a pin, a self-signed mark, a server name or a `verify_name`, none of which these take: the first holds the leaf against the key the client derives, the second has no TLS. Also a `ws-plain` cookie name that is none.
 	Candidate,
 }
 
@@ -460,6 +465,12 @@ fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 		if candidate.self_signed || !candidate.pins.is_empty() || candidate.verify_name.is_some() {return Err(Refuse::Candidate)}
 		return tls::name(candidate).map(|_| ());
 	}
+	// A `ws-plain` target has no TLS and no roots, and needs no `Link::node`: its key is its own.
+	if let Target::WsPlain {path, candidate, cookie, ..} = target {
+		if candidate.ech || candidate.self_signed || !candidate.pins.is_empty() || candidate.verify_name.is_some() || candidate.sni.is_some() || cookie.is_empty() || !cookie.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') {return Err(Refuse::Candidate)}
+		if [path, &candidate.host].iter().any(|text| text.is_empty() || text.bytes().any(|byte| byte <= b' ' || byte == 0x7f || byte == b'?')) || !path.starts_with('/') {return Err(Refuse::Request)}
+		return Ok(());
+	}
 	let (Target::Tls {path, candidate} | Target::Ws {path, candidate} | Target::Fronted {path, candidate} | Target::FrontedShaped {path, candidate, ..}) = target else {return Ok(())};
 	if link.node.is_none() {return Err(Refuse::NodeKey)}
 	if candidate.self_signed && (!matches!(target, Target::Tls {..}) || candidate.verify_name.is_some()) {return Err(Refuse::SelfSigned)}
@@ -482,8 +493,9 @@ pub(crate) fn launch(link: Link, target: Target, count: usize, env: Env, source:
 		let ended = match &target {
 			Target::Tls {..} | Target::Ws {..} | Target::FakeTls {..} if count > 1 => parallel::run(&mut port, &link, &target, count).await,
 			Target::UdpObfs(to) => udp::run(&mut port, &link, *to).await,
-			Target::Tls {path, candidate} => stream::run(&mut port, &link, Name::Tls, path, candidate).await,
-			Target::Ws {path, candidate} => stream::run(&mut port, &link, Name::Ws, path, candidate).await,
+			Target::Tls {path, candidate} => stream::run(&mut port, &link, Name::Tls, path, candidate, None).await,
+			Target::Ws {path, candidate} => stream::run(&mut port, &link, Name::Ws, path, candidate, None).await,
+			Target::WsPlain {path, candidate, key, cookie} => stream::run(&mut port, &Link {node: Some(*key), ..link.clone()}, Name::WsPlain, path, candidate, Some(cookie)).await,
 			Target::Fronted {path, candidate} => fronted::run(&mut port, &link, path, candidate).await,
 			Target::FrontedShaped {path, candidate, shape} => shaped::run(&mut port, &link, path, candidate, shape).await,
 			Target::FakeTls {candidate, client} => faketls::run(&mut port, &link, client, candidate).await,

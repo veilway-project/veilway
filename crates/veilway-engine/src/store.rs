@@ -9,7 +9,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
-use veilway_transport::choice::{Class, Network, Standing};
+use veilway_transport::choice::{Class, Network, Standing, FAILS};
 
 /// The largest file read. A run writes a few kilobytes.
 pub const FILE_MAX: usize = 1 << 20;
@@ -77,6 +77,7 @@ struct NetworkWire {
 	#[serde(default)] aside: Vec<(u64, Option<u64>, u64)>,
 	#[serde(default)] tried: Vec<(u64, u64, u64)>,
 	#[serde(default)] silent: Option<(u64, u64)>,
+	#[serde(default)] plain: Vec<(u64, u64, u32, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -133,6 +134,7 @@ fn read_network(wire: NetworkWire) -> Network {
 		aside: wire.aside.into_iter().take(LIST).filter_map(|(transport, candidate, until)| Some((index(transport)?, match candidate {Some(candidate) => Some(index(candidate)?), None => None}, until))).collect(),
 		tried: wire.tried.into_iter().take(LIST).filter_map(|(transport, candidate, when)| Some((index(transport)?, index(candidate)?, when))).collect(),
 		silent: wire.silent.and_then(|(transport, since)| Some((index(transport)?, since))),
+		plain: wire.plain.into_iter().take(LIST).filter_map(|(transport, candidate, count, when)| Some((index(transport)?, index(candidate)?, count.min(FAILS), when))).collect(),
 	}
 }
 
@@ -157,7 +159,7 @@ pub fn encode(saved: &Saved) -> Vec<u8> {
 		let standing = &kept.standing;
 		(key.clone(), ProfileWire {
 			standing: StandingWire {profile: standing.profile, refusals: standing.refusals, rows: standing.rows.iter().map(|(transport, candidate, row)| (*transport as u64, *candidate as u64, *row)).collect(), losses: standing.losses, opened: standing.opened, short: standing.short, unanswered: standing.unanswered, consent: standing.consent.iter().map(|class| class_word(*class).to_owned()).collect(), offset: standing.offset, bare: standing.bare},
-			networks: kept.networks.iter().map(|(network, state)| (network.clone(), NetworkWire {profile: state.profile, worked: state.worked.map(|(transport, candidate, when)| (transport as u64, candidate as u64, when)), aside: state.aside.iter().map(|(transport, candidate, until)| (*transport as u64, candidate.map(|candidate| candidate as u64), *until)).collect(), tried: state.tried.iter().map(|(transport, candidate, when)| (*transport as u64, *candidate as u64, *when)).collect(), silent: state.silent.map(|(transport, since)| (transport as u64, since))})).collect(),
+			networks: kept.networks.iter().map(|(network, state)| (network.clone(), NetworkWire {profile: state.profile, worked: state.worked.map(|(transport, candidate, when)| (transport as u64, candidate as u64, when)), aside: state.aside.iter().map(|(transport, candidate, until)| (*transport as u64, candidate.map(|candidate| candidate as u64), *until)).collect(), tried: state.tried.iter().map(|(transport, candidate, when)| (*transport as u64, *candidate as u64, *when)).collect(), silent: state.silent.map(|(transport, since)| (transport as u64, since)), plain: state.plain.iter().map(|(transport, candidate, count, when)| (*transport as u64, *candidate as u64, *count, *when)).collect()})).collect(),
 			mtus: kept.mtus.iter().map(|found| (found.network.clone(), found.transport as u64, u64::from(found.mtu), found.when)).collect(),
 			declined: kept.declined.iter().map(|class| class_word(*class).to_owned()).collect(),
 			stream_first: kept.stream_first,
@@ -335,7 +337,7 @@ mod tests {
 	}
 
 	fn network() -> impl Strategy<Value = Network> {
-		(any::<u64>(), proptest::option::of((0usize..256, 0usize..256, any::<u64>())), vec((0usize..256, proptest::option::of(0usize..256), any::<u64>()), 0..8), vec((0usize..256, 0usize..256, any::<u64>()), 0..8), proptest::option::of((0usize..256, any::<u64>()))).prop_map(|(profile, worked, aside, tried, silent)| Network {profile, worked, aside, tried, silent})
+		(any::<u64>(), proptest::option::of((0usize..256, 0usize..256, any::<u64>())), vec((0usize..256, proptest::option::of(0usize..256), any::<u64>()), 0..8), vec((0usize..256, 0usize..256, any::<u64>()), 0..8), proptest::option::of((0usize..256, any::<u64>())), vec((0usize..256, 0usize..256, 0u32..=FAILS, any::<u64>()), 0..8)).prop_map(|(profile, worked, aside, tried, silent, plain)| Network {profile, worked, aside, tried, silent, plain})
 	}
 
 	fn kept() -> impl Strategy<Value = Kept> {
@@ -346,7 +348,7 @@ mod tests {
 
 	// What every result of `parse` promises, whatever the bytes were.
 	fn bounded(saved: &Saved) -> bool {
-		saved.profiles.len() <= PROFILES_MAX && saved.lan_local.len() <= PROFILES_MAX && saved.lan_local.iter().all(|id| key_ok(id)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
+		saved.profiles.len() <= PROFILES_MAX && saved.lan_local.len() <= PROFILES_MAX && saved.lan_local.iter().all(|id| key_ok(id)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.plain.len() <= LIST && state.plain.iter().all(|(_, _, count, _)| *count <= FAILS) && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
 	}
 
 	proptest! {
@@ -390,6 +392,16 @@ mod tests {
 		let saved = parse(text.as_bytes()).unwrap();
 		let kept = &saved.profiles["a/b"];
 		assert_eq!((saved.profiles.len(), kept.standing.consent.clone(), kept.standing.rows.clone(), kept.networks.len(), kept.networks[0].1.worked, kept.networks[0].1.aside.clone(), kept.mtus.len()), (1, vec![Class::Cover], vec![(1, 2, 3)], 1, None, vec![(1, None, 5)], 1));
+	}
+
+	// A file written before `ws-plain` has no failure counts and loads with none, and the counts of a file that has them are cut to what a run writes.
+	#[test]
+	fn a_file_without_plain_failures_loads_and_the_failures_of_a_file_are_bounded() {
+		let text = r#"{"version":1,"seed":9,"profiles":{"a/b":{"networks":[["old",{"worked":[1,1,5],"aside":[[1,0,5]],"tried":[[1,0,5]]}],["new",{"plain":[[1,2,500,50],[999,1,2,5],[0,0,3,7]]}]]}}}"#;
+		let saved = parse(text.as_bytes()).unwrap();
+		let kept = &saved.profiles["a/b"];
+		assert_eq!((kept.networks[0].1.plain.clone(), kept.networks[0].1.aside.len(), kept.networks[1].1.plain.clone()), (Vec::new(), 1, vec![(1, 2, FAILS, 50), (0, 0, 3, 7)]));
+		assert_eq!(parse(&encode(&saved)), Ok(saved));
 	}
 
 	// The user's answers are the store's, whoever writes the rest: a running tunnel saves its own fields and never writes back the answers it read when it started.

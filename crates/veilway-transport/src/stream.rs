@@ -1,6 +1,8 @@
-//! The client of `tls` and `ws` (transports page, "WebSocket session", "Closing", "`tls`", "`ws`"): one connection, one upgrade request with a fresh proof, and then chunks in masked binary frames.
+//! The client of `tls`, `ws` and `ws-plain` (transports page, "WebSocket session", "Closing", "`tls`", "`ws`", "`ws-plain`"): one connection, one upgrade request with a fresh proof, and then chunks in masked binary frames.
 //!
-//! The two transports are one session here. They differ in the name the proof is made for and in what `tls` (the module) checks of the certificate, and in nothing else.
+//! The transports are one session here. They differ in the name the proof is made for, in what `tls` (the module) checks of the certificate, and in `ws-plain`, which has no TLS and carries the token in a cookie.
+//!
+//! On `ws-plain` nothing vouches for an answer, since anyone on the path can write one. Every answer that is not a session (any status but the expected one, bytes that are no answer, a forged frame before the node's first chunk) is `Unreachable::Answered` at once and never a refusal, and a connection that ends with no answer is `Unreachable::Cut`. A session is open only when a chunk of the node has opened, as everywhere.
 //!
 //! How an attempt is classified ("Refusals and clocks", rule 0, and "Transport fallback", rule 1):
 //! - No connection, a failed TLS handshake or a certificate that is not accepted: `Unreachable`.
@@ -94,14 +96,15 @@ trait Duplex: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Duplex for T {}
 
-pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, candidate: &Front) -> Ended {
+/// `cookie` is the name of the cookie that carries the token of a `ws-plain` session, which is dialled with no TLS. None for `tls` and `ws`.
+pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, candidate: &Front, cookie: Option<&str>) -> Ended {
 	let Some(node) = link.node else {return End::Source.into()};
 	// Everything a session needs of others is taken before anything is dialled: the WireGuard layer is never asked for a session nobody holds any more. "The client creates a new HPKE context for every proof and never reuses one." A fallback makes a new proof, so each attempt has its own token.
 	let (Ok(padding), Some(first)) = (Padding::new(link.padding.wide_max, link.padding.normal_max, &mut random), port.want(Want::First)) else {return End::Source.into()};
 	let (roots, hook, device, keepalive) = (port.env.roots.clone(), port.env.socket.clone(), port.env.device.clone(), lone(&first));
-	let (host, agent) = (tls::host(candidate), http::user_agent());
-	// "`full`: WebSocket over HTTP/2 first, unless this candidate was marked for an hour."
-	let mut http2 = candidate.http2 == Http2::Full && h2::marked(candidate).is_none();
+	let (host, agent, plain) = (if cookie.is_some() {if candidate.address.port() == 80 {candidate.host.clone()} else {format!("{}:{}", candidate.host, candidate.address.port())}} else {tls::host(candidate)}, http::user_agent(), cookie.is_some());
+	// "`full`: WebSocket over HTTP/2 first, unless this candidate was marked for an hour." There is no HTTP/2 without TLS.
+	let mut http2 = !plain && candidate.http2 == Http2::Full && h2::marked(candidate).is_none();
 	let (proof, io, buf, deadline, abnormal) = loop {
 		// Each attempt has its own 10 s, as a fallback is a new connection.
 		let dialled = Instant::now() + ATTEMPT;
@@ -110,33 +113,38 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 		if random(&mut nonce).is_err() {return End::Random.into()}
 		let key = STANDARD.encode(nonce);
 		// Chrome's order for a WebSocket upgrade over HTTP/1.1. Over HTTP/2 `h2::fields` takes the same fields and writes them in its own order.
-		let request = format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n", proof.token);
+		let request = if let Some(cookie) = cookie {
+			// A plain upgrade has a set of its own: Chrome's order over HTTP/1.1 from a page that is not https, no `Accept-Language`, and the token in one cookie, not in the target.
+			format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: http://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate\r\nCookie: {cookie}={}\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n", proof.token)
+		} else {format!("GET {path}?{} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n{agent}Upgrade: websocket\r\nOrigin: https://{host}\r\nSec-WebSocket-Version: 13\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n", proof.token)};
 		// The dial, the request and its answer. The 10 s for the answer and for the node's first chunk run from the moment the request is written: the node's own 10 s for a session it took run from about then.
 		let opening = async {
-			let io = tls::dial(candidate, &roots, &hook, dialled, http2).await?;
-			if http2 {
-				if io.0.ssl().selected_alpn_protocol() != Some(b"h2") {
-					h2::mark(candidate, Mark::NoConnect);
-					return Ok(None);
-				}
-				let Some((list, _)) = h2::fields(request.as_bytes(), &host, true) else {return Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None}))};
-				return match h2::Conn::new(io).websocket(&list).await {
-					Ok(Opened::Ready(pipe, abnormal)) => Ok(Some((Box::new(pipe) as Box<dyn Duplex>, Vec::new(), Instant::now() + ATTEMPT, Some(abnormal)))),
-					Ok(Opened::NoConnect) => {
+			let mut io: Box<dyn Duplex> = if plain {Box::new(tls::tcp(candidate, &hook, dialled).await?)} else {
+				let io = tls::dial(candidate, &roots, &hook, dialled, http2).await?;
+				if http2 {
+					if io.0.ssl().selected_alpn_protocol() != Some(b"h2") {
 						h2::mark(candidate, Mark::NoConnect);
-						Ok(None)
+						return Ok(None);
 					}
-					Ok(Opened::Misdirected) => {
-						h2::mark(candidate, Mark::Misdirected);
-						Ok(None)
-					}
-					Ok(Opened::Status(status)) => Err(Ended::Refused(Refusal {answer: Answer::Status(status), offset: None})),
-					Err(Fail::Cut) => Err(Ended::Unreachable(Unreachable::Cut)),
-					Err(Fail::Closed) => Err(Ended::Refused(Refusal {answer: Answer::Closed, offset: None})),
-					Err(Fail::Fault) => Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None})),
-				};
-			}
-			let mut io = io;
+					let Some((list, _)) = h2::fields(request.as_bytes(), &host, true) else {return Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None}))};
+					return match h2::Conn::new(io).websocket(&list).await {
+						Ok(Opened::Ready(pipe, abnormal)) => Ok(Some((Box::new(pipe) as Box<dyn Duplex>, Vec::new(), Instant::now() + ATTEMPT, Some(abnormal)))),
+						Ok(Opened::NoConnect) => {
+							h2::mark(candidate, Mark::NoConnect);
+							Ok(None)
+						}
+						Ok(Opened::Misdirected) => {
+							h2::mark(candidate, Mark::Misdirected);
+							Ok(None)
+						}
+						Ok(Opened::Status(status)) => Err(Ended::Refused(Refusal {answer: Answer::Status(status), offset: None})),
+						Err(Fail::Cut) => Err(Ended::Unreachable(Unreachable::Cut)),
+						Err(Fail::Closed) => Err(Ended::Refused(Refusal {answer: Answer::Closed, offset: None})),
+						Err(Fail::Fault) => Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None})),
+					};
+				}
+				Box::new(io)
+			};
 			let mut buf = Vec::with_capacity(HEAD_MAX);
 			match timeout_at(dialled, async {io.write_all(request.as_bytes()).await.is_ok() && io.flush().await.is_ok()}).await {
 				Ok(true) => {}
@@ -154,13 +162,15 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 			let read_at = device();
 			let Some(head) = http::head(&buf[..end]) else {return Err(Ended::Refused(Refusal {answer: Answer::NotHttp, offset: None}))};
 			// "Only after the certificate matched a pin from the profile, the client may read the `Date` header of the decoy's answer." The difference is taken against the device's own clock, as it stood when the head was read.
-			if let Err(answer) = head.upgraded(key.as_bytes()) {return Err(Ended::Refused(Refusal {answer, offset: head.date().filter(|_| !candidate.pins.is_empty()).map(|date| i64::try_from(date).unwrap_or(i64::MAX).saturating_sub(i64::try_from(read_at).unwrap_or(i64::MAX)))}))}
+			if let Err(answer) = head.upgraded(key.as_bytes()) {return Err(Ended::Refused(Refusal {answer, offset: head.date().filter(|_| !plain && !candidate.pins.is_empty()).map(|date| i64::try_from(date).unwrap_or(i64::MAX).saturating_sub(i64::try_from(read_at).unwrap_or(i64::MAX)))}))}
 			buf.drain(..end);
-			Ok(Some((Box::new(io) as Box<dyn Duplex>, buf, deadline, None)))
+			Ok(Some((io, buf, deadline, None)))
 		};
 		// A session that is closed or dropped while it opens stops here: no proof leaves the device after that.
 		let opened = match unasked(&mut port.ask, opening).await {
 			Some(Ok(opened)) => opened,
+			// Nothing vouches for an answer on a plain connection: a close with nothing before it is a dropped connection, and every other answer that is no session is unreachable at once.
+			Some(Err(Ended::Refused(refusal))) if plain => return Ended::Unreachable(if refusal.answer == Answer::Closed {Unreachable::Cut} else {Unreachable::Answered}),
 			Some(Err(ended)) => return ended,
 			None => return End::Asked.into(),
 		};
@@ -292,6 +302,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 	let told = match ended {
 		Ended::Closed(End::Peer | End::Lost) if !established && cut => Ended::Unreachable(Unreachable::Cut),
 		Ended::Closed(End::Peer | End::Lost) if !established && keepalive => End::Unanswered.into(),
+		Ended::Closed(End::Peer | End::Lost | End::Fault(_)) if !established && plain => Ended::Unreachable(Unreachable::Answered),
 		Ended::Closed(End::Peer | End::Lost) if !established => Ended::Refused(Refusal {answer: Answer::Unopened, offset: None}),
 		ended => ended,
 	};

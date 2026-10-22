@@ -167,7 +167,7 @@ pub fn ask_text(class: Class) -> &'static str {
 	match class {
 		Class::Cover => "Use the connection that looks like ordinary web traffic?",
 		Class::NoCover => "On some networks the only way through may be one that does not look like web traffic. Someone watching the network can tell that something unusual is going on, though not what. Allow it for this connection?",
-		Class::Exposed => "On some networks the only way through may be one that is easy to recognise. Someone watching the network can tell that you are using a tunnel. Allow it for this connection?",
+		Class::Exposed => "On some networks the only way through may be a plain web connection that nothing hides. The network can see this server's name and can tell that you use this app, and when and how much, now and later in its records. It cannot see what you send. If this transport's key ever leaks, it ties all of your device's plain connections together. Allow it for this connection?",
 		Class::Plain => "On some networks the only way through may be a plain tunnel that is easy to recognise as a VPN. Someone watching the network can tell that you are using one. Allow it for this connection?",
 	}
 }

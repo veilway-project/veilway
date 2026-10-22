@@ -980,3 +980,102 @@ async fn a_faketls_profile_reaches_its_tunnel_with_the_key_of_its_transport() {
 	net.node.engine.shutdown().await;
 	site_task.abort();
 }
+
+const PLAIN_KEY: [u8; 32] = [0x61; 32];
+const PLAIN_PATH: &str = "/assets/plain-3b9e41aa.js";
+
+/// A node whose listener also carries a `ws-plain` transport with its own key.
+async fn plain_net(test: &'static str, time: Time) -> Net {
+	net(test, time, |doc| {
+		let transports = doc["inbounds"][0]["transports"].as_array_mut().unwrap();
+		let mut plain = transports[0].clone();
+		plain["type"] = json!("ws-plain");
+		plain["path"] = json!(PLAIN_PATH);
+		plain["transport_keys"] = json!([text(&PLAIN_KEY)]);
+		transports.push(plain);
+	}).await
+}
+
+/// The plain target of a client for `address`, with the token in the cookie `cookie`.
+fn plain_target(net: &Net, address: SocketAddr, cookie: &str) -> Target {Target::WsPlain {path: PLAIN_PATH.into(), candidate: Front {sni: None, ..net.front(address, false)}, key: proof::public_key(&PLAIN_KEY), cookie: cookie.into()}}
+
+/// The environment of a plain target: no roots, since there is no TLS to check.
+fn plain_env(net: &Net) -> Env {Env {roots: Arc::new(RootCertStore::empty()), ..net.env()}}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_reaches_its_tunnel_over_plain_http_and_the_session_is_open_only_after_the_nodes_chunk() {
+	let time = time!();
+	let net = plain_net("client-plain", time).await;
+	let mut peer = peer(0, &link(0), plain_target(&net, net.node.front.addr, "sid"), 1, plain_env(&net), wireguard(0));
+	peer.connect().await.unwrap_or_else(|ended| panic!("{ended:?}"));
+	assert_eq!(peer.leaves(40000).await.as_deref(), Some("main"));
+	assert!(peer.ping(200, 1).await);
+	let (peers, numbers) = (net.node.engine.peers(Some("a")), peer.session.numbers());
+	assert_eq!((peers.len(), peers[0].over, peers[0].handshake.is_some(), net.node.totals().proofs_accepted), (1, Some(Over::WsPlain), true, 1));
+	assert!(numbers.heard.is_some() && numbers.dropped == 0, "{numbers:?}");
+	assert_eq!(peer.session.close().await, Ended::Closed(End::Asked));
+	// A target with a pin, a server name, a cookie that is none or a path with a query is not dialled.
+	let pinned = Target::WsPlain {path: PLAIN_PATH.into(), candidate: Front {sni: None, ..net.front(net.node.front.addr, true)}, key: proof::public_key(&PLAIN_KEY), cookie: "sid".into()};
+	let named = Target::WsPlain {path: PLAIN_PATH.into(), candidate: net.front(net.node.front.addr, false), key: proof::public_key(&PLAIN_KEY), cookie: "sid".into()};
+	let queried = Target::WsPlain {path: format!("{PLAIN_PATH}?x"), candidate: Front {sni: None, ..net.front(net.node.front.addr, false)}, key: proof::public_key(&PLAIN_KEY), cookie: "sid".into()};
+	for bad in [pinned, named, queried, plain_target(&net, net.node.front.addr, ""), plain_target(&net, net.node.front.addr, "a=b")] {assert!(Session::open(&link(0), bad, plain_env(&net), wireguard(0).2).is_err())}
+	net.node.engine.shutdown().await;
+}
+
+// "An answer that is not a session": over plain HTTP anyone on the path can write one, so it is unreachable at once and never a refusal, and the candidate is set aside for 90 s, doubling for each failure in a row, until a session opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answer_that_is_no_session_sets_a_plain_candidate_aside_with_a_doubling_wait_until_a_session_opens() {
+	let time = time!();
+	let net = plain_net("client-plain-aside", time).await;
+	let (mut network, mut standing, profile, mut now) = (Network {profile: 9, ..Network::default()}, Standing {profile: 9, ..Standing::default()}, 9, time.secs());
+	let mut waits = Vec::new();
+	for _ in 0..3 {
+		// The cookie has another name than the one the node reads: the origin's own miss comes back.
+		let ended = net.peer(0, &link(0), plain_target(&net, net.node.front.addr, "other")).ended().await;
+		assert_eq!(ended, Ended::Unreachable(Unreachable::Answered));
+		assert_eq!(choice::outcome(&mut network, &mut standing, profile, 0, 0, Some(ended), now, &mut random), Ok(Next::Move(Duration::ZERO)));
+		let until = network.aside.iter().find(|(at, candidate, _)| (*at, *candidate) == (0, Some(0))).unwrap().2;
+		waits.push(until - now);
+		now = until;
+	}
+	assert_eq!(waits, [90, 180, 360]);
+	assert_eq!((standing.refusals, standing.rows.len(), standing.losses, net.node.totals().proofs_accepted), (0, 0, 0, 0));
+	// A session that opens gives the 90 s back.
+	let mut peer = net.peer(0, &link(0), plain_target(&net, net.node.front.addr, "sid"));
+	peer.connect().await.unwrap_or_else(|ended| panic!("{ended:?}"));
+	choice::outcome(&mut network, &mut standing, profile, 0, 0, None, now, &mut random).unwrap();
+	assert!(network.plain.is_empty());
+	choice::outcome(&mut network, &mut standing, profile, 0, 0, Some(Ended::Unreachable(Unreachable::Answered)), now, &mut random).unwrap();
+	assert_eq!(network.aside.iter().find(|(at, candidate, _)| (*at, *candidate) == (0, Some(0))).unwrap().2 - now, 90);
+	net.node.engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_that_are_no_session_are_answered_and_a_close_with_no_answer_is_a_cut_on_a_plain_connection() {
+	let time = time!();
+	let net = plain_net("client-plain-junk", time).await;
+	let (junk, closing) = (TcpListener::bind("127.0.0.1:0").await.unwrap(), TcpListener::bind("127.0.0.1:0").await.unwrap());
+	let (junk_at, closing_at) = (junk.local_addr().unwrap(), closing.local_addr().unwrap());
+	let task = tokio::spawn(async move {
+		loop {
+			tokio::select! {
+				Ok((mut stream, _)) = junk.accept() => {
+					let mut buf = vec![0u8; 2048];
+					let _ = timeout(SECOND, stream.read(&mut buf)).await;
+					let _ = stream.write_all(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: AAAAAAAAAAAAAAAAAAAAAAAAAAA=\r\n\r\n").await;
+					let _ = stream.shutdown().await;
+				}
+				Ok((mut stream, _)) = closing.accept() => {
+					let mut buf = vec![0u8; 2048];
+					let _ = timeout(SECOND, stream.read(&mut buf)).await;
+					let _ = stream.shutdown().await;
+				}
+			}
+		}
+	});
+	// A `101` with a wrong accept value, and a close before any answer: the network's doing in both cases, and neither is a refusal.
+	assert_eq!(net.peer(0, &link(0), plain_target(&net, junk_at, "sid")).ended().await, Ended::Unreachable(Unreachable::Answered));
+	assert_eq!(net.peer(0, &link(0), plain_target(&net, closing_at, "sid")).ended().await, Ended::Unreachable(Unreachable::Cut));
+	task.abort();
+	net.node.engine.shutdown().await;
+}
