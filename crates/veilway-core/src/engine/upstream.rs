@@ -12,7 +12,7 @@ use crate::config::{self, random, Rating, Upstream, UpstreamClass};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use ipnet::IpNet;
-use socket2::{Domain, SockAddr, SockRef};
+use socket2::{SockAddr, SockRef};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -590,7 +590,7 @@ async fn attempt(shared: &Arc<Shared>, config: &Upstream, reach: Option<&Reach>,
 /// What is done to every socket of the engine and the fetcher when the config's `via` is a `direct` outbound: tied to its interface and bound to its address, as the sockets of its exit are.
 fn direct(bind: Option<IpAddr>, interface: Option<String>) -> Hook {
 	Arc::new(move |socket: SockRef<'_>| {
-		if let Some(name) = &interface {flows::tie(&socket, name, socket.domain()? == Domain::IPV4)?}
+		if let Some(name) = &interface {flows::tie(&socket, name, socket.local_addr().map(|address| address.is_ipv4()).unwrap_or(true))?}
 		if let Some(bind) = bind {socket.bind(&SockAddr::from(SocketAddr::new(bind, 0)))?}
 		Ok(())
 	})
