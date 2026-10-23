@@ -4,7 +4,7 @@ members=["crates/veilway-wg", "crates/veilway-proto", "crates/veilway-transport"
 exclude=["apps/desktop/src-tauri", "fuzz"]
 
 [workspace.package]
-version="0.2.18"
+version="0.2.19"
 edition="2021"
 license="Apache-2.0"
 repository="https://github.com/veilway-project/veilway"
