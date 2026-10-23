@@ -553,6 +553,10 @@ impl Config {
 		}
 		// Node links page. On the node it connects to, a link is "a peer on a `veilway` inbound: a WireGuard public key, a transport secret, and one tunnel address per family from that inbound's pool". On the node that dials, it is a client of that inbound's transports.
 		let peopled = sets.iter().fold(Bits::default(), |all, set| Bits(std::array::from_fn(|word| all.0[word] | set[2].0[word])));
+		// A connection that matches no device is a stranger's, so a veilway inbound that only strangers can reach is a setup that cannot work.
+		if small && self.users.iter().any(|user| !user.devices.is_empty()) {
+			for (i, inbound) in self.inbounds.iter().enumerate().filter(|(i, inbound)| inbound.kind == InboundType::Veilway && !inbound.transports.is_empty() && !peopled.has(*i) && !links.iter().any(|link| link.inbound.as_deref() == Some(inbound.tag.as_str()))) {r.warning(format!("inbounds[{i}].address"), "no device has an address in this inbound's pools, so every connection to its transports is treated as a stranger's: give a device an address here, or add these transports to an inbound that has devices")}
+		}
 		// The flow table keeps a quarter of its places from links, and links whose shares come to more than half of it can still leave the node's own users less than their shares add up to.
 		let shares: u64 = links.iter().filter(|link| !link.entry() && link.enabled != Some(false)).map(|link| u64::from(link.max_flows.unwrap_or(DEFAULT_LINK_FLOWS))).sum();
 		if shares > (route::MAX_FLOWS / 2) as u64 {r.warning("links", format!("the max_flows of the links this node is the exit of come to {shares}, more than half of the {} flows the node holds: links that fill their shares leave this node's own users with less", route::MAX_FLOWS))}

@@ -684,6 +684,26 @@ fn transports_and_listen_conflicts() {
 }
 
 #[test]
+fn a_veilway_inbound_no_device_can_use_is_warned_about() {
+	let veilway = |d: &mut Value| {
+		d["inbounds"][1]["type"] = json!("veilway");
+		d["inbounds"][1]["transports"] = json!([{"type": "udp-obfs", "listen": "[::]:51821"}]);
+		d["users"][0]["devices"][0]["addresses"].as_array_mut().unwrap().pop();
+	};
+	warning_at("inbounds[1].address", veilway);
+	clean(|d| {
+		veilway(d);
+		d["users"] = json!([]);
+	});
+	let report = check(&with(|d| {
+		veilway(d);
+		d["users"][1]["devices"][0]["addresses"] = json!(["10.8.0.3"]);
+		d["users"][1]["devices"][0]["transport_secrets"] = json!([key(0x41)]);
+	}));
+	assert!(report.errors.is_empty() && report.warnings.iter().all(|w| w.path != "inbounds[1].address"), "{report:#?}");
+}
+
+#[test]
 fn outbounds() {
 	cases! {error_at:
 		"outbounds[0]": |d| remove(d, "/outbounds/0", "password");

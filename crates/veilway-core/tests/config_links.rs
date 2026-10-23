@@ -80,6 +80,16 @@ fn a_node_with_both_halves_of_both_directions_validates() {
 }
 
 #[test]
+fn a_link_is_enough_for_an_inbound_without_devices() {
+	let report = check(&node());
+	assert!(report.warnings.iter().all(|w| w.path != "inbounds[1].address"), "{:#?}", report.warnings);
+	let mut none = node();
+	none["links"].as_array_mut().unwrap().remove(0);
+	let report = check(&none);
+	assert!(report.warnings.iter().any(|w| w.path == "inbounds[1].address"), "{report:#?}");
+}
+
+#[test]
 fn a_link_is_one_of_two_shapes_with_keys_and_an_id_of_its_own() {
 	refused(node, "links[0]", "either `inbound` with `public_key`", |doc| doc["links"][0]["peer"] = doc["links"][1]["peer"].clone());
 	refused(node, "links[0]", "either `inbound` with `public_key`", |doc| drop(doc["links"][0].as_object_mut().unwrap().remove("inbound")));
