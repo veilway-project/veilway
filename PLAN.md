@@ -382,6 +382,8 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 
 ## v0.3.0: the first beta
 
+Asked for by the owner on 2026-10-23, after v0.2.17: Xray outbounds through the add-on (VLESS, VMess, Trojan and Shadowsocks as outbound types behind a `netstack` exit, TCP and UDP only, the node writing Xray's config); a plugin system, which needs signed packages, a sandbox and its own threat model section before any code; a plugin marketplace on top of it, with review and signatures from the project; and the `dns` transport as an add-on, built on the design that v0.2.0 item 9 asked for, with its own review of what it costs third-party resolvers.
+
 The clients tested on every platform they claim: the macOS app on a real Mac, Windows connected to a real node, the Linux desktop on a real desktop with systemd-resolved. Then the store builds (F-Droid first, the updater off), bonded connections and `ws-plain` if v0.2.0 did not take them, and the `dns` transport built if its design passed review.
 
 The installer's `--domain` setup can route a node's `ws`, `fronted` or `fronted-shaped` path through the same web server as the panel, so the panel and the node share port 443 (Caddy and nginx both). And by domain name: nginx's `stream` module with `ssl_preread` (or HAProxy) reads the name in the TLS hello without ending TLS and passes the whole connection on, so the panel's name goes to the web server and the node's names, including a borrowed site's, go to the node's raw `tls` and borrowed-site transports byte for byte. The front passes the client's address with the PROXY protocol so the node's limits per source keep working, and the extra hop's delay is measured for borrowed-site.
