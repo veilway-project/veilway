@@ -305,6 +305,7 @@ async fn socks5_resolves_a_name_through_the_nodes_dns() {
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "Windows refuses a socket on the host's own address that sends to a loopback address")]
 async fn socks5_carries_udp_for_the_address_that_asked_and_for_no_other() {
 	let Some(net) = net(|_| {}).await else {return};
 	let echoed = udp_echo(net.own).await;
@@ -449,6 +450,7 @@ async fn a_socks5_inbound_does_not_answer_http_and_an_http_inbound_answers_garba
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "Windows refuses a socket on the host's own address that sends to a loopback address")]
 async fn a_connection_that_never_logs_in_is_closed_and_one_source_cannot_hold_more_than_its_share() {
 	let Some(net) = net(|doc| doc["inbounds"][1]["limits"] = json!({"per_source": 2})).await else {return};
 	let from = Some(net.own);
@@ -479,6 +481,7 @@ async fn a_loopback_peer_is_a_front_with_many_users_behind_it_and_is_held_to_nei
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "Windows refuses a socket on the host's own address that sends to a loopback address")]
 async fn a_source_that_fails_too_many_logins_is_turned_away() {
 	let Some(net) = net(|_| {}).await else {return};
 	let from = Some(net.own);
@@ -709,6 +712,7 @@ async fn udp_any_port_gives_a_client_behind_a_nat_an_association_bound_to_its_fi
 }
 
 #[tokio::test]
+#[cfg_attr(windows, ignore = "Windows refuses a socket on the host's own address that sends to a loopback address")]
 async fn idle_clients_cannot_hold_every_login_and_a_silent_one_is_closed_at_the_greeting_deadline() {
 	let Some(net) = net(|_| {}).await else {return};
 	let from = Some(net.own);
