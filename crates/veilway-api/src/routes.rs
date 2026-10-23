@@ -405,6 +405,7 @@ async fn inbounds(State(api): State<Arc<Api>>) -> Response {
 	json(StatusCode::OK, &model::Inbounds {inbounds: snapshot.config.inbounds.iter().map(|inbound| model::InboundInfo {
 		tag: inbound.tag.clone(),
 		kind: match inbound.kind {veilway_core::config::InboundType::Wireguard => model::InboundKind::Wireguard, veilway_core::config::InboundType::Veilway => model::InboundKind::Veilway},
+		enabled: inbound.on(),
 		public_key: inbound.public_key(),
 		transport_public_key: inbound.transport_public_key(),
 		transports: inbound.transports.iter().map(|transport| model::InboundTransport {
@@ -418,6 +419,7 @@ async fn inbounds(State(api): State<Arc<Api>>) -> Response {
 				veilway_core::config::Transport::FakeTls {..} => model::Transport::FakeTls,
 				veilway_core::config::Transport::WsPlain {..} => model::Transport::WsPlain,
 			},
+			enabled: transport.on(),
 			rating: transport.rating(),
 		}).collect(),
 	}).collect(), public_addresses: snapshot.config.public_addresses.clone()})

@@ -91,9 +91,9 @@ pub struct InboundChange {
 	pub tag: String,
 	/// `private_key`, the set of `address` networks or the effective `mtu` changed.
 	pub restart: bool,
-	/// Indexes into the old inbound's `transports` that are not in the new one.
+	/// Indexes into the old inbound's `transports` that listened and are not in the new one as they were, or that listened in an inbound the new config switches off.
 	pub transports_stopped: Vec<usize>,
-	/// Indexes into the new inbound's `transports` that are not in the old one.
+	/// Indexes into the new inbound's `transports` that listen and are not in the old one as they are, or that listen in an inbound the old config had switched off.
 	pub transports_started: Vec<usize>,
 }
 
@@ -165,11 +165,12 @@ impl Diff {
 				tag: tag.clone(),
 				// The same networks in another order, or an absent mtu and the default written out, are the same tunnel, and a restart drops every session.
 				restart: was.private_key != is.private_key || was.address.len() != is.address.len() || was.address.iter().any(|net| !is.address.contains(net)) || was.mtu() != is.mtu(),
-				transports_stopped: (0..was.transports.len()).filter(|i| !is.transports.contains(&was.transports[*i])).collect(),
-				transports_started: (0..is.transports.len()).filter(|i| !was.transports.contains(&is.transports[*i])).collect(),
+				// A transport or an inbound that is switched off listens on nothing, so switching it off stops what it ran and switching it on starts it.
+				transports_stopped: (0..was.transports.len()).filter(|i| was.on() && was.transports[*i].on() && (!is.on() || !is.transports.contains(&was.transports[*i]))).collect(),
+				transports_started: (0..is.transports.len()).filter(|i| is.on() && is.transports[*i].on() && (!was.on() || !was.transports.contains(&is.transports[*i]))).collect(),
 			};
 			// A changed `type` restarts nothing: the tunnel is the same, and what its gateway answers goes by the config in force.
-			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.padding != is.padding || was.transport_keys != is.transport_keys || was.upgrade_cookie != is.upgrade_cookie || [true, false].iter().any(|tls| was.transports.iter().chain(&is.transports).any(|transport| if *tls {matches!(transport, Transport::Tls {..})} else {matches!(transport, Transport::WsNative {..})}) && was.upgrade_headers(*tls) != is.upgrade_headers(*tls))).then_some(change)
+			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.on() != is.on() || was.padding != is.padding || was.transport_keys != is.transport_keys || was.upgrade_cookie != is.upgrade_cookie || [true, false].iter().any(|tls| was.transports.iter().chain(&is.transports).any(|transport| if *tls {matches!(transport, Transport::Tls {..})} else {matches!(transport, Transport::WsNative {..})}) && was.upgrade_headers(*tls) != is.upgrade_headers(*tls))).then_some(change)
 		}).collect();
 		inbounds.changed.retain(|tag| inbound_changes.iter().any(|change| change.tag == *tag));
 		let proxies = changes(&old.proxies, &new.proxies, |proxy| proxy.tag.as_str(), |was, is| was.effective() == is.effective());

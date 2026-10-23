@@ -614,6 +614,8 @@ export interface components {
         };
         /** @description An inbound with what a client profile takes from it. No private key. */
         InboundInfo: {
+            /** @description False for an inbound the config switched off: it does not listen and takes no device. */
+            enabled: boolean;
             kind: components["schemas"]["InboundKind"];
             /** @description The WireGuard public key of the inbound. */
             public_key: components["schemas"]["Key"];
@@ -626,6 +628,8 @@ export interface components {
         InboundKind: "wireguard" | "veilway";
         /** @description One transport of an inbound, with the rating a profile of it gets. */
         InboundTransport: {
+            /** @description False for a transport the config switched off: it does not listen. */
+            enabled: boolean;
             rating: components["schemas"]["Rating"];
             transport: components["schemas"]["Transport"];
         };

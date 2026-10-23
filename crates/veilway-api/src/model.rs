@@ -660,6 +660,8 @@ pub enum InboundKind {Wireguard, Veilway}
 #[derive(Serialize, JsonSchema)]
 pub struct InboundTransport {
 	pub transport: Transport,
+	/// False for a transport the config switched off: it does not listen.
+	pub enabled: bool,
 	pub rating: config::Rating,
 }
 
@@ -668,6 +670,8 @@ pub struct InboundTransport {
 pub struct InboundInfo {
 	pub tag: String,
 	pub kind: InboundKind,
+	/// False for an inbound the config switched off: it does not listen and takes no device.
+	pub enabled: bool,
 	/// The WireGuard public key of the inbound.
 	pub public_key: Key,
 	/// The public half of the node transport key a profile carries. Null for an inbound with no `transport_keys`.

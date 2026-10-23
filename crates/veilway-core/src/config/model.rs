@@ -767,6 +767,9 @@ pub struct Inbound {
 	pub tag: String,
 	#[serde(rename = "type")]
 	pub kind: InboundType,
+	/// Defaults to true. An inbound that is not enabled is validated like any other and does not listen: its tunnel takes no device, its transports bind nothing and its addresses stay reserved.
+	#[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "off_only")]
+	pub enabled: Option<bool>,
 	pub private_key: Secret<Key>,
 	#[schemars(length(min = 1, max = 2))]
 	pub address: Vec<GatewayNet>,
@@ -794,6 +797,9 @@ pub struct Inbound {
 }
 
 impl Inbound {
+	/// Whether this inbound listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
 	/// Whether the inbound has a transport that wraps its datagrams in `udp-obfs`.
 	pub fn enveloped(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..}))}
 
@@ -972,9 +978,17 @@ pub enum Rating {Protected, Detectable, Unsafe}
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transport {
-	Udp {listen: Addr},
+	Udp {
+		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
+	},
 	Ws {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{0,255}$"))]
 		path: String,
 		#[serde(skip_serializing_if = "Option::is_none")]
@@ -984,12 +998,18 @@ pub enum Transport {
 	#[serde(rename = "udp-obfs")]
 	UdpObfs {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		limits: Option<TransportLimits>,
 	},
 	/// The native WebSocket session inside TLS that the node ends itself, for a `veilway` inbound. Whoever is not a user is relayed to `decoy.origin`.
 	Tls {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, which the origin must serve nothing at.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1005,6 +1025,9 @@ pub enum Transport {
 	#[serde(rename = "faketls")]
 	FakeTls {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		site: Site,
 		/// The private half of the transport's own key: no other transport of the node may have it.
 		transport_key: TransportKey,
@@ -1015,6 +1038,9 @@ pub enum Transport {
 	#[serde(rename = "ws")]
 	WsNative {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, as the web server in front hands it on, which the origin must serve nothing at.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1033,6 +1059,9 @@ pub enum Transport {
 	#[serde(rename = "ws-plain")]
 	WsPlain {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, as the web server in front hands it on, which the origin must answer as it answers any other path.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1051,6 +1080,9 @@ pub enum Transport {
 	/// Polling with HTTP requests through a CDN that allows nothing better, behind the operator's own web server, for a `veilway` inbound. Its keys are those of the native `ws`.
 	Fronted {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
 		decoy: Decoy,
@@ -1066,6 +1098,9 @@ pub enum Transport {
 	#[serde(rename = "fronted-shaped")]
 	FrontedShaped {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
 		decoy: Decoy,
@@ -1166,7 +1201,14 @@ pub struct Proxied<'a> {pub fronted: bool, pub path: &'a str, pub decoy: &'a Dec
 impl Transport {
 	pub fn listen(&self) -> SocketAddr {
 		match self {
-			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::FakeTls {listen, ..} | Transport::WsNative {listen, ..} | Transport::WsPlain {listen, ..} | Transport::Fronted {listen, ..} | Transport::FrontedShaped {listen, ..} => listen.0,
+			Transport::Udp {listen, ..} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::FakeTls {listen, ..} | Transport::WsNative {listen, ..} | Transport::WsPlain {listen, ..} | Transport::Fronted {listen, ..} | Transport::FrontedShaped {listen, ..} => listen.0,
+		}
+	}
+
+	/// Whether the transport listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {
+		match self {
+			Transport::Udp {enabled, ..} | Transport::Ws {enabled, ..} | Transport::UdpObfs {enabled, ..} | Transport::Tls {enabled, ..} | Transport::FakeTls {enabled, ..} | Transport::WsNative {enabled, ..} | Transport::WsPlain {enabled, ..} | Transport::Fronted {enabled, ..} | Transport::FrontedShaped {enabled, ..} => *enabled != Some(false),
 		}
 	}
 
@@ -1193,6 +1235,9 @@ impl Transport {
 	}
 }
 
+/// `enabled` of an inbound or a transport, with the default written as absent so that two spellings of one config are equal.
+fn off_only<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {Ok(Option::<bool>::deserialize(d)?.filter(|on| !on))}
+
 /// A key that belongs to another `type` of the same object is refused like an unknown key.
 fn only<E: de::Error>(kind: &str, others: &[(&str, bool)]) -> Result<(), E> {
 	match others.iter().find(|(_, present)| *present) {
@@ -1208,25 +1253,26 @@ enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>, shape: Option<Shape>, http2: Option<Http2>, site: Option<Site>, transport_key: Option<TransportKey>, transport_keys: Option<Vec<TransportKey>>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, enabled: Option<bool>, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>, shape: Option<Shape>, http2: Option<Http2>, site: Option<Site>, transport_key: Option<TransportKey>, transport_keys: Option<Vec<TransportKey>>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
 		let keys = TransportKeys::deserialize(d)?;
+		let enabled = keys.enabled.filter(|on| !on);
 		let proxy = [("trusted_proxies", keys.trusted_proxies.is_some()), ("client_address_header", keys.client_address_header.is_some())];
 		let shaped = [("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())];
 		let borrowed = [("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some()), ("transport_keys", keys.transport_keys.is_some())];
 		match keys.kind {
-			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::Udp {listen: keys.listen}),
+			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::Udp {listen: keys.listen, enabled}),
 			// `ws` is two formats under one name. With none of the keys of the proxy path it is the one of a `wireguard` inbound, and with any of them the native one of a `veilway` inbound, which never ends TLS itself. `validate` holds each to its kind of inbound.
-			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && keys.shape.is_none() && keys.http2.is_none() && proxy.iter().chain(&borrowed).all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
-			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
-			TransportType::WsPlain => only("ws-plain", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some()), ("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some())]).and_then(|_| Ok(Transport::WsPlain {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, transport_keys: keys.transport_keys.ok_or_else(|| de::Error::missing_field("transport_keys"))?})),
-			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
-			TransportType::Tls => only("tls", &[&proxy[..], &[("shape", keys.shape.is_some())], &borrowed].concat()).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits, http2: keys.http2})),
-			TransportType::Fronted => only("fronted", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
-			TransportType::FrontedShaped => only("fronted-shaped", &[&[("tls", keys.tls.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::FrontedShaped {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, shape: keys.shape.ok_or_else(|| de::Error::missing_field("shape"))?})),
-			TransportType::FakeTls => only("faketls", &[&proxy[..], &shaped, &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("transport_keys", keys.transport_keys.is_some())]].concat()).and_then(|_| Ok(Transport::FakeTls {listen: keys.listen, site: keys.site.ok_or_else(|| de::Error::missing_field("site"))?, transport_key: keys.transport_key.ok_or_else(|| de::Error::missing_field("transport_key"))?, limits: keys.limits})),
+			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && keys.shape.is_none() && keys.http2.is_none() && proxy.iter().chain(&borrowed).all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
+			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::WsPlain => only("ws-plain", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some()), ("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some())]).and_then(|_| Ok(Transport::WsPlain {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, transport_keys: keys.transport_keys.ok_or_else(|| de::Error::missing_field("transport_keys"))?})),
+			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, enabled, limits: keys.limits}),
+			TransportType::Tls => only("tls", &[&proxy[..], &[("shape", keys.shape.is_some())], &borrowed].concat()).and_then(|_| Ok(Transport::Tls {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits, http2: keys.http2})),
+			TransportType::Fronted => only("fronted", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::FrontedShaped => only("fronted-shaped", &[&[("tls", keys.tls.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::FrontedShaped {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, shape: keys.shape.ok_or_else(|| de::Error::missing_field("shape"))?})),
+			TransportType::FakeTls => only("faketls", &[&proxy[..], &shaped, &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("transport_keys", keys.transport_keys.is_some())]].concat()).and_then(|_| Ok(Transport::FakeTls {listen: keys.listen, enabled, site: keys.site.ok_or_else(|| de::Error::missing_field("site"))?, transport_key: keys.transport_key.ok_or_else(|| de::Error::missing_field("transport_key"))?, limits: keys.limits})),
 		}
 	}
 }
@@ -2046,6 +2092,9 @@ pub struct ProxyInbound {
 	pub tag: String,
 	#[serde(rename = "type")]
 	pub kind: ProxyType,
+	/// Defaults to true. An inbound that is not enabled is validated like any other and does not listen, and its address stays reserved.
+	#[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "off_only")]
+	pub enabled: Option<bool>,
 	/// The TCP address this inbound listens on. A loopback address is taken as it is. A private address (RFC 1918, 100.64.0.0/10, unique local) is taken too, with a warning that it may be reachable from outside. Any other address, the wildcard and link-local addresses included, needs `public`.
 	pub listen: Addr,
 	/// The users that may log in. With `groups`, a user in either list may. Without both, every user that has a `proxy_password` may.
@@ -2069,6 +2118,9 @@ pub struct ProxyInbound {
 }
 
 impl ProxyInbound {
+	/// Whether this inbound listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
 	/// Whether UDP ASSOCIATE is answered.
 	pub fn udp(&self) -> bool {self.kind != ProxyType::Http && self.udp != Some(false)}
 
