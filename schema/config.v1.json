@@ -1310,6 +1310,10 @@
           "description": "Whether UDP ASSOCIATE is answered. Defaults to true. Only `socks5` and `mixed` have it.",
           "type": "boolean"
         },
+        "udp_any_port": {
+          "description": "Whether a client behind a NAT, which cannot say the port it sends UDP from, may have an association on an inbound that is not on loopback. The association then binds to the first datagram from the client's address, and a sender that shares that address can take it before the client's first datagram. Defaults to false. Only `socks5` and `mixed` have it.",
+          "type": "boolean"
+        },
         "users": {
           "description": "The users that may log in. With `groups`, a user in either list may. Without both, every user that has a `proxy_password` may.",
           "items": {
@@ -1668,7 +1672,7 @@
           "type": "string"
         },
         "transport": {
-          "description": "The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on, and a DNS query of the node's resolver, match no transport.",
+          "description": "The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on matches no transport, and a DNS query of the node's resolver goes by the transport of the flow it came in on.",
           "items": {
             "$ref": "#/$defs/RuleTransport"
           },

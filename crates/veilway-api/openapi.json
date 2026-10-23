@@ -1118,6 +1118,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "refused_udp_source": {
+            "description": "UDP datagrams dropped because they did not come from the address and port the client named for its association, which is what a client behind a NAT that rewrites ports is refused for.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "up_bytes": {
             "description": "Bytes the clients sent to their destinations and got back.",
             "format": "uint64",
@@ -1130,6 +1136,7 @@
           "opened",
           "open",
           "refused_logins",
+          "refused_udp_source",
           "refused_limit",
           "refused_source",
           "refused_busy",

@@ -266,3 +266,27 @@ fn a_rule_by_transport_names_only_transports_that_exist_and_warns_for_those_the_
 	doc["routing"]["rules"] = json!([{"tag": "a", "transport": ["udp"], "action": "block"}, {"tag": "b", "ip": ["203.0.113.0/24"], "action": "block"}]);
 	assert!(!check(&doc).warnings.iter().any(|warning| warning.message.contains("never matches")), "a rule by transport covered one that has no transport");
 }
+
+#[test]
+fn udp_any_port_belongs_to_socks5_and_mixed_and_is_warned_about_and_a_nat_is_said() {
+	refused("inbounds[2].udp_any_port", |doc| doc["inbounds"][2]["udp_any_port"] = json!(true));
+	let mut doc = node();
+	doc["inbounds"][1]["listen"] = json!("10.1.2.3:1080");
+	let said = |doc: &Value, path: &str, word: &str| check(doc).warnings.iter().any(|warning| warning.path == path && warning.message.contains(word));
+	assert!(said(&doc, "inbounds[1].udp", "NAT") && said(&doc, "inbounds[1].udp", "udp_any_port"), "a client behind a NAT is not told it gets no UDP");
+	doc["inbounds"][1]["udp_any_port"] = json!(true);
+	assert!(said(&doc, "inbounds[1].udp_any_port", "shares the client's address") && !check(&doc).warnings.iter().any(|warning| warning.path == "inbounds[1].udp"));
+	let mut doc = node();
+	doc["inbounds"][1]["udp_any_port"] = json!(true);
+	assert!(said(&doc, "inbounds[1].udp_any_port", "never used"), "the setting on loopback does nothing");
+}
+
+#[test]
+fn a_rule_by_inbound_that_names_a_proxy_inbound_is_held_to_the_users_it_admits() {
+	let mut doc = node();
+	doc["exits"] = json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}, {"tag": "other", "backend": {"type": "netstack", "outbound": "plain"}}]);
+	doc["users"][0]["exits"] = json!(["main"]);
+	doc["users"][0]["devices"] = json!([]);
+	doc["routing"]["rules"] = json!([{"tag": "to-other", "inbound": ["s5"], "ip": ["203.0.113.0/24"], "action": {"exit": "other"}}]);
+	assert!(check(&doc).warnings.iter().any(|warning| warning.path == "routing.rules[0].action" && warning.message.contains("not entitled")), "{:#?}", check(&doc).warnings);
+}

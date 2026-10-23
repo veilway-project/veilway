@@ -264,7 +264,7 @@ impl Drop for Slot {
 }
 
 pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String, owner: Lookup) {
-	let (via, handshakes, mut sessions) = (Arc::new(xray_udp::Via {label: "xray hop".to_string(), owner: Some(owner), inbound: None}), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
+	let (via, handshakes, mut sessions) = (Arc::new(xray_udp::Via {label: "xray hop".to_string(), owner: Some(owner), inbound: None, any_port: false, mismatch: None}), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
 	loop {
 		tokio::select! {
 			accepted = listener.accept() => {
@@ -285,6 +285,20 @@ pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: S
 /// The destination of a request: an address, or a name that is resolved here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Target {Address(SocketAddr), Name(String, u16)}
+
+/// Closes the write side after a refusal was written and discards what the client still sends, for up to 64 KiB and 1 s. Closing a socket with unread bytes in it makes the system reset the connection, and a reset can take the answer with it before the client has read it.
+pub(super) async fn linger(client: &mut TcpStream) {
+	let _ = client.shutdown().await;
+	let (mut sink, mut left) = ([0u8; 4096], 64 * 1024usize);
+	let _ = tokio::time::timeout(Duration::from_secs(1), async {
+		while left > 0 {
+			match client.read(&mut sink).await {
+				Ok(n) if n > 0 => left = left.saturating_sub(n),
+				_ => break,
+			}
+		}
+	}).await;
+}
 
 pub(super) fn reply(code: u8) -> [u8; 10] {[5, code, 0, 1, 0, 0, 0, 0, 0, 0]}
 
@@ -390,7 +404,7 @@ pub(super) async fn connect(shared: &Arc<Shared>, plan: Arc<Plan>, at: usize, ta
 	let (name, port, found) = match target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
 		Target::Name(name, port) => {
-			let found = resolve(shared, &plan, at, &name).await;
+			let found = resolve(shared, &plan, at, &name, plan.proxy_index(via.inbound.as_deref()), transport).await;
 			(Some(name), port, found)
 		}
 	};
@@ -491,7 +505,7 @@ pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, 
 }
 
 /// Every address of `name` that the DNS servers of the user's set give, IPv4 first, asked the way the tunnel's resolver asks (`resolver::ask`). The query counts for the user and for the exit it went through. Empty when none answers, when the rules or the gate turn the query away, and when the name is not one a resolver can be asked for.
-pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name: &str) -> Vec<IpAddr> {
+pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name: &str, inbound: usize, transport: Option<RuleTransport>) -> Vec<IpAddr> {
 	if name.len() > 253 || name.split('.').any(|label| label.is_empty() || label.len() > 63) || !name.is_ascii() {return Vec::new()}
 	let Ok(_permit) = plan.users[user].state.in_flight.try_acquire() else {return Vec::new()};
 	let (list, fallback) = (plan.users[user].dns.unwrap_or(0).min(plan.dns.len() - 1), plan.users[user].exit.unwrap_or(plan.default_exit));
@@ -503,7 +517,7 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 		}
 		query.extend_from_slice(&[0, 0, qtype, 0, 1]);
 		for at in 0..plan.dns[list].servers.len() {
-			match resolver::ask(shared, plan, usize::MAX, user, 17, fallback, list, at, &query, Some(name)).await {
+			match resolver::ask(shared, plan, inbound, transport, user, 17, fallback, list, at, &query, Some(name)).await {
 				Step::Refused(reason) => {
 					shared.count(reason);
 					return Vec::new();

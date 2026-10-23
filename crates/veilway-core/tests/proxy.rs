@@ -182,6 +182,9 @@ async fn socks_login_from(at: SocketAddr, from: Option<IpAddr>, user: &str, pass
 	if said == [1, 0] {Ok(stream)} else {Err(said)}
 }
 
+/// What a client names in its UDP ASSOCIATE on a loopback inbound: where the system can tell who owns a socket (Linux) nothing is needed, and elsewhere the address it sends from, which that inbound then insists on.
+fn loopback_hint(client: &UdpSocket) -> Dest {Dest::Addr(if cfg!(target_os = "linux") {"0.0.0.0:0".parse().unwrap()} else {client.local_addr().unwrap()})}
+
 /// A request on a logged in SOCKS5 stream: the reply code, and the address it carries.
 async fn socks_ask(stream: &mut TcpStream, command: u8, dest: &Dest) -> (u8, SocketAddr) {
 	stream.write_all(&[&[5, command, 0][..], &encode(dest)].concat()).await.unwrap();
@@ -305,10 +308,10 @@ async fn socks5_resolves_a_name_through_the_nodes_dns() {
 async fn socks5_carries_udp_for_the_address_that_asked_and_for_no_other() {
 	let Some(net) = net(|_| {}).await else {return};
 	let echoed = udp_echo(net.own).await;
-	let mut control = socks_login(net.socks, "alice", ALICE).await.unwrap();
-	let (code, relay) = socks_ask(&mut control, 3, &Dest::Addr("0.0.0.0:0".parse().unwrap())).await;
-	assert_eq!((code, relay.ip()), (0, net.socks.ip()), "the relay is not on the address the client connected to");
 	let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let mut control = socks_login(net.socks, "alice", ALICE).await.unwrap();
+	let (code, relay) = socks_ask(&mut control, 3, &loopback_hint(&client)).await;
+	assert_eq!((code, relay.ip()), (0, net.socks.ip()), "the relay is not on the address the client connected to");
 	let datagram = [&[0, 0, 0][..], &encode(&Dest::Addr(echoed)), b"hello"].concat();
 	let ask = async |socket: &UdpSocket, datagram: &[u8], wait: u64| {
 		let mut buffer = vec![0u8; 2048];
@@ -317,7 +320,7 @@ async fn socks5_carries_udp_for_the_address_that_asked_and_for_no_other() {
 	};
 	assert!(ask(&client, &datagram, 3000).await.expect("no answer through the relay").ends_with(b"hello"));
 	let spoofed = net.node.dropped(Reason::SpoofedSource);
-	let stranger = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+	let stranger = UdpSocket::bind((net.own, 0)).await.unwrap();
 	assert!(ask(&stranger, &datagram, 300).await.is_none(), "a datagram from another address was carried");
 	assert_eq!(net.node.dropped(Reason::SpoofedSource), spoofed + 1);
 	let (fragments, mut fragment) = (net.node.dropped(Reason::Fragment), datagram.clone());
@@ -432,8 +435,8 @@ async fn mixed_serves_socks5_and_http_on_one_port() {
 	let answer = http(net.mixed, &format!("GET http://{}/ HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n", net.origin, basic("alice", ALICE))).await;
 	assert_eq!(status(&answer), "HTTP/1.1 200 OK", "the mixed port did not serve HTTP: {answer}");
 	assert!(http(net.mixed, "GET http://example.com/ HTTP/1.1\r\n\r\n").await.starts_with("HTTP/1.1 407"));
-	let mut control = socks_login(net.mixed, "alice", ALICE).await.unwrap();
-	assert_eq!(socks_ask(&mut control, 3, &Dest::Addr("0.0.0.0:0".parse().unwrap())).await.0, 0, "the mixed port did not take UDP ASSOCIATE");
+	let (mut control, client) = (socks_login(net.mixed, "alice", ALICE).await.unwrap(), UdpSocket::bind("127.0.0.1:0").await.unwrap());
+	assert_eq!(socks_ask(&mut control, 3, &loopback_hint(&client)).await.0, 0, "the mixed port did not take UDP ASSOCIATE");
 }
 
 #[tokio::test]
@@ -453,8 +456,12 @@ async fn a_connection_that_never_logs_in_is_closed_and_one_source_cannot_hold_mo
 	let mut third = dial(net.socks, from).await;
 	assert!(timeout(Duration::from_secs(3), third.read(&mut [0u8; 1])).await.unwrap().map_or(true, |n| n == 0), "a third connection of one source was held");
 	assert_eq!(net.node.totals("s").refused_source, 1);
-	let mut other = dial(net.socks, Some("127.0.0.2".parse().unwrap())).await;
-	assert!(timeout(Duration::from_millis(300), other.read(&mut [0u8; 1])).await.is_err(), "another source was refused for what the first held");
+	// Only Linux has a second loopback address to be another source from.
+	#[cfg(target_os = "linux")]
+	{
+		let mut other = dial(net.socks, Some("127.0.0.2".parse().unwrap())).await;
+		assert!(timeout(Duration::from_millis(300), other.read(&mut [0u8; 1])).await.is_err(), "another source was refused for what the first held");
+	}
 	drop((first, second));
 }
 
@@ -671,6 +678,76 @@ async fn udp_on_an_address_that_strangers_may_reach_needs_the_port_the_client_se
 	assert!(!ask(&neighbour).await, "a sender on the client's address but not its port took the association");
 	assert_eq!(net.node.dropped(Reason::SpoofedSource), spoofed + 1);
 	assert!(ask(&client).await, "the client got no answer");
+	assert_eq!(net.node.totals("s").refused_udp_source, 1, "a datagram that came from another port was not counted for the inbound");
+	assert!(net.node.engine.proxies().iter().any(|(tag, totals)| tag == "s" && totals.refused_udp_source == 1));
+}
+
+#[tokio::test]
+async fn udp_any_port_gives_a_client_behind_a_nat_an_association_bound_to_its_first_datagram() {
+	let Some(mut net) = net(|_| {}).await else {return};
+	let addr = SocketAddr::new(net.own, std::net::TcpListener::bind((net.own, 0)).unwrap().local_addr().unwrap().port());
+	net.node.reload(|doc| {
+		doc["inbounds"][1]["listen"] = json!(addr.to_string());
+		doc["inbounds"][1]["public"] = json!(true);
+		doc["inbounds"][1]["udp_any_port"] = json!(true);
+	}).await;
+	let echoed = udp_echo(net.own).await;
+	let mut control = socks_login(addr, "alice", ALICE).await.unwrap();
+	let (code, relay) = socks_ask(&mut control, 3, &Dest::Addr("0.0.0.0:0".parse().unwrap())).await;
+	assert_eq!(code, 0, "an association with no port was refused though the operator allowed it");
+	let datagram = [&[0, 0, 0][..], &encode(&Dest::Addr(echoed)), b"hello"].concat();
+	let ask = async |socket: &UdpSocket| {
+		let mut buffer = vec![0u8; 2048];
+		socket.send_to(&datagram, relay).await.unwrap();
+		timeout(Duration::from_millis(500), socket.recv_from(&mut buffer)).await.is_ok()
+	};
+	let (client, neighbour) = (UdpSocket::bind((net.own, 0)).await.unwrap(), UdpSocket::bind((net.own, 0)).await.unwrap());
+	assert!(ask(&client).await, "the first datagram of the client got no answer");
+	assert!(!ask(&neighbour).await, "a second port took an association that was bound");
+	assert_eq!(net.node.totals("s").refused_udp_source, 1);
+	assert!(ask(&client).await);
+}
+
+#[tokio::test]
+async fn idle_clients_cannot_hold_every_login_and_a_silent_one_is_closed_at_the_greeting_deadline() {
+	let Some(net) = net(|_| {}).await else {return};
+	let from = Some(net.own);
+	let mut held = Vec::new();
+	for _ in 0..8 {held.push(dial(net.socks, from).await)}
+	let mut ninth = dial(net.socks, from).await;
+	assert!(timeout(Duration::from_secs(2), ninth.read(&mut [0u8; 1])).await.unwrap().map_or(true, |n| n == 0), "a ninth login of one source was held");
+	assert_eq!(net.node.totals("s").refused_busy, 1);
+	assert!(socks_login(net.socks, "alice", ALICE).await.is_ok(), "a loopback peer was held to what the other source held");
+	let started = tokio::time::Instant::now();
+	assert!(closed(&mut held[0], 6).await, "a client that never sent a byte was kept");
+	assert!(started.elapsed() < Duration::from_secs(5), "the greeting deadline took {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_login_that_is_right_does_not_wait_for_what_was_tried_against_its_name() {
+	let Some(net) = net(|_| {}).await else {return};
+	for _ in 0..8 {assert!(socks_login(net.socks, "alice", "not-her-password-123").await.is_err())}
+	let started = tokio::time::Instant::now();
+	assert!(socks_login(net.socks, "alice", ALICE).await.is_ok());
+	assert!(started.elapsed() < Duration::from_millis(400), "a right password waited {:?}", started.elapsed());
+	let started = tokio::time::Instant::now();
+	assert!(socks_login(net.socks, "alice", "not-her-password-123").await.is_err());
+	assert!(started.elapsed() >= Duration::from_millis(500), "a refusal was not delayed: {:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn names_are_resolved_under_the_rules_of_the_inbound_and_the_transport_the_connection_came_in_by() {
+	let Some(own) = own() else {return};
+	let by_inbound = json!([{"tag": "no-dns-on-s", "inbound": ["s"], "protocol": ["udp"], "ip": [format!("{own}/32")], "action": "block"}]);
+	let by_transport = json!([{"tag": "no-dns-for-socks5", "transport": ["socks5"], "protocol": ["udp"], "ip": [format!("{own}/32")], "action": "block"}]);
+	for (rules, blocked, open) in [(by_inbound, "s", ["h"].as_slice()), (by_transport, "m", ["h"].as_slice())] {
+		let Some(net) = net(|doc| doc["routing"]["rules"] = rules).await else {return};
+		let at = if blocked == "s" {net.socks} else {net.mixed};
+		assert!(matches!(socks_connect(at, "alice", ALICE, &Dest::Name("anything.example", net.echo.port())).await, Err(4 | 5)), "{blocked}: a name was resolved through a rule that blocks the resolver");
+		assert!(socks_connect(at, "alice", ALICE, &Dest::Addr(net.echo)).await.is_ok(), "{blocked}: the rule blocked more than the lookup");
+		let answer = http(net.http, &format!("CONNECT anything.example:{} HTTP/1.1\r\nProxy-Authorization: Basic {}\r\n\r\n", net.echo.port(), basic("alice", ALICE))).await;
+		assert!(answer.starts_with("HTTP/1.1 200"), "{open:?}: the rule reached an http connection: {answer}");
+	}
 }
 
 #[tokio::test]

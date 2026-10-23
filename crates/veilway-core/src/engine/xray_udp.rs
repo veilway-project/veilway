@@ -7,12 +7,12 @@ use super::plan::{Backend, Outbound, Plan};
 use super::resolver::{self, Step, MAX_IN_FLIGHT};
 use super::route::{By, Decision, Reason};
 use crate::config::RuleTransport;
-use super::xray::{exit_for, reply, resolve, Open, Slot, Target};
+use super::xray::{exit_for, linger, reply, resolve, Open, Slot, Target};
 use super::xray_owner::Lookup;
 use super::{dns, gate, Shared};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,7 +50,8 @@ const BUFFER: usize = MAX_PAYLOAD + 262 + 1;
 pub(super) struct Limits {per_user: usize, associations: Arc<Open>, total: Arc<Semaphore>, flows: Arc<Semaphore>, per_user_flows: usize, user_flows: Arc<Open>, noted: Mutex<HashMap<&'static str, Instant>>}
 
 /// How one door of the node asks for the code that carries a user's connections: what begins its log lines, how the owner of a socket is told (only where datagrams can be tied to a local user: the hop of Xray and a proxy inbound on loopback), and the tag of the proxy inbound the connections come in through, which the rules' `inbound` condition is held against. The hop of Xray has no inbound.
-pub(super) struct Via {pub label: String, pub owner: Option<Lookup>, pub inbound: Option<String>}
+/// `any_port` lets a client that names no port have an association where no owner can be looked up, which binds to its first datagram. `mismatch` counts the datagrams that came from another source than the association's.
+pub(super) struct Via {pub label: String, pub owner: Option<Lookup>, pub inbound: Option<String>, pub any_port: bool, pub mismatch: Option<Arc<AtomicU64>>}
 
 impl Limits {
 	pub(super) fn new(per_user: usize, total: usize, flows: usize, per_user_flows: usize) -> Limits {Limits {per_user, associations: Arc::default(), total: Arc::new(Semaphore::new(total)), flows: Arc::new(Semaphore::new(flows)), per_user_flows, user_flows: Arc::default(), noted: Mutex::default()}}
@@ -128,7 +129,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 	let label = via.label.as_str();
 	let (name, port, found) = match &target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
-		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name).await),
+		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name, plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5)).await),
 	};
 	let shown = plan.show(name.map_or_else(|| found.first().map_or_else(String::new, ToString::to_string), str::to_string));
 	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools) && !(shared.is_local)(*ip)) else {
@@ -188,6 +189,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 	let Some((_slot, _permit)) = limits.take(&user, &via.label) else {
 		shared.count(Reason::FlowTableFull);
 		let _ = control.write_all(&reply(1)).await;
+		linger(&mut control).await;
 		anyhow::bail!("user {user}: too many udp associations");
 	};
 	// Xray's request names no source port, so what ties a datagram to this association is its sender's user: the same as the one that holds the control connection.
@@ -198,15 +200,17 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 			None => {
 				shared.count(Reason::SpoofedSource);
 				let _ = control.write_all(&reply(1)).await;
+				linger(&mut control).await;
 				anyhow::bail!("user {user}: could not tell who owns the connection that asked for a udp association");
 			}
 		},
 		None => None,
 	};
 	// With no owner to look up, nothing ties a datagram to this association but the address and port the client says it sends from, so a client that gives no port has no association: until its first datagram any sender on its address could take it.
-	if uid.is_none() && !matches!(&hint, Target::Address(addr) if addr.port() != 0) {
+	if uid.is_none() && !via.any_port && !matches!(&hint, Target::Address(addr) if addr.port() != 0) {
 		shared.count(Reason::SpoofedSource);
 		let _ = control.write_all(&reply(2)).await;
+		linger(&mut control).await;
 		anyhow::bail!("user {user}: a udp association without the port the client sends from is not granted here");
 	}
 	let socket = UdpSocket::bind((here.ip(), 0)).await?;
@@ -236,6 +240,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 				let Ok((n, source)) = received else {break};
 				if source.ip() != from_ip || peer.is_some_and(|expected| expected != source) {
 					shared.count(Reason::SpoofedSource);
+					if let Some(mismatch) = &via.mismatch {mismatch.fetch_add(1, Ordering::Relaxed);}
 					continue;
 				}
 				if let (Some(uid), Some(lookup), true) = (uid, via.owner.clone(), verified != Some(source)) {
@@ -280,6 +285,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 						continue;
 					}
 					let (shared, message) = (shared.clone(), data.to_vec());
+					let (inbound, session) = (plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5));
 					answers.spawn(async move {
 						let (counted, resolver) = (&plan.users[at], &shared.resolver);
 						shared.spend(counted, true, message.len() + overhead);
@@ -294,7 +300,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 						let (list, fallback) = (counted.dns.unwrap_or(0).min(plan.dns.len() - 1), counted.exit.unwrap_or(plan.default_exit));
 						let mut answer = None;
 						for server in 0..plan.dns[list].servers.len() {
-							match resolver::ask(&shared, &plan, usize::MAX, at, 17, fallback, list, server, &message, query.question.name.as_deref()).await {
+							match resolver::ask(&shared, &plan, inbound, session, at, 17, fallback, list, server, &message, query.question.name.as_deref()).await {
 								Step::Refused(reason) => {
 									shared.count(reason);
 									resolver.refused.fetch_add(1, Ordering::Relaxed);

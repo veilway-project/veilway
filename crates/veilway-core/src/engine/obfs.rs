@@ -537,7 +537,7 @@ async fn handle(shared: &Arc<Shared>, listener: &Arc<Listener>, socket: &Arc<Udp
 			if let Some(sealed) = session.seal(None, false, Room::Inbound) {tunnel.sent(socket.send_to(&sealed, session.source).await)}
 		});
 	}
-	for packet in work.ip.drain(..) {shared.ingress(&plan, at, handled.device, packet).await}
+	for packet in work.ip.drain(..) {shared.ingress(&plan, at, handled.device, packet, Some(super::Over::UdpObfs.rule())).await}
 }
 
 /// Reads the socket of one `udp-obfs` transport until the handle it returns is aborted. Between datagrams it takes the opening packets that waited for a higher limit to the replay rule again, whenever a write of the replay file has ended.

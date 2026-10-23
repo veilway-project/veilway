@@ -299,7 +299,7 @@ pub(super) async fn serve(shared: &Arc<Shared>, listener: &Arc<Listener>, served
 	if !ip.is_empty() {
 		let plan = shared.plan();
 		if let Some(at) = plan.inbound_of(&seat.tunnel) {
-			for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet).await}
+			for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet, Some(shaped.session.over.rule())).await}
 		}
 	}
 	// "For the opening request, the node sends nothing, not even the head, until the session is established, as in the classic form." A session that is pending has this one request, and waits for the first tunnel packet deadline.

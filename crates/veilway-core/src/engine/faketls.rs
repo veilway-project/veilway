@@ -1427,7 +1427,7 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 			if !ip.is_empty() {
 				let plan = shared.plan();
 				if let Some(at) = plan.inbound_of(&seat.tunnel) {
-					for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet).await}
+					for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet, Some(super::Over::FakeTls.rule())).await}
 				}
 				ip.clear();
 			}

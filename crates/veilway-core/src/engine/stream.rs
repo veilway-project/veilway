@@ -1244,7 +1244,7 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 					if !ip.is_empty() {
 						let plan = shared.plan();
 						if let Some(at) = plan.inbound_of(&seat.tunnel) {
-							for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet).await}
+							for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet, Some(session.over.rule())).await}
 						}
 						ip.clear();
 					}
@@ -1960,7 +1960,7 @@ async fn poll(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served, w
 	if !ip.is_empty() {
 		let plan = shared.plan();
 		if let Some(at) = plan.inbound_of(&seat.tunnel) {
-			for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet).await}
+			for packet in ip.drain(..) {shared.ingress(&plan, at, seat.device, packet, Some(polling.session.over.rule())).await}
 		}
 	}
 	// "Its first answer on a new session comes when the session is established, as on every transport", and "the node sends nothing on a pending session". A session that is pending has this one request and can get no other while it is held, so it waits for the first tunnel packet deadline, and is then nobody's.

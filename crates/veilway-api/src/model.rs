@@ -494,6 +494,8 @@ pub struct ProxyStats {
 	pub open: usize,
 	/// Logins that were refused: no such user, a wrong password, a user the inbound does not admit.
 	pub refused_logins: u64,
+	/// UDP datagrams dropped because they did not come from the address and port the client named for its association, which is what a client behind a NAT that rewrites ports is refused for.
+	pub refused_udp_source: u64,
 	/// Connections turned away at the inbound's `connections`, at a source's `per_source` and at `handshakes`, and logins refused unheard because a source had failed too many to that name.
 	pub refused_limit: u64,
 	pub refused_source: u64,

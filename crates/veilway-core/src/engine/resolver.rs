@@ -119,9 +119,9 @@ pub(super) enum Step {
 /// An l3 exit with `masquerade` leaves through the host's own network stack under the host's own address, and so does a query the node sends for it itself.
 /// Without `masquerade` the operator decides where that traffic goes, which the node cannot know, so such an exit carries no query of the node's resolver rather than one that takes another way out.
 /// A `chain` exit carries the query into its link like any other packet, see `chain`.
-pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user: usize, protocol: u8, fallback: usize, list: usize, at: usize, message: &[u8], asked: Option<&str>) -> Step {
+pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, transport: Option<crate::config::RuleTransport>, user: usize, protocol: u8, fallback: usize, list: usize, at: usize, message: &[u8], asked: Option<&str>) -> Step {
 	let (set, server) = (&plan.dns[list], &plan.dns[list].servers[at]);
-	let action = route::evaluate(plan, inbound, user, server.ip(), protocol, 53, None, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
+	let action = route::evaluate(plan, inbound, user, server.ip(), protocol, 53, None, transport, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
 	let exit = if let Action::Exit(exit) = action {*exit} else {fallback};
 	let refusal = match (action, &plan.exits[exit].backend) {
 		(Action::Block | Action::Reject, _) => Some(Reason::Rule),
@@ -161,7 +161,7 @@ pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user:
 /// The query is a flow from the user to each server in turn on port 53: the rules see the server's address and the name that was asked, and the exit they choose must be one the user may use and one that carries the server's address.
 /// The plan is taken anew for each query, so a flow that outlives a reload is answered by the config that runs.
 async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message: Vec<u8>) -> Option<Vec<u8>> {
-	let (resolver, plan, protocol) = (&shared.resolver, shared.plan(), flow.0.protocol);
+	let (resolver, plan, protocol, session) = (&shared.resolver, shared.plan(), flow.0.protocol, shared.flows.transport(&flow.0, flow.1));
 	let from = plan.by_address.get(&flow.0.src).copied().filter(|from| plan.devices[from.device].public_key == device)?;
 	let (inbound, user) = (from.inbound, plan.devices[from.device].user);
 	let Some(query) = dns::query(&message) else {
@@ -179,7 +179,7 @@ async fn answer(shared: Arc<Shared>, flow: (Key, u64), device: [u8; 32], message
 		return Some(query.reply(dns::SERVFAIL));
 	};
 	for at in 0..set.servers.len() {
-		let (exit, answer) = match ask(&shared, &plan, inbound, user, protocol, plan.exit_of(from.device), list, at, &message, asked).await {
+		let (exit, answer) = match ask(&shared, &plan, inbound, session, user, protocol, plan.exit_of(from.device), list, at, &message, asked).await {
 			Step::Refused(reason) => {
 				shared.count(reason);
 				resolver.refused.fetch_add(1, Ordering::Relaxed);

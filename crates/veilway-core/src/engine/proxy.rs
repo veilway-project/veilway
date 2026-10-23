@@ -7,7 +7,7 @@ use super::proxy_http::{self, Body};
 use super::proxy_socks as socks;
 use super::route::Reason;
 use super::tunnel::{reset, source};
-use super::xray::{connect, relay, reply, Refused, Target};
+use super::xray::{connect, linger, relay, reply, Refused, Target};
 use super::xray_owner::{self, Lookup};
 use super::xray_udp::{self, Via};
 use super::Shared;
@@ -35,8 +35,14 @@ const FREE_FAILURES: u32 = 2;
 const WAIT: Duration = Duration::from_millis(100);
 const MAX_WAIT: Duration = Duration::from_secs(2);
 const WINDOW: Duration = Duration::from_secs(60);
-/// Entries each failure table keeps. A new one that finds a table full takes the place of the oldest, so a flood of names cannot keep the count of another from growing.
+/// Entries each failure table keeps. A table that is full gives up the entry with the lowest count and never one that is blocked or at its longest wait, so a flood of new keys cannot push out a count that matters.
 const SOURCES: usize = 4096;
+/// How many user names one source may hold failure counts for. A source that tries more is refused every name until the window is over, which is also what keeps it from flooding the tables with names of its own making.
+const NAMES_PER_SOURCE: u32 = 16;
+/// Logins in flight one source may have, and the share of the inbound's `handshakes` that peers on loopback have together.
+const SHAKING_PER_SOURCE: usize = 8;
+/// How long a client has to send its first byte, inside `HANDSHAKE`.
+const GREETING: Duration = Duration::from_secs(3);
 /// At most one line at info for refused logins in this long, which says how many there were.
 const NOTED: Duration = Duration::from_secs(10);
 
@@ -76,6 +82,8 @@ pub struct Totals {
 	pub open: usize,
 	/// Logins that were refused: no such user, a wrong password, a user the inbound does not admit.
 	pub refused_logins: u64,
+	/// UDP datagrams dropped because they did not come from the address and port the client named for its association (or, with `udp_any_port`, from its address): what a client behind a NAT that rewrites ports is refused for.
+	pub refused_udp_source: u64,
 	/// Connections turned away because the inbound held its `connections`, because the source held its `per_source`, and because `handshakes` were in flight. Logins refused unheard because the source had failed too many to that name.
 	pub refused_limit: u64,
 	pub refused_source: u64,
@@ -86,32 +94,53 @@ pub struct Totals {
 	pub down_bytes: u64,
 }
 
+/// `shaking` counts the logins in flight by source, with the peers on loopback together under None.
 #[derive(Default)]
-struct Held {open: usize, by: HashMap<IpAddr, usize>}
+struct Held {open: usize, by: HashMap<IpAddr, usize>, shaking: HashMap<Option<IpAddr>, usize>}
 
 /// Failures in a row of a login within `WINDOW`: when the count began, and how many.
 type Streak = (Instant, u32);
 
 #[derive(Default)]
-struct Failed {by: HashMap<(IpAddr, String), Streak>, names: HashMap<String, Streak>, noted: Option<Instant>, since: u64}
+struct Failed {by: HashMap<(IpAddr, String), Streak>, names: HashMap<String, Streak>, sources: HashMap<IpAddr, Streak>, noted: Option<Instant>, since: u64}
 
-/// Adds a failure to `key`. A count older than `WINDOW` starts over, and a table that is full gives up its oldest entry for a new key.
-fn bump<K: Hash + Eq + Clone>(table: &mut HashMap<K, Streak>, key: &K, now: Instant) {
+/// Whether a count is still inside its window.
+fn live(streak: &Streak, now: Instant) -> bool {now.saturating_duration_since(streak.0) < WINDOW}
+
+/// Adds a failure to `key` and says whether it is kept. A count older than `WINDOW` starts over. A table that is full forgets what is over first, then gives up the entry with the lowest count (the oldest of those), and never one at `protect` or more. When every entry is protected a new key is not kept.
+fn bump<K: Hash + Eq + Clone>(table: &mut HashMap<K, Streak>, key: &K, now: Instant, protect: u32) -> bool {
 	if !table.contains_key(key) && table.len() >= SOURCES {
-		table.retain(|_, (start, _)| now.saturating_duration_since(*start) < WINDOW);
+		table.retain(|_, streak| live(streak, now));
 		if table.len() >= SOURCES {
-			let oldest = table.iter().min_by_key(|(_, (start, _))| *start).map(|(key, _)| key.clone());
-			if let Some(oldest) = oldest {table.remove(&oldest);}
+			let weakest = table.iter().filter(|(_, (_, n))| *n < protect).min_by_key(|(_, (start, n))| (*n, *start)).map(|(key, _)| key.clone());
+			match weakest {
+				Some(weakest) => drop(table.remove(&weakest)),
+				None => return false,
+			}
 		}
 	}
 	let entry = table.entry(key.clone()).or_insert((now, 0));
-	if now.saturating_duration_since(entry.0) >= WINDOW {*entry = (now, 0)}
+	if !live(entry, now) {*entry = (now, 0)}
 	entry.1 += 1;
+	true
 }
 
-/// What a running inbound counts and holds.
+/// What a running inbound counts and holds. `mismatch` counts the datagrams of UDP associations that came from another source than the client named, which the relays count into it.
 #[derive(Default)]
-pub struct State {counts: [AtomicU64; Count::ALL], held: Mutex<Held>, failed: Mutex<Failed>}
+pub struct State {counts: [AtomicU64; Count::ALL], held: Mutex<Held>, failed: Mutex<Failed>, mismatch: Arc<AtomicU64>}
+
+/// A place among the logins in flight, given back when it is dropped.
+struct Shake {state: Arc<State>, key: Option<IpAddr>}
+
+impl Drop for Shake {
+	fn drop(&mut self) {
+		let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+		if let Some(here) = held.shaking.get_mut(&self.key) {
+			*here -= 1;
+			if *here == 0 {held.shaking.remove(&self.key);}
+		}
+	}
+}
 
 /// A place among the inbound's connections, given back when it is dropped.
 struct Place {state: Arc<State>, source: Option<IpAddr>}
@@ -145,9 +174,21 @@ impl State {
 		Ok(Place {state: self.clone(), source: Some(from)})
 	}
 
-	/// Whether `ip` has failed `FAILURES` logins to `name` within `WINDOW`. A loopback peer never has.
+	/// A place among the logins in flight: `total` in all, at most `SHAKING_PER_SOURCE` for a source, and for the peers on loopback together half of `total`. Idle clients that never log in cannot hold every place this way.
+	fn shake(self: &Arc<State>, ip: IpAddr, total: usize) -> Option<Shake> {
+		let key = (!ip.is_loopback()).then(|| source(ip));
+		let most = if key.is_none() {(total / 2).max(1)} else {SHAKING_PER_SOURCE.min(total)};
+		let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+		let here = held.shaking.entry(key).or_default();
+		if *here >= most {return None}
+		*here += 1;
+		Some(Shake {state: self.clone(), key})
+	}
+
+	/// Whether `ip` has failed `FAILURES` logins to `name` within `WINDOW`, or has tried more than `NAMES_PER_SOURCE` names. A loopback peer never has.
 	fn blocked(&self, ip: IpAddr, name: &str, now: Instant) -> bool {
-		!ip.is_loopback() && self.failed.lock().unwrap_or_else(|e| e.into_inner()).by.get(&(source(ip), name.to_string())).is_some_and(|(start, n)| now.saturating_duration_since(*start) < WINDOW && *n >= FAILURES)
+		let (failed, from) = (self.failed.lock().unwrap_or_else(|e| e.into_inner()), source(ip));
+		!ip.is_loopback() && (failed.by.get(&(from, name.to_string())).is_some_and(|streak| live(streak, now) && streak.1 >= FAILURES) || failed.sources.get(&from).is_some_and(|streak| live(streak, now) && streak.1 > NAMES_PER_SOURCE))
 	}
 
 	/// How long an answer for `name` waits: nothing for the first failures within `WINDOW`, then `WAIT` more for each, up to `MAX_WAIT`. It is the name's, whoever asks, so guessing at one user from many addresses slows down as it goes, and a user is slowed for what is tried against their name.
@@ -156,25 +197,32 @@ impl State {
 		(WAIT * failures.saturating_sub(FREE_FAILURES)).min(MAX_WAIT)
 	}
 
-	/// A login to `name` from `ip` that was refused: counted, held against the source and the name, and said at info when no line was said for `NOTED`.
+	/// A login to `name` from `ip` that was refused: counted, held against the source and the name, and said at info when no line was said for `NOTED`, without the address or the name, which are at debug.
 	fn refused(&self, tag: &str, ip: IpAddr, name: &str, now: Instant) {
 		self.count(Count::Login);
+		tracing::debug!("inbound {tag}: a login to {name} from {ip} was refused");
 		let said = {
 			let mut failed = self.failed.lock().unwrap_or_else(|e| e.into_inner());
-			if !ip.is_loopback() {bump(&mut failed.by, &(source(ip), name.to_string()), now)}
-			bump(&mut failed.names, &name.to_string(), now);
+			if !ip.is_loopback() {
+				let (from, key) = (source(ip), (source(ip), name.to_string()));
+				if !failed.sources.get(&from).is_some_and(|streak| live(streak, now) && streak.1 > NAMES_PER_SOURCE) {
+					let known = failed.by.contains_key(&key);
+					if bump(&mut failed.by, &key, now, FAILURES) && !known {bump(&mut failed.sources, &from, now, NAMES_PER_SOURCE + 1);}
+				}
+			}
+			bump(&mut failed.names, &name.to_string(), now, FREE_FAILURES + (MAX_WAIT.as_millis() / WAIT.as_millis()) as u32);
 			failed.since += 1;
 			if failed.noted.is_none_or(|at| now.saturating_duration_since(at) >= NOTED) {
 				failed.noted = Some(now);
 				Some(std::mem::take(&mut failed.since))
 			} else {None}
 		};
-		if let Some(n) = said {tracing::info!("inbound {tag}: {n} login(s) refused since the last line, the latest from {ip}")}
+		if let Some(n) = said {tracing::info!("inbound {tag}: {n} login(s) refused since the last line")}
 	}
 
 	pub fn totals(&self) -> Totals {
 		let get = |count: Count| self.counts[count as usize].load(Ordering::Relaxed);
-		Totals {opened: get(Count::Opened), open: self.held.lock().unwrap_or_else(|e| e.into_inner()).open, refused_logins: get(Count::Login), refused_limit: get(Count::Limit), refused_source: get(Count::Source), refused_busy: get(Count::Busy), refused_blocked: get(Count::Blocked), up_bytes: get(Count::Up), down_bytes: get(Count::Down)}
+		Totals {opened: get(Count::Opened), open: self.held.lock().unwrap_or_else(|e| e.into_inner()).open, refused_logins: get(Count::Login), refused_udp_source: self.mismatch.load(Ordering::Relaxed), refused_limit: get(Count::Limit), refused_source: get(Count::Source), refused_busy: get(Count::Busy), refused_blocked: get(Count::Blocked), up_bytes: get(Count::Up), down_bytes: get(Count::Down)}
 	}
 }
 
@@ -210,17 +258,19 @@ fn login(shared: &Shared, inbound: &str, user: &[u8], password: &[u8]) -> Option
 	Some((plan, at, given))
 }
 
-/// `login` for a front end: a source that failed `FAILURES` logins to this name is refused without being heard, an answer for a name that many logins failed for waits, and a login that fails is held against both.
+/// `login` for a front end: a source that failed `FAILURES` logins to this name, or tried too many names, is refused without being heard. A login that fails is held against the source and the name, and its refusal waits as long as the failures to that name say, which is after the password was checked, so a login that is right never waits for what others tried.
 async fn check(door: &Door, peer: SocketAddr, user: &[u8], password: &[u8]) -> Option<(Arc<Plan>, usize, [u8; 32])> {
 	let (name, now) = (String::from_utf8_lossy(&user[..user.len().min(64)]).to_string(), Instant::now());
 	if door.state.blocked(peer.ip(), &name, now) {
 		door.state.count(Count::Blocked);
 		return None;
 	}
-	let wait = door.state.wait(&name, now);
-	if !wait.is_zero() {sleep(wait).await}
 	let found = login(&door.shared, &door.inbound.tag, user, password);
-	if found.is_none() {door.state.refused(&door.inbound.tag, peer.ip(), &name, Instant::now())}
+	if found.is_none() {
+		let wait = door.state.wait(&name, now);
+		door.state.refused(&door.inbound.tag, peer.ip(), &name, Instant::now());
+		if !wait.is_zero() {sleep(wait).await}
+	}
 	found
 }
 
@@ -313,7 +363,7 @@ async fn http_front(door: &Door, client: &mut TcpStream, buf: &mut Vec<u8>, peer
 }
 
 /// What a connection does once its client is logged in and has said what it wants.
-async fn carry(door: &Door, mut client: TcpStream, front: Front, asked: Asked) -> anyhow::Result<()> {
+async fn carry(door: &Door, client: &mut TcpStream, front: Front, asked: Asked) -> anyhow::Result<()> {
 	let (shared, Asked {plan, at, digest, target, up, body}) = (&door.shared, asked);
 	let user = plan.users[at].name.clone();
 	let refuse = async |client: &mut TcpStream, reason: Reason, code: u8| {
@@ -322,17 +372,17 @@ async fn carry(door: &Door, mut client: TcpStream, front: Front, asked: Asked) -
 		let _ = timeout(HANDSHAKE, client.write_all(&bytes)).await;
 	};
 	if plan.users[at].denied.is_some() {
-		refuse(&mut client, Reason::Entitlement, 2).await;
+		refuse(client, Reason::Entitlement, 2).await;
 		anyhow::bail!("user {user}: cut off");
 	}
 	if matches!(&target, Target::Address(addr) if addr.port() == 0) || matches!(&target, Target::Name(_, 0)) {
-		refuse(&mut client, Reason::Unparsable, 2).await;
+		refuse(client, Reason::Unparsable, 2).await;
 		anyhow::bail!("user {user}: port 0");
 	}
 	let mut opened = match connect(shared, plan, at, target, &door.via, Some(if front == Front::Socks {RuleTransport::Socks5} else {RuleTransport::Http})).await {
 		Ok(opened) => opened,
 		Err(Refused {reason, code, why}) => {
-			refuse(&mut client, reason, code).await;
+			refuse(client, reason, code).await;
 			return Err(why);
 		}
 	};
@@ -345,33 +395,45 @@ async fn carry(door: &Door, mut client: TcpStream, front: Front, asked: Asked) -
 		Backend::Netstack {tcp_idle, ..} => Some(*tcp_idle),
 		_ => None,
 	};
-	relay(shared, &mut opened, &mut client, &up, body, &|up, n| door.state.bytes(up, n), idle, &|now| door.holds(now, &user, digest), &door.via.label).await;
+	relay(shared, &mut opened, client, &up, body, &|up, n| door.state.bytes(up, n), idle, &|now| door.holds(now, &user, digest), &door.via.label).await;
 	Ok(())
 }
 
-async fn session(door: &Door, mut client: TcpStream, peer: SocketAddr, permit: OwnedSemaphorePermit) -> anyhow::Result<()> {
+async fn session(door: &Door, mut client: TcpStream, peer: SocketAddr, permit: (OwnedSemaphorePermit, Shake)) -> anyhow::Result<()> {
 	let mut buf = Vec::new();
-	// What `mixed` looks at to tell the two apart and the whole of the login share one deadline.
+	// The first byte has `GREETING`, and it and the rest of the login, with what `mixed` looks at to tell the two apart, share `HANDSHAKE`.
 	let next = timeout(HANDSHAKE, async {
+		let mut first = [0u8; 1];
+		anyhow::ensure!(timeout(GREETING, client.peek(&mut first)).await?? == 1, "closed before it sent anything");
 		let socks = match door.inbound.kind {
 			ProxyType::Socks5 => true,
 			ProxyType::Http => false,
-			ProxyType::Mixed => {
-				let mut first = [0u8; 1];
-				anyhow::ensure!(client.peek(&mut first).await? == 1, "closed before it sent anything");
-				first[0] == 5
-			}
+			ProxyType::Mixed => first[0] == 5,
 		};
 		if socks {socks_front(door, &mut client, &mut buf, peer).await} else {http_front(door, &mut client, &mut buf, peer).await}
-	}).await??;
+	}).await;
 	drop(permit);
+	// A refusal is written, and the connection is then given a moment to be read before it closes, see `linger`.
+	let next = match next {
+		Ok(Ok(next)) => next,
+		Ok(Err(e)) => {
+			linger(&mut client).await;
+			return Err(e);
+		}
+		Err(e) => return Err(e.into()),
+	};
 	match next {
-		Next::Carry(front, asked) => carry(door, client, front, asked).await,
+		Next::Carry(front, asked) => {
+			let carried = carry(door, &mut client, front, asked).await;
+			if carried.is_err() {linger(&mut client).await}
+			carried
+		}
 		Next::Associate(Asked {plan, at, digest, target, ..}) => {
 			let user = plan.users[at].name.clone();
 			if plan.users[at].denied.is_some() {
 				door.shared.count(Reason::Entitlement);
 				let _ = timeout(HANDSHAKE, client.write_all(&reply(2))).await;
+				linger(&mut client).await;
 				anyhow::bail!("user {user}: cut off");
 			}
 			xray_udp::associate(door.shared.clone(), client, user.clone(), target, door.via.clone(), &|now| door.holds(now, &user, digest)).await
@@ -383,7 +445,7 @@ async fn session(door: &Door, mut client: TcpStream, peer: SocketAddr, permit: O
 pub(super) fn serve(shared: &Arc<Shared>, inbound: ProxyInbound, listener: Arc<TcpListener>, state: Arc<State>) -> AbortHandle {
 	// A loopback inbound ties a datagram to the user id that owns the control connection, as the hop of Xray does, where the system tells who owns a socket. Any other inbound asks the client for the port it sends from.
 	let owner = (cfg!(target_os = "linux") && inbound.loopback()).then(|| Arc::new(xray_owner::lookup) as Lookup);
-	let via = Arc::new(Via {label: format!("inbound {}", inbound.tag), owner, inbound: Some(inbound.tag.clone())});
+	let via = Arc::new(Via {label: format!("inbound {}", inbound.tag), owner, inbound: Some(inbound.tag.clone()), any_port: inbound.udp_any_port == Some(true), mismatch: Some(state.mismatch.clone())});
 	let door = Arc::new(Door {shared: shared.clone(), inbound, state, via});
 	tokio::spawn(accept(door, listener)).abort_handle()
 }
@@ -404,7 +466,7 @@ async fn accept(door: Arc<Door>, listener: Arc<TcpListener>) {
 							continue;
 						}
 					};
-					let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+					let (Ok(permit), Some(shake)) = (handshakes.clone().try_acquire_owned(), door.state.shake(peer.ip(), door.inbound.handshakes())) else {
 						door.state.count(Count::Busy);
 						reset(&stream);
 						continue;
@@ -412,7 +474,7 @@ async fn accept(door: Arc<Door>, listener: Arc<TcpListener>) {
 					door.state.count(Count::Opened);
 					let door = door.clone();
 					sessions.spawn(async move {
-						if let Err(e) = session(&door, stream, peer, permit).await {tracing::debug!("{}: {e:#}", door.via.label)}
+						if let Err(e) = session(&door, stream, peer, (permit, shake)).await {tracing::debug!("{}: {e:#}", door.via.label)}
 						drop(place);
 					});
 				}
@@ -448,14 +510,44 @@ mod tests {
 	}
 
 	#[test]
-	fn a_full_table_gives_up_its_oldest_entry_and_never_stops_counting_new_ones() {
+	fn a_flood_of_names_from_one_source_cannot_push_out_what_blocks_it() {
 		let (state, start) = (State::default(), Instant::now());
-		for n in 0..SOURCES {state.refused("s", "203.0.113.5".parse().unwrap(), &format!("name{n}"), start + Duration::from_millis(n as u64))}
+		let ip: IpAddr = "203.0.113.5".parse().unwrap();
+		for _ in 0..FAILURES {state.refused("s", ip, "alice", start)}
+		assert!(state.blocked(ip, "alice", start));
+		for n in 0..2 * SOURCES {state.refused("s", ip, &format!("name{n}"), start + Duration::from_millis(n as u64))}
 		let now = start + Duration::from_secs(1);
-		for _ in 0..FAILURES {state.refused("s", "203.0.113.5".parse().unwrap(), "fresh", now)}
-		assert!(state.blocked("203.0.113.5".parse().unwrap(), "fresh", now), "a source that found the table full was not counted");
+		assert!(state.blocked(ip, "alice", now) && state.blocked(ip, "anyone", now), "a source that tried more names than it may was heard for another");
 		let failed = state.failed.lock().unwrap();
-		assert!(failed.by.len() <= SOURCES && failed.names.len() <= SOURCES && !failed.names.contains_key("name0"), "the oldest entry was not the one that went");
+		assert!(failed.by.len() <= NAMES_PER_SOURCE as usize + 1 && failed.names.len() <= SOURCES, "one source filled the tables: {} entries", failed.by.len());
+	}
+
+	#[test]
+	fn a_flood_from_many_sources_gives_up_the_lowest_counts_and_keeps_a_slowed_name() {
+		let (state, start) = (State::default(), Instant::now());
+		let other: IpAddr = "198.51.100.9".parse().unwrap();
+		for _ in 0..5 {state.refused("s", other, "alice", start)}
+		assert_eq!(state.wait("alice", start), WAIT * 3);
+		for n in 0..2 * SOURCES {state.refused("s", IpAddr::from([10, (n >> 16) as u8, (n >> 8) as u8, n as u8]), &format!("name{n}"), start + Duration::from_millis(n as u64))}
+		assert_eq!(state.wait("alice", start + Duration::from_secs(1)), WAIT * 3, "a flood of names flushed the wait of a name");
+		let failed = state.failed.lock().unwrap();
+		assert!(failed.by.len() <= SOURCES && failed.names.len() <= SOURCES && failed.sources.len() <= SOURCES);
+	}
+
+	#[test]
+	fn logins_in_flight_are_held_to_a_share_of_each_source_and_of_loopback() {
+		let state = Arc::new(State::default());
+		let outside: IpAddr = "203.0.113.5".parse().unwrap();
+		let held: Vec<_> = (0..SHAKING_PER_SOURCE).map(|_| state.shake(outside, 256).unwrap()).collect();
+		assert!(state.shake(outside, 256).is_none(), "one source held more logins than its share");
+		assert!(state.shake("203.0.113.6".parse().unwrap(), 256).is_some(), "another source was held to it");
+		drop(held);
+		assert!(state.shake(outside, 256).is_some());
+		let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+		let front: Vec<_> = (0..128).map(|_| state.shake(loopback, 256).unwrap()).collect();
+		assert!(state.shake(loopback, 256).is_none(), "loopback peers took more than half");
+		assert!(state.shake(outside, 256).is_some());
+		drop(front);
 	}
 
 	#[test]

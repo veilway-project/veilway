@@ -267,8 +267,8 @@ impl Shared {
 		}
 	}
 
-	/// One decrypted packet from the device with the public key `peer`, which came in on inbound `at`, in the order the checks must happen: parse, source, destination, route.
-	pub(super) async fn ingress(self: &Arc<Self>, plan: &Arc<Plan>, at: usize, peer: [u8; 32], mut raw: Vec<u8>) {
+	/// One decrypted packet from the device with the public key `peer`, which came in on inbound `at` over a session of `session`, in the order the checks must happen: parse, source, destination, route.
+	pub(super) async fn ingress(self: &Arc<Self>, plan: &Arc<Plan>, at: usize, peer: [u8; 32], mut raw: Vec<u8>, session: Option<RuleTransport>) {
 		// What comes out of a node link this node is the entry half of answers flows it sent, or is dropped. What comes out of one it is the exit half of is held to the link's record as a device's packets are held to the device: "The exit treats the link as one peer and trusts nothing it says."
 		let linked = plan.link_of(at, &peer);
 		if let Some(link) = linked.filter(|link| plan.links[*link].entry) {return self.chain_back(plan, link, raw).await}
@@ -312,13 +312,9 @@ impl Shared {
 		let (id, decision) = if local && key.reversed().and_then(|back| self.flows.get(&back, plan.generation, None)).is_some_and(|(_, decision)| decision == Decision::Deliver) {(0, Decision::Deliver)}
 		else if let Some(known) = self.flows.sent(&key, plan.generation, heard) {known} else {
 			let names = if dns || control {Vec::new()} else {plan.users[user].state.names().of(packet.dst, Instant::now())};
-			// The transport of the device's session now, which stays with the flow: it decides the flow here and when a reload decides it again, whatever the device is on by then.
-			let transport = {
-				let peers = plan.inbounds[from.inbound].tunnel.lock();
-				peers.wg.index(&plan.devices[device].public_key).and_then(|peer| peers.over(peer)).map(Over::rule)
-			};
-			let decision = self.decide(plan, at, device, &key, &names, transport);
-			let id = match self.flows.capped(key, plan.devices[device].public_key, &plan.users[user].name, decision, names, transport, heard, plan.generation, if linked.is_some() {plan.users[user].flows} else {route::MAX_FLOWS_PER_DEVICE}, plan.users[user].flows, linked.is_some()) {
+			// `session` is the transport of the session that carried this packet, as its reader knows it. It stays with the flow: it decides the flow here and when a reload decides it again, whatever the device is on by then.
+			let decision = self.decide(plan, at, device, &key, &names, session);
+			let id = match self.flows.capped(key, plan.devices[device].public_key, &plan.users[user].name, decision, names, session, heard, plan.generation, if linked.is_some() {plan.users[user].flows} else {route::MAX_FLOWS_PER_DEVICE}, plan.users[user].flows, linked.is_some()) {
 				Ok(id) => id,
 				// "When the exit's cap for the link is reached, the exit refuses the flow with an ICMP error or a reset", within the link's share of them.
 				Err(Reason::FlowTableFull) if linked.is_some() => return self.refuse(plan, from, &raw, &packet, Reason::FlowTableFull, true).await,
@@ -487,7 +483,7 @@ pub fn read(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, socket: Arc<UdpSocket>, o
 			let Some(peer) = peer else {continue};
 			let plan = shared.plan();
 			let Some(at) = plan.inbound_of(&tunnel) else {continue};
-			for packet in ip_out.drain(..) {shared.ingress(&plan, at, peer, packet).await}
+			for packet in ip_out.drain(..) {shared.ingress(&plan, at, peer, packet, Some(over.rule())).await}
 		}
 	}).abort_handle()
 }

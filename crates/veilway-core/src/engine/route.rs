@@ -437,6 +437,9 @@ impl Flows {
 	pub fn of_device(&self, device: &[u8; 32]) -> usize {self.lock().per_device.get(device).map_or(0, HashSet::len)}
 
 	/// The carried flows of one device under the plan of `generation`: the key and entry id of each, its decision and the names it began with. At most `MAX_FLOWS_PER_DEVICE`, and no other device's flow is looked at.
+	/// The transport the flow with this key and id started on, which the rules held it to. None for a flow that has none, and for one that is not in the table.
+	pub fn transport(&self, key: &Key, id: u64) -> Option<RuleTransport> {self.lock().flows.get(key).filter(|entry| entry.id == id).and_then(|entry| entry.transport)}
+
 	pub fn of(&self, device: &[u8; 32], generation: u64) -> Vec<(Key, u64, Decision, Vec<Arc<str>>, Option<RuleTransport>)> {
 		let table = self.lock();
 		if table.generation != generation {return Vec::new()}
@@ -459,7 +462,7 @@ impl Flows {
 	pub fn is_empty(&self) -> bool {self.len() == 0}
 }
 
-/// The action of the first enabled rule that matches a flow from `user` on `inbound` to `dst`, or `user` when none does. `transport` is the kind of session the flow started on, None for a flow that has none (the Xray hop's and the resolver's): a rule with a `transport` condition never matches it.
+/// The action of the first enabled rule that matches a flow from `user` on `inbound` to `dst`, or `user` when none does. `transport` is the kind of session the flow started on, None for a flow that has none (the Xray hop's): a rule with a `transport` condition never matches it.
 /// `named` answers a `domain` condition: whether the flow goes to a name one of the patterns matches. It is asked last, and only by a rule that matched in everything else.
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate<'a>(plan: &'a Plan, inbound: usize, user: usize, dst: IpAddr, protocol: u8, dport: u16, icmp: Option<(u8, u8)>, transport: Option<RuleTransport>, named: &dyn Fn(&[Pattern]) -> bool) -> &'a Action {

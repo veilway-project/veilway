@@ -1366,6 +1366,33 @@ async fn tunnel_dns_is_routed_like_a_flow_to_the_resolver(){
 	assert!(seen_first.lock().unwrap().is_empty(), "a query left through the default exit");
 }
 
+/// A DNS query of the tunnel is routed with the transport of the session it came in over, as every other flow is.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn tunnel_dns_follows_a_rule_by_transport(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (first, seen_first)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let (second, seen_second)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup(first);
+	setup.doc["dns"]["hijack"]=json!(true);
+	add_exit(&mut setup.doc, "second", second);
+	add_rule(&mut setup.doc, json!({"tag":"ws-dns-second", "transport":["ws"], "ip":["1.1.1.1/32"], "protocol":["udp"], "port":[53], "action":{"exit":"second"}}));
+	let relay=listen();
+	setup.doc["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":setup.listen.to_string()}, {"type":"ws", "listen":relay.to_string(), "path":"/wg"}]);
+	let node=launch(setup).await;
+	let mut by_udp=Client::connect(node.keys[0], node.public, node.addr).await;
+	by_udp.send_ip(&ip_udp(PEER_A, [9, 9, 9, 9], 41150, 53, &dns_query(0x1234, "example.com", 1))).await;
+	assert!(by_udp.recv_ip(Duration::from_secs(5)).await.is_some(), "no dns reply over udp");
+	assert_eq!((seen_first.lock().unwrap().len(), seen_second.lock().unwrap().len()), (1, 0), "a query over udp did not leave by the default exit");
+	let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let bridge=socket.local_addr().unwrap();
+	tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), false));
+	let mut by_ws=Client::connect(node.keys[1], node.public, bridge).await;
+	by_ws.send_ip(&ip_udp(PEER_B, [9, 9, 9, 9], 41151, 53, &dns_query(0x1235, "example.com", 1))).await;
+	assert!(by_ws.recv_ip(Duration::from_secs(5)).await.is_some(), "no dns reply over ws");
+	assert_eq!((seen_first.lock().unwrap().len(), seen_second.lock().unwrap().len()), (1, 1), "a query over ws did not leave by the exit the rule named");
+}
+
 /// Ping to a destination behind a netstack exit is answered by the node itself, and never reaches the proxy.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn ping_is_answered_by_the_node(){

@@ -564,6 +564,11 @@ impl Config {
 					}
 				}
 			}
+			// A proxy inbound that admits the user is a home they leave from, which a rule scoped by inbound can name.
+			for (k, proxy) in self.proxies.iter().enumerate().take(MAX_INBOUNDS) {
+				let admits = proxy.users.is_empty() && proxy.groups.is_empty() || proxy.users.contains(&user.name) || user.groups.iter().any(|group| proxy.groups.contains(group));
+				if small && user.proxy_password.is_some() && admits && self.inbounds.len() + k < 256 {homes.set(self.inbounds.len() + k)}
+			}
 			sets.push([entitled, member, homes]);
 		}
 		// Node links page. On the node it connects to, a link is "a peer on a `veilway` inbound: a WireGuard public key, a transport secret, and one tunnel address per family from that inbound's pool". On the node that dials, it is a client of that inbound's transports.
@@ -1097,6 +1102,13 @@ impl Config {
 				(false, false, true) => r.warning(format!("{at}.listen"), "the traffic and the password cross the network unencrypted here, so anyone on the path can read them, and the listener is easy to find and block. Listen on loopback or a private address and reach it through a tunnel or a TLS front instead"),
 			}
 			if proxy.kind == ProxyType::Http && proxy.udp.is_some() {r.error(format!("{at}.udp"), "expected no udp: an http inbound has no UDP ASSOCIATE")}
+			if proxy.kind == ProxyType::Http && proxy.udp_any_port.is_some() {r.error(format!("{at}.udp_any_port"), "expected no udp_any_port: an http inbound has no UDP ASSOCIATE")}
+			match (proxy.udp(), proxy.loopback(), proxy.udp_any_port == Some(true)) {
+				(true, false, false) => r.warning(format!("{at}.udp"), "a client behind a NAT gets no UDP here: it can only say the port it sends from on its own host, the NAT rewrites it, and every datagram is dropped. Turn udp_any_port on to let such clients have an association, with the risk that warning names"),
+				(true, false, true) => r.warning(format!("{at}.udp_any_port"), "a sender that shares the client's address (neighbours behind the same carrier NAT, say) can take the association before the client's first datagram, and then reaches the destinations of the user's flows through it. Leave it off unless the clients are behind a NAT"),
+				(_, _, true) if proxy.loopback() || !proxy.udp() => r.warning(format!("{at}.udp_any_port"), "never used: a loopback inbound ties datagrams to the user that owns the connection, and an inbound with udp off has no association"),
+				_ => {}
+			}
 			if let Some(limits) = &proxy.limits {
 				for (key, value) in [("connections", limits.connections), ("per_source", limits.per_source), ("handshakes", limits.handshakes)] {
 					if value.is_some_and(|n| !(1..=MAX_PROXY_INBOUND_CONNECTIONS).contains(&n)) {r.error(format!("{at}.limits.{key}"), format!("expected an integer from 1 to {MAX_PROXY_INBOUND_CONNECTIONS}"))}

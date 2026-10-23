@@ -5,7 +5,7 @@ use super::flows::{self, Stop};
 use super::inbound::{Tunnel, Via};
 use super::plan::{self, Dialled, Plan, Upstream};
 use super::{Shared, Traffic};
-use crate::config::random;
+use crate::config::{random, RuleTransport};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -275,7 +275,16 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 				}
 				let plan = shared.plan();
 				let Some(at) = plan.inbound_of(tunnel) else {continue};
-				for packet in carried.drain(..) {shared.ingress(&plan, at, key, packet).await}
+				for packet in carried.drain(..) {shared.ingress(&plan, at, key, packet, Some(match &dialled.transports[transport] {
+					Transport::Udp(_) => RuleTransport::Udp,
+					Transport::UdpObfs(_) => RuleTransport::UdpObfs,
+					Transport::Tls(_) => RuleTransport::Tls,
+					Transport::Ws(_) => RuleTransport::Ws,
+					Transport::Fronted(_) => RuleTransport::Fronted,
+					Transport::FrontedShaped(..) => RuleTransport::FrontedShaped,
+					Transport::FakeTls {..} => RuleTransport::Faketls,
+					Transport::WsPlain {..} => RuleTransport::WsPlain,
+				})).await}
 			}
 			Some(datagram) = queue.recv() => {
 				// A handshake initiation of a tunnel that has had no handshake for as long as a link may be quiet is one WireGuard's timer made "because the node stopped answering": on `udp-obfs` it opens a new session, and on a stream it wants an answer or the session is lost.

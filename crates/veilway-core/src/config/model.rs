@@ -1466,7 +1466,7 @@ pub struct Rule {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_LINKS), inner(pattern(TAG_PATTERN)))]
 	pub link: Option<Vec<String>>,
-	/// The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on, and a DNS query of the node's resolver, match no transport.
+	/// The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on matches no transport, and a DNS query of the node's resolver goes by the transport of the flow it came in on.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_RULE_ENTRIES))]
 	pub transport: Option<Vec<RuleTransport>>,
@@ -1933,6 +1933,9 @@ pub struct ProxyInbound {
 	/// Whether UDP ASSOCIATE is answered. Defaults to true. Only `socks5` and `mixed` have it.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub udp: Option<bool>,
+	/// Whether a client behind a NAT, which cannot say the port it sends UDP from, may have an association on an inbound that is not on loopback. The association then binds to the first datagram from the client's address, and a sender that shares that address can take it before the client's first datagram. Defaults to false. Only `socks5` and `mixed` have it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub udp_any_port: Option<bool>,
 	/// Says the operator knows that traffic and passwords cross the network in the clear on a public address. Defaults to false.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub public: Option<bool>,
@@ -1962,5 +1965,5 @@ impl ProxyInbound {
 	}
 
 	/// The inbound with its defaults written out, so that two spellings of one inbound are equal.
-	pub fn effective(&self) -> ProxyInbound {ProxyInbound {udp: Some(self.udp()), public: Some(self.public == Some(true)), limits: Some(ProxyLimits {connections: Some(self.connections() as u32), per_source: Some(self.per_source() as u32), handshakes: Some(self.handshakes() as u32)}), ..self.clone()}}
+	pub fn effective(&self) -> ProxyInbound {ProxyInbound {udp: Some(self.udp()), udp_any_port: Some(self.udp_any_port == Some(true)), public: Some(self.public == Some(true)), limits: Some(ProxyLimits {connections: Some(self.connections() as u32), per_source: Some(self.per_source() as u32), handshakes: Some(self.handshakes() as u32)}), ..self.clone()}}
 }

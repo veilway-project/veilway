@@ -767,6 +767,11 @@ export interface components {
             refused_source: number;
             /**
              * Format: uint64
+             * @description UDP datagrams dropped because they did not come from the address and port the client named for its association, which is what a client behind a NAT that rewrites ports is refused for.
+             */
+            refused_udp_source: number;
+            /**
+             * Format: uint64
              * @description Bytes the clients sent to their destinations and got back.
              */
             up_bytes: number;
