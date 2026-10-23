@@ -3604,7 +3604,8 @@ async fn an_inbound_that_is_not_enabled_refuses_its_devices_and_ends_their_flows
 	assert_eq!(node.engine.flows(), 1, "the flow through the inbound that was switched off lives on");
 	assert!(!answers(key_c, office_public, office_listen).await, "an inbound that was switched off answered a device");
 	assert_eq!(ours.say(&mut a, b"still here").await, Answer::Accepted, "switching an inbound off disturbed another inbound");
-	assert_eq!(theirs.say(&mut c, b"anyone").await, Answer::Silence);
+	// Linux stays silent once the port is closed; macOS answers with port unreachable, which the client sees as a reset. Either way nothing gets through.
+	assert!(matches!(theirs.say(&mut c, b"anyone").await, Answer::Silence | Answer::Reset), "a device of an inbound that was switched off still got through");
 	doc["inbounds"][1].as_object_mut().unwrap().remove("enabled");
 	reload(&node, &doc).await.unwrap();
 	let mut back=Client::connect(key_c, office_public, office_listen).await;

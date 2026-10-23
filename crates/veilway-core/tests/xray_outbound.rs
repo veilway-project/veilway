@@ -1,4 +1,5 @@
 //! An `xray` outbound against a node that runs in this process, with a stand-in for the add-on's host: what the node asks of it, what the outbound reports while the add-on is missing and once it runs, and that nothing leaves around the outbound meanwhile. The real Xray is run by `an_xray_outbound_carries_tcp_and_udp_through_the_real_xray_and_a_down_hop_dials_nothing` in the crate itself, with VEILWAY_TEST_XRAY.
+#![cfg(unix)]
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
