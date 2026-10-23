@@ -116,6 +116,10 @@ async fn share_link(id: String) -> Result<Value, String> {
 #[tauri::command]
 async fn share_text(vpn: State<'_, Arc<Vpn>>, text: String) -> Result<Value, String> {plugin(&vpn, "shareText", json!({"text": text})).await}
 
+/// Whether the phone uses 24-hour clocks.
+#[tauri::command]
+async fn clock(vpn: State<'_, Arc<Vpn>>) -> Result<Value, String> {plugin(&vpn, "clock", json!({})).await}
+
 /// Seals the link under the password, then lets the user pick where the file goes (the system's save screen, from which it can be shared). Saved is false when the user backed out.
 #[tauri::command]
 async fn share_file(vpn: State<'_, Arc<Vpn>>, id: String, password: String) -> Result<bool, String> {
@@ -346,7 +350,7 @@ pub fn run() {
 		.plugin(tauri_plugin_opener::init())
 		.plugin(tauri_plugin_barcode_scanner::init())
 		.plugin(vpn_plugin())
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, clock, share_file, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {
 			let handle = app.handle().clone();
 			host::set_sink(move |out| forward(&handle, out));

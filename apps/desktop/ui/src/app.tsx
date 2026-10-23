@@ -3,7 +3,7 @@ import {useEffect, useMemo, useRef, useState} from "react";
 import {Bundle} from "./bundle.tsx";
 import {Home} from "./home.tsx";
 import {Importer} from "./importer.tsx";
-import {failureText, loadPrefs, savePrefs, useD, type Prefs} from "./kit.tsx";
+import {ANDROID, failureText, loadPrefs, savePrefs, useD, type Prefs} from "./kit.tsx";
 import {Library} from "./library.tsx";
 import {en, type DesktopKey} from "./locales/en.ts";
 import {fa} from "./locales/fa.ts";
@@ -22,10 +22,11 @@ const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill
 const MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
 export function App() {
-	const [prefs, setPrefs] = useState<Prefs>(loadPrefs), [saved, setSaved] = useState<Settings | null>(null);
+	const [prefs, setPrefs] = useState<Prefs>(loadPrefs), [saved, setSaved] = useState<Settings | null>(null), [h24, setH24] = useState<boolean>();
 	useEffect(() => { call("get_settings").then(setSaved, () => setSaved(FALLBACK)); }, []);
+	useEffect(() => { if (ANDROID) call("clock").then(found => setH24(found.h24), () => {}); }, []);
 	const locale: "en" | "fa" = saved?.locale === "fa" ? "fa" : "en";
-	const settings = useMemo(() => ({...DEFAULT_SETTINGS, locale, scheme: prefs.scheme}), [locale, prefs.scheme]);
+	const settings = useMemo(() => ({...DEFAULT_SETTINGS, locale, scheme: prefs.scheme, hour12: h24 === undefined ? undefined : !h24}), [locale, prefs.scheme, h24]);
 	const change = (next: Partial<Prefs>) => setPrefs(old => { const merged = {...old, ...next}; savePrefs(merged); return merged; });
 	return <UiProvider settings={settings} extra={PACKS}><ToastProvider>{saved && <Root prefs={prefs} onPrefs={change} settings={saved} onSettings={setSaved}/>}</ToastProvider></UiProvider>;
 }

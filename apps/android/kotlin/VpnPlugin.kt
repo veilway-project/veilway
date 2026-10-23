@@ -174,6 +174,12 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 		invoke.resolve()
 	}
 
+	/** Whether the phone shows clocks as 24 hours, so times read the way the rest of the phone does. */
+	@Command
+	fun clock(invoke: Invoke) {
+		invoke.resolve(JSObject().put("h24", android.text.format.DateFormat.is24HourFormat(activity)))
+	}
+
 	@Command
 	fun canInstall(invoke: Invoke) {
 		invoke.resolve(JSObject().put("granted", activity.packageManager.canRequestPackageInstalls()))
