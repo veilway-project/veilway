@@ -385,9 +385,11 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 
 Asked for by the owner on 2026-10-23, after v0.2.17: Xray outbounds through the add-on (VLESS, VMess, Trojan and Shadowsocks as outbound types behind a `netstack` exit, TCP and UDP only, the node writing Xray's config); a plugin system, which needs signed packages, a sandbox and its own threat model section before any code; a plugin marketplace on top of it, with review and signatures from the project; and the `dns` transport as an add-on, built on the design that v0.2.0 item 9 asked for, with its own review of what it costs third-party resolvers.
 
+Moved to v0.2.18 on 2026-10-23, before v0.3.0: Xray outbounds, the WireGuard config button below, the panel fetching a `tls` transport's certificate pin from the node, and a sliding window for new devices per subscription link.
+
 Also asked for on 2026-10-23: a WireGuard config button in the panel for a device whose keys the panel made, showing a `.conf` file and a QR code that the official WireGuard app can import for a plain `wireguard` inbound with a `udp` transport. The private key is shown only after re-authentication, like the panel's other secrets, and the page says that plain WireGuard is easy to recognize.
 
-The store builds (F-Droid first, the updater off), and bonded connections and `ws-plain` if v0.2.0 did not take them. The `dns` transport is the add-on above.
+Bonded connections and `ws-plain` if v0.2.0 did not take them. The `dns` transport is the add-on above. The store builds (F-Droid first, the updater off) are not in v0.3.0: the owner set them aside on 2026-10-23, with no release yet.
 
 The installer's `--domain` setup can route a node's `ws`, `fronted` or `fronted-shaped` path through the same web server as the panel, so the panel and the node share port 443 (Caddy and nginx both). And by domain name: nginx's `stream` module with `ssl_preread` (or HAProxy) reads the name in the TLS hello without ending TLS and passes the whole connection on, so the panel's name goes to the web server and the node's names, including a borrowed site's, go to the node's raw `tls` and borrowed-site transports byte for byte. The front passes the client's address with the PROXY protocol so the node's limits per source keep working, and the extra hop's delay is measured for borrowed-site.
 
