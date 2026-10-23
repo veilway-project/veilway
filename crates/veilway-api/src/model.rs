@@ -713,6 +713,10 @@ pub struct Exit {
 	pub latency_ms: Option<u64>,
 	/// Unix seconds when `latency_ms` was measured.
 	pub measured_at: Option<i64>,
+	/// The `load` setting of the exit in the config. Null when the exit reports no load to apps.
+	pub load: Option<veilway_core::config::Load>,
+	/// The level apps are told: "low", "medium" or "high". Null while the exit has no `load` setting and until the node has looked twice, which it does every 10 seconds.
+	pub load_level: Option<String>,
 	pub traffic: Traffic,
 }
 

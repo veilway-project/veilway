@@ -393,6 +393,8 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			link_up: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {Some(links.iter().any(|link| chain.links.contains(&link.tag) && link.status == Status::Up))} else {None},
 			latency_ms: latency.map(|(took, _)| took.as_millis() as u64),
 			measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64),
+			load: exit.load,
+			load_level: health.and_then(|health| health.load).map(str::to_string),
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
 		}
 	}).collect()})

@@ -26,7 +26,6 @@ export const en = {
 	"home.load.low": "Not busy",
 	"home.load.medium": "Busy",
 	"home.load.high": "Very busy",
-	"home.load.unknown": "Load not known",
 	"home.exitFailed": "The exit could not be changed",
 	"home.session": "This session",
 	"home.planEnds": "Plan ends {date}",

@@ -27,7 +27,6 @@ export const fa: Record<DesktopKey, string> = {
 	"home.load.low": "خلوت",
 	"home.load.medium": "شلوغ",
 	"home.load.high": "خیلی شلوغ",
-	"home.load.unknown": "میزان بار معلوم نیست",
 	"home.exitFailed": "خروجی عوض نشد",
 	"home.session": "این نشست",
 	"home.planEnds": "پایان طرح: {date}",

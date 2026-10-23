@@ -102,6 +102,8 @@ pub struct Exit {
 	pub name: String,
 	pub country: Option<[u8; 2]>,
 	pub backend: Backend,
+	/// What the exit's load level is measured by, None for an exit that reports none.
+	pub load: Option<config::Load>,
 	/// The tag of the outbound of a netstack backend. An exit that is given another outbound has changed, even when that one leads to the same place.
 	pub outbound: Option<String>,
 	pub traffic: Arc<Traffic>,
@@ -538,6 +540,7 @@ impl Plan {
 				name: exit.name.clone().unwrap_or_else(|| exit.tag.clone()),
 				country: exit.country.as_ref().and_then(|country| <[u8; 2]>::try_from(country.as_bytes()).ok()),
 				backend,
+				load: exit.load,
 				outbound: if let config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None},
 				traffic: was.map(|was| was.traffic.clone()).unwrap_or_default(),
 				state: was.map(|was| was.state.clone()).unwrap_or_default(),

@@ -78,6 +78,8 @@ pub const MAX_LINK_CANDIDATES: usize = 16;
 pub const MAX_LINK_PINS: usize = 4;
 pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_EXIT_NAME_CHARS: usize = 64;
+/// The most `load.busy` and `load.very_busy` of an exit take, in flows or in Mbit/s.
+pub const MAX_LOAD: u32 = 1_000_000;
 pub const MAX_INTERFACE_BYTES: usize = 15;
 pub const MAX_WS_PATH_BYTES: usize = 256;
 pub const MAX_DOMAIN_BYTES: usize = 253;

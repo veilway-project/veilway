@@ -443,6 +443,11 @@ impl Config {
 				r.error(format!("{at}.name"), format!("expected 1 to {MAX_EXIT_NAME_CHARS} characters with no control, bidirectional formatting, zero-width, line separator or other invisible characters"));
 			}
 			if exit.country.as_ref().is_some_and(|c| c.len() != 2 || !c.bytes().all(|b| b.is_ascii_uppercase())) {r.error(format!("{at}.country"), "expected two uppercase letters")}
+			if let Some(load) = &exit.load {
+				if !(1..=MAX_LOAD).contains(&load.busy) {r.error(format!("{at}.load.busy"), format!("expected 1 to {MAX_LOAD}"))}
+				else if !(load.busy + 1..=MAX_LOAD).contains(&load.very_busy) {r.error(format!("{at}.load.very_busy"), format!("expected more than busy ({}) and at most {MAX_LOAD}", load.busy))}
+				if matches!(exit.backend, Backend::Block {..}) {r.error(format!("{at}.load"), "a block exit carries nothing, so it has no load to report")}
+			}
 			match &exit.backend {
 				Backend::Netstack(netstack) => {
 					let outbound = outbound_tags.get(netstack.outbound.as_str()).map(|o| &self.outbounds[*o]);

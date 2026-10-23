@@ -1394,6 +1394,31 @@ pub struct Exit {
 	#[schemars(pattern("^[A-Z]{2}$"))]
 	pub country: Option<String>,
 	pub backend: Backend,
+	/// How busy apps are told this exit is. Absent means the exit reports no load.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub load: Option<Load>,
+}
+
+/// What `Load::by` measures.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBy {
+	/// Flows open on the exit, all users together.
+	Flows,
+	/// Up and down traffic of the exit added together, in megabits per second, averaged over the last 30 seconds.
+	Mbps,
+}
+
+/// Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Load {
+	pub by: LoadBy,
+	#[schemars(range(min = 1, max = 1000000))]
+	pub busy: u32,
+	/// Greater than `busy`.
+	#[schemars(range(min = 2, max = 1000000))]
+	pub very_busy: u32,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]

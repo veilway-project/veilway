@@ -387,6 +387,10 @@
           "pattern": "^[A-Z]{2}$",
           "type": "string"
         },
+        "load": {
+          "$ref": "#/$defs/Load",
+          "description": "How busy apps are told this exit is. Absent means the exit reports no load."
+        },
         "name": {
           "description": "Display name. Defaults to the tag.",
           "maxLength": 64,
@@ -968,6 +972,49 @@
         {
           "const": "fronted",
           "description": "Read so that validation can say why a link has none.",
+          "type": "string"
+        }
+      ]
+    },
+    "Load": {
+      "additionalProperties": false,
+      "description": "Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row.",
+      "properties": {
+        "busy": {
+          "format": "uint32",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "by": {
+          "$ref": "#/$defs/LoadBy"
+        },
+        "very_busy": {
+          "description": "Greater than `busy`.",
+          "format": "uint32",
+          "maximum": 1000000,
+          "minimum": 2,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "by",
+        "busy",
+        "very_busy"
+      ],
+      "type": "object"
+    },
+    "LoadBy": {
+      "description": "What `Load::by` measures.",
+      "oneOf": [
+        {
+          "const": "flows",
+          "description": "Flows open on the exit, all users together.",
+          "type": "string"
+        },
+        {
+          "const": "mbps",
+          "description": "Up and down traffic of the exit added together, in megabits per second, averaged over the last 30 seconds.",
           "type": "string"
         }
       ]

@@ -539,6 +539,8 @@ async fn every_route_answers() {
 	assert!(!String::from_utf8_lossy(&sessions.body).contains("127.0.0.1"), "a session shows where its device connects from");
 	let exits = get(&node.socket, "/v1/exits").await;
 	ask("GET", "/v1/exits");
+	// An exit with no `load` setting reports none.
+	assert_eq!((&exits.json["exits"][0]["load"], &exits.json["exits"][0]["load_level"]), (&Value::Null, &Value::Null), "{}", exits.json);
 	// A node without links lists none.
 	assert_eq!(get(&node.socket, "/v1/links").await.json, json!({"links": []}));
 	ask("GET", "/v1/links");

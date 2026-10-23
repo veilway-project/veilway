@@ -13,6 +13,7 @@ mod inbound;
 pub mod l3;
 pub mod limits;
 pub mod link;
+pub mod load;
 pub mod netstack;
 pub mod obfs;
 pub mod plan;
@@ -198,6 +199,8 @@ pub struct ExitHealth {
 	pub interface_down: Option<Option<Duration>>,
 	/// How often the interface of an l3 exit switched between up and down.
 	pub interface_flips: u64,
+	/// The load level that devices are told: "low", "medium" or "high". None when the exit has no `load` setting or has not been looked at twice yet.
+	pub load: Option<&'static str>,
 	/// For an exit through a SOCKS5 proxy: how long the proxy has not let the node in. None while it does, and for every other exit.
 	pub proxy_down: Option<Duration>,
 	/// How often such an exit switched between working and not.
@@ -222,6 +225,8 @@ pub struct Options {
 	pub replay: Option<PathBuf>,
 	/// The range, in milliseconds, the control channel draws the shortest time between two `usage` pushes of one connection from. It is `veilway_proto::control::USAGE_PUSH`, 30 to 90 s, and tests replace it so as not to wait that long.
 	pub usage_push: RangeInclusive<u32>,
+	/// How often the node looks at the load of the exits that report it, and the least time between two catalogues a device is sent for a new level. They are 10 s and 60 s, and tests replace them so as not to wait that long.
+	pub load: (Duration, Duration),
 	/// The certificates the TLS of a node link this node dials must lead to. None is the Mozilla root list, and tests give the root of the certificates they make.
 	pub roots: Option<Arc<RootCertStore>>,
 	/// The folder the Xray add-on is installed in, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
@@ -237,7 +242,7 @@ pub struct Options {
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, roots: None, addons: None, xray_socket: None, probes: Default::default(), upstreams: None, upstream: Default::default()}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, load: (load::EVERY, control::LOAD_PUSH), roots: None, addons: None, xray_socket: None, probes: Default::default(), upstreams: None, upstream: Default::default()}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -291,6 +296,8 @@ pub struct ExitState {
 	failing: Mutex<(u32, Option<Instant>)>,
 	/// Switches between working and not working, in either direction.
 	down_flips: AtomicU64,
+	/// The load level the control channel tells devices, when the exit has a `load` setting.
+	pub load: load::Meter,
 }
 
 impl ExitState {
@@ -584,7 +591,7 @@ impl Engine {
 		let plan = self.plan();
 		plan.exits.iter().enumerate().map(|(at, exit)| {
 			let health = plan.l3.as_ref().filter(|(wired, _)| *wired == at).map(|(_, port)| &port.health);
-			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed)), proxy_down: exit.state.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), proxy_flips: exit.state.down_flips.load(Ordering::Relaxed)}
+			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed)), proxy_down: exit.state.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), proxy_flips: exit.state.down_flips.load(Ordering::Relaxed), load: exit.load.and_then(|_| exit.state.load.name())}
 		}).collect()
 	}
 
@@ -784,6 +791,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let mut shared = Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots);
 	shared.previews = upstream::Previews::new(options.upstream.clone());
+	shared.control.load_push = options.load.1;
 	let shared = Arc::new(shared);
 	shared.faketls.set_patience(options.probes);
 	// A start is a reload from nothing: everything the config names is new, and a failure leaves nothing behind. A replay file that was taken before the failure is given back as a kill gives it back.
@@ -798,6 +806,24 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	};
 	host.commit(&shared, staged);
 	tokio::spawn(obfs::tables(shared.clone()));
+	tokio::spawn({
+		let shared = shared.clone();
+		async move {
+			let (started, mut tick) = (Instant::now(), tokio::time::interval(options.load.0));
+			tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+			loop {
+				tick.tick().await;
+				let plan = shared.plan();
+				// The flow table is only walked when an exit is held to its flows.
+				let flows = if plan.exits.iter().any(|exit| exit.load.is_some_and(|load| load.by == crate::config::LoadBy::Flows)) {shared.flows.per_exit(plan.exits.len(), plan.generation)} else {Vec::new()};
+				for (at, exit) in plan.exits.iter().enumerate() {
+					let (was, totals) = (exit.state.load.level(), exit.traffic.totals());
+					let now = exit.state.load.sample(exit.load.as_ref(), started.elapsed().as_secs(), flows.get(at).copied().unwrap_or(0), totals.up_bytes.saturating_add(totals.down_bytes));
+					if now != was {tracing::info!("exit {}: load is {now:?}, was {was:?}", exit.tag)}
+				}
+			}
+		}
+	});
 	let (l3, host) = (host.l3.clone(), Arc::new(tokio::sync::Mutex::new(host)));
 	tokio::spawn({
 		let (shared, host) = (shared.clone(), host.clone());
