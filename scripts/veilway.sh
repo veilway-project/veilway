@@ -63,6 +63,10 @@ STATE_DIR="/var/lib/veilway"
 MIRROR_DIR="/etc/veilway-mirror"
 ADDON_DIR="/usr/local/lib/veilway/addons"
 XRAY_RELEASE="v26.3.27"
+# Only where the package manager has no minisign. The hash was pinned after the tarball's signature was checked with the author's key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3.
+MINISIGN_VERSION="0.11"
+MINISIGN_URL="https://github.com/jedisct1/minisign/releases/download/$MINISIGN_VERSION/minisign-$MINISIGN_VERSION-linux.tar.gz"
+MINISIGN_SHA256="f0a0954413df8531befed169e447a66da6868d79052ed7e892e50a4291af7ae0"
 PANEL_DIR="/var/lib/veilway-panel"
 UPDATE_DIR="/var/lib/veilway-panel-update"
 SELF="/usr/local/sbin/veilway.sh"
@@ -195,7 +199,15 @@ ensure_tools() {
 		need_root
 		info "installing minisign, which checks every download"
 		if ! pkg_install minisign; then
-			die "minisign is not available from your package manager. Install it (https://jedisct1.github.io/minisign/) and run this again. Downloads are never installed unchecked."
+			info "minisign is not in your package manager: installing the author's release $MINISIGN_VERSION to $BIN_DIR, checked against its pinned SHA-256"
+			if [ "$DRY" = 1 ]; then dry "download $MINISIGN_URL, check SHA-256 ${MINISIGN_SHA256:0:12}..., install minisign-linux/$(uname -m)/minisign to $BIN_DIR/minisign"
+			else
+				local tmp; tmp="$(mktemp -d)"
+				curl -fsSL --proto "=https" --max-time 120 -o "$tmp/minisign.tar.gz" "$MINISIGN_URL" || { rm -rf "$tmp"; die "cannot download minisign from $MINISIGN_URL. Install it (https://jedisct1.github.io/minisign/) and run this again. Downloads are never installed unchecked."; }
+				[ "$(sha256sum "$tmp/minisign.tar.gz" | cut -d " " -f 1)" = "$MINISIGN_SHA256" ] || { rm -rf "$tmp"; die "the minisign download does not match its pinned SHA-256, so nothing was installed"; }
+				tar -xzf "$tmp/minisign.tar.gz" -C "$tmp" && install -m 755 "$tmp/minisign-linux/$(uname -m | sed "s/^arm64$/aarch64/;s/^amd64$/x86_64/")/minisign" "$BIN_DIR/minisign" || { rm -rf "$tmp"; die "cannot install minisign to $BIN_DIR"; }
+				rm -rf "$tmp"
+			fi
 		fi
 		[ "$DRY" = 1 ] || has minisign || die "minisign did not install"
 	fi
