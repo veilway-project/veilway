@@ -45,6 +45,7 @@ export type BundleReview = {fingerprint: string, created_at: number, old: boolea
 type Commands = {
 	import_open: [{source: {kind: "link", text: string} | {kind: "file", data: string} | {kind: "sealed", data: string, password: string}}, Offer | LegacyOffer],
 	import_qr: [{data: string}, Offer | LegacyOffer],
+	scan_frame: [{data: string}, Offer | LegacyOffer | null],
 	import_proceed: [{private?: string[]}, Review | PrivateAsk],
 	import_keep: [{keep: boolean}, Subscription[]],
 	import_cancel: [{}, null],

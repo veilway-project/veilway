@@ -59,6 +59,8 @@ html, body, #app { block-size: 100%; margin: 0; }
 .d-host-kind .vw-icon { flex: none; margin-block-start: 0.1em; }
 .d-share { display: grid; gap: var(--s-3); justify-items: start; }
 .d-share > .vw-field { inline-size: 100%; }
+.d-scan { inline-size: 100%; aspect-ratio: 4 / 3; border-radius: var(--r-1); background: var(--c-sunken); overflow: hidden; }
+.d-scan video { inline-size: 100%; block-size: 100%; object-fit: cover; }
 .d-qr { inline-size: 240px; block-size: 240px; border-radius: var(--r-1); background: #fff; }
 .d-legacy-note { display: grid; gap: var(--s-1); }
 .d-legacy-note p { margin: 0; }

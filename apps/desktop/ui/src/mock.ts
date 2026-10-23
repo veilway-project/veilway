@@ -94,6 +94,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	share_link: () => ({link: "veilway://sub/sub.harbor.example/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.VVVVVVVVVVVVVVVVVVVVVQ", qr: QR}),
 	share_file: () => true,
 	share_text: () => null,
+	scan_frame: () => new Promise(() => {}),
 	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, plain: false, in_file: false}),
 	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, moving: null, left_out: [], preview: subscription(languages[0] === "fa")}),
 	import_keep: args => { if (args.keep && lastLegacy) legacyHeld = true; else if (args.keep) held = 1; return list(); },

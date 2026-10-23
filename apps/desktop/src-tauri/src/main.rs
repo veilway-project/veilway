@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -34,7 +34,10 @@ use veilway_engine::import::Code;
 static HANDLE:OnceLock<AppHandle>=OnceLock::new();
 static LOGS:OnceLock<Mutex<VecDeque<String>>>=OnceLock::new();
 static LINKS:OnceLock<Mutex<HashSet<String>>>=OnceLock::new();
+static FRAME_AT:Mutex<Option<Instant>>=Mutex::new(None);
 const LOG_KEEP:usize=200;
+/// The camera preview sends a frame every 300 ms; frames closer than this are refused unread.
+const FRAME_GAP:Duration=Duration::from_millis(200);
 /// The largest bundle the window stages: the file cap of the offline bundle format.
 const BUNDLE_MAX:u64=1<<30;
 
@@ -101,6 +104,18 @@ async fn import_qr(backend:State<'_, Arc<Backend>>, data:String)->Result<Value, 
 	let bytes=base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| Code::PictureUnreadable.as_str().to_string())?;
 	let text=tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|e| e.to_string())?.map_err(|code| code.as_str().to_string())?;
 	ask(&backend, Call::ImportOpen{source:Source::Link{text}}).await
+}
+
+/// One frame of the camera preview in the scan dialog (base64 of a JPEG). None is a frame with no code in it, so the window keeps looking; a code opens the import exactly like a pasted link. Nothing of the frame is kept.
+#[tauri::command]
+async fn scan_frame(backend:State<'_, Arc<Backend>>, data:String)->Result<Option<Value>, String>{
+	{
+		let mut last=FRAME_AT.lock().unwrap();
+		if last.is_some_and(|at| at.elapsed()<FRAME_GAP){return Err("scan_busy".into())}
+		*last=Some(Instant::now());
+	}
+	let Some(text)=tokio::task::spawn_blocking(move || qr::frame(&data)).await.map_err(|e| e.to_string())?.map_err(|code| code.as_str().to_string())? else {return Ok(None)};
+	ask(&backend, Call::ImportOpen{source:Source::Link{text}}).await.map(Some)
 }
 
 /// The link of a held subscription with its code, for the share dialog. Only the link: the device's keys and secrets stay in the helper.
@@ -347,7 +362,7 @@ fn main(){
 		.plugin(tauri_plugin_dialog::init())
 		// Closing the window keeps the tunnel up and leaves the app in the tray; Quit in the tray menu is the real exit.
 		.on_window_event(|w, e| if let tauri::WindowEvent::CloseRequested{api, ..}=e{api.prevent_close(); let _=w.hide();})
-		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_file, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, library, refresh, remove, answer_hosts, set_lan, xray_state, xray_install, xray_remove, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
+		.invoke_handler(tauri::generate_handler![import_open, import_qr, scan_frame, import_proceed, import_keep, import_cancel, share_link, share_file, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, library, refresh, remove, answer_hosts, set_lan, xray_state, xray_install, xray_remove, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, get_settings, set_settings, open_link, get_autostart, set_autostart])
 		.setup(|app|{
 			let _=HANDLE.set(app.handle().clone());
 			let (handle, dir)=(app.handle().clone(), app.path().app_config_dir()?.join("helper"));

@@ -15,6 +15,9 @@ export const failureText = (text: string, t: (key: DesktopKey, params?: {minutes
 // The same window runs in the Android app (apps/android), which has no kill switch, start at login or updater of its own.
 export const ANDROID = /Android/i.test(navigator.userAgent);
 
+// Scanning with the camera: Android has its own scanner. On the desktop it needs a WebView that offers the camera, and WebKitGTK on Linux does not turn the camera on, so the option is not shown there.
+export const CAMERA = ANDROID || (!/Linux/.test(navigator.userAgent) && typeof navigator.mediaDevices?.getUserMedia === "function");
+
 // What only this window remembers. The theme, the language and the kill switch also go to the app's settings file, which is what the native title bar and the helper read.
 export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[], accepted: Record<string, string>};
 const PREFS = "veilway-desktop";

@@ -464,5 +464,14 @@ export const fa: Record<DesktopKey, string> = {
 	"settings.xrayRemoveTitle": "افزونهٔ Xray حذف شود؟",
 	"settings.xrayRemoveBody": "اتصالی که از آن استفاده می‌کند اول قطع می‌شود. پیوندهای چسبانده‌شده می‌مانند و وقتی به یکی وصل شوید افزونه دوباره پیشنهاد می‌شود.",
 	"settings.xrayRemoved": "افزونه حذف شد",
-	"settings.xrayRemoveFailed": "افزونه حذف نشد"
+	"settings.xrayRemoveFailed": "افزونه حذف نشد",
+	"import.scan": "اسکن با دوربین",
+	"scan.title": "اسکن کد QR",
+	"scan.hint": "کد QR را جلوی دوربین نگه دارید.",
+	"scan.starting": "دوربین در حال روشن شدن است",
+	"scan.privacy": "دوربین فقط تا وقتی این پنجره باز است روشن می‌ماند. چیزی ذخیره یا فرستاده نمی‌شود.",
+	"scan.privacyApp": "دوربین فقط تا وقتی اسکنر باز است روشن می‌ماند. چیزی ذخیره یا فرستاده نمی‌شود.",
+	"import.error.camera_denied": "دسترسی به دوربین بسته است. در تنظیمات سیستم اجازهٔ آن را برای Veilway باز کنید و دوباره امتحان کنید.",
+	"import.error.camera_none": "دوربینی روی این دستگاه پیدا نشد.",
+	"import.error.scan_failed": "اسکنر پیش از خواندن کد متوقف شد. دوباره امتحان کنید یا پیوند را بچسبانید."
 };
