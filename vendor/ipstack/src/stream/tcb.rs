@@ -2,8 +2,12 @@ use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
 use std::{collections::BTreeMap, time::Duration};
 
-pub(super) const MAX_UNACK: u32 = 1024 * 16; // 16KB
-pub(super) const READ_BUFFER_SIZE: usize = 1024 * 16; // 16KB
+// veilway patch: 16 KiB each upstream, which held one connection to 16 KiB a round trip (80 KiB/s at 200 ms). With the
+// window scale below a connection may have 512 KiB on the way each direction.
+pub(super) const MAX_UNACK: u32 = 1024 * 512;
+pub(super) const READ_BUFFER_SIZE: usize = 1024 * 512;
+// veilway patch: the window scale this stack announces when the peer's SYN carries one (RFC 7323 2.2), enough for READ_BUFFER_SIZE.
+pub(super) const WINDOW_SHIFT: u8 = 4;
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
@@ -49,7 +53,8 @@ pub(crate) struct Tcb {
     ack: SeqNum,
     mtu: u16,
     last_received_ack: SeqNum,
-    send_window: u16,
+    // veilway patch: in bytes, the peer's window field shifted by its scale.
+    send_window: u32,
     state: TcpState,
     inflight_packets: BTreeMap<SeqNum, InflightPacket>,
     unordered_packets: BTreeMap<SeqNum, Vec<u8>>,
@@ -63,6 +68,16 @@ pub(crate) struct Tcb {
     // veilway patch: the largest segment the peer said it takes, in the MSS option of its SYN. Upstream cuts segments to the MTU
     // of the stack alone, so a peer on a smaller link got segments it had asked not to get.
     peer_mss: u16,
+    // veilway patch: the window scales of the peer and of this stack, both 0 unless the peer's SYN asked for scaling.
+    peer_shift: u8,
+    own_shift: u8,
+    // veilway patch: congestion control (RFC 5681), which upstream has none of: it sent its whole window at once, and a
+    // queue on the way that held less dropped the rest. `recover` is the sequence number sent when the last loss was seen,
+    // so one loss episode halves the window once.
+    cwnd: u32,
+    ssthresh: u32,
+    recover: SeqNum,
+    recovering: bool,
 }
 
 impl Tcb {
@@ -84,7 +99,7 @@ impl Tcb {
             ack,
             mtu,
             last_received_ack: seq.into(),
-            send_window: u16::MAX,
+            send_window: u32::from(u16::MAX),
             state: TcpState::Listen,
             inflight_packets: BTreeMap::new(),
             unordered_packets: BTreeMap::new(),
@@ -96,6 +111,12 @@ impl Tcb {
             rto,
             max_retransmit_count,
             peer_mss: u16::MAX,
+            peer_shift: 0,
+            own_shift: 0,
+            cwnd: 10 * 1460,
+            ssthresh: u32::MAX,
+            recover: seq.into(),
+            recovering: false,
         }
     }
 
@@ -104,6 +125,49 @@ impl Tcb {
     /// ask for its data one byte a packet.
     pub(super) fn set_peer_mss(&mut self, mss: u16) {
         self.peer_mss = mss.max(88);
+    }
+
+    /// veilway patch: the peer's SYN carried a window scale, so both sides scale (RFC 7323 2.2). Above 14 counts as 14 (2.3).
+    pub(super) fn set_window_scale(&mut self, shift: u8) {
+        self.peer_shift = shift.min(14);
+        self.own_shift = WINDOW_SHIFT;
+    }
+
+    pub(super) fn get_own_shift(&self) -> u8 {
+        self.own_shift
+    }
+
+    /// veilway patch: the sender's segment size for congestion control.
+    fn smss(&self) -> u32 {
+        u32::from(self.peer_mss).min(u32::from(self.mtu).saturating_sub(40)).max(88)
+    }
+
+    /// veilway patch: new data acknowledged. Slow start grows the window by what was acknowledged, at most one segment
+    /// per ACK (RFC 5681 3.1, RFC 3465), congestion avoidance by about one segment per round trip.
+    fn on_acked(&mut self, acked: u32) {
+        let smss = self.smss();
+        self.cwnd = if self.cwnd < self.ssthresh { self.cwnd.saturating_add(acked.min(smss)) } else { self.cwnd.saturating_add((u64::from(smss) * u64::from(smss) / u64::from(self.cwnd.max(1))).max(1) as u32) }.min(self.max_unacked_bytes);
+    }
+
+    /// veilway patch: a loss, seen by duplicate ACKs or by a retransmission timeout. The window halves once per episode,
+    /// and a timeout starts again from one segment (RFC 5681 3.1, 3.2). True when the duplicate ACKs start a new episode,
+    /// the one time the missing segment is sent again for them: upstream sent it again for every duplicate ACK after the
+    /// third, hundreds of copies when a large window lost one segment.
+    pub(super) fn on_loss(&mut self, timeout: bool) -> bool {
+        if !timeout && self.recovering {
+            return false;
+        }
+        let smss = self.smss();
+        self.ssthresh = (self.seq.distance(self.last_received_ack) / 2).max(2 * smss);
+        self.cwnd = if timeout { smss } else { self.ssthresh };
+        (self.recover, self.recovering) = (self.seq, true);
+        true
+    }
+
+    /// veilway patch: NewReno (RFC 6582 3.2): during recovery an ACK that moves but stays below `recover` shows the next
+    /// hole, which is sent again at once instead of after a timeout. True when the segment at `ack` is to be sent again.
+    pub(super) fn partial_ack(&self, ack: SeqNum) -> bool {
+        self.recovering && ack > self.last_received_ack
     }
 
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
@@ -203,14 +267,18 @@ impl Tcb {
     pub(super) fn get_state(&self) -> TcpState {
         self.state
     }
-    pub(super) fn update_send_window(&mut self, window: u16) {
-        self.send_window = window;
+    // veilway patch: the window of a SYN is never scaled (RFC 7323 2.2), every other one is.
+    pub(super) fn update_send_window(&mut self, window: u16, syn: bool) {
+        self.send_window = self.scaled(window, syn);
     }
-    pub(super) fn get_send_window(&self) -> u16 {
+    fn scaled(&self, window: u16, syn: bool) -> u32 {
+        u32::from(window) << if syn { 0 } else { self.peer_shift }
+    }
+    pub(super) fn get_send_window(&self) -> u32 {
         self.send_window
     }
-    pub(super) fn get_recv_window(&self) -> u16 {
-        self.get_available_read_buffer_size().try_into().unwrap_or(u16::MAX)
+    pub(super) fn get_recv_window(&self) -> u32 {
+        self.get_available_read_buffer_size().try_into().unwrap_or(u32::MAX)
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -228,7 +296,7 @@ impl Tcb {
     pub(super) fn check_pkt_type(&self, tcp_header: &TcpHeader, payload: &[u8]) -> PacketType {
         let rcvd_ack = SeqNum(tcp_header.acknowledgment_number);
         let rcvd_seq = SeqNum(tcp_header.sequence_number);
-        let rcvd_window = tcp_header.window_size;
+        let rcvd_window = self.scaled(tcp_header.window_size, tcp_header.syn);
         let len = payload.len();
         let res = if rcvd_ack > self.seq {
             PacketType::Invalid
@@ -275,6 +343,14 @@ impl Tcb {
     }
 
     pub(crate) fn update_inflight_packet_queue(&mut self, ack: SeqNum) {
+        // veilway patch: congestion control, see `on_acked`. Recovery ends once everything sent before the loss is acknowledged,
+        // and the window does not grow during it (RFC 6582 3.2).
+        if self.recovering && ack >= self.recover {
+            self.recovering = false;
+        }
+        if !self.recovering && ack > self.last_received_ack && ack <= self.seq {
+            self.on_acked(ack.distance(self.last_received_ack));
+        }
         match self.inflight_packets.first_key_value() {
             None => return,
             Some((&seq, _)) if ack < seq => return,
@@ -333,7 +409,7 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window() as u32)
+        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window()).min(self.cwnd)
     }
 }
 
@@ -507,5 +583,56 @@ mod tests {
         let packets = tcb.collect_timed_out_inflight_packets();
         assert!(packets.is_empty());
         assert!(tcb.inflight_packets.is_empty());
+    }
+
+    // veilway patch: tests for the window scale and congestion control patches.
+    fn tcb() -> Tcb {
+        Tcb::new(SeqNum(1000), 1500, MAX_UNACK, READ_BUFFER_SIZE, MAX_COUNT_FOR_DUP_ACK, RTO, MAX_RETRANSMIT_COUNT)
+    }
+
+    /// RFC 7323 2.2: windows are scaled once the peer's SYN carried a scale, except the window of a SYN.
+    #[test]
+    fn windows_scale_only_when_the_peer_asked() {
+        let mut plain = tcb();
+        plain.update_send_window(1000, false);
+        assert_eq!(plain.get_send_window(), 1000);
+        assert_eq!(plain.get_own_shift(), 0);
+        let mut scaled = tcb();
+        scaled.set_window_scale(7);
+        scaled.update_send_window(1000, true);
+        assert_eq!(scaled.get_send_window(), 1000);
+        scaled.update_send_window(1000, false);
+        assert_eq!(scaled.get_send_window(), 128_000);
+        assert_eq!(scaled.get_own_shift(), WINDOW_SHIFT);
+        scaled.set_window_scale(30);
+        scaled.update_send_window(1, false);
+        assert_eq!(scaled.get_send_window(), 1 << 14);
+    }
+
+    /// Slow start grows by at most one segment per ACK, a loss halves the window once per episode, an ACK inside the
+    /// episode is partial, and recovery ends once everything sent before the loss is acknowledged.
+    #[test]
+    fn congestion_window_grows_and_halves_once_per_loss() {
+        let mut tcb = tcb();
+        let start = tcb.get_seq();
+        for _ in 0..20 {
+            tcb.add_inflight_packet(vec![0; 1000]).unwrap();
+        }
+        let initial = tcb.cwnd;
+        tcb.update_inflight_packet_queue(start + 3000);
+        tcb.update_last_received_ack(start + 3000);
+        assert_eq!(tcb.cwnd, initial + 1460);
+        assert!(tcb.on_loss(false));
+        assert_eq!(tcb.cwnd, 17_000 / 2);
+        assert!(!tcb.on_loss(false));
+        assert_eq!(tcb.cwnd, 17_000 / 2);
+        assert!(tcb.partial_ack(start + 5000));
+        tcb.update_inflight_packet_queue(start + 5000);
+        tcb.update_last_received_ack(start + 5000);
+        assert_eq!(tcb.cwnd, 17_000 / 2);
+        tcb.update_inflight_packet_queue(start + 20_000);
+        assert!(!tcb.partial_ack(start + 20_000));
+        assert!(tcb.on_loss(true));
+        assert_eq!(tcb.cwnd, 1460);
     }
 }

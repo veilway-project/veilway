@@ -68,7 +68,7 @@ gradle = root / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
 text = gradle.read_text()
 gradle.write_text(re.sub(r"(compileSdk|targetSdk) = \d+", r"\1 = 36", text))
 # Rust looks these up by name through JNI, and R8 renames members that only Kotlin code seems to use.
-(root / "src-tauri" / "gen" / "android" / "app" / "proguard-veilway.pro").write_text("-keep class io.github.veilwayproject.app.Native { *; }\n-keep class io.github.veilwayproject.app.Bridge { *; }\n")
+(root / "src-tauri" / "gen" / "android" / "app" / "proguard-veilway.pro").write_text("-keep class io.github.veilwayproject.app.Native { *; }\n-keep class io.github.veilwayproject.app.Bridge { *; }\n# Tauri plugins read their arguments by reflection: a shrunk or renamed argument class arrives as null and the app crashes, as the barcode scanner did in v0.2.18.\n-keep @app.tauri.annotation.InvokeArg class * { *; }\n-keep @app.tauri.annotation.TauriPlugin class * { *; }\n-keepclassmembers class * { @app.tauri.annotation.Command <methods>; @app.tauri.annotation.PermissionCallback <methods>; @app.tauri.annotation.ActivityCallback <methods>; }\n-keep class app.tauri.barcodescanner.** { *; }\n")
 # The template runs the CLI as `node tauri ...`, which only works for a CLI installed in the project. The image has it on the PATH.
 task = next((root / "src-tauri" / "gen" / "android" / "buildSrc").rglob("BuildTask.kt"))
 text = task.read_text().replace('val executable = """node""";', 'val executable = """tauri""";').replace('listOf("tauri", "android", "android-studio-script")', 'listOf("android", "android-studio-script")')

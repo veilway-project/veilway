@@ -51,6 +51,7 @@ type Commands = {
 	import_cancel: [{}, null],
 	share_link: [{id: string}, {link: string, qr: string}],
 	share_text: [{text: string}, null],
+	clock: [{}, {h24: boolean}],
 	share_file: [{id: string, password: string}, boolean],
 	bundle_pick: [{}, BundleReview | null],
 	bundle_document: [{id: string}, Subscription[]],
