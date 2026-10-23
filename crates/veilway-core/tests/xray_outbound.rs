@@ -38,12 +38,16 @@ async fn host(path: PathBuf) -> Arc<Host> {
 				node.read_exact(&mut length).await.unwrap();
 				let mut document = vec![0u8; u32::from_be_bytes(length) as usize];
 				node.read_exact(&mut document).await.unwrap();
-				state.documents.lock().unwrap().push(serde_json::from_slice(&document).unwrap());
+				let document: Value = serde_json::from_slice(&document).unwrap();
+				state.documents.lock().unwrap().push(document.clone());
 				if state.mode.load(Ordering::SeqCst) == MISSING {return drop(node.write_all(b"error the add-on is not installed (test): run `scripts/veilway.sh addon xray install`\n").await)}
+				// What Xray does with each inbound that listens on a socket: makes it.
+				let sockets: Vec<UnixListener> = document["inbounds"].as_array().unwrap().iter().filter_map(|inbound| inbound["listen"].as_str()?.split(',').next().map(|path| UnixListener::bind(path).unwrap())).collect();
 				node.write_all(b"ok 4242\n").await.unwrap();
 				state.held.fetch_add(1, Ordering::SeqCst);
 				let mut sink = [0u8; 16];
 				while node.read(&mut sink).await.is_ok_and(|n| n > 0) {}
+				drop(sockets);
 				state.held.fetch_sub(1, Ordering::SeqCst);
 			});
 		}
@@ -67,7 +71,7 @@ fn document(dns: SocketAddr, socks: SocketAddr) -> Value {
 			{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&[0x11; 32]), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": free().to_string()}]},
 			{"tag": "s", "type": "socks5", "listen": socks.to_string()}
 		],
-		"outbounds": [{"tag": "plain", "type": "direct"}, {"tag": "up", "type": "xray", "protocol": "vless", "server": "203.0.113.9:443", "id": "3f2b8c1e-5d4a-4e7b-9a6c-1d2e3f4a5b6c", "security": {"type": "tls", "server_name": "front.example"}}],
+		"outbounds": [{"tag": "plain", "type": "direct"}, {"tag": "up", "type": "xray", "protocol": "vless", "server": "93.184.216.34:443", "id": "3f2b8c1e-5d4a-4e7b-9a6c-1d2e3f4a5b6c", "security": {"type": "tls", "server_name": "front.example"}}],
 		"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}, {"tag": "far", "backend": {"type": "netstack", "outbound": "up"}}],
 		"routing": {"default": "far", "rules": []},
 		"users": [{"name": "alice", "exits": "all", "proxy_password": ALICE, "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}]
@@ -100,12 +104,14 @@ async fn the_add_on_missing_takes_the_outbound_down_with_a_reason_and_nothing_go
 	let dir = std::env::temp_dir().join(format!("veilway-xray-out-{}", std::process::id()));
 	std::fs::create_dir_all(&dir).unwrap();
 	let (socket, socks) = (dir.join("host.sock"), free());
+	let out = dir.join("out");
+	std::fs::create_dir_all(&out).unwrap();
 	let host = host(socket.clone()).await;
 	let doc = document(SocketAddr::new(own, 53), socks);
 	let config = Config::parse(doc.to_string().as_bytes()).unwrap();
 	let report = config.validate(false);
 	assert!(report.errors.is_empty(), "{:#?}", report.errors);
-	let engine: Engine = veilway_core::start(&config, Options {is_local: |_| false, xray_socket: Some(socket), ..Options::new("")}).await.unwrap();
+	let engine: Engine = veilway_core::start(&config, Options {is_local: |_| false, xray_socket: Some(socket), xray_dir: Some(out.clone()), ..Options::new("")}).await.unwrap();
 	eventually("the outbound was not told that the add-on is missing", || engine.xray_outbound_down("up").is_some_and(|why| why.contains("not installed"))).await;
 	assert_ne!(connect(socks, target).await, 0, "a flow of an exit whose Xray outbound is down was carried");
 	tokio::time::sleep(Duration::from_millis(300)).await;
@@ -115,20 +121,21 @@ async fn the_add_on_missing_takes_the_outbound_down_with_a_reason_and_nothing_go
 	let documents = host.documents.lock().unwrap().clone();
 	let document = documents.last().unwrap();
 	for inbound in document["inbounds"].as_array().unwrap() {
-		assert_eq!(inbound["listen"], "127.0.0.1", "an Xray listener that is not on loopback");
-		assert!(inbound["port"].as_u64().unwrap() >= 1024);
+		assert!(inbound["listen"].as_str().unwrap().starts_with(out.to_str().unwrap()) && inbound["listen"].as_str().unwrap().ends_with(",0660"), "an Xray listener that is not a socket of the shared folder");
+		assert!(inbound.get("port").is_none());
 	}
 	assert_eq!(document["inbounds"].as_array().unwrap().len(), 1);
-	assert_eq!(document["inbounds"][0]["settings"]["auth"], "password");
-	assert!(document["inbounds"][0]["settings"]["accounts"][0]["pass"].as_str().unwrap().len() >= 32);
+	assert_eq!(document["inbounds"][0]["protocol"], "trojan");
+	assert_eq!(document["inbounds"][0]["settings"]["clients"][0]["password"].as_str().unwrap().len(), 64);
 	assert_eq!(document["routing"]["rules"][0]["inboundTag"][0], "out-up");
-	assert_eq!(document["outbounds"][1]["settings"]["vnext"][0]["address"], "203.0.113.9");
+	assert_eq!(document["outbounds"][1]["settings"]["vnext"][0]["address"], "93.184.216.34");
 	assert!(document["log"]["maskAddress"] == "full" && document["log"]["access"] == "none");
 	let mut without = doc.clone();
 	without["outbounds"] = json!([{"tag": "plain", "type": "direct"}]);
 	without["exits"] = json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}]);
 	without["routing"]["default"] = json!("main");
 	engine.reload(without.to_string().into_bytes(), None).await.unwrap();
+	eventually("a removed outbound was still told to carry", || engine.xray_outbound_down("up").is_some()).await;
 	eventually("Xray was not stopped once the config had no outbound of it", || host.held.load(Ordering::SeqCst) == 0).await;
 	let _ = std::fs::remove_dir_all(dir);
 }

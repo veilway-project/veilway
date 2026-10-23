@@ -12,7 +12,7 @@ fn node(outbound: Value) -> Value {
 		"version": 1,
 		"dns": {"servers": ["1.1.1.1:53"]},
 		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": key(0x11), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
-		"outbounds": [{"tag": "plain", "type": "direct"}, {"tag": "chain", "type": "socks5", "server": "192.0.2.50:1080", "via": "up"}, outbound],
+		"outbounds": [{"tag": "plain", "type": "direct"}, {"tag": "chain", "type": "socks5", "server": "192.0.2.50:1080"}, outbound],
 		"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}, {"tag": "far", "backend": {"type": "netstack", "outbound": "up"}}],
 		"routing": {"default": "main", "rules": []},
 		"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": key(0x21), "addresses": ["10.7.0.2"]}]}]
@@ -40,11 +40,11 @@ fn clean(outbound: Value) {
 #[test]
 fn every_protocol_with_its_streams_is_valid() {
 	clean(vless());
-	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "203.0.113.9:443", "id": ID, "flow": "xtls-rprx-vision", "security": {"type": "reality", "server_name": "site.example", "public_key": PUBLIC, "short_id": "ab12", "fingerprint": "firefox"}}));
+	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "93.184.216.34:443", "id": ID, "flow": "xtls-rprx-vision", "security": {"type": "reality", "server_name": "site.example", "public_key": PUBLIC, "short_id": "ab12", "fingerprint": "firefox"}}));
 	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "provider.example:443", "id": ID, "transport": {"type": "xhttp", "path": "/x", "mode": "stream-up"}, "security": {"type": "tls", "alpn": ["h2", "http/1.1"]}}));
 	clean(json!({"type": "xray", "tag": "up", "protocol": "vmess", "server": "provider.example:80", "id": ID, "cipher": "chacha20-poly1305", "transport": {"type": "ws", "path": "/ws", "host": "front.example"}}));
 	clean(json!({"type": "xray", "tag": "up", "protocol": "trojan", "server": "provider.example:443", "password": "a-long-password", "transport": {"type": "grpc", "service": "svc"}, "security": {"type": "tls"}}));
-	clean(json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "203.0.113.9:8388", "password": key(0x41), "cipher": "2022-blake3-aes-256-gcm"}));
+	clean(json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "93.184.216.34:8388", "password": key(0x41), "cipher": "2022-blake3-aes-256-gcm"}));
 	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "provider.example:443", "id": ID, "transport": {"type": "httpupgrade"}, "security": {"type": "tls"}}));
 }
 
@@ -54,7 +54,7 @@ fn what_xray_cannot_do_or_the_node_may_not_dial_is_refused() {
 	refused("outbounds[2].server", |o| o["server"] = json!("169.254.169.254:443"));
 	refused("outbounds[2].server", |o| o["server"] = json!("10.7.0.9:443"));
 	refused("outbounds[2].server", |o| o["server"] = json!("[::1]:443"));
-	refused("outbounds[2].security.server_name", |o| o["server"] = json!("203.0.113.9:443"));
+	refused("outbounds[2].security.server_name", |o| o["server"] = json!("93.184.216.34:443"));
 	refused("outbounds[2].security", |o| o.as_object_mut().unwrap().remove("security").map(drop).unwrap());
 	refused("outbounds[2].security", |o| o["security"] = json!({"type": "none"}));
 	refused("outbounds[2].id", |o| o.as_object_mut().unwrap().remove("id").map(drop).unwrap());
@@ -73,8 +73,8 @@ fn what_xray_cannot_do_or_the_node_may_not_dial_is_refused() {
 	refused("outbounds[2].security.short_id", |o| o["security"] = json!({"type": "reality", "server_name": "site.example", "public_key": PUBLIC, "short_id": "abc"}));
 	refused("outbounds[2].security.fingerprint", |o| o["security"] = json!({"type": "tls", "fingerprint": "curl"}));
 	refused("outbounds[2].security.alpn", |o| o["security"] = json!({"type": "tls", "alpn": ["h3"]}));
-	refused("outbounds[2].cipher", |o| {*o = json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "203.0.113.9:8388", "password": "pw"})});
-	refused("outbounds[2].password", |o| *o = json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "203.0.113.9:8388", "password": "not-a-key", "cipher": "2022-blake3-aes-256-gcm"}));
+	refused("outbounds[2].cipher", |o| {*o = json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "93.184.216.34:8388", "password": "pw"})});
+	refused("outbounds[2].password", |o| *o = json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "93.184.216.34:8388", "password": "not-a-key", "cipher": "2022-blake3-aes-256-gcm"}));
 	let mut many = node(vless());
 	for i in 0..16 {many["outbounds"].as_array_mut().unwrap().push(json!({"type": "xray", "tag": format!("extra{i}"), "protocol": "trojan", "server": "provider.example:443", "password": "a-long-password", "security": {"type": "tls"}}))}
 	assert!(check(&many).errors.iter().any(|error| error.path == "outbounds"));
@@ -94,13 +94,37 @@ fn keys_that_belong_to_other_types_and_the_certificate_switch_do_not_parse() {
 }
 
 #[test]
-fn a_chain_may_end_at_an_xray_outbound_and_an_xray_outbound_starts_no_chain() {
+fn an_xray_outbound_is_no_link_in_a_chain_and_starts_none() {
 	let report = check(&node(vless()));
 	assert!(report.errors.is_empty(), "{:#?}", report.errors);
 	let mut doc = node(vless());
-	doc["outbounds"][1]["via"] = json!("plain");
-	assert!(check(&doc).errors.iter().any(|error| error.path == "outbounds[1].via"));
+	doc["outbounds"][1]["via"] = json!("up");
+	assert!(check(&doc).errors.iter().any(|error| error.path == "outbounds[1].via"), "a chain through an Xray outbound");
 	assert!(report.warnings.iter().any(|warning| warning.path == "outbounds[2].server"), "a name that is looked up says so");
+}
+
+#[test]
+fn an_exit_through_an_xray_outbound_has_no_way_around_it_and_a_fallback_is_said() {
+	for policy in [json!("direct"), json!({"via": "main"})] {
+		let mut doc = node(vless());
+		doc["exits"][1]["backend"]["unsupported"] = json!({"udp": policy});
+		doc["exits"][1]["backend"]["proxy_only"] = json!(false);
+		assert!(check(&doc).errors.iter().any(|error| error.path == "exits[1].backend.unsupported.udp"));
+	}
+	let mut doc = node(vless());
+	doc["routing"]["fallback"] = json!(["main"]);
+	assert!(check(&doc).warnings.iter().any(|warning| warning.path == "exits[1]"));
+}
+
+#[test]
+fn a_private_server_needs_allow_private_and_a_query_and_a_short_password_are_refused() {
+	refused("outbounds[2].server", |o| o["server"] = json!("192.168.1.5:443"));
+	refused("outbounds[2].server", |o| o["server"] = json!("100.64.0.1:443"));
+	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "192.168.1.5:443", "allow_private": true, "id": ID, "security": {"type": "tls", "server_name": "front.example"}}));
+	refused("outbounds[2].server", |o| {o["server"] = json!("127.0.0.1:443"); o["allow_private"] = json!(true)});
+	refused("outbounds[2].transport.path", |o| o["transport"] = json!({"type": "ws", "path": "/w?ed=2048"}));
+	refused("outbounds[2].password", |o| *o = json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "93.184.216.34:8388", "password": "short", "cipher": "aes-256-gcm"}));
+	clean(json!({"type": "xray", "tag": "up", "protocol": "shadowsocks", "server": "93.184.216.34:8388", "password": "a-password-of-sixteen", "cipher": "aes-256-gcm"}));
 }
 
 #[test]
@@ -109,7 +133,7 @@ fn a_share_link_is_read_into_the_typed_outbound_and_is_not_kept() {
 		(format!("vless://{ID}@provider.example:443?type=tcp&security=reality&sni=site.example&fp=chrome&pbk={PUBLIC}&sid=ab&flow=xtls-rprx-vision#name"), "vless"),
 		(format!("vless://{ID}@provider.example:443?type=ws&security=tls&sni=provider.example&path=%2Fws&host=front.example#name"), "vless"),
 		(format!("trojan://a-long-password@provider.example:443?type=grpc&security=tls&serviceName=svc#name"), "trojan"),
-		("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@203.0.113.9:8388#name".to_string(), "shadowsocks"),
+		("ss://YWVzLTI1Ni1nY206YS1wYXNzd29yZC1vZi1zaXh0ZWVu@93.184.216.34:8388#name".to_string(), "shadowsocks"),
 	];
 	for (link, protocol) in links {
 		let doc = node(json!({"type": "xray", "tag": "up", "link": link}));
@@ -132,7 +156,7 @@ fn a_link_the_client_refuses_is_refused_with_the_clients_code_and_never_echoed()
 		(format!("vless://{ID}@provider.example:443?type=tcp&security=tls&allowInsecure=1"), "profile_refused.certificate"),
 		(format!("vless://{ID}@provider.example:443?type=tcp"), "profile_refused.security"),
 		(format!("vless://{ID}@provider.example:443?type=ws&security=tls&flow=xtls-rprx-vision"), "profile_refused.flow"),
-		("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@203.0.113.9:8388?plugin=obfs-local".to_string(), "profile_refused.plugin"),
+		("ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@93.184.216.34:8388?plugin=obfs-local".to_string(), "profile_refused.plugin"),
 	];
 	for (link, code) in cases {
 		let message = Config::parse(node(json!({"type": "xray", "tag": "up", "link": link})).to_string().as_bytes()).err().unwrap_or_else(|| panic!("{link} was accepted")).message;
@@ -158,6 +182,12 @@ fn secrets_are_shown_as_markers_and_kept_for_the_same_outbound_and_server() {
 	moved["outbounds"][2]["server"] = json!("elsewhere.example:443");
 	let report = Config::parse_keeping(moved.to_string().as_bytes(), &config).err().expect("a marker was kept for another server");
 	assert_eq!(report.errors[0].path, "outbounds[2].id");
+	for (key, value) in [("protocol", json!("vmess")), ("security", json!({"type": "reality", "server_name": "site.example", "public_key": PUBLIC}))] {
+		let mut other = shown.clone();
+		other["outbounds"][2][key] = value;
+		let report = Config::parse_keeping(other.to_string().as_bytes(), &config).err().unwrap_or_else(|| panic!("a secret was kept across a change of {key}"));
+		assert_eq!(report.errors[0].path, "outbounds[2].id");
+	}
 	let mut spelled = node(vless());
 	spelled["outbounds"][2]["id"] = json!(REDACTED);
 	assert!(!check(&spelled).errors.is_empty(), "a marker passed validation as a secret");

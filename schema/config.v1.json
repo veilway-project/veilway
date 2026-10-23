@@ -1176,7 +1176,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. A `socks5` outbound may name this one in `via`; this outbound has no `via` of its own.",
+          "description": "A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. This outbound has no `via` and is no `via` of another outbound, a link or an upstream: it is reached through a Unix socket.",
           "oneOf": [
             {
               "required": [
@@ -1191,6 +1191,10 @@
             }
           ],
           "properties": {
+            "allow_private": {
+              "description": "Whether the server may be at a private, shared (CGNAT) or unique local address. Off unless true. Loopback, link-local, the node's own addresses and its inbounds' pools are refused whatever this says.",
+              "type": "boolean"
+            },
             "cipher": {
               "description": "The cipher of `vmess` (`auto`, `aes-128-gcm` or `chacha20-poly1305`, default `auto`) and the method of `shadowsocks` (required).",
               "type": "string"
@@ -1222,7 +1226,7 @@
             },
             "server": {
               "$ref": "#/$defs/HostPort",
-              "description": "The provider's server. Xray resolves nothing: a name is looked up by the node, every address it gives must pass the dial rules, and the one used is written into the add-on's document."
+              "description": "The provider's server. Xray resolves nothing: a name is looked up by the node through `dns.servers`, every address it gives must pass the dial rules, and the one used is written into the add-on's document."
             },
             "tag": {
               "not": {

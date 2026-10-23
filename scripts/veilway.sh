@@ -515,6 +515,9 @@ RestartSec=3
 LimitNOFILE=65536
 MemoryMax=1G
 TasksMax=4096
+# The sockets of the Xray outbounds are made here, by Xray, with mode 660. The folder belongs to this user and its group, which the node's user joins (xray_node_group), and nobody else can enter it.
+RuntimeDirectory=veilway-xray-out
+RuntimeDirectoryMode=0750
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
@@ -533,6 +536,15 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 SystemCallArchitectures=native
 UMask=0077
+EOF
+}
+
+# The node is let into the group of Xray's user, and so into the folder of the Xray outbounds' sockets. A drop-in of its own unit holds it, so that upgrading the node's unit does not lose it and removing the add-on takes it away.
+xray_node_group() {
+	act mkdir -p "$UNIT_DIR/veilway.service.d"
+	write_unit "$UNIT_DIR/veilway.service.d/xray.conf" <<EOF
+[Service]
+SupplementaryGroups=veilway-xray
 EOF
 }
 
@@ -1215,7 +1227,7 @@ do_uninstall() {
 		[ -e "$UNIT_DIR/$u" ] || continue
 		svc stop "$u" || true; svc disable "$u" 2>/dev/null || true
 	done
-	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway.service.d/xray.conf" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR, $PANEL_DIR and $MIRROR_DIR? The backup above keeps a copy."; then
@@ -1300,7 +1312,7 @@ do_addon() {
 			if [ "$DRY" = 1 ]; then
 				dry "download Xray-core $XRAY_RELEASE (Xray-$arch.zip) from $RELEASE_BASE/XTLS/Xray-core"
 				dry "refuse unless its SHA-256 is $pin"
-				dry "install the executable into $ADDON_DIR/xray, owned by root, and the units that run it under the user veilway-xray"
+				dry "install the executable into $ADDON_DIR/xray, owned by root, the units that run it under the user veilway-xray, and let the user veilway into its group for the sockets of Xray outbounds"
 				return 0
 			fi
 			TMP="$(mktemp -d)"
@@ -1315,6 +1327,7 @@ do_addon() {
 			mv -f "$ADDON_DIR/xray/xray.new" "$ADDON_DIR/xray/xray"
 			step "installed Xray-core $XRAY_RELEASE in $ADDON_DIR/xray"
 			xray_units
+			xray_node_group
 			daemon_reload
 			svc enable veilway-xray.socket
 			svc restart veilway-xray.socket
@@ -1324,7 +1337,7 @@ do_addon() {
 			need_root
 			svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true
 			svc disable veilway-xray.socket || true
-			act rm -f "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service"
+			act rm -f "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway.service.d/xray.conf"
 			act rm -rf "$ADDON_DIR/xray"
 			daemon_reload
 			has_systemd && systemctl is-active --quiet veilway.service && svc restart veilway.service || true

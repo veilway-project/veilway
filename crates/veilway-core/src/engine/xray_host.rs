@@ -49,9 +49,9 @@ fn open_pinned(addons: &Path) -> anyhow::Result<File> {
 	Ok(file)
 }
 
-/// Whether the document has a listener on a port below 1024, which is the one thing Xray keeps a capability for.
+/// Whether the document has a listener on a port below 1024, which is the one thing Xray keeps a capability for. A listener on a Unix socket has no port.
 fn low_port(document: &str) -> bool {
-	serde_json::from_str::<Value>(document).ok().and_then(|document| document["inbounds"].as_array().map(|inbounds| inbounds.iter().any(|inbound| inbound["port"].as_u64().is_none_or(|port| port < 1024)))).unwrap_or(true)
+	serde_json::from_str::<Value>(document).ok().and_then(|document| document["inbounds"].as_array().map(|inbounds| inbounds.iter().any(|inbound| !inbound["listen"].as_str().is_some_and(|listen| listen.starts_with('/')) && inbound["port"].as_u64().is_none_or(|port| port < 1024)))).unwrap_or(true)
 }
 
 /// Starts Xray from the descriptor of the checked executable. Between the fork and the exec, and in the child only, it sets `no_new_privs`, asks for a kill signal when this process ends, and drops every ambient capability unless a low port needs the one to bind it, so what Xray holds is nothing (`CapEff` 0 in its `/proc/<pid>/status`).

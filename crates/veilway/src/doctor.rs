@@ -302,7 +302,7 @@ fn print(lines: &[Line], config: &str, json: bool) -> i32 {
 /// `allow_readable` is the --allow-readable-config of `veilway run`: without it a config file that group or others can read is a failure here as it is there.
 /// Returns the exit status: 0 when nothing failed, 1 when a check failed, 2 when the config file could not be read at all.
 #[cfg_attr(not(unix), allow(unused_variables))]
-pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, replay: Option<PathBuf>, addons: PathBuf, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
+pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, replay: Option<PathBuf>, addons: PathBuf, xray_dir: PathBuf, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
 	let ((loaded, report), name, dir, mut lines) = (config::load(file, true), file.display().to_string(), file.parent().unwrap_or(Path::new("")), Vec::new());
 	let at = |path: &str| if path.is_empty() {name.clone()} else {path.to_string()};
 	#[cfg(unix)]
@@ -324,11 +324,26 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	};
 	if loaded.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()) || loaded.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Xray {..})) {
 		let (shown, folder) = (addons.display().to_string(), addons.clone());
+		#[cfg(not(unix))]
+		let _ = &xray_dir;
 		lines.push(match tokio::task::spawn_blocking(move || veilway_core::engine::xray::verify(&folder)).await {
 			Ok(Ok(())) => line(Status::Ok, "xray", shown, format!("the add-on is installed, is the pinned release {} and belongs to root", veilway_core::engine::xray::RELEASE)),
 			Ok(Err(why)) => line(Status::Fail, "xray", shown, format!("{why}: the Xray inbounds and outbounds of this config cannot run, and every exit through an Xray outbound is down. Install it with `scripts/veilway.sh addon xray install`")),
 			Err(_) => line(Status::Warn, "xray", shown, "the check did not finish"),
 		});
+		#[cfg(unix)]
+		{
+			if loaded.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Xray {..})) {
+				let shown = xray_dir.display().to_string();
+				lines.push(match std::fs::metadata(&xray_dir) {
+					Err(e) => line(Status::Warn, "xray", shown, format!("the folder for the sockets of Xray outbounds is not there ({}): the Xray unit makes it when it runs, and the node's user must be in the group of Xray's user to enter it. `scripts/veilway.sh addon xray install` sets both up", e.kind())),
+					Ok(meta) if !meta.is_dir() => line(Status::Fail, "xray", shown, "it is not a folder"),
+					Ok(meta) if std::os::unix::fs::MetadataExt::mode(&meta) & 0o007 != 0 => line(Status::Fail, "xray", shown, "other users can enter it: only the node's user and Xray's may, since a socket that is made there carries the provider's traffic"),
+					Ok(_) if std::fs::read_dir(&xray_dir).is_err() => line(Status::Fail, "xray", shown, "this user cannot enter it: the node's user must be in the group of Xray's user (`veilway-xray`)"),
+					Ok(_) => line(Status::Ok, "xray", shown, "the folder for the sockets of Xray outbounds is there and only its two users can enter it"),
+				});
+			}
+		}
 	}
 	// What a node that runs here already holds decides how a taken address and a taken interface name are read, so it is asked before either is looked at.
 	// Only a node that says so itself excuses anything, and only what it names: whatever else listens on the socket path is another program.

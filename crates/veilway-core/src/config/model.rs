@@ -1260,7 +1260,7 @@ pub enum Outbound {
 		#[schemars(pattern(TAG_PATTERN))]
 		via: Option<String>,
 	},
-	/// A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. A `socks5` outbound may name this one in `via`; this outbound has no `via` of its own.
+	/// A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. This outbound has no `via` and is no `via` of another outbound, a link or an upstream: it is reached through a Unix socket.
 	#[schemars(extend("required" = ["type", "tag"], "oneOf" = [{"required": ["link"]}, {"required": ["protocol", "server"]}]))]
 	Xray {
 		#[schemars(pattern(TAG_PATTERN))]
@@ -1270,8 +1270,11 @@ pub enum Outbound {
 		#[schemars(length(max = 4096), extend("writeOnly" = true))]
 		link: Option<Secret<String>>,
 		protocol: XrayOutboundProtocol,
-		/// The provider's server. Xray resolves nothing: a name is looked up by the node, every address it gives must pass the dial rules, and the one used is written into the add-on's document.
+		/// The provider's server. Xray resolves nothing: a name is looked up by the node through `dns.servers`, every address it gives must pass the dial rules, and the one used is written into the add-on's document.
 		server: HostPort,
+		/// Whether the server may be at a private, shared (CGNAT) or unique local address. Off unless true. Loopback, link-local, the node's own addresses and its inbounds' pools are refused whatever this says.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		allow_private: Option<bool>,
 		/// The user id of `vless` and `vmess`, a UUID.
 		#[serde(skip_serializing_if = "Option::is_none")]
 		id: Option<Secret<String>>,
@@ -1332,12 +1335,12 @@ enum OutboundType {Direct, Socks5, Xray}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, allow_private: Option<bool>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
-		let xray = [("link", keys.link.is_some()), ("protocol", keys.protocol.is_some()), ("id", keys.id.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())];
+		let xray = [("allow_private", keys.allow_private.is_some()), ("link", keys.link.is_some()), ("protocol", keys.protocol.is_some()), ("id", keys.id.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())];
 		match keys.kind {
 			OutboundType::Direct => only("direct", &[&[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray].concat()).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
 			OutboundType::Socks5 => {
@@ -1347,7 +1350,7 @@ impl<'de> Deserialize<'de> for Outbound {
 			OutboundType::Xray => {
 				only("xray", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some()), ("username", keys.username.is_some()), ("via", keys.via.is_some())])?;
 				let Some(link) = keys.link else {
-					return Ok(Outbound::Xray {tag: keys.tag, link: None, protocol: keys.protocol.ok_or_else(|| de::Error::missing_field("protocol"))?, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, id: keys.id, password: keys.password, flow: keys.flow, cipher: keys.cipher, transport: keys.transport, security: keys.security})
+					return Ok(Outbound::Xray {tag: keys.tag, link: None, protocol: keys.protocol.ok_or_else(|| de::Error::missing_field("protocol"))?, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, allow_private: keys.allow_private, id: keys.id, password: keys.password, flow: keys.flow, cipher: keys.cipher, transport: keys.transport, security: keys.security})
 				};
 				only("xray` with a `link", &[("protocol", keys.protocol.is_some()), ("server", keys.server.is_some()), ("id", keys.id.is_some()), ("password", keys.password.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())])?;
 				// One link, as a client's `Entry` and then its table, so a node accepts what the desktop accepts and refuses with the same codes. The text of the link is never in the error.
@@ -1361,6 +1364,7 @@ impl<'de> Deserialize<'de> for Outbound {
 					link: None,
 					protocol: match profile.scheme {legacy::Scheme::Vless => XrayOutboundProtocol::Vless, legacy::Scheme::Vmess => XrayOutboundProtocol::Vmess, legacy::Scheme::Trojan => XrayOutboundProtocol::Trojan, legacy::Scheme::Shadowsocks => XrayOutboundProtocol::Shadowsocks},
 					server,
+					allow_private: keys.allow_private,
 					id,
 					password,
 					flow: profile.flow.then_some(XrayFlow::Vision),

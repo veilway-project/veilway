@@ -25,7 +25,7 @@ use veilway_proto::subscription::Secret;
 use veilway_proto::{faketls, proof, udp_obfs, NoRandom};
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`. `via` is the proxy the connection to this one goes through, which may have one of its own.
-/// `hop` is set for an Xray outbound, which is dialed at a loopback inbound of the add-on that has a new port and login each run: `host`, `port` and `auth` are then empty and `endpoint` is what to dial.
+/// `hop` is set for an Xray outbound, which is dialed as Trojan over a Unix socket of the add-on that has a new path and password each run (`flows::dial_conn`): `host`, `port` and `auth` are then empty and the hop says where to go, or why it cannot.
 pub struct Upstream {pub tag: String, pub host: String, pub port: u16, pub auth: Option<(String, String)>, pub latency: Arc<Latency>, pub via: Option<Arc<Upstream>>, pub hop: Option<Arc<Hop>>}
 
 /// Equal when they name the same proxy with the same credentials and chain: what was measured of it does not count.
@@ -61,14 +61,6 @@ impl Upstream {
 				hop: None,
 			}),
 			config::Outbound::Direct {..} => None,
-		}
-	}
-
-	/// What to dial and log in with. For an Xray outbound it is the add-on's inbound of this run, and the reason there is none while Xray is not up.
-	pub fn endpoint(&self) -> anyhow::Result<(String, u16, Option<(String, String)>)> {
-		match &self.hop {
-			Some(hop) => hop.endpoint().map(|(port, user, pass)| ("127.0.0.1".to_string(), port, Some((user, pass)))).map_err(|why| anyhow!("xray outbound {} is down: {why}", self.tag)),
-			None => Ok((self.host.clone(), self.port, self.auth.clone())),
 		}
 	}
 }
@@ -779,6 +771,7 @@ impl Plan {
 	/// Whether exit `at` works as far as the node knows: a netstack exit while its proxy, when it has one, lets the node in, an l3 exit while its interface is up, a chain exit while one of its links is up, and a block exit never.
 	pub fn working(&self, at: usize) -> bool {
 		match &self.exits[at].backend {
+			Backend::Netstack {outbound: Outbound::Socks5(up), ..} => self.exits[at].state.working() && up.hop.as_ref().is_none_or(|hop| hop.reason().is_none()),
 			Backend::Netstack {..} => self.exits[at].state.working(),
 			Backend::L3 {..} => self.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
 			Backend::Chain {links} => links.iter().any(|link| self.up(*link)),
