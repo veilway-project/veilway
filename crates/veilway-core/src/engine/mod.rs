@@ -33,6 +33,8 @@ pub mod xray;
 pub mod xray_out;
 mod xray_owner;
 mod xray_udp;
+#[cfg(unix)]
+mod xray_trojan;
 #[cfg(target_os = "linux")]
 pub mod xray_host;
 
@@ -233,6 +235,10 @@ pub struct Options {
 	pub addons: Option<PathBuf>,
 	/// The unix socket of the Xray host, which starts Xray as a user of its own, see `xray`. Without one a config with an `xray` section keeps the node running and Xray not started.
 	pub xray_socket: Option<PathBuf>,
+	/// The folder the node and Xray share the sockets of the Xray outbounds in, which a group of Xray's user lets the node enter. Defaults to `/run/veilway-xray-out`.
+	pub xray_dir: Option<PathBuf>,
+	/// Lets the Xray host run as the node's own user, which no node should: for tests, whose stand-in for the host is the test itself.
+	pub xray_same_user: bool,
 	/// How long the probes of the site of a `faketls` transport wait at each step. Tests replace it so as not to wait that long.
 	pub probes: veilway_transport::probe::Patience,
 	/// The state file of the upstreams, which keeps the signed document of each with its keys, see `upstream_state`. It is not relative to `dir`. A config with an enabled upstream is not started, and not reloaded into, without one that the node can write.
@@ -242,7 +248,7 @@ pub struct Options {
 }
 
 impl Options {
-	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, load: (load::EVERY, control::LOAD_PUSH), roots: None, addons: None, xray_socket: None, probes: Default::default(), upstreams: None, upstream: Default::default()}}
+	pub fn new(dir: impl Into<PathBuf>) -> Options {Options {dir: dir.into(), is_local: gate::is_local, now: OffsetDateTime::now_utc, revision: None, allow_readable: false, state: None, replay: None, usage_push: veilway_proto::control::USAGE_PUSH, load: (load::EVERY, control::LOAD_PUSH), roots: None, addons: None, xray_socket: None, xray_dir: None, xray_same_user: false, probes: Default::default(), upstreams: None, upstream: Default::default()}}
 }
 
 /// Inner IP packets and their bytes. Up is from the user's device into the node, down is towards it.
@@ -879,6 +885,6 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		});
 	}
 	let stopped = Arc::new(tokio::sync::Notify::new());
-	let xray = (stopped.clone(), tokio::spawn(xray::run(shared.clone(), store.clone(), dir, options.xray_socket, stopped)));
+	let xray = (stopped.clone(), tokio::spawn(xray::run(shared.clone(), store.clone(), dir, options.xray_socket, options.xray_dir.unwrap_or_else(|| PathBuf::from("/run/veilway-xray-out")), options.xray_same_user, stopped)));
 	Ok(Engine {shared, store, host, l3, started: Instant::now(), written: Arc::default(), addons: options.addons, xray})
 }

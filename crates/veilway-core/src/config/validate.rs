@@ -10,7 +10,7 @@ use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use veilway_proto::subscription::is_host;
 use veilway_proto::subscription::link::Link as SubscriptionLink;
-use veilway_proto::subscription::payload::dialable;
+use veilway_proto::subscription::payload::{self, dialable};
 use veilway_proto::xray::profile as xray_profile;
 use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
 
@@ -336,7 +336,7 @@ impl Config {
 						if secret.as_ref().is_some_and(|s| s.expose() == REDACTED) {r.error(format!("outbounds[{i}].{key}"), format!("expected a {key}, found the marker the control API shows in the place of one: write the {key} itself"))}
 					}
 				}
-				Outbound::Xray {link, protocol, server, id, password, flow, cipher, transport, security, ..} => {
+				Outbound::Xray {link, protocol, server, id, password, flow, cipher, transport, security, allow_private, ..} => {
 					let at = format!("outbounds[{i}]");
 					let secret = |text: &str| (1..=MAX_CREDENTIAL_BYTES).contains(&text.len()) && !text.chars().any(char::is_control);
 					let named = |text: &str| domain(text, false) || text.parse::<IpAddr>().is_ok();
@@ -346,6 +346,7 @@ impl Config {
 					if link.is_some() {r.error(format!("{at}.link"), "expected no link: it is read when the document is read, and the outbound is kept as the fields it gave")}
 					if let Host::Ip(ip) = &server.host {
 						if gate::refused(*ip, &pools) {r.error(format!("{at}.server"), "expected an address the node may dial: not loopback, link-local, unspecified, multicast, a cloud metadata address or an address of an inbound's pool")}
+						else if *allow_private != Some(true) && (payload::private(*ip) || matches!(ip, IpAddr::V6(v6) if gate::embedded(*v6).into_iter().flatten().any(|v4| payload::private(IpAddr::V4(v4))))) {r.error(format!("{at}.server"), "expected a public address: this one is private, shared (CGNAT) or unique local, and `allow_private` is off")}
 					}
 					let (uses_id, keyed) = (matches!(protocol, XrayOutboundProtocol::Vless | XrayOutboundProtocol::Vmess), [("id", id), ("password", password)]);
 					for (key, value) in keyed {
@@ -366,6 +367,7 @@ impl Config {
 						(XrayOutboundProtocol::Shadowsocks, None) => r.error(format!("{at}.cipher"), "expected the method of the server"),
 						(XrayOutboundProtocol::Shadowsocks, Some(cipher)) if !xray_profile::SHADOWSOCKS_CIPHERS.contains(&cipher) => r.error(format!("{at}.cipher"), format!("expected one of {}", xray_profile::SHADOWSOCKS_CIPHERS.join(", "))),
 						(XrayOutboundProtocol::Shadowsocks, Some(cipher)) if cipher.starts_with("2022-") && password.as_ref().is_some_and(|key| key.expose() != REDACTED && STANDARD.decode(key.expose()).map_or(true, |bytes| bytes.len() != if cipher.contains("aes-128") {16} else {32})) => r.error(format!("{at}.password"), format!("expected the key of {cipher}: {} bytes as standard base64", if cipher.contains("aes-128") {16} else {32})),
+						(XrayOutboundProtocol::Shadowsocks, Some(cipher)) if !cipher.starts_with("2022-") && password.as_ref().is_some_and(|key| key.expose() != REDACTED && key.expose().len() < 16) => r.error(format!("{at}.password"), format!("expected at least 16 characters: the key of {cipher} comes from the password alone, and a short one is guessed offline")),
 						(XrayOutboundProtocol::Vless | XrayOutboundProtocol::Trojan, Some(_)) => r.error(format!("{at}.cipher"), "expected no cipher: only vmess and shadowsocks have one"),
 						_ => {}
 					}
@@ -374,6 +376,7 @@ impl Config {
 					if matches!(protocol, XrayOutboundProtocol::Vless | XrayOutboundProtocol::Trojan) && !(tls || reality) {r.error(format!("{at}.security"), "expected tls or reality: vless and trojan are never spoken in the clear")}
 					match transport {
 						Some(XrayTransport::Ws {path: p, host} | XrayTransport::Httpupgrade {path: p, host} | XrayTransport::Xhttp {path: p, host, ..}) => {
+							if p.as_deref().is_some_and(|p| p.contains('?')) {r.error(format!("{at}.transport.path"), "expected no query: a query in the path can carry early data, which the node does not use")}
 							if p.as_deref().is_some_and(|p| !path(p)) {r.error(format!("{at}.transport.path"), "expected a path that starts with / of at most 256 bytes from letters, digits and -._~!$&()*+,;=:@/?%")}
 							if host.as_deref().is_some_and(|host| !named(host)) {r.error(format!("{at}.transport.host"), "expected a lowercase host name or an address")}
 							if reality && !matches!(transport, Some(XrayTransport::Xhttp {..})) {r.error(format!("{at}.transport"), "expected tcp, grpc or xhttp: reality does not run over ws or httpupgrade")}
@@ -399,19 +402,20 @@ impl Config {
 						}
 						Some(XraySecurity::Off {}) | None => {}
 					}
-					if matches!(server.host, Host::Name(_)) {r.warning(format!("{at}.server"), "a name, which the node looks up at start, at every reload and every quarter hour: every address it gives must pass the dial rules, or the outbound is down until one does")}
+					if matches!(server.host, Host::Name(_)) {r.warning(format!("{at}.server"), "a name, which the node looks up itself in clear UDP through dns.servers, at start, at every reload and every quarter hour, so whoever sees that traffic learns the provider's name: write the address when the name must stay hidden. Every address it gives must pass the dial rules, or the outbound is down until one does")}
 				}
 				_ => {}
 			}
 		}
 		// Outbound chaining, "Outbounds": the named outbound must be a socks5 one, following `via` from any outbound must not come back to it, and a chain holds at most `MAX_CHAIN` of them.
-		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..} | Outbound::Xray {..})), _ => None};
+		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..})), _ => None};
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
 			let Outbound::Socks5 {via: Some(via), ..} = outbound else {continue};
 			match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
 				None => r.error(format!("outbounds[{i}].via"), "expected the tag of an outbound, found a tag no outbound has"),
 				Some(Outbound::Direct {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
-				Some(Outbound::Socks5 {..} | Outbound::Xray {..}) => {}
+				Some(Outbound::Xray {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry a chain"),
+				Some(Outbound::Socks5 {..}) => {}
 			}
 			let (mut at, mut chain) = (i, vec![i]);
 			while let Some(to) = via_of(at) {
@@ -454,6 +458,11 @@ impl Config {
 					let direct = matches!(outbound, Some(Outbound::Direct {..}));
 					// A chain carries no UDP, and `direct` would send that UDP from this node's own address around the chain.
 					if matches!(outbound, Some(Outbound::Socks5 {via: Some(_), ..})) && netstack.unsupported.udp == Some(Policy::Direct) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject, drop or a via to another exit: this outbound is a chain of proxies, which carry no UDP, and direct would send that UDP from this node's own address, around the chain")}
+					// An Xray outbound carries UDP itself, and when it is down the flow ends: nothing may send that UDP around it.
+					if matches!(outbound, Some(Outbound::Xray {..})) {
+						if matches!(netstack.unsupported.udp, Some(Policy::Direct | Policy::Via(_))) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject or drop: an Xray outbound carries UDP itself, and while it is down the flow ends rather than leave this exit around it")}
+						if self.routing.fallback.iter().any(|tag| *tag != exit.tag) {r.warning(&at, "an Xray outbound and routing.fallback: users routed here fall back to routing.fallback while the outbound is down, and their traffic then leaves by a route this exit was meant to replace")}
+					}
 					if outbound.is_none() {r.error(format!("{at}.backend.outbound"), "expected the tag of an outbound, found a tag no outbound has")}
 					if direct && netstack.proxy_only == Some(true) {r.error(format!("{at}.backend.proxy_only"), "expected false or no key: a direct outbound has no proxy")}
 					if netstack.tcp_idle_secs.is_some_and(|secs| !(MIN_TCP_IDLE_SECS..=MAX_TCP_IDLE_SECS).contains(&secs)) {r.error(format!("{at}.backend.tcp_idle_secs"), format!("expected an integer from {MIN_TCP_IDLE_SECS} to {MAX_TCP_IDLE_SECS}"))}
@@ -664,7 +673,8 @@ impl Config {
 				match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
 					None => r.error(at("via"), "expected the tag of an outbound, found a tag no outbound has"),
 					Some(Outbound::Direct {..}) => r.error(at("via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
-					Some(Outbound::Socks5 {..} | Outbound::Xray {..}) => {}
+					Some(Outbound::Xray {..}) => r.error(at("via"), "expected a socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry a link"),
+					Some(Outbound::Socks5 {..}) => {}
 				}
 			}
 			if !link_ids.insert(link.id.0) {r.error(at("id"), "expected an id no other link has")}
@@ -822,6 +832,7 @@ impl Config {
 			if secret == REDACTED {r.error(at("device_secret"), "expected a secret, found the marker the control API shows in the place of one: write the secret itself")} else if !URL_SAFE_NO_PAD.decode(secret).is_ok_and(|bytes| bytes.len() == 16 && URL_SAFE_NO_PAD.encode(bytes) == *secret) {r.error(at("device_secret"), "expected 16 bytes as 22 characters of base64url")}
 			if let Some(via) = &upstream.via {
 				if !outbound_tags.contains_key(via.as_str()) {r.error(at("via"), "expected the tag of a direct or socks5 outbound, found a tag no outbound has")}
+				if outbound_tags.get(via.as_str()).is_some_and(|to| matches!(self.outbounds[*to], Outbound::Xray {..})) {r.error(at("via"), "expected the tag of a direct or socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry an upstream")}
 				let mut hop = outbound_tags.get(via.as_str()).copied();
 				for _ in 0..MAX_CHAIN {
 					let Some(proxy) = hop else {break};
