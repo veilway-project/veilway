@@ -1,7 +1,7 @@
 //! Strict JSON reading. serde's own error texts quote the offending value, so nothing here passes one through:
 //! the document is first read into a small tree, then deserialized by a deserializer whose error type only
 //! ever says where the problem is and what was expected.
-use super::{Config, Diagnostic, HostPort, Key, Outbound, Report, Secret, Transport, TransportSecret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
+use super::{Config, Diagnostic, HostPort, Key, Outbound, Places, Report, Secret, Transport, TransportSecret, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_KEY_SHOWN, REDACTED};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::de::{self, DeserializeSeed, Deserializer, Expected, IgnoredAny, IntoDeserializer, MapAccess, SeqAccess, Unexpected, Visitor};
@@ -272,11 +272,40 @@ fn tree(bytes: &[u8]) -> Result<Json, Diagnostic> {
 	Ok(json)
 }
 
+/// Moves the `socks5`, `http` and `mixed` entries of `inbounds` to the key `proxy_inbounds`, which a document may not spell itself, so that each list is read as its own type. Returns the place each entry of the two lists had in the document.
+fn split(root: &mut BTreeMap<String, Json>) -> Result<(Vec<usize>, Vec<usize>), Diagnostic> {
+	if root.contains_key("proxy_inbounds") {return Err(Diagnostic {path: "proxy_inbounds".to_string(), message: "unknown key \"proxy_inbounds\"; the config may be newer than this build".to_string()})}
+	let Some(Json::Arr(listed)) = root.get_mut("inbounds") else {return Ok((Vec::new(), Vec::new()))};
+	let (mut tunnels, mut proxies, mut places) = (Vec::new(), Vec::new(), (Vec::new(), Vec::new()));
+	for (i, inbound) in std::mem::take(listed).into_iter().enumerate() {
+		if matches!(&inbound, Json::Obj(entries) if matches!(entries.get("type"), Some(Json::Str(kind)) if matches!(kind.as_str(), "socks5" | "http" | "mixed"))) {
+			proxies.push(inbound);
+			places.1.push(i);
+		} else {
+			tunnels.push(inbound);
+			places.0.push(i);
+		}
+	}
+	*listed = tunnels;
+	if !proxies.is_empty() {drop(root.insert("proxy_inbounds".to_string(), Json::Arr(proxies)))}
+	Ok(places)
+}
+
+/// A path in the numbers of the split lists, told in the numbers of the document.
+fn placed(path: String, places: &(Vec<usize>, Vec<usize>)) -> String {
+	for (key, list) in [("inbounds[", &places.0), ("proxy_inbounds[", &places.1)] {
+		let Some((number, rest)) = path.strip_prefix(key).and_then(|rest| rest.split_once(']')) else {continue};
+		if let Some(at) = number.parse::<usize>().ok().and_then(|number| list.get(number)) {return format!("inbounds[{at}]{rest}")}
+	}
+	path
+}
+
 impl Config {
 	/// Reads one document under the strict JSON rules. The result is not validated yet: call `validate`.
 	pub fn parse(bytes: &[u8]) -> Result<Config, Diagnostic> {
-		let json = tree(bytes)?;
-		Config::deserialize(De {json: &json, path: &Path::Root}).map_err(|e| Diagnostic {path: e.path.unwrap_or_default(), message: e.message})
+		let mut json = tree(bytes)?;
+		let places = if let Json::Obj(root) = &mut json {split(root)?} else {Default::default()};
+		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| Config {places: Places(Some(places.clone())), ..config}).map_err(|e| Diagnostic {path: placed(e.path.unwrap_or_default(), &places), message: e.message})
 	}
 
 	/// `parse` for a document in which a secret may hold `REDACTED` in the place of its value, which is how the control API shows a config and takes it back.
@@ -295,6 +324,10 @@ impl Config {
 		// A document that is no object has no secret to keep, and `deserialize` says what is wrong with it.
 		let mut nothing = BTreeMap::new();
 		let root = if let Json::Obj(root) = &mut json {root} else {&mut nothing};
+		let places = match split(root) {
+			Ok(places) => places,
+			Err(e) => return Err(Report {errors: vec![e], ..Report::default()}),
+		};
 		if let Some(Json::Arr(inbounds)) = root.get_mut("inbounds") {
 			for (i, inbound) in inbounds.iter_mut().enumerate() {
 				let Json::Obj(inbound) = inbound else {continue};
@@ -362,6 +395,12 @@ impl Config {
 			let secrets: HashMap<[u8; 32], &Vec<TransportSecret>> = running.users.iter().flat_map(|user| &user.devices).filter_map(|device| device.transport_secrets.as_ref().map(|list| (device.public_key.0, list))).collect();
 			for (u, user) in users.iter_mut().enumerate() {
 				let Json::Obj(user) = user else {continue};
+				if marked(user, "proxy_password") {
+					match named(user, "name").and_then(|name| running.users.iter().find(|was| was.name == name)).and_then(|was| was.proxy_password.as_ref()) {
+						Some(kept) => drop(user.insert("proxy_password".to_string(), Json::Str(kept.expose().clone()))),
+						None => report.error(format!("users[{u}].proxy_password"), "expected a password: the marker stands for the proxy password of the running user with this name, and none runs with one. A password that is new has to be sent itself"),
+					}
+				}
 				let Some(Json::Arr(devices)) = user.get_mut("devices") else {continue};
 				for (d, device) in devices.iter_mut().enumerate() {
 					let Json::Obj(device) = device else {continue};
@@ -448,7 +487,8 @@ impl Config {
 				}
 			}
 		}
+		for error in &mut report.errors {error.path = placed(std::mem::take(&mut error.path), &places)}
 		if !report.errors.is_empty() {return Err(report)}
-		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| (config, spelled)).map_err(|e| Report {errors: vec![Diagnostic {path: e.path.unwrap_or_default(), message: e.message}], ..Report::default()})
+		Config::deserialize(De {json: &json, path: &Path::Root}).map(|config| (Config {places: Places(Some(places.clone())), ..config}, spelled)).map_err(|e| Report {errors: vec![Diagnostic {path: placed(e.path.unwrap_or_default(), &places), message: e.message}], ..Report::default()})
 	}
 }

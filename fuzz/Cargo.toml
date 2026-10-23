@@ -281,6 +281,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="proxy_front"
+path="fuzz_targets/proxy_front.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="xray_packets"
 path="fuzz_targets/xray_packets.rs"
 test=false

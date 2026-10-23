@@ -217,7 +217,7 @@ pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
 	#[derive(Deserialize)]
 	struct Document {version: u64, inbounds: Vec<Inbound>, exits: Vec<Exit>}
 	#[derive(Deserialize)]
-	struct Inbound {transports: Vec<Transport>}
+	struct Inbound {#[serde(default)] transports: Vec<Transport>, listen: Option<SocketAddr>}
 	#[derive(Deserialize)]
 	struct Transport {r#type: String, listen: SocketAddr}
 	#[derive(Deserialize)]
@@ -233,7 +233,7 @@ pub async fn held(path: &Path, wait: Duration) -> Option<Held> {
 	let counted = request(path, "GET", "/v1/stats", None, wait).await.ok().filter(|(status, _)| (200..300).contains(status)).and_then(|(_, body)| serde_json::from_slice::<Stats>(&body).ok());
 	Some(Held {
 		proxy: counted.map_or((0, 0, 0), |stats| (stats.stream.proxy_requests, stats.stream.proxy_unnamed, stats.stream.proxy_http10)),
-		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, matches!(transport.r#type.as_str(), "ws" | "tls" | "fronted"))).collect(),
+		listens: running.document.inbounds.iter().flat_map(|inbound| &inbound.transports).map(|transport| (transport.listen, matches!(transport.r#type.as_str(), "ws" | "tls" | "fronted"))).chain(running.document.inbounds.iter().filter_map(|inbound| inbound.listen).map(|listen| (listen, true))).collect(),
 		interfaces: running.document.exits.into_iter().filter(|exit| exit.backend.r#type == "l3").map(|exit| exit.backend.interface.unwrap_or_else(|| DEFAULT_INTERFACE.to_string())).collect(),
 	})
 }

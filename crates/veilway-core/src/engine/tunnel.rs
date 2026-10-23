@@ -92,7 +92,7 @@ impl Count {
 struct Live {sources: Option<Vec<IpNet>>, most: usize}
 
 /// "One source (an IPv4 address or an IPv6 /64, as on the transports page)."
-fn source(ip: IpAddr) -> IpAddr {
+pub(super) fn source(ip: IpAddr) -> IpAddr {
 	match ip {
 		IpAddr::V4(_) => ip,
 		IpAddr::V6(v6) => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
@@ -256,7 +256,7 @@ fn route(shared: &Shared, plan: &Plan, exit: &str, how: How) -> Option<(usize, u
 }
 
 /// Closes the client's connection with a reset, as a refusal does.
-fn reset(stream: &TcpStream) {let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));}
+pub(super) fn reset(stream: &TcpStream) {let _ = SockRef::from(stream).set_linger(Some(Duration::ZERO));}
 
 /// Starts the tunnel: it accepts on its socket until the task is aborted, and the connections it has go with it.
 pub(super) fn serve(shared: &Arc<Shared>, tunnel: config::Tunnel, bound: Bound, state: Arc<State>) -> AbortHandle {

@@ -6,7 +6,7 @@ use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
 use super::obfs::{self, Room};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
 use super::{chain, control, faketls, flows, gate, l3, link, resolver, stream, Over, Shared};
-use crate::config::Protocol;
+use crate::config::{Protocol, RuleTransport};
 use ipstack::{IpStack, IpStackStream};
 use std::io;
 use std::net::SocketAddr;
@@ -215,7 +215,7 @@ impl Shared {
 
 	/// What is to be done with a flow of `device` that came in on inbound `at`, by the gate, the rules and the exits of `plan`. `names` is what the user had resolved to the destination when the flow began.
 	/// A new flow is decided here from its first packet, and when the plan changes every live flow is decided again from its key, so the two can never disagree.
-	pub(super) fn decide(&self, plan: &Plan, at: usize, device: usize, key: &Key, names: &[Arc<str>]) -> Decision {
+	pub(super) fn decide(&self, plan: &Plan, at: usize, device: usize, key: &Key, names: &[Arc<str>], session: Option<RuleTransport>) -> Decision {
 		let (transport, gateway, user, linked) = (key.protocol == Protocol::TCP || key.protocol == Protocol::UDP, plan.is_gateway(key.dst), plan.devices[device].user, plan.devices[device].link);
 		// Before the rules and before any exit, the way gateway DNS is: no rule can block, redirect or open it, and `dns.hijack` has nothing to say about it. Only the gateway of the inbound the flow came in through answers, and only on a `veilway` inbound. A link "is never served the control channel".
 		if key.protocol == Protocol::TCP && key.dport == PORT && plan.control(at, key.dst) && linked.is_none() {return Decision::Control}
@@ -231,7 +231,7 @@ impl Shared {
 		if dns {return Decision::Dns}
 		// A flow may only leave through an exit in its user's `exits`, whatever chose it. That is final: the flow is rejected and never falls through to another rule.
 		let entitled = |exit: usize| plan.users[user].entitled.as_ref().is_none_or(|list| list.contains(&exit));
-		match self.action(plan, at, user, key, names) {
+		match self.action(plan, at, user, key, names, session) {
 			Action::Block => Decision::Refuse {reason: Reason::Rule, reset: false},
 			Action::Reject => Decision::Refuse {reason: Reason::Rule, reset: true},
 			// Traffic between users never leaves through an exit: any outcome but a refusal is delivery inside the node.
@@ -312,8 +312,13 @@ impl Shared {
 		let (id, decision) = if local && key.reversed().and_then(|back| self.flows.get(&back, plan.generation, None)).is_some_and(|(_, decision)| decision == Decision::Deliver) {(0, Decision::Deliver)}
 		else if let Some(known) = self.flows.sent(&key, plan.generation, heard) {known} else {
 			let names = if dns || control {Vec::new()} else {plan.users[user].state.names().of(packet.dst, Instant::now())};
-			let decision = self.decide(plan, at, device, &key, &names);
-			let id = match self.flows.capped(key, plan.devices[device].public_key, &plan.users[user].name, decision, names, heard, plan.generation, if linked.is_some() {plan.users[user].flows} else {route::MAX_FLOWS_PER_DEVICE}, plan.users[user].flows, linked.is_some()) {
+			// The transport of the device's session now, which stays with the flow: it decides the flow here and when a reload decides it again, whatever the device is on by then.
+			let transport = {
+				let peers = plan.inbounds[from.inbound].tunnel.lock();
+				peers.wg.index(&plan.devices[device].public_key).and_then(|peer| peers.over(peer)).map(Over::rule)
+			};
+			let decision = self.decide(plan, at, device, &key, &names, transport);
+			let id = match self.flows.capped(key, plan.devices[device].public_key, &plan.users[user].name, decision, names, transport, heard, plan.generation, if linked.is_some() {plan.users[user].flows} else {route::MAX_FLOWS_PER_DEVICE}, plan.users[user].flows, linked.is_some()) {
 				Ok(id) => id,
 				// "When the exit's cap for the link is reached, the exit refuses the flow with an ICMP error or a reset", within the link's share of them.
 				Err(Reason::FlowTableFull) if linked.is_some() => return self.refuse(plan, from, &raw, &packet, Reason::FlowTableFull, true).await,

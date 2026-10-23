@@ -17,6 +17,9 @@ pub mod netstack;
 pub mod obfs;
 pub mod plan;
 pub mod probe;
+pub mod proxy;
+pub mod proxy_http;
+pub mod proxy_socks;
 pub mod replay;
 pub mod resolver;
 pub mod route;
@@ -35,12 +38,13 @@ pub use control::ControlTotals;
 pub use faketls::FakeTlsTotals;
 pub use obfs::ObfsTotals;
 pub use stream::StreamTotals;
+pub use proxy::Totals as ProxyTotals;
 pub use tunnel::Totals as TunnelTotals;
 pub use plan::{Denied, Plan};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
 
-use crate::config::{Applied, ApplyError, Config, Diff, Revision, Snapshot, Store};
+use crate::config::{Applied, ApplyError, Config, Diff, Revision, RuleTransport, Snapshot, Store};
 use host::Host;
 use rustls::RootCertStore;
 use resolver::{Names, Resolver};
@@ -116,6 +120,22 @@ pub enum Over {
 	FrontedShaped,
 	/// The borrowed-site `faketls` transport of a `veilway` inbound.
 	FakeTls,
+}
+
+impl Over {
+	/// The name a routing rule's `transport` condition gives it. A `ws` of either kind is `ws`.
+	pub fn rule(self) -> RuleTransport {
+		match self {
+			Over::Udp => RuleTransport::Udp,
+			Over::Ws | Over::WsNative => RuleTransport::Ws,
+			Over::UdpObfs => RuleTransport::UdpObfs,
+			Over::Tls => RuleTransport::Tls,
+			Over::WsPlain => RuleTransport::WsPlain,
+			Over::Fronted => RuleTransport::Fronted,
+			Over::FrontedShaped => RuleTransport::FrontedShaped,
+			Over::FakeTls => RuleTransport::Faketls,
+		}
+	}
 }
 
 /// A device as a peer of one inbound, as `Engine::peers` gives it.
@@ -383,6 +403,11 @@ pub struct Shared {
 	certificates: Mutex<Vec<certificate::Made>>,
 	/// The tunnels that run, in the order of the config, with what each counts.
 	tunnels: Mutex<Vec<(String, Arc<tunnel::State>)>>,
+	/// The connections each user holds through the hop of Xray and every proxy inbound together, and the UDP they relay: one count for all of those doors, so that a user's cap is the user's and not each door's.
+	open: Arc<xray::Open>,
+	udp: Arc<xray_udp::Limits>,
+	/// The proxy inbounds that run, in the order of the config, with what each counts.
+	proxies: Mutex<Vec<(String, Arc<proxy::State>)>>,
 	/// The subscriptions of other providers the operator was shown, which wait for the config that names them, see `upstream`.
 	previews: upstream::Previews,
 }
@@ -390,7 +415,7 @@ pub struct Shared {
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), previews: upstream::Previews::new(upstream::Hooks::default())}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), proxies: Mutex::default(), open: Arc::default(), udp: Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER)), previews: upstream::Previews::new(upstream::Hooks::default())}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -581,7 +606,8 @@ impl Engine {
 		let plan = self.plan();
 		Counters {
 			users: plan.users.iter().take(plan.people).map(Usage::of).collect(),
-			inbounds: plan.inbounds.iter().take(plan.listening).map(|inbound| (inbound.tag.clone(), inbound.traffic.totals())).collect(),
+			// A proxy inbound counts bytes only: what its clients sent to their destinations and got back. Its connections and refusals are in `Engine::proxies`.
+			inbounds: plan.inbounds.iter().take(plan.listening).map(|inbound| (inbound.tag.clone(), inbound.traffic.totals())).chain(self.shared.proxies.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(tag, state)| (tag.clone(), Totals {up_bytes: state.totals().up_bytes, down_bytes: state.totals().down_bytes, ..Totals::default()}))).collect(),
 			exits: plan.exits.iter().map(|exit| (exit.tag.clone(), exit.traffic.totals())).collect(),
 		}
 	}
@@ -699,6 +725,9 @@ impl Engine {
 	/// What the `faketls` listeners did since start, and what they hold right now.
 	pub fn faketls(&self) -> FakeTlsTotals {self.shared.faketls.totals()}
 
+	/// What each proxy inbound has counted since it started, in the order of the config. An inbound that a reload changed starts counting over.
+	pub fn proxies(&self) -> Vec<(String, ProxyTotals)> {self.shared.proxies.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(tag, state)| (tag.clone(), state.totals())).collect()}
+
 	/// Every tunnel that runs, in the order of the config, with what it counted since it started. A tunnel that a reload changed starts counting over.
 	pub fn tunnels(&self) -> Vec<(String, TunnelTotals)> {self.shared.tunnels.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(tag, state)| (tag.clone(), state.totals())).collect()}
 
@@ -747,7 +776,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (users, devices, writable) = usage::load(&path);
 		(users, devices, writable.then_some(path))
 	});
-	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER}).collect(), ..Plan::default()};
+	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER, proxy: None}).collect(), ..Plan::default()};
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let mut shared = Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots);
 	shared.previews = upstream::Previews::new(options.upstream.clone());

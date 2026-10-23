@@ -121,7 +121,7 @@ pub(super) enum Step {
 /// A `chain` exit carries the query into its link like any other packet, see `chain`.
 pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, user: usize, protocol: u8, fallback: usize, list: usize, at: usize, message: &[u8], asked: Option<&str>) -> Step {
 	let (set, server) = (&plan.dns[list], &plan.dns[list].servers[at]);
-	let action = route::evaluate(plan, inbound, user, server.ip(), protocol, 53, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
+	let action = route::evaluate(plan, inbound, user, server.ip(), protocol, 53, None, None, &|patterns| asked.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))));
 	let exit = if let Action::Exit(exit) = action {*exit} else {fallback};
 	let refusal = match (action, &plan.exits[exit].backend) {
 		(Action::Block | Action::Reject, _) => Some(Reason::Rule),

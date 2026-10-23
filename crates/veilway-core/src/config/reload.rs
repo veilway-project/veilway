@@ -172,6 +172,10 @@ impl Diff {
 			(change.restart || !change.transports_stopped.is_empty() || !change.transports_started.is_empty() || was.kind != is.kind || was.padding != is.padding || was.transport_keys != is.transport_keys || was.upgrade_cookie != is.upgrade_cookie || [true, false].iter().any(|tls| was.transports.iter().chain(&is.transports).any(|transport| if *tls {matches!(transport, Transport::Tls {..})} else {matches!(transport, Transport::WsNative {..})}) && was.upgrade_headers(*tls) != is.upgrade_headers(*tls))).then_some(change)
 		}).collect();
 		inbounds.changed.retain(|tag| inbound_changes.iter().any(|change| change.tag == *tag));
+		let proxies = changes(&old.proxies, &new.proxies, |proxy| proxy.tag.as_str(), |was, is| was.effective() == is.effective());
+		inbounds.added.extend(proxies.added);
+		inbounds.changed.extend(proxies.changed);
+		inbounds.removed.extend(proxies.removed);
 		// Objects that differ as written are compared again with their defaults filled in.
 		let users = changes(&old.users, &new.users, |user| user.name.as_str(), |was, is| was == is || User {enabled: Some(was.enabled != Some(false)), ..was.clone()} == User {enabled: Some(is.enabled != Some(false)), ..is.clone()});
 		let (before, after): (HashMap<&str, &User>, HashMap<&str, &User>) = (old.users.iter().map(|user| (user.name.as_str(), user)).collect(), new.users.iter().map(|user| (user.name.as_str(), user)).collect());

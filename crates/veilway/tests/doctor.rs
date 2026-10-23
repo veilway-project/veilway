@@ -783,3 +783,26 @@ async fn a_link_is_looked_at_without_dialling_it() {
 	}
 	std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_proxy_inbound_has_its_listen_checked_and_excused_like_a_transport() {
+	let dir = scratch("proxy");
+	let (taken, socket, servers) = (std::net::TcpListener::bind(free()).unwrap(), dir.join("veilway.sock"), dns(true).await);
+	let (held, open) = (taken.local_addr().unwrap().to_string(), free().to_string());
+	config(&dir, &[servers], json!([{"type": "udp", "listen": free().to_string()}]), json!([{"tag": "plain", "type": "direct"}]));
+	let mut document: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).unwrap()).unwrap();
+	document["inbounds"].as_array_mut().unwrap().extend([json!({"tag": "p1", "type": "socks5", "listen": held}), json!({"tag": "p2", "type": "http", "listen": open})]);
+	private(&dir, "config.json", &document.to_string());
+	let seen = |document: &str| {
+		let document: Value = serde_json::from_str(document).unwrap();
+		["inbound p1, tcp", "inbound p2, tcp"].map(|subject| status(&document, "listen", subject).to_string())
+	};
+	let (_, said, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!(seen(&said), ["fail", "ok"].map(str::to_string), "{said}");
+	let node = answering(&socket, json!({"revision": "0".repeat(64), "generation": 1, "document": {"version": 1, "inbounds": [{"tag": "home", "transports": [{"type": "udp", "listen": "127.0.0.1:9"}]}, {"tag": "p1", "listen": held}], "exits": []}}).to_string());
+	let (_, said, _) = doctor(&dir, &["--json"]).await;
+	assert_eq!(seen(&said), ["ok", "ok"].map(str::to_string), "a proxy inbound the running node holds is not excused: {said}");
+	node.abort();
+	drop(taken);
+	std::fs::remove_dir_all(&dir).unwrap();
+}

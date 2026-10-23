@@ -950,6 +950,42 @@ async fn a_rule_sends_one_destination_to_a_second_exit(){
 	assert!(main.up_packets>0 && main.down_packets>0 && other.up_packets>0 && other.down_packets>0, "both exits carried traffic: {main:?} {other:?}");
 }
 
+/// A rule's `transport` holds a flow to the transport of its device's session when the flow began, and the flow keeps it when the device moves to another transport.
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_rule_by_transport_follows_the_session_a_flow_began_on_and_the_flow_keeps_it(){
+	let (backend, _)=tcp_responder().await;
+	let (echo, _)=udp_responder().await;
+	let (first, seen_first)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let (second, seen_second)=socks5_proxy(dns_responder().await, backend, echo, false).await;
+	let mut setup=setup(first);
+	add_exit(&mut setup.doc, "second", second);
+	add_rule(&mut setup.doc, json!({"tag":"ws-leaves-by-second", "transport":["ws"], "action":{"exit":"second"}}));
+	let relay=listen();
+	setup.doc["inbounds"][0]["transports"]=json!([{"type":"udp", "listen":setup.listen.to_string()}, {"type":"ws", "listen":relay.to_string(), "path":"/wg"}]);
+	let node=launch(setup).await;
+	let bridge=||async{
+		let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let at=socket.local_addr().unwrap();
+		tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), false));
+		at
+	};
+	let mut by_udp=Client::connect(node.keys[0], node.public, node.addr).await;
+	open(&mut by_udp, PEER_A, PUBLIC, 41100, 80).await;
+	assert_eq!(greeting(&mut by_udp).await, GREETING);
+	let mut by_ws=Client::connect(node.keys[1], node.public, bridge().await).await;
+	open(&mut by_ws, PEER_B, PUBLIC, 41101, 80).await;
+	assert_eq!(greeting(&mut by_ws).await, GREETING);
+	assert_eq!((seen_first.lock().unwrap().len(), seen_second.lock().unwrap().len()), (1, 1), "a device over UDP and a device over ws were not sent by different exits");
+	// The first device now moves to ws: its new flows follow the rule, and the one it has stays where it began.
+	let mut moved=Client::connect(node.keys[0], node.public, bridge().await).await;
+	open(&mut moved, PEER_A, OTHER, 41102, 80).await;
+	assert_eq!(greeting(&mut moved).await, GREETING);
+	moved.send_ip(&ip_tcp(PEER_A, PUBLIC, syn(41100, 80), &[])).await;
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert_eq!(seen_first.lock().unwrap().as_slice(), ["93.184.216.34:80"], "a flow that began over UDP was decided again after its device moved to ws");
+	assert_eq!(seen_second.lock().unwrap().as_slice(), ["93.184.216.34:80", "93.184.216.35:80"], "a new flow of the device that moved to ws did not follow the rule");
+}
+
 /// `block` drops without a word, `reject` resets TCP, and neither reaches the proxy.
 #[tokio::test(flavor="multi_thread", worker_threads=4)]
 async fn block_drops_silently_and_reject_resets(){

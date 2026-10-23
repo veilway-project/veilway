@@ -8,8 +8,8 @@ use super::route::{self, By, Decision, Ended, Key};
 use super::limits::Clock;
 use super::upstream::{self, UpstreamState};
 use super::upstream_state::{UpstreamFile, UpstreamVault};
-use super::{certificate, control, faketls, l3, link, obfs, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use super::{certificate, control, faketls, l3, link, obfs, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use crate::config::{loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -74,6 +74,9 @@ struct Relay {served: watch::Sender<Arc<ws::Served>>, routes: Vec<(String, Optio
 /// A tunnel as it runs: the tunnel with its defaults written out, what it counts, the socket it listens on and the task that accepts on it, which takes every connection of the tunnel with it.
 struct Forward {config: Forwarded, links: Vec<String>, state: Arc<tunnel::State>, bound: tunnel::Bound, _task: Task}
 
+/// A proxy inbound as it runs: the inbound with its defaults written out, the socket it listens on, what it counts and the task that accepts on it, which takes every connection of the inbound with it.
+struct Proxy {config: ProxyInbound, listener: Arc<TcpListener>, state: Arc<proxy::State>, _task: Task}
+
 /// The l3 exit as it runs.
 pub struct Wired {wanted: l3::Wanted, port: l3::Port, queue: l3::Queue, pub running: l3::Running}
 
@@ -104,6 +107,8 @@ pub struct Host {
 	diallers: HashMap<String, (Arc<link::Dialler>, Task, Arc<Tunnel>, ([u8; 16], [u8; 32], [u8; 32], [u8; 32], u16, u64, Option<Arc<plan::Upstream>>))>,
 	/// The tunnels of the config in force that are enabled, by tag.
 	forwards: HashMap<String, Forward>,
+	/// The proxy inbounds of the config in force, by tag.
+	proxies: HashMap<String, Proxy>,
 	/// The state file of the upstreams, with what a test puts in place of the node's own network for them. None for a node that was given no path.
 	upstream_file: Option<(Arc<UpstreamFile>, upstream::Hooks)>,
 	/// The task of each upstream that runs, by tag, with the config it runs and its state. An upstream that is the same, with the same state, keeps its task and its tunnel through a reload.
@@ -133,6 +138,8 @@ pub struct Staged {
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
 	/// The tunnels that are new or changed, with their defaults written out, each with the socket it listens on.
 	forwards: Vec<(Forwarded, tunnel::Bound)>,
+	/// The proxy inbounds that are new or changed, each with the socket it listens on.
+	proxies: Vec<(ProxyInbound, Arc<TcpListener>)>,
 	l3: Option<Wired>,
 	/// The upstreams of the config that are enabled, each with the config it runs, how the node reaches its provider, its state and the vault of its document.
 	upstreams: Vec<(Upstream, Option<upstream::Reach>, Arc<UpstreamState>, UpstreamVault)>,
@@ -187,7 +194,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new(), upstream_file: None, upstreams: HashMap::new(), left: HashMap::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new(), proxies: HashMap::new(), upstream_file: None, upstreams: HashMap::new(), left: HashMap::new()}}
 
 	/// Ends the task of every upstream, and with it its tunnel: the node is going away, and a device of a provider should not stay connected from a node that is not there.
 	pub fn stop_upstreams(&mut self) {self.upstreams.clear()}
@@ -213,6 +220,11 @@ impl Host {
 	/// Takes from the host what `config` needs and the node does not hold yet: binds every new listener, reads every certificate again, builds the tunnels that are new or named in `restart`, and brings up the l3 interface.
 	/// The running config keeps working through all of it. An error names tags and field paths, never a value from the document, and leaves nothing behind.
 	pub async fn prepare(&mut self, shared: &Arc<Shared>, config: &Arc<Config>, restart: &[&str]) -> anyhow::Result<Staged> {
+		// A message names an inbound by its place in the document the config was read from.
+		self.stage(shared, config, restart).await.map_err(|e| anyhow!("{}", config.remap(&format!("{e:#}"))))
+	}
+
+	async fn stage(&mut self, shared: &Arc<Shared>, config: &Arc<Config>, restart: &[&str]) -> anyhow::Result<Staged> {
 		let (old, mut fresh) = (shared.plan(), Vec::new());
 		// The tunnel of every inbound, and behind them the tunnel of every enabled link this node dials, in the order of the config: a link this node dials has a tunnel of its own, whose one peer is the other node.
 		let dialled: Vec<(String, [u8; 32], [u8; 32], u16)> = config.links.iter().filter(|link| link.enabled != Some(false)).filter_map(|link| Some((format!("link:{}", link.tag), link.private_key.as_ref()?.expose().0, link.peer.as_ref()?.inbound_public_key.0, link.mtu(&config.inbounds)))).collect();
@@ -348,6 +360,21 @@ impl Host {
 			};
 			forwards.push((written, bound));
 		}
+		// Proxy inbounds: one that did not change keeps its listener and its connections. One that is new, or changed, binds its address now, or takes the socket of the one it replaces on the same address.
+		let mut proxies = Vec::new();
+		for (i, written) in config.proxies.iter().enumerate() {
+			let written = written.effective();
+			if self.proxies.get(&written.tag).is_some_and(|running| running.config == written) {continue}
+			let listen = written.listen.0;
+			let listener = match self.proxies.values().find(|running| running.config.listen == written.listen) {
+				Some(running) => running.listener.clone(),
+				None => Arc::new(bind(listen, Type::STREAM, self.released.contains(&listen)).await.and_then(|socket| {
+					socket.listen(1024)?;
+					TcpListener::from_std(socket.into())
+				}).map_err(|e| anyhow!("inbounds[{}].listen: inbound `{}` cannot listen there over tcp: {}", config.inbounds.len() + i, written.tag, e.kind()))?),
+			};
+			proxies.push((written, listener));
+		}
 		// A missing interface may come later, a PPP or VPN link for one, so it is a warning here and each flow fails until it is there. A system that cannot tie a socket to an interface at all is refused.
 		for exit in &plan.exits {
 			if let Backend::Netstack {outbound: Outbound::Direct {interface: Some(name), ..}, ..} = &exit.backend {
@@ -410,12 +437,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, l3: staged, upstreams})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, proxies, l3: staged, upstreams})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, l3, upstreams} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, proxies, l3, upstreams} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -543,6 +570,24 @@ impl Host {
 			if !self.forwards.values().any(|running| running.config.listen.0 == listen) {self.released.insert(listen);}
 			if !self.forwards.contains_key(&tag) {tracing::info!("tunnel {tag}: closed, with every connection it had")}
 		}
+		// The same for a proxy inbound: one that is as it was keeps its connections, and one that changed or went away closes its listener task and with it every connection. The socket of a changed one that keeps its address is handed on.
+		let named: Vec<ProxyInbound> = self.config.iter().flat_map(|config| &config.proxies).map(ProxyInbound::effective).collect();
+		let mut stopped = Vec::new();
+		self.proxies.retain(|tag, running| {
+			let kept = named.iter().any(|written| *written == running.config);
+			if !kept {stopped.push((tag.clone(), running.config.listen.0))}
+			kept
+		});
+		for (written, listener) in proxies {
+			let (state, may) = (Arc::new(proxy::State::default()), plan.proxies.get(&written.tag).map_or(0, |may| may.iter().filter(|may| **may).count()));
+			tracing::info!("inbound {}: {} on {}, {} user(s) may log in, at most {} connections ({} for one source){}", written.tag, match written.kind {crate::config::ProxyType::Socks5 => "socks5", crate::config::ProxyType::Http => "http", crate::config::ProxyType::Mixed => "mixed"}, written.listen.0, may, written.connections(), written.per_source(), if written.kind == crate::config::ProxyType::Http {String::new()} else {format!(", udp {}", if written.udp() {"on"} else {"off"})});
+			self.proxies.insert(written.tag.clone(), Proxy {config: written.clone(), listener: listener.clone(), state: state.clone(), _task: Task(proxy::serve(shared, written, listener, state))});
+		}
+		for (tag, listen) in stopped {
+			if !self.proxies.values().any(|running| running.config.listen.0 == listen) {self.released.insert(listen);}
+			if !self.proxies.contains_key(&tag) {tracing::info!("inbound {tag}: closed, with every connection it had")}
+		}
+		*shared.proxies.lock().unwrap_or_else(|e| e.into_inner()) = self.config.iter().flat_map(|config| &config.proxies).filter_map(|written| self.proxies.get(&written.tag).map(|running| (written.tag.clone(), running.state.clone()))).collect();
 		*shared.tunnels.lock().unwrap_or_else(|e| e.into_inner()) = self.config.iter().flat_map(|config| &config.tunnels).filter_map(|written| self.forwards.get(&written.tag).map(|running| (written.tag.clone(), running.state.clone()))).collect();
 		// A listener whose address the config still has is told what it serves now, and keeps every session whose transport is as it was. One whose address nobody has any more closes with everything it holds.
 		self.tls.retain(|addr, (listener, _)| match serving.remove(addr) {
@@ -711,13 +756,13 @@ impl Host {
 			(Backend::Chain {..}, Backend::Chain {..}) => true,
 			_ => false,
 		})).collect();
-		let judge = |key: &Key, device: &[u8; 32], user: &str, decision: Decision, names: &[Arc<str>]| {
+		let judge = |key: &Key, device: &[u8; 32], user: &str, decision: Decision, names: &[Arc<str>], transport: Option<RuleTransport>| {
 			if cut.contains_key(device) {return None}
 			// A flow belongs to a user and a device. It lives on only where that device still holds the address it came from, in the tunnel it came through.
 			let (is, was) = (plan.by_address.get(&key.src).copied()?, old.by_address.get(&key.src).copied()?);
 			let holder = &plan.devices[is.device];
 			if holder.public_key != *device || plan.users[holder.user].name != user || !Arc::ptr_eq(&plan.inbounds[is.inbound].tunnel, &old.inbounds[was.inbound].tunnel) {return None}
-			match (decision, shared.decide(&plan, is.inbound, is.device, key, names)) {
+			match (decision, shared.decide(&plan, is.inbound, is.device, key, names, transport)) {
 				(Decision::Deliver, Decision::Deliver) => Some(Decision::Deliver),
 				(Decision::Dns, Decision::Dns) => Some(Decision::Dns),
 				// A control connection lives on while its inbound is still a `veilway` inbound and its device still has the secret it proved, which is looked at once the plan is in force.

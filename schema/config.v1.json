@@ -1263,6 +1263,118 @@
       "pattern": "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$",
       "type": "string"
     },
+    "ProxyInbound": {
+      "additionalProperties": false,
+      "description": "An inbound that lets other software use this node as a plain proxy. Every connection logs in as a user with that user's `proxy_password`, and what comes in goes through the same gate, rules, exits, entitlement, quotas and counters as a tunnel's traffic. SOCKS5 and HTTP carry no encryption of their own.",
+      "properties": {
+        "groups": {
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 256,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "limits": {
+          "$ref": "#/$defs/ProxyLimits"
+        },
+        "listen": {
+          "$ref": "#/$defs/Addr",
+          "description": "The TCP address this inbound listens on. A loopback address is taken as it is. A private address (RFC 1918, 100.64.0.0/10, unique local) is taken too, with a warning that it may be reachable from outside. Any other address, the wildcard and link-local addresses included, needs `public`."
+        },
+        "public": {
+          "description": "Says the operator knows that traffic and passwords cross the network in the clear on a public address. Defaults to false.",
+          "type": "boolean"
+        },
+        "tag": {
+          "not": {
+            "enum": [
+              "all",
+              "any",
+              "block",
+              "reject",
+              "drop",
+              "local",
+              "direct",
+              "user"
+            ]
+          },
+          "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "type": {
+          "$ref": "#/$defs/ProxyType"
+        },
+        "udp": {
+          "description": "Whether UDP ASSOCIATE is answered. Defaults to true. Only `socks5` and `mixed` have it.",
+          "type": "boolean"
+        },
+        "users": {
+          "description": "The users that may log in. With `groups`, a user in either list may. Without both, every user that has a `proxy_password` may.",
+          "items": {
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+            "type": "string"
+          },
+          "maxItems": 65536,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "tag",
+        "type",
+        "listen"
+      ],
+      "type": "object"
+    },
+    "ProxyLimits": {
+      "additionalProperties": false,
+      "description": "Capacity numbers of a proxy inbound.",
+      "properties": {
+        "connections": {
+          "description": "Connections the inbound holds at once, logged in or not. Defaults to 1024.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "handshakes": {
+          "description": "Connections that have not finished logging in. Defaults to 256.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "per_source": {
+          "description": "How many of those one source may have. A source is an IPv4 address or an IPv6 /64. Defaults to 64.",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ProxyType": {
+      "oneOf": [
+        {
+          "const": "socks5",
+          "description": "SOCKS5 with username and password (RFC 1929): CONNECT, and UDP ASSOCIATE unless `udp` is false.",
+          "type": "string"
+        },
+        {
+          "const": "http",
+          "description": "An HTTP proxy: CONNECT, and plain `http://` requests, one request to a connection.",
+          "type": "string"
+        },
+        {
+          "const": "mixed",
+          "description": "One port for both: a first byte of 0x05 is SOCKS5 and anything else is read as HTTP.",
+          "type": "string"
+        }
+      ]
+    },
     "QuotaPeriod": {
       "enum": [
         "daily",
@@ -1349,6 +1461,11 @@
         {
           "required": [
             "inbound"
+          ]
+        },
+        {
+          "required": [
+            "transport"
           ]
         },
         {
@@ -1550,6 +1667,16 @@
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
           "type": "string"
         },
+        "transport": {
+          "description": "The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on, and a DNS query of the node's resolver, match no transport.",
+          "items": {
+            "$ref": "#/$defs/RuleTransport"
+          },
+          "maxItems": 1024,
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
         "user": {
           "items": {
             "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
@@ -1566,6 +1693,22 @@
         "action"
       ],
       "type": "object"
+    },
+    "RuleTransport": {
+      "description": "A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke.",
+      "enum": [
+        "udp",
+        "udp-obfs",
+        "tls",
+        "ws",
+        "ws-plain",
+        "fronted",
+        "fronted-shaped",
+        "faketls",
+        "socks5",
+        "http"
+      ],
+      "type": "string"
     },
     "SelfSigned": {
       "additionalProperties": false,
@@ -2485,11 +2628,11 @@
       },
       "properties": {
         "devices": {
+          "description": "At least one, except for a user with a `proxy_password`, who may write an empty list: such a user only logs in to proxy inbounds.",
           "items": {
             "$ref": "#/$defs/Device"
           },
           "maxItems": 16,
-          "minItems": 1,
           "type": "array",
           "uniqueItems": true
         },
@@ -2530,6 +2673,12 @@
         },
         "name": {
           "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+          "type": "string"
+        },
+        "proxy_password": {
+          "description": "The password this user logs in to a `socks5`, `http` or `mixed` inbound with, under their `name` as the username. 16 to 128 printable ASCII characters, no colon. Without one the user cannot log in to any of them.",
+          "maxLength": 128,
+          "minLength": 16,
           "type": "string"
         },
         "quota_bytes": {
@@ -2687,8 +2836,16 @@
       "uniqueItems": true
     },
     "inbounds": {
+      "description": "The tunnel inbounds (`wireguard` and `veilway`) and, among them in the document, the proxy inbounds (`socks5`, `http` and `mixed`).",
       "items": {
-        "$ref": "#/$defs/Inbound"
+        "oneOf": [
+          {
+            "$ref": "#/$defs/Inbound"
+          },
+          {
+            "$ref": "#/$defs/ProxyInbound"
+          }
+        ]
       },
       "maxItems": 64,
       "type": "array",

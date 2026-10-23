@@ -68,6 +68,18 @@ fn within<T>(early: &Option<Vec<T>>, late: &Option<Vec<T>>, holds: impl Fn(&T, &
 impl Config {
 	/// Reports every problem it can find, not only the first. `shadow` also looks for rules that an earlier rule covers completely, within `SHADOW_BUDGET`, when nothing else is wrong.
 	pub fn validate(&self, shadow: bool) -> Report {
+		let mut report = self.checked(shadow);
+		if self.places.0.is_some() {
+			for found in report.errors.iter_mut().chain(report.warnings.iter_mut()) {
+				found.path = self.remap(&found.path);
+				found.message = self.remap(&found.message);
+			}
+		}
+		report
+	}
+
+	/// `validate` with every `inbounds[n]` counting the tunnel inbounds and then the proxy inbounds.
+	fn checked(&self, shadow: bool) -> Report {
 		let mut r = Report::default();
 		let nets = |list: &[&str]| list.iter().filter_map(|s| s.parse::<IpNet>().ok()).collect::<Vec<_>>();
 		let (pool_ranges, private) = (nets(&POOL_RANGES), nets(&GEOIP_PRIVATE));
@@ -79,10 +91,12 @@ impl Config {
 			if !ident(group, true) {r.error(format!("groups[{i}]"), NAME_RULE)}
 		}
 		let groups = index(&mut r, |i| format!("groups[{i}]"), self.groups.iter().map(String::as_str));
-		if self.inbounds.len() > MAX_INBOUNDS {r.error("inbounds", format!("expected at most {MAX_INBOUNDS} inbounds"))}
-		let inbound_tags = tags(&mut r, "inbounds", self.inbounds.iter().map(|inbound| inbound.tag.as_str()));
+		if self.inbounds.len() + self.proxies.len() > MAX_INBOUNDS {r.error("inbounds", format!("expected at most {MAX_INBOUNDS} inbounds"))}
+		// The proxy inbounds stand behind the tunnel inbounds, in the numbers a document that is read back from this config has.
+		let all_tags = tags(&mut r, "inbounds", self.inbounds.iter().map(|inbound| inbound.tag.as_str()).chain(self.proxies.iter().map(|proxy| proxy.tag.as_str())));
+		let inbound_tags: HashMap<&str, usize> = all_tags.iter().filter(|(_, i)| **i < self.inbounds.len()).map(|(tag, i)| (*tag, *i)).collect();
 		// `tunnel:users` in a rule already means every inbound, so no inbound can be called that.
-		if let Some(i) = inbound_tags.get(RESERVED_INBOUND_TAG) {r.error(format!("inbounds[{i}].tag"), format!("expected a tag that is not `{RESERVED_INBOUND_TAG}`: tunnel:{RESERVED_INBOUND_TAG} stands for the pools of every inbound"))}
+		if let Some(i) = all_tags.get(RESERVED_INBOUND_TAG) {r.error(format!("inbounds[{i}].tag"), format!("expected a tag that is not `{RESERVED_INBOUND_TAG}`: tunnel:{RESERVED_INBOUND_TAG} stands for the pools of every inbound"))}
 		let mut pools: Vec<(IpNet, usize)> = Vec::new();
 		let mut inbound_keys: HashMap<[u8; 32], usize> = HashMap::new();
 		let mut listeners: Vec<(String, &Transport)> = Vec::new();
@@ -514,7 +528,8 @@ impl Config {
 			}
 			if user.quota_bytes.is_some_and(|quota| !(1..=MAX_QUOTA_BYTES).contains(&quota)) {r.error(format!("{at}.quota_bytes"), format!("expected an integer from 1 to {MAX_QUOTA_BYTES}"))}
 			if user.quota_period.is_some() && user.quota_bytes.is_none() {r.error(format!("{at}.quota_period"), "needs quota_bytes")}
-			if !(1..=MAX_DEVICES).contains(&user.devices.len()) {r.error(format!("{at}.devices"), format!("expected 1 to {MAX_DEVICES} devices"))}
+			// A user who only logs in to proxy inbounds has no tunnel and so no device.
+			if !(if user.proxy_password.is_some() {0} else {1}..=MAX_DEVICES).contains(&user.devices.len()) {r.error(format!("{at}.devices"), if user.proxy_password.is_some() {format!("expected at most {MAX_DEVICES} devices")} else {format!("expected 1 to {MAX_DEVICES} devices, or none for a user with a proxy_password")})}
 			index(&mut r, |j| format!("{at}.devices[{j}].name"), user.devices.iter().take(MAX_DEVICES).map(|device| device.name.as_str()));
 			for (j, device) in user.devices.iter().enumerate().take(MAX_DEVICES) {
 				let at = |key: &str| format!("{at}.devices[{j}].{key}");
@@ -838,19 +853,36 @@ impl Config {
 		for set in &sets {*classes.entry(*set).or_default() += 1}
 		let countable = classes.len() <= MAX_ENTITLEMENT_CLASSES;
 		if !countable {r.warning("routing.rules", format!("users differ in exits, groups and inbounds in more than {MAX_ENTITLEMENT_CLASSES} ways, so rules were not checked for sending users to exits they are not entitled to"))}
+		// The transports a flow can start on here: those of the tunnel inbounds, and the proxy types.
+		let offered: HashSet<RuleTransport> = self.inbounds.iter().take(MAX_INBOUNDS).flat_map(|inbound| inbound.transports.iter().take(MAX_TRANSPORTS)).map(|transport| match transport {
+			Transport::Udp {..} => RuleTransport::Udp,
+			Transport::UdpObfs {..} => RuleTransport::UdpObfs,
+			Transport::Ws {..} | Transport::WsNative {..} => RuleTransport::Ws,
+			Transport::Tls {..} => RuleTransport::Tls,
+			Transport::WsPlain {..} => RuleTransport::WsPlain,
+			Transport::Fronted {..} => RuleTransport::Fronted,
+			Transport::FrontedShaped {..} => RuleTransport::FrontedShaped,
+			Transport::FakeTls {..} => RuleTransport::Faketls,
+		}).chain(self.proxies.iter().take(MAX_INBOUNDS).flat_map(|proxy| match proxy.kind {
+			ProxyType::Socks5 => vec![RuleTransport::Socks5],
+			ProxyType::Http => vec![RuleTransport::Http],
+			ProxyType::Mixed => vec![RuleTransport::Socks5, RuleTransport::Http],
+		})).collect();
 		let last_refusal = rules.iter().rposition(|rule| live(rule) && matches!(rule.action, Action::Block | Action::Reject));
 		for (i, rule) in rules.iter().enumerate() {
 			let at = format!("routing.rules[{i}]");
 			let present = [
 				condition(&mut r, &at, "inbound", &rule.inbound), condition(&mut r, &at, "user", &rule.user), condition(&mut r, &at, "group", &rule.group), condition(&mut r, &at, "link", &rule.link),
 				condition(&mut r, &at, "ip", &rule.ip), condition(&mut r, &at, "domain", &rule.domain), condition(&mut r, &at, "protocol", &rule.protocol),
-				condition(&mut r, &at, "port", &rule.port), condition(&mut r, &at, "icmp_type", &rule.icmp_type), condition(&mut r, &at, "icmp_code", &rule.icmp_code),
+				condition(&mut r, &at, "port", &rule.port), condition(&mut r, &at, "icmp_type", &rule.icmp_type), condition(&mut r, &at, "icmp_code", &rule.icmp_code), condition(&mut r, &at, "transport", &rule.transport),
 			];
+			for (j, _) in rule.transport.iter().flatten().enumerate().take(MAX_RULE_ENTRIES).filter(|(_, wanted)| !offered.contains(wanted)) {r.warning(format!("{at}.transport[{j}]"), "no inbound of this node has this transport, so this entry never matches")}
 			if !present.contains(&true) {r.error(&at, "expected at least one condition")}
 			let (mut from, mut of) = (Bits::default(), Bits::default());
+			if live(rule) && rule.inbound.is_some() && self.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()) {r.warning(format!("{at}.inbound"), "a rule scoped by inbound does not apply to traffic that comes in through an Xray inbound: the add-on's hop knows the user and no inbound, so that traffic skips this rule")}
 			for (j, tag) in rule.inbound.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
-				match inbound_tags.get(tag.as_str()) {
-					Some(inbound) if small => from.set(*inbound),
+				match all_tags.get(tag.as_str()) {
+					Some(inbound) if small && *inbound < 256 => from.set(*inbound),
 					Some(_) => {}
 					None => r.error(format!("{at}.inbound[{j}]"), "expected the tag of an inbound, found a tag no inbound has"),
 				}
@@ -942,21 +974,21 @@ impl Config {
 			if let Some((i, _)) = first.filter(|(_, rule)| refuses(rule, None)) {r.warning(format!("routing.rules[{i}]"), format!("refuses {at} on port 53 before any rule sends it to an exit, so the node cannot reach its own resolver"))}
 		}
 		if shadow && r.errors.is_empty() {
-			let shape = |rule: &Rule| [rule.inbound.is_some(), rule.user.is_some(), rule.group.is_some(), rule.link.is_some(), rule.ip.is_some(), rule.domain.is_some(), rule.protocol.is_some(), rule.port.is_some(), rule.icmp_type.is_some(), rule.icmp_code.is_some()];
-			let size = |rule: &Rule| [rule.inbound.as_ref().map_or(0, Vec::len), rule.user.as_ref().map_or(0, Vec::len), rule.group.as_ref().map_or(0, Vec::len), rule.link.as_ref().map_or(0, Vec::len), rule.ip.as_ref().map_or(0, Vec::len), rule.domain.as_ref().map_or(0, Vec::len), rule.protocol.as_ref().map_or(0, Vec::len), rule.port.as_ref().map_or(0, Vec::len), rule.icmp_type.as_ref().map_or(0, Vec::len), rule.icmp_code.as_ref().map_or(0, Vec::len)].iter().sum::<usize>();
-			let facts: Vec<([bool; 10], usize)> = rules.iter().map(|rule| (shape(rule), size(rule))).collect();
+			let shape = |rule: &Rule| [rule.inbound.is_some(), rule.user.is_some(), rule.group.is_some(), rule.link.is_some(), rule.ip.is_some(), rule.domain.is_some(), rule.protocol.is_some(), rule.port.is_some(), rule.icmp_type.is_some(), rule.icmp_code.is_some(), rule.transport.is_some()];
+			let size = |rule: &Rule| [rule.inbound.as_ref().map_or(0, Vec::len), rule.user.as_ref().map_or(0, Vec::len), rule.group.as_ref().map_or(0, Vec::len), rule.link.as_ref().map_or(0, Vec::len), rule.ip.as_ref().map_or(0, Vec::len), rule.domain.as_ref().map_or(0, Vec::len), rule.protocol.as_ref().map_or(0, Vec::len), rule.port.as_ref().map_or(0, Vec::len), rule.icmp_type.as_ref().map_or(0, Vec::len), rule.icmp_code.as_ref().map_or(0, Vec::len), rule.transport.as_ref().map_or(0, Vec::len)].iter().sum::<usize>();
+			let facts: Vec<([bool; 11], usize)> = rules.iter().map(|rule| (shape(rule), size(rule))).collect();
 			let mut budget = SHADOW_BUDGET;
 			'late: for (j, late) in rules.iter().enumerate().skip(1).filter(|(_, rule)| live(rule)) {
 				for (i, early) in rules[..j].iter().enumerate().filter(|(_, rule)| live(rule)) {
 					// An earlier rule can only cover a later one that has every condition it has.
-					let comparable = (0..10).all(|c| !facts[i].0[c] || facts[j].0[c]);
+					let comparable = (0..11).all(|c| !facts[i].0[c] || facts[j].0[c]);
 					let cost = if comparable {facts[i].1.saturating_mul(facts[j].1).saturating_add(1)} else {1};
 					if cost > budget {
 						r.shadow_cut_short = true;
 						break 'late;
 					}
 					budget -= cost;
-					let covered = comparable && within(&early.inbound, &late.inbound, |e, l| e == l) && within(&early.user, &late.user, |e, l| e == l) && within(&early.link, &late.link, |e, l| e == l) && within(&early.group, &late.group, |e, l| e == l)
+					let covered = comparable && within(&early.inbound, &late.inbound, |e, l| e == l) && within(&early.user, &late.user, |e, l| e == l) && within(&early.link, &late.link, |e, l| e == l) && within(&early.group, &late.group, |e, l| e == l) && within(&early.transport, &late.transport, |e, l| e == l)
 						&& within(&early.protocol, &late.protocol, |e, l| e == l) && within(&early.icmp_type, &late.icmp_type, |e, l| e == l) && within(&early.icmp_code, &late.icmp_code, |e, l| e == l)
 						&& within(&early.port, &late.port, |e, l| e.lo <= l.lo && l.hi <= e.hi) && within(&early.ip, &late.ip, |e, l| e == l || matches!((e, l), (IpEntry::Users, IpEntry::Tunnel(_))) || matches!(l, IpEntry::Net(l) if inside(e, l)))
 						&& within(&early.domain, &late.domain, |e, l| e == l || e.strip_prefix("*.").is_some_and(|base| {
@@ -1042,7 +1074,7 @@ impl Config {
 				Some(_) => r.error(format!("{at}.exit"), "expected an exit with a chain backend: a tunnel leaves through a node link"),
 			}
 			let target = tunnel.target.0;
-			if listeners.iter().any(|(_, other)| overlap(target, other.listen())) || self.xray.iter().flat_map(|xray| &xray.inbounds).take(MAX_XRAY_INBOUNDS).any(|inbound| overlap(target, inbound.listen.0)) || tunnels.iter().any(|other| overlap(target, other.listen.0)) {r.error(format!("{at}.target"), "expected an address that is not a listen address of this node: the node would connect to itself")}
+			if listeners.iter().any(|(_, other)| overlap(target, other.listen())) || self.xray.iter().flat_map(|xray| &xray.inbounds).take(MAX_XRAY_INBOUNDS).any(|inbound| overlap(target, inbound.listen.0)) || tunnels.iter().any(|other| overlap(target, other.listen.0)) || self.proxies.iter().take(MAX_INBOUNDS).any(|proxy| overlap(target, proxy.listen.0)) {r.error(format!("{at}.target"), "expected an address that is not a listen address of this node: the node would connect to itself")}
 			if link_addresses.contains(&target.ip()) {r.error(format!("{at}.target"), "expected an address that is not a link address: a link address is never a destination")} else if gate::refused(target.ip(), &pools) {r.error(format!("{at}.target"), "expected an address the destination gate lets through: not loopback, link-local, multicast, unspecified, nor inside an inbound pool of this node")}
 			match &tunnel.sources {
 				None if !here.ip().is_loopback() && udp => r.error(format!("{at}.sources"), "expected the networks that may get answers: a UDP tunnel on an address that is not loopback needs them, and a source address can be forged, so the target authenticates its own clients"),
@@ -1052,6 +1084,51 @@ impl Config {
 				None => {}
 			}
 			if tunnel.max_connections.is_some_and(|n| !(1..=MAX_TUNNEL_CONNECTIONS).contains(&n)) {r.error(format!("{at}.max_connections"), format!("expected an integer from 1 to {MAX_TUNNEL_CONNECTIONS}"))}
+		}
+		// Proxy inbounds: a listener of the node like the others, that strangers find with a port scan when it is public. Every connection logs in, so the rest is who may, and what an operator is told when the traffic would cross the network in the clear.
+		let mut proxied = false;
+		for (i, proxy) in self.proxies.iter().enumerate().take(MAX_INBOUNDS) {
+			let (at, here) = (format!("inbounds[{}]", self.inbounds.len() + i), proxy.listen.0);
+			match (proxy.loopback(), proxy.private(), proxy.public == Some(true)) {
+				(true, _, false) => {}
+				(true, _, true) => r.warning(format!("{at}.public"), "never needed: the listen address is loopback"),
+				(false, true, _) => r.warning(format!("{at}.listen"), "a private address is no promise that outsiders cannot reach it: on a cloud host it may be NATed one to one to a public address, and a local network has other machines. The traffic and the password are not encrypted, so anyone who reaches the port or is on the path can read them. Listen on loopback and reach it through a tunnel or a TLS front instead"),
+				(false, false, false) => r.error(format!("{at}.listen"), "expected a loopback address, a private one, or `public` set to true: SOCKS5 and HTTP carry the password and the traffic in the clear, and any other address, the wildcard and link-local ones included, is one strangers reach"),
+				(false, false, true) => r.warning(format!("{at}.listen"), "the traffic and the password cross the network unencrypted here, so anyone on the path can read them, and the listener is easy to find and block. Listen on loopback or a private address and reach it through a tunnel or a TLS front instead"),
+			}
+			if proxy.kind == ProxyType::Http && proxy.udp.is_some() {r.error(format!("{at}.udp"), "expected no udp: an http inbound has no UDP ASSOCIATE")}
+			if let Some(limits) = &proxy.limits {
+				for (key, value) in [("connections", limits.connections), ("per_source", limits.per_source), ("handshakes", limits.handshakes)] {
+					if value.is_some_and(|n| !(1..=MAX_PROXY_INBOUND_CONNECTIONS).contains(&n)) {r.error(format!("{at}.limits.{key}"), format!("expected an integer from 1 to {MAX_PROXY_INBOUND_CONNECTIONS}"))}
+				}
+			}
+			if let Some(j) = listeners.iter().position(|(_, other)| !other.datagram() && overlap(here, other.listen())) {r.error(format!("{at}.listen"), format!("conflicts with {}: a proxy inbound never shares an address and port with a listener of the node", listeners[j].0))}
+			if let Some(xray) = &self.xray {
+				if let Some(j) = xray.inbounds.iter().take(MAX_XRAY_INBOUNDS).position(|inbound| overlap(here, inbound.listen.0) || (inbound.listen.0.is_ipv6() && inbound.listen.0.ip().is_unspecified() && inbound.listen.0.port() == here.port())) {r.error(format!("{at}.listen"), format!("conflicts with xray.inbounds[{j}].listen: a proxy inbound never shares an address and port with a listener of the node"))}
+			}
+			if let Some(j) = tunnels.iter().position(|tunnel| tunnel.protocol == TunnelProtocol::Tcp && overlap(here, tunnel.listen.0)) {r.error(format!("{at}.listen"), format!("conflicts with tunnels[{j}].listen: a proxy inbound never shares an address and port with a listener of the node"))}
+			if let Some(j) = self.proxies[..i].iter().position(|other| overlap(here, other.listen.0)) {r.error(format!("{at}.listen"), format!("conflicts with inbounds[{}].listen: two proxy inbounds never share an address and port", self.inbounds.len() + j))}
+			for (key, names, known, most, what) in [("users", &proxy.users, &user_names, MAX_USERS, "user"), ("groups", &proxy.groups, &groups, MAX_GROUPS, "group")] {
+				if names.len() > most {r.error(format!("{at}.{key}"), format!("expected at most {most} entries"))}
+				index(&mut r, |j| format!("{at}.{key}[{j}]"), names.iter().take(most).map(String::as_str));
+				for (j, name) in names.iter().enumerate().take(most) {
+					if !known.contains_key(name.as_str()) {r.error(format!("{at}.{key}[{j}]"), format!("expected the name of a {what}, found a name no {what} has"))}
+				}
+			}
+			let able = |user: &User| user.proxy_password.is_some() && (proxy.users.is_empty() && proxy.groups.is_empty() || proxy.users.contains(&user.name) || user.groups.iter().any(|group| proxy.groups.contains(group)));
+			if !self.users.iter().take(MAX_USERS).any(able) {r.warning(&at, "nobody can log in: no user it admits has a proxy_password, so every connection is refused")}
+			proxied = true;
+		}
+		for (i, user) in self.users.iter().enumerate().take(MAX_USERS) {
+			let Some(password) = &user.proxy_password else {continue};
+			let (at, password) = (format!("users[{i}].proxy_password"), password.expose());
+			if password == REDACTED {
+				r.error(&at, "expected a password, found the marker the control API shows in the place of one: write the password itself");
+			} else if !(MIN_PROXY_PASSWORD..=MAX_PROXY_PASSWORD).contains(&password.len()) || !password.bytes().all(|b| (0x20..=0x7e).contains(&b) && b != b':') {
+				r.error(&at, format!("expected {MIN_PROXY_PASSWORD} to {MAX_PROXY_PASSWORD} printable ASCII characters, with no colon"));
+			} else if !proxied {
+				r.warning(&at, "never used: the config has no socks5, http or mixed inbound");
+			}
 		}
 		if tunnels.iter().map(|tunnel| u64::from(tunnel.limit())).sum::<u64>() > MAX_TUNNEL_TOTAL {r.error("tunnels", format!("expected the max_connections of all tunnels to come to at most {MAX_TUNNEL_TOTAL}: a quarter of the flow table, so that tunnels cannot fill the translation users' flows need"))}
 		r

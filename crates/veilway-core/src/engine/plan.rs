@@ -3,7 +3,7 @@
 use super::inbound::Tunnel;
 use super::route;
 use super::upstream::UpstreamState;
-use super::{control, icmp, l3, link, usage, ExitState, Traffic, UserState};
+use super::{control, icmp, l3, link, proxy, usage, ExitState, Traffic, UserState};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, LinkTransportType, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_LINK_FLOWS, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
@@ -286,6 +286,8 @@ pub struct User {
 	pub link: Option<usize>,
 	/// The flows the user may have at once: `route::MAX_FLOWS_PER_USER`, or the `max_flows` of a link.
 	pub flows: usize,
+	/// What the user's `proxy_password` comes to under `proxy::tag`, and so what a login to a proxy inbound is held against. The password itself is not kept. None for a user without one, and for a link.
+	pub proxy: Option<[u8; 32]>,
 }
 
 pub struct Device {
@@ -396,6 +398,7 @@ pub struct Rule {
 	pub group: Option<Vec<usize>>,
 	/// Links by their place in `Plan::links`. A link the config names and that is not enabled is in no plan, and so matches nothing.
 	pub link: Option<Vec<usize>>,
+	pub transport: Option<Vec<config::RuleTransport>>,
 	pub ip: Option<Vec<IpMatch>>,
 	/// Matched against the names the user resolved to the destination through the node, or against the name a DNS query asks for.
 	pub domain: Option<Vec<Pattern>>,
@@ -456,7 +459,14 @@ pub struct Plan {
 	/// How many of `users` and of `inbounds` are those of the config. What stands behind them belongs to links.
 	pub people: usize,
 	pub listening: usize,
+	/// For every proxy inbound by tag: whether each user of the config, in the order of `users`, may log in to it.
+	pub proxies: HashMap<String, Vec<bool>>,
+	/// The tags of the proxy inbounds in the order of the config, which is what their number in `rules[].inbound` follows, see `PROXY_INBOUNDS`.
+	pub proxy_tags: Vec<String>,
 }
+
+/// The number a rule's `inbound` condition gives the first proxy inbound, and `route::evaluate` is asked for when a flow comes in through it. The tunnel inbounds and the inbounds of links are numbered from 0, far below.
+pub const PROXY_INBOUNDS: usize = 1 << 20;
 
 impl Plan {
 	/// Compiles a validated config. `now` decides which users have expired, `tunnels` holds the tunnel of each inbound in the order of the config,
@@ -475,6 +485,7 @@ impl Plan {
 		let find = |map: &HashMap<String, usize>, name: &str| map.get(name).copied().ok_or_else(stale);
 		let find_all = |map: &HashMap<String, usize>, names: &Option<Vec<String>>| names.as_ref().map(|names| names.iter().map(|name| find(map, name)).collect::<anyhow::Result<Vec<usize>>>()).transpose();
 		let (exit_tags, inbound_tags) = (index(config.exits.iter().map(|exit| exit.tag.as_str()).collect()), index(config.inbounds.iter().map(|inbound| inbound.tag.as_str()).collect()));
+		let rule_inbounds: HashMap<String, usize> = inbound_tags.iter().map(|(tag, at)| (tag.clone(), *at)).chain(config.proxies.iter().enumerate().map(|(at, proxy)| (proxy.tag.clone(), PROXY_INBOUNDS + at))).collect();
 		let (group_names, user_names) = (index(config.groups.iter().map(String::as_str).collect()), index(config.users.iter().map(|user| user.name.as_str()).collect()));
 		let fallback = |policy: &Option<Policy>, default: Fallback| -> anyhow::Result<Fallback> {
 			Ok(match policy {
@@ -559,6 +570,7 @@ impl Plan {
 				state,
 				link: None,
 				flows: route::MAX_FLOWS_PER_USER,
+				proxy: user.proxy_password.as_ref().map(|password| proxy::tag(password.expose().as_bytes())),
 			});
 			// What the channel keeps for a device stays with the device while it is the same user's. A key that is given to another user is another device from here on: it starts with no exit chosen, no MTU and no connection.
 			// The plan before the first one holds what the state file remembered and knows no user, and there the key alone decides.
@@ -625,7 +637,7 @@ impl Plan {
 				denied = if lapsed.is_some() {Some(Denied::Expired)} else if written.quota_bytes.is_some_and(|quota| used >= quota) {Some(Denied::Quota)} else {None};
 				if let (None, Some(at)) = (denied, written.expires_at) {next_expiry = Some(next_expiry.map_or(at.0, |next| next.min(at.0)))}
 				user = Some(users.len());
-				users.push(User {name: name.clone(), groups: Vec::new(), entitled: Some(written.exits.iter().flatten().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?), exit: written.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?, dns: None, quota: written.quota_bytes, period: written.quota_period, expires: written.expires_at.map(|at| at.0.unix_timestamp()), denied, state, link: Some(l), flows: written.max_flows.unwrap_or(DEFAULT_LINK_FLOWS) as usize});
+				users.push(User {name: name.clone(), groups: Vec::new(), entitled: Some(written.exits.iter().flatten().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?), exit: written.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?, dns: None, quota: written.quota_bytes, period: written.quota_period, expires: written.expires_at.map(|at| at.0.unix_timestamp()), denied, state, link: Some(l), flows: written.max_flows.unwrap_or(DEFAULT_LINK_FLOWS) as usize, proxy: None});
 				if denied.is_none() {
 					device = Some(devices.len());
 					for address in &addresses {by_address.insert(*address, Holder {device: devices.len(), inbound});}
@@ -685,7 +697,7 @@ impl Plan {
 		for rule in config.routing.rules.iter().filter(|rule| rule.enabled != Some(false)) {
 			rules.push(Rule {
 				tag: rule.tag.clone(),
-				inbound: find_all(&inbound_tags, &rule.inbound)?,
+				inbound: find_all(&rule_inbounds, &rule.inbound)?,
 				user: find_all(&user_names, &rule.user)?,
 				group: find_all(&group_names, &rule.group)?,
 				link: rule.link.as_ref().map(|tags| tags.iter().filter_map(|tag| links[..paired].iter().position(|link| link.tag == *tag)).collect()),
@@ -700,6 +712,7 @@ impl Plan {
 				port: rule.port.as_ref().map(|list| list.iter().map(|range| (range.lo, range.hi)).collect()),
 				icmp_type: rule.icmp_type.clone(),
 				icmp_code: rule.icmp_code.clone(),
+				transport: rule.transport.clone(),
 				action: match &rule.action {
 					config::Action::Exit(tag) => Action::Exit(find(&exit_tags, tag)?),
 					config::Action::User => Action::User,
@@ -719,6 +732,8 @@ impl Plan {
 			l3: None,
 			notices: config.notices.iter().map(|notice| (notice.severity, notice.text.clone())).collect(),
 			latency,
+			proxy_tags: config.proxies.iter().map(|proxy| proxy.tag.clone()).collect(),
+			proxies: config.proxies.iter().map(|proxy| (proxy.tag.clone(), config.users.iter().map(|user| user.proxy_password.is_some() && (proxy.users.is_empty() && proxy.groups.is_empty() || proxy.users.contains(&user.name) || user.groups.iter().any(|group| proxy.groups.contains(group)))).collect())).collect(),
 			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry, starts, states, links, by_link, linked, people, listening,
 		})
 	}
@@ -727,6 +742,9 @@ impl Plan {
 	pub fn pool_of(&self, ip: IpAddr) -> Option<usize> {self.pools.iter().find(|(pool, _)| pool.contains(&ip)).map(|(_, inbound)| *inbound)}
 
 	pub fn is_gateway(&self, ip: IpAddr) -> bool {self.pools.iter().any(|(pool, _)| pool.addr() == ip)}
+
+	/// The number of the proxy inbound `tag` in the rules' `inbound` condition, and the one no rule names when there is none (a flow of the Xray hop).
+	pub fn proxy_index(&self, tag: Option<&str>) -> usize {tag.and_then(|tag| self.proxy_tags.iter().position(|candidate| candidate == tag)).map_or(usize::MAX, |at| PROXY_INBOUNDS + at)}
 
 	/// The inbound a tunnel belongs to under this plan. None for a tunnel the plan no longer has.
 	pub fn inbound_of(&self, tunnel: &Arc<Tunnel>) -> Option<usize> {self.inbounds.iter().position(|inbound| Arc::ptr_eq(&inbound.tunnel, tunnel))}

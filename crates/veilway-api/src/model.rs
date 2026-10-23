@@ -123,14 +123,14 @@ impl From<&config::Diff> for Diff {
 	}
 }
 
-/// A config version 1 document. Its own schema is `schema/config.v1.json`, with one difference: here every secret (`private_key`, `preshared_key`, `username`, `password`) may hold the marker `<redacted>`, and every entry of `transport_secrets` a marker that names it, `<redacted:` with eight hex digits and `>`.
+/// A config version 1 document. Its own schema is `schema/config.v1.json`, with one difference: here every secret (`private_key`, `preshared_key`, `username`, `password`, `proxy_password`) may hold the marker `<redacted>`, and every entry of `transport_secrets` a marker that names it, `<redacted:` with eight hex digits and `>`.
 #[derive(Serialize)]
 #[serde(transparent)]
 pub struct Document(pub Value);
 
 impl JsonSchema for Document {
 	fn schema_name() -> Cow<'static, str> {"Document".into()}
-	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker \"<redacted>\", and every entry of transport_secrets holds a marker that names it, \"<redacted:\" with eight hex digits and \">\". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out."})}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password, proxy_password) holds the marker \"<redacted>\", and every entry of transport_secrets holds a marker that names it, \"<redacted:\" with eight hex digits and \">\". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server, the user with that name (proxy_password). A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out."})}
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -352,6 +352,8 @@ pub struct Stats {
 	pub control: Control,
 	/// Every tunnel that runs, in the order of the config. A tunnel that a reload changed starts counting over.
 	pub tunnels: Vec<TunnelStats>,
+	/// Every proxy inbound (`socks5`, `http`, `mixed`) that runs, in the order of the config. An inbound that a reload changed starts counting over. Its bytes are in `inbounds` as well.
+	pub proxies: Vec<ProxyStats>,
 	pub udp_obfs: UdpObfs,
 	pub stream: Stream,
 	/// The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory.
@@ -480,6 +482,26 @@ impl From<veilway_core::StreamTotals> for Stream {
 			shaped: totals.shaped, streams: totals.streams, shaped_polls: totals.shaped_polls, shaped_repeats: totals.shaped_repeats, shaped_late: totals.shaped_late, shaped_streams: totals.shaped_streams, shaped_events: totals.shaped_events, shaped_beats: totals.shaped_beats, shaped_limited: totals.shaped_limited,
 		}
 	}
+}
+
+/// What one proxy inbound counted since it started. Everything but `open` only grows.
+#[derive(Serialize, JsonSchema)]
+pub struct ProxyStats {
+	/// The tag of the inbound.
+	pub name: String,
+	/// Connections the inbound took, and those open right now.
+	pub opened: u64,
+	pub open: usize,
+	/// Logins that were refused: no such user, a wrong password, a user the inbound does not admit.
+	pub refused_logins: u64,
+	/// Connections turned away at the inbound's `connections`, at a source's `per_source` and at `handshakes`, and logins refused unheard because a source had failed too many to that name.
+	pub refused_limit: u64,
+	pub refused_source: u64,
+	pub refused_busy: u64,
+	pub refused_blocked: u64,
+	/// Bytes the clients sent to their destinations and got back.
+	pub up_bytes: u64,
+	pub down_bytes: u64,
 }
 
 /// What one tunnel counted since it started. Everything but `open` only grows.

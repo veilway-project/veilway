@@ -2,7 +2,10 @@
 //! The node holds one connection to the host for each Xray it wants running: the document goes in over it, and closing it, or the node ending for any reason, stops Xray. So Xray never outlives the node, and has nothing of the node's: not its config, its state, its keys, nor its control socket.
 //! Xray sends each client's traffic out through an outbound of its own, and the outbound logs in to the hop as that client's user. So every connection is a flow of a known user: the hop applies the same gate, rules, exits, entitlement and quota as for a tunnel, and counts into the same per-user and per-exit counters.
 //! The hop answers CONNECT, and UDP ASSOCIATE for UDP (`xray_udp`). Destinations that are names are resolved here, the way the tunnel's resolver does it: with the DNS servers of the user's set, through the exit the rules give that query.
+//! What follows a login is `connect` and `relay` below and `xray_udp::associate`, which the `socks5`, `http` and `mixed` inbounds (`proxy`) run as well after their own login: one code decides and carries a user's connection, whoever the front door is.
 use super::plan::{Action, Backend, Outbound, Plan};
+use super::proxy_http::Body;
+use crate::config::RuleTransport;
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
 use super::xray_owner::{self, Lookup};
@@ -14,6 +17,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -260,7 +264,7 @@ impl Drop for Slot {
 }
 
 pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: String, owner: Lookup) {
-	let (open, limits, handshakes, mut sessions) = (Arc::new(Open::default()), Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER, owner)), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
+	let (via, handshakes, mut sessions) = (Arc::new(xray_udp::Via {label: "xray hop".to_string(), owner: Some(owner), inbound: None}), Arc::new(Semaphore::new(MAX_HANDSHAKES)), JoinSet::new());
 	loop {
 		tokio::select! {
 			accepted = listener.accept() => {
@@ -268,9 +272,9 @@ pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: S
 				// Only Xray has any business here.
 				if !from.ip().is_loopback() {continue}
 				let Ok(permit) = handshakes.clone().try_acquire_owned() else {continue};
-				let (shared, secret, open, limits) = (shared.clone(), secret.clone(), open.clone(), limits.clone());
+				let (shared, secret, via) = (shared.clone(), secret.clone(), via.clone());
 				sessions.spawn(async move {
-					if let Err(e) = session(&shared, stream, &secret, &open, &limits, permit).await {tracing::debug!("xray hop: {e:#}")}
+					if let Err(e) = session(&shared, stream, &secret, &via, permit).await {tracing::debug!("xray hop: {e:#}")}
 				});
 			}
 			Some(_) = sessions.join_next() => {}
@@ -280,11 +284,11 @@ pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: S
 
 /// The destination of a request: an address, or a name that is resolved here.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Target {Address(SocketAddr), Name(String, u16)}
+pub enum Target {Address(SocketAddr), Name(String, u16)}
 
 pub(super) fn reply(code: u8) -> [u8; 10] {[5, code, 0, 1, 0, 0, 0, 0, 0, 0]}
 
-async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open: &Arc<Open>, limits: &Arc<xray_udp::Limits>, permit: tokio::sync::OwnedSemaphorePermit) -> anyhow::Result<()> {
+async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, via: &Arc<xray_udp::Via>, permit: tokio::sync::OwnedSemaphorePermit) -> anyhow::Result<()> {
 	let hop_key = hmac::Key::new(hmac::HMAC_SHA256, b"veilway xray hop");
 	let (user, command, target) = tokio::time::timeout(HANDSHAKE, async {
 		let mut head = [0u8; 2];
@@ -353,19 +357,36 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 		client.write_all(&reply(2)).await?;
 		anyhow::bail!("a user the config does not have");
 	};
-	let refuse = async |client: &mut TcpStream, reason: Reason, code: u8| {
-		shared.count(reason);
-		let _ = client.write_all(&reply(code)).await;
-	};
 	if plan.users[at].denied.is_some() {
-		refuse(&mut client, Reason::Entitlement, 2).await;
+		shared.count(Reason::Entitlement);
+		let _ = client.write_all(&reply(2)).await;
 		anyhow::bail!("user {user}: cut off");
 	}
-	if command == 3 {return xray_udp::associate(shared.clone(), client, user, target, limits.clone(), open.clone()).await}
-	let Some(_slot) = Slot::take(open, &user, plan.users[at].flows) else {
-		refuse(&mut client, Reason::FlowTableFull, 1).await;
-		anyhow::bail!("user {user}: too many connections");
+	if command == 3 {return xray_udp::associate(shared.clone(), client, user, target, via.clone(), &|_| true).await}
+	let mut opened = match connect(shared, plan, at, target, via, None).await {
+		Ok(opened) => opened,
+		Err(refused) => {
+			shared.count(refused.reason);
+			let _ = client.write_all(&reply(refused.code)).await;
+			return Err(refused.why);
+		}
 	};
+	client.write_all(&reply(0)).await?;
+	relay(shared, &mut opened, &mut client, &[], None, &|_, _| {}, None, &|_| true, "xray hop").await;
+	Ok(())
+}
+
+/// Why a connection was not opened: what to count, the SOCKS5 reply code that tells the client (a front end that is not SOCKS5 turns it into its own answer) and what to log.
+pub(super) struct Refused {pub reason: Reason, pub code: u8, pub why: anyhow::Error}
+
+/// A connection to the destination of a user's request, decided as a flow of the tunnel is. It holds a place among the user's flows until it is dropped.
+pub(super) struct Opened {pub remote: TcpStream, pub plan: Arc<Plan>, pub at: usize, pub exit: usize, _slot: Slot}
+
+/// Takes the request of user `at` (a user of `plan` who is not denied) for `target`, an address or a name, to the end of the dial: a place among the user's flows, the name resolved with the user's DNS through the exit the rules give that query, the destination gate, the rules, the user's exits and the exit's outbound. The caller counts a refusal and tells its client, and a `Refused` carries what both need.
+/// This is the whole of what the Xray hop and the proxy inbounds do before they relay, so that neither can be given less than the other.
+pub(super) async fn connect(shared: &Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, via: &xray_udp::Via, transport: Option<RuleTransport>) -> Result<Opened, Refused> {
+	let user = plan.users[at].name.clone();
+	let Some(slot) = Slot::take(&shared.open, &user, plan.users[at].flows) else {return Err(Refused {reason: Reason::FlowTableFull, code: 1, why: anyhow::anyhow!("user {user}: too many connections")})};
 	let (name, port, found) = match target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
 		Target::Name(name, port) => {
@@ -374,42 +395,51 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 		}
 	};
 	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools) && !(shared.is_local)(*ip)) else {
-		refuse(&mut client, if found.is_empty() {Reason::Unreachable} else {Reason::Gate}, if found.is_empty() {4} else {2}).await;
-		anyhow::bail!("user {user}: {}: {}", plan.show(name.as_deref().unwrap_or("an address")), if found.is_empty() {"no address"} else {"refused by the gate"});
+		let why = anyhow::anyhow!("user {user}: {}: {}", plan.show(name.as_deref().unwrap_or("an address")), if found.is_empty() {"no address"} else {"refused by the gate"});
+		return Err(if found.is_empty() {Refused {reason: Reason::Unreachable, code: 4, why}} else {Refused {reason: Reason::Gate, code: 2, why}});
 	};
 	let (dst, shown) = (SocketAddr::new(ip, port), plan.show(name.clone().unwrap_or_else(|| ip.to_string())));
-	let (exit, outbound) = match exit_for(&plan, at, ip, 6, port, name.as_deref()) {
+	let (exit, outbound) = match exit_for(&plan, at, ip, 6, port, name.as_deref(), plan.proxy_index(via.inbound.as_deref()), transport) {
 		Ok(found) => found,
-		Err((reason, why)) => {
-			refuse(&mut client, reason, 2).await;
-			anyhow::bail!("user {user}: {shown}: {why}");
-		}
+		Err((reason, why)) => return Err(Refused {reason, code: 2, why: anyhow::anyhow!("user {user}: {shown}: {why}")}),
 	};
 	let dialled = match outbound {
 		Outbound::Socks5(up) => tokio::time::timeout(DIAL, flows::dial(up, dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result),
 		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
 		Outbound::Direct {bind, interface} => tokio::time::timeout(DIAL, flows::connect_from(*bind, interface.as_deref(), dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|e| anyhow::anyhow!("{}", e.kind()))),
 	};
-	let mut remote = match dialled {
-		Ok(remote) => remote,
-		Err(e) => {
-			refuse(&mut client, Reason::Unreachable, 5).await;
-			anyhow::bail!("user {user}: {shown}: exit {}: {e}", plan.exits[exit].tag);
-		}
-	};
-	client.write_all(&reply(0)).await?;
-	tracing::debug!("xray hop: user {user}: {shown} through exit {}", plan.exits[exit].tag);
+	let remote = dialled.map_err(|e| Refused {reason: Reason::Unreachable, code: 5, why: anyhow::anyhow!("user {user}: {shown}: exit {}: {e}", plan.exits[exit].tag)})?;
+	tracing::debug!("{}: user {user}: {shown} through exit {}", via.label, plan.exits[exit].tag);
+	Ok(Opened {remote, plan, at, exit, _slot: slot})
+}
+
+/// Carries bytes both ways between `client` and the connection `opened`, counting them for the user and the exit and with `count` (up when the flag is set) for whoever else wants them. `up` is written to the destination first. Each direction ends on its own, and the connection ends with the second.
+/// With a `body`, the client's side carries only what belongs to one HTTP request: `up` has to be cut to it by the caller, and once `body` is done the node reads nothing more from the client, so a second request that was written behind the first never reaches the destination.
+/// A user who is cut off, or removed, ends it within `WATCH`, and so does a connection that `keep` says may not go on (it is asked with the plan in force, every `WATCH`) and one that was quiet for `idle`.
+pub(super) async fn relay(shared: &Shared, opened: &mut Opened, client: &mut TcpStream, up: &[u8], mut body: Option<Body>, count: &(dyn Fn(bool, usize) + Sync), idle: Option<Duration>, keep: &(dyn Fn(&Arc<Plan>) -> bool + Sync), label: &str) {
+	let (plan, at, exit) = (opened.plan.clone(), opened.at, opened.exit);
+	let user = plan.users[at].name.as_str();
 	let (mut from_client, mut to_client) = client.split();
-	let (mut from_remote, mut to_remote) = remote.split();
-	let counted = &plan.users[at];
+	let (mut from_remote, mut to_remote) = opened.remote.split();
+	let (counted, started, last) = (&plan.users[at], Instant::now(), AtomicU64::new(0));
 	let upward = async {
 		let mut buffer = vec![0u8; CHUNK];
+		if !up.is_empty() {
+			to_remote.write_all(up).await?;
+			shared.spend(counted, true, up.len());
+			plan.exits[exit].traffic.up(up.len());
+			count(true, up.len());
+		}
 		loop {
+			if body.as_ref().is_some_and(Body::done) {return Ok(())}
 			let n = from_client.read(&mut buffer).await?;
 			if n == 0 {return to_remote.shutdown().await}
+			let n = body.as_mut().map_or(n, |body| body.take(&buffer[..n]));
 			to_remote.write_all(&buffer[..n]).await?;
 			shared.spend(counted, true, n);
 			plan.exits[exit].traffic.up(n);
+			count(true, n);
+			last.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
 		}
 	};
 	let downward = async {
@@ -420,28 +450,31 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, open
 			to_client.write_all(&buffer[..n]).await?;
 			shared.spend(counted, false, n);
 			plan.exits[exit].traffic.down(n);
+			count(false, n);
+			last.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
 		}
 	};
-	// Each direction ends on its own, and the connection ends with the second. A user who is cut off, or removed, ends it at once.
 	let both = async {tokio::join!(upward, downward)};
 	let watch = async {
 		let mut tick = tokio::time::interval(WATCH);
 		loop {
 			tick.tick().await;
-			if shared.plan().users.iter().find(|candidate| candidate.name == user && candidate.link.is_none()).is_none_or(|now| now.denied.is_some()) {return}
+			let now = shared.plan();
+			if now.users.iter().find(|candidate| candidate.name == user && candidate.link.is_none()).is_none_or(|now| now.denied.is_some()) {return "the user was cut off"}
+			if !keep(&now) {return "the login does not hold any more"}
+			if idle.is_some_and(|idle| started.elapsed().saturating_sub(Duration::from_millis(last.load(Ordering::Relaxed))) >= idle) {return "it was quiet for too long"}
 		}
 	};
 	tokio::select! {
 		_ = both => {}
-		_ = watch => tracing::debug!("xray hop: user {user}: connection ended, the user was cut off"),
+		why = watch => tracing::debug!("{label}: user {user}: connection ended, {why}"),
 	}
-	Ok(())
 }
 
-/// The exit the rules give a flow of user `at` to `ip` and `port` (`name` when it was asked for by name) and the outbound of that exit, which TCP and UDP both ask: the gate has already been through. An error is what to count and what to say.
-pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>) -> Result<(usize, &'a Outbound), (Reason, String)> {
+/// The exit the rules give a flow of user `at` that came in through `inbound` on a session of `transport` (None for the Xray hop) (the number rules' `inbound` conditions use, `usize::MAX` for the Xray hop, which has none) to `ip` and `port` (`name` when it was asked for by name) and the outbound of that exit, which TCP and UDP both ask: the gate has already been through. An error is what to count and what to say.
+pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>, inbound: usize, transport: Option<RuleTransport>) -> Result<(usize, &'a Outbound), (Reason, String)> {
 	// A name asked for, or one the user resolved to this address through the node's resolver: an address alone is matched by domain rules the way the tunnel does it.
-	let exit = match route::evaluate(plan, usize::MAX, at, ip, protocol, port, None, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))) || plan.users[at].state.names().matches(ip, patterns, Instant::now())) {
+	let exit = match route::evaluate(plan, inbound, at, ip, protocol, port, None, transport, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))) || plan.users[at].state.names().matches(ip, patterns, Instant::now())) {
 		Action::Exit(exit) => *exit,
 		Action::User => plan.automatic(at),
 		Action::Block | Action::Reject => return Err((Reason::Rule, "refused by a rule".to_string())),
@@ -523,9 +556,9 @@ mod tests {
 		let state = UpstreamState::new("b", [1; 16], [2; 32]);
 		state.known_gateways(&["203.0.113.1".parse().unwrap()]);
 		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[state]).unwrap();
-		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 6, 80, None), Err((Reason::Gate, _))));
-		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 17, 47873, Some("gateway.example.org")), Err((Reason::Gate, _))));
-		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None), Err((Reason::Unsupported, _))));
+		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Gate, _))));
+		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 17, 47873, Some("gateway.example.org"), usize::MAX, None), Err((Reason::Gate, _))));
+		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Unsupported, _))));
 	}
 
 	// The node and the apps name one Xray: the release, the executable of this architecture and the archives of the installer.

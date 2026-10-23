@@ -6,7 +6,7 @@ use super::netstack::Packet;
 use super::plan::{Action, Backend, Device, Holder, Plan, User};
 use super::route::{Decision, Key, CLOSED_IDLE};
 use super::{Over, Shared};
-use crate::config::{NoticeSeverity, Protocol, QuotaPeriod};
+use crate::config::{NoticeSeverity, Protocol, QuotaPeriod, RuleTransport};
 use etherparse::PacketBuilder;
 use ipstack::{IpStackStream, TcpSendState};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -332,9 +332,9 @@ impl Shared {
 	}
 
 	/// The action the rules of `plan` give a flow of `user` that came in on inbound `at`. `names` is what the user had resolved to the destination when the flow began.
-	pub(super) fn action<'a>(&self, plan: &'a Plan, at: usize, user: usize, key: &Key, names: &[Arc<str>]) -> &'a Action {
+	pub(super) fn action<'a>(&self, plan: &'a Plan, at: usize, user: usize, key: &Key, names: &[Arc<str>], transport: Option<RuleTransport>) -> &'a Action {
 		let icmp = (key.protocol == Protocol::ICMP || key.protocol == Protocol::ICMPV6).then_some((key.sport as u8, key.dport as u8));
-		super::route::evaluate(plan, at, user, key.dst, key.protocol, if icmp.is_some() {0} else {key.dport}, icmp, &|patterns| names.iter().any(|name| patterns.iter().any(|pattern| pattern.matches(name))))
+		super::route::evaluate(plan, at, user, key.dst, key.protocol, if icmp.is_some() {0} else {key.dport}, icmp, transport, &|patterns| names.iter().any(|name| patterns.iter().any(|pattern| pattern.matches(name))))
 	}
 }
 
@@ -482,7 +482,7 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 								let plan = shared.plan();
 								let Some(from) = plan.by_address.get(&key.src).copied().filter(|from| plan.devices[from.device].public_key == device) else {return End::Gone};
 								let (user, leaves) = (plan.devices[from.device].user, plan.exit_of(from.device));
-								let stale: Vec<(Key, u64)> = shared.flows.of(&device, plan.generation).into_iter().filter(|(flow, _, decision, names)| matches!(decision, Decision::Exit {exit, ..} if *exit != leaves) && plan.by_address.get(&flow.src).is_some_and(|holder| holder.device == from.device && matches!(shared.action(&plan, holder.inbound, user, flow, names), Action::User))).map(|(flow, entry, ..)| (flow, entry)).collect();
+								let stale: Vec<(Key, u64)> = shared.flows.of(&device, plan.generation).into_iter().filter(|(flow, _, decision, names, transport)| matches!(decision, Decision::Exit {exit, ..} if *exit != leaves) && plan.by_address.get(&flow.src).is_some_and(|holder| holder.device == from.device && matches!(shared.action(&plan, holder.inbound, user, flow, names, *transport), Action::User))).map(|(flow, entry, ..)| (flow, entry)).collect();
 								let gone = shared.flows.end(&stale, plan.generation);
 								ended += gone.len();
 								for flow in &gone {

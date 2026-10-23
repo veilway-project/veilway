@@ -28,6 +28,13 @@ pub const MAX_FILE_BYTES: u64 = 64 << 20;
 pub const MAX_JSON_NODES: usize = 8_000_000;
 pub const MAX_INBOUNDS: usize = 64;
 pub const MAX_XRAY_INBOUNDS: usize = 16;
+/// A proxy inbound (`socks5`, `http`, `mixed`): the connections it holds, how many one source may have, how many may be logging in, and the length of a user's `proxy_password`.
+pub const MAX_PROXY_INBOUND_CONNECTIONS: u32 = 65536;
+pub const DEFAULT_PROXY_CONNECTIONS: u32 = 1024;
+pub const DEFAULT_PROXY_PER_SOURCE: u32 = 64;
+pub const DEFAULT_PROXY_HANDSHAKES: u32 = 256;
+pub const MIN_PROXY_PASSWORD: usize = 16;
+pub const MAX_PROXY_PASSWORD: usize = 128;
 pub const MAX_TRANSPORTS: usize = 8;
 pub const MAX_OUTBOUNDS: usize = 256;
 /// The most `socks5` outbounds one `via` chain may hold, counting the outbound that starts it.

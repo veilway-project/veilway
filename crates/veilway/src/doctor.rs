@@ -365,6 +365,20 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			});
 		}
 	}
+	for proxy in &config.proxies {
+		let (addr, subject) = (proxy.listen.0, format!("inbound {}, tcp {}", proxy.tag, proxy.listen.0));
+		if !bound.insert((addr, true)) {continue}
+		lines.push(match probe::listen(addr, true).await {
+			Ok(()) => line(Status::Ok, "listen", subject, "the address can be bound"),
+			Err(e) if e.kind() == io::ErrorKind::AddrInUse && listens.contains(&(addr, true)) => line(Status::Ok, "listen", subject, "the address is taken, and the node on the control socket says it is the one that holds it"),
+			Err(e) => line(Status::Fail, "listen", subject, format!("the address cannot be bound ({}), so `veilway run` would not start: {}", e.kind(), match e.kind() {
+				io::ErrorKind::AddrInUse => "another program holds it. Stop that program or give the inbound another `listen`",
+				io::ErrorKind::PermissionDenied => "a port below 1024 takes root or CAP_NET_BIND_SERVICE",
+				io::ErrorKind::AddrNotAvailable => "it is not an address of this host",
+				_ => "check the address",
+			})),
+		});
+	}
 	for inbound in &config.inbounds {
 		for (t, transport) in inbound.transports.iter().enumerate() {
 			let tls = match transport {

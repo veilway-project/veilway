@@ -1,0 +1,8 @@
+GET http://Example.com:8080/a/b?c=d HTTP/1.1
+Host: other.example
+Proxy-Authorization: Basic YWxpY2U6c2VjcmV0
+Proxy-Connection: keep-alive
+Connection: keep-alive, Upgrade
+Upgrade: websocket
+Accept: */*
+

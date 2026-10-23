@@ -1,0 +1,11 @@
+POST http://example.com/ HTTP/1.1
+Transfer-Encoding: chunked
+Proxy-Authorization: Basic YWxpY2U6c2VjcmV0
+
+4;x=y
+abcd
+0
+T: v
+
+GET http://other.example/ HTTP/1.1
+

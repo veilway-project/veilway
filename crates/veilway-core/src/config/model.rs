@@ -1,5 +1,5 @@
 //! The typed document. Deserializing checks that each value is well formed on its own; `Config::validate` checks everything that relates one value to another.
-use super::{DEFAULT_TUNNEL_CONNECTIONS, DOMAIN_PATTERN, MAX_SITE_NAMES, MAX_SITE_RATE, DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_TUNNELS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_SOURCES, MAX_UPGRADE_HEADERS, MAX_UPSTREAMS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
+use super::{DEFAULT_TUNNEL_CONNECTIONS, DOMAIN_PATTERN, MAX_SITE_NAMES, MAX_SITE_RATE, DEFAULT_MTU, DEFAULT_MTU_OBFS, DEFAULT_PROOFS_PER_SOURCE, DEFAULT_REPLAY_CACHE, DEFAULT_UPGRADE_HEADERS, KEY_CHARS, MAX_CHAIN_LINKS, MAX_CREDENTIAL_BYTES, MAX_DEVICES, MAX_DEVICE_ADDRESSES, MAX_DNS_SETS, MAX_DOMAIN_BYTES, MAX_EXITS, MAX_GROUPS, MAX_INBOUNDS, MAX_LABEL_BYTES, MAX_LINKS, MAX_LINK_CANDIDATES, MAX_LINK_PINS, MAX_NAME_BYTES, MAX_NOTICES, MAX_NOTICE_BYTES, MAX_OUTBOUNDS, MIN_PROXY_PASSWORD, MAX_PROXY_PASSWORD, MAX_PROXY_INBOUND_CONNECTIONS, DEFAULT_PROXY_CONNECTIONS, DEFAULT_PROXY_HANDSHAKES, DEFAULT_PROXY_PER_SOURCE, MAX_PUBLIC_ADDRESSES, MAX_RULES, MAX_RULE_ENTRIES, MAX_TRANSPORTS, MAX_TRANSPORT_KEYS, MAX_TRANSPORT_SECRETS, MAX_TRUSTED_PROXIES, MAX_TUNNELS, MAX_TUNNEL_CONNECTIONS, MAX_TUNNEL_SOURCES, MAX_UPGRADE_HEADERS, MAX_UPSTREAMS, MAX_USERS, MAX_XRAY_INBOUNDS, NAME_PATTERN, TAG_PATTERN};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use ipnet::IpNet;
@@ -506,7 +506,7 @@ pub enum Action {Exit(String), User, Block, Reject}
 word_or_object!(Action, "{\"exit\": \"<exit tag>\"}, \"user\", \"block\" or \"reject\"", ["user" => User, "block" => Block, "reject" => Reject], "exit" => Exit);
 word_or_object_schema!(Action, "{\"exit\": \"<exit tag>\"}, \"user\", \"block\" or \"reject\"", ["user", "block", "reject"], "exit");
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
+#[derive(Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
 	#[schemars(range(min = 1, max = 1))]
@@ -517,8 +517,17 @@ pub struct Config {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_GROUPS), inner(pattern(NAME_PATTERN)))]
 	pub groups: Vec<String>,
-	#[schemars(length(max = MAX_INBOUNDS))]
+	/// The tunnel inbounds (`wireguard` and `veilway`) and, among them in the document, the proxy inbounds (`socks5`, `http` and `mixed`).
+	#[schemars(schema_with = "listed_inbounds")]
 	pub inbounds: Vec<Inbound>,
+	/// The `socks5`, `http` and `mixed` entries of `inbounds`. The reader sets this key itself from the list of `inbounds`, and a document that spells it is refused.
+	#[serde(default, rename = "proxy_inbounds")]
+	#[schemars(skip)]
+	pub proxies: Vec<ProxyInbound>,
+	/// Where each tunnel inbound and each proxy inbound stood in the document this was read from, so that a message names the entry as the operator numbered it and a document is written back in the order it came in. Never part of a comparison, and unknown for a config that was not read from a document.
+	#[serde(skip)]
+	#[schemars(skip)]
+	pub places: Places,
 	#[schemars(length(max = MAX_OUTBOUNDS))]
 	pub outbounds: Vec<Outbound>,
 	#[schemars(length(max = MAX_EXITS))]
@@ -552,6 +561,89 @@ pub struct Config {
 	/// The Xray add-on: inbounds of Xray that carry the users listed in their `clients`. Off when the key is absent.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub xray: Option<Xray>,
+}
+
+/// What `inbounds` holds when it is written: the tunnel inbounds, then the proxy inbounds.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Listed<'a> {Tunnel(&'a Inbound), Proxy(&'a ProxyInbound)}
+
+/// See `Config::places`.
+#[derive(Clone, Debug, Default)]
+pub struct Places(pub Option<(Vec<usize>, Vec<usize>)>);
+
+impl PartialEq for Places {
+	fn eq(&self, _: &Places) -> bool {true}
+}
+
+impl Config {
+	/// `text` with every `inbounds[n]` in it, which counts the tunnel inbounds and then the proxy inbounds, told in the numbers of the document the config was read from. A config that was not read from one is left as it is.
+	pub fn remap(&self, text: &str) -> String {
+		let Some((tunnels, proxies)) = &self.places.0 else {return text.to_string()};
+		let (mut out, mut rest) = (String::new(), text);
+		while let Some(at) = rest.find("inbounds[") {
+			let (head, tail) = rest.split_at(at);
+			let after = &tail["inbounds[".len()..];
+			out.push_str(head);
+			let number = after.split_once(']').and_then(|(number, _)| number.parse::<usize>().ok().map(|n| (n, number.len()))).filter(|_| !head.ends_with(|c: char| c == '.' || c == '_' || c.is_ascii_alphanumeric()));
+			match number {
+				Some((n, length)) => {
+					out.push_str(&format!("inbounds[{}", if n < tunnels.len() {tunnels[n]} else {proxies.get(n - tunnels.len()).copied().unwrap_or(n)}));
+					rest = &after[length..];
+				}
+				None => {
+					out.push_str("inbounds[");
+					rest = after;
+				}
+			}
+		}
+		out.push_str(rest);
+		out
+	}
+
+	/// The place in the document of tunnel inbound `i`, or with `proxy` of proxy inbound `i`.
+	pub fn inbound_place(&self, proxy: bool, i: usize) -> usize {
+		match &self.places.0 {
+			Some((tunnels, proxies)) => *(if proxy {proxies} else {tunnels}).get(i).unwrap_or(&i),
+			None => if proxy {self.inbounds.len() + i} else {i},
+		}
+	}
+}
+
+fn listed_inbounds(generator: &mut SchemaGenerator) -> Schema {
+	json_schema!({"type": "array", "maxItems": MAX_INBOUNDS, "items": {"oneOf": [generator.subschema_for::<Inbound>(), generator.subschema_for::<ProxyInbound>()]}})
+}
+
+impl Serialize for Config {
+	fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		let mut map = s.serialize_map(None)?;
+		map.serialize_entry("version", &self.version)?;
+		map.serialize_entry("log", &self.log)?;
+		map.serialize_entry("dns", &self.dns)?;
+		if !self.groups.is_empty() {map.serialize_entry("groups", &self.groups)?}
+		let mut listed: Vec<Listed> = self.inbounds.iter().map(Listed::Tunnel).chain(self.proxies.iter().map(Listed::Proxy)).collect();
+		// A document that was read goes back in the order it came in.
+		if let Some((tunnels, proxies)) = self.places.0.as_ref().filter(|(tunnels, proxies)| tunnels.len() == self.inbounds.len() && proxies.len() == self.proxies.len()) {
+			let mut slots: Vec<Option<Listed>> = (0..listed.len()).map(|_| None).collect();
+			for (listed, at) in listed.drain(..).zip(tunnels.iter().chain(proxies)) {
+				if let Some(slot) = slots.get_mut(*at).filter(|slot| slot.is_none()) {*slot = Some(listed)}
+			}
+			if slots.iter().all(Option::is_some) {listed = slots.into_iter().flatten().collect()} else {listed = self.inbounds.iter().map(Listed::Tunnel).chain(self.proxies.iter().map(Listed::Proxy)).collect()}
+		}
+		map.serialize_entry("inbounds", &listed)?;
+		map.serialize_entry("outbounds", &self.outbounds)?;
+		map.serialize_entry("exits", &self.exits)?;
+		map.serialize_entry("routing", &self.routing)?;
+		map.serialize_entry("users", &self.users)?;
+		if !self.notices.is_empty() {map.serialize_entry("notices", &self.notices)?}
+		if !self.public_addresses.is_empty() {map.serialize_entry("public_addresses", &self.public_addresses)?}
+		if !self.replay.is_default() {map.serialize_entry("replay", &self.replay)?}
+		if !self.links.is_empty() {map.serialize_entry("links", &self.links)?}
+		if !self.upstreams.is_empty() {map.serialize_entry("upstreams", &self.upstreams)?}
+		if !self.tunnels.is_empty() {map.serialize_entry("tunnels", &self.tunnels)?}
+		if let Some(xray) = &self.xray {map.serialize_entry("xray", xray)?}
+		map.end()
+	}
 }
 
 /// Accepted proofs one source may bring: `burst` at once, then `rate` a second. A source is an IPv4 address or an IPv6 /64.
@@ -1343,11 +1435,16 @@ pub struct Routing {
 	pub rules: Vec<Rule>,
 }
 
+/// A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuleTransport {Udp, UdpObfs, Tls, Ws, WsPlain, Fronted, FrontedShaped, Faketls, Socks5, Http}
+
 /// Every condition that is present must hold. A condition that is present is never an empty list.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend(
-	"anyOf" = [{"required": ["inbound"]}, {"required": ["user"]}, {"required": ["group"]}, {"required": ["link"]}, {"required": ["ip"]}, {"required": ["domain"]}, {"required": ["protocol"]}, {"required": ["port"]}, {"required": ["icmp_type"]}, {"required": ["icmp_code"]}],
+	"anyOf" = [{"required": ["inbound"]}, {"required": ["transport"]}, {"required": ["user"]}, {"required": ["group"]}, {"required": ["link"]}, {"required": ["ip"]}, {"required": ["domain"]}, {"required": ["protocol"]}, {"required": ["port"]}, {"required": ["icmp_type"]}, {"required": ["icmp_code"]}],
 	"dependentRequired" = {"port": ["protocol"], "icmp_type": ["protocol"], "icmp_code": ["icmp_type"]},
 ))]
 pub struct Rule {
@@ -1369,6 +1466,10 @@ pub struct Rule {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_LINKS), inner(pattern(TAG_PATTERN)))]
 	pub link: Option<Vec<String>>,
+	/// The transports of the session a flow started on: for a device of a tunnel, the transport of its session at the moment the flow was created, and for a proxy inbound `socks5` or `http`. A flow keeps what was decided for it when its device later changes transport, and a new flow follows the rule. A flow of the Xray add-on, and a DNS query of the node's resolver, match no transport.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = 1, max = MAX_RULE_ENTRIES))]
+	pub transport: Option<Vec<RuleTransport>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_RULE_ENTRIES))]
 	pub ip: Option<Vec<IpEntry>>,
@@ -1406,7 +1507,8 @@ pub struct User {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	#[schemars(length(max = MAX_GROUPS), inner(pattern(NAME_PATTERN)))]
 	pub groups: Vec<String>,
-	#[schemars(length(min = 1, max = MAX_DEVICES))]
+	/// At least one, except for a user with a `proxy_password`, who may write an empty list: such a user only logs in to proxy inbounds.
+	#[schemars(length(max = MAX_DEVICES))]
 	pub devices: Vec<Device>,
 	pub exits: Exits,
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -1419,6 +1521,10 @@ pub struct User {
 	pub quota_period: Option<QuotaPeriod>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub expires_at: Option<Timestamp>,
+	/// The password this user logs in to a `socks5`, `http` or `mixed` inbound with, under their `name` as the username. 16 to 128 printable ASCII characters, no colon. Without one the user cannot log in to any of them.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(min = MIN_PROXY_PASSWORD, max = MAX_PROXY_PASSWORD))]
+	pub proxy_password: Option<Secret<String>>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
@@ -1776,4 +1882,85 @@ pub struct XrayClient {
 	/// A UUID for `vless`. For `trojan` a password of 22 to 128 characters from A-Z a-z 0-9 and _ - . + / =. For `shadowsocks` a key of 32 bytes as standard base64. No two clients of an inbound share a secret.
 	#[schemars(length(min = 22, max = 128))]
 	pub secret: Secret<String>,
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyType {
+	/// SOCKS5 with username and password (RFC 1929): CONNECT, and UDP ASSOCIATE unless `udp` is false.
+	Socks5,
+	/// An HTTP proxy: CONNECT, and plain `http://` requests, one request to a connection.
+	Http,
+	/// One port for both: a first byte of 0x05 is SOCKS5 and anything else is read as HTTP.
+	Mixed,
+}
+
+/// Capacity numbers of a proxy inbound.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyLimits {
+	/// Connections the inbound holds at once, logged in or not. Defaults to 1024.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = MAX_PROXY_INBOUND_CONNECTIONS))]
+	pub connections: Option<u32>,
+	/// How many of those one source may have. A source is an IPv4 address or an IPv6 /64. Defaults to 64.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = MAX_PROXY_INBOUND_CONNECTIONS))]
+	pub per_source: Option<u32>,
+	/// Connections that have not finished logging in. Defaults to 256.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 1, max = MAX_PROXY_INBOUND_CONNECTIONS))]
+	pub handshakes: Option<u32>,
+}
+
+/// An inbound that lets other software use this node as a plain proxy. Every connection logs in as a user with that user's `proxy_password`, and what comes in goes through the same gate, rules, exits, entitlement, quotas and counters as a tunnel's traffic. SOCKS5 and HTTP carry no encryption of their own.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyInbound {
+	#[schemars(pattern(TAG_PATTERN))]
+	pub tag: String,
+	#[serde(rename = "type")]
+	pub kind: ProxyType,
+	/// The TCP address this inbound listens on. A loopback address is taken as it is. A private address (RFC 1918, 100.64.0.0/10, unique local) is taken too, with a warning that it may be reachable from outside. Any other address, the wildcard and link-local addresses included, needs `public`.
+	pub listen: Addr,
+	/// The users that may log in. With `groups`, a user in either list may. Without both, every user that has a `proxy_password` may.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_USERS), inner(pattern(NAME_PATTERN)))]
+	pub users: Vec<String>,
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[schemars(length(max = MAX_GROUPS), inner(pattern(NAME_PATTERN)))]
+	pub groups: Vec<String>,
+	/// Whether UDP ASSOCIATE is answered. Defaults to true. Only `socks5` and `mixed` have it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub udp: Option<bool>,
+	/// Says the operator knows that traffic and passwords cross the network in the clear on a public address. Defaults to false.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub public: Option<bool>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub limits: Option<ProxyLimits>,
+}
+
+impl ProxyInbound {
+	/// Whether UDP ASSOCIATE is answered.
+	pub fn udp(&self) -> bool {self.kind != ProxyType::Http && self.udp != Some(false)}
+
+	pub fn connections(&self) -> usize {self.limits.and_then(|limits| limits.connections).unwrap_or(DEFAULT_PROXY_CONNECTIONS) as usize}
+
+	pub fn per_source(&self) -> usize {self.limits.and_then(|limits| limits.per_source).unwrap_or(DEFAULT_PROXY_PER_SOURCE) as usize}
+
+	pub fn handshakes(&self) -> usize {self.limits.and_then(|limits| limits.handshakes).unwrap_or(DEFAULT_PROXY_HANDSHAKES) as usize}
+
+	/// Whether the listen address is loopback, which only this host reaches. The one address that needs no warning.
+	pub fn loopback(&self) -> bool {self.listen.0.ip().is_loopback()}
+
+	/// Whether the listen address is a private one that is not loopback: RFC 1918, shared address space (100.64.0.0/10) or unique local IPv6. Such an address is no promise that outsiders cannot reach it: a cloud host's private address is often 1:1 NATed to a public one, and a local network has other machines. Any other address is reachable by strangers or means nothing as an address to listen on.
+	pub fn private(&self) -> bool {
+		match self.listen.0.ip() {
+			IpAddr::V4(a) => a.is_private() || (a.octets()[0] == 100 && a.octets()[1] & 0xc0 == 64),
+			IpAddr::V6(a) => a.segments()[0] & 0xfe00 == 0xfc00,
+		}
+	}
+
+	/// The inbound with its defaults written out, so that two spellings of one inbound are equal.
+	pub fn effective(&self) -> ProxyInbound {ProxyInbound {udp: Some(self.udp()), public: Some(self.public == Some(true)), limits: Some(ProxyLimits {connections: Some(self.connections() as u32), per_source: Some(self.per_source() as u32), handshakes: Some(self.handshakes() as u32)}), ..self.clone()}}
 }

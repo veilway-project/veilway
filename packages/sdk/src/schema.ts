@@ -524,7 +524,7 @@ export interface components {
             /** Format: uint64 */
             throttled: number;
         };
-        /** @description A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password) holds the marker "<redacted>", and every entry of transport_secrets holds a marker that names it, "<redacted:" with eight hex digits and ">". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server. A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out. */
+        /** @description A config version 1 document, see schema/config.v1.json. In an answer every secret (private_key, preshared_key, username, password, proxy_password) holds the marker "<redacted>", and every entry of transport_secrets holds a marker that names it, "<redacted:" with eight hex digits and ">". In a request a marker stands for the value the same object has in the running config: the inbound with that tag, the device with that public_key, the socks5 outbound with that tag and that server, the user with that name (proxy_password). A marker in transport_secrets stands for the secret of that device which it names, wherever it is in the list: an entry that is left out is removed, and a marker that names no secret of the device is an error. An outbound whose server is new or has changed needs its username and password written out. */
         Document: Record<string, never>;
         /** @description The one shape of every answer that is not a success. */
         ErrorBody: {
@@ -736,6 +736,41 @@ export interface components {
             message: string;
             path: string;
         };
+        /** @description What one proxy inbound counted since it started. Everything but `open` only grows. */
+        ProxyStats: {
+            /** Format: uint64 */
+            down_bytes: number;
+            /** @description The tag of the inbound. */
+            name: string;
+            /** Format: uint */
+            open: number;
+            /**
+             * Format: uint64
+             * @description Connections the inbound took, and those open right now.
+             */
+            opened: number;
+            /** Format: uint64 */
+            refused_blocked: number;
+            /** Format: uint64 */
+            refused_busy: number;
+            /**
+             * Format: uint64
+             * @description Connections turned away at the inbound's `connections`, at a source's `per_source` and at `handshakes`, and logins refused unheard because a source had failed too many to that name.
+             */
+            refused_limit: number;
+            /**
+             * Format: uint64
+             * @description Logins that were refused: no such user, a wrong password, a user the inbound does not admit.
+             */
+            refused_logins: number;
+            /** Format: uint64 */
+            refused_source: number;
+            /**
+             * Format: uint64
+             * @description Bytes the clients sent to their destinations and got back.
+             */
+            up_bytes: number;
+        };
         /** @enum {string} */
         QuotaPeriod: "daily" | "weekly" | "monthly";
         /** @description The counters of one user, inbound or exit, with how fast they grew over the last seconds. */
@@ -899,6 +934,8 @@ export interface components {
             inbounds: components["schemas"]["Rated"][];
             /** @description Every outbound of the running config, in its order. An exit with an `l3` or `block` backend has no outbound and is in none of them. */
             outbounds: components["schemas"]["OutboundStats"][];
+            /** @description Every proxy inbound (`socks5`, `http`, `mixed`) that runs, in the order of the config. An inbound that a reload changed starts counting over. Its bytes are in `inbounds` as well. */
+            proxies: components["schemas"]["ProxyStats"][];
             /** @description The replay memory of the obfuscated transports. Null for a node that never ran one, which keeps no replay memory. */
             replay: components["schemas"]["Replay"] | null;
             /**
