@@ -344,6 +344,7 @@ fn vpn_plugin() -> TauriPlugin<Wry> {
 pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
+		.plugin(tauri_plugin_barcode_scanner::init())
 		.plugin(vpn_plugin())
 		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, share_file, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {

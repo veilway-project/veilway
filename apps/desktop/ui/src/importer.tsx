@@ -1,15 +1,21 @@
 import {Banner, Button, Glass, List, ListRow, SecretField, TextField, UnsafeNote} from "@veilway/ui";
 import {useEffect, useRef, useState, type ChangeEvent, type FormEvent} from "react";
-import {agreement, base64, failureText, LegacyNote, protocolName, useD} from "./kit.tsx";
+import {agreement, ANDROID, base64, CAMERA, failureText, LegacyNote, protocolName, useD} from "./kit.tsx";
+import {ScanDialog} from "./scan.tsx";
 import {asksPrivate, call, type BundleReview, type LegacyOffer, type Offer, type PrivateAsk, type Review, type Subscription} from "./tauri.ts";
 
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void, onBundle: (review: BundleReview) => void}) {
-	const {t, locale, number} = useD(), [text, setText] = useState(""), [offer, setOffer] = useState<Offer | LegacyOffer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState("");
+	const {t, locale, number} = useD(), [text, setText] = useState(""), [offer, setOffer] = useState<Offer | LegacyOffer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState(""), [scanning, setScanning] = useState(false);
 	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const bundle = () => run(call("bundle_pick"), found => { if (found) onBundle(found); });
 	const qr = (picture: Blob) => run(base64(picture).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_qr", {data})), setOffer);
+	// Android: its scanner reads the code and hands over only the text, which goes through the same step as a pasted link.
+	const scanApp = () => run(import("@tauri-apps/plugin-barcode-scanner").then(async ({scan, requestPermissions, Format}) => {
+		if (await requestPermissions() !== "granted") return Promise.reject("camera_denied");
+		return (await scan({formats: [Format.QRCode], windowed: false})).content;
+	}).catch(error => Promise.reject(error === "camera_denied" ? error : "scan_failed")).then(text => call("import_open", {source: {kind: "link", text}})), setOffer);
 	const proceed = (agreed?: string[]) => run(call("import_proceed", agreed ? {private: agreed} : {}), found => { if (asksPrivate(found)) { setAsked(found.ask_private); } else { setAsked(null); setReview(found); } });
 	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setSealed(null); setPassword(""); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
 	useEffect(() => {
@@ -107,12 +113,15 @@ export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: 
 			<div className="d-actions d-start">
 				<Button icon="upload" disabled={busy} onClick={() => fileInput.current?.click()}>{t("import.file")}</Button>
 				<Button icon="upload" disabled={busy} onClick={() => qrInput.current?.click()}>{t("import.qr")}</Button>
+				{CAMERA && <Button disabled={busy} onClick={() => ANDROID ? scanApp() : setScanning(true)}>{t("import.scan")}</Button>}
 				<Button icon="upload" disabled={busy} onClick={bundle}>{t("bundle.open")}</Button>
 			</div>
+			{ANDROID && <p className="vw-muted vw-small">{t("scan.privacyApp")}</p>}
 			{!matchMedia("(pointer: coarse)").matches && <p className="vw-muted vw-small">{t("import.pasteHint")}</p>}
 			<input ref={fileInput} type="file" hidden onChange={event => picked(event, "file")}/>
 			<input ref={qrInput} type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" hidden onChange={event => picked(event, "qr")}/>
 			{failure}
+			{scanning && <ScanDialog onClose={() => setScanning(false)} onFound={found => { setScanning(false); setOffer(found); }}/>}
 			{!first && <Button variant="quiet" className="d-start" onClick={cancel}>{t("common.cancel")}</Button>}
 		</Glass>
 	</div>;

@@ -43,6 +43,11 @@ if "VeilwayVpnService" not in text:
 if "InstallReceiver" not in text:
     text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + '\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />', text, count=1)
     text = text.replace("</application>", '        <receiver android:name=".InstallReceiver" android:exported="false" />\n    </application>', 1)
+# The scanner plugin declares a required camera; a phone without one can still install the app and use links, files and pictures.
+if "android.hardware.camera.any" not in text or 'tools:replace="android:required"' not in text:
+    if "xmlns:tools=" not in text:
+        text = re.sub(r"<manifest\b", '<manifest xmlns:tools="http://schemas.android.com/tools"', text, count=1)
+    text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + '\n    <uses-feature android:name="android.hardware.camera.any" android:required="false" tools:replace="android:required" />', text, count=1)
 # The vault and its key are not backed up or transferred: the key is wrapped by a Keystore key that no restore brings back, so a restored vault could not be opened.
 text = re.sub(r"\s+android:(allowBackup|dataExtractionRules|fullBackupContent)=\"[^\"]*\"", "", text)
 text = re.sub(r"<application\b", "<application android:allowBackup=\"false\" android:dataExtractionRules=\"@xml/data_extraction_rules\" android:fullBackupContent=\"@xml/backup_rules\"", text, count=1)

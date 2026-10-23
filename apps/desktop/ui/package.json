@@ -17,6 +17,7 @@
 	},
 	"dependencies": {
 		"@tauri-apps/api": "^2.9.0",
+		"@tauri-apps/plugin-barcode-scanner": "^2.5.3",
 		"@veilway/i18n": "file:../../../../veilway-ui/packages/i18n",
 		"@veilway/ui": "file:../../../../veilway-ui/packages/ui",
 		"react": "^19.3.0",
