@@ -64,7 +64,7 @@
               "type": "string"
             },
             "proxy_only": {
-              "description": "Defaults to true on a socks5 outbound. Must be absent or false on a direct one.",
+              "description": "Defaults to true on a socks5 or xray outbound. Must be absent or false on a direct one.",
               "type": "boolean"
             },
             "tcp_idle_secs": {
@@ -387,6 +387,10 @@
           "pattern": "^[A-Z]{2}$",
           "type": "string"
         },
+        "load": {
+          "$ref": "#/$defs/Load",
+          "description": "How busy apps are told this exit is. Absent means the exit reports no load."
+        },
         "name": {
           "description": "Display name. Defaults to the tag.",
           "maxLength": 64,
@@ -516,6 +520,10 @@
           "minItems": 1,
           "type": "array",
           "uniqueItems": true
+        },
+        "enabled": {
+          "description": "Defaults to true. An inbound that is not enabled is validated like any other and does not listen: its tunnel takes no device, its transports bind nothing and its addresses stay reserved.",
+          "type": "boolean"
         },
         "mtu": {
           "description": "Defaults to 1420, and to 1390 for a `veilway` inbound with a `udp-obfs` transport.",
@@ -972,6 +980,49 @@
         }
       ]
     },
+    "Load": {
+      "additionalProperties": false,
+      "description": "Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row.",
+      "properties": {
+        "busy": {
+          "format": "uint32",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "by": {
+          "$ref": "#/$defs/LoadBy"
+        },
+        "very_busy": {
+          "description": "Greater than `busy`.",
+          "format": "uint32",
+          "maximum": 1000000,
+          "minimum": 2,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "by",
+        "busy",
+        "very_busy"
+      ],
+      "type": "object"
+    },
+    "LoadBy": {
+      "description": "What `Load::by` measures.",
+      "oneOf": [
+        {
+          "const": "flows",
+          "description": "Flows open on the exit, all users together.",
+          "type": "string"
+        },
+        {
+          "const": "mbps",
+          "description": "Up and down traffic of the exit added together, in megabits per second, averaged over the last 30 seconds.",
+          "type": "string"
+        }
+      ]
+    },
     "Log": {
       "additionalProperties": false,
       "properties": {
@@ -1173,6 +1224,91 @@
             "server"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. This outbound has no `via` and is no `via` of another outbound, a link or an upstream: it is reached through a Unix socket.",
+          "oneOf": [
+            {
+              "required": [
+                "link"
+              ]
+            },
+            {
+              "required": [
+                "protocol",
+                "server"
+              ]
+            }
+          ],
+          "properties": {
+            "allow_private": {
+              "description": "Whether the server may be at a private, shared (CGNAT) or unique local address. Off unless true. Loopback, link-local, the node's own addresses and its inbounds' pools are refused whatever this says.",
+              "type": "boolean"
+            },
+            "cipher": {
+              "description": "The cipher of `vmess` (`auto`, `aes-128-gcm` or `chacha20-poly1305`, default `auto`) and the method of `shadowsocks` (required).",
+              "type": "string"
+            },
+            "flow": {
+              "$ref": "#/$defs/XrayFlow",
+              "description": "`vless` only, and only over TCP with TLS or REALITY."
+            },
+            "id": {
+              "description": "The user id of `vless` and `vmess`, a UUID.",
+              "type": "string"
+            },
+            "link": {
+              "description": "Input only: a share link of a scheme the client's legacy reader knows (`vless`, `vmess`, `trojan`, `ss`), with the limits of the client's table: TCP, WebSocket and gRPC streams, TLS and REALITY, Vision. It is a secret and is never written back, so this is always absent in what the node holds.",
+              "maxLength": 4096,
+              "type": "string",
+              "writeOnly": true
+            },
+            "password": {
+              "description": "The password of `trojan` and `shadowsocks`. For a `shadowsocks` 2022 cipher it is the key as standard base64.",
+              "type": "string"
+            },
+            "protocol": {
+              "$ref": "#/$defs/XrayOutboundProtocol"
+            },
+            "security": {
+              "$ref": "#/$defs/XraySecurity",
+              "description": "Defaults to `none`, which `vless` and `trojan` refuse. Certificates are always checked: there is no way to switch that off."
+            },
+            "server": {
+              "$ref": "#/$defs/HostPort",
+              "description": "The provider's server. Xray resolves nothing: a name is looked up by the node through `dns.servers`, every address it gives must pass the dial rules, and the one used is written into the add-on's document."
+            },
+            "tag": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/XrayTransport",
+              "description": "Defaults to `tcp`."
+            },
+            "type": {
+              "const": "xray",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tag"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1267,6 +1403,10 @@
       "additionalProperties": false,
       "description": "An inbound that lets other software use this node as a plain proxy. Every connection logs in as a user with that user's `proxy_password`, and what comes in goes through the same gate, rules, exits, entitlement, quotas and counters as a tunnel's traffic. SOCKS5 and HTTP carry no encryption of their own.",
       "properties": {
+        "enabled": {
+          "description": "Defaults to true. An inbound that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+          "type": "boolean"
+        },
         "groups": {
           "items": {
             "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
@@ -1933,6 +2073,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "listen": {
               "$ref": "#/$defs/Addr"
             },
@@ -1950,6 +2094,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "listen": {
               "$ref": "#/$defs/Addr"
             },
@@ -1976,6 +2124,10 @@
           "additionalProperties": false,
           "description": "WireGuard datagrams inside the `udp-obfs` envelope, for a `veilway` inbound.",
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -1999,6 +2151,10 @@
           "properties": {
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "http2": {
               "$ref": "#/$defs/Http2",
@@ -2036,6 +2192,10 @@
           "additionalProperties": false,
           "description": "The borrowed-site transport of a `veilway` inbound (alpha, new and unreviewed): the node holds no certificate, a client proves itself inside its first TLS message, and every other connection is relayed to the real `site`. `limits` takes `relayed` and `site_rate` alone.",
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -2073,6 +2233,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
@@ -2119,6 +2283,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
@@ -2176,6 +2344,10 @@
             "decoy": {
               "$ref": "#/$defs/Decoy"
             },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -2219,6 +2391,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
@@ -2702,6 +2878,15 @@
       ],
       "type": "object"
     },
+    "XhttpMode": {
+      "enum": [
+        "auto",
+        "packet-up",
+        "stream-up",
+        "stream-one"
+      ],
+      "type": "string"
+    },
     "Xray": {
       "additionalProperties": false,
       "description": "The Xray add-on's part of the config. Xray runs as a child of the node and only ever reaches the network through the node: its traffic is attributed to the user of the client, and the node's gate, rules, exits and quotas apply to it.",
@@ -2739,6 +2924,12 @@
         "secret"
       ],
       "type": "object"
+    },
+    "XrayFlow": {
+      "enum": [
+        "xtls-rprx-vision"
+      ],
+      "type": "string"
     },
     "XrayInbound": {
       "additionalProperties": false,
@@ -2796,6 +2987,15 @@
       ],
       "type": "object"
     },
+    "XrayOutboundProtocol": {
+      "enum": [
+        "vless",
+        "vmess",
+        "trojan",
+        "shadowsocks"
+      ],
+      "type": "string"
+    },
     "XrayProtocol": {
       "oneOf": [
         {
@@ -2812,6 +3012,176 @@
           "const": "shadowsocks",
           "description": "The cipher is 2022-blake3-aes-256-gcm with a key for the server and one per client. Every key is 32 bytes as standard base64.",
           "type": "string"
+        }
+      ]
+    },
+    "XraySecurity": {
+      "description": "The security around an Xray outbound's stream. The chain is always checked against the system roots, and there is no key that turns that off or pins a certificate instead.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`server_name` defaults to the server's name, and is needed when the server is an address. `fingerprint` is the ClientHello Xray imitates, default `chrome`. `alpn` is `h2` and `http/1.1` in any order.",
+          "properties": {
+            "alpn": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "server_name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tls",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`public_key` is 43 characters of base64url. `short_id` is up to 16 hexadecimal digits, an even number of them.",
+          "properties": {
+            "fingerprint": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string"
+            },
+            "server_name": {
+              "type": "string"
+            },
+            "short_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "reality",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "server_name",
+            "public_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "XrayTransport": {
+      "description": "The stream an Xray outbound speaks over its connection. Fields that are left out take Xray's own defaults, `/` for a path.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "tcp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ws",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "authority": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "type": {
+              "const": "grpc",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "httpupgrade",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/XhttpMode"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "xhttp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     }

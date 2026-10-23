@@ -130,12 +130,12 @@ fn parsed(doc: &Value) -> Config {
 	config
 }
 
-/// Starts a node on `document` after `change` had its way with it. The usage pushes of its control channel come 300 to 600 ms apart, so no test waits a minute for one.
+/// Starts a node on `document` after `change` had its way with it. The usage pushes of its control channel come 300 to 600 ms apart, and the node looks at the load of its exits every 300 ms and tells a device a new level every 1.5 s at the earliest, so no test waits a minute for one.
 async fn launch(change: impl FnOnce(&mut Value), state: Option<PathBuf>) -> Node {
 	let ((main, seen_main), (alt, seen_alt), addr) = (proxy("main", ANY).await, proxy("alt", ANY).await, listen());
 	let mut doc = document(main, alt, addr);
 	change(&mut doc);
-	let engine = veilway_core::start(&parsed(&doc), Options {state, usage_push: 300..=600, ..Options::new("")}).await.unwrap();
+	let engine = veilway_core::start(&parsed(&doc), Options {state, usage_push: 300..=600, load: (Duration::from_millis(300), Duration::from_millis(1500)), ..Options::new("")}).await.unwrap();
 	Node {engine, addr, doc, main: seen_main, alt: seen_alt}
 }
 
@@ -1255,4 +1255,24 @@ async fn a_device_without_a_choice_leaves_through_a_working_exit_while_its_own_i
 	while let Ok(event) = events.try_recv() {if let Event::ExitWorkingChanged {exit, working} = event {told.push((exit, working))}}
 	assert_eq!(told, [("main".to_string(), false), ("main".to_string(), true)]);
 	assert_eq!(node.engine.exit_health()[0].proxy_flips, 2);
+}
+
+// "Load" of an exit: the node measures it for an exit that has a `load` setting, a device sees the level in its catalogue and is pushed a new one when it changes, at most once per push interval, and an exit without a setting says nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exit_with_a_load_setting_tells_a_device_how_busy_it_is() {
+	let node = launch(|doc| doc["exits"][0]["load"] = json!({"by": "flows", "busy": 2, "very_busy": 4}), None).await;
+	tokio::time::sleep(Duration::from_millis(800)).await;
+	let mut a = Client::connect(KEY_A, node.addr).await;
+	let mut channel = Channel::of_a(&mut a, 50000).await;
+	let (_, exits, ..) = channel.snapshot(&mut a).await;
+	assert_eq!(exits.iter().map(|exit| (exit.tag.as_str(), exit.load)).collect::<Vec<_>>(), [("main", Load::Low), ("alt", Load::Unknown)]);
+	let mut held = Vec::new();
+	for sport in 40001..40003 {held.push(leaves(&mut a, A, sport, 80).await.0)}
+	let level = |exits: Vec<control::Exit>| exits.iter().map(|exit| (exit.tag.as_str().to_string(), exit.load)).collect::<Vec<_>>();
+	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(10)).await.expect("no catalogue was pushed for two flows");
+	assert_eq!(level(exits), [("main".to_string(), Load::Medium), ("alt".to_string(), Load::Unknown)]);
+	for sport in 40003..40005 {held.push(leaves(&mut a, A, sport, 80).await.0)}
+	let exits = pushed_exits(&mut channel, &mut a, Duration::from_secs(10)).await.expect("no catalogue was pushed for four flows");
+	assert_eq!(level(exits), [("main".to_string(), Load::High), ("alt".to_string(), Load::Unknown)]);
+	assert_eq!(node.engine.exit_health().iter().map(|health| (health.exit.as_str(), health.load)).collect::<Vec<_>>(), [("main", Some("high")), ("alt", None)]);
 }

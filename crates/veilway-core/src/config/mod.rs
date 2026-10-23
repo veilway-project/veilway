@@ -28,6 +28,8 @@ pub const MAX_FILE_BYTES: u64 = 64 << 20;
 pub const MAX_JSON_NODES: usize = 8_000_000;
 pub const MAX_INBOUNDS: usize = 64;
 pub const MAX_XRAY_INBOUNDS: usize = 16;
+/// Outbounds of the `xray` type: each is a loopback listener of the add-on's one process.
+pub const MAX_XRAY_OUTBOUNDS: usize = 16;
 /// A proxy inbound (`socks5`, `http`, `mixed`): the connections it holds, how many one source may have, how many may be logging in, and the length of a user's `proxy_password`.
 pub const MAX_PROXY_INBOUND_CONNECTIONS: u32 = 65536;
 pub const DEFAULT_PROXY_CONNECTIONS: u32 = 1024;
@@ -76,6 +78,8 @@ pub const MAX_LINK_CANDIDATES: usize = 16;
 pub const MAX_LINK_PINS: usize = 4;
 pub const MAX_NAME_BYTES: usize = 64;
 pub const MAX_EXIT_NAME_CHARS: usize = 64;
+/// The most `load.busy` and `load.very_busy` of an exit take, in flows or in Mbit/s.
+pub const MAX_LOAD: u32 = 1_000_000;
 pub const MAX_INTERFACE_BYTES: usize = 15;
 pub const MAX_WS_PATH_BYTES: usize = 256;
 pub const MAX_DOMAIN_BYTES: usize = 253;

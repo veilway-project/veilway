@@ -2,10 +2,10 @@
 use crate::subscription::legacy::{Credential, Entry, Scheme, Server, Tls};
 use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine};
 
-const FINGERPRINTS: [&str; 7] = ["chrome", "firefox", "safari", "ios", "android", "edge", "randomized"];
-const ALPN: [&str; 2] = ["h2", "http/1.1"];
-const VMESS_CIPHERS: [&str; 3] = ["auto", "aes-128-gcm", "chacha20-poly1305"];
-const SHADOWSOCKS_CIPHERS: [&str; 6] = ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"];
+pub const FINGERPRINTS: [&str; 7] = ["chrome", "firefox", "safari", "ios", "android", "edge", "randomized"];
+pub const ALPN: [&str; 2] = ["h2", "http/1.1"];
+pub const VMESS_CIPHERS: [&str; 3] = ["auto", "aes-128-gcm", "chacha20-poly1305"];
+pub const SHADOWSOCKS_CIPHERS: [&str; 6] = ["aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305", "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm", "2022-blake3-chacha20-poly1305"];
 
 /// The part of the table a profile fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -718,6 +718,28 @@ fn outbounds() {
 }
 
 #[test]
+fn the_load_of_an_exit() {
+	cases! {error_at:
+		"exits[0].load.busy": |d| d["exits"][0]["load"] = json!({"by": "flows", "busy": 0, "very_busy": 10});
+		"exits[0].load.busy": |d| d["exits"][0]["load"] = json!({"by": "mbps", "busy": 1000001, "very_busy": 1000002});
+		"exits[0].load.very_busy": |d| d["exits"][0]["load"] = json!({"by": "flows", "busy": 10, "very_busy": 10});
+		"exits[0].load.very_busy": |d| d["exits"][0]["load"] = json!({"by": "flows", "busy": 10, "very_busy": 5});
+		"exits[0].load.very_busy": |d| d["exits"][0]["load"] = json!({"by": "mbps", "busy": 10, "very_busy": 1000001});
+		"exits[3].load": |d| d["exits"][3]["load"] = json!({"by": "flows", "busy": 10, "very_busy": 20});
+	};
+	all_clean! {
+		|d| d["exits"][0]["load"] = json!({"by": "flows", "busy": 1, "very_busy": 2});
+		|d| d["exits"][0]["load"] = json!({"by": "mbps", "busy": 999999, "very_busy": 1000000});
+		|d| d["exits"][2]["load"] = json!({"by": "mbps", "busy": 100, "very_busy": 400});
+	};
+	for bad in [json!({"by": "bytes", "busy": 1, "very_busy": 2}), json!({"by": "flows", "busy": 1}), json!({"by": "flows", "busy": 1.5, "very_busy": 2}), json!({"by": "flows", "busy": -1, "very_busy": 2}), json!({"by": "flows", "busy": 1, "very_busy": 2, "extra": 1})] {
+		let mut doc = good();
+		doc["exits"][0]["load"] = bad.clone();
+		assert!(Config::parse(doc.to_string().as_bytes()).is_err(), "{bad} was parsed");
+	}
+}
+
+#[test]
 fn exits_and_backends() {
 	cases! {error_at:
 		"exits[0].name": |d| d["exits"][0]["name"] = json!("");

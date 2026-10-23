@@ -1,4 +1,5 @@
 //! Reads a QR code out of a picture the user pasted or picked. It runs in the unprivileged app, never in the helper, because a picture is hostile input: the file is size-limited before it is decoded, and what comes out is only a text that the import treats like any pasted link (nothing is contacted before the user's first yes).
+use base64::Engine;
 use image::{ImageReader, Limits};
 use std::io::Cursor;
 use veilway_engine::import::Code;
@@ -7,6 +8,8 @@ const FILE_MAX: usize = 16 << 20;
 const SIDE_MAX: u32 = 8000;
 /// The longest text taken from a code: a link is far shorter, a whole carried subscription fits in a few kilobytes.
 const TEXT_MAX: usize = 64 << 10;
+/// The most base64 text taken for one camera frame: an 800 pixel JPEG is tens of kilobytes, so this stops a window that sends pictures instead of frames.
+const FRAME_MAX: usize = 512 << 10;
 
 pub fn decode(bytes: &[u8]) -> Result<String, Code> {
 	if bytes.len() > FILE_MAX {return Err(Code::PictureLarge)}
@@ -24,6 +27,15 @@ pub fn decode(bytes: &[u8]) -> Result<String, Code> {
 		}
 	}
 	Err(Code::NoQr)
+}
+
+/// One frame of the camera preview, as base64 of a JPEG. No code in the frame is the normal case and comes back as `None`; only a frame that cannot be read is an error.
+pub fn frame(data: &str) -> Result<Option<String>, Code> {
+	if data.len() > FRAME_MAX {return Err(Code::PictureLarge)}
+	match decode(&base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| Code::PictureUnreadable)?) {
+		Err(Code::NoQr) => Ok(None),
+		found => found.map(Some),
+	}
 }
 
 /// The picture of a code for a link the user is about to pass on, as SVG text with its quiet zone. The window shows it as an image and never as markup.
@@ -71,5 +83,18 @@ mod tests {
 		assert_eq!(decode(&blank).unwrap_err(), Code::NoQr);
 		assert_eq!(decode(b"hello").unwrap_err(), Code::PictureUnreadable);
 		assert!(decode(&vec![0; FILE_MAX + 1]).is_err());
+	}
+
+	#[test]
+	fn a_camera_frame_is_a_code_a_miss_or_an_error() {
+		let link = "veilway://example.invalid/s/abcdefghijklmnop#token";
+		let encode = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+		assert_eq!(frame(&encode(&picture(link))).unwrap().as_deref(), Some(link));
+		let mut blank = Vec::new();
+		image::DynamicImage::new_luma8(64, 64).write_to(&mut Cursor::new(&mut blank), ImageFormat::Png).unwrap();
+		assert_eq!(frame(&encode(&blank)), Ok(None));
+		assert_eq!(frame("not base64 !"), Err(Code::PictureUnreadable));
+		assert_eq!(frame(&encode(b"hello")), Err(Code::PictureUnreadable));
+		assert_eq!(frame(&"A".repeat(FRAME_MAX + 1)), Err(Code::PictureLarge));
 	}
 }

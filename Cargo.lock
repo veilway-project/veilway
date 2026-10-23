@@ -3073,6 +3073,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "smoltcp",
  "socket2",
  "time",

@@ -13,6 +13,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+#[cfg(unix)]
+use tokio::net::UnixStream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -135,6 +139,78 @@ pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> 
 	Ok((control, relay))
 }
 
+/// A connection to a destination through an outbound: TCP to a SOCKS5 proxy, or a Unix socket to the Trojan inbound of an Xray outbound.
+pub enum Conn {
+	Tcp(TcpStream),
+	#[cfg(unix)]
+	Unix(UnixStream),
+}
+
+impl AsyncRead for Conn {
+	fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+		match self.get_mut() {
+			Conn::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
+			#[cfg(unix)]
+			Conn::Unix(stream) => Pin::new(stream).poll_read(cx, buf),
+		}
+	}
+}
+
+impl AsyncWrite for Conn {
+	fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+		match self.get_mut() {
+			Conn::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
+			#[cfg(unix)]
+			Conn::Unix(stream) => Pin::new(stream).poll_write(cx, buf),
+		}
+	}
+
+	fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		match self.get_mut() {
+			Conn::Tcp(stream) => Pin::new(stream).poll_flush(cx),
+			#[cfg(unix)]
+			Conn::Unix(stream) => Pin::new(stream).poll_flush(cx),
+		}
+	}
+
+	fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+		match self.get_mut() {
+			Conn::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
+			#[cfg(unix)]
+			Conn::Unix(stream) => Pin::new(stream).poll_shutdown(cx),
+		}
+	}
+}
+
+/// `dial_until` for every kind of outbound the engine's flows go through: through a SOCKS5 proxy as there, or, for an Xray outbound, a connection to its socket with a Trojan CONNECT. A hop that is down fails here at the first proxy with its reason. Trojan has no reply, so a destination that does not connect shows only as a stream that ends.
+pub async fn dial_conn(up: &Upstream, dst: SocketAddr, deadline: tokio::time::Instant) -> Result<Conn, Failure<'_>> {
+	let Some(hop) = &up.hop else {return dial_until(up, dst, deadline).await.map(Conn::Tcp)};
+	let failed = |error: anyhow::Error, timeout: bool| Failure {stop: Stop::First(&up.tag), timeout, error};
+	let reach = hop.reach().map_err(|why| failed(anyhow::anyhow!("xray outbound {} is down: {why}", up.tag), false))?;
+	#[cfg(unix)]
+	{
+		let started = Instant::now();
+		let opened = tokio::time::timeout_at(deadline, async {
+			let mut stream = super::xray_trojan::open(&reach).await?;
+			stream.write_all(&super::xray_trojan::head(&reach.password, 1, dst)).await?;
+			std::io::Result::Ok(stream)
+		}).await;
+		match opened {
+			Ok(Ok(stream)) => {
+				up.latency.set(started.elapsed());
+				Ok(Conn::Unix(stream))
+			}
+			Ok(Err(e)) => Err(failed(anyhow::anyhow!("the xray socket: {}", e.kind()), false)),
+			Err(_) => Err(failed(anyhow::anyhow!("the xray socket timed out"), true)),
+		}
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = (reach, deadline, dst);
+		Err(failed(anyhow::anyhow!("the Xray add-on runs on Unix hosts only"), false))
+	}
+}
+
 /// A SOCKS5 CONNECT on `control` to `host` and `port`, a literal address or a name the proxy resolves, and the reply read in full.
 async fn connect_to(control: &mut TcpStream, host: &str, port: u16) -> anyhow::Result<()> {
 	let mut request = vec![5, 1, 0];
@@ -255,7 +331,17 @@ fn keep(shared: &Arc<Shared>, state: &Arc<ExitState>) {
 			let plan = shared.plan();
 			let Some(exit) = plan.exits.iter().position(|exit| Arc::ptr_eq(&exit.state, &held)).filter(|_| !held.working()) else {return};
 			let Backend::Netstack {outbound: Outbound::Socks5(up), ..} = &plan.exits[exit].backend else {return};
-			let reached = reach(up).await;
+			// An Xray outbound is probed at its socket. While its hop is down the exit is not working whatever this says (`Plan::working`), and the hop going up is what ends that.
+			let reached = match &up.hop {
+				#[cfg(unix)]
+				Some(hop) => match hop.reach() {
+					Ok(reach) => super::xray_trojan::open(&reach).await.map(drop).map_err(|e| format!("the xray socket: {}", e.kind())),
+					Err(_) => continue,
+				},
+				#[cfg(not(unix))]
+				Some(_) => continue,
+				None => reach(up).await,
+			};
 			heard(&shared, &plan, exit, reached);
 		}
 	});
@@ -349,14 +435,14 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 		match (stream, outbound) {
 			(IpStackStream::Tcp(mut stream), outbound) => {
 				let copied = match outbound {
-					Outbound::Socks5(up) => match dial_until(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await {
+					Outbound::Socks5(up) => match dial_conn(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await {
 						Ok(mut remote) => {
 							heard(&shared, &plan, carrier, Ok(()));
 							tokio::io::copy_bidirectional(&mut stream, &mut remote).await
 						}
 						Err(failure) => {
-							// A destination that does not connect says nothing against the proxy, which let the node in to ask.
-							heard(&shared, &plan, carrier, if matches!(failure.stop, Stop::Target) {Ok(())} else {Err(failure.describe())});
+							// A destination that does not connect says nothing against the proxy, which let the node in to ask. A hop that is down says nothing either: it is the hop that makes the exit not work, and it is the hop that ends that.
+							if up.hop.as_ref().is_none_or(|hop| hop.reason().is_none()) {heard(&shared, &plan, carrier, if matches!(failure.stop, Stop::Target) {Ok(())} else {Err(failure.describe())})}
 							return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {}", plan.show(target), failure.error);
 						}
 					},
@@ -487,6 +573,52 @@ async fn direct_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrie
 #[allow(clippy::too_many_arguments)]
 async fn udp_relay<S: Datagrams>(shared: &Shared, exit: usize, tag: &str, mut stream: S, up: &Upstream, dst: SocketAddr, mtu: u16, plan: &Plan, pin: Option<(&Key, u64)>) -> Option<S> {
 	let state = &plan.exits[exit].state;
+	// An Xray outbound carries UDP over a stream of its own for each flow. When it cannot, the exit is down and the flow ends: that is no reason to ask the exit's `unsupported.udp` policy, which is for a proxy that has no UDP.
+	if let Some(hop) = &up.hop {
+		#[cfg(unix)]
+		{
+			let Ok(reach) = hop.reach() else {
+				tracing::debug!("exit {tag}: udp to {}: xray outbound {} is down, so the flow ends", plan.show(dst), up.tag);
+				return None;
+			};
+			let opened = tokio::time::timeout(ASSOCIATE_TIMEOUT, async {
+				let mut remote = super::xray_trojan::open(&reach).await?;
+				remote.write_all(&super::xray_trojan::head(&reach.password, 3, dst)).await?;
+				std::io::Result::Ok(remote)
+			}).await;
+			let Ok(Ok(mut remote)) = opened else {
+				tracing::debug!("exit {tag}: udp to {}: the xray socket was not opened, so the flow ends", plan.show(dst));
+				return None;
+			};
+			if pin.is_some_and(|(key, id)| !shared.flows.pin(key, id, plan.generation)) {return None}
+			let (cap, traffic, overhead) = (usize::from(mtu).saturating_sub(UDP_OVERHEAD), &plan.exits[exit].traffic, if dst.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6});
+			let (mut from_peer, mut from_remote, mut frames) = (vec![0u8; MAX_DATAGRAM], Vec::new(), super::xray_trojan::Frames::default());
+			let (mut reader, mut writer) = remote.split();
+			loop {
+				tokio::select! {
+					r = stream.recv(&mut from_peer) => {
+						let Ok(n) = r else {return None};
+						if n == 0 || writer.write_all(&super::xray_trojan::packet(dst, &from_peer[..n])).await.is_err() {return None}
+						traffic.up(n + overhead);
+					}
+					r = frames.next(&mut reader, &mut from_remote) => {
+						if r.is_err() {return None}
+						if from_remote.len() > cap {
+							tracing::debug!("exit {tag}: udp from {}: dropping a {} byte reply, over the {cap} byte mtu", plan.show(dst), from_remote.len());
+							continue;
+						}
+						traffic.down(from_remote.len() + overhead);
+						if stream.send(&from_remote).await.is_err() {return None}
+					}
+				}
+			}
+		}
+		#[cfg(not(unix))]
+		{
+			let _ = (hop, pin, mtu);
+			return None;
+		}
+	}
 	if state.no_udp.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|since| since.elapsed() < UDP_RETRY) {return Some(stream)}
 	// A chain carries no UDP ASSOCIATE, so none is asked for: the exit is marked as without UDP, once logged, and the policy decides every flow, as for a proxy that refused one.
 	if up.via.is_some() {
@@ -601,7 +733,7 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 	let (query, client) = (&asked[..], query.get(..2)?);
 	let exchange = async {
 		let answer = match outbound {
-			Outbound::Socks5(up) => framed(&mut dial(up, target).await.ok()?, query).await.ok()?,
+			Outbound::Socks5(up) => framed(&mut dial_conn(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await.ok()?, query).await.ok()?,
 			Outbound::Direct {bind, interface} => {
 				let answer = ask_udp(*bind, interface.as_deref(), target, query).await.ok()?;
 				if answer.len() < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 {answer} else {framed(&mut connect_from(*bind, interface.as_deref(), target).await.ok()?, query).await.ok()?}
@@ -623,10 +755,10 @@ async fn dns_over_tcp<S: Datagrams>(mut stream: S, up: &Upstream, target: Socket
 			Ok(0) | Err(_) => return,
 			Ok(n) => n,
 		};
-		let mut remote = match dial(up, target).await {
+		let mut remote = match dial_conn(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await {
 			Ok(r) => r,
-			Err(e) => {
-				tracing::debug!("dns to {}: socks5 connect failed: {e}", plan.show(target));
+			Err(failure) => {
+				tracing::debug!("dns to {}: socks5 connect failed: {}", plan.show(target), failure.error);
 				continue;
 			}
 		};

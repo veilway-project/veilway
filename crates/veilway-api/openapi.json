@@ -493,6 +493,24 @@
             },
             "type": "array"
           },
+          "load": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Load"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The `load` setting of the exit in the config. Null when the exit reports no load to apps."
+          },
+          "load_level": {
+            "description": "The level apps are told: \"low\", \"medium\" or \"high\". Null while the exit has no `load` setting and until the node has looked twice, which it does every 10 seconds.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "measured_at": {
             "description": "Unix seconds when `latency_ms` was measured.",
             "format": "int64",
@@ -555,6 +573,8 @@
           "link_up",
           "latency_ms",
           "measured_at",
+          "load",
+          "load_level",
           "traffic"
         ],
         "type": "object"
@@ -674,6 +694,10 @@
       "InboundInfo": {
         "description": "An inbound with what a client profile takes from it. No private key.",
         "properties": {
+          "enabled": {
+            "description": "False for an inbound the config switched off: it does not listen and takes no device.",
+            "type": "boolean"
+          },
           "kind": {
             "$ref": "#/components/schemas/InboundKind"
           },
@@ -705,6 +729,7 @@
         "required": [
           "tag",
           "kind",
+          "enabled",
           "public_key",
           "transport_public_key",
           "transports"
@@ -721,6 +746,10 @@
       "InboundTransport": {
         "description": "One transport of an inbound, with the rating a profile of it gets.",
         "properties": {
+          "enabled": {
+            "description": "False for a transport the config switched off: it does not listen.",
+            "type": "boolean"
+          },
           "rating": {
             "$ref": "#/components/schemas/Rating"
           },
@@ -730,6 +759,7 @@
         },
         "required": [
           "transport",
+          "enabled",
           "rating"
         ],
         "type": "object"
@@ -977,6 +1007,49 @@
         ],
         "type": "object"
       },
+      "Load": {
+        "additionalProperties": false,
+        "description": "Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row.",
+        "properties": {
+          "busy": {
+            "format": "uint32",
+            "maximum": 1000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "by": {
+            "$ref": "#/components/schemas/LoadBy"
+          },
+          "very_busy": {
+            "description": "Greater than `busy`.",
+            "format": "uint32",
+            "maximum": 1000000,
+            "minimum": 2,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "by",
+          "busy",
+          "very_busy"
+        ],
+        "type": "object"
+      },
+      "LoadBy": {
+        "description": "What `Load::by` measures.",
+        "oneOf": [
+          {
+            "const": "flows",
+            "description": "Flows open on the exit, all users together.",
+            "type": "string"
+          },
+          {
+            "const": "mbps",
+            "description": "Up and down traffic of the exit added together, in megabits per second, averaged over the last 30 seconds.",
+            "type": "string"
+          }
+        ]
+      },
       "OutboundStats": {
         "description": "The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.\nThe node learns whether a proxy relays UDP once for each exit, from the flows of that exit, so two exits through one proxy can know different things for a while. This is what they know together.",
         "properties": {
@@ -984,6 +1057,13 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "down_reason": {
+            "description": "Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "latency_ms": {
             "description": "How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.",
@@ -1048,7 +1128,8 @@
           "udp_down_secs",
           "udp_flips",
           "latency_ms",
-          "measured_at"
+          "measured_at",
+          "down_reason"
         ],
         "type": "object"
       },

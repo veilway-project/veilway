@@ -553,6 +553,10 @@ export interface components {
             link_up: boolean | null;
             /** @description The node links of a chain backend, by tag, which `/v1/links` reports on. Empty for every other backend. */
             links: string[];
+            /** @description The `load` setting of the exit in the config. Null when the exit reports no load to apps. */
+            load: components["schemas"]["Load"] | null;
+            /** @description The level apps are told: "low", "medium" or "high". Null while the exit has no `load` setting and until the node has looked twice, which it does every 10 seconds. */
+            load_level: string | null;
             /**
              * Format: int64
              * @description Unix seconds when `latency_ms` was measured.
@@ -610,6 +614,8 @@ export interface components {
         };
         /** @description An inbound with what a client profile takes from it. No private key. */
         InboundInfo: {
+            /** @description False for an inbound the config switched off: it does not listen and takes no device. */
+            enabled: boolean;
             kind: components["schemas"]["InboundKind"];
             /** @description The WireGuard public key of the inbound. */
             public_key: components["schemas"]["Key"];
@@ -622,6 +628,8 @@ export interface components {
         InboundKind: "wireguard" | "veilway";
         /** @description One transport of an inbound, with the rating a profile of it gets. */
         InboundTransport: {
+            /** @description False for a transport the config switched off: it does not listen. */
+            enabled: boolean;
             rating: components["schemas"]["Rating"];
             transport: components["schemas"]["Transport"];
         };
@@ -692,6 +700,19 @@ export interface components {
         Links: {
             links: components["schemas"]["Link"][];
         };
+        /** @description Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row. */
+        Load: {
+            /** Format: uint32 */
+            busy: number;
+            by: components["schemas"]["LoadBy"];
+            /**
+             * Format: uint32
+             * @description Greater than `busy`.
+             */
+            very_busy: number;
+        };
+        /** @description What `Load::by` measures. */
+        LoadBy: "flows" | "mbps";
         /**
          * @description The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.
          *     The node learns whether a proxy relays UDP once for each exit, from the flows of that exit, so two exits through one proxy can know different things for a while. This is what they know together.
@@ -699,6 +720,8 @@ export interface components {
         OutboundStats: {
             /** Format: uint64 */
             down_bytes_per_sec: number;
+            /** @description Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`. */
+            down_reason: string | null;
             /**
              * Format: uint64
              * @description How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.

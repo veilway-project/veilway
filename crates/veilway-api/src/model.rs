@@ -290,6 +290,8 @@ pub struct OutboundStats {
 	pub latency_ms: Option<u64>,
 	/// Unix seconds when `latency_ms` was measured.
 	pub measured_at: Option<i64>,
+	/// Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`.
+	pub down_reason: Option<String>,
 }
 
 /// What the node's resolver did with the DNS queries of its tunnels since start.
@@ -658,6 +660,8 @@ pub enum InboundKind {Wireguard, Veilway}
 #[derive(Serialize, JsonSchema)]
 pub struct InboundTransport {
 	pub transport: Transport,
+	/// False for a transport the config switched off: it does not listen.
+	pub enabled: bool,
 	pub rating: config::Rating,
 }
 
@@ -666,6 +670,8 @@ pub struct InboundTransport {
 pub struct InboundInfo {
 	pub tag: String,
 	pub kind: InboundKind,
+	/// False for an inbound the config switched off: it does not listen and takes no device.
+	pub enabled: bool,
 	/// The WireGuard public key of the inbound.
 	pub public_key: Key,
 	/// The public half of the node transport key a profile carries. Null for an inbound with no `transport_keys`.
@@ -711,6 +717,10 @@ pub struct Exit {
 	pub latency_ms: Option<u64>,
 	/// Unix seconds when `latency_ms` was measured.
 	pub measured_at: Option<i64>,
+	/// The `load` setting of the exit in the config. Null when the exit reports no load to apps.
+	pub load: Option<veilway_core::config::Load>,
+	/// The level apps are told: "low", "medium" or "high". Null while the exit has no `load` setting and until the node has looked twice, which it does every 10 seconds.
+	pub load_level: Option<String>,
 	pub traffic: Traffic,
 }
 

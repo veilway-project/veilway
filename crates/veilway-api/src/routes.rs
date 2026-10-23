@@ -119,7 +119,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 					let mut diff = Diff::between(&snapshot.config, &config, OffsetDateTime::now_utc());
 					// An outbound whose user name or password the document spells out is a changed one whatever they are. "Not changed" would tell whoever guessed a password that the guess was right.
 					diff.outbounds.changed = config.outbounds.iter().map(|outbound| match outbound {
-						Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} => tag,
+						Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag,
 					}).filter(|tag| diff.outbounds.changed.contains(tag) || (spelled.contains(tag) && !diff.outbounds.added.contains(tag))).cloned().collect();
 					diff
 				});
@@ -369,7 +369,7 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 	json(StatusCode::OK, &model::Exits {exits: snapshot.config.exits.iter().map(|exit| {
 		let (health, outbound) = (health.iter().find(|health| health.exit == exit.tag), if let veilway_core::config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None});
 		// Only a SOCKS5 proxy can refuse to relay UDP, so only an exit through one has anything to say here.
-		let proxied = outbound.as_ref().is_some_and(|tag| snapshot.config.outbounds.iter().any(|outbound| matches!(outbound, Outbound::Socks5 {tag: of, ..} if of == tag)));
+		let proxied = outbound.as_ref().is_some_and(|tag| snapshot.config.outbounds.iter().any(|outbound| matches!(outbound, Outbound::Socks5 {tag: of, ..} | Outbound::Xray {tag: of, ..} if of == tag)));
 		let down = health.and_then(|health| health.no_udp).filter(|_| proxied);
 		let latency = outbound.as_ref().and_then(|tag| latencies.get(tag)).copied();
 		model::Exit {
@@ -393,6 +393,8 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			link_up: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {Some(links.iter().any(|link| chain.links.contains(&link.tag) && link.status == Status::Up))} else {None},
 			latency_ms: latency.map(|(took, _)| took.as_millis() as u64),
 			measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64),
+			load: exit.load,
+			load_level: health.and_then(|health| health.load).map(str::to_string),
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
 		}
 	}).collect()})
@@ -403,6 +405,7 @@ async fn inbounds(State(api): State<Arc<Api>>) -> Response {
 	json(StatusCode::OK, &model::Inbounds {inbounds: snapshot.config.inbounds.iter().map(|inbound| model::InboundInfo {
 		tag: inbound.tag.clone(),
 		kind: match inbound.kind {veilway_core::config::InboundType::Wireguard => model::InboundKind::Wireguard, veilway_core::config::InboundType::Veilway => model::InboundKind::Veilway},
+		enabled: inbound.on(),
 		public_key: inbound.public_key(),
 		transport_public_key: inbound.transport_public_key(),
 		transports: inbound.transports.iter().map(|transport| model::InboundTransport {
@@ -416,6 +419,7 @@ async fn inbounds(State(api): State<Arc<Api>>) -> Response {
 				veilway_core::config::Transport::FakeTls {..} => model::Transport::FakeTls,
 				veilway_core::config::Transport::WsPlain {..} => model::Transport::WsPlain,
 			},
+			enabled: transport.on(),
 			rating: transport.rating(),
 		}).collect(),
 	}).collect(), public_addresses: snapshot.config.public_addresses.clone()})
@@ -614,13 +618,13 @@ impl Api {
 			outbounds: snapshot.config.outbounds.iter().map(|outbound| {
 				let (tag, proxied) = match outbound {
 					Outbound::Direct {tag, ..} => (tag, false),
-					Outbound::Socks5 {tag, ..} => (tag, true),
+					Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => (tag, true),
 				};
 				let (totals, (up, down), refused, flips) = sums.get(tag.as_str()).copied().unwrap_or_default();
 				// Only a SOCKS5 proxy can refuse to relay UDP, as in `exits`.
 				let refused = refused.filter(|_| proxied);
 				let latency = latencies.get(tag).copied();
-				model::OutboundStats {name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}, latency_ms: latency.map(|(took, _)| took.as_millis() as u64), measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64)}
+				model::OutboundStats {down_reason: if matches!(outbound, Outbound::Xray {..}) {self.engine.xray_outbound_down(tag)} else {None}, name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}, latency_ms: latency.map(|(took, _)| took.as_millis() as u64), measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64)}
 			}).collect(),
 			drops: Reason::ALL.iter().map(|reason| (reason.name().to_string(), self.engine.dropped(*reason))).collect(),
 			dns: model::Dns {answered: dns.answered, refused: dns.refused, failed: dns.failed, malformed: dns.malformed, throttled: dns.throttled},

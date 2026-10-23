@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/mobile-schema.json",
   "identifier": "default",
-  "description": "Main window: core APIs and the opener for provider links.",
+  "description": "Main window: core APIs, the opener for provider links and the QR scanner.",
   "windows": ["main"],
   "platforms": ["android"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "barcode-scanner:allow-scan", "barcode-scanner:allow-request-permissions", "barcode-scanner:allow-cancel"]
 }

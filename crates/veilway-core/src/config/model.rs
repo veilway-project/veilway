@@ -15,6 +15,8 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use veilway_proto::subscription::legacy;
+use veilway_proto::xray::profile as xray_profile;
 
 /// A value written as one JSON string. A failure reports only what was expected, never the text. The pattern is for the schema: it holds for every text that parses and carries the canonical spelling, not the whole rule.
 macro_rules! text_value {
@@ -765,6 +767,9 @@ pub struct Inbound {
 	pub tag: String,
 	#[serde(rename = "type")]
 	pub kind: InboundType,
+	/// Defaults to true. An inbound that is not enabled is validated like any other and does not listen: its tunnel takes no device, its transports bind nothing and its addresses stay reserved.
+	#[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "off_only")]
+	pub enabled: Option<bool>,
 	pub private_key: Secret<Key>,
 	#[schemars(length(min = 1, max = 2))]
 	pub address: Vec<GatewayNet>,
@@ -792,6 +797,9 @@ pub struct Inbound {
 }
 
 impl Inbound {
+	/// Whether this inbound listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
 	/// Whether the inbound has a transport that wraps its datagrams in `udp-obfs`.
 	pub fn enveloped(&self) -> bool {self.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..}))}
 
@@ -970,9 +978,17 @@ pub enum Rating {Protected, Detectable, Unsafe}
 #[derive(Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Transport {
-	Udp {listen: Addr},
+	Udp {
+		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
+	},
 	Ws {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{0,255}$"))]
 		path: String,
 		#[serde(skip_serializing_if = "Option::is_none")]
@@ -982,12 +998,18 @@ pub enum Transport {
 	#[serde(rename = "udp-obfs")]
 	UdpObfs {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[serde(skip_serializing_if = "Option::is_none")]
 		limits: Option<TransportLimits>,
 	},
 	/// The native WebSocket session inside TLS that the node ends itself, for a `veilway` inbound. Whoever is not a user is relayed to `decoy.origin`.
 	Tls {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, which the origin must serve nothing at.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1003,6 +1025,9 @@ pub enum Transport {
 	#[serde(rename = "faketls")]
 	FakeTls {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		site: Site,
 		/// The private half of the transport's own key: no other transport of the node may have it.
 		transport_key: TransportKey,
@@ -1013,6 +1038,9 @@ pub enum Transport {
 	#[serde(rename = "ws")]
 	WsNative {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, as the web server in front hands it on, which the origin must serve nothing at.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1031,6 +1059,9 @@ pub enum Transport {
 	#[serde(rename = "ws-plain")]
 	WsPlain {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		/// The path a proof arrives on, as the web server in front hands it on, which the origin must answer as it answers any other path.
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
@@ -1049,6 +1080,9 @@ pub enum Transport {
 	/// Polling with HTTP requests through a CDN that allows nothing better, behind the operator's own web server, for a `veilway` inbound. Its keys are those of the native `ws`.
 	Fronted {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
 		decoy: Decoy,
@@ -1064,6 +1098,9 @@ pub enum Transport {
 	#[serde(rename = "fronted-shaped")]
 	FrontedShaped {
 		listen: Addr,
+		/// Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		enabled: Option<bool>,
 		#[schemars(pattern("^/[A-Za-z0-9._~/-]{11,255}$"))]
 		path: String,
 		decoy: Decoy,
@@ -1164,7 +1201,14 @@ pub struct Proxied<'a> {pub fronted: bool, pub path: &'a str, pub decoy: &'a Dec
 impl Transport {
 	pub fn listen(&self) -> SocketAddr {
 		match self {
-			Transport::Udp {listen} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::FakeTls {listen, ..} | Transport::WsNative {listen, ..} | Transport::WsPlain {listen, ..} | Transport::Fronted {listen, ..} | Transport::FrontedShaped {listen, ..} => listen.0,
+			Transport::Udp {listen, ..} | Transport::Ws {listen, ..} | Transport::UdpObfs {listen, ..} | Transport::Tls {listen, ..} | Transport::FakeTls {listen, ..} | Transport::WsNative {listen, ..} | Transport::WsPlain {listen, ..} | Transport::Fronted {listen, ..} | Transport::FrontedShaped {listen, ..} => listen.0,
+		}
+	}
+
+	/// Whether the transport listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {
+		match self {
+			Transport::Udp {enabled, ..} | Transport::Ws {enabled, ..} | Transport::UdpObfs {enabled, ..} | Transport::Tls {enabled, ..} | Transport::FakeTls {enabled, ..} | Transport::WsNative {enabled, ..} | Transport::WsPlain {enabled, ..} | Transport::Fronted {enabled, ..} | Transport::FrontedShaped {enabled, ..} => *enabled != Some(false),
 		}
 	}
 
@@ -1191,6 +1235,9 @@ impl Transport {
 	}
 }
 
+/// `enabled` of an inbound or a transport, with the default written as absent so that two spellings of one config are equal.
+fn off_only<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {Ok(Option::<bool>::deserialize(d)?.filter(|on| !on))}
+
 /// A key that belongs to another `type` of the same object is refused like an unknown key.
 fn only<E: de::Error>(kind: &str, others: &[(&str, bool)]) -> Result<(), E> {
 	match others.iter().find(|(_, present)| *present) {
@@ -1206,25 +1253,26 @@ enum TransportType {Udp, Ws, #[serde(rename = "udp-obfs")] UdpObfs, Tls, Fronted
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>, shape: Option<Shape>, http2: Option<Http2>, site: Option<Site>, transport_key: Option<TransportKey>, transport_keys: Option<Vec<TransportKey>>}
+struct TransportKeys {#[serde(rename = "type")] kind: TransportType, listen: Addr, enabled: Option<bool>, path: Option<String>, tls: Option<Certificate>, decoy: Option<Decoy>, trusted_proxies: Option<Vec<Proxy>>, client_address_header: Option<String>, limits: Option<TransportLimits>, shape: Option<Shape>, http2: Option<Http2>, site: Option<Site>, transport_key: Option<TransportKey>, transport_keys: Option<Vec<TransportKey>>}
 
 impl<'de> Deserialize<'de> for Transport {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Transport, D::Error> {
 		let keys = TransportKeys::deserialize(d)?;
+		let enabled = keys.enabled.filter(|on| !on);
 		let proxy = [("trusted_proxies", keys.trusted_proxies.is_some()), ("client_address_header", keys.client_address_header.is_some())];
 		let shaped = [("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())];
 		let borrowed = [("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some()), ("transport_keys", keys.transport_keys.is_some())];
 		match keys.kind {
-			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::Udp {listen: keys.listen}),
+			TransportType::Udp => only("udp", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("limits", keys.limits.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::Udp {listen: keys.listen, enabled}),
 			// `ws` is two formats under one name. With none of the keys of the proxy path it is the one of a `wireguard` inbound, and with any of them the native one of a `veilway` inbound, which never ends TLS itself. `validate` holds each to its kind of inbound.
-			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && keys.shape.is_none() && keys.http2.is_none() && proxy.iter().chain(&borrowed).all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
-			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
-			TransportType::WsPlain => only("ws-plain", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some()), ("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some())]).and_then(|_| Ok(Transport::WsPlain {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, transport_keys: keys.transport_keys.ok_or_else(|| de::Error::missing_field("transport_keys"))?})),
-			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, limits: keys.limits}),
-			TransportType::Tls => only("tls", &[&proxy[..], &[("shape", keys.shape.is_some())], &borrowed].concat()).and_then(|_| Ok(Transport::Tls {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits, http2: keys.http2})),
-			TransportType::Fronted => only("fronted", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
-			TransportType::FrontedShaped => only("fronted-shaped", &[&[("tls", keys.tls.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::FrontedShaped {listen: keys.listen, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, shape: keys.shape.ok_or_else(|| de::Error::missing_field("shape"))?})),
-			TransportType::FakeTls => only("faketls", &[&proxy[..], &shaped, &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("transport_keys", keys.transport_keys.is_some())]].concat()).and_then(|_| Ok(Transport::FakeTls {listen: keys.listen, site: keys.site.ok_or_else(|| de::Error::missing_field("site"))?, transport_key: keys.transport_key.ok_or_else(|| de::Error::missing_field("transport_key"))?, limits: keys.limits})),
+			TransportType::Ws if keys.decoy.is_none() && keys.limits.is_none() && keys.shape.is_none() && keys.http2.is_none() && proxy.iter().chain(&borrowed).all(|(_, present)| !present) => Ok(Transport::Ws {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: match keys.tls {Some(Certificate::SelfSigned(_)) => return Err(de::Error::custom("no `self_signed` on a ws transport of a wireguard inbound: the node makes its own certificate for a native tls transport alone")), Some(Certificate::Files(tls)) => Some(tls), None => None}}),
+			TransportType::Ws => only("ws` with a decoy, which reads plain HTTP from the web server in front of it and never ends TLS: that is `tls", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::WsNative {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::WsPlain => only("ws-plain", &[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some()), ("site", keys.site.is_some()), ("transport_key", keys.transport_key.is_some())]).and_then(|_| Ok(Transport::WsPlain {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, transport_keys: keys.transport_keys.ok_or_else(|| de::Error::missing_field("transport_keys"))?})),
+			TransportType::UdpObfs => only("udp-obfs", &[&[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some())][..], &proxy, &shaped, &borrowed].concat()).map(|_| Transport::UdpObfs {listen: keys.listen, enabled, limits: keys.limits}),
+			TransportType::Tls => only("tls", &[&proxy[..], &[("shape", keys.shape.is_some())], &borrowed].concat()).and_then(|_| Ok(Transport::Tls {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, tls: keys.tls.ok_or_else(|| de::Error::missing_field("tls"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, limits: keys.limits, http2: keys.http2})),
+			TransportType::Fronted => only("fronted", &[&[("tls", keys.tls.is_some()), ("shape", keys.shape.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::Fronted {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits})),
+			TransportType::FrontedShaped => only("fronted-shaped", &[&[("tls", keys.tls.is_some()), ("http2", keys.http2.is_some())][..], &borrowed].concat()).and_then(|_| Ok(Transport::FrontedShaped {listen: keys.listen, enabled, path: keys.path.ok_or_else(|| de::Error::missing_field("path"))?, decoy: keys.decoy.ok_or_else(|| de::Error::missing_field("decoy"))?, trusted_proxies: keys.trusted_proxies.ok_or_else(|| de::Error::missing_field("trusted_proxies"))?, client_address_header: keys.client_address_header, limits: keys.limits, shape: keys.shape.ok_or_else(|| de::Error::missing_field("shape"))?})),
+			TransportType::FakeTls => only("faketls", &[&proxy[..], &shaped, &[("path", keys.path.is_some()), ("tls", keys.tls.is_some()), ("decoy", keys.decoy.is_some()), ("transport_keys", keys.transport_keys.is_some())]].concat()).and_then(|_| Ok(Transport::FakeTls {listen: keys.listen, enabled, site: keys.site.ok_or_else(|| de::Error::missing_field("site"))?, transport_key: keys.transport_key.ok_or_else(|| de::Error::missing_field("transport_key"))?, limits: keys.limits})),
 		}
 	}
 }
@@ -1258,24 +1306,126 @@ pub enum Outbound {
 		#[schemars(pattern(TAG_PATTERN))]
 		via: Option<String>,
 	},
+	/// A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. This outbound has no `via` and is no `via` of another outbound, a link or an upstream: it is reached through a Unix socket.
+	#[schemars(extend("required" = ["type", "tag"], "oneOf" = [{"required": ["link"]}, {"required": ["protocol", "server"]}]))]
+	Xray {
+		#[schemars(pattern(TAG_PATTERN))]
+		tag: String,
+		/// Input only: a share link of a scheme the client's legacy reader knows (`vless`, `vmess`, `trojan`, `ss`), with the limits of the client's table: TCP, WebSocket and gRPC streams, TLS and REALITY, Vision. It is a secret and is never written back, so this is always absent in what the node holds.
+		#[serde(skip_serializing)]
+		#[schemars(length(max = 4096), extend("writeOnly" = true))]
+		link: Option<Secret<String>>,
+		protocol: XrayOutboundProtocol,
+		/// The provider's server. Xray resolves nothing: a name is looked up by the node through `dns.servers`, every address it gives must pass the dial rules, and the one used is written into the add-on's document.
+		server: HostPort,
+		/// Whether the server may be at a private, shared (CGNAT) or unique local address. Off unless true. Loopback, link-local, the node's own addresses and its inbounds' pools are refused whatever this says.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		allow_private: Option<bool>,
+		/// The user id of `vless` and `vmess`, a UUID.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		id: Option<Secret<String>>,
+		/// The password of `trojan` and `shadowsocks`. For a `shadowsocks` 2022 cipher it is the key as standard base64.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		password: Option<Secret<String>>,
+		/// `vless` only, and only over TCP with TLS or REALITY.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		flow: Option<XrayFlow>,
+		/// The cipher of `vmess` (`auto`, `aes-128-gcm` or `chacha20-poly1305`, default `auto`) and the method of `shadowsocks` (required).
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cipher: Option<String>,
+		/// Defaults to `tcp`.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		transport: Option<XrayTransport>,
+		/// Defaults to `none`, which `vless` and `trojan` refuse. Certificates are always checked: there is no way to switch that off.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		security: Option<XraySecurity>,
+	},
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XrayOutboundProtocol {Vless, Vmess, Trojan, Shadowsocks}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XrayFlow {#[serde(rename = "xtls-rprx-vision")] Vision}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XhttpMode {#[serde(rename = "auto")] Auto, #[serde(rename = "packet-up")] PacketUp, #[serde(rename = "stream-up")] StreamUp, #[serde(rename = "stream-one")] StreamOne}
+
+/// The stream an Xray outbound speaks over its connection. Fields that are left out take Xray's own defaults, `/` for a path.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum XrayTransport {
+	Tcp {},
+	Ws {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>},
+	Grpc {#[serde(skip_serializing_if = "Option::is_none")] service: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] authority: Option<String>},
+	Httpupgrade {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>},
+	Xhttp {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] mode: Option<XhttpMode>},
+}
+
+/// The security around an Xray outbound's stream. The chain is always checked against the system roots, and there is no key that turns that off or pins a certificate instead.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum XraySecurity {
+	#[serde(rename = "none")]
+	Off {},
+	/// `server_name` defaults to the server's name, and is needed when the server is an address. `fingerprint` is the ClientHello Xray imitates, default `chrome`. `alpn` is `h2` and `http/1.1` in any order.
+	Tls {#[serde(skip_serializing_if = "Option::is_none")] server_name: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] alpn: Option<Vec<String>>, #[serde(skip_serializing_if = "Option::is_none")] fingerprint: Option<String>},
+	/// `public_key` is 43 characters of base64url. `short_id` is up to 16 hexadecimal digits, an even number of them.
+	Reality {server_name: String, public_key: String, #[serde(skip_serializing_if = "Option::is_none")] short_id: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] fingerprint: Option<String>},
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum OutboundType {Direct, Socks5}
+enum OutboundType {Direct, Socks5, Xray}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, allow_private: Option<bool>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
+		let xray = [("allow_private", keys.allow_private.is_some()), ("link", keys.link.is_some()), ("protocol", keys.protocol.is_some()), ("id", keys.id.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())];
 		match keys.kind {
-			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
+			OutboundType::Direct => only("direct", &[&[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray].concat()).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
 			OutboundType::Socks5 => {
-				only("socks5", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())])?;
+				only("socks5", &[&[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())][..], &xray].concat())?;
 				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password, via: keys.via})
+			}
+			OutboundType::Xray => {
+				only("xray", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some()), ("username", keys.username.is_some()), ("via", keys.via.is_some())])?;
+				let Some(link) = keys.link else {
+					return Ok(Outbound::Xray {tag: keys.tag, link: None, protocol: keys.protocol.ok_or_else(|| de::Error::missing_field("protocol"))?, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, allow_private: keys.allow_private, id: keys.id, password: keys.password, flow: keys.flow, cipher: keys.cipher, transport: keys.transport, security: keys.security})
+				};
+				only("xray` with a `link", &[("protocol", keys.protocol.is_some()), ("server", keys.server.is_some()), ("id", keys.id.is_some()), ("password", keys.password.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())])?;
+				// One link, as a client's `Entry` and then its table, so a node accepts what the desktop accepts and refuses with the same codes. The text of the link is never in the error.
+				let list = Some(link.expose().as_str()).filter(|text| text.contains("://") && !text.contains(['\n', '\r'])).and_then(|text| legacy::list(text.as_bytes()).ok()).filter(|list| list.entries.len() == 1 && list.skipped == 0).ok_or_else(|| de::Error::invalid_value(Unexpected::Other("link"), &"one share link of the vless, vmess, trojan or ss kind that reads"))?;
+				let profile = xray_profile::check(&list.entries[0]).map_err(|refusal| de::Error::invalid_value(Unexpected::Other("link"), &format!("a link this node can run, found one that is refused: {}", refusal.code()).as_str()))?;
+				let server = HostPort {host: match &profile.server {legacy::Server::Name(name) => Host::Name(name.clone()), legacy::Server::Address(ip) => Host::Ip(*ip)}, port: profile.port};
+				let secret = Secret(profile.credential.expose().to_string());
+				let (id, password) = if matches!(profile.scheme, legacy::Scheme::Vless | legacy::Scheme::Vmess) {(Some(secret), None)} else {(None, Some(secret))};
+				Ok(Outbound::Xray {
+					tag: keys.tag,
+					link: None,
+					protocol: match profile.scheme {legacy::Scheme::Vless => XrayOutboundProtocol::Vless, legacy::Scheme::Vmess => XrayOutboundProtocol::Vmess, legacy::Scheme::Trojan => XrayOutboundProtocol::Trojan, legacy::Scheme::Shadowsocks => XrayOutboundProtocol::Shadowsocks},
+					server,
+					allow_private: keys.allow_private,
+					id,
+					password,
+					flow: profile.flow.then_some(XrayFlow::Vision),
+					cipher: profile.cipher.clone(),
+					transport: match &profile.stream {
+						xray_profile::Stream::Tcp => None,
+						xray_profile::Stream::Ws {path, host} => Some(XrayTransport::Ws {path: Some(path.clone()), host: host.clone()}),
+						xray_profile::Stream::Grpc {service} => Some(XrayTransport::Grpc {service: Some(service.clone()).filter(|service| !service.is_empty()), authority: None}),
+					},
+					security: match &profile.security {
+						xray_profile::Security::None => None,
+						xray_profile::Security::Tls {sni, alpn, fingerprint} => Some(XraySecurity::Tls {server_name: sni.clone(), alpn: Some(alpn.clone()).filter(|alpn| !alpn.is_empty()), fingerprint: Some(fingerprint.clone())}),
+						xray_profile::Security::Reality {sni, fingerprint, public_key, short_id} => Some(XraySecurity::Reality {server_name: sni.clone(), public_key: public_key.clone(), short_id: Some(short_id.clone()).filter(|id| !id.is_empty()), fingerprint: Some(fingerprint.clone())}),
+					},
+				})
 			}
 		}
 	}
@@ -1294,6 +1444,31 @@ pub struct Exit {
 	#[schemars(pattern("^[A-Z]{2}$"))]
 	pub country: Option<String>,
 	pub backend: Backend,
+	/// How busy apps are told this exit is. Absent means the exit reports no load.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub load: Option<Load>,
+}
+
+/// What `Load::by` measures.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadBy {
+	/// Flows open on the exit, all users together.
+	Flows,
+	/// Up and down traffic of the exit added together, in megabits per second, averaged over the last 30 seconds.
+	Mbps,
+}
+
+/// Apps show a user how busy an exit is in three coarse levels: below `busy` is low, from `busy` is medium, from `very_busy` is high. The node looks every 10 seconds and changes the level once the new one held for two looks in a row.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Load {
+	pub by: LoadBy,
+	#[schemars(range(min = 1, max = 1000000))]
+	pub busy: u32,
+	/// Greater than `busy`.
+	#[schemars(range(min = 2, max = 1000000))]
+	pub very_busy: u32,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
@@ -1318,7 +1493,7 @@ pub struct Unsupported {
 pub struct Netstack {
 	#[schemars(pattern(TAG_PATTERN))]
 	pub outbound: String,
-	/// Defaults to true on a socks5 outbound. Must be absent or false on a direct one.
+	/// Defaults to true on a socks5 or xray outbound. Must be absent or false on a direct one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub proxy_only: Option<bool>,
 	/// Defaults to 7200.
@@ -1921,6 +2096,9 @@ pub struct ProxyInbound {
 	pub tag: String,
 	#[serde(rename = "type")]
 	pub kind: ProxyType,
+	/// Defaults to true. An inbound that is not enabled is validated like any other and does not listen, and its address stays reserved.
+	#[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "off_only")]
+	pub enabled: Option<bool>,
 	/// The TCP address this inbound listens on. A loopback address is taken as it is. A private address (RFC 1918, 100.64.0.0/10, unique local) is taken too, with a warning that it may be reachable from outside. Any other address, the wildcard and link-local addresses included, needs `public`.
 	pub listen: Addr,
 	/// The users that may log in. With `groups`, a user in either list may. Without both, every user that has a `proxy_password` may.
@@ -1944,6 +2122,9 @@ pub struct ProxyInbound {
 }
 
 impl ProxyInbound {
+	/// Whether this inbound listens: `enabled` is left out or true.
+	pub fn on(&self) -> bool {self.enabled != Some(false)}
+
 	/// Whether UDP ASSOCIATE is answered.
 	pub fn udp(&self) -> bool {self.kind != ProxyType::Http && self.udp != Some(false)}
 

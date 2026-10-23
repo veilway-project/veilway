@@ -7,6 +7,7 @@ use super::gate;
 use super::link;
 use super::plan::{self, Carrier, Latency, Outbound};
 use super::upstream_state::{bind, UpstreamVault};
+use super::xray_out::Hops;
 use super::{Shared, Totals, QUEUE};
 use crate::config::{self, random, Rating, Upstream, UpstreamClass};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -63,9 +64,9 @@ pub const LEAVE_WAIT: Duration = Duration::from_secs(10);
 #[derive(Clone, PartialEq)]
 pub enum Reach {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks(Arc<plan::Upstream>)}
 
-/// The outbound `tag` of the config as the node reaches a provider through it. None for a tag that is no `direct` or `socks5` outbound, which validation does not let through.
-pub fn reach(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Reach> {
-	match Outbound::of(outbounds, latency, tag)? {
+/// The outbound `tag` of the config as the node reaches a provider through it. None for a tag that is no `direct`, `socks5` or `xray` outbound, which validation does not let through.
+pub fn reach(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, tag: &str) -> Option<Reach> {
+	match Outbound::of(outbounds, latency, hops, tag)? {
 		Outbound::Direct {bind, interface} => Some(Reach::Direct {bind, interface}),
 		Outbound::Socks5(up) => Some(Reach::Socks(Arc::new(up))),
 	}
@@ -389,7 +390,7 @@ fn plain(text: &str, most: usize) -> String {
 pub fn forbidden(address: IpAddr, pools: &[(IpNet, usize)], is_local: fn(IpAddr) -> bool, allow_private: bool) -> Option<&'static str> {
 	if gate::refused(address, pools) {Some("loopback, link-local, multicast, unspecified, IPv4-mapped or inside an inbound pool of the node")}
 	else if is_local(address) {Some("an address of the node itself")}
-	else if !allow_private && payload::private(address) {Some("a private address, and `allow_private` is off")}
+	else if !allow_private && (payload::private(address) || matches!(address, IpAddr::V6(v6) if gate::embedded(v6).into_iter().flatten().any(|v4| payload::private(IpAddr::V4(v4))))) {Some("a private address, or one that carries a private IPv4 address, and `allow_private` is off")}
 	else {None}
 }
 
@@ -887,7 +888,7 @@ pub async fn preview(shared: &Arc<Shared>, outbounds: &[config::Outbound], reque
 	let bound = bind(&request.link, device.public());
 	let plan = shared.plan();
 	let reach = match request.via.as_deref() {
-		Some(tag) => Some(self::reach(outbounds, &plan.latency, tag).ok_or(PreviewError::Invalid("via names no direct or socks5 outbound of the running config"))?),
+		Some(tag) => Some(self::reach(outbounds, &plan.latency, &plan.hops, tag).ok_or(PreviewError::Invalid("via names no direct, socks5 or xray outbound of the running config"))?),
 		None => None,
 	};
 	let fetcher = fetcher(shared, reach.as_ref(), &previews.hooks, |_| {});

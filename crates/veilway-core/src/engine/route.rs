@@ -433,6 +433,17 @@ impl Flows {
 	/// The carried flows each device has right now, by its public key. A device without one is not in it.
 	pub fn per_device(&self) -> HashMap<[u8; 32], usize> {self.lock().per_device.iter().map(|(device, keys)| (*device, keys.len())).collect()}
 
+	/// The carried flows each of `exits` exits has right now under the plan of `generation`, by the exit the rules chose. All zeros under another plan.
+	pub fn per_exit(&self, exits: usize, generation: u64) -> Vec<u64> {
+		let (table, mut counts) = (self.lock(), vec![0; exits]);
+		if table.generation == generation {
+			for entry in table.flows.values().filter(|entry| entry.owner.is_some()) {
+				if let Decision::Exit {exit, ..} = entry.decision {if let Some(count) = counts.get_mut(exit) {*count += 1}}
+			}
+		}
+		counts
+	}
+
 	/// The carried flows one device has right now.
 	pub fn of_device(&self, device: &[u8; 32]) -> usize {self.lock().per_device.get(device).map_or(0, HashSet::len)}
 

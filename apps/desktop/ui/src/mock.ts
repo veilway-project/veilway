@@ -42,7 +42,7 @@ const status = (): StatusView => {
 	if (xrayScene) return {state: "connected", name: "Edge Frankfurt", exit: null, wait_until: null, say_code: null, say: null, exits: [], usage: null, notices: [], sent_bytes: sent, received_bytes: received, mtu: 1400, out_of_date: false, connection: null, applied: null, xray: {open_tcp: 14, open_udp: 3, failed_flows: 2, carried_flows: 318, bytes_sent: sent, bytes_received: received, unsupported_packets: 6, dropped_udp_flows: 0, restarts: 0, last_restart: null, say_code: null, say: null}};
 	return {
 		state: scene === "question" ? "connecting" : "connected", name: "Main", exit: selected ?? (scene === "fallback" ? "ams" : "fra"), wait_until: null, say_code: null, say: null,
-		exits: [{tag: "fra", name: "Frankfurt", country: "de", selected: selected === "fra", configured: true, working: scene !== "fallback", load: "low"}, {tag: "ams", name: "Amsterdam", country: "nl", selected: selected === "ams", configured: false, working: true, load: "medium"}, {tag: "hel", name: "Helsinki", country: "fi", selected: selected === "hel", configured: false, working: true, load: "high"}, {tag: "ist", name: "Istanbul", country: "tr", selected: false, configured: false, working: false, load: "unknown"}],
+		exits: [{tag: "fra", name: "Frankfurt", country: "de", selected: selected === "fra", configured: true, working: scene !== "fallback", load: "low"}, {tag: "ams", name: "Amsterdam", country: "nl", selected: selected === "ams", configured: false, working: true, load: "medium"}, {tag: "hel", name: "Helsinki", country: "fi", selected: selected === "hel", configured: false, working: true, load: "high"}, {tag: "waw", name: "Warsaw", country: "pl", selected: false, configured: false, working: true, load: "unknown"}, {tag: "ist", name: "Istanbul", country: "tr", selected: false, configured: false, working: false, load: "unknown"}],
 		usage: {used_bytes: 31.4 * GB, quota_bytes: 50 * GB, period: "monthly", expires_at: now() + 23 * DAY, up_bytes: 2.1 * GB, down_bytes: 29.3 * GB},
 		notices: [], sent_bytes: sent, received_bytes: received, mtu: 1390, out_of_date: false, connection: scene === "question" ? {...connection, since: null} : connection, applied: null
 	};
@@ -94,6 +94,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	share_link: () => ({link: "veilway://sub/sub.harbor.example/s#v1.0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc.VVVVVVVVVVVVVVVVVVVVVQ", qr: QR}),
 	share_file: () => true,
 	share_text: () => null,
+	scan_frame: () => new Promise(() => {}),
 	import_qr: () => ({kind: "carried", host: null, fingerprint: "hb7Q-2mXe-91Lk-Pz4c", pinned: false, plain: false, in_file: false}),
 	import_proceed: () => ({fingerprint: "hb7Q-2mXe-91Lk-Pz4c", replaces: false, endpoint_changed: false, moving: null, left_out: [], preview: subscription(languages[0] === "fa")}),
 	import_keep: args => { if (args.keep && lastLegacy) legacyHeld = true; else if (args.keep) held = 1; return list(); },

@@ -42,6 +42,8 @@ enum Command {
 		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
 		/// The unix socket of the Xray host (`veilway xray-host`, run by its own unit), which starts Xray as a user of its own. The node never runs Xray itself
 		#[arg(long, default_value = "/run/veilway-xray/host.sock")] xray_socket: PathBuf,
+		/// The folder shared with Xray's user where the sockets of Xray outbounds are made
+		#[arg(long, default_value = "/run/veilway-xray-out")] xray_dir: PathBuf,
 		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -69,6 +71,10 @@ enum Command {
 		#[arg(long)] state: Option<PathBuf>,
 		/// The replay file `run` would use [default: veilway-replay next to the state file]
 		#[arg(long)] replay: Option<PathBuf>,
+		/// Where the add-ons are installed: the Xray add-on is checked here when the config has an Xray inbound or outbound
+		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
+		/// The folder `run` would make the sockets of Xray outbounds in, which is checked when the config has one
+		#[arg(long, default_value = "/run/veilway-xray-out")] xray_dir: PathBuf,
 		/// The control socket `run` would use, which also says whether a node runs already [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -268,7 +274,7 @@ async fn main() -> anyhow::Result<()> {
 			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, xray_dir, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -289,7 +295,7 @@ async fn main() -> anyhow::Result<()> {
 			let replay = replay.unwrap_or_else(|| state.with_file_name("veilway-replay"));
 			// The signed documents of the upstreams and their held keys, in a file of its own next to the usage state file.
 			let upstreams = state.with_file_name("upstreams.state");
-			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), upstreams: Some(upstreams), addons: Some(addons), xray_socket: Some(xray_socket), ..Options::new(dir)}).await?);
+			let engine = Arc::new(veilway_core::start(&loaded, Options {revision: report.revision, allow_readable: allow_readable_config, state: Some(state), replay: Some(replay), upstreams: Some(upstreams), addons: Some(addons), xray_socket: Some(xray_socket), xray_dir: Some(xray_dir), ..Options::new(dir)}).await?);
 			// The control API is the last listener of the node to come up and the first to go. A socket that cannot be made stops the node: one that was meant to be administered must not run where nobody can reach it.
 			#[cfg(unix)]
 			let (control, mut events) = (if no_api {None} else {
@@ -371,12 +377,12 @@ async fn main() -> anyhow::Result<()> {
 			if print(&report, &config) {std::process::exit(1)}
 			Ok(())
 		}
-		Command::Doctor {config, allow_readable_config, state, replay, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+		Command::Doctor {config, allow_readable_config, state, replay, addons, xray_dir, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
 			#[cfg(unix)]
 			let socket = (!no_api).then(|| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 			#[cfg(not(unix))]
 			let socket = None;
-			std::process::exit(doctor::run(&config, allow_readable_config, state, replay, socket, json, Duration::from_secs(timeout)).await)
+			std::process::exit(doctor::run(&config, allow_readable_config, state, replay, addons, xray_dir, socket, json, Duration::from_secs(timeout)).await)
 		}
 		#[cfg(unix)]
 		Command::Replay {command: Replay::Reset {yes, api, config}} => {

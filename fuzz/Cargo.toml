@@ -162,6 +162,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="fuzz_xray_outbound"
+path="fuzz_targets/fuzz_xray_outbound.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="fuzz_sub_request"
 path="fuzz_targets/fuzz_sub_request.rs"
 test=false

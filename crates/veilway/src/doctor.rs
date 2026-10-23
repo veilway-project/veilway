@@ -17,9 +17,12 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use veilway_core::config::{self, Backend, Certificate, Http2, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
+use veilway_core::engine::xray_out::Hops;
 use veilway_core::engine::{certificate, dns, icmp, probe, replay, stream};
 use veilway_proto::replay::{STEP, WINDOW};
 use veilway_wg::ws::{self, TlsFiles};
@@ -84,9 +87,12 @@ async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duratio
 
 /// One outbound tried the way the engine uses it, towards the DNS servers of the config: a direct one from the node itself, a socks5 one step by step so that each thing a proxy may lack has its own line.
 async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Duration) -> Vec<Line> {
-	let (config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..}) = outbound;
+	let tag = match outbound {
+		config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => tag,
+		config::Outbound::Xray {tag, ..} => return vec![line(Status::Skipped, "outbound", tag, "carried by the Xray add-on, through a Unix socket of Xray that exists only while the node runs, so nothing is tried from here: the xray line says whether the add-on is installed and pinned")],
+	};
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
-	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), tag) else {return Vec::new()};
+	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), &Hops::default(), tag) else {return Vec::new()};
 	match route {
 		Outbound::Direct {bind, interface} => {
 			if let Some(name) = interface.as_deref().filter(|name| !probe::has_interface(name)) {return vec![line(Status::Fail, "outbound", tag, format!("tied to the network interface {name}, which this host does not have: check `ip link`, or remove its `interface`"))]}
@@ -298,7 +304,7 @@ fn print(lines: &[Line], config: &str, json: bool) -> i32 {
 /// `allow_readable` is the --allow-readable-config of `veilway run`: without it a config file that group or others can read is a failure here as it is there.
 /// Returns the exit status: 0 when nothing failed, 1 when a check failed, 2 when the config file could not be read at all.
 #[cfg_attr(not(unix), allow(unused_variables))]
-pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, replay: Option<PathBuf>, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
+pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, replay: Option<PathBuf>, addons: PathBuf, xray_dir: PathBuf, api: Option<PathBuf>, json: bool, wait: Duration) -> i32 {
 	let ((loaded, report), name, dir, mut lines) = (config::load(file, true), file.display().to_string(), file.parent().unwrap_or(Path::new("")), Vec::new());
 	let at = |path: &str| if path.is_empty() {name.clone()} else {path.to_string()};
 	#[cfg(unix)]
@@ -318,6 +324,38 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		lines.push(line(Status::Skipped, "checks", name.as_str(), "the config is not one a node would start with, so nothing it names was tried: fix the lines above first"));
 		return print(&lines, &name, json).max(if report.revision.is_none() {2} else {1});
 	};
+	if loaded.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()) || loaded.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Xray {..})) {
+		let (shown, folder) = (addons.display().to_string(), addons.clone());
+		#[cfg(not(unix))]
+		let _ = &xray_dir;
+		lines.push(match tokio::task::spawn_blocking(move || veilway_core::engine::xray::verify(&folder)).await {
+			Ok(Ok(())) => line(Status::Ok, "xray", shown, format!("the add-on is installed, is the pinned release {} and belongs to root", veilway_core::engine::xray::RELEASE)),
+			Ok(Err(why)) => line(Status::Fail, "xray", shown, format!("{why}: the Xray inbounds and outbounds of this config cannot run, and every exit through an Xray outbound is down. Install it with `scripts/veilway.sh addon xray install`")),
+			Err(_) => line(Status::Warn, "xray", shown, "the check did not finish"),
+		});
+		#[cfg(unix)]
+		{
+			if loaded.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Xray {..})) {
+				let shown = xray_dir.display().to_string();
+				lines.push(match std::fs::metadata(&xray_dir) {
+					Err(e) => line(Status::Warn, "xray", shown, format!("the folder for the sockets of Xray outbounds is not there ({}): the Xray unit makes it when it runs, and the node's user must be in the group of Xray's user to enter it. `scripts/veilway.sh addon xray install` sets both up", e.kind())),
+					Ok(meta) if !meta.is_dir() => line(Status::Fail, "xray", shown, "it is not a folder"),
+					Ok(meta) => {
+						let (mode, owner, group) = (meta.mode() & 0o777, meta.uid(), meta.gid());
+						// What this user belongs to is what the node it runs as belongs to, which is why the installer puts the node's user in the group in the system's files.
+						let (euid, mut groups) = (unsafe {libc::geteuid()}, vec![0 as libc::gid_t; 256]);
+						let counted = unsafe {libc::getgroups(groups.len() as i32, groups.as_mut_ptr())};
+						groups.truncate(counted.max(0) as usize);
+						if mode & 0o027 != 0 {line(Status::Fail, "xray", shown, format!("its mode is {mode:o}: only the owner and the group may enter it and only the owner may write to it (750), since a socket that is made there carries the provider's traffic"))}
+						else if owner == 0 {line(Status::Fail, "xray", shown, "it belongs to root: Xray's user makes it, and the node checks that the sockets in it are that user's")}
+						else if euid == 0 {line(Status::Warn, "xray", shown, "the folder looks right, but root enters any folder: run doctor as the node's user (`sudo -u veilway`) to see whether that user may")}
+						else if unsafe {libc::getegid()} != group && !groups.contains(&group) {line(Status::Fail, "xray", shown, format!("this user is not in the group of the folder (gid {group}): put the node's user in the group veilway-xray (`scripts/veilway.sh addon xray install` does) and start the node again"))}
+						else {line(Status::Ok, "xray", shown, "the folder for the sockets of Xray outbounds is there, belongs to Xray's user, and this user is in its group")}
+					}
+				});
+			}
+		}
+	}
 	// What a node that runs here already holds decides how a taken address and a taken interface name are read, so it is asked before either is looked at.
 	// Only a node that says so itself excuses anything, and only what it names: whatever else listens on the socket path is another program.
 	#[cfg(unix)]
@@ -347,8 +385,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let answering = node.0 == Status::Ok && node.2.starts_with("a node answers");
 	lines.push(line(node.0, "node", node.1, node.2));
 	let (config, mut bound, mut read, now) = (Arc::new(loaded), HashSet::new(), HashSet::new(), SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64));
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			// Transports that share an address share one listener, as they do in the node.
 			let (addr, stream) = (transport.listen(), !transport.datagram());
 			if !bound.insert((addr, stream)) {continue}
@@ -365,7 +403,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			});
 		}
 	}
-	for proxy in &config.proxies {
+	for proxy in config.proxies.iter().filter(|proxy| proxy.on()) {
 		let (addr, subject) = (proxy.listen.0, format!("inbound {}, tcp {}", proxy.tag, proxy.listen.0));
 		if !bound.insert((addr, true)) {continue}
 		lines.push(match probe::listen(addr, true).await {
@@ -379,8 +417,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			})),
 		});
 	}
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let tls = match transport {
 				Transport::Ws {tls: Some(tls), ..} | Transport::Tls {tls: Certificate::Files(tls), ..} => tls,
 				// The certificate the node makes itself: the pin of the key it keeps, which is what profiles carry. Nothing is made or written here.
@@ -411,8 +449,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	// The decoy origin of every `tls` transport, once for each origin and path. It is asked directly, with or without a node that runs.
 	let mut origins = HashSet::new();
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::WsPlain {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..} | Transport::FrontedShaped {path, decoy: origin, ..}) = transport else {continue};
 			// The answer to a `fronted` request is no upgrade and takes no field from the origin.
 			let wanted = if matches!(transport, Transport::Fronted {..} | Transport::FrontedShaped {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
@@ -420,8 +458,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		}
 	}
 	// The shape each `fronted-shaped` transport uses (shapes page, "Choosing a shape"): "`veilway doctor` prints the shape each transport uses." The node cannot see the profile, so the line is what the profile has to say as well.
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let Some(shape) = transport.proxied().and_then(|proxied| proxied.shape) else {continue};
 			lines.push(match shape.resolve() {
 				Ok(shape) => line(Status::Ok, "shape", format!("inbound {}, transports[{t}].shape", inbound.tag), format!("{shape}. The profile of this transport must carry the same object: the node cannot see it, and a request in another shape reaches the decoy origin")),
@@ -430,8 +468,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		}
 	}
 	// The HTTP/2 of each `tls` transport (http2 page, "Modes"): on, the node answers the peer's streams itself, and that is the difference a probe can see.
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let Transport::Tls {http2, ..} = transport else {continue};
 			lines.push(match http2 {
 				Some(Http2::On) => line(Status::Warn, "http2", format!("inbound {}, transports[{t}].http2", inbound.tag), "on: the node answers HTTP/2 itself, so its frames differ from the decoy origin's, and the tunnel is offered to peers that negotiate h2"),
@@ -441,8 +479,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	// The proxy path of every `ws` and `fronted` listener (transports page, "Who ends TLS" and "Pools and what happens when one is full"): whether anybody but this host reaches it, and whether the web server in front names the visitor in the header the config says. The second is known only to a node that runs and has read requests.
 	let mut fronts = HashSet::new();
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let (Some(proxied), addr) = (transport.proxied(), transport.listen()) else {continue};
 			if !fronts.insert(addr) {continue}
 			let (subject, outside) = (format!("inbound {}, transports[{t}]", inbound.tag), proxied.trusted.iter().filter(|proxy| !proxy.0.addr().is_loopback()).count());
@@ -529,7 +567,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let ended: HashSet<usize> = tried.iter().map(|(at, _)| *at).collect();
 	let late = format!("it was not tried to its end: doctor ran out of time, which is {} s for everything on the network together. Run it again, with a smaller --timeout if little of this network answers", TOTAL.as_secs());
 	tried.extend((0..asked.len() + config.outbounds.len()).filter(|at| !ended.contains(at)).map(|at| (at, vec![match at.checked_sub(asked.len()).map(|at| &config.outbounds[at]) {
-		Some(config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..}) => line(Status::Skipped, "outbound", tag, late.as_str()),
+		Some(config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..}) => line(Status::Skipped, "outbound", tag, late.as_str()),
 		None => line(Status::Skipped, "dns", asked[at].0.as_str(), late.as_str()),
 	}])));
 	// The servers of a set were asked from the node itself and through no outbound, which is said rather than left to be assumed. It is put in first with the place of the first outbound, so the sort leaves it after the last server and before that outbound.

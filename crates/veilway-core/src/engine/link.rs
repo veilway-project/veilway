@@ -14,6 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use veilway_engine::import::Named;
+use veilway_proto::session::{self, KEEPALIVE, REKEY};
 use veilway_proto::subscription::payload::Transport;
 use veilway_transport::choice::{self, Class, Network, Next, Pick, Standing};
 use veilway_transport::{connector, Connect, End, Ended, Env, Kind, Session, Source, State as Opened, Target, Unreachable, Want, ATTEMPT};
@@ -201,14 +202,20 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 	let connect = dialled.via.clone().map(|via| through(via, {let (state, tag) = (state.clone(), tag.to_string()); move |cause| state.carried(&tag, cause)}));
 	let source: Source = Arc::new(Mutex::new({
 		let tunnel = tunnel.clone();
-		// "A keepalive of a tunnel that is already up, or else a fresh handshake initiation."
-		move |want: Want| {
+		// "A keepalive of a tunnel that is already up, or else a fresh handshake initiation." The dialler of a link is the client of the transports page, so it also starts a new handshake once the last one is older than the client rekey point (60 to 110 s, drawn again after each), and WireGuard, which only rekeys on data, does not give an idle link up at 180 s.
+		// Unlike an app, a link with no session sends an initiation on an idle keepalive too: the session it rides is still open, and waiting for the listener's idle limit to end it kept a quiet link down for minutes.
+		let draw = || session::delay(&REKEY, &mut random).unwrap_or(Duration::from_secs(85));
+		let rekey = Mutex::new(draw());
+		move |_: Want| {
 			let (mut peers, mut out) = (tunnel.lock(), Vec::new());
 			let peer = peers.wg.index(&key)?;
-			match (want, peers.wg.time_since_last_handshake(peer).is_some()) {
-				(Want::First, false) => peers.wg.initiate(peer, &mut out),
-				(Want::Keepalive, false) => return None,
-				(_, true) => peers.wg.encapsulate(peer, &[], &mut out),
+			let mut point = rekey.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+			match peers.wg.time_since_last_handshake(peer) {
+				Some(age) if age <= *point => peers.wg.encapsulate(peer, &[], &mut out),
+				_ => {
+					*point = draw();
+					peers.wg.initiate(peer, &mut out);
+				}
 			}
 			out.pop()
 		}
@@ -242,6 +249,8 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 		if let Some(peer) = peers.wg.index(&key) {peers.heard(peer, Via::Dial(me.clone()))}
 	}
 	let (started, mut live, mut full, mut buf, mut tick) = (Instant::now(), false, 0u64, vec![0u8; MAX_PACKET], tokio::time::interval(Duration::from_secs(1)));
+	// Plain `udp` has no transport to ask for an idle keepalive, so this asks the source itself, which is also where the rekey comes from.
+	let mut idle = Instant::now() + session::delay(&KEEPALIVE, &mut random).unwrap_or(Duration::from_secs(30));
 	loop {
 		let received = async {
 			match &mut carrier {
@@ -316,10 +325,14 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 					}
 				}
 				// Plain `udp` has no session to say that it ended: silence at the start is an endpoint that does not answer, and a tunnel that has gone quiet for as long as a link may is a session that is lost.
-				Carrier::Plain(_) => {
+				Carrier::Plain(socket) => {
 					let quiet = !shared.plan().inbound_of(tunnel).and_then(|at| shared.plan().inbounds[at].link).is_some_and(|link| shared.plan().up(link));
 					if !live && started.elapsed() >= ATTEMPT {return Ended::Unreachable(Unreachable::Silence)}
 					if live && quiet {return Ended::Closed(End::Lost)}
+					if live && Instant::now() >= idle {
+						idle = Instant::now() + session::delay(&KEEPALIVE, &mut random).unwrap_or(Duration::from_secs(30));
+						if let Some(datagram) = source.lock().ok().and_then(|mut source| source(Want::Keepalive)) {let _ = socket.send(&datagram).await;}
+					}
 				}
 			},
 		}

@@ -26,7 +26,6 @@ export const en = {
 	"home.load.low": "Not busy",
 	"home.load.medium": "Busy",
 	"home.load.high": "Very busy",
-	"home.load.unknown": "Load not known",
 	"home.exitFailed": "The exit could not be changed",
 	"home.session": "This session",
 	"home.planEnds": "Plan ends {date}",
@@ -463,7 +462,16 @@ export const en = {
 	"settings.xrayRemoveTitle": "Remove the Xray add-on?",
 	"settings.xrayRemoveBody": "A connection that uses it is ended first. Your pasted links stay, and the add-on is offered again when you connect to one.",
 	"settings.xrayRemoved": "Add-on removed",
-	"settings.xrayRemoveFailed": "Could not remove the add-on"
+	"settings.xrayRemoveFailed": "Could not remove the add-on",
+	"import.scan": "Scan with the camera",
+	"scan.title": "Scan a QR code",
+	"scan.hint": "Hold the QR code in front of the camera.",
+	"scan.starting": "Starting the camera",
+	"scan.privacy": "The camera is on only while this window is open. Nothing is saved or sent.",
+	"scan.privacyApp": "The camera is on only while the scanner is open. Nothing is saved or sent.",
+	"import.error.camera_denied": "The camera is blocked. Allow it for Veilway in the system settings, then try again.",
+	"import.error.camera_none": "No camera was found on this device.",
+	"import.error.scan_failed": "The scanner stopped before it read a code. Try again, or paste the link."
 };
 
 export type DesktopKey = keyof typeof en;

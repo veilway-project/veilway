@@ -16,7 +16,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 	const code = said && ("say." + said) in en ? t(("say." + said) as DesktopKey) : xray?.say ?? status?.say;
 	const wait = status?.wait_until ? t("home.retryAt", {time: time(fromUnix(status.wait_until))}) : state === "stopped" ? t("home.retryAsked") : null;
 	const country = (exit: Exit) => { try { return exit.country ? new Intl.DisplayNames([locale], {type: "region"}).of(exit.country.toUpperCase()) : undefined; } catch { return undefined; } };
-	const exitDetail = (exit: Exit) => [country(exit), exit.working ? t(("home.load." + (["low", "medium", "high"].includes(exit.load) ? exit.load : "unknown")) as DesktopKey) : t("home.exitDown")].filter(Boolean).join(locale === "fa" ? "، " : ", ");
+	const exitDetail = (exit: Exit) => [country(exit), exit.working ? (["low", "medium", "high"].includes(exit.load) ? t(("home.load." + exit.load) as DesktopKey) : "") : t("home.exitDown")].filter(Boolean).join(locale === "fa" ? "، " : ", ");
 	const pick = (tag: string | null) => { setPicking(false); call("select_exit", {tag}).catch(error => toast({tone: "danger", title: t("home.exitFailed"), body: error})); };
 	const items: ProviderItem[] = subscription ? [
 		...subscription.notices.map(n => ({type: "notice" as const, text: n.text, severity: n.severity === "warning" ? "warning" as const : n.severity === "critical" ? "critical" as const : "info" as const})),

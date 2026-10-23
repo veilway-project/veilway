@@ -31,6 +31,8 @@ const HELD: Duration = Duration::from_secs(30 * 86_400);
 const PUSHES: usize = PROBES + 1;
 /// How often a connection whose next `usage` is due looks whether the numbers have changed.
 const USAGE_LOOK: Duration = Duration::from_secs(1);
+/// How soon a device is told a new load level at the earliest, see `Options::load`. It is told one at most this often, however often the node measures. Levels are coarse and rare on purpose: one device cannot use them to watch what other users do.
+pub(super) const LOAD_PUSH: Duration = Duration::from_secs(60);
 /// Lines one device can have written to the log at info at once, and how long it takes to earn one more, see `State::say`.
 const SAID_BURST: u32 = 6;
 const SAID_REFILL: Duration = Duration::from_secs(30);
@@ -87,10 +89,12 @@ pub(super) struct Channel {
 	watched: Mutex<HashMap<[u8; 32], (Arc<State>, Instant)>>,
 	/// `Options::usage_push`.
 	usage_push: RangeInclusive<u32>,
+	/// The time between two catalogues a connection is sent for a new load level, from `Options::load`.
+	pub(super) load_push: Duration,
 }
 
 impl Channel {
-	pub(super) fn new(usage_push: RangeInclusive<u32>) -> Channel {Channel {counters: Counters::default(), plans: watch::Sender::new(0), health: watch::Sender::new(0), watched: Mutex::default(), usage_push}}
+	pub(super) fn new(usage_push: RangeInclusive<u32>) -> Channel {Channel {counters: Counters::default(), plans: watch::Sender::new(0), health: watch::Sender::new(0), watched: Mutex::default(), usage_push, load_push: LOAD_PUSH}}
 
 	/// When the next `usage` of a connection is due at the earliest: "not sooner than a time drawn uniformly from 30 to 90 s after the last one". A random source that fails gives the longest wait.
 	fn next_usage(&self) -> Instant {Instant::now() + Duration::from_millis(veilway_proto::uniform(*self.usage_push.start(), *self.usage_push.end(), &mut random).unwrap_or(*self.usage_push.end()).into())}
@@ -310,8 +314,7 @@ impl Shared {
 				selected: chosen.as_deref() == Some(exit.tag.as_str()),
 				configured: at == configured,
 				working: plan.working(at),
-				// Nothing measures load yet.
-				load: Load::Unknown,
+				load: exit.load.map_or(Load::Unknown, |_| exit.state.load.level()),
 			}).collect(),
 			notices: plan.notices.clone(),
 		}
@@ -426,7 +429,7 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 		counters.open.fetch_add(1, Ordering::Relaxed);
 		state.say(&format!("{who}: control channel open through inbound {tag}"));
 		shared.flows.hold(&key, id, HELD + super::flows::HOLD_MARGIN);
-		let (mut sent, mut mark, mut usage_due, mut pending, mut doubted) = (None::<Sent>, None::<Mark>, Instant::now(), rest, false);
+		let (mut sent, mut mark, mut usage_due, mut pending, mut doubted, mut load_due) = (None::<Sent>, None::<Mark>, Instant::now(), rest, false, Instant::now() + shared.control.load_push);
 		// The first round sends the snapshot, unasked. After it every round waits for one thing, writes what it calls for, and looks at the plan in force anew.
 		let mut wanted = Some(None::<ClientMessage>);
 		loop {
@@ -600,7 +603,13 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					if !changed {return End::Gone}
 					let plan = shared.plan();
 					let Some(from) = plan.by_address.get(&key.src).copied().filter(|from| plan.devices[from.device].public_key == device && plan.control(from.inbound, key.dst)) else {return End::Gone};
-					let (now, was) = (shared.snapshot(&plan, from), sent.as_ref());
+					let (mut now, was) = (shared.snapshot(&plan, from), sent.as_ref());
+					// A level that was told and still is one moves on the load timer only, not with whatever else made the catalogue change.
+					if let Some(was) = was {
+						for exit in now.exits.iter_mut().filter(|exit| exit.load != Load::Unknown) {
+							if let Some(old) = was.exits.iter().find(|old| old.tag == exit.tag && old.load != Load::Unknown) {exit.load = old.load}
+						}
+					}
 					if was.is_none_or(|was| (was.mtu, was.v4, was.v6) != (now.mtu, now.v4, now.v6)) {put(&mut out, &NodeMessage::Session(control::Session {node_time: u64::try_from((shared.now)().unix_timestamp()).unwrap_or(0), mtu: now.mtu, v4: now.v4, v6: now.v6}))}
 					if was.is_none_or(|was| was.exits != now.exits) {
 						if let Ok(parts) = control::catalogue(&now.exits) {
@@ -609,6 +618,18 @@ pub async fn serve(shared: Arc<Shared>, key: Key, id: u64, device: [u8; 32], str
 					}
 					if was.is_none_or(|was| was.notices != now.notices) {put(&mut out, &NodeMessage::Notices(now.notices.iter().map(|(severity, text)| control::Notice {severity: if *severity == NoticeSeverity::Warning {Severity::Warning} else {Severity::Information}, text: text.as_str().into()}).collect()))}
 					sent = Some(now);
+				}
+				_ = tokio::time::sleep_until(load_due.into()) => {
+					load_due = Instant::now() + shared.control.load_push;
+					let plan = shared.plan();
+					let Some(from) = plan.by_address.get(&key.src).copied().filter(|from| plan.devices[from.device].public_key == device && plan.control(from.inbound, key.dst)) else {return End::Gone};
+					let now = shared.snapshot(&plan, from);
+					if let Some(was) = sent.as_mut().filter(|was| was.exits != now.exits) {
+						if let Ok(parts) = control::catalogue(&now.exits) {
+							for part in &parts {put(&mut out, part)}
+						}
+						was.exits = now.exits;
+					}
 				}
 				// "The node sends a new `usage` when the numbers changed since the last one, and not sooner than the time in the table of numbers. Nothing is pushed while nothing changes."
 				_ = tokio::time::sleep_until(usage_due.into()) => {

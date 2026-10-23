@@ -3,6 +3,7 @@
 use super::inbound::Tunnel;
 use super::route;
 use super::upstream::UpstreamState;
+use super::xray_out::{Hop, Hops};
 use super::{control, icmp, l3, link, proxy, usage, ExitState, Traffic, UserState};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, LinkTransportType, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_LINK_FLOWS, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
@@ -24,10 +25,11 @@ use veilway_proto::subscription::Secret;
 use veilway_proto::{faketls, proof, udp_obfs, NoRandom};
 
 /// A SOCKS5 proxy. Its credentials are secrets, so this has no `Debug`. `via` is the proxy the connection to this one goes through, which may have one of its own.
-pub struct Upstream {pub tag: String, pub host: String, pub port: u16, pub auth: Option<(String, String)>, pub latency: Arc<Latency>, pub via: Option<Arc<Upstream>>}
+/// `hop` is set for an Xray outbound, which is dialed as Trojan over a Unix socket of the add-on that has a new path and password each run (`flows::dial_conn`): `host`, `port` and `auth` are then empty and the hop says where to go, or why it cannot.
+pub struct Upstream {pub tag: String, pub host: String, pub port: u16, pub auth: Option<(String, String)>, pub latency: Arc<Latency>, pub via: Option<Arc<Upstream>>, pub hop: Option<Arc<Hop>>}
 
 /// Equal when they name the same proxy with the same credentials and chain: what was measured of it does not count.
-impl PartialEq for Upstream {fn eq(&self, other: &Upstream) -> bool {self.tag == other.tag && self.host == other.host && self.port == other.port && self.auth == other.auth && self.via == other.via}}
+impl PartialEq for Upstream {fn eq(&self, other: &Upstream) -> bool {self.tag == other.tag && self.host == other.host && self.port == other.port && self.auth == other.auth && self.via == other.via && match (&self.hop, &other.hop) {(Some(was), Some(is)) => Arc::ptr_eq(was, is), (None, None) => true, _ => false}}}
 
 impl Eq for Upstream {}
 
@@ -45,26 +47,30 @@ impl Latency {
 pub enum Outbound {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks5(Upstream)}
 
 impl Upstream {
-	/// The proxy of the `socks5` outbound `tag` names, behind the chain its `via` keys give. Validation has refused a loop and a chain longer than `MAX_CHAIN`, so this ends.
-	fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Upstream> {
-		let config::Outbound::Socks5 {server, username, password, via, ..} = outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Socks5 {tag: name, ..} if name == tag))? else {return None};
-		Some(Upstream {
-			tag: tag.to_string(),
-			host: match &server.host {config::Host::Ip(ip) => ip.to_string(), config::Host::Name(name) => name.clone()},
-			port: server.port,
-			auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
-			latency: latency.get(tag)?.clone(),
-			via: match via {Some(via) => Some(Arc::new(Upstream::of(outbounds, latency, via)?)), None => None},
-		})
+	/// The proxy of the `socks5` or `xray` outbound `tag` names, behind the chain its `via` keys give. Validation has refused a loop and a chain longer than `MAX_CHAIN`, so this ends.
+	fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, tag: &str) -> Option<Upstream> {
+		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Socks5 {tag: name, ..} | config::Outbound::Xray {tag: name, ..} if name == tag))? {
+			config::Outbound::Xray {..} => Some(Upstream {tag: tag.to_string(), host: String::new(), port: 0, auth: None, latency: latency.get(tag)?.clone(), via: None, hop: Some(hops.get(tag))}),
+			config::Outbound::Socks5 {server, username, password, via, ..} => Some(Upstream {
+				tag: tag.to_string(),
+				host: match &server.host {config::Host::Ip(ip) => ip.to_string(), config::Host::Name(name) => name.clone()},
+				port: server.port,
+				auth: username.as_ref().zip(password.as_ref()).map(|(user, pass)| (user.expose().clone(), pass.expose().clone())),
+				latency: latency.get(tag)?.clone(),
+				via: match via {Some(via) => Some(Arc::new(Upstream::of(outbounds, latency, hops, via)?)), None => None},
+				hop: None,
+			}),
+			config::Outbound::Direct {..} => None,
+		}
 	}
 }
 
 impl Outbound {
 	/// The outbound `tag` names, as the engine dials through it.
-	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, tag: &str) -> Option<Outbound> {
-		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} if name == tag))? {
+	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, tag: &str) -> Option<Outbound> {
+		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} | config::Outbound::Xray {tag: name, ..} if name == tag))? {
 			config::Outbound::Direct {bind, interface, ..} => Some(Outbound::Direct {bind: bind.map(|ip| ip.0), interface: interface.clone()}),
-			config::Outbound::Socks5 {..} => Upstream::of(outbounds, latency, tag).map(Outbound::Socks5),
+			config::Outbound::Socks5 {..} | config::Outbound::Xray {..} => Upstream::of(outbounds, latency, hops, tag).map(Outbound::Socks5),
 		}
 	}
 }
@@ -88,6 +94,8 @@ pub struct Exit {
 	pub name: String,
 	pub country: Option<[u8; 2]>,
 	pub backend: Backend,
+	/// What the exit's load level is measured by, None for an exit that reports none.
+	pub load: Option<config::Load>,
 	/// The tag of the outbound of a netstack backend. An exit that is given another outbound has changed, even when that one leads to the same place.
 	pub outbound: Option<String>,
 	pub traffic: Arc<Traffic>,
@@ -450,6 +458,8 @@ pub struct Plan {
 	pub notices: Vec<(NoticeSeverity, String)>,
 	/// The latency each outbound's proxy was last measured at, by tag. The exits through an outbound share its entry.
 	pub latency: HashMap<String, Arc<Latency>>,
+	/// Where each Xray outbound is dialed. One registry for the life of the engine, handed from plan to plan, which the add-on's supervisor fills in.
+	pub hops: Arc<Hops>,
 	/// Every enabled node link of the config, in its order.
 	pub links: Vec<Link>,
 	/// The links this node is dialled for, by the key that names them, which is the key their packets arrive under.
@@ -497,12 +507,12 @@ impl Plan {
 				Some(Policy::Via(tag)) => Fallback::Via(find(&exit_tags, tag)?),
 			})
 		};
-		let latency: HashMap<String, Arc<Latency>> = config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => (tag.clone(), Arc::new(Latency::default()))}).collect();
+		let latency: HashMap<String, Arc<Latency>> = config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..} => (tag.clone(), Arc::new(Latency::default()))}).collect();
 		let mut exits: Vec<Exit> = Vec::with_capacity(config.exits.len());
 		for exit in &config.exits {
 			let backend = match &exit.backend {
 				config::Backend::Netstack(netstack) => Backend::Netstack {
-					outbound: Outbound::of(&config.outbounds, &latency, &netstack.outbound).ok_or_else(stale)?,
+					outbound: Outbound::of(&config.outbounds, &latency, &previous.hops, &netstack.outbound).ok_or_else(stale)?,
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
 					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,
@@ -522,6 +532,7 @@ impl Plan {
 				name: exit.name.clone().unwrap_or_else(|| exit.tag.clone()),
 				country: exit.country.as_ref().and_then(|country| <[u8; 2]>::try_from(country.as_bytes()).ok()),
 				backend,
+				load: exit.load,
 				outbound: if let config::Backend::Netstack(netstack) = &exit.backend {Some(netstack.outbound.clone())} else {None},
 				traffic: was.map(|was| was.traffic.clone()).unwrap_or_default(),
 				state: was.map(|was| was.state.clone()).unwrap_or_default(),
@@ -537,7 +548,7 @@ impl Plan {
 			veilway: inbound.kind == InboundType::Veilway,
 			pools: inbound.address.iter().map(|net| net.0).collect(),
 			mtu: inbound.mtu(),
-			transports: inbound.transports.clone(),
+			transports: if inbound.on() {inbound.transports.clone()} else {Vec::new()},
 			dns: set_of_inbound.get(inbound.tag.as_str()).map_or(0, |set| set + 1),
 			traffic: was_inbound.get(inbound.tag.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(),
 			tunnel,
@@ -581,9 +592,12 @@ impl Plan {
 				let (d, mut addresses, mut within) = (devices.len(), Vec::with_capacity(device.addresses.len()), Vec::new());
 				for config::Ip(ip) in &device.addresses {
 					let inbound = pools.iter().find(|(pool, _)| pool.contains(ip)).map(|(_, i)| *i).ok_or_else(stale)?;
-					if !within.contains(&inbound) {within.push(inbound)}
+					// A device of an inbound that is not enabled has its address and no place in the inbound: it is no peer of the tunnel and its flows through it end.
+					if config.inbounds[inbound].on() {
+						if !within.contains(&inbound) {within.push(inbound)}
+						by_address.insert(*ip, Holder {device: d, inbound});
+					}
 					addresses.push(*ip);
-					by_address.insert(*ip, Holder {device: d, inbound});
 				}
 				addresses.sort();
 				by_key.insert(device.public_key.0, d);
@@ -623,7 +637,7 @@ impl Plan {
 						}
 					})).collect::<Option<Vec<_>>>().ok_or_else(stale)?;
 					inbounds.push(Inbound {tag: name.clone(), private_key: private.expose().0, public_key: identity, native: None, veilway: false, pools: Vec::new(), mtu, transports: Vec::new(), dns: 0, traffic: was_inbound.get(name.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(), tunnel: tunnels.next().ok_or_else(stale)?, link: Some(l)});
-					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}, borrowed: Default::default()}, transports, via: match &written.via {Some(tag) => Some(Arc::new(Upstream::of(&config.outbounds, &latency, tag).ok_or_else(stale)?)), None => None}})))
+					(inbounds.len() - 1, peer.inbound_public_key.0, Some(Arc::new(Dialled {link: veilway_transport::Link {inbound: peer.inbound_public_key.0, device: identity, secret: Secret::new(written.transport_secret.0), node: peer.transport_public_key.map(|key| key.0), mtu, padding: payload::Padding {wide_max: WIDE_DEFAULT, normal_max: NORMAL_DEFAULT, keepalive: KEEPALIVE}, borrowed: Default::default()}, transports, via: match &written.via {Some(tag) => Some(Arc::new(Upstream::of(&config.outbounds, &latency, &previous.hops, tag).ok_or_else(stale)?)), None => None}})))
 				}
 				_ => return Err(stale()),
 			};
@@ -675,7 +689,7 @@ impl Plan {
 		// The keys and the tags of a large inbound take a while to make. A plan is compiled on a thread of the runtime with a reload or a cut-off waiting for it, so the runtime is told that this thread is busy: its other work, every packet among it, goes to the other threads.
 		// A runtime of one thread has no other to give it to, and code that runs on none, a test or a harness, needs none.
 		let mut tables = || -> anyhow::Result<()> {
-			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
+			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.on() && inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
 				let (public, mut was) = (inbounds[i].public_key, HashMap::new());
 				for derived in previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()).flat_map(|native| &native.keys) {was.insert((derived.device.public, derived.device.id.0), derived);}
 				let keys = devices.iter().filter(|device| device.inbounds.contains(&i)).flat_map(|device| device.secrets.iter().map(|secret| (device.public_key, *secret))).chain(links.iter().filter(|link| link.listener && link.inbound == i && link.denied.is_none()).map(|link| (link.identity, link.secret))).map(|(key, secret)| was.get(&(key, secret)).map_or_else(|| Arc::new(Derived::new(&secret, &public, &key)), |derived| (*derived).clone())).collect();
@@ -732,6 +746,7 @@ impl Plan {
 			l3: None,
 			notices: config.notices.iter().map(|notice| (notice.severity, notice.text.clone())).collect(),
 			latency,
+			hops: previous.hops.clone(),
 			proxy_tags: config.proxies.iter().map(|proxy| proxy.tag.clone()).collect(),
 			proxies: config.proxies.iter().map(|proxy| (proxy.tag.clone(), config.users.iter().map(|user| user.proxy_password.is_some() && (proxy.users.is_empty() && proxy.groups.is_empty() || proxy.users.contains(&user.name) || user.groups.iter().any(|group| proxy.groups.contains(group)))).collect())).collect(),
 			dns, inbounds, users, devices, exits, rules, pools, by_address, by_key, expired, next_expiry, starts, states, links, by_link, linked, people, listening,
@@ -762,6 +777,7 @@ impl Plan {
 	/// Whether exit `at` works as far as the node knows: a netstack exit while its proxy, when it has one, lets the node in, an l3 exit while its interface is up, a chain exit while one of its links is up, and a block exit never.
 	pub fn working(&self, at: usize) -> bool {
 		match &self.exits[at].backend {
+			Backend::Netstack {outbound: Outbound::Socks5(up), ..} => self.exits[at].state.working() && up.hop.as_ref().is_none_or(|hop| hop.reason().is_none()),
 			Backend::Netstack {..} => self.exits[at].state.working(),
 			Backend::L3 {..} => self.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
 			Backend::Chain {links} => links.iter().any(|link| self.up(*link)),

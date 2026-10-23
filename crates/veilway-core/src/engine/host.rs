@@ -252,7 +252,7 @@ impl Host {
 			upstreams.push((written.effective(), None, state, vault));
 		}
 		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>())?;
-		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
+		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, &plan.hops, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
 		for (tunnel, ..) in &fresh {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
 			for device in plan.devices.iter().filter(|device| device.inbounds.contains(&at)) {peers.add(device.public_key, device.preshared_key)}
@@ -269,9 +269,9 @@ impl Host {
 		let (mut listeners, mut streams, mut certified) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new());
 		let (mut borrowed, mut sites) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, SocketAddr>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
-			for (t, transport) in inbound.transports.iter().enumerate() {
+			for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 				match transport {
-					Transport::Udp {listen} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
+					Transport::Udp {listen, ..} | Transport::UdpObfs {listen, ..} if !self.udp.contains_key(&listen.0) => udp.push((listen.0, Arc::new(bind(listen.0, Type::DGRAM, self.released.contains(&listen.0)).await.and_then(|socket| UdpSocket::from_std(socket.into())).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].listen: inbound `{}` cannot listen there over udp: {}", inbound.tag, e.kind()))?))),
 					Transport::Udp {..} | Transport::UdpObfs {..} => {}
 					Transport::Tls {listen, decoy, ..} | Transport::WsNative {listen, decoy, ..} | Transport::WsPlain {listen, decoy, ..} | Transport::Fronted {listen, decoy, ..} | Transport::FrontedShaped {listen, decoy, ..} => {
 						if !self.tls.contains_key(&listen.0) && !listeners.iter().any(|(addr, _)| *addr == listen.0) {
@@ -362,7 +362,7 @@ impl Host {
 		}
 		// Proxy inbounds: one that did not change keeps its listener and its connections. One that is new, or changed, binds its address now, or takes the socket of the one it replaces on the same address.
 		let mut proxies = Vec::new();
-		for (i, written) in config.proxies.iter().enumerate() {
+		for (i, written) in config.proxies.iter().enumerate().filter(|(_, written)| written.on()) {
 			let written = written.effective();
 			if self.proxies.get(&written.tag).is_some_and(|running| running.config == written) {continue}
 			let listen = written.listen.0;
@@ -502,11 +502,11 @@ impl Host {
 		// For each UDP address: its tunnel, the session pool of a `udp-obfs` transport, and whether what leaves it must never be fragmented, with the inbound to say so of.
 		let (mut wanted, mut routes): (HashMap<SocketAddr, (&Arc<Tunnel>, Option<usize>, bool, &str)>, HashMap<SocketAddr, Vec<(String, Option<Tls>, Arc<Tunnel>, u64)>>) = Default::default();
 		for inbound in &plan.inbounds {
-			for transport in &inbound.transports {
+			for transport in inbound.transports.iter().filter(|transport| transport.on()) {
 				match transport {
-					Transport::Udp {listen} => drop(wanted.insert(listen.0, (&inbound.tunnel, None, inbound.veilway, inbound.tag.as_str()))),
-					Transport::UdpObfs {listen, limits} => drop(wanted.insert(listen.0, (&inbound.tunnel, Some(limits.and_then(|limits| limits.sessions).unwrap_or(DEFAULT_SESSIONS) as usize), true, inbound.tag.as_str()))),
-					Transport::Ws {listen, path, tls} => {
+					Transport::Udp {listen, ..} => drop(wanted.insert(listen.0, (&inbound.tunnel, None, inbound.veilway, inbound.tag.as_str()))),
+					Transport::UdpObfs {listen, limits, ..} => drop(wanted.insert(listen.0, (&inbound.tunnel, Some(limits.and_then(|limits| limits.sessions).unwrap_or(DEFAULT_SESSIONS) as usize), true, inbound.tag.as_str()))),
+					Transport::Ws {listen, path, tls, ..} => {
 						// A transport that is as it was keeps its number, and with the number the connections it has. Any other is a new route.
 						let id = self.ws.get(&listen.0).and_then(|relay| relay.routes.iter().find(|(was, files, tunnel, _)| was == path && files == tls && Arc::ptr_eq(tunnel, &inbound.tunnel))).map(|(.., id)| *id).unwrap_or_else(|| {
 							self.routes += 1;
@@ -521,7 +521,7 @@ impl Host {
 		// What each stream listener serves from here on: the certificate and the origin as `prepare` found them, and one route for each `tls`, native `ws` or `fronted` transport on its address. Transports that share an address have one decoy, one list of proxies and one set of pools, which the first of them gives.
 		let mut serving: HashMap<SocketAddr, stream::Served> = HashMap::new();
 		for (inbound, written) in plan.inbounds.iter().zip(self.config.iter().flat_map(|config| &config.inbounds)) {
-			for transport in &inbound.transports {
+			for transport in inbound.transports.iter().filter(|transport| transport.on()) {
 				let (Some(decoy), Some((acceptor, origin)), cookie) = (transport.decoy(), streams.get(&transport.listen()), written.upgrade_cookie.clone().unwrap_or_default()) else {continue};
 				let (route, limits) = match transport {
 					Transport::Tls {path, limits, ..} => (stream::Route::tls(path.clone(), inbound.tunnel.clone(), cookie, written.upgrade_headers(true)), *limits),
@@ -534,14 +534,14 @@ impl Host {
 					},
 					_ => continue,
 				};
-				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), h2: matches!(transport, Transport::Tls {http2: Some(Http2::On), ..}), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
+				serving.entry(transport.listen()).or_insert_with(|| stream::Served {acceptor: acceptor.clone(), routes: Vec::new(), origin: stream::Origin::Tcp(*origin), proxy: decoy.proxy_protocol == Some(true), host: decoy.origin.host(), pools: stream::Pools::of(limits), h2: matches!(transport, Transport::Tls {http2: Some(Http2::On), ..}), front: transport.proxied().map(|proxied| stream::Front::of(proxied.trusted.iter().map(|proxy| proxy.0).collect(), proxied.header.map(str::to_string), proxied.limits, plan.inbounds.iter().flat_map(|other| &other.transports).any(|other| other.on() && other.listen() == transport.listen() && other.proxied().is_some_and(|other| other.shape.is_some_and(|shape| shape.down.mode == crate::config::ShapeMode::Sse)))))}).routes.push(route);
 			}
 		}
 		// What each `faketls` listener serves from here on: the site, the names a hello may carry, the key of the transport and the limits of the transport.
 		let mut borrowing: HashMap<SocketAddr, faketls::Served> = HashMap::new();
 		for inbound in &plan.inbounds {
-			for transport in &inbound.transports {
-				let (Transport::FakeTls {listen, site, transport_key, limits}, Some(address)) = (transport, sites.get(&transport.listen())) else {continue};
+			for transport in inbound.transports.iter().filter(|transport| transport.on()) {
+				let (Transport::FakeTls {listen, site, transport_key, limits, ..}, Some(address)) = (transport, sites.get(&transport.listen())) else {continue};
 				borrowing.insert(listen.0, faketls::Served {tunnel: inbound.tunnel.clone(), key: transport_key.0, host: site.host.clone(), names: std::iter::once(&site.host).chain(site.names.iter().flatten()).map(|name| name.as_bytes().to_vec()).collect(), site: *address, relayed: limits.and_then(|limits| limits.relayed).unwrap_or(DEFAULT_SITE_RELAYED) as usize, rate: limits.and_then(|limits| limits.site_rate).unwrap_or(DEFAULT_SITE_RATE)});
 			}
 		}
@@ -571,7 +571,7 @@ impl Host {
 			if !self.forwards.contains_key(&tag) {tracing::info!("tunnel {tag}: closed, with every connection it had")}
 		}
 		// The same for a proxy inbound: one that is as it was keeps its connections, and one that changed or went away closes its listener task and with it every connection. The socket of a changed one that keeps its address is handed on.
-		let named: Vec<ProxyInbound> = self.config.iter().flat_map(|config| &config.proxies).map(ProxyInbound::effective).collect();
+		let named: Vec<ProxyInbound> = self.config.iter().flat_map(|config| &config.proxies).filter(|written| written.on()).map(ProxyInbound::effective).collect();
 		let mut stopped = Vec::new();
 		self.proxies.retain(|tag, running| {
 			let kept = named.iter().any(|written| *written == running.config);
@@ -812,6 +812,11 @@ impl Host {
 					let mut peers = tunnel.lock();
 					if stays {peers.wg.drop_sessions(&was.public_key);} else {peers.wg.remove_peer(&was.public_key);}
 				}
+			}
+			// A device that is no longer in an inbound it was in, because the inbound is not enabled, is no peer of its tunnel: its sessions go and its handshakes are refused.
+			for was in old.devices.iter().filter(|was| !cut.contains_key(&was.public_key)) {
+				let Some(is) = plan.by_key.get(&was.public_key).map(|at| &plan.devices[*at]) else {continue};
+				for at in was.inbounds.iter().filter(|at| !is.inbounds.iter().any(|now| Arc::ptr_eq(&plan.inbounds[*now].tunnel, &old.inbounds[**at].tunnel))) {old.inbounds[*at].tunnel.lock().wg.remove_peer(&was.public_key);}
 			}
 			for device in &plan.devices {
 				for at in &device.inbounds {
