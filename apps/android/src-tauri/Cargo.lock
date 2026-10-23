@@ -5141,7 +5141,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-android"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5172,7 +5172,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-engine"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "base64 0.23.1",
  "boringtun",
@@ -5213,7 +5213,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-proto"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -5230,7 +5230,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-transport"
-version = "0.2.17"
+version = "0.2.18"
 dependencies = [
  "base64 0.23.1",
  "boring",
