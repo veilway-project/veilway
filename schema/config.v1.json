@@ -517,6 +517,10 @@
           "type": "array",
           "uniqueItems": true
         },
+        "enabled": {
+          "description": "Defaults to true. An inbound that is not enabled is validated like any other and does not listen: its tunnel takes no device, its transports bind nothing and its addresses stay reserved.",
+          "type": "boolean"
+        },
         "mtu": {
           "description": "Defaults to 1420, and to 1390 for a `veilway` inbound with a `udp-obfs` transport.",
           "format": "uint16",
@@ -1348,6 +1352,10 @@
       "additionalProperties": false,
       "description": "An inbound that lets other software use this node as a plain proxy. Every connection logs in as a user with that user's `proxy_password`, and what comes in goes through the same gate, rules, exits, entitlement, quotas and counters as a tunnel's traffic. SOCKS5 and HTTP carry no encryption of their own.",
       "properties": {
+        "enabled": {
+          "description": "Defaults to true. An inbound that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+          "type": "boolean"
+        },
         "groups": {
           "items": {
             "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
@@ -2014,6 +2022,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "listen": {
               "$ref": "#/$defs/Addr"
             },
@@ -2031,6 +2043,10 @@
         {
           "additionalProperties": false,
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "listen": {
               "$ref": "#/$defs/Addr"
             },
@@ -2057,6 +2073,10 @@
           "additionalProperties": false,
           "description": "WireGuard datagrams inside the `udp-obfs` envelope, for a `veilway` inbound.",
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -2080,6 +2100,10 @@
           "properties": {
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "http2": {
               "$ref": "#/$defs/Http2",
@@ -2117,6 +2141,10 @@
           "additionalProperties": false,
           "description": "The borrowed-site transport of a `veilway` inbound (alpha, new and unreviewed): the node holds no certificate, a client proves itself inside its first TLS message, and every other connection is relayed to the real `site`. `limits` takes `relayed` and `site_rate` alone.",
           "properties": {
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -2154,6 +2182,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
@@ -2200,6 +2232,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
@@ -2257,6 +2293,10 @@
             "decoy": {
               "$ref": "#/$defs/Decoy"
             },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
+            },
             "limits": {
               "$ref": "#/$defs/TransportLimits"
             },
@@ -2300,6 +2340,10 @@
             },
             "decoy": {
               "$ref": "#/$defs/Decoy"
+            },
+            "enabled": {
+              "description": "Defaults to true. A transport that is not enabled is validated like any other and does not listen, and its address stays reserved.",
+              "type": "boolean"
             },
             "limits": {
               "$ref": "#/$defs/TransportLimits"

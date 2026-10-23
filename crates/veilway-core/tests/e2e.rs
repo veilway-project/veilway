@@ -3531,3 +3531,73 @@ async fn an_answer_that_comes_after_its_user_changed_sets_is_relayed_and_not_rem
 	}
 	assert_eq!((example(&mut a, PEER_A, 47043).await, node.engine.dns_names("a"), family_hits.load(Ordering::SeqCst)), (IpAddr::from([198, 51, 100, 2]), Some(1), 1));
 }
+
+/// Whether a node answers a handshake sent to `server` within a second. A listener that is gone answers with an ICMP error, which counts as no answer.
+async fn answers(private:[u8;32], server_public:[u8;32], server:SocketAddr)->bool{
+	let sock=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	sock.connect(server).await.unwrap();
+	let mut tunn=Tunn::new(StaticSecret::from(private), PublicKey::from(server_public), None, None, 0, None);
+	let mut scratch=vec![0u8;2048];
+	let TunnResult::WriteToNetwork(init)=tunn.format_handshake_initiation(&mut scratch, false) else{panic!("no handshake initiation")};
+	sock.send(init).await.unwrap();
+	let mut datagram=vec![0u8;2048];
+	matches!(timeout(Duration::from_secs(1), sock.recv(&mut datagram)).await, Ok(Ok(_)))
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn a_transport_that_is_not_enabled_does_not_listen_and_the_other_one_of_its_inbound_does(){
+	let second=listen();
+	let Live{node, ..}=live(false, Options::new(""), |setup| setup.doc["inbounds"][0]["transports"].as_array_mut().unwrap().push(json!({"type":"udp", "listen":second.to_string(), "enabled":false}))).await;
+	assert!(answers(node.keys[0], node.public, node.addr).await, "the enabled transport of the same inbound did not answer");
+	assert!(!answers(node.keys[0], node.public, second).await, "a transport that is not enabled answered");
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn switching_a_transport_off_at_reload_ends_its_sessions_and_switching_it_on_binds_again(){
+	let (second, third)=(listen(), listen());
+	let Live{node, mut doc, ..}=live(false, Options::new(""), |setup| setup.doc["inbounds"][0]["transports"].as_array_mut().unwrap().extend([json!({"type":"udp", "listen":second.to_string()}), json!({"type":"udp", "listen":third.to_string()})])).await;
+	let mut a=Client::connect(node.keys[0], node.public, second).await;
+	let mut b=Client::connect(node.keys[1], node.public, third).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, 43000, 80).await;
+	let mut theirs=Flow::open(&mut b, PEER_B, PUBLIC, 43001, 80).await;
+	doc["inbounds"][0]["transports"][1]["enabled"]=json!(false);
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!((applied.diff.inbound_changes.len(), applied.diff.inbound_changes[0].transports_stopped.clone(), applied.diff.inbound_changes[0].restart), (1, vec![1], false));
+	assert!(!answers(node.keys[0], node.public, second).await, "a transport that was switched off still answers");
+	assert!(answers(node.keys[0], node.public, node.addr).await, "the first transport stopped answering");
+	assert_eq!(theirs.say(&mut b, b"still here").await, Answer::Accepted, "switching one transport off disturbed another transport's session");
+	// The session of the device lives in the tunnel, which the other transports share, but nothing can reach it or leave to it through a socket that is gone.
+	assert_eq!(ours.say(&mut a, b"anyone").await, Answer::Silence, "a session on a transport that was switched off was still answered");
+	doc["inbounds"][0]["transports"][1].as_object_mut().unwrap().remove("enabled");
+	let applied=reload(&node, &doc).await.unwrap();
+	assert_eq!(applied.diff.inbound_changes[0].transports_started, vec![1]);
+	let mut again=Client::connect(node.keys[0], node.public, second).await;
+	let mut flow=Flow::open(&mut again, PEER_A, PUBLIC, 43002, 80).await;
+	assert_eq!(flow.say(&mut again, b"back").await, Answer::Accepted);
+}
+
+#[tokio::test(flavor="multi_thread", worker_threads=4)]
+async fn an_inbound_that_is_not_enabled_refuses_its_devices_and_ends_their_flows(){
+	let (office, office_listen, key_c)=(veilway_wg::generate_key(), listen(), veilway_wg::generate_key());
+	let Live{node, mut doc, closed}=live(false, Options::new(""), |setup| {
+		setup.doc["inbounds"].as_array_mut().unwrap().push(inbound("office", &office, "10.8.0.1/24", udp(office_listen)));
+		setup.doc["users"].as_array_mut().unwrap().push(user("c", &key_c, "10.8.0.2"));
+	}).await;
+	let office_public=veilway_wg::public_key(&office);
+	let mut a=Client::connect(node.keys[0], node.public, node.addr).await;
+	let mut c=Client::connect(key_c, office_public, office_listen).await;
+	let mut ours=Flow::open(&mut a, PEER_A, PUBLIC, 44000, 80).await;
+	let mut theirs=Flow::open(&mut c, PEER_C, PUBLIC, 44001, 80).await;
+	doc["inbounds"][1]["enabled"]=json!(false);
+	reload(&node, &doc).await.unwrap();
+	eventually("the upstream connection of a device of an inbound that was switched off stayed open", || closed.load(Ordering::SeqCst)==1).await;
+	assert_eq!(node.engine.flows(), 1, "the flow through the inbound that was switched off lives on");
+	assert!(!answers(key_c, office_public, office_listen).await, "an inbound that was switched off answered a device");
+	assert_eq!(ours.say(&mut a, b"still here").await, Answer::Accepted, "switching an inbound off disturbed another inbound");
+	assert_eq!(theirs.say(&mut c, b"anyone").await, Answer::Silence);
+	doc["inbounds"][1].as_object_mut().unwrap().remove("enabled");
+	reload(&node, &doc).await.unwrap();
+	let mut back=Client::connect(key_c, office_public, office_listen).await;
+	let mut flow=Flow::open(&mut back, PEER_C, PUBLIC, 44002, 80).await;
+	assert_eq!(flow.say(&mut back, b"hello").await, Answer::Accepted);
+}

@@ -553,7 +553,7 @@ impl Plan {
 			veilway: inbound.kind == InboundType::Veilway,
 			pools: inbound.address.iter().map(|net| net.0).collect(),
 			mtu: inbound.mtu(),
-			transports: inbound.transports.clone(),
+			transports: if inbound.on() {inbound.transports.clone()} else {Vec::new()},
 			dns: set_of_inbound.get(inbound.tag.as_str()).map_or(0, |set| set + 1),
 			traffic: was_inbound.get(inbound.tag.as_str()).map(|was| was.traffic.clone()).unwrap_or_default(),
 			tunnel,
@@ -597,9 +597,12 @@ impl Plan {
 				let (d, mut addresses, mut within) = (devices.len(), Vec::with_capacity(device.addresses.len()), Vec::new());
 				for config::Ip(ip) in &device.addresses {
 					let inbound = pools.iter().find(|(pool, _)| pool.contains(ip)).map(|(_, i)| *i).ok_or_else(stale)?;
-					if !within.contains(&inbound) {within.push(inbound)}
+					// A device of an inbound that is not enabled has its address and no place in the inbound: it is no peer of the tunnel and its flows through it end.
+					if config.inbounds[inbound].on() {
+						if !within.contains(&inbound) {within.push(inbound)}
+						by_address.insert(*ip, Holder {device: d, inbound});
+					}
 					addresses.push(*ip);
-					by_address.insert(*ip, Holder {device: d, inbound});
 				}
 				addresses.sort();
 				by_key.insert(device.public_key.0, d);
@@ -691,7 +694,7 @@ impl Plan {
 		// The keys and the tags of a large inbound take a while to make. A plan is compiled on a thread of the runtime with a reload or a cut-off waiting for it, so the runtime is told that this thread is busy: its other work, every packet among it, goes to the other threads.
 		// A runtime of one thread has no other to give it to, and code that runs on none, a test or a harness, needs none.
 		let mut tables = || -> anyhow::Result<()> {
-			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
+			for (i, inbound) in config.inbounds.iter().enumerate().filter(|(_, inbound)| inbound.on() && inbound.kind == InboundType::Veilway && inbound.obfuscated()) {
 				let (public, mut was) = (inbounds[i].public_key, HashMap::new());
 				for derived in previous.inbounds.iter().filter(|was| was.public_key == public).filter_map(|was| was.native.as_ref()).flat_map(|native| &native.keys) {was.insert((derived.device.public, derived.device.id.0), derived);}
 				let keys = devices.iter().filter(|device| device.inbounds.contains(&i)).flat_map(|device| device.secrets.iter().map(|secret| (device.public_key, *secret))).chain(links.iter().filter(|link| link.listener && link.inbound == i && link.denied.is_none()).map(|link| (link.identity, link.secret))).map(|(key, secret)| was.get(&(key, secret)).map_or_else(|| Arc::new(Derived::new(&secret, &public, &key)), |derived| (*derived).clone())).collect();

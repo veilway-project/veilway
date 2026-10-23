@@ -52,7 +52,7 @@ fn a_faketls_transport_validates_and_reads_back() {
 	let report = check(&node());
 	assert!(report.errors.is_empty() && report.warnings.is_empty(), "{report:#?}");
 	let config = parse(&node()).unwrap();
-	let Transport::FakeTls {listen, site, transport_key, limits} = &config.inbounds[0].transports[0] else {panic!("not a faketls transport")};
+	let Transport::FakeTls {listen, site, transport_key, limits, ..} = &config.inbounds[0].transports[0] else {panic!("not a faketls transport")};
 	assert_eq!((listen.0.to_string(), site.host.as_str(), site.names.as_ref(), site.port, site.address.map(|address| address.0.to_string()), site.acknowledged, transport_key.0, limits.is_none()), ("203.0.113.5:443".to_string(), "www.example.com", None, None, Some("198.51.100.9:443".to_string()), true, [0x71; 32], true));
 	assert!(config.inbounds[0].borrowed() && config.inbounds[0].obfuscated() && !config.inbounds[0].proved() && !config.inbounds[0].enveloped());
 	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);

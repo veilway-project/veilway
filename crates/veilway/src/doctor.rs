@@ -359,8 +359,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let answering = node.0 == Status::Ok && node.2.starts_with("a node answers");
 	lines.push(line(node.0, "node", node.1, node.2));
 	let (config, mut bound, mut read, now) = (Arc::new(loaded), HashSet::new(), HashSet::new(), SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64));
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			// Transports that share an address share one listener, as they do in the node.
 			let (addr, stream) = (transport.listen(), !transport.datagram());
 			if !bound.insert((addr, stream)) {continue}
@@ -377,7 +377,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			});
 		}
 	}
-	for proxy in &config.proxies {
+	for proxy in config.proxies.iter().filter(|proxy| proxy.on()) {
 		let (addr, subject) = (proxy.listen.0, format!("inbound {}, tcp {}", proxy.tag, proxy.listen.0));
 		if !bound.insert((addr, true)) {continue}
 		lines.push(match probe::listen(addr, true).await {
@@ -391,8 +391,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			})),
 		});
 	}
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let tls = match transport {
 				Transport::Ws {tls: Some(tls), ..} | Transport::Tls {tls: Certificate::Files(tls), ..} => tls,
 				// The certificate the node makes itself: the pin of the key it keeps, which is what profiles carry. Nothing is made or written here.
@@ -423,8 +423,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	// The decoy origin of every `tls` transport, once for each origin and path. It is asked directly, with or without a node that runs.
 	let mut origins = HashSet::new();
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let (Transport::Tls {path, decoy: origin, ..} | Transport::WsNative {path, decoy: origin, ..} | Transport::WsPlain {path, decoy: origin, ..} | Transport::Fronted {path, decoy: origin, ..} | Transport::FrontedShaped {path, decoy: origin, ..}) = transport else {continue};
 			// The answer to a `fronted` request is no upgrade and takes no field from the origin.
 			let wanted = if matches!(transport, Transport::Fronted {..} | Transport::FrontedShaped {..}) {Vec::new()} else {inbound.upgrade_headers(matches!(transport, Transport::Tls {..}))};
@@ -432,8 +432,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		}
 	}
 	// The shape each `fronted-shaped` transport uses (shapes page, "Choosing a shape"): "`veilway doctor` prints the shape each transport uses." The node cannot see the profile, so the line is what the profile has to say as well.
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let Some(shape) = transport.proxied().and_then(|proxied| proxied.shape) else {continue};
 			lines.push(match shape.resolve() {
 				Ok(shape) => line(Status::Ok, "shape", format!("inbound {}, transports[{t}].shape", inbound.tag), format!("{shape}. The profile of this transport must carry the same object: the node cannot see it, and a request in another shape reaches the decoy origin")),
@@ -442,8 +442,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		}
 	}
 	// The HTTP/2 of each `tls` transport (http2 page, "Modes"): on, the node answers the peer's streams itself, and that is the difference a probe can see.
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let Transport::Tls {http2, ..} = transport else {continue};
 			lines.push(match http2 {
 				Some(Http2::On) => line(Status::Warn, "http2", format!("inbound {}, transports[{t}].http2", inbound.tag), "on: the node answers HTTP/2 itself, so its frames differ from the decoy origin's, and the tunnel is offered to peers that negotiate h2"),
@@ -453,8 +453,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	}
 	// The proxy path of every `ws` and `fronted` listener (transports page, "Who ends TLS" and "Pools and what happens when one is full"): whether anybody but this host reaches it, and whether the web server in front names the visitor in the header the config says. The second is known only to a node that runs and has read requests.
 	let mut fronts = HashSet::new();
-	for inbound in &config.inbounds {
-		for (t, transport) in inbound.transports.iter().enumerate() {
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 			let (Some(proxied), addr) = (transport.proxied(), transport.listen()) else {continue};
 			if !fronts.insert(addr) {continue}
 			let (subject, outside) = (format!("inbound {}, transports[{t}]", inbound.tag), proxied.trusted.iter().filter(|proxy| !proxy.0.addr().is_loopback()).count());

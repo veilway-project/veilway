@@ -674,6 +674,10 @@
       "InboundInfo": {
         "description": "An inbound with what a client profile takes from it. No private key.",
         "properties": {
+          "enabled": {
+            "description": "False for an inbound the config switched off: it does not listen and takes no device.",
+            "type": "boolean"
+          },
           "kind": {
             "$ref": "#/components/schemas/InboundKind"
           },
@@ -705,6 +709,7 @@
         "required": [
           "tag",
           "kind",
+          "enabled",
           "public_key",
           "transport_public_key",
           "transports"
@@ -721,6 +726,10 @@
       "InboundTransport": {
         "description": "One transport of an inbound, with the rating a profile of it gets.",
         "properties": {
+          "enabled": {
+            "description": "False for a transport the config switched off: it does not listen.",
+            "type": "boolean"
+          },
           "rating": {
             "$ref": "#/components/schemas/Rating"
           },
@@ -730,6 +739,7 @@
         },
         "required": [
           "transport",
+          "enabled",
           "rating"
         ],
         "type": "object"

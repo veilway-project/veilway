@@ -1495,7 +1495,7 @@ async fn a_replay_reset_is_written_before_it_is_answered_and_touches_no_usage() 
 async fn an_inbound_lists_the_public_keys_a_profile_takes_and_the_rating_of_each_transport() {
 	let mut setup = setup().await;
 	let (private, native, node_key) = (setup.private, veilway_wg::generate_key(), veilway_wg::generate_key());
-	let listed = json!({"tag": "native", "type": "veilway", "private_key": veilway_wg::encode_key(&native), "address": ["10.9.0.1/24"], "transport_keys": [veilway_wg::encode_key(&node_key)], "transports": [{"type": "udp-obfs", "listen": listen().to_string()}, {"type": "fronted", "listen": listen().to_string(), "path": "/relay/inbound-path", "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For"}]});
+	let listed = json!({"tag": "native", "type": "veilway", "private_key": veilway_wg::encode_key(&native), "address": ["10.9.0.1/24"], "transport_keys": [veilway_wg::encode_key(&node_key)], "transports": [{"type": "udp-obfs", "listen": listen().to_string()}, {"type": "fronted", "enabled": false, "listen": listen().to_string(), "path": "/relay/inbound-path", "decoy": {"origin": "http://127.0.0.1:8080"}, "trusted_proxies": ["127.0.0.1"], "client_address_header": "X-Forwarded-For"}]});
 	setup.doc["inbounds"].as_array_mut().unwrap().push(listed);
 	let node = launch(setup).await;
 	let answer = get(&node.socket, "/v1/inbounds").await;
@@ -1503,8 +1503,8 @@ async fn an_inbound_lists_the_public_keys_a_profile_takes_and_the_rating_of_each
 	let transport_public = veilway_wg::encode_key(&veilway_proto::proof::public_key(&node_key));
 	assert_eq!(answer.status, 200);
 	assert_eq!(answer.json, json!({"inbounds": [
-		{"tag": "home", "kind": "wireguard", "public_key": public(&private), "transport_public_key": null, "transports": [{"transport": "udp", "rating": "detectable"}]},
-		{"tag": "native", "kind": "veilway", "public_key": public(&native), "transport_public_key": transport_public, "transports": [{"transport": "udp-obfs", "rating": "detectable"}, {"transport": "fronted", "rating": "detectable"}]}
+		{"tag": "home", "kind": "wireguard", "enabled": true, "public_key": public(&private), "transport_public_key": null, "transports": [{"transport": "udp", "enabled": true, "rating": "detectable"}]},
+		{"tag": "native", "kind": "veilway", "enabled": true, "public_key": public(&native), "transport_public_key": transport_public, "transports": [{"transport": "udp-obfs", "enabled": true, "rating": "detectable"}, {"transport": "fronted", "enabled": false, "rating": "detectable"}]}
 	], "public_addresses": []}));
 	no_secret_in(&answer.body, "the inbounds listing");
 	node.end().await;
