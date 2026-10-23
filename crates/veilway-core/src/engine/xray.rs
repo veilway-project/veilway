@@ -9,13 +9,16 @@ use crate::config::RuleTransport;
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
 use super::xray_owner::{self, Lookup};
+use super::xray_out::{self, Wire};
 use super::{dns, flows, gate, xray_udp, Shared};
-use crate::config::{Config, Store, XrayProtocol};
+use crate::config::{Config, Outbound as ConfigOutbound, Store, XrayProtocol};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,6 +45,9 @@ const DIAL: Duration = Duration::from_secs(10);
 /// How often a connection looks whether its user is still allowed, which is how long a user cut off by a quota, an expiry or a disable keeps a connection that is open.
 const WATCH: Duration = Duration::from_secs(1);
 const MAX_HANDSHAKES: usize = 256;
+/// How often the names of the outbounds' servers are looked up again, and how soon after one that did not resolve.
+const RECHECK: Duration = Duration::from_secs(900);
+const RETRY_RESOLVE: Duration = Duration::from_secs(30);
 const RESTART_MIN: Duration = Duration::from_secs(3);
 const RESTART_MAX: Duration = Duration::from_secs(60);
 /// A child that ran this long before it ended was working, and its next start is not a retry.
@@ -58,6 +64,18 @@ const CHUNK: usize = 16384;
 /// Where the executable is, in the add-on folder.
 pub fn binary(addons: &Path) -> PathBuf {addons.join("xray").join("xray")}
 
+/// What `veilway doctor` says of the add-on: the executable is there, belongs to root and is the pinned release. The host checks the same, from the open file, before every start. This reads by path, so it says what the host would find and is no guarantee for the moment the host looks.
+#[cfg(unix)]
+pub fn verify(addons: &Path) -> Result<(), String> {
+	let path = binary(addons);
+	let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("the add-on is not installed ({})", e.kind()))?;
+	if !meta.is_file() || meta.uid() != 0 || meta.mode() & 0o022 != 0 {return Err("the xray executable is not a file of root's that only root can write to".to_string())}
+	let bytes = std::fs::read(&path).map_err(|e| format!("the xray executable cannot be read ({})", e.kind()))?;
+	let found: String = ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+	if PIN.is_empty() || found != PIN {return Err(format!("the xray executable is not the pinned release {RELEASE}"))}
+	Ok(())
+}
+
 /// The lines of a PEM file, which Xray takes in its document in the place of a path.
 async fn pem(dir: &Path, name: &str) -> anyhow::Result<Vec<String>> {
 	let file = tokio::fs::File::open(dir.join(name)).await.map_err(|e| anyhow::anyhow!("{name}: {}", e.kind()))?;
@@ -68,7 +86,8 @@ async fn pem(dir: &Path, name: &str) -> anyhow::Result<Vec<String>> {
 
 /// The document Xray is started with. Users who are disabled are left out, so a change that cuts a user off also stops Xray from accepting their credential. A quota or an expiry is held by the hop, at once.
 /// Everything not listed here goes to a blackhole outbound, which is the first and so the default. Xray has no access log, and the addresses in what it logs are masked. A connection that does not carry a user's credential is handed to the operator's web server on a `vless` or `trojan` listener, as a connection that never was Xray's would be, and a certificate and its key are in the document and not on a path, since Xray has no access to the node's folders.
-fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret: &str) -> Value {
+/// Each outbound of `wires` adds a loopback SOCKS5 inbound that only routes to it, and the outbound itself (`xray_out`). They are named apart from the inbounds' and the users' by their prefixes.
+fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret: &str, wires: &[Wire]) -> Value {
 	let able: Vec<&str> = config.users.iter().filter(|user| user.enabled != Some(false)).map(|user| user.name.as_str()).collect();
 	let (mut inbounds, mut used) = (Vec::new(), Vec::<&str>::new());
 	for inbound in config.xray.iter().flat_map(|xray| &xray.inbounds) {
@@ -100,7 +119,13 @@ fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret
 	used.dedup();
 	let mut outbounds = vec![json!({"tag": "refused", "protocol": "blackhole"})];
 	outbounds.extend(used.iter().map(|user| json!({"tag": format!("u-{user}"), "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": hop, "users": [{"user": user, "pass": secret}]}]}})));
-	let rules: Vec<Value> = used.iter().map(|user| json!({"type": "field", "user": [user], "outboundTag": format!("u-{user}")})).collect();
+	let mut rules: Vec<Value> = used.iter().map(|user| json!({"type": "field", "user": [user], "outboundTag": format!("u-{user}")})).collect();
+	for wire in wires {
+		let Some((inbound, outbound)) = config.outbounds.iter().find(|outbound| matches!(outbound, ConfigOutbound::Xray {tag, ..} if *tag == wire.tag)).and_then(|outbound| xray_out::parts(outbound, wire)) else {continue};
+		inbounds.push(inbound);
+		outbounds.push(outbound);
+		rules.push(json!({"type": "field", "inboundTag": [format!("out-{}", wire.tag)], "outboundTag": format!("via-{}", wire.tag)}));
+	}
 	json!({"log": {"access": "none", "loglevel": "warning", "maskAddress": "full"}, "inbounds": inbounds, "outbounds": outbounds, "routing": {"domainStrategy": "AsIs", "rules": rules}})
 }
 
@@ -114,24 +139,32 @@ async fn stop(mut running: Running) {
 	let _ = tokio::time::timeout(STOP_WAIT, async {while running.link.read(&mut sink).await.is_ok_and(|n| n > 0) {}}).await;
 }
 
-/// Keeps Xray running as the config says: started when the `xray` section has an inbound, started again with a new document when the section or the users it names change (after `SETTLE` without another change, and with the old one ended first), started again after it ends with a longer wait each time, and stopped when the section goes or `stopped` is notified.
+/// Keeps Xray running as the config says: started when the `xray` section has an inbound or the config has an outbound of type `xray`, started again with a new document when the section, the outbounds or the users the section names change (after `SETTLE` without another change, and with the old one ended first), started again after it ends with a longer wait each time, and stopped when both go or `stopped` is notified.
+/// The names of the outbounds' servers are looked up again every `RECHECK` (every `RETRY_RESOLVE` while one does not resolve), and a changed address restarts Xray. Each outbound's hop is told whether Xray carries it and why not, so the exit that uses it fails with the reason and never goes around it.
 pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, socket: Option<PathBuf>, stopped: Arc<Notify>) {
 	let mut changes = store.subscribe();
 	let (mut hop, mut running, mut failures, mut waiting, mut settling): (Option<(JoinHandle<()>, u16, String)>, Option<Running>, u32, Option<Instant>, Option<Instant>) = (None, None, 0, None, None);
+	// The port and login of each outbound's inbound, made when the outbound first has a server to dial and made again after Xray ends or fails to start.
+	let (mut endpoints, mut recheck): (HashMap<String, (u16, String, String)>, Option<Instant>) = (HashMap::new(), None);
 	loop {
 		let config = changes.borrow_and_update().config.clone();
+		let (inbounds, hops) = (config.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()), shared.plan().hops.clone());
+		let wanted: Vec<(&String, &ConfigOutbound)> = config.outbounds.iter().filter_map(|outbound| if let ConfigOutbound::Xray {tag, ..} = outbound {Some((tag, outbound))} else {None}).collect();
 		if settling.is_some_and(|until| until > Instant::now()) {}
-		else if config.xray.as_ref().is_none_or(|xray| xray.inbounds.is_empty()) {
+		else if !inbounds && wanted.is_empty() {
 			if let Some(was) = running.take() {
 				stop(was).await;
-				tracing::info!("xray: stopped, the config has no xray inbound any more");
+				tracing::info!("xray: stopped, the config has no xray inbound or outbound any more");
 			}
 			if let Some((task, ..)) = hop.take() {task.abort()}
 			failures = 0;
-			waiting = None;
+			(waiting, recheck) = (None, None);
+			endpoints.clear();
 		} else if waiting.is_none_or(|until| until <= Instant::now()) {
 			waiting = None;
-			if hop.is_none() {
+			if !inbounds {
+				if let Some((task, ..)) = hop.take() {task.abort()}
+			} else if hop.is_none() {
 				match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.and_then(|listener| listener.local_addr().map(|addr| (listener, addr.port()))) {
 					Ok((listener, port)) => {
 						let mut raw = [0u8; 24];
@@ -142,7 +175,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 					Err(e) => tracing::error!("xray: the local hop could not be opened ({}), so xray is not started", e.kind()),
 				}
 			}
-			if let Some((_, port, secret)) = &hop {
+			if !inbounds || hop.is_some() {
 				let (mut files, mut unreadable) = (HashMap::new(), None);
 				for name in config.xray.iter().flat_map(|xray| &xray.inbounds).filter_map(|inbound| inbound.tls.as_ref()).flat_map(|tls| [tls.cert.as_str(), tls.key.as_str()]) {
 					if files.contains_key(name) {continue}
@@ -151,8 +184,43 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 						Err(e) => unreadable = Some(e),
 					}
 				}
-				let document = generate(&config, &files, *port, secret).to_string();
-				if unreadable.is_none() && running.as_ref().is_some_and(|was| was.document == document) {}
+				let pools: Vec<(ipnet::IpNet, usize)> = config.inbounds.iter().enumerate().flat_map(|(at, inbound)| inbound.address.iter().map(move |net| (net.0, at))).collect();
+				endpoints.retain(|tag, _| wanted.iter().any(|(wanted, _)| *wanted == tag));
+				let (mut wires, mut unreached) = (Vec::new(), HashMap::new());
+				for (tag, outbound) in &wanted {
+					match xray_out::resolve(outbound, &pools).await {
+						Ok(address) => {
+							if !endpoints.contains_key(*tag) {
+								match xray_out::endpoint() {
+									Ok(made) => drop(endpoints.insert((*tag).clone(), made)),
+									Err(e) => {
+										unreached.insert((*tag).clone(), format!("no local port for it ({})", e.kind()));
+										continue;
+									}
+								}
+							}
+							let (port, user, pass) = endpoints[*tag].clone();
+							wires.push(Wire {tag: (*tag).clone(), port, user, pass, address});
+						}
+						Err(why) => drop(unreached.insert((*tag).clone(), why)),
+					}
+				}
+				recheck = if !unreached.is_empty() {Some(Instant::now() + RETRY_RESOLVE)} else if wanted.iter().any(|(_, outbound)| matches!(outbound, ConfigOutbound::Xray {server, ..} if matches!(server.host, crate::config::Host::Name(_)))) {Some(Instant::now() + RECHECK)} else {None};
+				// What the hops say, once Xray is up or is not: an outbound that could not be given an address says why, and every other one is carried by Xray or says that Xray is not.
+				let publish = |why: Option<&str>| for (tag, _) in &wanted {
+					let (state, wire) = (hops.get(tag), wires.iter().find(|wire| wire.tag == **tag));
+					match (wire, unreached.get(*tag), why) {
+						(Some(wire), _, None) => state.up(wire),
+						(_, Some(told), _) => {
+							if state.reason().as_deref() != Some(told.as_str()) {tracing::warn!("xray outbound {tag}: not carried, {told}")}
+							state.down(told);
+						}
+						(_, _, why) => state.down(why.unwrap_or("xray is not running")),
+					}
+				};
+				let (hop_port, hop_secret) = hop.as_ref().map_or((0, String::new()), |(_, port, secret)| (*port, secret.clone()));
+				let document = generate(&config, &files, hop_port, &hop_secret, &wires).to_string();
+				if unreadable.is_none() && running.as_ref().is_some_and(|was| was.document == document) {publish(None)}
 				else {
 					if let Some(was) = running.take() {stop(was).await}
 					let started = match unreadable {
@@ -161,14 +229,17 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 					};
 					match started {
 						Ok((link, pid)) => {
-							tracing::info!("xray {RELEASE}: started (pid {pid}), {} inbound(s)", config.xray.iter().flat_map(|xray| &xray.inbounds).count());
+							tracing::info!("xray {RELEASE}: started (pid {pid}), {} inbound(s), {} outbound(s)", config.xray.iter().flat_map(|xray| &xray.inbounds).count(), wires.len());
 							running = Some(Running {document, link, since: Instant::now(), said: Vec::new()});
+							publish(None);
 						}
 						Err(e) => {
 							failures += 1;
 							let wait = (RESTART_MIN * 2u32.saturating_pow(failures - 1)).min(RESTART_MAX);
 							tracing::error!("xray: not started: {e:#}; trying again in {}s", wait.as_secs());
 							waiting = Some(Instant::now() + wait);
+							endpoints.clear();
+							publish(Some(&format!("xray is not running: {e:#}")));
 						}
 					}
 				}
@@ -204,10 +275,12 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 					let wait = (RESTART_MIN * 2u32.saturating_pow(failures - 1)).min(RESTART_MAX);
 					tracing::warn!("xray: ended after {}s ({}); starting it again in {}s", ran.as_secs(), was.as_ref().map_or_else(String::new, |was| String::from_utf8_lossy(&was.said).trim().to_string()), wait.as_secs());
 					waiting = Some(Instant::now() + wait);
+					endpoints.clear();
+					for (tag, _) in &wanted {hops.get(tag).down(&format!("xray ended, starting it again in {}s", wait.as_secs()))}
 				}
 			},
 			_ = async {
-				match [waiting, settling].into_iter().flatten().filter(|until| *until > Instant::now()).min() {
+				match [waiting, settling, recheck].into_iter().flatten().filter(|until| *until > Instant::now()).min() {
 					Some(until) => tokio::time::sleep_until(until.into()).await,
 					None => std::future::pending().await,
 				}
@@ -539,14 +612,23 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 
 #[cfg(test)]
 mod tests {
-	use super::{exit_for, PIN, RELEASE};
+	use super::{exit_for, generate, PIN, RELEASE};
 	use crate::config::Config;
+	use crate::engine::flows;
+	use crate::engine::plan::{Latency, Upstream};
+	use crate::engine::xray_out::{self, Hops, Wire};
+	use std::collections::HashMap;
+	use std::process::Stdio;
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+	use tokio::net::{TcpListener, TcpStream, UdpSocket};
+	use tokio::process::{Child, Command};
 	use crate::engine::inbound::{Peers, Tunnel};
 	use crate::engine::plan::Plan;
 	use crate::engine::upstream::UpstreamState;
 	use crate::engine::Reason;
 	use serde_json::json;
 	use std::sync::Arc;
+	use std::time::Duration;
 	use tokio::sync::mpsc;
 	use veilway_proto::xray::{self, PINS};
 	use veilway_wg::Wg;
@@ -583,5 +665,81 @@ mod tests {
 		assert_eq!((RELEASE, PIN), (xray::RELEASE, xray::pin(target).unwrap().executable));
 		assert!(script.contains(&format!("XRAY_RELEASE=\"{}\"", xray::RELEASE)));
 		for pin in PINS.iter().filter(|pin| pin.target.starts_with("linux")) {assert!(script.contains(&format!("{}) printf '%s' {} ;;", pin.target, pin.archive)), "{}", pin.target)}
+	}
+
+	/// Starts the executable `path` with `document` on its standard input, and waits until `port` takes connections.
+	async fn xray(path: &str, document: &str, port: u16) -> Child {
+		let mut child = Command::new(path).args(["run", "-config", "stdin:"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+		let mut stdin = child.stdin.take().unwrap();
+		stdin.write_all(document.as_bytes()).await.unwrap();
+		drop(stdin);
+		for _ in 0..100 {
+			if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {return child}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		panic!("xray did not listen on {port}");
+	}
+
+	/// Runs the pinned Xray that VEILWAY_TEST_XRAY names (the executable, not the archive): a VLESS server, the document the node writes for an Xray outbound towards it, and TCP and UDP carried through the outbound's loopback inbound. Without the variable it does nothing, as the l3 tests do.
+	/// A hop that is down dials nothing, and says why.
+	#[tokio::test]
+	async fn an_xray_outbound_carries_tcp_and_udp_through_the_real_xray_and_a_down_hop_dials_nothing() {
+		let Ok(path) = std::env::var("VEILWAY_TEST_XRAY") else {return};
+		let found: String = ring::digest::digest(&ring::digest::SHA256, &std::fs::read(&path).unwrap()).as_ref().iter().map(|byte| format!("{byte:02x}")).collect();
+		assert_eq!(found, PIN, "VEILWAY_TEST_XRAY is not the pinned release");
+		let (tcp_echo, udp_echo) = (TcpListener::bind("127.0.0.1:0").await.unwrap(), UdpSocket::bind("127.0.0.1:0").await.unwrap());
+		let (tcp_at, udp_at) = (tcp_echo.local_addr().unwrap(), udp_echo.local_addr().unwrap());
+		tokio::spawn(async move {
+			loop {
+				let (mut stream, _) = tcp_echo.accept().await.unwrap();
+				tokio::spawn(async move {
+					let mut buffer = [0u8; 1024];
+					while let Ok(n) = stream.read(&mut buffer).await {
+						if n == 0 || stream.write_all(&buffer[..n]).await.is_err() {break}
+					}
+				});
+			}
+		});
+		tokio::spawn(async move {
+			let mut buffer = [0u8; 2048];
+			while let Ok((n, from)) = udp_echo.recv_from(&mut buffer).await {let _ = udp_echo.send_to(&buffer[..n], from).await;}
+		});
+		let id = "3f2b8c1e-5d4a-4e7b-9a6c-1d2e3f4a5b6c";
+		let (provider, _, _) = xray_out::endpoint().unwrap();
+		let server = json!({"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": provider, "protocol": "vless", "settings": {"clients": [{"id": id}], "decryption": "none"}, "streamSettings": {"network": "tcp"}}], "outbounds": [{"protocol": "freedom"}]});
+		let _provider = xray(&path, &server.to_string(), provider).await;
+		// Parsed and not validated: validation refuses a provider on loopback, and a plain VLESS stream.
+		let config = Config::parse(json!({
+			"version": 1,
+			"dns": {"servers": ["1.1.1.1:53"]},
+			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&[0x11; 32]), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
+			"outbounds": [{"tag": "up", "type": "xray", "protocol": "vless", "server": format!("127.0.0.1:{provider}"), "id": id}],
+			"exits": [{"tag": "far", "backend": {"type": "netstack", "outbound": "up"}}],
+			"routing": {"default": "far", "rules": []},
+			"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}]
+		}).to_string().as_bytes()).unwrap();
+		let (port, user, pass) = xray_out::endpoint().unwrap();
+		let wire = Wire {tag: "up".to_string(), port, user, pass, address: "127.0.0.1".parse().unwrap()};
+		let document = generate(&config, &HashMap::new(), 0, "", std::slice::from_ref(&wire)).to_string();
+		let _client = xray(&path, &document, port).await;
+		let hops = Hops::default();
+		hops.get("up").up(&wire);
+		let carried = Upstream {tag: "up".to_string(), host: String::new(), port: 0, auth: None, latency: Arc::new(Latency::default()), via: None, hop: Some(hops.get("up"))};
+		let mut stream = flows::dial(&carried, tcp_at).await.unwrap();
+		stream.write_all(b"hello through xray").await.unwrap();
+		let mut back = [0u8; 18];
+		tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut back)).await.unwrap().unwrap();
+		assert_eq!(&back, b"hello through xray");
+		let (_control, relay) = flows::associate(&carried).await.unwrap();
+		let mut datagram = flows::udp_header(udp_at);
+		datagram.extend_from_slice(b"datagram through xray");
+		relay.send(&datagram).await.unwrap();
+		let mut answer = [0u8; 2048];
+		let n = tokio::time::timeout(Duration::from_secs(5), relay.recv(&mut answer)).await.unwrap().unwrap();
+		assert_eq!(flows::unwrap_udp(&answer[..n]), Some(&b"datagram through xray"[..]));
+		let (idle, nothing) = (Hops::default(), Arc::new(Latency::default()));
+		let down = Upstream {tag: "gone".to_string(), host: String::new(), port: 0, auth: None, latency: nothing, via: None, hop: Some(idle.get("gone"))};
+		let failure = flows::dial(&down, tcp_at).await.err().expect("a hop that is down carried a flow").to_string();
+		assert!(failure.contains("gone") && failure.contains("is down") && failure.contains("not started yet"), "{failure}");
 	}
 }

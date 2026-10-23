@@ -290,6 +290,8 @@ pub struct OutboundStats {
 	pub latency_ms: Option<u64>,
 	/// Unix seconds when `latency_ms` was measured.
 	pub measured_at: Option<i64>,
+	/// Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`.
+	pub down_reason: Option<String>,
 }
 
 /// What the node's resolver did with the DNS queries of its tunnels since start.

@@ -15,6 +15,8 @@ use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use veilway_proto::subscription::legacy;
+use veilway_proto::xray::profile as xray_profile;
 
 /// A value written as one JSON string. A failure reports only what was expected, never the text. The pattern is for the schema: it holds for every text that parses and carries the canonical spelling, not the whole rule.
 macro_rules! text_value {
@@ -1258,24 +1260,122 @@ pub enum Outbound {
 		#[schemars(pattern(TAG_PATTERN))]
 		via: Option<String>,
 	},
+	/// A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. A `socks5` outbound may name this one in `via`; this outbound has no `via` of its own.
+	#[schemars(extend("required" = ["type", "tag"], "oneOf" = [{"required": ["link"]}, {"required": ["protocol", "server"]}]))]
+	Xray {
+		#[schemars(pattern(TAG_PATTERN))]
+		tag: String,
+		/// Input only: a share link of a scheme the client's legacy reader knows (`vless`, `vmess`, `trojan`, `ss`), with the limits of the client's table: TCP, WebSocket and gRPC streams, TLS and REALITY, Vision. It is a secret and is never written back, so this is always absent in what the node holds.
+		#[serde(skip_serializing)]
+		#[schemars(length(max = 4096), extend("writeOnly" = true))]
+		link: Option<Secret<String>>,
+		protocol: XrayOutboundProtocol,
+		/// The provider's server. Xray resolves nothing: a name is looked up by the node, every address it gives must pass the dial rules, and the one used is written into the add-on's document.
+		server: HostPort,
+		/// The user id of `vless` and `vmess`, a UUID.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		id: Option<Secret<String>>,
+		/// The password of `trojan` and `shadowsocks`. For a `shadowsocks` 2022 cipher it is the key as standard base64.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		password: Option<Secret<String>>,
+		/// `vless` only, and only over TCP with TLS or REALITY.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		flow: Option<XrayFlow>,
+		/// The cipher of `vmess` (`auto`, `aes-128-gcm` or `chacha20-poly1305`, default `auto`) and the method of `shadowsocks` (required).
+		#[serde(skip_serializing_if = "Option::is_none")]
+		cipher: Option<String>,
+		/// Defaults to `tcp`.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		transport: Option<XrayTransport>,
+		/// Defaults to `none`, which `vless` and `trojan` refuse. Certificates are always checked: there is no way to switch that off.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		security: Option<XraySecurity>,
+	},
+}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum XrayOutboundProtocol {Vless, Vmess, Trojan, Shadowsocks}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XrayFlow {#[serde(rename = "xtls-rprx-vision")] Vision}
+
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XhttpMode {#[serde(rename = "auto")] Auto, #[serde(rename = "packet-up")] PacketUp, #[serde(rename = "stream-up")] StreamUp, #[serde(rename = "stream-one")] StreamOne}
+
+/// The stream an Xray outbound speaks over its connection. Fields that are left out take Xray's own defaults, `/` for a path.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum XrayTransport {
+	Tcp {},
+	Ws {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>},
+	Grpc {#[serde(skip_serializing_if = "Option::is_none")] service: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] authority: Option<String>},
+	Httpupgrade {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>},
+	Xhttp {#[serde(skip_serializing_if = "Option::is_none")] path: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] host: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] mode: Option<XhttpMode>},
+}
+
+/// The security around an Xray outbound's stream. The chain is always checked against the system roots, and there is no key that turns that off or pins a certificate instead.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum XraySecurity {
+	#[serde(rename = "none")]
+	Off {},
+	/// `server_name` defaults to the server's name, and is needed when the server is an address. `fingerprint` is the ClientHello Xray imitates, default `chrome`. `alpn` is `h2` and `http/1.1` in any order.
+	Tls {#[serde(skip_serializing_if = "Option::is_none")] server_name: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] alpn: Option<Vec<String>>, #[serde(skip_serializing_if = "Option::is_none")] fingerprint: Option<String>},
+	/// `public_key` is 43 characters of base64url. `short_id` is up to 16 hexadecimal digits, an even number of them.
+	Reality {server_name: String, public_key: String, #[serde(skip_serializing_if = "Option::is_none")] short_id: Option<String>, #[serde(skip_serializing_if = "Option::is_none")] fingerprint: Option<String>},
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum OutboundType {Direct, Socks5}
+enum OutboundType {Direct, Socks5, Xray}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
+		let xray = [("link", keys.link.is_some()), ("protocol", keys.protocol.is_some()), ("id", keys.id.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())];
 		match keys.kind {
-			OutboundType::Direct => only("direct", &[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())]).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
+			OutboundType::Direct => only("direct", &[&[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray].concat()).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
 			OutboundType::Socks5 => {
-				only("socks5", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())])?;
+				only("socks5", &[&[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())][..], &xray].concat())?;
 				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password, via: keys.via})
+			}
+			OutboundType::Xray => {
+				only("xray", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some()), ("username", keys.username.is_some()), ("via", keys.via.is_some())])?;
+				let Some(link) = keys.link else {
+					return Ok(Outbound::Xray {tag: keys.tag, link: None, protocol: keys.protocol.ok_or_else(|| de::Error::missing_field("protocol"))?, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, id: keys.id, password: keys.password, flow: keys.flow, cipher: keys.cipher, transport: keys.transport, security: keys.security})
+				};
+				only("xray` with a `link", &[("protocol", keys.protocol.is_some()), ("server", keys.server.is_some()), ("id", keys.id.is_some()), ("password", keys.password.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())])?;
+				// One link, as a client's `Entry` and then its table, so a node accepts what the desktop accepts and refuses with the same codes. The text of the link is never in the error.
+				let list = Some(link.expose().as_str()).filter(|text| text.contains("://") && !text.contains(['\n', '\r'])).and_then(|text| legacy::list(text.as_bytes()).ok()).filter(|list| list.entries.len() == 1 && list.skipped == 0).ok_or_else(|| de::Error::invalid_value(Unexpected::Other("link"), &"one share link of the vless, vmess, trojan or ss kind that reads"))?;
+				let profile = xray_profile::check(&list.entries[0]).map_err(|refusal| de::Error::invalid_value(Unexpected::Other("link"), &format!("a link this node can run, found one that is refused: {}", refusal.code()).as_str()))?;
+				let server = HostPort {host: match &profile.server {legacy::Server::Name(name) => Host::Name(name.clone()), legacy::Server::Address(ip) => Host::Ip(*ip)}, port: profile.port};
+				let secret = Secret(profile.credential.expose().to_string());
+				let (id, password) = if matches!(profile.scheme, legacy::Scheme::Vless | legacy::Scheme::Vmess) {(Some(secret), None)} else {(None, Some(secret))};
+				Ok(Outbound::Xray {
+					tag: keys.tag,
+					link: None,
+					protocol: match profile.scheme {legacy::Scheme::Vless => XrayOutboundProtocol::Vless, legacy::Scheme::Vmess => XrayOutboundProtocol::Vmess, legacy::Scheme::Trojan => XrayOutboundProtocol::Trojan, legacy::Scheme::Shadowsocks => XrayOutboundProtocol::Shadowsocks},
+					server,
+					id,
+					password,
+					flow: profile.flow.then_some(XrayFlow::Vision),
+					cipher: profile.cipher.clone(),
+					transport: match &profile.stream {
+						xray_profile::Stream::Tcp => None,
+						xray_profile::Stream::Ws {path, host} => Some(XrayTransport::Ws {path: Some(path.clone()), host: host.clone()}),
+						xray_profile::Stream::Grpc {service} => Some(XrayTransport::Grpc {service: Some(service.clone()).filter(|service| !service.is_empty()), authority: None}),
+					},
+					security: match &profile.security {
+						xray_profile::Security::None => None,
+						xray_profile::Security::Tls {sni, alpn, fingerprint} => Some(XraySecurity::Tls {server_name: sni.clone(), alpn: Some(alpn.clone()).filter(|alpn| !alpn.is_empty()), fingerprint: Some(fingerprint.clone())}),
+						xray_profile::Security::Reality {sni, fingerprint, public_key, short_id} => Some(XraySecurity::Reality {server_name: sni.clone(), public_key: public_key.clone(), short_id: Some(short_id.clone()).filter(|id| !id.is_empty()), fingerprint: Some(fingerprint.clone())}),
+					},
+				})
 			}
 		}
 	}
@@ -1318,7 +1418,7 @@ pub struct Unsupported {
 pub struct Netstack {
 	#[schemars(pattern(TAG_PATTERN))]
 	pub outbound: String,
-	/// Defaults to true on a socks5 outbound. Must be absent or false on a direct one.
+	/// Defaults to true on a socks5 or xray outbound. Must be absent or false on a direct one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub proxy_only: Option<bool>,
 	/// Defaults to 7200.

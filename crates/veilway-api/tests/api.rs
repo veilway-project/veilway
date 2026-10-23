@@ -1414,7 +1414,7 @@ async fn an_outbound_is_the_sum_of_the_exits_that_leave_through_it() {
 		assert!(sum, "{stats}");
 		(proxy.clone(), stats["outbounds"][1].clone(), [main.clone(), second.clone()])
 	};
-	let unused = json!({"name": "spare", "traffic": {"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}, "up_bytes_per_sec": 0, "down_bytes_per_sec": 0, "udp": null, "udp_down_secs": null, "udp_flips": 0, "latency_ms": null, "measured_at": null});
+	let unused = json!({"name": "spare", "traffic": {"up_bytes": 0, "up_packets": 0, "down_bytes": 0, "down_packets": 0}, "up_bytes_per_sec": 0, "down_bytes_per_sec": 0, "udp": null, "udp_down_secs": null, "udp_flips": 0, "latency_ms": null, "measured_at": null, "down_reason": null});
 	let (proxy, spare, _) = read(&node.socket).await;
 	assert_eq!((&proxy["traffic"]["up_bytes"], &proxy["udp"], &proxy["udp_down_secs"], &proxy["udp_flips"], &spare), (&json!(0), &json!(true), &Value::Null, &json!(0), &unused), "{proxy}");
 	// A new TCP flow through each exit every 200 ms for three seconds.

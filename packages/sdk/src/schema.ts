@@ -699,6 +699,8 @@ export interface components {
         OutboundStats: {
             /** Format: uint64 */
             down_bytes_per_sec: number;
+            /** @description Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`. */
+            down_reason: string | null;
             /**
              * Format: uint64
              * @description How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.

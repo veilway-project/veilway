@@ -252,7 +252,7 @@ impl Host {
 			upstreams.push((written.effective(), None, state, vault));
 		}
 		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>())?;
-		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
+		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, &plan.hops, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
 		for (tunnel, ..) in &fresh {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
 			for device in plan.devices.iter().filter(|device| device.inbounds.contains(&at)) {peers.add(device.public_key, device.preshared_key)}

@@ -11,6 +11,7 @@ use std::net::{IpAddr, SocketAddr};
 use veilway_proto::subscription::is_host;
 use veilway_proto::subscription::link::Link as SubscriptionLink;
 use veilway_proto::subscription::payload::dialable;
+use veilway_proto::xray::profile as xray_profile;
 use veilway_proto::chunk::{NORMAL_BOUNDS, WIDE_BOUNDS};
 
 const TAG_RULE: &str = "expected a tag: 1 to 64 characters from a-z, 0-9, _ and -, starting with a letter or digit";
@@ -319,7 +320,8 @@ impl Config {
 			if let Some((other, _)) = listeners.iter().find(|(_, other)| !other.datagram() && loops(other.listen(), address.0)) {r.error(format!("{at}.site.address"), format!("expected the real site, found the address and port {other} listens on: every stranger's connection would come back to the node"))}
 		}
 		if self.outbounds.len() > MAX_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_OUTBOUNDS} outbounds"))}
-		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} => tag.as_str()}));
+		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag.as_str()}));
+		if self.outbounds.iter().filter(|outbound| matches!(outbound, Outbound::Xray {..})).count() > MAX_XRAY_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_XRAY_OUTBOUNDS} outbounds of type xray"))}
 		let tunnels: Vec<&str> = self.exits.iter().filter_map(|exit| if let Backend::L3(l3) = &exit.backend {Some(l3.interface.as_deref().unwrap_or(DEFAULT_INTERFACE))} else {None}).collect();
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
 			match outbound {
@@ -334,17 +336,82 @@ impl Config {
 						if secret.as_ref().is_some_and(|s| s.expose() == REDACTED) {r.error(format!("outbounds[{i}].{key}"), format!("expected a {key}, found the marker the control API shows in the place of one: write the {key} itself"))}
 					}
 				}
+				Outbound::Xray {link, protocol, server, id, password, flow, cipher, transport, security, ..} => {
+					let at = format!("outbounds[{i}]");
+					let secret = |text: &str| (1..=MAX_CREDENTIAL_BYTES).contains(&text.len()) && !text.chars().any(char::is_control);
+					let named = |text: &str| domain(text, false) || text.parse::<IpAddr>().is_ok();
+					let path = |text: &str| text.starts_with('/') && text.len() <= 256 && text.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~!$&()*+,;=:@/?%".contains(&b));
+					let (reality, tls) = (matches!(security, Some(XraySecurity::Reality {..})), matches!(security, Some(XraySecurity::Tls {..})));
+					let plain = matches!(transport, None | Some(XrayTransport::Tcp {}));
+					if link.is_some() {r.error(format!("{at}.link"), "expected no link: it is read when the document is read, and the outbound is kept as the fields it gave")}
+					if let Host::Ip(ip) = &server.host {
+						if gate::refused(*ip, &pools) {r.error(format!("{at}.server"), "expected an address the node may dial: not loopback, link-local, unspecified, multicast, a cloud metadata address or an address of an inbound's pool")}
+					}
+					let (uses_id, keyed) = (matches!(protocol, XrayOutboundProtocol::Vless | XrayOutboundProtocol::Vmess), [("id", id), ("password", password)]);
+					for (key, value) in keyed {
+						match value {
+							None if (key == "id") == uses_id => r.error(format!("{at}.{key}"), format!("expected a {key}: {} needs one", if uses_id {"vless and vmess"} else {"trojan and shadowsocks"})),
+							Some(_) if (key == "id") != uses_id => r.error(format!("{at}.{key}"), format!("expected no {key}: {} takes the other one", if uses_id {"vless and vmess"} else {"trojan and shadowsocks"})),
+							Some(value) if value.expose() == REDACTED => r.error(format!("{at}.{key}"), format!("expected a {key}, found the marker the control API shows in the place of one: write the {key} itself")),
+							Some(value) if key == "id" => {
+								let groups: Vec<usize> = value.expose().split('-').map(str::len).collect();
+								if groups != [8, 4, 4, 4, 12] || !value.expose().bytes().all(|b| b == b'-' || b.is_ascii_hexdigit()) {r.error(format!("{at}.id"), "expected a UUID such as 3f2b8c1e-5d4a-4e7b-9a6c-1d2e3f4a5b6c")}
+							}
+							Some(value) if !secret(value.expose()) => r.error(format!("{at}.{key}"), format!("expected 1 to {MAX_CREDENTIAL_BYTES} bytes with no control characters")),
+							_ => {}
+						}
+					}
+					match (protocol, cipher.as_deref()) {
+						(XrayOutboundProtocol::Vmess, Some(cipher)) if !xray_profile::VMESS_CIPHERS.contains(&cipher) => r.error(format!("{at}.cipher"), format!("expected one of {}", xray_profile::VMESS_CIPHERS.join(", "))),
+						(XrayOutboundProtocol::Shadowsocks, None) => r.error(format!("{at}.cipher"), "expected the method of the server"),
+						(XrayOutboundProtocol::Shadowsocks, Some(cipher)) if !xray_profile::SHADOWSOCKS_CIPHERS.contains(&cipher) => r.error(format!("{at}.cipher"), format!("expected one of {}", xray_profile::SHADOWSOCKS_CIPHERS.join(", "))),
+						(XrayOutboundProtocol::Shadowsocks, Some(cipher)) if cipher.starts_with("2022-") && password.as_ref().is_some_and(|key| key.expose() != REDACTED && STANDARD.decode(key.expose()).map_or(true, |bytes| bytes.len() != if cipher.contains("aes-128") {16} else {32})) => r.error(format!("{at}.password"), format!("expected the key of {cipher}: {} bytes as standard base64", if cipher.contains("aes-128") {16} else {32})),
+						(XrayOutboundProtocol::Vless | XrayOutboundProtocol::Trojan, Some(_)) => r.error(format!("{at}.cipher"), "expected no cipher: only vmess and shadowsocks have one"),
+						_ => {}
+					}
+					if flow.is_some() && *protocol != XrayOutboundProtocol::Vless {r.error(format!("{at}.flow"), "expected no flow: only vless has one")}
+					if flow.is_some() && !(plain && (tls || reality)) {r.error(format!("{at}.flow"), "expected a tcp transport with tls or reality: Vision runs over a TLS stream it can read")}
+					if matches!(protocol, XrayOutboundProtocol::Vless | XrayOutboundProtocol::Trojan) && !(tls || reality) {r.error(format!("{at}.security"), "expected tls or reality: vless and trojan are never spoken in the clear")}
+					match transport {
+						Some(XrayTransport::Ws {path: p, host} | XrayTransport::Httpupgrade {path: p, host} | XrayTransport::Xhttp {path: p, host, ..}) => {
+							if p.as_deref().is_some_and(|p| !path(p)) {r.error(format!("{at}.transport.path"), "expected a path that starts with / of at most 256 bytes from letters, digits and -._~!$&()*+,;=:@/?%")}
+							if host.as_deref().is_some_and(|host| !named(host)) {r.error(format!("{at}.transport.host"), "expected a lowercase host name or an address")}
+							if reality && !matches!(transport, Some(XrayTransport::Xhttp {..})) {r.error(format!("{at}.transport"), "expected tcp, grpc or xhttp: reality does not run over ws or httpupgrade")}
+						}
+						Some(XrayTransport::Grpc {service, authority}) => {
+							if service.as_deref().is_some_and(|service| !(1..=128).contains(&service.len()) || !service.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._/".contains(&b))) {r.error(format!("{at}.transport.service"), "expected 1 to 128 characters from letters, digits and -._/")}
+							if authority.as_deref().is_some_and(|authority| !named(authority)) {r.error(format!("{at}.transport.authority"), "expected a lowercase host name or an address")}
+						}
+						Some(XrayTransport::Tcp {}) | None => {}
+					}
+					match security {
+						Some(XraySecurity::Tls {server_name, alpn, fingerprint}) => {
+							if server_name.as_deref().is_some_and(|name| !domain(name, false)) {r.error(format!("{at}.security.server_name"), "expected a lowercase host name")}
+							if server_name.is_none() && matches!(server.host, Host::Ip(_)) {r.error(format!("{at}.security.server_name"), "expected the name the server's certificate is for: the server is an address, and the certificate is checked against a name")}
+							if alpn.as_ref().is_some_and(|alpn| alpn.is_empty() || alpn.len() > 2 || alpn.iter().any(|item| !xray_profile::ALPN.contains(&item.as_str())) || (alpn.len() == 2 && alpn[0] == alpn[1])) {r.error(format!("{at}.security.alpn"), "expected h2 and http/1.1, each at most once")}
+							if fingerprint.as_deref().is_some_and(|fingerprint| !xray_profile::FINGERPRINTS.contains(&fingerprint)) {r.error(format!("{at}.security.fingerprint"), format!("expected one of {}", xray_profile::FINGERPRINTS.join(", ")))}
+						}
+						Some(XraySecurity::Reality {server_name, public_key, short_id, fingerprint}) => {
+							if !domain(server_name, false) {r.error(format!("{at}.security.server_name"), "expected a lowercase host name: the site the server borrows")}
+							if public_key.len() != 43 || URL_SAFE_NO_PAD.decode(public_key).map_or(true, |key| key.len() != 32) {r.error(format!("{at}.security.public_key"), "expected 32 bytes as 43 characters of base64url")}
+							if short_id.as_deref().is_some_and(|id| id.len() > 16 || id.len() % 2 == 1 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {r.error(format!("{at}.security.short_id"), "expected at most 16 lowercase hexadecimal digits, an even number of them")}
+							if fingerprint.as_deref().is_some_and(|fingerprint| !xray_profile::FINGERPRINTS.contains(&fingerprint)) {r.error(format!("{at}.security.fingerprint"), format!("expected one of {}", xray_profile::FINGERPRINTS.join(", ")))}
+						}
+						Some(XraySecurity::Off {}) | None => {}
+					}
+					if matches!(server.host, Host::Name(_)) {r.warning(format!("{at}.server"), "a name, which the node looks up at start, at every reload and every quarter hour: every address it gives must pass the dial rules, or the outbound is down until one does")}
+				}
 				_ => {}
 			}
 		}
 		// Outbound chaining, "Outbounds": the named outbound must be a socks5 one, following `via` from any outbound must not come back to it, and a chain holds at most `MAX_CHAIN` of them.
-		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..})), _ => None};
+		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..} | Outbound::Xray {..})), _ => None};
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
 			let Outbound::Socks5 {via: Some(via), ..} = outbound else {continue};
 			match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
 				None => r.error(format!("outbounds[{i}].via"), "expected the tag of an outbound, found a tag no outbound has"),
 				Some(Outbound::Direct {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
-				Some(Outbound::Socks5 {..}) => {}
+				Some(Outbound::Socks5 {..} | Outbound::Xray {..}) => {}
 			}
 			let (mut at, mut chain) = (i, vec![i]);
 			while let Some(to) = via_of(at) {
@@ -592,7 +659,7 @@ impl Config {
 				match outbound_tags.get(via.as_str()).map(|o| &self.outbounds[*o]) {
 					None => r.error(at("via"), "expected the tag of an outbound, found a tag no outbound has"),
 					Some(Outbound::Direct {..}) => r.error(at("via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
-					Some(Outbound::Socks5 {..}) => {}
+					Some(Outbound::Socks5 {..} | Outbound::Xray {..}) => {}
 				}
 			}
 			if !link_ids.insert(link.id.0) {r.error(at("id"), "expected an id no other link has")}

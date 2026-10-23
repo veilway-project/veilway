@@ -311,7 +311,7 @@ impl Config {
 	/// `parse` for a document in which a secret may hold `REDACTED` in the place of its value, which is how the control API shows a config and takes it back.
 	/// The marker stands for the value of the same object in `running`: the `private_key` of the inbound with that tag, the `preshared_key` of the device with that `public_key`,
 	/// each entry of `transport_secrets` of the device with that `public_key` (there the marker carries digits that name one secret of that device, and stands for that one wherever it is in the list, so a list that loses or gains an entry keeps exactly what its markers name),
-	/// and the `username` and `password` of the socks5 outbound with that tag and that `server`. The server is part of it because that is who the node sends them to: kept for another one, they would go to whoever the document names.
+	/// and the `username` and `password` of the socks5 outbound, and the `id` and `password` of the xray outbound, with that tag and that `server`. The server is part of it because that is who the node sends them to: kept for another one, they would go to whoever the document names.
 	/// A marker `running` has no value for is an error at the path of its field, and so is the marker anywhere else, where it is no valid value. The result holds the real secrets.
 	/// Next to it come the tags of the outbounds whose `username` or `password` the document spells out, which is what lets a caller say "changed" for them without saying whether they are what runs.
 	pub fn parse_keeping(bytes: &[u8], running: &Config) -> Result<(Config, Vec<String>), Report> {
@@ -376,16 +376,17 @@ impl Config {
 			for (i, outbound) in outbounds.iter_mut().enumerate() {
 				let Json::Obj(outbound) = outbound else {continue};
 				let (tag, server) = (named(outbound, "tag"), outbound.get("server").and_then(|json| HostPort::deserialize(De {json, path: &Path::Root}).ok()));
-				if ["username", "password"].iter().any(|key| outbound.contains_key(*key) && !marked(outbound, *key)) {spelled.extend(tag.clone())}
-				for key in ["username", "password"] {
+				if ["username", "password", "id", "link"].iter().any(|key| outbound.contains_key(*key) && !marked(outbound, *key)) {spelled.extend(tag.clone())}
+				for key in ["username", "password", "id"] {
 					if !marked(outbound, key) {continue}
 					let kept = tag.as_ref().zip(server.as_ref()).and_then(|(tag, server)| running.outbounds.iter().find_map(|was| match was {
 						Outbound::Socks5 {tag: of, server: at, username, password, ..} if of == tag && at == server => if key == "username" {username.as_ref()} else {password.as_ref()},
+						Outbound::Xray {tag: of, server: at, id, password, ..} if of == tag && at == server => if key == "id" {id.as_ref()} else {password.as_ref()},
 						_ => None,
 					}));
 					match kept {
 						Some(kept) => drop(outbound.insert(key.to_string(), Json::Str(kept.expose().clone()))),
-						None => report.error(format!("outbounds[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running socks5 outbound with this tag and this server, and no such outbound runs with one. For a server that is new or has changed, the {key} has to be sent itself")),
+						None => report.error(format!("outbounds[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running socks5 or xray outbound with this tag and this server, and no such outbound runs with one. For a server that is new or has changed, the {key} has to be sent itself")),
 					}
 				}
 			}

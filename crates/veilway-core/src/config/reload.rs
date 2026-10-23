@@ -201,7 +201,7 @@ impl Diff {
 			if exit.name.is_none() {exit.name = Some(exit.tag.clone())}
 			match &mut exit.backend {
 				Backend::Netstack(netstack) => {
-					if netstack.proxy_only.is_none() {netstack.proxy_only = Some(config.outbounds.iter().any(|outbound| matches!(outbound, Outbound::Socks5 {tag, ..} if *tag == netstack.outbound)))}
+					if netstack.proxy_only.is_none() {netstack.proxy_only = Some(config.outbounds.iter().any(|outbound| matches!(outbound, Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} if *tag == netstack.outbound)))}
 					netstack.tcp_idle_secs.get_or_insert(DEFAULT_TCP_IDLE_SECS);
 					netstack.udp_idle_secs.get_or_insert(DEFAULT_UDP_IDLE_SECS);
 					netstack.unsupported.icmp_echo.get_or_insert(Policy::Local);
@@ -220,7 +220,7 @@ impl Diff {
 		Diff {
 			inbounds,
 			outbounds: changes(&old.outbounds, &new.outbounds, |outbound| match outbound {
-				Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} => tag.as_str(),
+				Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag.as_str(),
 			}, |was, is| was == is),
 			exits: changes(&old.exits, &new.exits, |exit| exit.tag.as_str(), |was, is| was == is || effective(old, was) == effective(new, is)),
 			rules: changes(&old.routing.rules, &new.routing.rules, |rule| rule.tag.as_str(), |was, is| was == is || Rule {enabled: Some(was.enabled != Some(false)), ..was.clone()} == Rule {enabled: Some(is.enabled != Some(false)), ..is.clone()}),

@@ -985,6 +985,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "down_reason": {
+            "description": "Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "latency_ms": {
             "description": "How long the proxy took to answer the greeting of the last flow that dialled it, in milliseconds. Null for a direct outbound, and until a flow has used the proxy. A reload starts it over.",
             "format": "uint64",
@@ -1048,7 +1055,8 @@
           "udp_down_secs",
           "udp_flips",
           "latency_ms",
-          "measured_at"
+          "measured_at",
+          "down_reason"
         ],
         "type": "object"
       },

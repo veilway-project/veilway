@@ -86,7 +86,8 @@ pub async fn greet(control: &mut TcpStream, up: &Upstream) -> anyhow::Result<()>
 	match chosen[1] {
 		0 => {}
 		2 => {
-			let (user, pass) = up.auth.as_ref().ok_or_else(|| anyhow::anyhow!("upstream wants credentials we do not have"))?;
+			let (_, _, auth) = up.endpoint()?;
+			let (user, pass) = auth.as_ref().ok_or_else(|| anyhow::anyhow!("upstream wants credentials we do not have"))?;
 			anyhow::ensure!(user.len() < 256 && pass.len() < 256, "credentials do not fit rfc 1929");
 			let mut req = vec![1, user.len() as u8];
 			req.extend_from_slice(user.as_bytes());
@@ -105,7 +106,8 @@ pub async fn greet(control: &mut TcpStream, up: &Upstream) -> anyhow::Result<()>
 /// Opens a UDP ASSOCIATE on `up` and returns the control connection that owns it plus a socket connected to the relay. The association lives exactly as long as the returned TcpStream.
 pub async fn associate(up: &Upstream) -> anyhow::Result<(TcpStream, UdpSocket)> {
 	anyhow::ensure!(up.via.is_none(), "a chain of proxies carries no udp");
-	let mut control = TcpStream::connect((up.host.as_str(), up.port)).await?;
+	let (host, port, _) = up.endpoint()?;
+	let mut control = TcpStream::connect((host.as_str(), port)).await?;
 	greet(&mut control, up).await?;
 	control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await?;
 	let mut head = [0u8; 4];
@@ -270,7 +272,8 @@ async fn walk<'a>(up: &'a Upstream, dst: Option<(String, u16)>, stop: &mut Stop<
 		at = via;
 	}
 	hops.reverse();
-	let mut control = TcpStream::connect((hops[0].host.as_str(), hops[0].port)).await?;
+	let (host, port, _) = hops[0].endpoint()?;
+	let mut control = TcpStream::connect((host.as_str(), port)).await?;
 	greet(&mut control, hops[0]).await?;
 	for hop in &hops[1..] {
 		*stop = Stop::Hop(&hop.tag);

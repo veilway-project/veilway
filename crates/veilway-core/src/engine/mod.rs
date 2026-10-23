@@ -29,6 +29,7 @@ pub mod upstream;
 pub mod upstream_state;
 pub mod usage;
 pub mod xray;
+pub mod xray_out;
 mod xray_owner;
 mod xray_udp;
 #[cfg(target_os = "linux")]
@@ -544,6 +545,9 @@ impl Engine {
 
 	/// Whether the Xray add-on's executable is in the add-on folder. Whether it is the pinned one is checked when it is started.
 	pub fn xray_installed(&self) -> bool {self.addons.as_deref().is_some_and(|addons| xray::binary(addons).is_file())}
+
+	/// Why the Xray outbound `tag` cannot carry a flow right now: the add-on is not installed or not running, Xray ended, or its server's name does not resolve to an address the node may dial. None when it carries.
+	pub fn xray_outbound_down(&self, tag: &str) -> Option<String> {self.plan().hops.get(tag).reason()}
 
 	/// Every device that may connect right now, once for each inbound it has an address in, with what its tunnel knows of it, inbound by inbound. The devices of a user who is denied are not peers and not in it.
 	/// With `only`, the devices of the user of that name, and nothing of any other device is looked at.

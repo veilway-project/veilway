@@ -833,7 +833,7 @@ fn egress_never_dials_directly(){
 			// The stream listener dials one more place, and no user's traffic goes there: the decoy origin of its config, which is the operator's own web server and the one address a stranger's bytes are handed to.
 			// So does the `faketls` listener: the site of its config, which is the one address a stranger's bytes are handed to, and the one place the early connection of every accepted connection goes.
 			for line in text.lines().filter(|l| l.contains("TcpStream::connect")){
-				let proxy=path.ends_with("engine/flows.rs")&&(line.trim()=="let mut control = TcpStream::connect((up.host.as_str(), up.port)).await?;"||line.trim()=="let mut control = TcpStream::connect((hops[0].host.as_str(), hops[0].port)).await?;");
+				let proxy=path.ends_with("engine/flows.rs")&&(line.trim()=="let mut control = TcpStream::connect((host.as_str(), port)).await?;");
 				let decoy=path.ends_with("engine/stream.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(to))");
 				let site=path.ends_with("engine/faketls.rs")&& line.contains("timeout(DECOY_CONNECT, TcpStream::connect(site))");
 				assert!(proxy|| decoy|| site, "{} dials {} without the proxy", path.display(), line.trim());

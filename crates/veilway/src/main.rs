@@ -69,6 +69,8 @@ enum Command {
 		#[arg(long)] state: Option<PathBuf>,
 		/// The replay file `run` would use [default: veilway-replay next to the state file]
 		#[arg(long)] replay: Option<PathBuf>,
+		/// Where the add-ons are installed: the Xray add-on is checked here when the config has an Xray inbound or outbound
+		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
 		/// The control socket `run` would use, which also says whether a node runs already [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -371,12 +373,12 @@ async fn main() -> anyhow::Result<()> {
 			if print(&report, &config) {std::process::exit(1)}
 			Ok(())
 		}
-		Command::Doctor {config, allow_readable_config, state, replay, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+		Command::Doctor {config, allow_readable_config, state, replay, addons, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
 			#[cfg(unix)]
 			let socket = (!no_api).then(|| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 			#[cfg(not(unix))]
 			let socket = None;
-			std::process::exit(doctor::run(&config, allow_readable_config, state, replay, socket, json, Duration::from_secs(timeout)).await)
+			std::process::exit(doctor::run(&config, allow_readable_config, state, replay, addons, socket, json, Duration::from_secs(timeout)).await)
 		}
 		#[cfg(unix)]
 		Command::Replay {command: Replay::Reset {yes, api, config}} => {

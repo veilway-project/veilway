@@ -64,7 +64,7 @@
               "type": "string"
             },
             "proxy_only": {
-              "description": "Defaults to true on a socks5 outbound. Must be absent or false on a direct one.",
+              "description": "Defaults to true on a socks5 or xray outbound. Must be absent or false on a direct one.",
               "type": "boolean"
             },
             "tcp_idle_secs": {
@@ -1171,6 +1171,87 @@
             "type",
             "tag",
             "server"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A proxy server run through the Xray add-on: the node writes a loopback SOCKS5 inbound for it into the add-on's document, routed to this outbound, and dials that inbound as it dials a `socks5` outbound. Give either `link` or `protocol` and `server` with the fields of the protocol. A link is read once and the outbound is kept in the typed form, so a document that is read back from the node has no `link`. The server and the keys are the operator's secrets. The add-on must be installed, or every exit that uses this outbound is down and says why. A `socks5` outbound may name this one in `via`; this outbound has no `via` of its own.",
+          "oneOf": [
+            {
+              "required": [
+                "link"
+              ]
+            },
+            {
+              "required": [
+                "protocol",
+                "server"
+              ]
+            }
+          ],
+          "properties": {
+            "cipher": {
+              "description": "The cipher of `vmess` (`auto`, `aes-128-gcm` or `chacha20-poly1305`, default `auto`) and the method of `shadowsocks` (required).",
+              "type": "string"
+            },
+            "flow": {
+              "$ref": "#/$defs/XrayFlow",
+              "description": "`vless` only, and only over TCP with TLS or REALITY."
+            },
+            "id": {
+              "description": "The user id of `vless` and `vmess`, a UUID.",
+              "type": "string"
+            },
+            "link": {
+              "description": "Input only: a share link of a scheme the client's legacy reader knows (`vless`, `vmess`, `trojan`, `ss`), with the limits of the client's table: TCP, WebSocket and gRPC streams, TLS and REALITY, Vision. It is a secret and is never written back, so this is always absent in what the node holds.",
+              "maxLength": 4096,
+              "type": "string",
+              "writeOnly": true
+            },
+            "password": {
+              "description": "The password of `trojan` and `shadowsocks`. For a `shadowsocks` 2022 cipher it is the key as standard base64.",
+              "type": "string"
+            },
+            "protocol": {
+              "$ref": "#/$defs/XrayOutboundProtocol"
+            },
+            "security": {
+              "$ref": "#/$defs/XraySecurity",
+              "description": "Defaults to `none`, which `vless` and `trojan` refuse. Certificates are always checked: there is no way to switch that off."
+            },
+            "server": {
+              "$ref": "#/$defs/HostPort",
+              "description": "The provider's server. Xray resolves nothing: a name is looked up by the node, every address it gives must pass the dial rules, and the one used is written into the add-on's document."
+            },
+            "tag": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "transport": {
+              "$ref": "#/$defs/XrayTransport",
+              "description": "Defaults to `tcp`."
+            },
+            "type": {
+              "const": "xray",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tag"
           ],
           "type": "object"
         }
@@ -2702,6 +2783,15 @@
       ],
       "type": "object"
     },
+    "XhttpMode": {
+      "enum": [
+        "auto",
+        "packet-up",
+        "stream-up",
+        "stream-one"
+      ],
+      "type": "string"
+    },
     "Xray": {
       "additionalProperties": false,
       "description": "The Xray add-on's part of the config. Xray runs as a child of the node and only ever reaches the network through the node: its traffic is attributed to the user of the client, and the node's gate, rules, exits and quotas apply to it.",
@@ -2739,6 +2829,12 @@
         "secret"
       ],
       "type": "object"
+    },
+    "XrayFlow": {
+      "enum": [
+        "xtls-rprx-vision"
+      ],
+      "type": "string"
     },
     "XrayInbound": {
       "additionalProperties": false,
@@ -2796,6 +2892,15 @@
       ],
       "type": "object"
     },
+    "XrayOutboundProtocol": {
+      "enum": [
+        "vless",
+        "vmess",
+        "trojan",
+        "shadowsocks"
+      ],
+      "type": "string"
+    },
     "XrayProtocol": {
       "oneOf": [
         {
@@ -2812,6 +2917,176 @@
           "const": "shadowsocks",
           "description": "The cipher is 2022-blake3-aes-256-gcm with a key for the server and one per client. Every key is 32 bytes as standard base64.",
           "type": "string"
+        }
+      ]
+    },
+    "XraySecurity": {
+      "description": "The security around an Xray outbound's stream. The chain is always checked against the system roots, and there is no key that turns that off or pins a certificate instead.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`server_name` defaults to the server's name, and is needed when the server is an address. `fingerprint` is the ClientHello Xray imitates, default `chrome`. `alpn` is `h2` and `http/1.1` in any order.",
+          "properties": {
+            "alpn": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "server_name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tls",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "`public_key` is 43 characters of base64url. `short_id` is up to 16 hexadecimal digits, an even number of them.",
+          "properties": {
+            "fingerprint": {
+              "type": "string"
+            },
+            "public_key": {
+              "type": "string"
+            },
+            "server_name": {
+              "type": "string"
+            },
+            "short_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "reality",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "server_name",
+            "public_key"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "XrayTransport": {
+      "description": "The stream an Xray outbound speaks over its connection. Fields that are left out take Xray's own defaults, `/` for a path.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "tcp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ws",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "authority": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "type": {
+              "const": "grpc",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "httpupgrade",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "host": {
+              "type": "string"
+            },
+            "mode": {
+              "$ref": "#/$defs/XhttpMode"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "xhttp",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
         }
       ]
     }
