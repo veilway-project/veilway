@@ -62,6 +62,8 @@ pub struct TcpConfig {
 pub enum TcpOptions {
     /// Maximum segment size (MSS) for TCP connections.
     MaximumSegmentSize(u16),
+    /// veilway patch: the window scale of a SYN/ACK, added by `write_packet_to_device`.
+    WindowScale(u8),
 }
 
 impl Default for TcpConfig {
@@ -213,6 +215,13 @@ impl IpStackTcpStream {
             _ => None,
         }) {
             tcb.set_peer_mss(mss);
+        }
+        // veilway patch: window scaling, see `Tcb::set_window_scale`.
+        if let Some(shift) = tcp.options_iterator().find_map(|option| match option {
+            Ok(TcpOptionElement::WindowScale(shift)) => Some(shift),
+            _ => None,
+        }) {
+            tcb.set_window_scale(shift);
         }
         let tuple = NetworkTuple::new(src_addr, dst_addr, true);
         if !tcp.syn {
@@ -720,7 +729,12 @@ async fn tcp_main_logic_loop(
 
         tcb.update_inflight_packet_queue(incoming_ack);
 
-        for packet in tcb.collect_timed_out_inflight_packets() {
+        let timed_out = tcb.collect_timed_out_inflight_packets();
+        // veilway patch: congestion control, see `Tcb::on_loss`.
+        if !timed_out.is_empty() {
+            tcb.on_loss(true);
+        }
+        for packet in timed_out {
             let (seq, count) = (packet.seq, packet.retransmit_count);
             log::debug!("{network_tuple} inflight packet retransmission timeout: {seq:?}, retransmit_count: {count}",);
             write_packet_to_device(
@@ -762,7 +776,10 @@ async fn tcp_main_logic_loop(
                             write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK, None, None)?;
                         }
                         PacketType::RetransmissionRequest => {
-                            if let Some(packet) = tcb.find_inflight_packet(incoming_ack) {
+                            // veilway patch: congestion control and one retransmission per loss, see `Tcb::on_loss`.
+                            if tcb.on_loss(false)
+                                && let Some(packet) = tcb.find_inflight_packet(incoming_ack)
+                            {
                                 let (s, p) = (packet.seq, packet.payload.clone());
                                 log::debug!(
                                     "{network_tuple} {state:?}: {l_info}, {pkt_type:?}, retransmission request, seq = {s}, len = {}",
@@ -778,6 +795,13 @@ async fn tcp_main_logic_loop(
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Ack => {
+                            // veilway patch: NewReno, see `Tcb::partial_ack`.
+                            if tcb.partial_ack(incoming_ack)
+                                && let Some(packet) = tcb.find_inflight_packet(incoming_ack)
+                            {
+                                let (s, p) = (packet.seq, packet.payload.clone());
+                                write_packet_to_device(&up_packet_sender, network_tuple, &tcb, None, ACK | PSH, Some(s), Some(p))?;
+                            }
                             write_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
                         }
                         PacketType::Invalid => {}
@@ -955,7 +979,7 @@ async fn tcp_main_logic_loop(
         }
 
         tcb.update_last_received_ack(incoming_ack);
-        tcb.update_send_window(incoming_win);
+        tcb.update_send_window(incoming_win, flags & SYN == SYN);
     } // end of loop
     Ok::<(), std::io::Error>(())
 }
@@ -997,7 +1021,12 @@ pub(crate) fn write_packet_to_device(
 ) -> std::io::Result<usize> {
     use std::io::Error;
     let seq = seq.unwrap_or(tcb.get_seq()).0;
-    let (ack, window_size) = (tcb.get_ack().0, tcb.get_recv_window().max(tcb.get_mtu()));
+    // veilway patch: the window is scaled except on a SYN (RFC 7323 2.2), and a SYN/ACK announces the scale when the peer's SYN had one.
+    let (syn, shift) = (flags & SYN != 0, tcb.get_own_shift());
+    let window = if syn { tcb.get_recv_window() } else { tcb.get_recv_window() >> shift };
+    let (ack, window_size) = (tcb.get_ack().0, window.max(u32::from(tcb.get_mtu())).min(u32::from(u16::MAX)) as u16);
+    let scaled: Option<Vec<TcpOptions>> = (syn && shift > 0).then(|| options.into_iter().flatten().cloned().chain([TcpOptions::WindowScale(shift)]).collect());
+    let options = scaled.as_ref().or(options);
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);
     let packet = create_raw_packet(
@@ -1043,6 +1072,7 @@ pub(crate) fn create_raw_packet(
         for opt in opts {
             match opt {
                 TcpOptions::MaximumSegmentSize(mss) => tcp_options.push(TcpOptionElement::MaximumSegmentSize(*mss)),
+                TcpOptions::WindowScale(shift) => tcp_options.push(TcpOptionElement::WindowScale(*shift)),
             }
         }
         tcp_header
@@ -1129,6 +1159,25 @@ mod tests {
         }
         assert_eq!(stream.tcb.lock().unwrap().get_state(), TcpState::Established);
         (stream, up_rx, local_seq)
+    }
+
+    /// RFC 7323 2.2: the SYN/ACK announces the stack's window scale only when the peer's SYN carried one.
+    #[tokio::test]
+    async fn the_syn_ack_announces_a_window_scale_only_when_asked() {
+        for (options, expected) in [(vec![TcpOptionElement::WindowScale(7)], Some(super::super::tcb::WINDOW_SHIFT)), (vec![], None)] {
+            let (up_tx, mut up_rx) = tokio::sync::mpsc::unbounded_channel::<NetworkPacket>();
+            let mut syn = TcpHeader::new(12345, 80, 1000, u16::MAX);
+            syn.syn = true;
+            syn.set_options(&options).unwrap();
+            let _stream = IpStackTcpStream::new(PEER.parse().unwrap(), LOCAL.parse().unwrap(), syn, up_tx, 1500, None, Arc::new(TcpConfig::default())).unwrap();
+            let packet = up_rx.recv().await.unwrap();
+            let TransportHeader::Tcp(header) = packet.transport_header() else { panic!("the stack wrote a packet that is not TCP") };
+            let scale = header.options_iterator().find_map(|option| match option {
+                Ok(TcpOptionElement::WindowScale(shift)) => Some(shift),
+                _ => None,
+            });
+            assert_eq!(scale, expected);
+        }
     }
 
     /// A gap filled by a late segment releases more contiguous bytes than one handoff moves (8192), and the FIN follows
