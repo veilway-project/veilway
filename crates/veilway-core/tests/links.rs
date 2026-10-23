@@ -283,7 +283,7 @@ impl Peer {
 }
 
 /// A link up between two engines, and a user on the entry.
-struct Linked {entry: Engine, exit: Engine, user: Peer, pair: Pair, _site: Site}
+struct Linked {entry: Engine, exit: Engine, user: Peer, pair: Pair, home: SocketAddr, _site: Site}
 
 /// `edit` changes the entry's document before it starts, for a test that puts a proxy chain in front of the link.
 async fn linked(test: &'static str, forward: bool, over: Over, edit: impl FnOnce(&mut Value), time: Time) -> Linked {
@@ -310,7 +310,7 @@ async fn linked(test: &'static str, forward: bool, over: Over, edit: impl FnOnce
 	}
 	let mut user = Peer::device(&USER, &ENTRY, home, USER_ADDRESS).await;
 	user.connect().await;
-	Linked {entry, exit, user, pair, _site: site}
+	Linked {entry, exit, user, pair, home, _site: site}
 }
 
 /// What every direction and transport must do: traffic leaves from the exit and is counted for the user at the entry, a ping is answered from the far side under the identifier the user chose, and a packet larger than the link is refused at the entry with the link's MTU.
@@ -332,6 +332,29 @@ async fn carries(mut net: Linked, base: u16) {
 	net.entry.shutdown().await;
 	net.exit.shutdown().await;
 }
+
+/// "The client starts a new WireGuard handshake when it sends a packet on a tunnel whose last handshake is older than the client rekey point": a link that carries nothing stays up past WireGuard's 180 s, and so its traffic still flows. Real time, since WireGuard keeps its own clock: run with `--ignored`, about three and a half minutes each.
+async fn stays_up_while_idle(test: &'static str, forward: bool, over: Over) {
+	let mut net = linked(test, forward, over, |_| {}, time!()).await;
+	tokio::time::sleep(Duration::from_secs(200)).await;
+	for (node, name) in [(&net.entry, "entry"), (&net.exit, "exit")] {
+		let link = &node.links()[0];
+		assert_eq!(link.status, Status::Up, "the idle link went down at the {name}: {link:?}");
+		assert!(link.handshake.is_some_and(|age| age < Duration::from_secs(180)), "the idle link at the {name} has no fresh handshake: {link:?}");
+	}
+	// The test's user is a bare WireGuard peer that renews nothing, so its own tunnel to the entry has lapsed by now: it connects again, as an app would.
+	net.user = Peer::device(&USER, &ENTRY, net.home, USER_ADDRESS).await;
+	net.user.connect().await;
+	carries(net, 46000).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real time, about three and a half minutes"]
+async fn an_idle_forward_link_over_tls_stays_up_past_the_reject_time() {stays_up_while_idle("links-idle-tls", true, Over::Tls).await}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real time, about three and a half minutes"]
+async fn an_idle_reverse_link_over_udp_obfs_stays_up_past_the_reject_time() {stays_up_while_idle("links-idle-obfs", false, Over::Obfs).await}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_forward_link_over_udp_obfs_carries_a_users_traffic_out_of_the_exit() {
