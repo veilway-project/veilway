@@ -696,7 +696,7 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 	Vec::new()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 	use super::{exit_for, generate, PIN, RELEASE};
 	use crate::config::Config;
