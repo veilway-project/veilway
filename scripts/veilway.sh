@@ -6,7 +6,7 @@
 #   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
 #   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx] [--https-port 443]   also set up a web server with HTTPS and a decoy site
 #   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
-#   sudo bash veilway.sh update [node|panel|mirror|both]
+#   sudo bash veilway.sh update [node|panel|mirror|both]   also adds the decoy origin (127.0.0.1:8080) to a web server setup that lacks it
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
@@ -81,6 +81,8 @@ DECOY_ON=0
 CADDY_SITE="/etc/caddy/conf.d/veilway-panel.caddy"
 CADDY_IMPORT="import /etc/caddy/conf.d/*.caddy"
 NGINX_SITE="/etc/nginx/conf.d/veilway-panel.conf"
+CADDY_DECOY="/etc/caddy/conf.d/veilway-decoy.caddy"
+NGINX_DECOY="/etc/nginx/conf.d/veilway-decoy.conf"
 DRY=0
 ASSUME_YES=0
 ALLOW_DOWNGRADE=0
@@ -967,7 +969,7 @@ do_install() {
 }
 
 do_update() {
-	local comp="${1:-both}" cur
+	local comp="${1:-both}" cur web decoy
 	need_root
 	refuse_links
 	detect_target
@@ -1008,6 +1010,47 @@ do_update() {
 			svc start veilway-panel-update.path
 			svc restart veilway-panel.service
 		else info "panel is not installed, skipped"; fi
+	fi
+	web="$(web_state web)"
+	# A web setup from before v0.2.15 has no decoy origin, and its site file is the operator's to edit, so the decoy goes in a file of its own.
+	if [ -f "$WEB_STATE" ] && { [ "$web" = caddy ] || [ "$web" = nginx ]; }; then
+		if [ -n "$(ss -H -ltnp "sport = :$DECOY_PORT" | grep -vE '"(caddy|nginx)"' || true)" ]; then warn "127.0.0.1:$DECOY_PORT is used by something else here, so the plain site is not served there. A node's decoy origin needs a web page: pick another port with VEILWAY_DECOY_PORT=<port> and run update again, or point the origin at your own page."
+		elif [ -z "$(ss -H -ltn "sport = :$DECOY_PORT")" ]; then
+			web_decoy
+			if [ "$web" = caddy ]; then
+				decoy="$CADDY_DECOY"
+				write_unit "$decoy" <<EOF
+# Written by veilway.sh update. Remove it with: sudo bash veilway.sh uninstall web
+http://127.0.0.1:$DECOY_PORT {
+	bind 127.0.0.1
+	root * $WEB_ROOT
+	file_server
+}
+EOF
+			else
+				decoy="$NGINX_DECOY"
+				write_unit "$decoy" <<EOF
+# Written by veilway.sh update. Remove it with: sudo bash veilway.sh uninstall web
+server {
+	listen 127.0.0.1:$DECOY_PORT;
+	server_tokens off;
+	root $WEB_ROOT;
+	location / {
+		try_files \$uri \$uri/ =404;
+	}
+}
+EOF
+			fi
+			if [ "$DRY" = 1 ]; then dry "check the $web config, reload $web and note $decoy in $WEB_STATE"
+			elif { [ "$web" = caddy ] && caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; } || { [ "$web" = nginx ] && nginx -t >/dev/null 2>&1; }; then
+				web_note decoy_file "$decoy"
+				if systemctl is-active --quiet "$web.service" 2>/dev/null; then svc reload "$web.service"; fi
+				step "$web now serves the plain site over http on 127.0.0.1:$DECOY_PORT (this machine only), the default decoy origin of a node's transports"
+			else
+				rm -f -- "$decoy"
+				warn "$web did not accept the decoy site on 127.0.0.1:$DECOY_PORT, so it was taken back: a node's decoy origin needs a web page there, add one by hand"
+			fi
+		fi
 	fi
 	update_self
 	warn "a node restart drops every live tunnel for a moment"
@@ -1751,13 +1794,14 @@ web_setup() {
 	web_not_found
 }
 
-# Takes back what web_setup recorded in $WEB_STATE: the site file, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
+# Takes back what web_setup and update recorded in $WEB_STATE: the site file, the decoy site file, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
 do_uninstall_web() {
 	local web domain p sha pkgs rest port from to moved
 	need_root
 	[ -f "$WEB_STATE" ] || die "no web server setup by this script is recorded here"
 	web="$(web_state web)"; domain="$(web_state domain)"; pkgs="$(web_state pkgs)"; port="$(web_state https_port)"
 	confirm "Remove the web server setup for $domain ($web on port ${port:-443}): its site file, the plain site if it is unchanged, the panel's not_found${pkgs:+, and the packages ${pkgs# }}?" || die "cancelled"
+	[ -z "$(web_state decoy_file)" ] || act rm -f -- "$(web_state decoy_file)"
 	case "$web" in
 		caddy)
 			act rm -f -- "$CADDY_SITE"
