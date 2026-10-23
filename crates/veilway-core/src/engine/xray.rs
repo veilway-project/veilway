@@ -146,13 +146,14 @@ async fn stop(mut running: Running) {
 
 /// Keeps Xray running as the config says: started when the `xray` section has an inbound or the config has an outbound of type `xray` that has an address, started again with a new document when the section, the outbounds or the users the section names change (after `SETTLE` without another change, and with the old one ended first), started again after it ends with a longer wait each time, and stopped when both go or `stopped` is notified.
 /// Each start has socket paths and passwords of its own for the outbounds, and each hop is told it is down before Xray is stopped and is told it is up only once its socket is there and belongs to Xray's user. The names of the servers are looked up by `xray_out::watch`, which this does not wait for.
-pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, socket: Option<PathBuf>, out_dir: PathBuf, stopped: Arc<Notify>) {
+pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, socket: Option<PathBuf>, out_dir: PathBuf, same_user: bool, stopped: Arc<Notify>) {
 	let mut changes = store.subscribe();
 	let names = Arc::new(xray_out::Names::default());
 	let _watcher = Aborts(tokio::spawn(xray_out::watch(shared.clone(), store.clone(), names.clone())));
 	let (mut hop, mut running, mut failures, mut waiting, mut settling): (Option<(JoinHandle<()>, u16, String)>, Option<Running>, u32, Option<Instant>, Option<Instant>) = (None, None, 0, None, None);
 	// What one start of Xray has made for its outbounds, and the outbounds it carries.
 	let (mut start_name, mut endpoints, mut carried): (Option<String>, HashMap<String, (PathBuf, String)>, HashMap<String, ConfigOutbound>) = (None, HashMap::new(), HashMap::new());
+	let mut told: HashMap<String, bool> = HashMap::new();
 	loop {
 		let config = changes.borrow_and_update().config.clone();
 		let (inbounds, hops) = (config.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()), shared.plan().hops.clone());
@@ -240,9 +241,12 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 					}
 				};
 				if unchanged {
+					// The sockets are looked at again: one that is gone, or no longer Xray's, is not carried.
 					let uid = running.as_ref().map_or(0, |was| was.uid);
-					publish(&wires.iter().collect::<Vec<_>>(), uid, "xray is not running");
+					let up: Vec<&Wire> = wires.iter().filter(|wire| xray_out::held(&wire.path, uid) == Ok(true)).collect();
+					publish(&up, uid, "its socket is gone or is not Xray's any more");
 				} else if idle {
+					hops.all_down("xray is being stopped: no outbound has an address to dial");
 					if let Some(was) = running.take() {stop(was).await}
 					publish(&[], 0, "no outbound has an address to dial yet");
 				} else {
@@ -250,20 +254,27 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 						hops.all_down("xray is being started again");
 						stop(was).await;
 					}
-					match start(socket.as_deref(), &document).await {
+					match start(socket.as_deref(), &document, same_user).await {
 						Ok((link, pid, uid)) => {
 							tracing::info!("xray {RELEASE}: started (pid {pid}), {} inbound(s), {} outbound(s)", config.xray.iter().flat_map(|xray| &xray.inbounds).count(), wires.len());
 							running = Some(Running {document, link, uid, since: Instant::now(), said: Vec::new()});
 							// An outbound is up once its socket is there and Xray's user holds it.
 							let until = Instant::now() + SOCKETS;
-							let mut late: Vec<&Wire> = wires.iter().collect();
+							let (mut late, mut denied): (Vec<&Wire>, bool) = (wires.iter().collect(), false);
 							while !late.is_empty() && Instant::now() < until {
-								late.retain(|wire| !xray_out::held(&wire.path, uid));
+								late.retain(|wire| match xray_out::held(&wire.path, uid) {
+									Ok(held) => !held,
+									Err(kind) => {
+										denied |= kind == std::io::ErrorKind::PermissionDenied;
+										true
+									}
+								});
 								if !late.is_empty() {tokio::time::sleep(Duration::from_millis(50)).await}
 							}
 							let up: Vec<&Wire> = wires.iter().filter(|wire| !late.iter().any(|late| late.tag == wire.tag)).collect();
-							if !late.is_empty() {tracing::error!("xray: the socket of {} outbound(s) did not appear as Xray's within {}s", late.len(), SOCKETS.as_secs())}
-							publish(&up, uid, "its socket did not appear as Xray's in time");
+							let why = if denied {"the folder of the sockets cannot be entered by this user: the node's user must be in the group of Xray's user (veilway-xray), and the node restarted after it joined"} else {"its socket did not appear as Xray's in time"};
+							if !late.is_empty() {tracing::error!("xray: {} outbound(s) are not carried: {why}", late.len())}
+							publish(&up, uid, why);
 						}
 						Err(e) => {
 							failures += 1;
@@ -278,6 +289,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 				}
 			}
 		}
+		tell(&shared, &mut told);
 		let mut heard = [0u8; 256];
 		tokio::select! {
 			_ = stopped.notified() => {
@@ -295,6 +307,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 				// What the new config no longer holds as it was is not carried from this moment, though Xray goes on for a moment.
 				let now = changes.borrow().config.clone();
 				for tag in carried.iter().filter(|(_, was)| !now.outbounds.iter().any(|outbound| outbound == *was)).map(|(tag, _)| tag) {hops.get(tag).down("the outbound was changed or removed, so Xray is started again")}
+				tell(&shared, &mut told);
 			}
 			_ = names.changed.notified() => {}
 			read = async {
@@ -317,6 +330,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 					(start_name, carried) = (None, HashMap::new());
 					endpoints.clear();
 					hops.all_down(&format!("xray ended, starting it again in {}s", wait.as_secs()));
+					tell(&shared, &mut told);
 				}
 			},
 			_ = async {
@@ -329,6 +343,21 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 	}
 }
 
+/// Says what a hop that went up or down did to the exits that use it: the event, the tick the control channel's health watchers wait for, and a line in the log. `told` holds what each exit was last said to be. Whether an exit works is read from the plan in force (`Plan::working`, which looks at the hop), so this only has to notice.
+fn tell(shared: &Shared, told: &mut HashMap<String, bool>) {
+	let plan = shared.plan();
+	for (at, exit) in plan.exits.iter().enumerate() {
+		let Backend::Netstack {outbound: Outbound::Socks5(up), ..} = &exit.backend else {continue};
+		if up.hop.is_none() {continue}
+		let working = plan.working(at);
+		if told.insert(exit.tag.clone(), working).unwrap_or(false) != working {
+			tracing::info!("exit {}: its xray outbound is {}, so the exit {}", exit.tag, if working {"carried again"} else {"not carried"}, if working {"works again and devices without a choice of exit leave through it again"} else {"does not work"});
+			shared.publish(super::Event::ExitWorkingChanged {exit: exit.tag.clone(), working});
+			shared.control.health.send_modify(|moved| *moved = moved.wrapping_add(1));
+		}
+	}
+}
+
 /// Ends the task it holds when it is dropped.
 struct Aborts(JoinHandle<()>);
 
@@ -337,7 +366,7 @@ impl Drop for Aborts {
 }
 
 /// Asks the host to start Xray with `document`, which it does after checking the executable against the pin. The answer is the process id, and the connection is what keeps Xray alive.
-async fn start(socket: Option<&Path>, document: &str) -> anyhow::Result<(Link, u32, u32)> {
+async fn start(socket: Option<&Path>, document: &str, same_user: bool) -> anyhow::Result<(Link, u32, u32)> {
 	let socket = socket.ok_or_else(|| anyhow::anyhow!("the node has no socket to the xray host"))?;
 	#[cfg(unix)]
 	let connect = Link::connect(socket);
@@ -351,15 +380,20 @@ async fn start(socket: Option<&Path>, document: &str) -> anyhow::Result<(Link, u
 		while said.len() < 512 && link.read_exact(&mut byte).await.is_ok() && byte[0] != b'\n' {said.push(byte[0])}
 	}).await.map_err(|_| anyhow::anyhow!("the xray host did not answer in time"))?;
 	let said = String::from_utf8_lossy(&said).to_string();
-	// The host runs as the user Xray runs as, so whoever answered on this socket says which user the sockets of the outbounds must belong to.
+	let (pid, uid) = ready(&said, same_user)?;
+	Ok((link, pid, uid))
+}
+
+/// The process id and the user from the host's `ok <pid> <uid>`. The user is what the sockets of the outbounds must belong to, and it is the host's own word: the peer of this connection is whoever systemd made the socket for, which is root. Root, and the node's own user (Xray must be another one, or it has the node's files), are refused, unless `same_user` is set, which only tests do (they run as whatever user the test runs as, root in a container).
+fn ready(said: &str, same_user: bool) -> anyhow::Result<(u32, u32)> {
+	let Some((pid, uid)) = said.strip_prefix("ok ").and_then(|rest| rest.split_once(' ')).and_then(|(pid, uid)| Some((pid.parse().ok()?, uid.parse::<u32>().ok()?))) else {anyhow::bail!("{}", said.strip_prefix("error ").unwrap_or("the xray host closed the connection or answered in a way this node does not know"))};
 	#[cfg(unix)]
-	let uid = link.peer_cred()?.uid();
+	let own = unsafe {libc::geteuid()};
 	#[cfg(not(unix))]
-	let uid = 0;
-	match said.strip_prefix("ok ").and_then(|pid| pid.parse().ok()) {
-		Some(pid) => Ok((link, pid, uid)),
-		None => anyhow::bail!("{}", said.strip_prefix("error ").unwrap_or("the xray host closed the connection")),
-	}
+	let own = u32::MAX;
+	anyhow::ensure!(same_user || uid != 0, "the xray host says it runs as root");
+	anyhow::ensure!(same_user || uid != own, "the xray host runs as the node's own user: give it a user of its own");
+	Ok((pid, uid))
 }
 
 /// The connections of one user the hop holds, so that a user cannot hold more than a user may have flows.
@@ -710,6 +744,18 @@ mod tests {
 		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Unsupported, _))));
 	}
 
+	// The host's own word is the user, since the peer of the lease socket is root when systemd made the socket.
+	#[test]
+	fn the_user_xray_runs_as_is_what_the_host_says_and_never_root_or_the_node() {
+		let own = unsafe {libc::geteuid()};
+		assert_eq!(super::ready(&format!("ok 4242 {}", own + 1), false).unwrap(), (4242, own + 1));
+		assert!(super::ready("ok 4242 0", false).is_err(), "root");
+		assert!(super::ready(&format!("ok 4242 {own}"), false).is_err(), "the node's own user");
+		assert_eq!(super::ready(&format!("ok 4242 {own}"), true).unwrap().1, own);
+		for said in ["ok 4242", "ok x 5", "ok 4242 y", "", "error the add-on is not installed"] {assert!(super::ready(said, false).is_err(), "{said}")}
+		assert_eq!(super::ready("error the add-on is not installed", false).unwrap_err().to_string(), "the add-on is not installed");
+	}
+
 	// The node and the apps name one Xray: the release, the executable of this architecture and the archives of the installer.
 	#[test]
 	fn the_node_and_the_apps_pin_the_same_xray() {
@@ -799,10 +845,10 @@ mod tests {
 		let wire = wire(100);
 		let _client = xray(&path, &generate(&config, &HashMap::new(), 0, "", std::slice::from_ref(&wire)).to_string(), provider).await;
 		for _ in 0..100 {
-			if xray_out::held(&wire.path, uid) {break}
+			if xray_out::held(&wire.path, uid) == Ok(true) {break}
 			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
-		assert!(xray_out::held(&wire.path, uid), "Xray made no socket of its own");
+		assert_eq!(xray_out::held(&wire.path, uid), Ok(true), "Xray made no socket of its own");
 		assert!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&wire.path).unwrap().permissions()) & 0o777 == 0o660);
 		let hops = Hops::default();
 		hops.get("up").up(Reach {path: wire.path.clone(), uid, password: wire.password.clone()});
@@ -817,7 +863,7 @@ mod tests {
 		datagrams.write_all(&xray_trojan::head(&reach.password, 3, udp_at)).await.unwrap();
 		datagrams.write_all(&xray_trojan::packet(udp_at, b"datagram through xray")).await.unwrap();
 		let mut payload = Vec::new();
-		tokio::time::timeout(Duration::from_secs(5), xray_trojan::read_packet(&mut datagrams, &mut payload)).await.unwrap().unwrap();
+		tokio::time::timeout(Duration::from_secs(5), xray_trojan::Frames::default().next(&mut datagrams, &mut payload)).await.unwrap().unwrap();
 		assert_eq!(payload, b"datagram through xray");
 		let strange = Reach {uid: uid + 1, ..reach.clone()};
 		assert!(xray_trojan::open(&strange).await.is_err(), "a socket of another user was spoken to");

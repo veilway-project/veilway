@@ -32,32 +32,48 @@ pub(super) fn packet(dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
 	framed
 }
 
-/// Reads one framed datagram into `payload`, whatever address it names. An address type the node does not speak, or a frame without its CRLF, ends the stream with an error.
-pub(super) async fn read_packet<R: AsyncRead + Unpin>(from: &mut R, payload: &mut Vec<u8>) -> std::io::Result<()> {
-	let mut kind = [0u8; 1];
-	from.read_exact(&mut kind).await?;
-	let mut skip = [0u8; 258];
-	let address = match kind[0] {
-		1 => 4,
-		4 => 16,
-		3 => {
-			from.read_exact(&mut kind).await?;
-			usize::from(kind[0])
+/// What was read of a UDP stream and is not a whole frame yet. `next` can be dropped half way, as a branch of `select!` is, and loses nothing: bytes that were read stay here until a frame is whole.
+#[derive(Default)]
+pub(super) struct Frames(Vec<u8>);
+
+impl Frames {
+	/// The datagram of the first whole frame in `held`, and how many bytes the frame took. None while it is not whole, an error for an address type the node does not speak or a frame without its CRLF.
+	fn parse(held: &[u8]) -> std::io::Result<Option<(usize, std::ops::Range<usize>)>> {
+		let Some(&kind) = held.first() else {return Ok(None)};
+		let address = match kind {
+			1 => 4,
+			4 => 16,
+			3 => match held.get(1) {
+				Some(&length) => 1 + usize::from(length),
+				None => return Ok(None),
+			},
+			_ => return Err(std::io::Error::other("an address type the node does not speak")),
+		};
+		let head = 1 + address + 2;
+		let Some(frame) = held.get(head..head + 4) else {return Ok(None)};
+		if frame[2..] != [13, 10] {return Err(std::io::Error::other("a frame without its CRLF"))}
+		let end = head + 4 + usize::from(u16::from_be_bytes([frame[0], frame[1]]));
+		Ok((held.len() >= end).then_some((end, head + 4..end)))
+	}
+
+	/// Reads until one datagram is whole and puts it in `payload`.
+	pub(super) async fn next<R: AsyncRead + Unpin>(&mut self, from: &mut R, payload: &mut Vec<u8>) -> std::io::Result<()> {
+		loop {
+			if let Some((end, range)) = Self::parse(&self.0)? {
+				payload.clear();
+				payload.extend_from_slice(&self.0[range]);
+				self.0.drain(..end);
+				return Ok(());
+			}
+			if from.read_buf(&mut self.0).await? == 0 {return Err(std::io::ErrorKind::UnexpectedEof.into())}
 		}
-		_ => return Err(std::io::Error::other("an address type the node does not speak")),
-	};
-	from.read_exact(&mut skip[..address + 2]).await?;
-	let mut length = [0u8; 4];
-	from.read_exact(&mut length).await?;
-	if length[2..] != [13, 10] {return Err(std::io::Error::other("a frame without its CRLF"))}
-	payload.resize(usize::from(u16::from_be_bytes([length[0], length[1]])), 0);
-	from.read_exact(payload).await?;
-	Ok(())
+	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use tokio::io::AsyncWriteExt;
 
 	#[test]
 	fn a_request_is_the_hash_of_the_password_a_command_and_an_address() {
@@ -67,15 +83,25 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_datagram_goes_in_a_frame_and_comes_out_of_one() {
+	async fn a_datagram_goes_in_a_frame_and_comes_out_of_one_however_the_stream_is_cut() {
 		for dst in ["192.0.2.1:53", "[2001:db8::1]:53"] {
-			let framed = packet(dst.parse().unwrap(), b"hello");
+			let framed = [packet(dst.parse().unwrap(), b"hello"), packet(dst.parse().unwrap(), b"again")].concat();
+			let mut frames = Frames::default();
 			let mut payload = Vec::new();
-			read_packet(&mut &framed[..], &mut payload).await.unwrap();
-			assert_eq!(payload, b"hello");
+			for cut in [1, 3, 7, 12] {
+				let (mut reader, mut writer) = tokio::io::duplex(64);
+				writer.write_all(&framed[..cut]).await.unwrap();
+				// A read that is dropped half way, as `select!` does, loses nothing.
+				assert!(tokio::time::timeout(std::time::Duration::from_millis(20), frames.next(&mut reader, &mut payload)).await.is_err());
+				writer.write_all(&framed[cut..]).await.unwrap();
+				frames.next(&mut reader, &mut payload).await.unwrap();
+				assert_eq!(payload, b"hello");
+				frames.next(&mut reader, &mut payload).await.unwrap();
+				assert_eq!(payload, b"again");
+			}
 		}
 		let mut payload = Vec::new();
-		assert!(read_packet(&mut &[9u8, 0, 0][..], &mut payload).await.is_err());
-		assert!(read_packet(&mut &[1u8, 1, 1, 1, 1, 0, 53, 0, 5, 0, 0, 1, 2, 3, 4, 5][..], &mut payload).await.is_err());
+		assert!(Frames::default().next(&mut &[9u8, 0, 0][..], &mut payload).await.is_err());
+		assert!(Frames::default().next(&mut &[1u8, 1, 1, 1, 1, 0, 53, 0, 5, 0, 0, 1, 2, 3, 4, 5][..], &mut payload).await.is_err());
 	}
 }

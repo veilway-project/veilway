@@ -346,7 +346,7 @@ impl Config {
 					if link.is_some() {r.error(format!("{at}.link"), "expected no link: it is read when the document is read, and the outbound is kept as the fields it gave")}
 					if let Host::Ip(ip) = &server.host {
 						if gate::refused(*ip, &pools) {r.error(format!("{at}.server"), "expected an address the node may dial: not loopback, link-local, unspecified, multicast, a cloud metadata address or an address of an inbound's pool")}
-						else if *allow_private != Some(true) && payload::private(*ip) {r.error(format!("{at}.server"), "expected a public address: this one is private, shared (CGNAT) or unique local, and `allow_private` is off")}
+						else if *allow_private != Some(true) && (payload::private(*ip) || matches!(ip, IpAddr::V6(v6) if gate::embedded(*v6).into_iter().flatten().any(|v4| payload::private(IpAddr::V4(v4))))) {r.error(format!("{at}.server"), "expected a public address: this one is private, shared (CGNAT) or unique local, and `allow_private` is off")}
 					}
 					let (uses_id, keyed) = (matches!(protocol, XrayOutboundProtocol::Vless | XrayOutboundProtocol::Vmess), [("id", id), ("password", password)]);
 					for (key, value) in keyed {
@@ -402,7 +402,7 @@ impl Config {
 						}
 						Some(XraySecurity::Off {}) | None => {}
 					}
-					if matches!(server.host, Host::Name(_)) {r.warning(format!("{at}.server"), "a name, which the node looks up at start, at every reload and every quarter hour: every address it gives must pass the dial rules, or the outbound is down until one does")}
+					if matches!(server.host, Host::Name(_)) {r.warning(format!("{at}.server"), "a name, which the node looks up itself in clear UDP through dns.servers, at start, at every reload and every quarter hour, so whoever sees that traffic learns the provider's name: write the address when the name must stay hidden. Every address it gives must pass the dial rules, or the outbound is down until one does")}
 				}
 				_ => {}
 			}

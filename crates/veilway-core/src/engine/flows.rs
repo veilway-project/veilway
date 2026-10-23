@@ -331,7 +331,17 @@ fn keep(shared: &Arc<Shared>, state: &Arc<ExitState>) {
 			let plan = shared.plan();
 			let Some(exit) = plan.exits.iter().position(|exit| Arc::ptr_eq(&exit.state, &held)).filter(|_| !held.working()) else {return};
 			let Backend::Netstack {outbound: Outbound::Socks5(up), ..} = &plan.exits[exit].backend else {return};
-			let reached = reach(up).await;
+			// An Xray outbound is probed at its socket. While its hop is down the exit is not working whatever this says (`Plan::working`), and the hop going up is what ends that.
+			let reached = match &up.hop {
+				#[cfg(unix)]
+				Some(hop) => match hop.reach() {
+					Ok(reach) => super::xray_trojan::open(&reach).await.map(drop).map_err(|e| format!("the xray socket: {}", e.kind())),
+					Err(_) => continue,
+				},
+				#[cfg(not(unix))]
+				Some(_) => continue,
+				None => reach(up).await,
+			};
 			heard(&shared, &plan, exit, reached);
 		}
 	});
@@ -431,8 +441,8 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 							tokio::io::copy_bidirectional(&mut stream, &mut remote).await
 						}
 						Err(failure) => {
-							// A destination that does not connect says nothing against the proxy, which let the node in to ask.
-							heard(&shared, &plan, carrier, if matches!(failure.stop, Stop::Target) {Ok(())} else {Err(failure.describe())});
+							// A destination that does not connect says nothing against the proxy, which let the node in to ask. A hop that is down says nothing either: it is the hop that makes the exit not work, and it is the hop that ends that.
+							if up.hop.as_ref().is_none_or(|hop| hop.reason().is_none()) {heard(&shared, &plan, carrier, if matches!(failure.stop, Stop::Target) {Ok(())} else {Err(failure.describe())})}
 							return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {}", plan.show(target), failure.error);
 						}
 					},
@@ -582,7 +592,7 @@ async fn udp_relay<S: Datagrams>(shared: &Shared, exit: usize, tag: &str, mut st
 			};
 			if pin.is_some_and(|(key, id)| !shared.flows.pin(key, id, plan.generation)) {return None}
 			let (cap, traffic, overhead) = (usize::from(mtu).saturating_sub(UDP_OVERHEAD), &plan.exits[exit].traffic, if dst.is_ipv4() {UDP_OVERHEAD} else {UDP_OVERHEAD_V6});
-			let (mut from_peer, mut from_remote) = (vec![0u8; MAX_DATAGRAM], Vec::new());
+			let (mut from_peer, mut from_remote, mut frames) = (vec![0u8; MAX_DATAGRAM], Vec::new(), super::xray_trojan::Frames::default());
 			let (mut reader, mut writer) = remote.split();
 			loop {
 				tokio::select! {
@@ -591,7 +601,7 @@ async fn udp_relay<S: Datagrams>(shared: &Shared, exit: usize, tag: &str, mut st
 						if n == 0 || writer.write_all(&super::xray_trojan::packet(dst, &from_peer[..n])).await.is_err() {return None}
 						traffic.up(n + overhead);
 					}
-					r = super::xray_trojan::read_packet(&mut reader, &mut from_remote) => {
+					r = frames.next(&mut reader, &mut from_remote) => {
 						if r.is_err() {return None}
 						if from_remote.len() > cap {
 							tracing::debug!("exit {tag}: udp from {}: dropping a {} byte reply, over the {cap} byte mtu", plan.show(dst), from_remote.len());

@@ -390,7 +390,7 @@ fn plain(text: &str, most: usize) -> String {
 pub fn forbidden(address: IpAddr, pools: &[(IpNet, usize)], is_local: fn(IpAddr) -> bool, allow_private: bool) -> Option<&'static str> {
 	if gate::refused(address, pools) {Some("loopback, link-local, multicast, unspecified, IPv4-mapped or inside an inbound pool of the node")}
 	else if is_local(address) {Some("an address of the node itself")}
-	else if !allow_private && payload::private(address) {Some("a private address, and `allow_private` is off")}
+	else if !allow_private && (payload::private(address) || matches!(address, IpAddr::V6(v6) if gate::embedded(v6).into_iter().flatten().any(|v4| payload::private(IpAddr::V4(v4))))) {Some("a private address, or one that carries a private IPv4 address, and `allow_private` is off")}
 	else {None}
 }
 

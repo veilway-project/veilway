@@ -844,6 +844,16 @@ fn egress_never_dials_directly(){
 			for line in text.lines().filter(|l| l.contains("TcpSocket::new")|| l.contains(".connect(target)")){
 				assert!(path.ends_with("engine/flows.rs"), "{} dials {} outside the direct outbound", path.display(), line.trim());
 			}
+			// The node's other ways out are as few as the direct and the proxy dials. A datagram socket is bound by the direct outbound and UDP flows of exits (`flows`), the relays of the hop and the proxy inbounds (`xray_udp`), the node's own address probe (`gate`), the listeners and the replay of the hosts (`host`, `link`), and `xray_owner`. Of the calls that reach out of the node on their own, the provider's name is asked of `dns.servers` in clear UDP in `xray_out` and nowhere else (threat model 5.17), and a Unix socket is dialed to the add-on's host (`xray`) and to the Trojan inbound of an Xray outbound (`xray_trojan`) and to nothing else.
+			for line in text.lines().filter(|l| l.contains("ask_udp(")&& !l.contains("fn ask_udp")){
+				assert!(path.ends_with("engine/flows.rs")|| path.ends_with("engine/xray_out.rs"), "{} asks over UDP in {}", path.display(), line.trim());
+			}
+			for line in text.lines().filter(|l| l.contains("UnixStream::connect")){
+				assert!(path.ends_with("engine/xray.rs")|| path.ends_with("engine/xray_trojan.rs"), "{} dials a Unix socket in {}", path.display(), line.trim());
+			}
+			for line in text.lines().filter(|l| l.contains("UdpSocket::bind")){
+				assert!(["engine/flows.rs", "engine/xray_udp.rs", "engine/gate.rs", "engine/host.rs", "engine/link.rs", "engine/xray_owner.rs"].iter().any(|file| path.ends_with(file)), "{} binds a datagram socket in {}", path.display(), line.trim());
+			}
 			// Where that dial goes is made in one place, from the config's `decoy.origin`. The only other line that names it is the one that takes it apart to dial.
 			for line in text.lines().filter(|l| l.contains("Origin::Tcp(")&& !l.trim_start().starts_with("Origin::Tcp(to)=>")&& !l.trim_start().starts_with("Origin::Tcp(to) =>")){
 				assert!(path.ends_with("engine/host.rs")&& line.contains("stream::Origin::Tcp(*origin)"), "{} makes a decoy origin in {}", path.display(), line.trim());

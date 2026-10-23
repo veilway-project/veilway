@@ -42,8 +42,12 @@ async fn host(path: PathBuf) -> Arc<Host> {
 				state.documents.lock().unwrap().push(document.clone());
 				if state.mode.load(Ordering::SeqCst) == MISSING {return drop(node.write_all(b"error the add-on is not installed (test): run `scripts/veilway.sh addon xray install`\n").await)}
 				// What Xray does with each inbound that listens on a socket: makes it.
-				let sockets: Vec<UnixListener> = document["inbounds"].as_array().unwrap().iter().filter_map(|inbound| inbound["listen"].as_str()?.split(',').next().map(|path| UnixListener::bind(path).unwrap())).collect();
-				node.write_all(b"ok 4242\n").await.unwrap();
+				let sockets: Vec<UnixListener> = document["inbounds"].as_array().unwrap().iter().filter_map(|inbound| inbound["listen"].as_str()?.split(',').next().map(|path| {
+					let listener = UnixListener::bind(path).unwrap();
+					std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o660)).unwrap();
+					listener
+				})).collect();
+				node.write_all(format!("ok 4242 {}\n", unsafe {libc::geteuid()}).as_bytes()).await.unwrap();
 				state.held.fetch_add(1, Ordering::SeqCst);
 				let mut sink = [0u8; 16];
 				while node.read(&mut sink).await.is_ok_and(|n| n > 0) {}
@@ -111,7 +115,7 @@ async fn the_add_on_missing_takes_the_outbound_down_with_a_reason_and_nothing_go
 	let config = Config::parse(doc.to_string().as_bytes()).unwrap();
 	let report = config.validate(false);
 	assert!(report.errors.is_empty(), "{:#?}", report.errors);
-	let engine: Engine = veilway_core::start(&config, Options {is_local: |_| false, xray_socket: Some(socket), xray_dir: Some(out.clone()), ..Options::new("")}).await.unwrap();
+	let engine: Engine = veilway_core::start(&config, Options {is_local: |_| false, xray_socket: Some(socket), xray_dir: Some(out.clone()), xray_same_user: true, ..Options::new("")}).await.unwrap();
 	eventually("the outbound was not told that the add-on is missing", || engine.xray_outbound_down("up").is_some_and(|why| why.contains("not installed"))).await;
 	assert_ne!(connect(socks, target).await, 0, "a flow of an exit whose Xray outbound is down was carried");
 	tokio::time::sleep(Duration::from_millis(300)).await;

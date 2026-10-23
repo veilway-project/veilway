@@ -539,13 +539,10 @@ UMask=0077
 EOF
 }
 
-# The node is let into the group of Xray's user, and so into the folder of the Xray outbounds' sockets. A drop-in of its own unit holds it, so that upgrading the node's unit does not lose it and removing the add-on takes it away.
+# The node is let into the group of Xray's user, and so into the folder of the Xray outbounds' sockets. It is a member of the group in the system's own files, and not a setting of the node's unit, so that `veilway doctor` run as that user sees what the node sees. The node takes the group when it starts.
 xray_node_group() {
-	act mkdir -p "$UNIT_DIR/veilway.service.d"
-	write_unit "$UNIT_DIR/veilway.service.d/xray.conf" <<EOF
-[Service]
-SupplementaryGroups=veilway-xray
-EOF
+	getent group veilway-xray >/dev/null 2>&1 || { if has groupadd; then act groupadd --system veilway-xray; else act addgroup -S veilway-xray; fi; }
+	if has usermod; then act usermod -aG veilway-xray veilway; else act addgroup veilway veilway-xray; fi
 }
 
 panel_unit() {
@@ -994,7 +991,7 @@ do_update() {
 			fetch_and_install node
 			prepare_node_dir
 			node_unit
-			[ -f "$UNIT_DIR/veilway-xray.service" ] && xray_units
+			if [ -f "$UNIT_DIR/veilway-xray.service" ]; then xray_units; xray_node_group; fi
 			daemon_reload
 			[ -f "$UNIT_DIR/veilway-mirror.service" ] && svc restart veilway-mirror.service
 			svc restart veilway.service
@@ -1227,7 +1224,7 @@ do_uninstall() {
 		[ -e "$UNIT_DIR/$u" ] || continue
 		svc stop "$u" || true; svc disable "$u" 2>/dev/null || true
 	done
-	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway.service.d/xray.conf" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
+	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR, $PANEL_DIR and $MIRROR_DIR? The backup above keeps a copy."; then
@@ -1331,13 +1328,16 @@ do_addon() {
 			daemon_reload
 			svc enable veilway-xray.socket
 			svc restart veilway-xray.socket
+			# The node joins the group of Xray's user when it starts, so a node that runs is started again for it.
+			[ -f "$UNIT_DIR/veilway.service" ] && svc restart veilway.service
 			info "the node starts it when its config has an xray inbound; create one in the panel"
 			;;
 		remove)
 			need_root
 			svc stop veilway-xray.socket || true; svc stop veilway-xray.service || true
 			svc disable veilway-xray.socket || true
-			act rm -f "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway.service.d/xray.conf"
+			act rm -f "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service"
+			if has gpasswd; then act gpasswd -d veilway veilway-xray >/dev/null 2>&1 || true; else act deluser veilway veilway-xray >/dev/null 2>&1 || true; fi
 			act rm -rf "$ADDON_DIR/xray"
 			daemon_reload
 			has_systemd && systemctl is-active --quiet veilway.service && svc restart veilway.service || true

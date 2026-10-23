@@ -14,7 +14,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 /// How long one server of `dns.servers` is given to answer a lookup of a provider's name.
@@ -76,22 +76,28 @@ pub(super) fn start_name() -> std::io::Result<String> {
 	Ok(raw.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// What the lookups have found, by the tag of the outbound with its server: an address to dial, or why there is none. An address stays until the lookup stops giving it, so a resolver that flaps costs no restart of Xray.
+/// What the lookups have found, by the tag of the outbound with its server: an address to dial, or why there is none, and since when. An address stays until the lookup stops giving it, so a resolver that flaps costs no restart of Xray.
 #[derive(Default)]
-pub(super) struct Names {found: Mutex<HashMap<String, (config::HostPort, Result<IpAddr, String>)>>, pub changed: Notify}
+pub(super) struct Names {found: Mutex<HashMap<String, (config::HostPort, Result<IpAddr, String>, Instant)>>, pub changed: Notify}
 
 impl Names {
-	pub(super) fn get(&self, tag: &str, server: &config::HostPort) -> Option<Result<IpAddr, String>> {self.found.lock().unwrap_or_else(|e| e.into_inner()).get(tag).filter(|(was, _)| was == server).map(|(_, found)| found.clone())}
+	pub(super) fn get(&self, tag: &str, server: &config::HostPort) -> Option<Result<IpAddr, String>> {self.held(tag, server).map(|(found, _)| found)}
+
+	fn held(&self, tag: &str, server: &config::HostPort) -> Option<(Result<IpAddr, String>, Instant)> {self.found.lock().unwrap_or_else(|e| e.into_inner()).get(tag).filter(|(was, ..)| was == server).map(|(_, found, since)| (found.clone(), *since))}
 }
 
-/// Whether `path` is a socket that `uid` owns, which is how an outbound's socket shows that Xray made it.
+/// Whether `path` is a socket that `uid` owns and that has the mode Xray gives it once it is ready (660, which it sets after it binds), which is how an outbound's socket shows that Xray made it. The error is why the folder could not be looked at: a permission one says the node is not in Xray's group.
 #[cfg(unix)]
-pub(super) fn held(path: &Path, uid: u32) -> bool {
-	std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_socket() && meta.uid() == uid)
+pub(super) fn held(path: &Path, uid: u32) -> Result<bool, std::io::ErrorKind> {
+	match std::fs::symlink_metadata(path) {
+		Ok(meta) => Ok(meta.file_type().is_socket() && meta.uid() == uid && meta.mode() & 0o777 == 0o660),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+		Err(e) => Err(e.kind()),
+	}
 }
 
 #[cfg(not(unix))]
-pub(super) fn held(_: &Path, _: u32) -> bool {false}
+pub(super) fn held(_: &Path, _: u32) -> Result<bool, std::io::ErrorKind> {Ok(false)}
 
 /// A DNS question of `qtype` for `name`, the way the node asks its own servers.
 fn question(name: &str, qtype: u16, id: u16) -> Vec<u8> {
@@ -104,14 +110,20 @@ fn question(name: &str, qtype: u16, id: u16) -> Vec<u8> {
 	message
 }
 
-/// The addresses of `name`, from the first server of `dns.servers` that answers, which the node asks itself over UDP and not through the host's resolver. None when none answered.
+/// The addresses of `name`, from the first server of `dns.servers` that answers it with some, which the node asks itself over UDP and not through the host's resolver. Each query has an id of its own from the system generator, and an answer counts only for the question that was asked (the name and the type) and only with addresses of the type asked for. None when no server did.
 async fn lookup(name: &str, servers: &[std::net::SocketAddr]) -> Option<Vec<IpAddr>> {
-	let id = u16::from_be_bytes([std::process::id() as u8, name.len() as u8]);
 	for server in servers {
-		let (v4, v6) = (question(name, 1, id), question(name, 28, id));
-		let (a, aaaa) = tokio::join!(tokio::time::timeout(ASK, flows::ask_udp(None, None, *server, &v4)), tokio::time::timeout(ASK, flows::ask_udp(None, None, *server, &v6)));
-		let answered: Vec<dns::Response> = [a, aaaa].into_iter().filter_map(|answer| answer.ok()?.ok()).filter_map(|answer| dns::response(&answer)).filter(|response| response.rcode == 0 && !response.truncated).collect();
-		if !answered.is_empty() {return Some(answered.iter().flat_map(|response| response.addresses.iter().map(|(address, _)| *address)).collect())}
+		let mut ids = [0u8; 4];
+		SystemRandom::new().fill(&mut ids).ok()?;
+		let asked = [(1u16, question(name, 1, u16::from_be_bytes([ids[0], ids[1]]))), (28, question(name, 28, u16::from_be_bytes([ids[2], ids[3]])))];
+		let (a, aaaa) = tokio::join!(tokio::time::timeout(ASK, flows::ask_udp(None, None, *server, &asked[0].1)), tokio::time::timeout(ASK, flows::ask_udp(None, None, *server, &asked[1].1)));
+		let mut found = Vec::new();
+		for ((qtype, _), answer) in asked.iter().zip([a, aaaa]) {
+			let Some(response) = answer.ok().and_then(|answer| answer.ok()).and_then(|answer| dns::response(&answer)) else {continue};
+			if response.rcode != 0 || response.truncated || !response.question.as_ref().is_some_and(|question| question.qtype == *qtype && question.name.as_deref().is_some_and(|asked| asked.eq_ignore_ascii_case(name))) {continue}
+			found.extend(response.addresses.iter().map(|(address, _)| *address).filter(|address| address.is_ipv4() == (*qtype == 1)));
+		}
+		if !found.is_empty() {return Some(found)}
 	}
 	None
 }
@@ -124,27 +136,37 @@ pub(super) async fn watch(shared: Arc<Shared>, store: Arc<Store>, names: Arc<Nam
 		let config = changes.borrow_and_update().config.clone();
 		let pools: Vec<(IpNet, usize)> = config.inbounds.iter().enumerate().flat_map(|(at, inbound)| inbound.address.iter().map(move |net| (net.0, at))).collect();
 		let servers: Vec<std::net::SocketAddr> = config.dns.servers.iter().map(|server| server.0).collect();
-		let (mut next, mut moved) = (HashMap::new(), false);
+		let (mut next, mut moved, mut deferred) = (HashMap::new(), false, false);
 		for outbound in &config.outbounds {
 			let config::Outbound::Xray {tag, server, allow_private, ..} = outbound else {continue};
-			let (allow, was) = (*allow_private == Some(true), names.get(tag, server));
+			let (allow, was) = (*allow_private == Some(true), names.held(tag, server));
 			let found: Option<Vec<IpAddr>> = match &server.host {
 				Host::Ip(ip) => Some(vec![*ip]),
 				Host::Name(name) => lookup(name, &servers).await,
 			};
-			let now = match (found, was) {
-				(Some(found), was) => {
+			let (current, since) = (was.as_ref().and_then(|(was, _)| was.as_ref().ok().copied()), was.as_ref().map(|(_, since)| *since));
+			let current = current.filter(|ip| upstream::forbidden(*ip, &pools, shared.is_local, allow).is_none());
+			// An address in use is given up only for another that is allowed, and not more often than every `RETRY`; an answer with nothing allowed in it, like one that did not come, changes nothing.
+			let now = match (found, current) {
+				(Some(found), current) => {
 					let allowed: Vec<IpAddr> = found.into_iter().filter(|ip| upstream::forbidden(*ip, &pools, shared.is_local, allow).is_none()).collect();
-					match was {
-						Some(Ok(current)) if allowed.contains(&current) => Ok(current),
-						_ => allowed.first().copied().ok_or_else(|| "the server gives no address the node may dial: loopback, link-local, one of the node's own or an inbound's, or private while `allow_private` is off".to_string()),
+					match (allowed.first().copied(), current) {
+						(None, Some(current)) => Ok(current),
+						(Some(_), Some(current)) if allowed.contains(&current) => Ok(current),
+						(Some(_), Some(current)) if since.is_some_and(|since| since.elapsed() < RETRY) => {
+							deferred = true;
+							Ok(current)
+						}
+						(Some(first), _) => Ok(first),
+						(None, None) => Err("the server gives no address the node may dial: loopback, link-local, one of the node's own or an inbound's, or private while `allow_private` is off".to_string()),
 					}
 				}
-				(None, Some(Ok(current))) => Ok(current),
-				(None, _) => Err("the name of the server does not resolve".to_string()),
+				(None, Some(current)) => Ok(current),
+				(None, None) => Err("the name of the server does not resolve".to_string()),
 			};
-			if names.get(tag, server) != Some(now.clone()) {moved = true}
-			next.insert(tag.clone(), (server.clone(), now));
+			let kept = was.filter(|(was, _)| *was == now).map(|(_, since)| since);
+			if kept.is_none() {moved = true}
+			next.insert(tag.clone(), (server.clone(), now, kept.unwrap_or_else(Instant::now)));
 		}
 		{
 			let mut held = names.found.lock().unwrap_or_else(|e| e.into_inner());
@@ -152,7 +174,7 @@ pub(super) async fn watch(shared: Arc<Shared>, store: Arc<Store>, names: Arc<Nam
 			*held = next.clone();
 		}
 		if moved {names.changed.notify_one()}
-		let wait = if next.values().any(|(_, found)| found.is_err()) {RETRY} else {RECHECK};
+		let wait = if deferred || next.values().any(|(_, found, _)| found.is_err()) {RETRY} else {RECHECK};
 		tokio::select! {
 			_ = tokio::time::sleep(wait) => {}
 			r = changes.changed() => if r.is_err() {return},

@@ -120,6 +120,8 @@ fn an_exit_through_an_xray_outbound_has_no_way_around_it_and_a_fallback_is_said(
 fn a_private_server_needs_allow_private_and_a_query_and_a_short_password_are_refused() {
 	refused("outbounds[2].server", |o| o["server"] = json!("192.168.1.5:443"));
 	refused("outbounds[2].server", |o| o["server"] = json!("100.64.0.1:443"));
+	refused("outbounds[2].server", |o| o["server"] = json!("[64:ff9b::a00:1]:443"));
+	refused("outbounds[2].server", |o| o["server"] = json!("[2002:c0a8:101::1]:443"));
 	clean(json!({"type": "xray", "tag": "up", "protocol": "vless", "server": "192.168.1.5:443", "allow_private": true, "id": ID, "security": {"type": "tls", "server_name": "front.example"}}));
 	refused("outbounds[2].server", |o| {o["server"] = json!("127.0.0.1:443"); o["allow_private"] = json!(true)});
 	refused("outbounds[2].transport.path", |o| o["transport"] = json!({"type": "ws", "path": "/w?ed=2048"}));

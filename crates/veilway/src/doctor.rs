@@ -17,6 +17,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use veilway_core::config::{self, Backend, Certificate, Http2, Policy, Transport};
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
@@ -87,7 +89,7 @@ async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duratio
 async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Duration) -> Vec<Line> {
 	let tag = match outbound {
 		config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => tag,
-		config::Outbound::Xray {tag, ..} => return vec![line(Status::Skipped, "outbound", tag, "carried by the Xray add-on, through a loopback inbound of Xray that exists only while the node runs, so nothing is tried from here: the xray line says whether the add-on is installed and pinned")],
+		config::Outbound::Xray {tag, ..} => return vec![line(Status::Skipped, "outbound", tag, "carried by the Xray add-on, through a Unix socket of Xray that exists only while the node runs, so nothing is tried from here: the xray line says whether the add-on is installed and pinned")],
 	};
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
 	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), &Hops::default(), tag) else {return Vec::new()};
@@ -338,9 +340,18 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 				lines.push(match std::fs::metadata(&xray_dir) {
 					Err(e) => line(Status::Warn, "xray", shown, format!("the folder for the sockets of Xray outbounds is not there ({}): the Xray unit makes it when it runs, and the node's user must be in the group of Xray's user to enter it. `scripts/veilway.sh addon xray install` sets both up", e.kind())),
 					Ok(meta) if !meta.is_dir() => line(Status::Fail, "xray", shown, "it is not a folder"),
-					Ok(meta) if std::os::unix::fs::MetadataExt::mode(&meta) & 0o007 != 0 => line(Status::Fail, "xray", shown, "other users can enter it: only the node's user and Xray's may, since a socket that is made there carries the provider's traffic"),
-					Ok(_) if std::fs::read_dir(&xray_dir).is_err() => line(Status::Fail, "xray", shown, "this user cannot enter it: the node's user must be in the group of Xray's user (`veilway-xray`)"),
-					Ok(_) => line(Status::Ok, "xray", shown, "the folder for the sockets of Xray outbounds is there and only its two users can enter it"),
+					Ok(meta) => {
+						let (mode, owner, group) = (meta.mode() & 0o777, meta.uid(), meta.gid());
+						// What this user belongs to is what the node it runs as belongs to, which is why the installer puts the node's user in the group in the system's files.
+						let (euid, mut groups) = (unsafe {libc::geteuid()}, vec![0 as libc::gid_t; 256]);
+						let counted = unsafe {libc::getgroups(groups.len() as i32, groups.as_mut_ptr())};
+						groups.truncate(counted.max(0) as usize);
+						if mode & 0o027 != 0 {line(Status::Fail, "xray", shown, format!("its mode is {mode:o}: only the owner and the group may enter it and only the owner may write to it (750), since a socket that is made there carries the provider's traffic"))}
+						else if owner == 0 {line(Status::Fail, "xray", shown, "it belongs to root: Xray's user makes it, and the node checks that the sockets in it are that user's")}
+						else if euid == 0 {line(Status::Warn, "xray", shown, "the folder looks right, but root enters any folder: run doctor as the node's user (`sudo -u veilway`) to see whether that user may")}
+						else if unsafe {libc::getegid()} != group && !groups.contains(&group) {line(Status::Fail, "xray", shown, format!("this user is not in the group of the folder (gid {group}): put the node's user in the group veilway-xray (`scripts/veilway.sh addon xray install` does) and start the node again"))}
+						else {line(Status::Ok, "xray", shown, "the folder for the sockets of Xray outbounds is there, belongs to Xray's user, and this user is in its group")}
+					}
 				});
 			}
 		}

@@ -1,6 +1,6 @@
 //! The host of the Xray add-on: a small process that runs as a user of its own, which the node asks over a unix socket to start Xray. It is what lets Xray run without anything of the node's: its user, its files, its capabilities and its control socket.
 //! The node connects and sends one document (a 4 byte length and the bytes). The host opens the executable in the add-on folder, which must belong to root and be writable by nobody else, takes its SHA-256 from the very file it then executes, and refuses anything but the pinned release. It starts Xray with the document on its standard input, no environment, no capability but the one to bind a port below 1024 when the document has one, and a kill signal for when this process ends.
-//! It answers `ok <pid>` or `error <reason>` on one line. The connection is Xray's lease: when the node closes it, or ends, Xray is killed and awaited. When Xray ends first the host says `ended <status>` and closes.
+//! It answers `ok <pid> <uid>` (the user it and Xray run as) or `error <reason>` on one line. The connection is Xray's lease: when the node closes it, or ends, Xray is killed and awaited. When Xray ends first the host says `ended <status>` and closes.
 use super::xray::{PIN, RELEASE};
 use ring::digest::{Context, SHA256};
 use serde_json::Value;
@@ -119,7 +119,8 @@ async fn lease(mut node: UnixStream, addons: PathBuf) -> anyhow::Result<()> {
 	if let Some(out) = child.stderr.take() {tokio::spawn(relay(out));}
 	let pid = child.id().unwrap_or(0);
 	tracing::info!("xray {RELEASE}: started (pid {pid})");
-	node.write_all(format!("ok {pid}\n").as_bytes()).await?;
+	// Its own user is part of the answer: the node cannot read it off this connection, whose peer is the one that systemd made the socket for.
+	node.write_all(format!("ok {pid} {}\n", unsafe {libc::geteuid()}).as_bytes()).await?;
 	let mut sink = [0u8; 256];
 	loop {
 		tokio::select! {
