@@ -22,6 +22,7 @@ ignore = [
 	{ id = "RUSTSEC-2025-0081", reason = "unic-char-property: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
 	{ id = "RUSTSEC-2025-0098", reason = "unic-ucd-version: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
 	{ id = "RUSTSEC-2025-0100", reason = "unic-ucd-ident: same tauri-utils -> urlpattern chain as RUSTSEC-2025-0075." },
+	{ id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5: secret-dependent branches in subtraction and division. Reached only through p256 in veilway-proto faketls::leaf_key, the throwaway leaf of the alpha faketls transport, derived from a seed the authenticated client chose for that connection and already knows. The fix is crypto-bigint 0.7, which needs p256 0.14 (not released). Remove on that upgrade." },
 ]
 
 [licenses]
