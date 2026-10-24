@@ -189,7 +189,7 @@ impl Core {
 					_ => {}
 				},
 				_ = &mut sleep => {
-					self.counters.ticks += 1;
+					self.woke.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 					self.tick(&mut c, &carrier);
 					let now = Instant::now();
 					sleep.as_mut().reset(now + self.pace(&c, now));

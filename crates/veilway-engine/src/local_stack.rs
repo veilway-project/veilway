@@ -26,7 +26,7 @@ const CONNECT: Duration = Duration::from_secs(10);
 /// A connection with no byte either way for this long is closed.
 const IDLE: Duration = Duration::from_secs(3600);
 /// How often the task looks at its deadlines when nothing else wakes it.
-const TICK: Duration = Duration::from_secs(1);
+const TICK: Duration = Duration::from_secs(5);
 /// What each side of a connection buffers: in the socket, and in the pipe to the proxy task.
 const SOCKET: usize = 65536;
 const PIPE: usize = 32768;

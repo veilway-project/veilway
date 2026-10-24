@@ -190,6 +190,7 @@ pub struct Tunnel {
 	into: mpsc::Sender<Vec<u8>>,
 	out: mpsc::Receiver<Vec<u8>>,
 	refused: Arc<AtomicU64>,
+	woke: Arc<AtomicU64>,
 	task: JoinHandle<()>,
 	device: Vec<IpAddr>,
 	gateways: Vec<IpAddr>,
@@ -227,15 +228,17 @@ impl Tunnel {
 		// The user's saved choice for this subscription goes in first, so the node is asked for it once the control channel opens.
 		if let Some(tag) = settings.store.exit_choice(held.id().as_str()) {let _ = commands.send(Command::Exit(Some(tag)));}
 		*settings.handle.0.lock().unwrap() = Some(commands.clone());
-		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
+		let ((into, from), (to, out), (events, _), refused, woke) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
 		let (status_tx, status) = watch::channel(Status::off(profile.name.as_str().to_owned(), profile.mtu));
 		let (device, gateways) = (profile.device.addresses.clone(), profile.gateways.clone());
-		let core = engine::Core::new(engine::Parts {settings, profile: profile.clone(), subscription: Arc::new(subscription.clone()), link, key, store_key, kept, commands: input, from_platform: from, to_platform: to, status: status_tx, events: events.clone(), refused: refused.clone(), private: agree.private});
-		Ok(Self {commands, status, events, into, out, refused, task: tokio::spawn(core.run()), device, gateways})
+		let core = engine::Core::new(engine::Parts {settings, profile: profile.clone(), subscription: Arc::new(subscription.clone()), link, key, store_key, kept, commands: input, from_platform: from, to_platform: to, status: status_tx, events: events.clone(), refused: refused.clone(), woke: woke.clone(), private: agree.private});
+		Ok(Self {commands, status, events, into, out, refused, woke, task: tokio::spawn(core.run()), device, gateways})
 	}
 	/// The device's addresses inside the tunnel and the gateways, one per family in the same order, as the signed profile gives them. The gateway answers DNS.
 	pub fn addresses(&self) -> (&[IpAddr], &[IpAddr]) {(&self.device, &self.gateways)}
 	/// The state of the tunnel and everything an app shows of it.
+	/// Wakeups of the timer loops so far, as they happen: the status carries the count only when something else changed.
+	pub fn ticks(&self) -> u64 {self.woke.load(Ordering::Relaxed)}
 	pub fn status(&self) -> Status {self.status.borrow().clone()}
 	/// The status as something to wait on: it changes at every state change and about once a second while the counters move.
 	pub fn watch(&self) -> watch::Receiver<Status> {self.status.clone()}

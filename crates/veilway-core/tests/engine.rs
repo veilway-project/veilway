@@ -347,15 +347,15 @@ async fn an_idle_tunnel_wakes_far_less_than_four_times_a_second_and_still_carrie
 	assert!(run.ping(200, 1).await);
 	// Four ticks a second before: 32 in 8 s. Idle it is one a second, with room for what the node says on its own.
 	tokio::time::sleep(Duration::from_secs(3)).await;
-	let before = run.tunnel.status().counters.ticks;
+	let before = run.tunnel.ticks();
 	tokio::time::sleep(Duration::from_secs(8)).await;
-	let idle = run.tunnel.status().counters.ticks - before;
+	let idle = run.tunnel.ticks() - before;
 	assert!(idle <= 16, "{idle} ticks in 8 s idle");
 	run.tunnel.low_power(true);
 	tokio::time::sleep(Duration::from_secs(3)).await;
-	let before = run.tunnel.status().counters.ticks;
+	let before = run.tunnel.ticks();
 	tokio::time::sleep(Duration::from_secs(8)).await;
-	let low = run.tunnel.status().counters.ticks - before;
+	let low = run.tunnel.ticks() - before;
 	assert!(low <= 10, "{low} ticks in 8 s of low power");
 	// Traffic and the control channel work in low power, and leaving it changes nothing for the session.
 	assert!(run.ping(201, 1).await);

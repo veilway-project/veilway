@@ -70,6 +70,8 @@ pub(crate) struct Parts {
 	pub status: watch::Sender<Status>,
 	pub events: broadcast::Sender<Event>,
 	pub refused: Arc<AtomicU64>,
+	/// Wakeups of the sessions' timer loops, read by `Tunnel::ticks` as they happen.
+	pub woke: Arc<AtomicU64>,
 	/// The user said yes to "this profile connects to a private address" for this start.
 	pub private: bool,
 }
@@ -97,6 +99,7 @@ pub(crate) struct Core {
 	pub status_tx: watch::Sender<Status>,
 	pub events: broadcast::Sender<Event>,
 	pub refused: Arc<AtomicU64>,
+	pub woke: Arc<AtomicU64>,
 	pub commands: mpsc::UnboundedReceiver<Command>,
 	pub from_platform: mpsc::Receiver<Vec<u8>>,
 	pub to_platform: mpsc::Sender<Vec<u8>>,
@@ -152,12 +155,12 @@ fn skipped(consented: bool, address: &Dial, networks: &[OwnNetwork]) -> bool {ad
 
 impl Core {
 	pub(crate) fn new(parts: Parts) -> Self {
-		let Parts {settings, profile, subscription, link, key, store_key, kept, commands, from_platform, to_platform, status, events, refused, private} = parts;
+		let Parts {settings, profile, subscription, link, key, store_key, kept, commands, from_platform, to_platform, status, events, refused, woke, private} = parts;
 		let (transports, seed) = (profile.transports.clone(), settings.store.seed());
 		let net_key = crate::store::network_key(seed, &settings.network);
 		let wire = Shared::new(Wire::new(key, link.inbound, profile.device.preshared_key.clone()));
 		let initial = status.borrow().clone();
-		Self {consented: private, networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, low_power: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
+		Self {consented: private, networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, woke, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, low_power: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
 	}
 	pub(crate) fn unix(&self) -> u64 {(self.settings.clock)()}
 	// The device's clock and the offset a pinned candidate's answer gave, which is what proofs are made with.
@@ -172,9 +175,14 @@ impl Core {
 	pub(crate) fn publish(&mut self) {
 		self.status.counters = self.counters;
 		self.status.counters.dropped_full += self.refused.load(Ordering::Relaxed);
+		self.status.counters.ticks = self.woke.load(Ordering::Relaxed);
 		self.status.say = self.reason.or(self.warn);
+		// The loop's wakeup count alone is no change: told on every tick, it woke every reader of the status (the platform's loop, the app) as often as the loop itself.
 		self.status_tx.send_if_modified(|status| {
+			let ticks = self.status.counters.ticks;
+			self.status.counters.ticks = status.counters.ticks;
 			let changed = *status != self.status;
+			self.status.counters.ticks = ticks;
 			if changed {*status = self.status.clone()}
 			changed
 		});
