@@ -987,10 +987,19 @@ do_install() {
 	if [ "$NO_DOMAIN" = 1 ]; then
 		port=443; if has ss && [ -n "$(ss -H -ltn "sport = :443" 2>/dev/null)" ]; then port=8443; fi
 		detected="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)"
-		[ -n "$WEB" ] || WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
+		# nginx by default: it serves the certificate whatever the SNI, which apps leave out for an IP, and opens no port 80.
+		[ -n "$WEB" ] || WEB="$(ask "Web server, nginx or caddy? [nginx]" nginx)"
 		[ -n "$HTTPS_PORT" ] || HTTPS_PORT="$(ask "Port for the subscriptions? [$port]" "$port")"
+		IP_GIVEN=0; [ -z "$PUBLIC_IP" ] || IP_GIVEN=1
 		[ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(ask "This server's IPv4 address? [$detected]" "$detected")"
 		[[ "$PUBLIC_IP" =~ $IPV4_RE ]] || die "\"$PUBLIC_IP\" is not an IPv4 address: pass it with --ip <address>"
+		# On a cloud with NAT the address this server sees is a private one, which apps outside cannot reach. One given with --ip is the operator's choice, for a server only reached at home.
+		if [[ "$PUBLIC_IP" =~ $PRIVATE_RE ]] && [ "$IP_GIVEN" = 0 ]; then
+			{ [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ]; } || die "this server sees the private address $PUBLIC_IP: pass the address apps reach it at with --ip <address> (a private one too, for a server used only at home)"
+			PUBLIC_IP="$(ask "This server sees the private address $PUBLIC_IP. Apps outside cannot reach it, only devices on the same network. The address apps reach it at? [$PUBLIC_IP]" "$PUBLIC_IP")"
+			[[ "$PUBLIC_IP" =~ $IPV4_RE ]] || die "\"$PUBLIC_IP\" is not an IPv4 address: pass it with --ip <address>"
+		fi
+		if [[ "$PUBLIC_IP" =~ $PRIVATE_RE ]]; then warn "$PUBLIC_IP is a private address: only devices on the same network can use these subscriptions, and the apps ask before they connect to it"; fi
 	fi
 	if [ -n "$(web_state web)" ] && { [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ]; }; then
 		if [ "$(web_state mode)" = ip ]; then [ "$NO_DOMAIN" = 1 ] || die "the web server here serves the subscriptions on an IP address: run sudo bash veilway.sh uninstall web first"
@@ -1612,7 +1621,8 @@ web_pkg() {
 # Run before anything is installed: finds out what already holds ports 80 and the HTTPS port and stops with an explanation when the setup would take them from someone. The node on the HTTPS port is the one case it works around, see web_free_https.
 web_preflight() {
 	local s p out held="" other="" same=0 ports=(80 "$HTTPS_PORT")
-	[ "$NO_DOMAIN" = 0 ] || ports=("$HTTPS_PORT")
+	# Caddy also opens port 80 in no-domain mode, to answer it with 404 instead of a redirect.
+	[ "$NO_DOMAIN" = 0 ] || [ "$WEB" = caddy ] || ports=("$HTTPS_PORT")
 	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports ${ports[*]}"
 	has apt-get || die "the automatic web server setup runs on Debian or Ubuntu: it needs apt-get. Install a web server by hand with the snippets that the install prints, or run this without --domain."
 	for s in nginx caddy apache2 httpd lighttpd haproxy; do
