@@ -192,6 +192,34 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 		Ok(Err(failure)) => return failure.into_response(),
 		Err(_) => return Failure::late(&api).into_response(),
 	};
+	// A removal's answer goes back through the link it removes, so it is answered first and goes into force once the answer had time to leave. It is in the config file and the trial is gone before it is answered, so a restart meanwhile comes back emptied and never puts the config before back.
+	if removal {
+		{
+			let mut trial = api.trial.lock().await;
+			let (file, copy) = (api.config.clone(), bytes.clone());
+			match tokio::task::spawn_blocking(move || veilway_core::config::save(&file, &copy)).await {
+				Ok(Ok(())) => {}
+				Ok(Err(e)) => return Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "removal_unsaved", format!("The removal could not be written to the config file ({}), so nothing was changed.", e.kind())).into_response(),
+				Err(_) => return Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "The change did not finish.").into_response(),
+			}
+			*trial = None;
+			if let Err(e) = manage::mirror(&api.config, None) {tracing::error!("control api: the trial file of the config could not be removed ({}): a restart would put the config before back", e.kind())}
+		}
+		let (tag, wait) = (via.as_ref().map(|via| via.tag.clone()).unwrap_or_default(), api.limits.settle);
+		tracing::info!("control api: a removal came through link {tag}: it is in the config file and goes into force in {} s, once its answer has left", wait.as_secs());
+		tokio::spawn({
+			let api = api.clone();
+			async move {
+				tokio::time::sleep(wait).await;
+				match api.engine.apply(bytes, snapshot.revision, &api.config).await {
+					Ok((applied, Ok(()))) => tracing::info!("control api: the removal that came through link {tag} is in force (generation {}): no users, and the link is gone", applied.snapshot.generation),
+					Ok((applied, Err(e))) => tracing::error!("control api: the removal that came through link {tag} is in force (generation {}) and could not be written to {} again ({}): a restart puts in force what the file holds", applied.snapshot.generation, api.config.display(), e.kind()),
+					Err(e) => tracing::error!("control api: the removal that came through link {tag} could not be put in force ({}): a restart puts in force what the config file holds", match e {ApplyError::Stale {..} => "the config was changed by somebody else since".to_string(), ApplyError::Invalid(_) => "it no longer validates".to_string(), ApplyError::Prepare(e) => format!("{e:#}")}),
+				}
+			}
+		});
+		return json(StatusCode::ACCEPTED, &serde_json::json!({"removal": true, "in_force_after_secs": wait.as_secs()}));
+	}
 	let previous = via.as_ref().filter(|_| !removal).and_then(|_| serde_json::to_vec_pretty(&*snapshot.config).ok());
 	// What changes the trial of a link runs to its end on a task of its own: the request may be gone by the time the config is in force, since a reload ends the session that carried it, and the trial must still be saved, kept in step with its file and rolled back in time.
 	// The trial of a push is saved before the push is applied, so that a restart once the new config is in force finds the config before in the file next to the config. Everything that changes the trial happens under its lock.
@@ -199,8 +227,6 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 		let (api, via) = (api.clone(), via.clone());
 		async move {
 			let mut trial = api.trial.lock().await;
-			// A removal's answer goes back through the link it removes, so it is sent first and the document goes into force once the answer had time to leave, as a push renews its session. The trial stays locked meanwhile, so the rollback of a push before cannot come in between.
-			if removal {tokio::time::sleep(api.limits.renew).await}
 			let due = SystemTime::now() + api.limits.trial;
 			let pushed = manage::digest(&bytes);
 			let kept = match (&via, &previous) {
@@ -221,16 +247,9 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 			}
 			if let Err(e) = manage::mirror(&api.config, trial.as_ref()) {tracing::error!("control api: the trial file of the config could not be written ({}): a restart would not put the config before back", e.kind())}
 			drop(trial);
-			if removal {
-				match &outcome {
-					Ok((applied, _)) => tracing::info!("control api: the removal pushed through link {} is in force (generation {}): no users, and the link is gone", via.as_ref().map_or("", |via| via.tag.as_str()), applied.snapshot.generation),
-					Err(e) => tracing::warn!("control api: the removal pushed through link {} could not be applied: {}", via.as_ref().map_or("", |via| via.tag.as_str()), match e {ApplyError::Stale {..} => "the config was changed by somebody else since".to_string(), ApplyError::Invalid(_) => "it no longer validates".to_string(), ApplyError::Prepare(e) => format!("{e:#}")}),
-				}
-			}
 			Ok(outcome)
 		}
 	});
-	if removal {return json(StatusCode::ACCEPTED, &serde_json::json!({"removal": true, "in_force_after_ms": api.limits.renew.as_millis() as u64}))}
 	let outcome = match task.await {
 		Ok(Ok(outcome)) => outcome,
 		Ok(Err(failure)) => return failure.into_response(),
@@ -613,7 +632,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		relay
 	};
 	let relay_get = relayed(schemas, Method::GET, "relayGet", "Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it.");
-	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link, except the removal of the node: no users and no such link, answered 202 before it goes into force two seconds later, since the answer goes back through that link.");
+	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link, except the removal of the node: no users and no such link, answered 202 once it is in the config file, and put in force 10 seconds later, since the answer goes back through that link.");
 	let relay_post = relayed(schemas, Method::POST, "relayPost", "The same call with POST.");
 	let relay_delete = relayed(schemas, Method::DELETE, "relayDelete", "The same call with DELETE.");
 	vec![

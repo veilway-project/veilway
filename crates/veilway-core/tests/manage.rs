@@ -761,6 +761,9 @@ async fn a_config_that_would_cut_the_managing_link_is_refused_and_a_removal_with
 	// The answer is sent before the removal goes into force, since it goes back through the link the document removes.
 	assert_eq!(status, 202, "{answer}");
 	assert_eq!(net.remote().links().len(), 1, "the removal was applied before its answer left");
+	// It is in the config file before it is answered, so a restart meanwhile comes back emptied.
+	let saved: Value = serde_json::from_slice(&std::fs::read(net.remote_dir.join("config.json")).unwrap()).unwrap();
+	assert!(saved["links"].as_array().is_none_or(Vec::is_empty) && saved["users"].as_array().is_none_or(Vec::is_empty), "the config file does not hold the removal: {saved}");
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	assert!(net.remote().links().is_empty(), "the removal was not applied");
 	tokio::time::sleep(Duration::from_secs(3)).await;
