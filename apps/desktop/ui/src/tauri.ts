@@ -15,7 +15,7 @@ export type Legacy = {protocol: string, unsafe_cap: boolean, refused: string | n
 export type Profile = {id: string, name: string, exits: [string, string][], left_out: boolean, legacy?: Legacy | null};
 // A backup update address of a subscription, or the new main address a move asks for. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does, and a `move` would become the main one. Over `plain` the network can tell that the device uses this app. `from` is the address a move leaves.
 export type Host = {key: string, host: string, kind: "update" | "static" | "move", state: "waiting" | "allowed" | "declined", check: "chain" | "pinned" | "plain", from: string | null};
-export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, unknown_type?: boolean, lan_local: boolean, hosts: Host[], legacy?: boolean, bundle_notices?: {severity: string, text: string, issued_at: number}[]};
+export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, unknown_type?: boolean, lan_local: boolean, exit_choice: string | null, hosts: Host[], legacy?: boolean, bundle_notices?: {severity: string, text: string, issued_at: number}[]};
 export type Offer = {kind: "native" | "carried", host: string | null, fingerprint: string, pinned: boolean, plain: boolean, in_file: boolean};
 // Pasted links of another app, read and checked by the helper. Nothing is fetched for them; keeping them is the only step left.
 export type LegacyOffer = {kind: "legacy", connections: {name: string, protocol: string, unsafe_cap: boolean}[], refused: {name: string, code: string}[], skipped: number, cut: boolean};
@@ -71,7 +71,7 @@ type Commands = {
 	xray_remove: [{}, XrayState],
 	answer: [{yes: boolean}, null],
 	disconnect: [{}, null],
-	select_exit: [{tag: string | null}, null],
+	select_exit: [{id: string, tag: string | null}, Subscription[]],
 	status: [{}, Running],
 	log_history: [{}, string[]],
 	check_update: [{}, UpdateInfo],

@@ -257,7 +257,7 @@ async fn answer(backend:State<'_, Arc<Backend>>, yes:bool)->Result<Value, String
 async fn disconnect(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::Disconnect).await}
 
 #[tauri::command]
-async fn select_exit(backend:State<'_, Arc<Backend>>, tag:Option<String>)->Result<Value, String>{ask(&backend, Call::SelectExit{tag}).await}
+async fn select_exit(backend:State<'_, Arc<Backend>>, id:String, tag:Option<String>)->Result<Value, String>{ask_branded(&backend, Call::SelectExit{subscription:id, tag}).await}
 
 #[tauri::command]
 async fn status(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::Status).await}

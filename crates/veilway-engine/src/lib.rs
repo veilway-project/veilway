@@ -217,6 +217,8 @@ impl Tunnel {
 		// Alpha is the reason only if turning it on would give something to try.
 		if plan.order.is_empty() {return Err(if !alpha && !choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, true).order.is_empty() {StartError::Alpha} else {StartError::Nothing})}
 		let (commands, input) = mpsc::unbounded_channel();
+		// The user's saved choice for this subscription goes in first, so the node is asked for it once the control channel opens.
+		if let Some(tag) = settings.store.exit_choice(held.id().as_str()) {let _ = commands.send(Command::Exit(Some(tag)));}
 		*settings.handle.0.lock().unwrap() = Some(commands.clone());
 		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
 		let (status_tx, status) = watch::channel(Status::off(profile.name.as_str().to_owned(), profile.mtu));

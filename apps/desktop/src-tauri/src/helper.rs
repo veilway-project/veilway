@@ -241,6 +241,7 @@ impl Core {
 				if let Some(found) = found {fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				drop(library);
 				self.store.set_lan_local(&id, false);
+				self.store.set_exit_choice(&id, None);
 				let _ = self.store.flush();
 				self.library_value().await
 			}
@@ -338,9 +339,15 @@ impl Core {
 				self.disconnect().await.map_err(|error| format!("{error:#}"))?;
 				Ok(Value::Null)
 			}
-			Call::SelectExit {tag} => {
-				let sent = self.handle.lock().unwrap().as_ref().is_some_and(|handle| handle.select_exit(tag));
-				if sent {Ok(Value::Null)} else {Err("There is no running tunnel to change the exit of.".into())}
+			Call::SelectExit {subscription: id, tag} => {
+				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
+				self.store.set_exit_choice(&id, tag.clone());
+				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
+				// With no tunnel the choice waits: the engine sends it when a tunnel of this subscription starts.
+				if self.running.lock().unwrap().as_ref().is_some_and(|running| running.subscription == id) {
+					if let Some(handle) = self.handle.lock().unwrap().as_ref() {handle.select_exit(tag);}
+				}
+				self.library_value().await
 			}
 			Call::BundleReview => self.bundle_review().await,
 			Call::BundleDocument {subscription} => self.bundle_document(&subscription).await,
@@ -761,7 +768,7 @@ mod tests {
 		assert_eq!(link.call(Call::ImportProceed {private: Vec::new()}).await.unwrap_err(), "no_import");
 		assert_eq!(link.call(Call::Connect {subscription: "x".into(), profile: "y".into(), options: Options::default()}).await.unwrap_err(), "That subscription is not held.");
 		assert_eq!(link.call(Call::Answer {yes: true}).await.unwrap_err(), "There is no question waiting.");
-		assert_eq!(link.call(Call::SelectExit {tag: None}).await.unwrap_err(), "There is no running tunnel to change the exit of.");
+		assert_eq!(link.call(Call::SelectExit {subscription: "x".into(), tag: None}).await.unwrap_err(), "That subscription is not held.");
 	}
 
 	const GOOD: &str = "vless://5f2c8e1a-0b3d-4c6e-9a7f-1d2e3f4a5b6c@203.0.113.5:443?security=tls&sni=edge.example&type=ws&path=%2Fws#Edge";

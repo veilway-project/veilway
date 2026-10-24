@@ -120,7 +120,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
 		: tab === "subscriptions" ? <Library library={named} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
 		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
-		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh}/>;
+		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh} onLibrary={setLibrary}/>;
 	const lit = running.status?.state === "connected";
 	return <Backdrop fixed lit={lit} className="d-app">
 		<Shell nav={<Nav header={<Brand/>} value={adding ? "subscriptions" : tab} onChange={id => { setAdding(false); setTab(id); }} items={[{id: "home", label: t("nav.home"), icon: "power"}, {id: "usage", label: t("nav.usage"), icon: "chart"}, {id: "subscriptions", label: t("nav.subscriptions"), icon: "inbox"}, {id: "settings", label: t("nav.settings"), icon: "settings"}]}/>} banner={updateBanner}>{content}</Shell>

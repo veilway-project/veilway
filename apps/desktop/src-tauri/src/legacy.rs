@@ -141,7 +141,7 @@ impl Store {
 /// A paste of links as the library shows it: no provider, no expiry, no refresh, and each link with its protocol and, when the table refuses it, the code of the refusal.
 pub fn view(pasted: &Pasted, lan_local: bool) -> SubscriptionOut {
 	let profiles = pasted.items.iter().enumerate().map(|(at, item)| ProfileOut {id: (at + 1).to_string(), name: item.name(at), exits: Vec::new(), left_out: false, legacy: Some(LegacyOut {protocol: item.protocol().into(), unsafe_cap: item.unsafe_cap(), refused: item.checked.as_ref().err().map(|code| (*code).into())})}).collect();
-	SubscriptionOut {id: pasted.id.clone(), provider: String::new(), standing: "current".into(), expires_at: 0, can_refresh: false, profiles, usage: None, cards: Vec::new(), notices: Vec::new(), support: Vec::new(), terms: None, privacy: None, logo: None, accent: None, left_out: 0, unknown_type: false, lan_local, hosts: Vec::new(), legacy: true}
+	SubscriptionOut {id: pasted.id.clone(), provider: String::new(), standing: "current".into(), expires_at: 0, can_refresh: false, profiles, usage: None, cards: Vec::new(), notices: Vec::new(), support: Vec::new(), terms: None, privacy: None, logo: None, accent: None, left_out: 0, unknown_type: false, lan_local, exit_choice: None, hosts: Vec::new(), legacy: true}
 }
 
 #[cfg(test)]

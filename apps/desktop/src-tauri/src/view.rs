@@ -166,6 +166,9 @@ pub struct SubscriptionOut {
 	/// The user's choice to let apps reach devices on the networks the device is on outside the tunnel, for this subscription. Off unless chosen.
 	#[serde(default)]
 	pub lan_local: bool,
+	/// The tag of the exit the user picked for this subscription, `None` for automatic.
+	#[serde(default)]
+	pub exit_choice: Option<String>,
 	/// The backup update hosts of a held subscription, empty in a review: the hosts on an import's screen are confirmed with it.
 	#[serde(default)]
 	pub hosts: Vec<HostOut>,
@@ -238,6 +241,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		left_out: subscription.left_out,
 		unknown_type: subscription.has_unknown_transport(),
 		lan_local,
+		exit_choice: None,
 		hosts: Vec::new(),
 		legacy: false,
 	}
@@ -251,7 +255,7 @@ pub fn hosts_view(held: &Held) -> Vec<HostOut> {
 }
 
 pub fn library_view(library: &Library, store: &Store, languages: &[Tag], now: u64) -> Vec<SubscriptionOut> {
-	library.held().iter().map(|held| SubscriptionOut {hosts: hosts_view(held), ..subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)}).collect()
+	library.held().iter().map(|held| SubscriptionOut {hosts: hosts_view(held), exit_choice: store.exit_choice(held.subscription().id.as_str()), ..subscription_view(held.subscription(), held.standing(now), held.fetch().is_some(), store.lan_local(held.subscription().id.as_str()), languages)}).collect()
 }
 
 pub fn tags(languages: &[String]) -> Vec<Tag> {languages.iter().take(8).filter_map(|text| Tag::read(&text.replace('_', "-"))).collect()}

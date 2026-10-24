@@ -6,18 +6,19 @@ import {call, type Ended, type Exit, type Profile, type Running, type Subscripti
 
 type Choice = {subscription: Subscription, profile: Profile};
 
-export function Home({running, busy, ended, points, choices, chosen, prefs, onPrefs, onConnect, onDisconnect, onRefresh}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void}) {
+export function Home({running, busy, ended, points, choices, chosen, prefs, onPrefs, onConnect, onDisconnect, onRefresh, onLibrary}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void, onLibrary: (found: Subscription[]) => void}) {
 	const {t, rate, time, date, locale, number, bytes} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
 	const status = running.status, state = running.connected ? status?.state ?? "connecting" : "off", subscription = chosen?.subscription, logo = useLogo(subscription?.logo ?? null);
 	const link: ConnectState = state === "connected" ? "on" : state === "off" || state === "failed" ? "off" : "connecting";
 	const heading = state === "connected" ? t("state.connected") : state === "connecting" ? t("state.connecting") : state === "reconnecting" ? t("state.reconnecting") : state === "stopped" ? t("state.stopped") : state === "failed" ? t("state.failed") : t("state.disconnected");
-	const exits = status?.exits ?? [], current = exits.find(e => e.tag === status?.exit), usage = status?.usage, now = points[points.length - 1];
+	// Before the node's list arrives (and while disconnected) the exits are the ones the connection lists, with the choice saved for the subscription.
+	const exits = status?.exits ?? [], saved = subscription?.exit_choice ?? null, listed = exits.length > 0 ? exits.map(exit => ({tag: exit.tag, name: exit.name, selected: exit.selected, exit})) : (chosen?.profile.exits ?? []).map(([tag, name]) => ({tag, name, selected: tag === saved, exit: undefined})), current = exits.find(e => e.tag === status?.exit), usage = status?.usage, now = points[points.length - 1];
 	const xray = status?.xray ?? null, said = xray?.say_code ?? status?.say_code, refused = chosen?.profile.legacy?.refused ?? null;
 	const code = said && ("say." + said) in en ? t(("say." + said) as DesktopKey) : xray?.say ?? status?.say;
 	const wait = status?.wait_until ? t("home.retryAt", {time: time(fromUnix(status.wait_until))}) : state === "stopped" ? t("home.retryAsked") : null;
 	const country = (exit: Exit) => { try { return exit.country ? new Intl.DisplayNames([locale], {type: "region"}).of(exit.country.toUpperCase()) : undefined; } catch { return undefined; } };
 	const exitDetail = (exit: Exit) => [country(exit), exit.working ? (["low", "medium", "high"].includes(exit.load) ? t(("home.load." + exit.load) as DesktopKey) : "") : t("home.exitDown")].filter(Boolean).join(locale === "fa" ? "، " : ", ");
-	const pick = (tag: string | null) => { setPicking(false); call("select_exit", {tag}).catch(error => toast({tone: "danger", title: t("home.exitFailed"), body: error})); };
+	const pick = (tag: string | null) => { setPicking(false); if (subscription) call("select_exit", {id: subscription.id, tag}).then(onLibrary, error => toast({tone: "danger", title: t("home.exitFailed"), body: error})); };
 	const items: ProviderItem[] = subscription ? [
 		...subscription.notices.map(n => ({type: "notice" as const, text: n.text, severity: n.severity === "warning" ? "warning" as const : n.severity === "critical" ? "critical" as const : "info" as const})),
 		...subscription.cards.map((card): ProviderItem => card.kind === "stat" ? {type: "stat", label: card.label, value: card.value, unit: card.unit ?? undefined} : card.kind === "progress" ? {type: "progress", label: card.label, used: card.used, total: card.total} : card.kind === "notice" ? {type: "notice", text: card.text, severity: card.severity === "warning" ? "warning" : card.severity === "critical" ? "critical" : "info"} : {type: "link", label: card.label, url: card.url}),
@@ -60,7 +61,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error === "alpha_off" ? t("alpha.off") : ended?.error && failureText(ended.error, t), kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}
-		{exits.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={exits.find(e => e.selected)?.name ?? (state === "connected" && current ? t("home.exitAutoUsing", {exit: current.name}) : t("home.exitAuto"))} trailing={<Icon name="chevronForward"/>}/></List></Glass>}
+		{listed.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={listed.find(e => e.selected)?.name ?? (state === "connected" && current ? t("home.exitAutoUsing", {exit: current.name}) : t("home.exitAuto"))} trailing={<Icon name="chevronForward"/>}/></List></Glass>}
 		{connection && <Glass className="d-details"><details>
 			<summary><span>{t("details.title")}</span><Icon name="chevronDown"/></summary>
 			<dl>{rows.map(row => <div key={row.key}><dt>{t(row.key)}</dt><dd>{row.code ? <span className="vw-code" dir="ltr">{row.shown}</span> : row.shown}</dd></div>)}</dl>
@@ -83,8 +84,8 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			: <ProviderCard provider={subscription.provider} accent={subscription.accent ?? undefined} logo={logo} cards={items} onHide={() => onPrefs({hidden: [...prefs.hidden, subscription.id]})} onOpenLink={open}/>)}
 		<Dialog open={picking} onOpenChange={setPicking} title={t("home.exitPick")} description={t("home.exitPickBody")}>
 			<List label={t("home.exitPick")}>
-				<ListRow onClick={() => pick(null)} current={!exits.some(e => e.selected)} title={t("home.exitAuto")} detail={t("home.exitAutoDetail")}/>
-				{exits.map(exit => <ListRow key={exit.tag} onClick={() => pick(exit.tag)} current={exit.selected} title={exit.name} detail={exitDetail(exit)}/>)}
+				<ListRow onClick={() => pick(null)} current={!listed.some(e => e.selected)} title={t("home.exitAuto")} detail={t("home.exitAutoDetail")}/>
+				{listed.map(row => <ListRow key={row.tag} onClick={() => pick(row.tag)} current={row.selected} title={row.name} detail={row.exit && exitDetail(row.exit)}/>)}
 			</List>
 		</Dialog>
 	</div>;

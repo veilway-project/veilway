@@ -22,12 +22,12 @@ function subscription(fa: boolean): Subscription {
 		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]], left_out: false}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]], left_out: true}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
-		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], terms: "https://harbor.example/terms", privacy: "https://harbor.example/privacy", logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan, hosts
+		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], terms: "https://harbor.example/terms", privacy: "https://harbor.example/privacy", logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan, exit_choice: selected, hosts
 	};
 }
 
 // Pasted links of another app, kept unsigned and connected through the Xray add-on.
-const pasted = (): Subscription => ({id: "legacy.7c1e", provider: "", standing: "current", expires_at: 0, can_refresh: false, profiles: [{id: "1", name: "Edge Frankfurt", exits: [], left_out: false, legacy: {protocol: "vless", unsafe_cap: false, refused: null}}, {id: "2", name: "Backup", exits: [], left_out: false, legacy: {protocol: "trojan", unsafe_cap: false, refused: null}}], usage: null, cards: [], notices: [], support: [], terms: null, privacy: null, logo: null, accent: null, left_out: 0, lan_local: lan, hosts: [], legacy: true});
+const pasted = (): Subscription => ({id: "legacy.7c1e", provider: "", standing: "current", expires_at: 0, can_refresh: false, profiles: [{id: "1", name: "Edge Frankfurt", exits: [], left_out: false, legacy: {protocol: "vless", unsafe_cap: false, refused: null}}, {id: "2", name: "Backup", exits: [], left_out: false, legacy: {protocol: "trojan", unsafe_cap: false, refused: null}}], usage: null, cards: [], notices: [], support: [], terms: null, privacy: null, logo: null, accent: null, left_out: 0, lan_local: lan, exit_choice: null, hosts: [], legacy: true});
 const legacyOffer: LegacyOffer = {kind: "legacy", connections: [{name: "Edge Frankfurt", protocol: "vless", unsafe_cap: false}, {name: "Backup", protocol: "trojan", unsafe_cap: false}], refused: [{name: "Old KCP", code: "profile_refused.stream"}], skipped: 0, cut: false};
 const xrayScene = scene === "offer" || scene === "xray";
 let xrayInstalled = scene === "xray", legacyHeld = xrayScene, lastLegacy = false;
@@ -82,7 +82,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	xray_remove: () => { xrayInstalled = false; return xrayState(); },
 	disconnect: () => { connected = false; return null; },
 	answer: () => null,
-	select_exit: args => { selected = (args.tag as string | null) ?? null; return null; },
+	select_exit: args => { selected = (args.tag as string | null) ?? null; return [subscription(languages[0] === "fa")]; },
 	import_open: args => {
 		const source = args.source as {kind: string, password?: string, text?: string};
 		lastLegacy = source.kind === "link" && /^(vless|vmess|trojan|ss):\/\//.test(source.text ?? "");

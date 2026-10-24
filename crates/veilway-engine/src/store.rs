@@ -18,6 +18,7 @@ pub const NETWORKS_MAX: usize = 16;
 /// The longest list of anything kept for one network or profile.
 pub const LIST: usize = 64;
 const KEY_MAX: usize = 130;
+const TAG_MAX: usize = 64;
 const VERSION: u64 = 1;
 
 /// A size found by probing for a transport of the profile on a network, and when. "Remembered MTU on the client: per network and transport, 7 days."
@@ -43,9 +44,10 @@ impl Kept {
 }
 
 /// The whole file. `lan_local` holds the ids of the subscriptions whose user let apps reach devices on the local network outside the tunnel: absent is off, which is also what a file from before this setting says. The first version of this setting was stored as `lan_tunnel` and is not read.
+/// `exit_choice` is the exit a user picked per subscription, by the exit's tag, so that a choice made while disconnected is sent when the tunnel is up: absent is automatic.
 /// `alpha_transports` is the one client setting that lets the engine dial a transport in alpha, `faketls`: off by default, and off in a file from before it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_local: BTreeSet<String>, pub alpha_transports: bool}
+pub struct Saved {pub seed: u64, pub profiles: BTreeMap<String, Kept>, pub lan_local: BTreeSet<String>, pub exit_choice: BTreeMap<String, String>, pub alpha_transports: bool}
 
 /// Why a file was not taken as it is. Either way the client starts without it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,6 +98,7 @@ struct FileWire {
 	#[serde(default)] seed: u64,
 	#[serde(default)] profiles: BTreeMap<String, ProfileWire>,
 	#[serde(default)] lan_local: Vec<String>,
+	#[serde(default)] exit_choice: BTreeMap<String, String>,
 	#[serde(default)] alpha_transports: bool,
 }
 
@@ -124,6 +127,8 @@ fn index(number: u64) -> Option<usize> {Some(number as usize).filter(|number| *n
 // A key that can only be one this crate wrote: letters, digits and a few signs, and not long.
 fn key_ok(key: &str) -> bool {!key.is_empty() && key.len() <= KEY_MAX && key.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-/.".contains(&byte))}
 
+fn tag_ok(tag: &str) -> bool {!tag.is_empty() && tag.len() <= TAG_MAX && tag.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))}
+
 fn read_standing(wire: StandingWire) -> Standing {
 	Standing {profile: wire.profile, refusals: wire.refusals, rows: wire.rows.into_iter().take(LIST).filter_map(|(transport, candidate, row)| Some((index(transport)?, index(candidate)?, row))).collect(), losses: wire.losses, opened: wire.opened, short: wire.short, unanswered: wire.unanswered, consent: classes(&wire.consent), exposed: wire.exposed, offset: wire.offset, bare: wire.bare}
 }
@@ -144,7 +149,7 @@ pub fn parse(bytes: &[u8]) -> Result<Saved, Damaged> {
 	if bytes.len() > FILE_MAX {return Err(Damaged::Size)}
 	let wire: FileWire = serde_json::from_slice(bytes).map_err(|_| Damaged::Form)?;
 	if wire.version != VERSION {return Err(Damaged::Form)}
-	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_local: wire.lan_local.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect(), alpha_transports: wire.alpha_transports};
+	let mut saved = Saved {seed: wire.seed, profiles: BTreeMap::new(), lan_local: wire.lan_local.into_iter().filter(|id| key_ok(id)).take(PROFILES_MAX).collect(), exit_choice: wire.exit_choice.into_iter().filter(|(id, tag)| key_ok(id) && tag_ok(tag)).take(PROFILES_MAX).collect(), alpha_transports: wire.alpha_transports};
 	for (key, profile) in wire.profiles.into_iter().filter(|(key, _)| key_ok(key)).take(PROFILES_MAX) {
 		let mut kept = Kept {standing: read_standing(profile.standing), stream_first: profile.stream_first, declined: classes(&profile.declined), ..Kept::default()};
 		for (network, wire) in profile.networks.into_iter().filter(|(network, _)| key_ok(network)).take(NETWORKS_MAX) {kept.networks.push((network, read_network(wire)))}
@@ -167,7 +172,7 @@ pub fn encode(saved: &Saved) -> Vec<u8> {
 		})
 	}).collect();
 	// A map with string keys and plain numbers cannot fail to be written.
-	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_local: saved.lan_local.iter().cloned().collect(), alpha_transports: saved.alpha_transports}).unwrap_or_default()
+	serde_json::to_vec(&FileWire {version: VERSION, seed: saved.seed, profiles, lan_local: saved.lan_local.iter().cloned().collect(), exit_choice: saved.exit_choice.clone(), alpha_transports: saved.alpha_transports}).unwrap_or_default()
 }
 
 /// How a network is kept: the first eight bytes of the SHA-256 of the seed and the caller's description, in hex. The same network is the same key on this installation and an unrelated one on another.
@@ -284,6 +289,17 @@ impl Store {
 		let changed = if on {key_ok(subscription) && (guard.0.lan_local.len() < PROFILES_MAX || guard.0.lan_local.contains(subscription)) && guard.0.lan_local.insert(subscription.to_owned())} else {guard.0.lan_local.remove(subscription)};
 		guard.1 |= changed;
 	}
+	/// The exit the user picked for this subscription, if any: the tag of one of its exits.
+	pub fn exit_choice(&self, subscription: &str) -> Option<String> {self.lock().0.exit_choice.get(subscription).cloned()}
+	/// Saves that choice, `None` for automatic. A key or tag this crate could not have written, or one past `PROFILES_MAX` subscriptions, is not kept.
+	pub fn set_exit_choice(&self, subscription: &str, tag: Option<String>) {
+		let mut guard = self.lock();
+		let changed = match tag {
+			Some(tag) => key_ok(subscription) && tag_ok(&tag) && (guard.0.exit_choice.len() < PROFILES_MAX || guard.0.exit_choice.contains_key(subscription)) && guard.0.exit_choice.insert(subscription.to_owned(), tag.clone()).as_ref() != Some(&tag),
+			None => guard.0.exit_choice.remove(subscription).is_some(),
+		};
+		guard.1 |= changed;
+	}
 	/// Whether the user turned on transports in alpha (`alpha_transports`). Off until they do: "No `faketls` candidate is dialed until it is on." A running tunnel reads it at every attempt.
 	pub fn alpha_transports(&self) -> bool {self.lock().0.alpha_transports}
 	/// Saves that setting. The app shows `ALPHA_WARNING` before it turns it on the first time.
@@ -354,11 +370,11 @@ mod tests {
 		(standing(), vec(("[a-f0-9]{16}", network()), 0..4), vec(("[a-f0-9]{16}", 0usize..256, any::<u16>(), any::<u64>()), 0..4), classes_strategy(), proptest::option::of(any::<bool>())).prop_map(|(standing, networks, mtus, declined, stream_first)| Kept {standing, networks, mtus: mtus.into_iter().map(|(network, transport, mtu, when)| Remembered {network, transport, mtu, when}).collect(), declined, stream_first})
 	}
 
-	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4)).prop_map(|(seed, profiles, lan_local)| Saved {seed, profiles, lan_local, alpha_transports: seed % 2 == 0})}
+	fn saved() -> impl Strategy<Value = Saved> {(any::<u64>(), btree_map("[a-zA-Z0-9_-]{16,40}/[a-z0-9_-]{1,20}", kept(), 0..4), proptest::collection::btree_set("[a-zA-Z0-9_-]{16,40}", 0..4), btree_map("[a-zA-Z0-9_-]{16,40}", "[a-z0-9_.-]{1,20}", 0..4)).prop_map(|(seed, profiles, lan_local, exit_choice)| Saved {seed, profiles, lan_local, exit_choice, alpha_transports: seed % 2 == 0})}
 
 	// What every result of `parse` promises, whatever the bytes were.
 	fn bounded(saved: &Saved) -> bool {
-		saved.profiles.len() <= PROFILES_MAX && saved.lan_local.len() <= PROFILES_MAX && saved.lan_local.iter().all(|id| key_ok(id)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.plain.len() <= LIST && state.plain.iter().all(|(_, _, count, _)| *count <= FAILS) && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
+		saved.profiles.len() <= PROFILES_MAX && saved.lan_local.len() <= PROFILES_MAX && saved.lan_local.iter().all(|id| key_ok(id)) && saved.exit_choice.len() <= PROFILES_MAX && saved.exit_choice.iter().all(|(id, tag)| key_ok(id) && tag_ok(tag)) && saved.profiles.iter().all(|(key, kept)| key_ok(key) && kept.networks.len() <= NETWORKS_MAX && kept.mtus.len() <= LIST && kept.standing.rows.len() <= LIST && kept.standing.consent.len() <= 4 && kept.declined.len() <= 4 && kept.networks.iter().all(|(network, state)| key_ok(network) && state.aside.len() <= LIST && state.tried.len() <= LIST && state.plain.len() <= LIST && state.plain.iter().all(|(_, _, count, _)| *count <= FAILS) && state.worked.is_none_or(|(transport, candidate, _)| transport < 256 && candidate < 256)) && kept.mtus.iter().all(|found| key_ok(&found.network) && found.transport < 256))
 	}
 
 	proptest! {
@@ -464,6 +480,21 @@ mod tests {
 		assert!(parse(br#"{"version":1,"seed":3,"lan_tunnel":["ok"]}"#).unwrap().lan_local.is_empty());
 		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_local":["ok","no no",7]}"#).map(|saved| saved.lan_local.len()), Err(Damaged::Form));
 		assert_eq!(parse(br#"{"version":1,"seed":3,"lan_local":["ok","no no"]}"#).unwrap().lan_local.into_iter().collect::<Vec<_>>(), vec!["ok".to_owned()]);
+	}
+
+	#[test]
+	fn an_exit_choice_is_kept_per_subscription_and_a_file_with_a_bad_one_loses_only_that() {
+		let store = Store::volatile();
+		assert_eq!(store.exit_choice("sub-a"), None);
+		store.set_exit_choice("sub-a", Some("de-1".into()));
+		store.set_exit_choice("bad key", Some("de-1".into()));
+		store.set_exit_choice("sub-b", Some("no no".into()));
+		assert_eq!((store.exit_choice("sub-a"), store.exit_choice("bad key"), store.exit_choice("sub-b")), (Some("de-1".into()), None, None));
+		store.set_exit_choice("sub-a", None);
+		assert_eq!(store.exit_choice("sub-a"), None);
+		assert!(parse(br#"{"version":1,"seed":3}"#).unwrap().exit_choice.is_empty());
+		assert_eq!(parse(br#"{"version":1,"seed":3,"exit_choice":{"ok":"de-1","no no":"x","ok2":"bad tag","ok3":""}}"#).unwrap().exit_choice.into_iter().collect::<Vec<_>>(), vec![("ok".to_owned(), "de-1".to_owned())]);
+		assert_eq!(parse(br#"{"version":1,"seed":3,"exit_choice":{"ok":7}}"#).map(|saved| saved.exit_choice.len()), Err(Damaged::Form));
 	}
 
 	#[test]

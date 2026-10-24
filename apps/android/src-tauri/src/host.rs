@@ -179,6 +179,7 @@ impl Core {
 				if let Some(found) = found {fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				drop(library);
 				self.store.set_lan_local(&id, false);
+				self.store.set_exit_choice(&id, None);
 				let _ = self.store.flush();
 				self.library_value().await
 			}
@@ -218,9 +219,15 @@ impl Core {
 				self.disconnect().await.map_err(|error| format!("{error:#}"))?;
 				Ok(Value::Null)
 			}
-			Call::SelectExit {tag} => {
-				let sent = self.handle.lock().unwrap().as_ref().is_some_and(|handle| handle.select_exit(tag));
-				if sent {Ok(Value::Null)} else {Err("There is no running tunnel to change the exit of.".into())}
+			Call::SelectExit {subscription: id, tag} => {
+				if !self.library.lock().await.held().iter().any(|held| held.id().as_str() == id) {return Err("That subscription is not held.".into())}
+				self.store.set_exit_choice(&id, tag.clone());
+				self.store.flush().map_err(|error| format!("The choice could not be saved: {error}"))?;
+				// With no tunnel the choice waits: the engine sends it when a tunnel of this subscription starts.
+				if self.running.lock().unwrap().as_ref().is_some_and(|running| running.subscription == id) {
+					if let Some(handle) = self.handle.lock().unwrap().as_ref() {handle.select_exit(tag);}
+				}
+				self.library_value().await
 			}
 			Call::BundleReview => self.bundle_review().await,
 			Call::BundleDocument {subscription} => self.bundle_document(&subscription).await,

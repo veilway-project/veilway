@@ -186,7 +186,7 @@ async fn disconnect(vpn: State<'_, Arc<Vpn>>) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn select_exit(tag: Option<String>) -> Result<Value, String> {host::call(Call::SelectExit {tag}).await}
+async fn select_exit(id: String, tag: Option<String>) -> Result<Value, String> {call_branded(Call::SelectExit {subscription: id, tag}).await}
 
 #[tauri::command]
 async fn status() -> Result<Value, String> {host::call(Call::Status).await}
