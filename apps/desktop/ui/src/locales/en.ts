@@ -468,7 +468,7 @@ export const en = {
 	"scan.hint": "Hold the QR code in front of the camera.",
 	"scan.starting": "Starting the camera",
 	"scan.privacy": "The camera is on only while this window is open. Nothing is saved or sent.",
-	"scan.privacyApp": "The camera is on only while the scanner is open. Nothing is saved or sent.",
+	"scan.privacyApp": "Your camera app takes one photo. Veilway reads the code on this phone, then deletes the photo.",
 	"import.error.camera_denied": "The camera is blocked. Allow it for Veilway in the system settings, then try again.",
 	"import.error.camera_none": "No camera was found on this device.",
 	"import.error.scan_failed": "The scanner stopped before it read a code. Try again, or paste the link."

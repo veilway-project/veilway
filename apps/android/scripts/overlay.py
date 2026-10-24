@@ -43,11 +43,9 @@ if "VeilwayVpnService" not in text:
 if "InstallReceiver" not in text:
     text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + '\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />', text, count=1)
     text = text.replace("</application>", '        <receiver android:name=".InstallReceiver" android:exported="false" />\n    </application>', 1)
-# The scanner plugin declares a required camera; a phone without one can still install the app and use links, files and pictures.
-if "android.hardware.camera.any" not in text or 'tools:replace="android:required"' not in text:
-    if "xmlns:tools=" not in text:
-        text = re.sub(r"<manifest\b", '<manifest xmlns:tools="http://schemas.android.com/tools"', text, count=1)
-    text = re.sub(r"(<manifest[^>]*>)", lambda m: m.group(1) + '\n    <uses-feature android:name="android.hardware.camera.any" android:required="false" tools:replace="android:required" />', text, count=1)
+# The scanner hands the photo to the phone's camera app through the web view, and from Android 11 the app only finds a camera app that it names here.
+if "android.media.action.IMAGE_CAPTURE" not in text:
+    text = text.replace("</manifest>", '    <queries>\n        <intent><action android:name="android.media.action.IMAGE_CAPTURE" /></intent>\n    </queries>\n</manifest>', 1)
 # The vault and its key are not backed up or transferred: the key is wrapped by a Keystore key that no restore brings back, so a restored vault could not be opened.
 text = re.sub(r"\s+android:(allowBackup|dataExtractionRules|fullBackupContent)=\"[^\"]*\"", "", text)
 text = re.sub(r"<application\b", "<application android:allowBackup=\"false\" android:dataExtractionRules=\"@xml/data_extraction_rules\" android:fullBackupContent=\"@xml/backup_rules\"", text, count=1)
@@ -68,7 +66,7 @@ gradle = root / "src-tauri" / "gen" / "android" / "app" / "build.gradle.kts"
 text = gradle.read_text()
 gradle.write_text(re.sub(r"(compileSdk|targetSdk) = \d+", r"\1 = 36", text))
 # Rust looks these up by name through JNI, and R8 renames members that only Kotlin code seems to use.
-(root / "src-tauri" / "gen" / "android" / "app" / "proguard-veilway.pro").write_text("-keep class io.github.veilwayproject.app.Native { *; }\n-keep class io.github.veilwayproject.app.Bridge { *; }\n# Tauri plugins read their arguments by reflection: a shrunk or renamed argument class arrives as null and the app crashes, as the barcode scanner did in v0.2.18.\n-keep @app.tauri.annotation.InvokeArg class * { *; }\n-keep @app.tauri.annotation.TauriPlugin class * { *; }\n-keepclassmembers class * { @app.tauri.annotation.Command <methods>; @app.tauri.annotation.PermissionCallback <methods>; @app.tauri.annotation.ActivityCallback <methods>; }\n-keep class app.tauri.barcodescanner.** { *; }\n")
+(root / "src-tauri" / "gen" / "android" / "app" / "proguard-veilway.pro").write_text("-keep class io.github.veilwayproject.app.Native { *; }\n-keep class io.github.veilwayproject.app.Bridge { *; }\n# Tauri plugins read their arguments by reflection: a shrunk or renamed argument class arrives as null and the app crashes, as the barcode scanner of v0.2.18 did.\n-keep @app.tauri.annotation.InvokeArg class * { *; }\n-keep @app.tauri.annotation.TauriPlugin class * { *; }\n-keepclassmembers class * { @app.tauri.annotation.Command <methods>; @app.tauri.annotation.PermissionCallback <methods>; @app.tauri.annotation.ActivityCallback <methods>; }\n")
 # The template runs the CLI as `node tauri ...`, which only works for a CLI installed in the project. The image has it on the PATH.
 task = next((root / "src-tauri" / "gen" / "android" / "buildSrc").rglob("BuildTask.kt"))
 text = task.read_text().replace('val executable = """node""";', 'val executable = """tauri""";').replace('listOf("tauri", "android", "android-studio-script")', 'listOf("android", "android-studio-script")')

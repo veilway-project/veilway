@@ -180,6 +180,13 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 		invoke.resolve(JSObject().put("h24", android.text.format.DateFormat.is24HourFormat(activity)))
 	}
 
+	/** Deletes the photos the camera app took for the scanner. The web view's capture writes them to the app's Pictures folder and never removes them, and each one shows a subscription link. */
+	@Command
+	fun forgetPhotos(invoke: Invoke) {
+		activity.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES)?.listFiles()?.filter { it.name.startsWith("JPEG_") }?.forEach { it.delete() }
+		invoke.resolve()
+	}
+
 	@Command
 	fun canInstall(invoke: Invoke) {
 		invoke.resolve(JSObject().put("granted", activity.packageManager.canRequestPackageInstalls()))

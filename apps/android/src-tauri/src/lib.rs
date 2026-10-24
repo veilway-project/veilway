@@ -97,9 +97,12 @@ async fn plugin<T: serde::de::DeserializeOwned + Send + 'static>(vpn: &State<'_,
 async fn import_open(source: Source) -> Result<Value, String> {host::call(Call::ImportOpen {source}).await}
 
 #[tauri::command]
-async fn import_qr(data: String) -> Result<Value, String> {
+async fn import_qr(vpn: State<'_, Arc<Vpn>>, data: String) -> Result<Value, String> {
 	let bytes = base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|_| veilway_engine::import::Code::PictureUnreadable.as_str().to_string())?;
-	let text = tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|error| error.to_string())?.map_err(|code| code.as_str().to_string())?;
+	let text = tokio::task::spawn_blocking(move || qr::decode(&bytes)).await.map_err(|error| error.to_string());
+	// The scanner's photo is in the app's Pictures folder by now, read or not.
+	let _: Result<Value, String> = plugin(&vpn, "forgetPhotos", json!({})).await;
+	let text = text?.map_err(|code| code.as_str().to_string())?;
 	host::call(Call::ImportOpen {source: Source::Link {text}}).await
 }
 
@@ -348,7 +351,6 @@ fn vpn_plugin() -> TauriPlugin<Wry> {
 pub fn run() {
 	tauri::Builder::default()
 		.plugin(tauri_plugin_opener::init())
-		.plugin(tauri_plugin_barcode_scanner::init())
 		.plugin(vpn_plugin())
 		.invoke_handler(tauri::generate_handler![import_open, import_qr, import_proceed, import_keep, import_cancel, share_link, share_text, clock, share_file, library, refresh, remove, answer_hosts, set_lan, get_alpha, set_alpha, connect, answer, disconnect, select_exit, status, log_history, check_update, install_update, bundle_pick, bundle_document, bundle_notices, bundle_close, bundle_install, get_settings, set_settings, open_link, get_autostart, set_autostart, open_vpn_settings])
 		.setup(|app| {

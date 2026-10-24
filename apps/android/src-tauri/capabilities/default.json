@@ -4,5 +4,5 @@
   "description": "Main window: core APIs, the opener for provider links and the QR scanner.",
   "windows": ["main"],
   "platforms": ["android"],
-  "permissions": ["core:default", "barcode-scanner:allow-scan", "barcode-scanner:allow-request-permissions", "barcode-scanner:allow-cancel"]
+  "permissions": ["core:default"]
 }

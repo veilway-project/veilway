@@ -7,15 +7,10 @@ import {asksPrivate, call, type BundleReview, type LegacyOffer, type Offer, type
 // Three steps, each a plain choice: what to add, whether to reach out for it (or read it), and whether to keep what came back. Nothing leaves the device before the second step's yes.
 export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: boolean, onCancel: () => void, onDone: (library: Subscription[]) => void, onAccept: (id: string, terms: string) => void, onBundle: (review: BundleReview) => void}) {
 	const {t, locale, number} = useD(), [text, setText] = useState(""), [offer, setOffer] = useState<Offer | LegacyOffer | null>(null), [review, setReview] = useState<Review | null>(null), [asked, setAsked] = useState<PrivateAsk["ask_private"] | null>(null), [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null), [sealed, setSealed] = useState<string | null>(null), [password, setPassword] = useState(""), [scanning, setScanning] = useState(false);
-	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null);
+	const fileInput = useRef<HTMLInputElement>(null), qrInput = useRef<HTMLInputElement>(null), cameraInput = useRef<HTMLInputElement>(null);
 	const run = <T,>(work: Promise<T>, then: (value: T) => void) => { setBusy(true); setError(null); work.then(then, setError).finally(() => setBusy(false)); };
 	const bundle = () => run(call("bundle_pick"), found => { if (found) onBundle(found); });
 	const qr = (picture: Blob) => run(base64(picture).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_qr", {data})), setOffer);
-	// Android: its scanner reads the code and hands over only the text, which goes through the same step as a pasted link.
-	const scanApp = () => run(import("@tauri-apps/plugin-barcode-scanner").then(async ({scan, requestPermissions, Format}) => {
-		if (await requestPermissions() !== "granted") return Promise.reject("camera_denied");
-		return (await scan({formats: [Format.QRCode], windowed: false})).content;
-	}).catch(error => Promise.reject(error === "camera_denied" ? error : "scan_failed")).then(text => call("import_open", {source: {kind: "link", text}})), setOffer);
 	const proceed = (agreed?: string[]) => run(call("import_proceed", agreed ? {private: agreed} : {}), found => { if (asksPrivate(found)) { setAsked(found.ask_private); } else { setAsked(null); setReview(found); } });
 	const cancel = () => { if (offer || review) call("import_cancel").catch(() => {}); setSealed(null); setPassword(""); setOffer(null); setReview(null); setAsked(null); setError(null); if (!first) onCancel(); };
 	useEffect(() => {
@@ -25,11 +20,13 @@ export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: 
 		return () => removeEventListener("paste", paste);
 	}, [offer, review]);
 	const submit = (event: FormEvent) => { event.preventDefault(); if (!text.trim()) return setError(t("import.needLink")); run(call("import_open", {source: {kind: "link", text: text.trim()}}), setOffer); };
-	const picked = (event: ChangeEvent<HTMLInputElement>, kind: "file" | "qr") => {
+	const picked = (event: ChangeEvent<HTMLInputElement>, kind: "file" | "qr" | "camera") => {
 		const file = event.target.files?.[0];
 		event.target.value = "";
 		if (!file) return;
 		if (kind === "qr") return qr(file);
+		// Android: the phone's camera app takes the photo. It is brought down to 2000 pixels first, which keeps a code readable and the decode quick on a phone.
+		if (kind === "camera") return void createImageBitmap(file).then(bitmap => { const scale = Math.min(1, 2000 / Math.max(bitmap.width, bitmap.height)), canvas = document.createElement("canvas"); [canvas.width, canvas.height] = [Math.round(bitmap.width * scale), Math.round(bitmap.height * scale)]; canvas.getContext("2d")!.drawImage(bitmap, 0, 0, canvas.width, canvas.height); return new Promise<Blob>((done, fail) => canvas.toBlob(blob => blob ? done(blob) : fail(), "image/jpeg", 0.9)); }).then(qr, () => qr(file));
 		// A sealed file is told by its first bytes, and the password is asked for here. The file stays in this window only until it is opened or backed out of.
 		run(base64(file).catch(() => Promise.reject(t("import.readFailed"))).then(data => call("import_open", {source: {kind: "file", data}}).catch(code => code === "needs_password" ? (setSealed(data), null) : Promise.reject(code))), found => { if (found) setOffer(found); });
 	};
@@ -113,12 +110,13 @@ export function Importer({first, onCancel, onDone, onAccept, onBundle}: {first: 
 			<div className="d-actions d-start">
 				<Button icon="upload" disabled={busy} onClick={() => fileInput.current?.click()}>{t("import.file")}</Button>
 				<Button icon="upload" disabled={busy} onClick={() => qrInput.current?.click()}>{t("import.qr")}</Button>
-				{CAMERA && <Button disabled={busy} onClick={() => ANDROID ? scanApp() : setScanning(true)}>{t("import.scan")}</Button>}
+				{CAMERA && <Button disabled={busy} onClick={() => ANDROID ? cameraInput.current?.click() : setScanning(true)}>{t("import.scan")}</Button>}
 				<Button icon="upload" disabled={busy} onClick={bundle}>{t("bundle.open")}</Button>
 			</div>
 			{ANDROID && <p className="vw-muted vw-small">{t("scan.privacyApp")}</p>}
 			{!matchMedia("(pointer: coarse)").matches && <p className="vw-muted vw-small">{t("import.pasteHint")}</p>}
 			<input ref={fileInput} type="file" hidden onChange={event => picked(event, "file")}/>
+			<input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={event => picked(event, "camera")}/>
 			<input ref={qrInput} type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" hidden onChange={event => picked(event, "qr")}/>
 			{failure}
 			{scanning && <ScanDialog onClose={() => setScanning(false)} onFound={found => { setScanning(false); setOffer(found); }}/>}
