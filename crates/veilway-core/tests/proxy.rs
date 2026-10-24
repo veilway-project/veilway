@@ -19,7 +19,15 @@ fn own() -> Option<IpAddr> {
 }
 
 /// A loopback address with a port nothing holds.
-fn free() -> SocketAddr {std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()}
+/// A port no listener holds now and that this process has not handed out before: one that is let go at once can come back for the next inbound of the same config.
+fn free() -> SocketAddr {
+	static GIVEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+	loop {
+		let at = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+		let mut given = GIVEN.lock().unwrap();
+		if !given.contains(&at.port()) {given.push(at.port()); return at}
+	}
+}
 
 /// A server that sends back every byte until the client closes.
 async fn echo(at: IpAddr) -> SocketAddr {

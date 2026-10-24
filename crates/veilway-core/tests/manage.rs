@@ -496,7 +496,15 @@ async fn a_4_mib_transfer_each_way_leaves_a_users_traffic_and_the_flow_table_alo
 	let mut net = up("manage-4mib", Setup {api: false, ..Setup::new(true, Over::Obfs, true)}, time!()).await;
 	let standing = stand_in(net.remote(), |path, length| if path == "/echo" {Reply::Raw(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n{length}", length.to_string().len()).into_bytes())} else {Reply::Length(manage::BODY)});
 	assert_eq!(net.user.as_mut().unwrap().leaves(PUBLIC, 40000).await.as_deref(), Some("main"));
-	let (flows, far, used) = (net.node1.flows(), net.remote().links()[0].flows, net.node1.usage("alice").unwrap().used_bytes);
+	// The closing packets of the user's own flow can still be counted a moment later on a slow runner: the count is taken once it holds still.
+	let mut used = net.node1.usage("alice").unwrap().used_bytes;
+	for _ in 0..20 {
+		tokio::time::sleep(Duration::from_millis(250)).await;
+		let now = net.node1.usage("alice").unwrap().used_bytes;
+		if now == used {break}
+		used = now;
+	}
+	let (flows, far) = (net.node1.flows(), net.remote().links()[0].flows);
 	let started = Instant::now();
 	let sent = net.node1.manage("far", ask("POST", "/echo", vec![b'a'; manage::BODY])).await.expect("a 4 MiB request was not carried");
 	let up_took = started.elapsed();
