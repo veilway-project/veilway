@@ -396,6 +396,8 @@ Decided by the owner on 2026-10-24, from the design: quotas count what the other
 
 Then simplified by the owner the same day: no new panel and node channel. A remote node is connected to the panel's node by a node link over an inbound, dialled by either side, and the panel reaches the remote node's control API inside that link, through its own node's control socket. Nothing new listens on a node and there is no new cryptography; quotas are enforced by the panel adding up every node's usage and cutting a user on every node once the limit is reached. Threat model 5.19 and the protocol page panel-nodes describe the first design and are rewritten for this one.
 
+The design for links (2026-10-24, owner going with the recommendations): node 1 gets a control API route `/v1/links/{tag}/api/{path}` that opens a TCP connection inside the link (userspace stack) to the remote node's management port, where the remote serves an allowlist of its own control API routes, only from the link it marked `manage: "by_peer"` (node 1's side says `manage: "peer"`); `manage` and both link addresses are in the pairing offer, so the fingerprint covers them and an older node refuses; a config pushed through a link is applied on trial and rolled back after 120 s without a confirming request; a user over quota is cut by setting each node's quota to what it counted; one managing panel per node and no chains; the single-node routes keep meaning node 1 until v0.4.0; a node's profile appears once that node has the device.
+
 ## After v0.3.0
 
 Moved out of v0.3.0 by the owner on 2026-10-24, which holds only several nodes from one panel. Still wanted, with no release set:
