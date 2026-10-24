@@ -30,6 +30,11 @@ static OWN: LazyLock<watch::Sender<Own>> = LazyLock::new(|| watch::channel(Own {
 
 pub fn own() -> watch::Receiver<Own> {OWN.subscribe()}
 
+/// Whether the device is idle (screen off or Doze), as the service last told. A tunnel reads it at start and on every change.
+static LOW_POWER: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
+
+pub fn low_power() -> watch::Receiver<bool> {LOW_POWER.subscribe()}
+
 fn with_bridge<T>(call: impl FnOnce(&mut JNIEnv, &JClass) -> jni::errors::Result<T>) -> Option<T> {
 	let (vm, class) = (VM.get()?, CLASS.get()?);
 	let mut env = vm.attach_current_thread().ok()?;
@@ -156,6 +161,16 @@ pub extern "system" fn Java_io_github_veilwayproject_app_Native_disconnect<'a>(m
 #[no_mangle]
 pub extern "system" fn Java_io_github_veilwayproject_app_Native_lockdown(_: JNIEnv, _: JClass, on: jboolean) {
 	host::LOCKDOWN.store(on == JNI_TRUE, Ordering::Relaxed);
+}
+
+/// The device went idle (screen off or Doze) or came back. Kotlin says it when the service starts and on every change.
+#[no_mangle]
+pub extern "system" fn Java_io_github_veilwayproject_app_Native_lowPower(_: JNIEnv, _: JClass, on: jboolean) {
+	LOW_POWER.send_if_modified(|low| {
+		let changed = *low != (on == JNI_TRUE);
+		*low = on == JNI_TRUE;
+		changed
+	});
 }
 
 /// The networks the device is on, as `address/prefix` strings: its addresses on networks that are not the VPN, and the gateway, and whether they are mobile data. The engine skips an address of the profile that lies inside one of them, and reconnects when the networks change.

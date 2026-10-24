@@ -69,8 +69,7 @@ impl Conn {
 	/// Whether the handshake is done and the connection is not over.
 	pub fn is_open(&self) -> bool {self.state == State::Open}
 	pub fn closed(&self) -> Option<Closed> {if let State::Over(closed) = self.state {Some(closed)} else {None}}
-	#[cfg(test)]
-	fn due(&self) -> Option<Instant> {self.due}
+	pub fn due(&self) -> Option<Instant> {self.due}
 	/// What arrived in order and was not read before.
 	pub fn read(&mut self) -> Vec<u8> {std::mem::take(&mut self.received)}
 	fn window(&self) -> u16 {WINDOW.saturating_sub(self.received.len()) as u16}

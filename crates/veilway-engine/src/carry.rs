@@ -12,7 +12,7 @@ use boringtun::noise::TunnResult;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::time::{Instant, MissedTickBehavior};
+use tokio::time::Instant;
 use veilway_proto::control::{self, ByeReason, ClientMessage, ExitStatus, NodeMessage, Period, MTU_CONFIRM, MTU_REMEMBERED, OPEN_DELAY, PROBE_RUN_INTERVAL, SET_EXIT_BURST, SET_EXIT_REFILL};
 use veilway_proto::opening::OpenError;
 use veilway_proto::{session, uniform};
@@ -51,7 +51,22 @@ impl Carrier {
 	}
 	fn dropped(&self) -> u64 {if let Self::Native(session) = self {session.numbers().dropped} else {0}}
 	fn moved(&self) {if let Self::Native(session) = self {session.moved()}}
+	fn low_power(&self, on: bool) {if let Self::Native(session) = self {session.low_power(on)}}
 	async fn close(self) {if let Self::Native(session) = self {session.close().await;}}
+}
+
+// The timer loop's steps. While something moves it ticks every 250 ms, as it always did. Idle, every second, and every two seconds while the device is in low power.
+const FAST: Duration = Duration::from_millis(250);
+const IDLE: Duration = Duration::from_secs(1);
+const IDLE_LOW: Duration = Duration::from_secs(2);
+// How long after the last packet or command the loop stays at the fast step.
+const ACTIVE: Duration = Duration::from_secs(2);
+
+/// How long the timer loop sleeps before its next tick. The fast step while the session is not settled (`busy`: not opened, a handshake in flight, something asked for that the next tick answers) or `now` is before `active_until`. Otherwise the idle step, or the time to the nearest `deadline` the machines of the session report when that is sooner, never below the fast step, so nothing due fires later than the idle step allows.
+fn pause(now: Instant, busy: bool, active_until: Instant, deadline: Option<Instant>, low_power: bool) -> Duration {
+	if busy || now < active_until {return FAST}
+	let idle = if low_power {IDLE_LOW} else {IDLE};
+	deadline.map_or(idle, |at| at.saturating_duration_since(now).clamp(FAST, idle))
 }
 
 /// What belongs to one session and ends with it.
@@ -78,6 +93,11 @@ pub(crate) struct Carry {
 	broken: Option<Ended>,
 	say: Option<Say>,
 	opened: bool,
+	// A handshake initiation went out and no response has come: the loop keeps the fast step, as WireGuard's retries (5 s) and the session's give-up depend on it.
+	handshaking: bool,
+	// Set by what moves the loop (a packet of the platform, one that carries data or a handshake from the node, a command), read once after the wait.
+	touched: bool,
+	active_until: Instant,
 	began: Instant,
 	shown: Instant,
 	seen_dropped: u64,
@@ -141,7 +161,7 @@ impl Core {
 	pub(crate) async fn carried(&mut self, mut carrier: Carrier, transport: usize, candidate: usize, opened: bool, mut ended: Vec<(usize, Ended)>) -> Done {
 		let (now, local) = (Instant::now(), self.profile.device.addresses.first().copied().zip(self.profile.gateways.first().copied()));
 		let channel = local.map(|(local, gateway)| Channel::new(self.link.secret.clone(), self.link.inbound, self.link.device, self.profile.min_control_version, local, gateway, now));
-		let mut c = Carry {transport, candidate, datagrams: veilway_transport::udp::DONT_FRAGMENT && matches!(self.transports[transport], Transport::Udp(_) | Transport::UdpObfs(_)), channel, armed: false, control_at: None, failures: 0, dead: false, catalogue: false, walk: None, walk_at: None, confirm_at: None, tokens: f64::from(SET_EXIT_BURST), refilled: now, asked: None, bye: false, replan: false, broken: None, say: None, opened: false, began: now, shown: now, seen_dropped: 0, buffer: vec![0u8; BUFFER]};
+		let mut c = Carry {transport, candidate, datagrams: veilway_transport::udp::DONT_FRAGMENT && matches!(self.transports[transport], Transport::Udp(_) | Transport::UdpObfs(_)), channel, armed: false, control_at: None, failures: 0, dead: false, catalogue: false, walk: None, walk_at: None, confirm_at: None, tokens: f64::from(SET_EXIT_BURST), refilled: now, asked: None, bye: false, replan: false, broken: None, say: None, opened: false, handshaking: false, touched: false, active_until: now + ACTIVE, began: now, shown: now, seen_dropped: 0, buffer: vec![0u8; BUFFER]};
 		self.status.connection = Connection::of(&self.transports[transport], candidate);
 		// What the node said over an earlier session's channel is not shown as this session's: the catalogue comes again with the snapshot.
 		(self.warn, self.status.out_of_date, self.status.exits) = (None, false, Vec::new());
@@ -149,21 +169,35 @@ impl Core {
 		self.mtu_set(self.remembered(transport).unwrap_or(self.profile.mtu));
 		carrier.room(self.status.mtu);
 		if opened {self.opened(&mut c)}
-		let mut tick = tokio::time::interval(Duration::from_millis(250));
-		tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+		carrier.low_power(self.low_power);
+		let sleep = tokio::time::sleep(FAST);
+		tokio::pin!(sleep);
 		let (end, why) = loop {
 			tokio::select! {
 				received = carrier.recv() => match received {
 					Ok(datagram) => self.datagram(&mut c, &carrier, &datagram),
 					Err(error) => break (error, Why::Over),
 				},
-				Some(packet) = self.from_platform.recv() => self.outgoing(&mut c, &carrier, packet),
-				command = self.commands.recv() => match command.map_or(Reaction::Stop, |command| self.command(command)) {
+				Some(packet) = self.from_platform.recv() => {
+					c.touched = true;
+					self.outgoing(&mut c, &carrier, packet);
+				}
+				command = self.commands.recv() => match command.inspect(|_| c.touched = true).map_or(Reaction::Stop, |command| self.command(command)) {
 					Reaction::Stop => break (Ended::Closed(End::Asked), Why::Stop),
 					Reaction::Moved => self.moved(&mut c, &carrier),
+					Reaction::Power => carrier.low_power(self.low_power),
 					_ => {}
 				},
-				_ = tick.tick() => self.tick(&mut c, &carrier),
+				_ = &mut sleep => {
+					self.counters.ticks += 1;
+					self.tick(&mut c, &carrier);
+					let now = Instant::now();
+					sleep.as_mut().reset(now + self.pace(&c, now));
+				}
+			}
+			if let Some(at) = c.touched.then(Instant::now) {
+				(c.touched, c.active_until) = (false, at + ACTIVE);
+				if sleep.deadline() > at + FAST {sleep.as_mut().reset(at + FAST)}
 			}
 			carrier.room(self.status.mtu);
 			if c.bye {break (Ended::Closed(End::Peer), Why::Bye)}
@@ -213,6 +247,8 @@ impl Core {
 				input = &[];
 			}
 		}
+		c.touched |= !replies.is_empty() || !packets.is_empty();
+		if datagram.first() == Some(&2) {c.handshaking = false}
 		for reply in replies {
 			let kind = if matches!(reply.first(), Some(1..=3)) {Kind::Handshake} else {Kind::Packet {flow: 0, control: false}};
 			carrier.send(reply, kind);
@@ -276,8 +312,12 @@ impl Core {
 			let rekey = if wire.due() {wire.initiation()} else {None};
 			(rekey, if let TunnResult::WriteToNetwork(datagram) = wire.tunn().encapsulate(packet, &mut c.buffer) {Some(datagram.to_vec())} else {None})
 		};
-		if let Some(rekey) = rekey {carrier.send(rekey, Kind::Handshake)}
+		if let Some(rekey) = rekey {
+			c.handshaking = true;
+			carrier.send(rekey, Kind::Handshake);
+		}
 		if let Some(datagram) = datagram {
+			c.handshaking |= datagram.first() == Some(&1);
 			let kind = if matches!(datagram.first(), Some(1..=3)) {Kind::Handshake} else if probe {Kind::Probe} else {Kind::Packet {flow: flow(packet), control}};
 			carrier.send(datagram, kind);
 		}
@@ -298,6 +338,16 @@ impl Core {
 			c.walk_at = Some(Instant::now() + Duration::from_secs(1));
 		}
 	}
+	// How long until the next tick: see `pause`. The deadlines are those of the control channel (a segment sent again, a message held back, an opening's time), of the MTU walk and of what waits to start (the channel's opening, the walk, its confirmation).
+	fn pace(&self, c: &Carry, now: Instant) -> Duration {
+		let busy = !c.opened || c.handshaking || self.reprobe || self.wanted.is_some() && c.catalogue;
+		#[cfg(feature = "testing")]
+		let busy = busy || !self.injected.is_empty();
+		// A start that `control_tick` leaves alone (the channel gave up, or is not open) is no deadline: it would never pass.
+		let open = c.channel.as_ref().is_some_and(Channel::is_open);
+		let deadline = [c.control_at.filter(|_| !c.dead), c.walk_at.filter(|_| open), c.confirm_at.filter(|_| open), c.walk.as_ref().and_then(Walk::due), c.channel.as_ref().and_then(Channel::due)].into_iter().flatten().min();
+		pause(now, busy, c.active_until, deadline, self.low_power)
+	}
 	// Everything that happens on a timer.
 	fn tick(&mut self, c: &mut Carry, carrier: &Carrier) {
 		let now = Instant::now();
@@ -314,6 +364,7 @@ impl Core {
 			}
 		};
 		for datagram in timers {
+			c.handshaking |= datagram.first() == Some(&1);
 			// A handshake initiation made by WireGuard's own timer is one "because the node stopped answering".
 			let kind = match datagram.first() {
 				Some(1) => Kind::Stalled,
@@ -620,5 +671,25 @@ mod tests {
 		assert_eq!(next_period(Period::Monthly, 1_701_388_800), Some(1_704_067_200));
 		assert_eq!(next_period(Period::Monthly, 1_706_745_600 + 40 * 86_400), Some(1_711_929_600));
 		assert_eq!(next_period(Period::Monthly, 0), Some(31 * 86_400));
+	}
+
+	#[test]
+	fn the_loop_ticks_fast_while_it_matters_and_slowly_when_idle_and_never_later_than_a_deadline_allows() {
+		let (now, quiet) = (Instant::now(), Instant::now() - Duration::from_secs(5));
+		let long = Some(now + Duration::from_secs(30));
+		assert_eq!(pause(now, false, quiet, None, false), IDLE);
+		assert_eq!(pause(now, false, quiet, None, true), IDLE_LOW);
+		// A session that is not settled, a handshake in flight or a request the next tick answers: all `busy`.
+		assert_eq!(pause(now, true, quiet, None, true), FAST);
+		// Packets in the last 2 s.
+		assert_eq!(pause(now, false, now + Duration::from_secs(1), long, false), FAST);
+		assert_eq!(pause(now + ACTIVE, false, now + ACTIVE, None, false), IDLE);
+		// A deadline sooner than the idle step is met, down to the fast step, and one that is far does not shorten the idle step.
+		assert_eq!(pause(now, false, quiet, Some(now + Duration::from_millis(600)), true), Duration::from_millis(600));
+		assert_eq!(pause(now, false, quiet, Some(now + Duration::from_millis(600)), false), Duration::from_millis(600));
+		assert_eq!(pause(now, false, quiet, Some(now + Duration::from_millis(10)), true), FAST);
+		assert_eq!(pause(now, false, quiet, Some(now), false), FAST);
+		assert_eq!(pause(now, false, quiet, long, false), IDLE);
+		assert_eq!(pause(now, false, quiet, long, true), IDLE_LOW);
 	}
 }

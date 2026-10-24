@@ -72,8 +72,7 @@ impl Walk {
 	pub fn port(&self) -> u16 {self.port}
 	#[cfg(test)]
 	fn is_over(&self) -> bool {self.step == Step::Over}
-	#[cfg(test)]
-	fn due(&self) -> Option<Instant> {self.due}
+	pub fn due(&self) -> Option<Instant> {self.due}
 	// Ends the run.
 	fn end(&mut self, outcome: Outcome) -> Vec<Action> {
 		(self.step, self.due) = (Step::Over, None);

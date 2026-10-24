@@ -383,6 +383,8 @@ impl Core {
 			}
 		};
 		let mut watch = local.watch().context("the proxy has no tunnel under it")?;
+		let mut power = crate::bridge::low_power();
+		local.low_power(*power.borrow_and_update());
 		self.show_proxy(Some(proxy.out(local.addr(), None)));
 		on_status(&watch.borrow_and_update().clone());
 		loop {
@@ -396,6 +398,10 @@ impl Core {
 					let found = own.borrow_and_update().clone();
 					tracing::info!(networks = found.networks.len(), "the device's networks changed");
 					local.moved(found.description, found.networks);
+				}
+				changed = power.changed() => {
+					changed?;
+					local.low_power(*power.borrow_and_update());
 				}
 				() = stop.notified() => break,
 			}

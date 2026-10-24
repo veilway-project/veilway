@@ -5,7 +5,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
+import android.content.BroadcastReceiver
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.LinkProperties
@@ -14,6 +16,7 @@ import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.PowerManager
 import java.net.Inet6Address
 import java.util.Locale
 import java.util.concurrent.Executors
@@ -49,6 +52,9 @@ class VeilwayVpnService : VpnService() {
 	/** The default network the system reports, the one the phone's packets leave by (the service's own sockets are kept out of the VPN). */
 	@Volatile private var underlying: Pair<Network, LinkProperties>? = null
 	private var callback: ConnectivityManager.NetworkCallback? = null
+	private var idleWatcher: BroadcastReceiver? = null
+	/** What the ongoing notification says now, so that a status that changes only counters does not post it again. */
+	private var shown = ""
 	private var state = "connecting"
 	private var finished = false
 	/** The connection has no VPN interface: only programs set to use the local proxy go through it, and the phone's other traffic is not blocked. */
@@ -87,6 +93,7 @@ class VeilwayVpnService : VpnService() {
 		finished = false
 		if (fromWindow) retries = 0
 		watchNetworks()
+		watchIdle()
 		start(resumed, 0)
 		return START_STICKY
 	}
@@ -111,6 +118,8 @@ class VeilwayVpnService : VpnService() {
 	@Synchronized fun show(newState: String) {
 		state = newState
 		if (newState == "connected") retries = 0
+		if (shown == "$proxyOnly $newState") return
+		shown = "$proxyOnly $newState"
 		getSystemService(NotificationManager::class.java).notify(ONGOING, ongoing())
 	}
 
@@ -137,6 +146,7 @@ class VeilwayVpnService : VpnService() {
 		held?.close()
 		held = null
 		unwatchNetworks()
+		unwatchIdle()
 		stopForeground(STOP_FOREGROUND_REMOVE)
 		if (error != null) {
 			wanted.wanted = false
@@ -188,6 +198,7 @@ class VeilwayVpnService : VpnService() {
 		held?.close()
 		held = null
 		unwatchNetworks()
+		unwatchIdle()
 		instance = null
 		worker.shutdown()
 		super.onDestroy()
@@ -218,6 +229,7 @@ class VeilwayVpnService : VpnService() {
 	}
 
 	private fun startForegroundNow() {
+		shown = "$proxyOnly $state"
 		if (Build.VERSION.SDK_INT >= 34) startForeground(ONGOING, ongoing(), ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED) else startForeground(ONGOING, ongoing())
 	}
 
@@ -248,6 +260,23 @@ class VeilwayVpnService : VpnService() {
 		}
 		callback = watcher
 		getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(watcher)
+	}
+
+	/** Tells the engine when the phone goes idle (screen off, or Doze), so that it can keep fewer timers running. */
+	private fun watchIdle() {
+		if (idleWatcher != null) return
+		val power = getSystemService(PowerManager::class.java)
+		val tell = { Native.lowPower(!power.isInteractive || power.isDeviceIdleMode) }
+		val watcher = object : BroadcastReceiver() { override fun onReceive(context: Context, intent: Intent) = tell() }
+		idleWatcher = watcher
+		registerReceiver(watcher, IntentFilter().apply { addAction(Intent.ACTION_SCREEN_OFF); addAction(Intent.ACTION_SCREEN_ON); addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED) })
+		tell()
+	}
+
+	private fun unwatchIdle() {
+		val watcher = idleWatcher ?: return
+		idleWatcher = null
+		try { unregisterReceiver(watcher) } catch (e: Exception) { }
 	}
 
 	private fun unwatchNetworks() {

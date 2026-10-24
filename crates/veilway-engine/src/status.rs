@@ -290,6 +290,8 @@ pub struct Counters {
 	pub byes: u64,
 	/// MTU probe runs finished and the size last found.
 	pub probes: u64,
+	/// Wakeups of a session's timer loop, a count to measure how often an idle tunnel wakes the device.
+	pub ticks: u64,
 }
 
 /// What the carrier of a legacy profile counts ("Counters"). Every field but the open flows only grows during a run. No rating word, no profile text and no address is in it.

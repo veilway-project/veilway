@@ -1,6 +1,9 @@
 package io.github.veilwayproject.app
 
 import android.os.Bundle
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -15,5 +18,22 @@ class MainActivity : TauriActivity() {
       view.setPadding(bars.left, bars.top, bars.right, bars.bottom)
       WindowInsetsCompat.CONSUMED
     }
+  }
+
+  /** The web view keeps running in the background unless it is told: pausing it makes the page hidden (visibilitychange), and the screens stop their one second timers. */
+  private fun webView(view: View): WebView? {
+    if (view is WebView) return view
+    if (view is ViewGroup) for (i in 0 until view.childCount) webView(view.getChildAt(i))?.let { return it }
+    return null
+  }
+
+  override fun onStop() {
+    super.onStop()
+    webView(findViewById(android.R.id.content))?.onPause()
+  }
+
+  override fun onStart() {
+    super.onStart()
+    webView(findViewById(android.R.id.content))?.onResume()
   }
 }

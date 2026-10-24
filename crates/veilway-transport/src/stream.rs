@@ -14,7 +14,7 @@
 //! An open session is lost when its connection ends, when an idle keepalive gets no chunk back within 10 s, and when a handshake WireGuard started because the node stopped answering (`Kind::Stalled`) gets none either: a connection that goes dark without a reset is noticed by that and by nothing else while the caller keeps sending.
 use crate::h2::{self, Fail, Mark, Opened};
 use crate::http::{self, Stop, HEAD_MAX};
-use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
+use crate::{keepalive_range, lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -185,6 +185,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 	let (mut batch, mut flush, mut held, mut awaiting, mut carry, mut established, mut idle) = (vec![(first, Kind::Packet {flow: 0, control: false})], true, None::<(Vec<u8>, Instant, bool)>, None::<Instant>, None::<(Vec<u8>, Kind)>, false, deadline);
 	// `next` is a datagram the caller handed over while the task waited, and `closing` that the caller closed the session. `gone` says the connection is over, so there is nobody to close the session with, and `cut` that it ended with nothing to vouch for who ended it.
 	let (mut next, mut closing, mut gone, mut cut) = (None::<(Vec<u8>, Kind)>, false, false, false);
+	// `low` is the low power state the idle keepalive was last drawn for, and `sent_at` when the session last sent: leaving low power draws the normal range again from there.
+	let (mut low, mut sent_at) = (false, Instant::now());
 	let ended = 'session: loop {
 		batch.extend(carry.take());
 		// "The sender puts every datagram that is waiting at the moment it writes into one chunk, up to the limit, and never waits for more."
@@ -232,8 +234,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 			if batch.iter().any(|(_, kind)| *kind == Kind::Stalled) {awaiting.get_or_insert(Instant::now() + LIVENESS);}
 			port.sent(batch.len());
 			batch.clear();
-			let Ok(silence) = pause(&link.padding.keepalive) else {break End::Random.into()};
-			(flush, idle) = (false, Instant::now() + silence);
+			let Ok(silence) = pause(&keepalive_range(link, port.shared.low_power.load(Ordering::Relaxed))) else {break End::Random.into()};
+			(flush, idle, sent_at) = (false, Instant::now() + silence, Instant::now());
 		}
 		if closing {
 			if carry.is_none() {break End::Asked.into()}
@@ -264,6 +266,14 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 			}
 		}
 		// The idle keepalive is not due while a keepalive is on its way out already.
+		let now_low = port.shared.low_power.load(Ordering::Relaxed);
+		if now_low != low {
+			low = now_low;
+			if !low {
+				let Ok(silence) = pause(&link.padding.keepalive) else {break End::Random.into()};
+				idle = sent_at + silence;
+			}
+		}
 		let timer = [held.as_ref().map(|held| held.1), awaiting, if !established {Some(deadline)} else if held.is_none() {Some(idle)} else {None}].into_iter().flatten().min().unwrap_or(idle);
 		tokio::select! {
 			got = rd.read(&mut read) => match got {
@@ -278,7 +288,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 				Some(sent) => next = Some(sent),
 				None => closing = true,
 			},
-			asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved)),
+			asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved | Ask::Power)),
 			_ = sleep_until(timer) => {
 				let now = Instant::now();
 				// "Gives each transport 10 s to carry a chunk from the node." The proof was taken, so a node that knows the tunnel answers: silence behind a handshake initiation is the path's. Behind a keepalive it is a node that no longer has the tunnel, and that is neither a refusal nor a block.
@@ -291,7 +301,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, name: Name, path: &str, ca
 					if waited {awaiting.get_or_insert(now + LIVENESS);}
 				} else if established && held.is_none() && now >= idle {
 					// "When it has sent nothing for the idle keepalive time, it asks the WireGuard layer for one keepalive datagram and sends it in a chunk."
-					let (Ok(silence), Ok(delay)) = (pause(&link.padding.keepalive), pause(&LONE_KEEPALIVE)) else {break End::Random.into()};
+					let (Ok(silence), Ok(delay)) = (pause(&keepalive_range(link, port.shared.low_power.load(Ordering::Relaxed))), pause(&LONE_KEEPALIVE)) else {break End::Random.into()};
 					idle = now + silence;
 					held = port.want(Want::Keepalive).map(|datagram| (datagram, now + delay, true));
 				}

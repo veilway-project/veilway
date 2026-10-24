@@ -5,11 +5,12 @@
 //! Every answer is read inside bounds that are checked before a buffer grows: the head of an answer, its length, the chunked coding of a stream, its lines and its events.
 use crate::fronted::{exchange, slower, spread, POLL};
 use crate::http::{self, Stop, CHROME, PLATFORM};
-use crate::{fingerprint::Stream as Conn, lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Hook, Kind, Link, Port, Refusal, Unreachable, Want, ATTEMPT};
+use crate::{fingerprint::Stream as Conn, keepalive_range, lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Hook, Kind, Link, Port, Refusal, Unreachable, Want, ATTEMPT};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rustls::RootCertStore;
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -338,7 +339,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 					flights.spawn(flight(candidate.clone(), roots.clone(), hook.clone(), conn, request, number, limit));
 				}
 				gather_at = if pending.is_empty() {None} else {Some(now)};
-				due = Instant::now() + if streaming {pause(&link.padding.keepalive).unwrap_or_default()} else {spread(wait).unwrap_or(POLL)};
+				due = Instant::now() + if streaming {pause(&keepalive_range(link, port.shared.low_power.load(Ordering::Relaxed))).unwrap_or_default()} else {spread(wait).unwrap_or(POLL)};
 			}
 			if closing && pending.is_empty() && held.is_none() && inflight == 0 {break 'session End::Asked.into()}
 			if number >= NUMBER_LAST && inflight == 0 {break 'session End::Exhausted.into()}
@@ -363,6 +364,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 				},
 				asked = port.ask.recv() => match asked {
 					// The network moved: what was learnt about streams on the old one is not carried over.
+					Some(Ask::Power) => {}
 					Some(Ask::Moved) => MARKS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(address, _)| *address != candidate.address),
 					_ => closing = true,
 				},

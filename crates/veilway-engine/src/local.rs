@@ -663,6 +663,7 @@ impl Local {
 	pub fn connect_again(&self) {self.send(Command::Again)}
 	pub fn moved(&self, network: String, networks: Vec<Network>) {self.send(Command::Moved(network, networks))}
 	pub fn reprobe(&self) {self.send(Command::Reprobe)}
+	pub fn low_power(&self, on: bool) {self.send(Command::LowPower(on))}
 	pub fn refreshed(&self, usage: Option<Usage>) {self.send(Command::Refreshed(usage))}
 
 	fn send(&self, command: Command) {

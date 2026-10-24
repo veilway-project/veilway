@@ -42,7 +42,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::RangeInclusive;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -374,9 +374,9 @@ pub struct Numbers {
 	pub heard: Option<Instant>,
 }
 
-pub(crate) struct Shared {datagram: usize, room: AtomicU16, sent: AtomicU64, received: AtomicU64, dropped: AtomicU64, heard: Mutex<Option<Instant>>}
+pub(crate) struct Shared {datagram: usize, room: AtomicU16, low_power: AtomicBool, sent: AtomicU64, received: AtomicU64, dropped: AtomicU64, heard: Mutex<Option<Instant>>}
 
-pub(crate) enum Ask {Close, Moved}
+pub(crate) enum Ask {Close, Moved, Power}
 
 /// One session's ends as its task holds them.
 pub(crate) struct Port {pub out: mpsc::Receiver<(Vec<u8>, Kind)>, pub input: mpsc::Sender<Vec<u8>>, pub ask: mpsc::UnboundedReceiver<Ask>, pub state: watch::Sender<State>, pub shared: Arc<Shared>, pub last: Arc<Mutex<Option<Instant>>>, pub source: Source, pub env: Env}
@@ -416,7 +416,7 @@ pub(crate) async fn unasked<T>(ask: &mut mpsc::UnboundedReceiver<Ask>, opening: 
 	loop {
 		tokio::select! {
 			done = &mut opening => return Some(done),
-			asked = ask.recv() => if !matches!(asked, Some(Ask::Moved)) {return None},
+			asked = ask.recv() => if !matches!(asked, Some(Ask::Moved | Ask::Power)) {return None},
 		}
 	}
 }
@@ -430,6 +430,14 @@ impl fmt::Debug for Session {
 
 /// The system's secure random source, as `veilway-proto` takes one.
 pub(crate) fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {SystemRandom::new().fill(bytes).map_err(|_| NoRandom)}
+
+/// The range the idle keepalive of a stream is drawn from. While the device is in low power it is the top 10 s of the range the profile allows: 50 to 60 s for a profile that keeps the default, and the last 10 s of its own range when the profile set one, so the draw never passes what the provider chose and never passes 60 s.
+pub(crate) fn keepalive_range(link: &Link, low_power: bool) -> RangeInclusive<u32> {
+	let (start, end) = (*link.padding.keepalive.start(), *link.padding.keepalive.end());
+	if !low_power {return link.padding.keepalive.clone()}
+	let top = if link.padding.keepalive == session::KEEPALIVE {*session::KEEPALIVE_BOUNDS.end()} else {end};
+	top.saturating_sub(10_000).max(start)..=top
+}
 
 /// A time drawn uniformly from a range of milliseconds.
 pub(crate) fn pause(range: &RangeInclusive<u32>) -> Result<Duration, End> {session::delay(range, &mut random).map_err(|_| End::Random)}
@@ -513,7 +521,7 @@ impl Session {
 	/// The same over up to `connections` connections of `tls`, `ws` or `faketls`, the profile's `parallel`: "Each connection is its own session with its own proof and keys, for the same device", the second and later ones opened "one at a time, each after a delay drawn uniformly from 1 to 5 s". Every other transport has one.
 	pub fn parallel(link: &Link, target: Target, connections: u8, env: Env, source: Source) -> Result<Session, Refuse> {
 		check(link, &target, &env)?;
-		let ((input, inbox), shared) = (mpsc::channel(INBOX), Arc::new(Shared {datagram: (usize::from(link.mtu) + 32).min(MAX_ITEM), room: AtomicU16::new(link.mtu), sent: AtomicU64::new(0), received: AtomicU64::new(0), dropped: AtomicU64::new(0), heard: Mutex::new(None)}));
+		let ((input, inbox), shared) = (mpsc::channel(INBOX), Arc::new(Shared {datagram: (usize::from(link.mtu) + 32).min(MAX_ITEM), room: AtomicU16::new(link.mtu), low_power: AtomicBool::new(false), sent: AtomicU64::new(0), received: AtomicU64::new(0), dropped: AtomicU64::new(0), heard: Mutex::new(None)}));
 		Ok(Session {member: launch(link.clone(), target, usize::from(connections.clamp(1, 4)), env, source, input, shared.clone()), input: inbox, shared})
 	}
 	/// Hands one WireGuard datagram to the session. False when it was dropped because the queue is full or the session is over: "Drop, do not queue." Nothing is ever sent outside the session.
@@ -545,6 +553,11 @@ impl Session {
 	pub fn moved(&self) {let _ = self.member.ask.send(Ask::Moved);}
 	/// The tunnel's MTU now, the profile's or a lower one the probes found. `udp-obfs` pads no packet above it and 62 bytes, so that padding never makes a packet the path drops.
 	pub fn room(&self, mtu: u16) {self.shared.room.store(mtu, Ordering::Relaxed)}
+	/// The device is idle (screen off, Doze) or is not. Stream transports with an idle keepalive draw it from the top of the profile's range while it is, and `udp-obfs` does not change: the NAT bindings of mobile networks may expire sooner than the range's top.
+	pub fn low_power(&self, on: bool) {
+		self.shared.low_power.store(on, Ordering::Relaxed);
+		let _ = self.member.ask.send(Ask::Power);
+	}
 	pub fn state(&self) -> State {*self.member.state.borrow()}
 	/// The state as something to wait on.
 	pub fn watch(&self) -> watch::Receiver<State> {self.member.state.clone()}
@@ -583,5 +596,17 @@ mod tests {
 		let plain = Kind::Packet {flow: 0, control: false};
 		assert!(lone(&[4; 32]) && !lone(&[4; 48]) && !lone(&[1; 32]));
 		assert!(wide(plain, &[1; 148]) && wide(plain, &[2; 92]) && !wide(plain, &[4; 64]) && wide(Kind::Packet {flow: 0, control: true}, &[4; 64]) && wide(Kind::Handshake, &[4; 64]) && wide(Kind::Stalled, &[4; 64]));
+	}
+
+	#[test]
+	fn the_idle_keepalive_of_low_power_is_the_top_of_the_range_and_never_past_the_profile() {
+		let link = |keepalive: RangeInclusive<u32>| Link {inbound: [1; 32], device: [2; 32], secret: Secret::new([3; 32]), node: None, mtu: 1390, padding: Padding {wide_max: 1023, normal_max: 255, keepalive}, borrowed: Default::default()};
+		assert_eq!(keepalive_range(&link(session::KEEPALIVE), false), 20_000..=40_000);
+		assert_eq!(keepalive_range(&link(session::KEEPALIVE), true), 50_000..=60_000);
+		assert_eq!(keepalive_range(&link(10_000..=60_000), true), 50_000..=60_000);
+		assert_eq!(keepalive_range(&link(15_000..=25_000), true), 15_000..=25_000);
+		assert_eq!(keepalive_range(&link(30_000..=50_000), true), 40_000..=50_000);
+		assert_eq!(keepalive_range(&link(30_000..=50_000), false), 30_000..=50_000);
+		for range in [10_000..=20_000, 15_000..=25_000, 30_000..=50_000, 10_000..=60_000, 55_000..=60_000] {assert!(session::keepalive(keepalive_range(&link(range), true)).is_some())}
 	}
 }

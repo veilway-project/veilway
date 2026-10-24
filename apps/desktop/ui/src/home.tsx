@@ -31,9 +31,11 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 	const connection = status?.connection ?? null, since = connection?.since ?? null;
 	useEffect(() => {
 		if (since === null) return;
-		setTick(Date.now());
-		const timer = setInterval(() => setTick(Date.now()), 1000);
-		return () => clearInterval(timer);
+		let timer: number | undefined;
+		const follow = () => { window.clearInterval(timer); timer = undefined; if (document.visibilityState === "hidden") return; setTick(Date.now()); timer = window.setInterval(() => setTick(Date.now()), 1000); };
+		follow();
+		document.addEventListener("visibilitychange", follow);
+		return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", follow); };
 	}, [since]);
 	const up = since === null ? null : Math.max(0, Math.floor(tick / 1000) - since), clock = up === null ? null : [Math.floor(up / 3600), Math.floor(up / 60) % 60, up % 60].map((n, i) => String(n).padStart(i ? 2 : 1, "0")).join(":");
 	const check = connection?.check && ("details.check." + connection.check) in en ? ("details.check." + connection.check) as DesktopKey : null;

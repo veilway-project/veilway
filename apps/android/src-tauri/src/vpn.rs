@@ -84,6 +84,8 @@ async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, lan_lo
 	let mut status_rx = tunnel.watch();
 	let mut mtu = tunnel.status().mtu;
 	let mut own_rx = bridge::own();
+	let mut power_rx = bridge::low_power();
+	tunnel.low_power(*power_rx.borrow_and_update());
 	// The subnets of the networks the phone is on go outside the VPN only when the user let apps reach them, and never on mobile data, where a private address is the carrier's and not a device of the user's.
 	let local = |own: &Own| if lan_local && !own.cellular {lan::local(&own.networks)} else {Vec::new()};
 	let mut lan = local(&own_rx.borrow());
@@ -128,6 +130,10 @@ async fn carry(tunnel: &mut Tunnel, profile: &Profile, options: &Options, lan_lo
 					tracing::info!(subnets = lan.len(), "the VPN interface was replaced for the subnets of the new network");
 				}
 				tunnel.moved(own.description, own.networks);
+			}
+			changed = power_rx.changed() => {
+				changed?;
+				tunnel.low_power(*power_rx.borrow_and_update());
 			}
 			() = &mut stop => return Ok(()),
 		}

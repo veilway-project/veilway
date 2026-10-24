@@ -117,7 +117,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 						},
 						Some(sent) => pending.push(sent),
 					},
-					asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved)),
+					asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved | Ask::Power)),
 					_ = sleep_until(held.as_ref().map_or(due, |held| held.1.min(due))) => break,
 				}
 			}
@@ -177,7 +177,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, path: &str, candidate: &Fr
 				loop {
 					tokio::select! {
 						answered = &mut asked => break answered.unwrap_or(Err(End::Lost.into())),
-						said = port.ask.recv(), if !closing => closing |= !matches!(said, Some(Ask::Moved)),
+						said = port.ask.recv(), if !closing => closing |= !matches!(said, Some(Ask::Moved | Ask::Power)),
 					}
 				}
 			};

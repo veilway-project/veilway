@@ -103,6 +103,8 @@ impl Reader {
 		}
 		Ok(())
 	}
+	// When something held back is next due.
+	fn due(&self) -> Option<Instant> {(0..KINDS).filter(|at| self.waiting[*at].is_some()).filter_map(|at| self.last[at].map(|last| last + APPLY_INTERVAL)).min()}
 	// Gives what was held back and is due now.
 	pub fn poll(&mut self, now: Instant, events: &mut Vec<Event>) {
 		for at in 0..KINDS {
@@ -158,6 +160,15 @@ impl Channel {
 	pub fn receive(&mut self, segment: &ip::Segment<'_>, now: Instant, random: &mut Random, out: &mut Vec<Vec<u8>>, events: &mut Vec<Event>) -> Result<(), Failure> {
 		if let Phase::Connecting(conn) | Phase::Opening {conn, ..} | Phase::Open {conn, ..} = &mut self.phase {conn.receive(segment, now, out)}
 		self.advance(now, random, out, events)
+	}
+	/// When `poll` next has something to do: a segment to send again, a message held back by the limit, an opening that runs out of time. None when nothing is waiting on the clock.
+	pub fn due(&self) -> Option<Instant> {
+		match &self.phase {
+			Phase::Closed => None,
+			Phase::Connecting(conn) => conn.due(),
+			Phase::Opening {conn, began, ..} => conn.due().into_iter().chain([*began + DEADLINE]).min(),
+			Phase::Open {conn, reader} => conn.due().into_iter().chain(reader.due()).min(),
+		}
 	}
 	/// Sends again what is due, gives what was held back, and ends an opening that took too long.
 	pub fn poll(&mut self, now: Instant, random: &mut Random, out: &mut Vec<Vec<u8>>, events: &mut Vec<Event>) -> Result<(), Failure> {
@@ -353,5 +364,14 @@ mod tests {
 		assert!(events.is_empty());
 		// A hello after the opening is an unknown type like any other.
 		assert!(reader().feed(&[0, 34, 0x01], now, &mut events).is_err());
+	}
+
+	#[test]
+	fn a_channel_says_when_it_next_needs_a_tick() {
+		let (now, mut out) = (Instant::now(), Vec::new());
+		let mut channel = Channel::new(Secret::new(SECRET), INBOUND, DEVICE, 1, "10.7.0.2".parse().unwrap(), "10.7.0.1".parse().unwrap(), now);
+		assert_eq!(channel.due(), None);
+		channel.connect(40000, 1, 1200, now, &mut out).unwrap();
+		assert_eq!(channel.due(), Some(now + Duration::from_millis(1_000)));
 	}
 }

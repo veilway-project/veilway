@@ -126,6 +126,8 @@ impl Handle {
 	fn send(&self, command: Command) -> bool {self.0.lock().unwrap().as_ref().is_some_and(|sender| sender.send(command).is_ok())}
 	pub fn select_exit(&self, tag: Option<String>) -> bool {self.send(Command::Exit(tag))}
 	pub fn connect_again(&self) -> bool {self.send(Command::Again)}
+	/// The device is idle (screen off, Doze) or is not: see `Tunnel::low_power`.
+	pub fn low_power(&self, on: bool) -> bool {self.send(Command::LowPower(on))}
 }
 
 /// The roots of the Mozilla list, for a platform that has none of its own.
@@ -255,6 +257,8 @@ impl Tunnel {
 	pub fn moved(&self, network: String, networks: Vec<Network>) {let _ = self.commands.send(Command::Moved(network, networks));}
 	/// The system reported that a packet was too big for the path: the MTU is confirmed again at once. What the report says of a size is never used.
 	pub fn reprobe(&self) {let _ = self.commands.send(Command::Reprobe);}
+	/// The device is idle (screen off, Doze) or is not. While it is, an idle tunnel wakes every 2 s instead of every second, and the idle keepalive of a stream transport (`tls`, `ws`, `ws-plain`, `faketls`, a streaming `fronted` shape) is drawn from the top 10 s of the range the profile allows, never above 60 s. `udp` and `udp-obfs` are not slowed down in what they send: a NAT binding of a mobile network may expire sooner. Leaving low power restores both at once, and a new session starts in the state last set.
+	pub fn low_power(&self, on: bool) {let _ = self.commands.send(Command::LowPower(on));}
 	/// A refreshed subscription brought new numbers. A stop for a used-up quota or an expired account ends when they show the cause is gone.
 	pub fn refreshed(&self, usage: Option<Usage>) {let _ = self.commands.send(Command::Refreshed(usage));}
 	/// Hands the tunnel a message as if the node had sent it over the control channel, to see what the engine does with one it should not believe. Only with the `testing` feature.
@@ -281,6 +285,8 @@ impl Carrier {
 	pub async fn recv(&mut self) -> Option<Vec<u8>> {match self {Self::Native(tunnel) => tunnel.recv().await, Self::Xray(tunnel) => tunnel.recv().await}}
 	/// The device's networks changed. The carrier of a legacy profile has nothing to redo: Xray's own socket is kept out of the tunnel by the platform.
 	pub fn moved(&self, network: String, networks: Vec<Network>) {if let Self::Native(tunnel) = self {tunnel.moved(network, networks)}}
+	/// The device is idle or is not. The carrier of a legacy profile has no timers of its own to slow down.
+	pub fn low_power(&self, on: bool) {if let Self::Native(tunnel) = self {tunnel.low_power(on)}}
 	pub async fn stop(self) -> Status {match self {Self::Native(tunnel) => tunnel.stop().await, Self::Xray(tunnel) => tunnel.stop().await}}
 }
 

@@ -69,7 +69,11 @@ pub(crate) async fn run(port: &mut Port, link: &Link, target: &Target, count: us
 				Some((datagram, kind)) => pass(port, &members, datagram, kind),
 				None => break End::Asked.into(),
 			},
-			asked = port.ask.recv() => if !matches!(asked, Some(Ask::Moved)) {break End::Asked.into()},
+			asked = port.ask.recv() => match asked {
+				Some(Ask::Moved) => {}
+				Some(Ask::Power) => for (_, member, _) in &members {let _ = member.ask.send(Ask::Power);},
+				_ => break End::Asked.into(),
+			},
 		}
 	};
 	// What the caller handed over before it closed goes to the connections first. Then every connection is closed the way a session of its transport is closed, which sends what it was handed, and this task ends when they have.

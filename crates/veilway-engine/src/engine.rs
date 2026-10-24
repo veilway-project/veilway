@@ -29,6 +29,8 @@ pub(crate) enum Command {
 	Exit(Option<String>),
 	Moved(String, Vec<OwnNetwork>),
 	Reprobe,
+	/// The device is idle (screen off, Doze) or is not.
+	LowPower(bool),
 	Refreshed(Option<Usage>),
 	/// A message of the node that the test hands the tunnel (`Tunnel::inject`).
 	#[cfg(feature = "testing")]
@@ -37,7 +39,7 @@ pub(crate) enum Command {
 
 /// What a command did to the loop that read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Reaction {None, Stop, Again, Moved}
+pub(crate) enum Reaction {None, Stop, Again, Moved, Power}
 
 /// A stop by the node and what it waits for.
 #[derive(Debug, Clone, Copy)]
@@ -106,6 +108,8 @@ pub(crate) struct Core {
 	pub warn: Option<Say>,
 	pub wanted: Option<Option<String>>,
 	pub reprobe: bool,
+	/// The platform said the device is idle: the timer loop and the idle keepalive of a stream transport are slower.
+	pub low_power: bool,
 	/// Messages a test handed the tunnel, read as the node's at the next tick.
 	#[cfg(feature = "testing")]
 	pub injected: Vec<veilway_proto::control::NodeMessage>,
@@ -153,7 +157,7 @@ impl Core {
 		let net_key = crate::store::network_key(seed, &settings.network);
 		let wire = Shared::new(Wire::new(key, link.inbound, profile.device.preshared_key.clone()));
 		let initial = status.borrow().clone();
-		Self {consented: private, networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
+		Self {consented: private, networks: settings.networks.clone(), digest: choice::digest(&transports), network: kept.network(&net_key), standing: kept.standing.clone(), net_key, transports, seed, wire, offset: Arc::new(AtomicI64::new(0)), status: initial, status_tx: status, events, refused, commands, from_platform, to_platform, counters: Counters::default(), hold: None, rounds: 0, connected_once: false, reason: None, warn: None, wanted: None, reprobe: false, low_power: false, #[cfg(feature = "testing")] injected: Vec::new(), settings, profile, subscription, link, store_key, kept}
 	}
 	pub(crate) fn unix(&self) -> u64 {(self.settings.clock)()}
 	// The device's clock and the offset a pinned candidate's answer gave, which is what proofs are made with.
@@ -248,6 +252,10 @@ impl Core {
 				self.reprobe = true;
 				Reaction::None
 			}
+			Command::LowPower(on) => {
+				self.low_power = on;
+				Reaction::Power
+			}
 			Command::Refreshed(usage) => {
 				let now = self.unix();
 				let released = match (self.hold, usage) {
@@ -272,7 +280,7 @@ impl Core {
 				command = self.commands.recv() => match command.map_or(Reaction::Stop, |command| self.command(command)) {
 					Reaction::Stop => return Rested::Stop,
 					Reaction::Again | Reaction::Moved => return Rested::Again,
-					Reaction::None => {}
+					Reaction::None | Reaction::Power => {}
 				},
 				Some(_) = self.from_platform.recv() => self.counters.dropped_offline += 1,
 			}
@@ -552,7 +560,7 @@ impl Core {
 						if let Some(unopened) = second {self.untrack(transport, unopened, added)}
 						return Done {ended: Vec::new(), why: if reaction == Reaction::Stop {Why::Stop} else {Why::Again}, say: None, opened: false};
 					}
-					Reaction::None => {}
+					Reaction::None | Reaction::Power => {}
 				},
 				Some(_) = self.from_platform.recv() => self.counters.dropped_offline += 1,
 			}

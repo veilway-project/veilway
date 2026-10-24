@@ -70,14 +70,19 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	// Byte counters come with the status; the speed is their change over the second between two polls.
 	useEffect(() => {
 		if (!running.connected) { last.current = null; return; }
-		const timer = setInterval(() => call("status").then(next => {
+		// Nothing is polled while the window is hidden (or the phone's app is in the background), and the speed starts again from a fresh sample.
+		let timer: number | undefined;
+		const poll = () => call("status").then(next => {
 			setRunning(next);
 			const found = next.status, at = Date.now(), before = last.current;
 			if (!found) return;
 			last.current = {at, sent: found.sent_bytes, received: found.received_bytes};
 			if (before && at > before.at) setPoints(list => [...list.slice(-59), {time: new Date(at), down: Math.max(0, (found.received_bytes - before.received) * 1000 / (at - before.at)), up: Math.max(0, (found.sent_bytes - before.sent) * 1000 / (at - before.at))}]);
-		}, () => {}), 1000);
-		return () => clearInterval(timer);
+		}, () => {});
+		const follow = () => { window.clearInterval(timer); timer = undefined; if (document.visibilityState === "hidden") return; last.current = null; poll(); timer = window.setInterval(poll, 1000); };
+		follow();
+		document.addEventListener("visibilitychange", follow);
+		return () => { window.clearInterval(timer); document.removeEventListener("visibilitychange", follow); };
 	}, [running.connected]);
 	// Pasted links have no provider: the window names them.
 	const named = useMemo(() => library?.map(subscription => subscription.legacy ? {...subscription, provider: t("xray.pasted")} : subscription) ?? null, [library, t]);

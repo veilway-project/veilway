@@ -6,7 +6,7 @@
 //! Every byte from the network is hostile: records are bounded before they are waited for, a handshake message is bounded before it is collected, and a certificate chain is decompressed to the length it declared and no further.
 use crate::fingerprint;
 use crate::mlkem;
-use crate::{lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
+use crate::{keepalive_range, lone, pause, random, tls, unasked, wide, Answer, Ask, End, Ended, Fault, Front, Kind, Link, Port, Refusal, State, Unreachable, Want, ATTEMPT};
 use boring::ssl::HandshakeError;
 use ring::signature;
 use std::collections::HashMap;
@@ -311,6 +311,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, client: &Mutex<Client>, ca
 	// As in `stream.rs`: `batch` is what the next frame holds, `flush` that it goes out even if it is a lone keepalive, `held` a lone keepalive on its way out with whether it is the idle one, and `awaiting` until when a frame of the node must have come.
 	let (mut batch, mut flush, mut held, mut awaiting, mut carry, mut established, mut idle, mut frames) = (vec![(first, Kind::Packet {flow: 0, control: false})], true, None::<(Vec<u8>, Instant, bool)>, None::<Instant>, None::<(Vec<u8>, Kind)>, false, deadline, 0u64);
 	let (mut next, mut closing, mut gone, mut cut) = (None::<(Vec<u8>, Kind)>, false, false, false);
+	// `low` is the low power state the idle keepalive was last drawn for, and `sent_at` when the session last sent: leaving low power draws the normal range again from there.
+	let (mut low, mut sent_at) = (false, Instant::now());
 	let ended = 'session: loop {
 		batch.extend(carry.take());
 		let mut used: usize = batch.iter().map(|(datagram, _)| 2 + datagram.len()).sum();
@@ -351,8 +353,8 @@ pub(crate) async fn run(port: &mut Port, link: &Link, client: &Mutex<Client>, ca
 			if batch.iter().any(|(_, kind)| *kind == Kind::Stalled) {awaiting.get_or_insert(Instant::now() + LIVENESS);}
 			port.sent(batch.len());
 			batch.clear();
-			let Ok(silence) = pause(&link.padding.keepalive) else {break End::Random.into()};
-			(flush, idle) = (false, Instant::now() + silence);
+			let Ok(silence) = pause(&keepalive_range(link, port.shared.low_power.load(Ordering::Relaxed))) else {break End::Random.into()};
+			(flush, idle, sent_at) = (false, Instant::now() + silence, Instant::now());
 		}
 		if closing {
 			if carry.is_none() {break End::Asked.into()}
@@ -395,6 +397,14 @@ pub(crate) async fn run(port: &mut Port, link: &Link, client: &Mutex<Client>, ca
 				_ => break 'session End::Fault(Fault::Frame).into(),
 			}
 		}
+		let now_low = port.shared.low_power.load(Ordering::Relaxed);
+		if now_low != low {
+			low = now_low;
+			if !low {
+				let Ok(silence) = pause(&link.padding.keepalive) else {break End::Random.into()};
+				idle = sent_at + silence;
+			}
+		}
 		let timer = [held.as_ref().map(|held| held.1), awaiting, if !established {Some(deadline)} else if held.is_none() {Some(idle)} else {None}].into_iter().flatten().min().unwrap_or(idle);
 		tokio::select! {
 			got = rd.read(&mut read) => match got {
@@ -409,7 +419,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, client: &Mutex<Client>, ca
 				Some(sent) => next = Some(sent),
 				None => closing = true,
 			},
-			asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved)),
+			asked = port.ask.recv() => closing |= !matches!(asked, Some(Ask::Moved | Ask::Power)),
 			_ = sleep_until(timer) => {
 				let now = Instant::now();
 				if !established && now >= deadline {break if keepalive {End::Unanswered.into()} else {Ended::Unreachable(Unreachable::Timeout)}}
@@ -419,7 +429,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, client: &Mutex<Client>, ca
 					flush = true;
 					if waited {awaiting.get_or_insert(now + LIVENESS);}
 				} else if established && held.is_none() && now >= idle {
-					let (Ok(silence), Ok(delay)) = (pause(&link.padding.keepalive), pause(&LONE_KEEPALIVE)) else {break End::Random.into()};
+					let (Ok(silence), Ok(delay)) = (pause(&keepalive_range(link, port.shared.low_power.load(Ordering::Relaxed))), pause(&LONE_KEEPALIVE)) else {break End::Random.into()};
 					idle = now + silence;
 					held = port.want(Want::Keepalive).map(|datagram| (datagram, now + delay, true));
 				}

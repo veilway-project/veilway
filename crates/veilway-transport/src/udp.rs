@@ -213,6 +213,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, to: SocketAddr) -> Ended {
 				Err(_) => return End::Offline.into(),
 			},
 			// There is nothing to say to the node: a session of `udp-obfs` ends by its idle time. What the caller handed over before it closed goes out first.
+			Event::Ask(Some(Ask::Power)) => Ok(()),
 			Event::Ask(_) => {
 				while let Ok((datagram, kind)) = port.out.try_recv() {
 					if machine.send(&datagram, kind, &mut io).is_err() {break}

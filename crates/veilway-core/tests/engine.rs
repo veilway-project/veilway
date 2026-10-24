@@ -337,6 +337,37 @@ async fn a_tunnel_connects_over_each_transport_carries_packets_and_runs_the_cont
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_tunnel_wakes_far_less_than_four_times_a_second_and_still_carries_traffic_in_low_power() {
+	let time = time!();
+	let net = net("engine-idle", time, |_| {}).await;
+	let library = library(&net, "idle", &payload(time, vec![profile(&net, 0, &["tls"])])).await;
+	let mut run = Run::new(start(&net, net.settings("idle"), &library, PRIVATE).unwrap(), 0);
+	run.connected().await;
+	run.until("no catalogue", Duration::from_secs(20), |status| status.control && !status.exits.is_empty() && status.usage.is_some()).await;
+	assert!(run.ping(200, 1).await);
+	// Four ticks a second before: 32 in 8 s. Idle it is one a second, with room for what the node says on its own.
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let before = run.tunnel.status().counters.ticks;
+	tokio::time::sleep(Duration::from_secs(8)).await;
+	let idle = run.tunnel.status().counters.ticks - before;
+	assert!(idle <= 16, "{idle} ticks in 8 s idle");
+	run.tunnel.low_power(true);
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let before = run.tunnel.status().counters.ticks;
+	tokio::time::sleep(Duration::from_secs(8)).await;
+	let low = run.tunnel.status().counters.ticks - before;
+	assert!(low <= 10, "{low} ticks in 8 s of low power");
+	// Traffic and the control channel work in low power, and leaving it changes nothing for the session.
+	assert!(run.ping(201, 1).await);
+	run.tunnel.select_exit(Some("alt".into()));
+	run.until("the exit did not move in low power", Duration::from_secs(20), |status| status.exits.iter().any(|exit| exit.tag == "alt" && exit.selected)).await;
+	run.tunnel.low_power(false);
+	assert!(run.ping(202, 1).await);
+	assert_eq!(run.tunnel.status().counters.opened, 1);
+	assert_eq!(run.tunnel.stop().await.state, State::Off);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_user_moves_the_exit_through_the_channel_and_the_flows_follow() {
 	let time = time!();
 	let net = net("engine-exit", time, |_| {}).await;
