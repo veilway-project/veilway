@@ -91,9 +91,21 @@ jobs:
           tool: cargo-zigbuild
       - if: matrix.cross
         run: pip install --break-system-packages ziglang
+      # The Windows CLI carries the pinned Wintun library (`embedded-wintun`), so it runs with no wintun.dll next to it. build.rs refuses any other file.
+      - name: Fetch wintun
+        if: contains(matrix.target, 'windows')
+        shell: pwsh
+        run: |
+          $ver = "0.14.1"
+          $sha = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile "$env:RUNNER_TEMP\wintun.zip"
+          $got = (Get-FileHash "$env:RUNNER_TEMP\wintun.zip" -Algorithm SHA256).Hash
+          if ($got -ne $sha) { throw "wintun checksum mismatch: $got" }
+          Expand-Archive "$env:RUNNER_TEMP\wintun.zip" -DestinationPath "$env:RUNNER_TEMP\wintun-unpacked" -Force
+          "VEILWAY_WINTUN_DLL=$env:RUNNER_TEMP\wintun-unpacked\wintun\bin\amd64\wintun.dll" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       - name: Build
         shell: bash
-        run: cargo ${{ matrix.cross && 'zigbuild' || 'build' }} --release --locked --target ${{ matrix.target }} -p veilway --bin veilway
+        run: cargo ${{ matrix.cross && 'zigbuild' || 'build' }} --release --locked --target ${{ matrix.target }} -p veilway --bin veilway ${{ contains(matrix.target, 'windows') && '--features embedded-wintun' || '' }}
       - name: Stage asset
         shell: bash
         env:

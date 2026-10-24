@@ -34,6 +34,21 @@ jobs:
         run: |
           for a in 127.0.1.1 $(seq -f "127.0.0.%g" 2 9) 127.0.0.77 $(seq -f "127.0.2.%g" 100 155); do sudo ifconfig lo0 alias $a up; done
       - run: cargo build --workspace --release
+      # The Windows CLI carries the pinned Wintun library, as the release build does: the same fetch, then the CLI built with `embedded-wintun`. build.rs refuses any other file.
+      - name: Fetch wintun
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $ver = "0.14.1"
+          $sha = "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51"
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-$ver.zip" -OutFile "$env:RUNNER_TEMP\wintun.zip"
+          $got = (Get-FileHash "$env:RUNNER_TEMP\wintun.zip" -Algorithm SHA256).Hash
+          if ($got -ne $sha) { throw "wintun checksum mismatch: $got" }
+          Expand-Archive "$env:RUNNER_TEMP\wintun.zip" -DestinationPath "$env:RUNNER_TEMP\wintun-unpacked" -Force
+          "VEILWAY_WINTUN_DLL=$env:RUNNER_TEMP\wintun-unpacked\wintun\bin\amd64\wintun.dll" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Build the CLI with the embedded wintun.dll
+        if: matrix.os == 'windows-latest'
+        run: cargo build -p veilway --release --features embedded-wintun
       # A shared runner sometimes starves a test that times real sockets. A test that failed runs once more on its own: one that passes then is named as flaky, one that fails again, a doc test or a build that failed fails the job.
       - name: Test
         shell: bash
@@ -159,12 +174,11 @@ jobs:
         run: |
           choco install nasm ninja -y --no-progress
           "C:\Program Files\NASM" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
-      - name: Build the client and install it with wintun.dll
+      - name: Build the client with the embedded wintun.dll and install it alone
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           "SMOKE=$env:RUNNER_TEMP\smoke" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          cargo build -p veilway
           # The pinned release of apps/desktop/scripts/fetch-wintun.sh, with the same hash.
           $zip = "$env:RUNNER_TEMP\wintun.zip"
           Invoke-WebRequest -UseBasicParsing -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile $zip
@@ -172,11 +186,12 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath "$env:RUNNER_TEMP\wintun"
           $dll = Get-ChildItem "$env:RUNNER_TEMP\wintun" -Recurse -Filter wintun.dll | Where-Object {$_.FullName -match "bin.amd64"} | Select-Object -First 1
           if (-not $dll) {Write-Output "::error::bin/amd64/wintun.dll is not in the archive"; exit 1}
-          # The client loads wintun.dll from the folder of veilway.exe, and as an administrator it refuses a folder that others can write in, so both go to Program Files.
+          # The client carries wintun.dll inside (`embedded-wintun`) and writes it to ProgramData itself, so the smoke test runs the single file the release ships. As an administrator it refuses a folder that others can write in, so it goes to Program Files.
+          $env:VEILWAY_WINTUN_DLL = $dll.FullName
+          cargo build -p veilway --features embedded-wintun
           $install = Join-Path $env:ProgramFiles "Veilway"
           New-Item -ItemType Directory -Force -Path $install | Out-Null
           Copy-Item "target\debug\veilway.exe" $install
-          Copy-Item $dll.FullName $install
       - name: Record the network state before the test
         shell: pwsh
         run: |

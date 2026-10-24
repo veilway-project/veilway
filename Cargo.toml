@@ -33,6 +33,7 @@ etherparse="0.21"
 # The userspace TCP of a tunnel (node links page, "Tunnels"): the entry opens its own connection inside the link with it. Only the TCP socket over IP packets, no device, no ARP, no DHCP.
 smoltcp={version="0.12", default-features=false, features=["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"]}
 wintun-bindings="0.7"
+libloading="0.9"
 windows-sys="0.61"
 security-framework="3"
 schemars="1"

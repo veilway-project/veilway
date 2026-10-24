@@ -10,6 +10,10 @@ keywords=["vpn", "windows", "wintun", "wfp", "dpapi"]
 categories=["network-programming", "os::windows-apis"]
 exclude=["tests/", "examples/", "proptest-regressions/"]
 
+[features]
+# The official Wintun library (0.14.1) inside the binary, from `VEILWAY_WINTUN_DLL` at build time, for a program that has no wintun.dll next to it (`wintun.rs`).
+embedded-wintun=[]
+
 [dependencies]
 veilway-engine={path="../veilway-engine", version="0.2.22"}
 veilway-proto={path="../veilway-proto", version="0.2.22"}
@@ -18,11 +22,19 @@ tokio.workspace=true
 tracing.workspace=true
 anyhow.workspace=true
 ipnet.workspace=true
+# The SHA-256 of the Wintun library, checked before it is loaded from ProgramData.
+ring.workspace=true
 # The socket option behind the hook that keeps the engine's sockets on the physical interface (`all` for the raw socket handle).
 socket2={workspace=true, features=["all"]}
+
+[build-dependencies]
+# build.rs checks the file of `VEILWAY_WINTUN_DLL` against the pinned hash.
+ring.workspace=true
 
 [target.'cfg(windows)'.dependencies]
 # Wintun's DLL is loaded from a path, and its sessions are the TUN device.
 wintun-bindings.workspace=true
+# The library handle that `wintun-bindings` takes, loaded with the system folder as the only search place.
+libloading.workspace=true
 # The IP Helper API (addresses, routes, change notifications), the Windows Filtering Platform, DPAPI and the named objects of the lock: the only `unsafe` in the platform layer, each with its reason.
 windows-sys={workspace=true, features=["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Rpc", "Win32_Storage_FileSystem", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_NetworkManagement_WindowsFilteringPlatform", "Win32_Networking_WinSock", "Win32_System_Com", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_UI_Shell"]}

@@ -67,6 +67,9 @@ pub fn default_data_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf:
 /// Where the add-ons are kept (`xray\<release>\xray.exe` below it): `Veilway\addons` in ProgramData, made for administrators and SYSTEM to write and users to read (`Access::Read`). It is not under the client's data folder because the add-on runs with a token that has the Administrators group switched off, and so it needs the read and execute right the users' group gives.
 pub fn default_addons_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf::from("C:\\ProgramData")).join("Veilway").join("addons")}
 
+/// Where the copy of Wintun that is compiled into the client is kept: `Veilway\wintun` in ProgramData, made for administrators and SYSTEM only (`wintun`).
+pub fn default_wintun_dir() -> PathBuf {known_folder().unwrap_or_else(|_| PathBuf::from("C:\\ProgramData")).join("Veilway").join("wintun")}
+
 /// The path of a program in the system's own folder, and nowhere else: not `PATH` and not the working directory, which an ordinary user could have planted a program in.
 pub fn program(name: &str) -> io::Result<PathBuf> {
 	use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;

@@ -1,11 +1,12 @@
 //! The TUN device through Wintun: whole IP packets in and out.
 //!
-//! `wintun.dll` is loaded from the folder of the executable and from nowhere else (`apps/desktop/scripts/fetch-wintun.sh` puts the pinned release there), so that a DLL planted in the working directory or on `PATH` is never the one an administrator's process runs. The adapter has a fixed GUID, so Windows keeps one network profile for it and does not make a new "Unidentified network N" at every connection. Packets are read on a thread of their own, because Wintun's wait is a blocking one, and handed to the runtime through a channel.
+//! `wintun.dll` is the one next to the executable, or else the pinned copy that `wintun` keeps in ProgramData (`apps/desktop/scripts/fetch-wintun.sh` puts the release next to the desktop app). It is loaded by its full path with the system folder as the only place searched for its imports, so that a DLL planted in the working directory or on `PATH` is never the one an administrator's process runs. The adapter has a fixed GUID, so Windows keeps one network profile for it and does not make a new "Unidentified network N" at every connection. Packets are read on a thread of their own, because Wintun's wait is a blocking one, and handed to the runtime through a channel.
 //!
 //! An adapter lives as long as the process that made it: when the process dies, Wintun removes the adapter and its routes with it, and what holds the traffic then is the kill switch.
 use std::io;
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use libloading::os::windows::{Library, LOAD_LIBRARY_SEARCH_SYSTEM32};
 use tokio::sync::{mpsc, Mutex};
 use wintun_bindings::{Adapter, Session, Wintun};
 
@@ -26,9 +27,12 @@ impl Tun {
 	pub fn create(name: &str) -> io::Result<Self> {
 		if !valid_name(name) {return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("{name:?} is not a name a network adapter can have")))}
 		crate::state::check_install_dir()?;
-		let dll = std::env::current_exe()?.with_file_name("wintun.dll");
-		// SAFETY: loading a DLL runs its initialization. It is the one next to this executable, which the same installer or script put there, and not a name left to the search path.
-		let wintun = unsafe {wintun_bindings::load_from_path(&dll)}.map_err(|error| io::Error::other(format!("cannot load {} ({error}): wintun.dll has to be next to veilway.exe", dll.display())))?;
+		let dll = crate::wintun::locate()?;
+		tracing::info!("loading {}", dll.display());
+		// SAFETY: loading a DLL runs its initialization, so the file has to be Wintun's. `locate` gives the one next to this executable, in a folder the check above has passed, or the pinned copy in a folder only administrators can write. The system folder is the only place searched for what the library imports.
+		let library = unsafe {Library::load_with_flags(&dll, LOAD_LIBRARY_SEARCH_SYSTEM32)}.map_err(|error| io::Error::other(format!("cannot load {} ({error})", dll.display())))?;
+		// SAFETY: the library is the Wintun build that `locate` chose, and the bindings read only the exports that Wintun's reference names, with their signatures.
+		let wintun = unsafe {wintun_bindings::load_from_library(library)}.map_err(|error| io::Error::other(format!("cannot load {} ({error})", dll.display())))?;
 		let adapter = match Adapter::open(&wintun, name) {
 			Ok(adapter) => adapter,
 			Err(_) => Adapter::create(&wintun, name, TYPE, Some(GUID)).map_err(|error| io::Error::other(format!("cannot create the network adapter ({error}): the program needs to run as an administrator")))?,

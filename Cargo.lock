@@ -3259,6 +3259,8 @@ version = "0.2.22"
 dependencies = [
  "anyhow",
  "ipnet",
+ "libloading 0.9.0",
+ "ring",
  "socket2",
  "tokio",
  "tracing",

@@ -14,6 +14,10 @@ exclude=["tests/", "examples/", "proptest-regressions/"]
 name="veilway"
 path="src/main.rs"
 
+[features]
+# The Windows build carries the pinned Wintun library, so it runs with no wintun.dll next to it. The release workflow builds with it and sets `VEILWAY_WINTUN_DLL`.
+embedded-wintun=["veilway-windows/embedded-wintun"]
+
 [dependencies]
 veilway-core={path="../veilway-core", version="0.2.22"}
 veilway-wg={path="../veilway-wg", version="0.2.22"}
