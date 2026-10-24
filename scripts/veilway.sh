@@ -5,6 +5,7 @@
 #   sudo bash veilway.sh                      interactive menu
 #   sudo bash veilway.sh install node|panel|both|mirror [--version vX.Y.Z]
 #   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx] [--https-port 443]   also set up a web server with HTTPS and a decoy site
+#   sudo bash veilway.sh install panel|both --no-domain [--ip <address>] [--web caddy|nginx] [--https-port 443]   no domain: the subscriptions on this server's IP, self-signed and pinned
 #   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
 #   sudo bash veilway.sh update [node|panel|mirror|both]   also adds the decoy origin (127.0.0.1:8080) to a web server setup that lacks it
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
@@ -20,6 +21,7 @@
 #          --allow-downgrade (install a --version older than the installed one),
 #          --mirror <url> (repeatable, https only; tried in order, then GitHub), --mirror-only (never fall back to GitHub),
 #          --domain <name>, --web caddy|nginx and --https-port <port> (install panel and both; default 443, else the panel is at https://name:port/<prefix>/)
+#          --no-domain and --ip <address> (this server's IPv4, found by itself when not given) instead of --domain
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
 # comment must read "veilway <tag> <asset>" for the node and "veilway-panel <tag> <asset>" for the panel.
@@ -79,6 +81,9 @@ BACKUP_DIR="/var/backups/veilway"
 UNIT_DIR="/etc/systemd/system"
 WEB_ROOT="/var/www/veilway-site"
 WEB_STATE="$VER_DIR/web.state"
+SUB_TLS="/etc/veilway-sub-tls"
+SUB_CERT="$SUB_TLS/endpoint.crt"
+SUB_KEY="$SUB_TLS/endpoint.key"
 DECOY_PORT="${VEILWAY_DECOY_PORT:-8080}"
 case "$DECOY_PORT" in ""|*[!0-9]*) DECOY_PORT=8080 ;; esac
 DECOY_ON=0
@@ -96,6 +101,8 @@ DOMAIN=""
 WEB=""
 HTTPS_PORT=""
 HTTPS_HOST=""
+NO_DOMAIN=0
+PUBLIC_IP=""
 NODE_HTTPS=0
 TAG_OUT=""
 TMP=""
@@ -821,7 +828,7 @@ install_panel() {
 	updater_units
 	install_self
 	daemon_reload
-	[ -z "$DOMAIN" ] || web_setup
+	[ -z "$DOMAIN" ] && [ "$NO_DOMAIN" = 0 ] || web_setup
 	svc enable veilway-panel.service
 	svc enable veilway-panel-update.path
 	svc start veilway-panel-update.path
@@ -872,6 +879,15 @@ panel_summary() {
 		done
 	fi
 	printf '\n'
+	if [ "$NO_DOMAIN" = 1 ]; then
+		lines=("Admin pages: not on the internet. Open them through an SSH tunnel from your computer:" "  ssh -L 8480:127.0.0.1:$PANEL_PORT root@$PUBLIC_IP" "Then open http://localhost:8480$prefix/ in your browser.")
+		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
+		lines+=("Open the admin pages in a browser and paste the token there." "It asks for your username, password and the terms." "")
+		lines+=("Subscriptions: https://$HTTPS_HOST$sub/main, self-signed." "Add it under Settings > Endpoints: name main, URL https://$HTTPS_HOST$sub/main, pin $(web_state pin)" "The apps check that pin, so the self-signed certificate is safe for your users." "Never open the admin pages over https://$PUBLIC_IP: only the tunnel is meant for them." "")
+		lines+=("Web server: $WEB, site file $([ "$WEB" = caddy ] && echo "$CADDY_SITE" || echo "$NGINX_SITE"), serves $sub only." "Remove it all with: sudo bash veilway.sh uninstall web")
+		box "Panel" "${lines[@]}"
+		return 0
+	fi
 	if [ -n "$DOMAIN" ]; then
 		lines=("Admin pages: https://$HTTPS_HOST$prefix/")
 		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
@@ -932,7 +948,8 @@ do_panel_prefix() {
 		die "the panel did not start with $new, so it is back at $old: see sudo journalctl -u veilway-panel"
 	fi
 	step "the admin pages are now at $new"
-	box "Panel path" "Change the path in your web server's config, then reload it:" "" "  nginx:  location ~ ^($new|$sub)(/|\$) {" "  Caddy:  reverse_proxy $new/* 127.0.0.1:$PANEL_PORT" "" "Admin pages: https://$host$new/"
+	if [ "$(web_state mode)" = ip ]; then box "Panel path" "The admin pages stay on the SSH tunnel: nothing is added to your web server." "" "  ssh -L 8480:127.0.0.1:$PANEL_PORT root@$(web_state ip)" "" "Admin pages: http://localhost:8480$new/"
+	else box "Panel path" "Change the path in your web server's config, then reload it:" "" "  nginx:  location ~ ^($new|$sub)(/|\$) {" "  Caddy:  reverse_proxy $new/* 127.0.0.1:$PANEL_PORT" "" "Admin pages: https://$host$new/"; fi
 }
 
 pick_component() {
@@ -944,7 +961,7 @@ pick_component() {
 }
 
 do_install() {
-	local what comp
+	local what comp port detected
 	comp="$(pick_component "${1:-}")"
 	what="$comp"
 	need_root
@@ -952,20 +969,38 @@ do_install() {
 	detect_target
 	ensure_tools
 	[ -z "$DOMAIN" ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--domain is for install panel or install both"
-	if [ -z "$DOMAIN" ] && [ -z "$WEB" ] && { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
+	[ "$NO_DOMAIN" = 0 ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--no-domain is for install panel or install both"
+	[ "$NO_DOMAIN" = 0 ] || [ -z "$DOMAIN" ] || die "--no-domain and --domain cannot be used together"
+	[ -z "$PUBLIC_IP" ] || [ "$NO_DOMAIN" = 1 ] || die "--ip needs --no-domain"
+	if [ -z "$DOMAIN" ] && [ -z "$WEB" ] && [ "$NO_DOMAIN" = 0 ] && { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
 		if confirm "Set up a web server with HTTPS for the panel now? It needs a domain name that points at this server."; then
 			DOMAIN="$(ask "Domain name:" "")"
 			if [ -n "$DOMAIN" ]; then
 				WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
 				HTTPS_PORT="$(web_state https_port)"; HTTPS_PORT="$(ask "HTTPS port? [${HTTPS_PORT:-443}]" "${HTTPS_PORT:-443}")"
 			else info "no domain name given: no web server is set up"; fi
+		elif confirm "No domain name? Then the subscriptions are served on this server's IP, with a self-signed certificate that the apps check by its pin."; then NO_DOMAIN=1
 		fi
 	fi
-	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || die "--web needs --domain"
-	[ -z "$HTTPS_PORT" ] || [ -n "$DOMAIN" ] || die "--https-port needs --domain"
-	if [ -n "$DOMAIN" ]; then
-		DOMAIN="${DOMAIN,,}"
-		[[ "$DOMAIN" =~ $DOMAIN_RE ]] || die "\"$DOMAIN\" is not a domain name: use something like panel.example.com"
+	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--web needs --domain or --no-domain"
+	[ -z "$HTTPS_PORT" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--https-port needs --domain or --no-domain"
+	if [ "$NO_DOMAIN" = 1 ]; then
+		port=443; if has ss && [ -n "$(ss -H -ltn "sport = :443" 2>/dev/null)" ]; then port=8443; fi
+		detected="$(ip -4 -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)"
+		[ -n "$WEB" ] || WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
+		[ -n "$HTTPS_PORT" ] || HTTPS_PORT="$(ask "Port for the subscriptions? [$port]" "$port")"
+		[ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(ask "This server's IPv4 address? [$detected]" "$detected")"
+		[[ "$PUBLIC_IP" =~ $IPV4_RE ]] || die "\"$PUBLIC_IP\" is not an IPv4 address: pass it with --ip <address>"
+	fi
+	if [ -n "$(web_state web)" ] && { [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ]; }; then
+		if [ "$(web_state mode)" = ip ]; then [ "$NO_DOMAIN" = 1 ] || die "the web server here serves the subscriptions on an IP address: run sudo bash veilway.sh uninstall web first"
+		else [ "$NO_DOMAIN" = 0 ] || die "the web server here serves a domain: run sudo bash veilway.sh uninstall web first"; fi
+	fi
+	if [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ]; then
+		if [ -n "$DOMAIN" ]; then
+			DOMAIN="${DOMAIN,,}"
+			[[ "$DOMAIN" =~ $DOMAIN_RE ]] || die "\"$DOMAIN\" is not a domain name: use something like panel.example.com"
+		fi
 		WEB="${WEB:-caddy}"
 		[ "$WEB" = caddy ] || [ "$WEB" = nginx ] || die "--web is caddy or nginx"
 		HTTPS_PORT="${HTTPS_PORT:-$(web_state https_port)}"; HTTPS_PORT="${HTTPS_PORT:-443}"
@@ -973,7 +1008,7 @@ do_install() {
 		HTTPS_PORT=$((10#$HTTPS_PORT))
 		[ "$HTTPS_PORT" != 80 ] || die "port 80 cannot be the HTTPS port: the certificate is checked over port 80"
 		[ "$HTTPS_PORT" != "$PANEL_PORT" ] || die "port $PANEL_PORT is the panel's own port on 127.0.0.1: pick another --https-port"
-		HTTPS_HOST="$DOMAIN"; [ "$HTTPS_PORT" = 443 ] || HTTPS_HOST+=":$HTTPS_PORT"
+		HTTPS_HOST="${DOMAIN:-$PUBLIC_IP}"; [ "$HTTPS_PORT" = 443 ] || HTTPS_HOST+=":$HTTPS_PORT"
 		web_preflight
 	fi
 	[ "$DRY" = 1 ] || { TMP="$(mktemp -d)"; install -d -m 0755 "$STATE_DIR" 2>/dev/null || true; }
@@ -1087,7 +1122,7 @@ unit_state() {
 }
 
 do_status() {
-	local v prefix host port line
+	local v prefix host port line sub
 	header
 	printf '  %s%-14s %-34s %s%s\n' "$B" "Part" "State" "Version" "$Z"
 	printf '  %s%s%s\n' "$D" "$(rule 62)" "$Z"
@@ -1105,8 +1140,12 @@ do_status() {
 		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
 		host="$(web_state domain)"; port="$(web_state https_port)"
 		[ -z "$host" ] || [ -z "$port" ] || [ "$port" = 443 ] || host="$host:$port"
-		printf '\n  %-14s %s\n' "admin pages" "https://${host:-your-domain}$prefix/"
-		printf '  %-14s %s\n' "subscriptions" "$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		if [ "$(web_state mode)" = ip ]; then
+			printf '\n  %-14s %s\n' "admin pages" "http://localhost:8480$prefix/ through: ssh -L 8480:127.0.0.1:$PANEL_PORT root@$(web_state ip)"
+			printf '  %-14s %s\n' "endpoint" "https://$(web_state ip)$([ "$port" = 443 ] || echo ":$port")$sub/main, pin $(web_state pin)"
+		else printf '\n  %-14s %s\n' "admin pages" "https://${host:-your-domain}$prefix/"; fi
+		printf '  %-14s %s\n' "subscriptions" "$sub"
 		[ -x "$BIN_DIR/veilway-panel" ] && as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" 2>/dev/null | while IFS= read -r line; do printf '  %-14s %s\n' "admin" "$line"; done
 	fi
 	printf '\n'
@@ -1572,14 +1611,15 @@ web_pkg() {
 
 # Run before anything is installed: finds out what already holds ports 80 and the HTTPS port and stops with an explanation when the setup would take them from someone. The node on the HTTPS port is the one case it works around, see web_free_https.
 web_preflight() {
-	local s p out held="" other="" same=0
-	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports 80 and $HTTPS_PORT"
+	local s p out held="" other="" same=0 ports=(80 "$HTTPS_PORT")
+	[ "$NO_DOMAIN" = 0 ] || ports=("$HTTPS_PORT")
+	has ss || pkg_install iproute2 || die "cannot install iproute2, which shows what holds ports ${ports[*]}"
 	has apt-get || die "the automatic web server setup runs on Debian or Ubuntu: it needs apt-get. Install a web server by hand with the snippets that the install prints, or run this without --domain."
 	for s in nginx caddy apache2 httpd lighttpd haproxy; do
 		if ! has_systemd || ! systemctl is-active --quiet "$s.service" 2>/dev/null; then continue; fi
 		if [ "$s" = "$WEB" ]; then same=1; else other+="${other:+, }$s"; fi
 	done
-	for p in 80 "$HTTPS_PORT"; do
+	for p in "${ports[@]}"; do
 		out="$(ss -H -ltnp "sport = :$p" 2>/dev/null || true)"
 		[ -n "$out" ] || continue
 		if [ "$p" = "$HTTPS_PORT" ] && grep -q '"veilway"' <<<"$out"; then NODE_HTTPS=1
@@ -1589,7 +1629,7 @@ web_preflight() {
 		box "A web server is already here" \
 			"${other:+Running: $other}" \
 			"${held:+TCP port(s) in use by something else: $held}" \
-			"Two programs cannot share ports 80 and $HTTPS_PORT, and this script will not stop" \
+			"Two programs cannot share ports ${ports[*]}, and this script will not stop" \
 			"or replace a server it did not install. Either add the panel to your own" \
 			"server by hand (run without --domain for the snippets), or stop that server" \
 			"and run this again."
@@ -1599,8 +1639,8 @@ web_preflight() {
 		warn "$WEB already runs here. Your own configuration stays as it is: this only adds the panel's site file$([ "$WEB" = caddy ] && echo " and one import line")."
 		confirm "Add the panel's site to the running $WEB?" || die "cancelled, nothing was changed"
 	fi
-	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow ports 80 and $HTTPS_PORT (sudo ufw allow 80,$HTTPS_PORT/tcp) or the certificate and the site cannot be reached"; fi
-	getent hosts "$DOMAIN" >/dev/null 2>&1 || warn "$DOMAIN does not resolve yet: the certificate needs its DNS record to point at this server"
+	if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow ports ${ports[*]// /,} (sudo ufw allow ${ports[*]// /,}/tcp) or the site cannot be reached"; fi
+	[ "$NO_DOMAIN" = 1 ] || getent hosts "$DOMAIN" >/dev/null 2>&1 || warn "$DOMAIN does not resolve yet: the certificate needs its DNS record to point at this server"
 	return 0
 }
 
@@ -1697,6 +1737,7 @@ web_caddy() {
 			web_pkg caddy
 		fi
 	fi
+	[ "$NO_DOMAIN" = 0 ] || [ "$DRY" = 1 ] || chown caddy:caddy "$SUB_KEY" "$SUB_CERT"
 	act install -d -m 0755 /etc/caddy/conf.d
 	if [ "$DRY" = 1 ]; then dry "add the line \"$CADDY_IMPORT\" to $cf (a fresh install gets a Caddyfile with only that line)"
 	elif [ "$fresh" = 1 ] || [ ! -f "$cf" ]; then
@@ -1709,7 +1750,25 @@ web_caddy() {
 		step "added \"$CADDY_IMPORT\" to the end of $cf, the rest is untouched"
 	fi
 	if [ "${VEILWAY_CADDY_TLS:-}" = internal ]; then tls=$'\n\ttls internal'; fi
-	write_unit "$CADDY_SITE" <<EOF
+	if [ "$NO_DOMAIN" = 1 ]; then
+		write_unit "$CADDY_SITE" <<EOF
+# Written by veilway.sh install panel --no-domain. Remove it with: sudo bash veilway.sh uninstall web
+http://:80 {
+	respond 404
+}
+https://:$HTTPS_PORT {
+	tls $SUB_CERT $SUB_KEY
+	@sub path $sub $sub/*
+	handle @sub {
+		reverse_proxy 127.0.0.1:$PANEL_PORT
+	}
+	handle {
+		respond 404
+	}
+}
+$([ "$DECOY_ON" = 1 ] && printf 'http://127.0.0.1:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
+EOF
+	else write_unit "$CADDY_SITE" <<EOF
 # Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
 $HTTPS_HOST {$tls
 	handle $prefix/* {
@@ -1725,6 +1784,7 @@ $HTTPS_HOST {$tls
 }
 $([ "$DECOY_ON" = 1 ] && printf 'http://127.0.0.1:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
 EOF
+	fi
 	if has_systemd && [ "$DRY" = 0 ]; then
 		if ! { if [ "$fresh" = 1 ] || ! systemctl is-active --quiet caddy.service; then svc enable caddy.service; svc restart caddy.service; else svc reload caddy.service; fi; }; then
 			rm -f -- "$CADDY_SITE"
@@ -1732,13 +1792,14 @@ EOF
 		fi
 	else svc reload caddy.service; fi
 	web_note web caddy
-	[ "$DRY" = 1 ] || step "Caddy serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"
+	if [ "$DRY" = 0 ] && [ "$NO_DOMAIN" = 1 ]; then step "Caddy serves https://$HTTPS_HOST$sub only, every other path answers 404"
+	elif [ "$DRY" = 0 ]; then step "Caddy serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"; fi
 }
 
 web_nginx() {
 	local fresh=0 prefix="$1" sub="$2" cert="${VEILWAY_NGINX_CERT:-}" tls=""
 	pkg_has nginx || fresh=1
-	if [ -n "$cert" ]; then web_pkg nginx; else web_pkg nginx certbot python3-certbot-nginx; fi
+	if [ -n "$cert" ] || [ "$NO_DOMAIN" = 1 ]; then web_pkg nginx; else web_pkg nginx certbot python3-certbot-nginx; fi
 	if [ "$fresh" = 1 ] && [ -L /etc/nginx/sites-enabled/default ]; then
 		act rm -f /etc/nginx/sites-enabled/default
 		web_note nginx_default_removed 1
@@ -1748,7 +1809,28 @@ web_nginx() {
 	ssl_certificate ${cert%%:*};
 	ssl_certificate_key ${cert#*:};"
 	else tls="	# certbot adds the https part here"; fi
-	write_unit "$NGINX_SITE" <<EOF
+	if [ "$NO_DOMAIN" = 1 ]; then
+		write_unit "$NGINX_SITE" <<EOF
+# Written by veilway.sh install panel --no-domain. Remove it with: sudo bash veilway.sh uninstall web
+server {
+	listen $HTTPS_PORT ssl;
+	listen [::]:$HTTPS_PORT ssl;
+	server_tokens off;
+	ssl_certificate $SUB_CERT;
+	ssl_certificate_key $SUB_KEY;
+	location ~ ^$sub(/|\$) {
+		proxy_pass http://127.0.0.1:$PANEL_PORT;
+		client_max_body_size 100m;
+		proxy_set_header Host \$http_host;
+		proxy_set_header X-Forwarded-For \$remote_addr;
+	}
+	location / {
+		return 404;
+	}
+}
+$([ "$DECOY_ON" = 1 ] && printf 'server {\n\tlisten 127.0.0.1:%s;\n\tserver_tokens off;\n\troot %s;\n\tlocation / {\n\t\ttry_files %s %s/ =404;\n\t}\n}' "$DECOY_PORT" "$WEB_ROOT" "\$uri" "\$uri")
+EOF
+	else write_unit "$NGINX_SITE" <<EOF
 # Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
 server {
 	listen 80;
@@ -1769,6 +1851,7 @@ $tls
 }
 $([ "$DECOY_ON" = 1 ] && printf 'server {\n\tlisten 127.0.0.1:%s;\n\tserver_tokens off;\n\troot %s;\n\tlocation / {\n\t\ttry_files %s %s/ =404;\n\t}\n}' "$DECOY_PORT" "$WEB_ROOT" "\$uri" "\$uri")
 EOF
+	fi
 	if has_systemd && [ "$DRY" = 0 ]; then
 		if ! nginx -t >/dev/null 2>&1; then
 			rm -f -- "$NGINX_SITE"
@@ -1777,8 +1860,9 @@ EOF
 		if [ "$fresh" = 1 ] || ! systemctl is-active --quiet nginx.service; then svc enable nginx.service; svc restart nginx.service; else svc reload nginx.service; fi
 	else svc reload nginx.service; fi
 	web_note web nginx
-	[ "$DRY" = 1 ] || step "nginx serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"
-	[ -z "$cert" ] || return 0
+	if [ "$DRY" = 0 ] && [ "$NO_DOMAIN" = 1 ]; then step "nginx serves https://$HTTPS_HOST$sub only, every other path answers 404"
+	elif [ "$DRY" = 0 ]; then step "nginx serves $HTTPS_HOST: the panel at $prefix and $sub, the plain site everywhere else"; fi
+	[ -z "$cert" ] && [ "$NO_DOMAIN" = 0 ] || return 0
 	if [ "$DRY" = 1 ]; then dry "certbot --nginx -d $DOMAIN --https-port $HTTPS_PORT, with an https redirect"; return 0; fi
 	web_note certbot_domain "$DOMAIN"
 	if certbot --nginx -d "$DOMAIN" --https-port "$HTTPS_PORT" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then step "certbot issued the certificate for $DOMAIN and turned on https"
@@ -1809,7 +1893,22 @@ web_setup() {
 		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"
 		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
 	fi
+	if [ "$NO_DOMAIN" = 1 ]; then
+		if [ "$DRY" = 1 ]; then dry "make $SUB_KEY (EC P-256) if there is none, and a self-signed certificate for $PUBLIC_IP valid 10 years in $SUB_CERT, both mode 600"
+		else
+			install -d -m 0755 "$SUB_TLS"
+			[ -f "$SUB_KEY" ] || ( umask 077; openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$SUB_KEY" ) || die "openssl could not make the key"
+			if [ ! -f "$SUB_CERT" ] || [ "$(web_state ip)" != "$PUBLIC_IP" ]; then
+				( umask 077; openssl req -new -x509 -key "$SUB_KEY" -days 3650 -subj "/CN=$PUBLIC_IP" -addext "subjectAltName=IP:$PUBLIC_IP" -out "$SUB_CERT" ) || die "openssl could not make the certificate"
+				step "made a self-signed certificate for $PUBLIC_IP, valid 10 years"
+			else info "kept the certificate for $PUBLIC_IP"; fi
+			chmod 0600 "$SUB_KEY" "$SUB_CERT"
+			web_note pin "$(openssl x509 -in "$SUB_CERT" -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256 -binary | base64 | tr -d '\n')"
+		fi
+	fi
+	web_note mode "$([ "$NO_DOMAIN" = 1 ] && echo ip || echo domain)"
 	web_note domain "$DOMAIN"
+	web_note ip "$PUBLIC_IP"
 	web_note https_port "$HTTPS_PORT"
 	web_free_https
 	web_pkg jq
@@ -1826,6 +1925,7 @@ do_uninstall_web() {
 	need_root
 	[ -f "$WEB_STATE" ] || die "no web server setup by this script is recorded here"
 	web="$(web_state web)"; domain="$(web_state domain)"; pkgs="$(web_state pkgs)"; port="$(web_state https_port)"
+	[ -n "$domain" ] || domain="$(web_state ip)"
 	confirm "Remove the web server setup for $domain ($web on port ${port:-443}): its site file, the plain site if it is unchanged, the panel's not_found${pkgs:+, and the packages ${pkgs# }}?" || die "cancelled"
 	[ -z "$(web_state decoy_file)" ] || act rm -f -- "$(web_state decoy_file)"
 	case "$web" in
@@ -1841,6 +1941,7 @@ do_uninstall_web() {
 			if [ "$(web_state nginx_default_removed)" = 1 ] && [ -e /etc/nginx/sites-available/default ]; then act ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default; fi
 			;;
 	esac
+	[ "$(web_state mode)" != ip ] || act rm -rf -- "$SUB_TLS"
 	sha="$(web_state decoy_sha)"
 	if [ -n "$sha" ] && [ -f "$WEB_ROOT/index.html" ] && [ "$(sha256sum "$WEB_ROOT/index.html" | cut -d' ' -f1)" = "$sha" ] && [ "$(find "$WEB_ROOT" -mindepth 1 | wc -l)" = 1 ]; then act rm -rf -- /var/www/veilway-site
 	elif [ -e "$WEB_ROOT" ]; then info "kept $WEB_ROOT: it was edited or holds other files"; fi
@@ -1893,9 +1994,12 @@ main() {
 			--web=*) WEB="${1#*=}" ;;
 			--https-port) [ $# -gt 1 ] || die "--https-port needs a port number"; HTTPS_PORT="$2"; shift ;;
 			--https-port=*) HTTPS_PORT="${1#*=}" ;;
+			--no-domain) NO_DOMAIN=1 ;;
+			--ip) [ $# -gt 1 ] || die "--ip needs an IPv4 address"; PUBLIC_IP="$2"; shift ;;
+			--ip=*) PUBLIC_IP="${1#*=}" ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
-			-h | --help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+			-h | --help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) args+=("$1") ;;
 		esac
 		shift
