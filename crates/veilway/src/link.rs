@@ -245,3 +245,64 @@ pub async fn answer(config: &Path, tag: &str, apply: Option<Option<PathBuf>>) ->
 	if let Some(manage) = paired.offer.manage {entry["manage"] = json!(if manage == Manage::Dialler {"peer"} else {"by_peer"})}
 	done(doc, entry, reverse, &config.routing.default, socket).await
 }
+
+/// `veilway link remove`: takes link `tag` out of this node's config, and with `empty` every user and Xray client too, which is how a managed node leaves its panel ("Removal"). Through the control socket of the node that runs with `apply`, else in the config file, which the node reads at its next reload.
+pub async fn remove(path: &Path, tag: &str, empty: bool, yes: bool, apply: Option<Option<PathBuf>>) -> i32 {
+	let socket = apply.map(|api| api.unwrap_or_else(|| path.parent().unwrap_or(Path::new("")).join("veilway.sock")));
+	let wait = Duration::from_secs(30);
+	// The running config comes with its secrets as markers, which the node takes back as they are; the file has them in full.
+	let (revision, mut doc) = match &socket {
+		#[cfg(unix)]
+		Some(socket) => match veilway_api::request(socket, "GET", "/v1/config", None, wait).await {
+			Ok((200, body)) => {
+				let mut running: Value = serde_json::from_slice(&body).unwrap_or_default();
+				let Some(revision) = running["revision"].as_str().map(str::to_string) else {eprintln!("error: the node's config came without its revision"); return 1};
+				(Some(revision), running["document"].take())
+			}
+			Ok((status, _)) => {eprintln!("error: the node answered {status} when its config was read"); return 1}
+			Err(e) => {eprintln!("error: no node answers on the control socket {} ({})", socket.display(), e.kind()); return 1}
+		},
+		#[cfg(not(unix))]
+		Some(_) => {eprintln!("error: --apply needs the control socket, which this platform does not have. Leave it out to change the config file"); return 1}
+		None => match loaded(path) {Some((doc, _)) => (None, doc), None => return 1},
+	};
+	let Some(link) = doc["links"].as_array().and_then(|links| links.iter().find(|link| link["tag"] == tag)).cloned() else {
+		eprintln!("error: this node has no link called {tag}");
+		return 1;
+	};
+	let users = doc["users"].as_array().map_or(0, Vec::len);
+	match link["manage"].as_str() {
+		Some("by_peer") => eprintln!("The other node manages this node through link {tag}. Removing it ends that at once: the other node can no longer read or change anything here, and its panel shows this node as down."),
+		Some("peer") => eprintln!("This node manages the other node through link {tag}. Removing it ends that, and the other node keeps its config as it is."),
+		_ => eprintln!("Removing link {tag} ends it at once, and what goes through it stops."),
+	}
+	if empty {eprintln!("All {users} users of this node are removed too, with the clients of its Xray inbounds: nobody can connect here until users are added again.")} else if users > 0 {eprintln!("The {users} users of this node stay and keep working. --empty removes them too.")}
+	if !yes && line("Type yes to remove it:").as_deref() != Some("yes") {
+		eprintln!("Nothing was changed.");
+		return DECLINED;
+	}
+	if let Some(links) = doc["links"].as_array_mut() {links.retain(|link| link["tag"] != tag)}
+	if empty {
+		doc["users"] = json!([]);
+		for inbound in doc.get_mut("xray").and_then(|xray| xray.get_mut("inbounds")).and_then(Value::as_array_mut).into_iter().flatten() {inbound["clients"] = json!([])}
+	}
+	match (&socket, revision) {
+		#[cfg(unix)]
+		(Some(socket), Some(revision)) => match veilway_api::request_with(socket, "PUT", "/v1/config", &[("if-match", &revision)], Some(doc.to_string().into_bytes()), wait).await {
+			Ok((200, _)) => {eprintln!("Removed, and in force on the node that runs."); 0}
+			Ok((status, body)) => {eprintln!("error: the node answered {status}: {}. Nothing was changed", serde_json::from_slice::<Value>(&body).unwrap_or_default()["error"]["message"].as_str().unwrap_or("with no message")); 1}
+			Err(e) => {eprintln!("error: the node did not answer the change ({e}), so whether it was made is not known: look at its links"); 1}
+		},
+		_ => {
+			let report = match Config::parse(doc.to_string().as_bytes()) {Ok(config) => config.validate(false), Err(e) => {eprintln!("error, without this link: {e}. Nothing was changed"); return 1}};
+			for error in &report.errors {eprintln!("error, without this link: {error}")}
+			if !report.errors.is_empty() {eprintln!("Nothing was changed: fix what still names the link first."); return 1}
+			let mut bytes = serde_json::to_vec_pretty(&doc).unwrap_or_default();
+			bytes.push(b'\n');
+			match config::save(path, &bytes) {
+				Ok(()) => {eprintln!("Removed from {}. It goes into force when the node reloads or restarts, or use --apply on a node that runs.", path.display()); 0}
+				Err(e) => {eprintln!("error: {} could not be written ({e}). Nothing was changed", path.display()); 1}
+			}
+		}
+	}
+}

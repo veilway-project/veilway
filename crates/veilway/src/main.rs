@@ -189,6 +189,18 @@ enum Link {
 		/// Put the entry into the config of the node that runs, through its control socket, instead of printing it. The socket can be named as --apply=SOCKET [default: veilway.sock next to the config file]
 		#[arg(long, num_args = 0..=1, require_equals = true, value_name = "SOCKET")] apply: Option<Option<PathBuf>>,
 	},
+	/// Take a link out of this node's config, which ends it at once. On a node a panel manages, this is how it leaves the panel: with --empty its users go too, without it they stay and keep working, out of the panel's reach. Asks for a yes first. Exit status: 0 removed, 2 not confirmed, 1 anything else
+	Remove {
+		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+		/// The tag of the link in this node's config
+		#[arg(long)] tag: String,
+		/// Also remove every user of this node, and the clients of its Xray inbounds
+		#[arg(long)] empty: bool,
+		/// Remove without asking
+		#[arg(long)] yes: bool,
+		/// Change the config of the node that runs, through its control socket, instead of the config file. The socket can be named as --apply=SOCKET [default: veilway.sock next to the config file]
+		#[arg(long, num_args = 0..=1, require_equals = true, value_name = "SOCKET")] apply: Option<Option<PathBuf>>,
+	},
 }
 
 #[cfg(unix)]
@@ -483,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
 		}
 		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, managed, manages, transports, mtu, lifetime, apply}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, if managed {Some(veilway_proto::pairing::Manage::Dialler)} else if manages {Some(veilway_proto::pairing::Manage::Listener)} else {None}, &transports, mtu, lifetime, apply).await),
 		Command::Link {command: Link::Answer {config, tag, apply}} => std::process::exit(link::answer(&config, &tag, apply).await),
+		Command::Link {command: Link::Remove {config, tag, empty, yes, apply}} => std::process::exit(link::remove(&config, &tag, empty, yes, apply).await),
 		Command::Bundle {command: Bundle::Make {key, out, bundle_id, apps, packs, notices}} => bundle::make(&key, &out, bundle_id.as_deref(), &apps, &packs, &notices),
 		Command::Bundle {command: Bundle::Inspect {file, keys}} => std::process::exit(if bundle::inspect(&file, &keys)? {0} else {1}),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]

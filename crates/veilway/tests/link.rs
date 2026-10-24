@@ -157,3 +157,52 @@ fn a_pairing_that_is_not_confirmed_prints_no_entry() {
 	}
 	let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn link_remove_takes_a_link_out_asks_first_refuses_what_still_names_it_and_empties_with_empty() {
+	let dir = folder("remove");
+	let ((listener, dialler), at) = (configs(&dir), |name: &str| dir.join(name).to_str().unwrap().to_string());
+	let (config, transports, other) = (at("listener.json"), at("transports.json"), at("dialler.json"));
+	let (mut offering, mut answering) = (Side::start(&["offer", "--config", &config, "--tag", "to-dialler", "--inbound", "links", "--name", "north", "--address", "10.9.0.2", "--transports", &transports]), Side::start(&["answer", "--config", &other, "--tag", "to-listener"]));
+	answering.types(&offering.prints());
+	answering.says("udp-obfs ");
+	answering.types("yes");
+	offering.types(&answering.prints());
+	let (shown, heard) = (offering.says("over a channel you trust:"), answering.says("over a channel you trust:"));
+	offering.types(&heard);
+	answering.types(&shown);
+	let ((done, entry), (answered, back)) = (offering.ends(), answering.ends());
+	assert_eq!((done, answered), (0, 0), "{entry} {back}");
+	let remove = |file: &str, args: &[&str], typed: &str| {
+		let mut child = Command::new(env!("CARGO_BIN_EXE_veilway")).args(["link", "remove", "--config", file]).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+		writeln!(child.stdin.take().unwrap(), "{typed}").unwrap();
+		let out = child.wait_with_output().unwrap();
+		(out.status.code().unwrap(), String::from_utf8_lossy(&out.stderr).to_string())
+	};
+	let read = |file: &str| serde_json::from_slice::<Value>(&std::fs::read(file).unwrap()).unwrap();
+	let mut doc = listener.clone();
+	doc["links"] = json!([serde_json::from_str::<Value>(&entry).unwrap()]);
+	std::fs::write(&config, doc.to_string()).unwrap();
+	assert_eq!(remove(&config, &["--tag", "nowhere", "--yes"], "").0, 1);
+	// Not removed without a yes.
+	let (status, said) = remove(&config, &["--tag", "to-dialler"], "no");
+	assert_eq!((status, read(&config)["links"].as_array().map(Vec::len)), (2, Some(1)), "{said}");
+	let (status, said) = remove(&config, &["--tag", "to-dialler"], "yes");
+	assert_eq!((status, read(&config)["links"].as_array().map(Vec::len)), (0, Some(0)), "{said}");
+	assert!(said.contains("reloads or restarts"), "{said}");
+	// The entry half behind a chain exit: the exit still names the link, so nothing is changed.
+	let mut doc = dialler.clone();
+	doc["links"] = json!([serde_json::from_str::<Value>(&back).unwrap()]);
+	doc["exits"].as_array_mut().unwrap().push(json!({"tag": "far", "backend": {"type": "chain", "links": ["to-listener"]}}));
+	std::fs::write(&other, doc.to_string()).unwrap();
+	let (status, said) = remove(&other, &["--tag", "to-listener", "--yes"], "");
+	assert_eq!((status, read(&other)["links"].as_array().map(Vec::len)), (1, Some(1)), "{said}");
+	// Without it the link goes, and with --empty the users go too.
+	doc["exits"].as_array_mut().unwrap().pop();
+	std::fs::write(&other, doc.to_string()).unwrap();
+	let (status, said) = remove(&other, &["--tag", "to-listener", "--empty", "--yes"], "");
+	let left = read(&other);
+	assert_eq!((status, left["links"].as_array().map(Vec::len), left["users"].as_array().map(Vec::len)), (0, Some(0), Some(0)), "{said}");
+	assert!(Config::parse(left.to_string().as_bytes()).unwrap().validate(false).errors.is_empty());
+	let _ = std::fs::remove_dir_all(&dir);
+}
