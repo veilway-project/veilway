@@ -51,6 +51,8 @@ class VeilwayVpnService : VpnService() {
 	private var callback: ConnectivityManager.NetworkCallback? = null
 	private var state = "connecting"
 	private var finished = false
+	/** The connection has no VPN interface: only programs set to use the local proxy go through it, and the phone's other traffic is not blocked. */
+	@Volatile var proxyOnly = false
 	private var retries = 0
 	/** The VPN interface as the system holds it for this service. It stays up while the engine reconnects and after it gave up, so that the phone's traffic is dropped and does not leave outside the VPN, until [finish] ends the service. */
 	private var held: ParcelFileDescriptor? = null
@@ -192,7 +194,11 @@ class VeilwayVpnService : VpnService() {
 	}
 
 	private fun ongoing(): Notification {
-		val text = when (state) {
+		val text = if (proxyOnly) when (state) {
+			"connected" -> label("Proxy only: connected", "فقط پروکسی: متصل است")
+			"reconnecting", "blocked", "stopped" -> label("Proxy only: no connection", "فقط پروکسی: اتصال برقرار نیست")
+			else -> label("Connecting", "در حال اتصال")
+		} else when (state) {
 			"connected" -> label("Connected", "متصل است")
 			"reconnecting", "blocked" -> label("No connection. Internet blocked until the VPN is back", "اتصال برقرار نیست. اینترنت تا بازگشت وی‌پی‌ان مسدود است")
 			"stopped" -> label("Internet blocked until you reconnect", "اینترنت تا اتصال دوباره مسدود است")

@@ -17,7 +17,7 @@ const IDLE: Running = {connected: false, status: null, kill_switch_kept: false};
 const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe", "does not check who"], ["stale", "expired more than 30 days"], ["cover", "looks like ordinary web traffic"], ["nocover", "does not look like web traffic"], ["plain", "plain tunnel"], ["exposed", "can tell that you use this app"]];
 
 // Used only until the helper's settings arrive, and when they cannot be read.
-const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true};
+const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true, proxy: {on: false, only: false, kind: "mixed", port: 10808, lan: false, login: true, user: "", password: ""}};
 // The add-on has not run on a real Mac yet, which its offer says there.
 const MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
@@ -110,7 +110,8 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 	};
 	// The desktop restarts into the new version and never returns here; Android returns once the system's installer has the file, and the user may still cancel there.
 	const install = () => { setProgress({downloaded: 0, total: null}); call("install_update").then(() => setProgress(null), error => { setProgress(null); toast({tone: "danger", title: t("update.failed"), body: error}); }); };
-	const saveSettings = (next: Settings) => { onSettings(next); call("set_settings", {settings: next}).catch(error => toast({tone: "danger", title: t("settings.saveFailed"), body: error})); };
+	// The app answers with what it kept, which has the proxy's login once it made one.
+	const saveSettings = (next: Settings) => { onSettings(next); call("set_settings", {settings: next}).then(onSettings, error => { toast({tone: "danger", title: t("settings.saveFailed"), body: error}); call("get_settings").then(onSettings, () => {}); }); };
 	const kind = question === null ? null : QUESTIONS.find(([, words]) => question.includes(words))?.[0] ?? "other";
 	const updateBanner = update && <Banner tone="info" title={t("update.title", {version: update.version})} action={!progress && <Button size="sm" variant="primary" onClick={install}>{t("update.install")}</Button>}>
 		{progress ? <span className="d-progress"><span>{t("update.installing")}</span>{progress.total ? <><span className="vw-meter" role="progressbar" aria-valuemin={0} aria-valuemax={progress.total} aria-valuenow={progress.downloaded}><span style={{inlineSize: Math.min(100, progress.downloaded / progress.total * 100) + "%"}}/></span><strong className="vw-num vw-small">{percent(progress.downloaded / progress.total)}</strong></> : null}</span> : update.notes.slice(0, 200)}
@@ -120,7 +121,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		: tab === "usage" ? <UsagePage running={running} points={points}/>
 		: tab === "subscriptions" ? <Library library={named} inUse={running.connected ? chosen?.subscription.id ?? null : null} onAdd={() => setAdding(true)} onRefresh={refresh} onChange={setLibrary}/>
 		: tab === "settings" ? <SettingsPage prefs={prefs} onPrefs={onPrefs} settings={settings} onSettings={saveSettings} logs={logs} onUpdate={setUpdate}/>
-		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh} onLibrary={setLibrary}/>;
+		: <Home running={running} busy={busy} ended={ended} points={points} choices={choices} chosen={chosen} prefs={prefs} proxyBlocked={!!chosen?.profile.legacy && settings.proxy.on && settings.proxy.only} onPrefs={onPrefs} onConnect={connect} onDisconnect={disconnect} onRefresh={refresh} onLibrary={setLibrary}/>;
 	const lit = running.status?.state === "connected";
 	return <Backdrop fixed lit={lit} className="d-app">
 		<Shell nav={<Nav header={<Brand/>} value={adding ? "subscriptions" : tab} onChange={id => { setAdding(false); setTab(id); }} items={[{id: "home", label: t("nav.home"), icon: "power"}, {id: "usage", label: t("nav.usage"), icon: "chart"}, {id: "subscriptions", label: t("nav.subscriptions"), icon: "inbox"}, {id: "settings", label: t("nav.settings"), icon: "settings"}]}/>} banner={updateBanner}>{content}</Shell>

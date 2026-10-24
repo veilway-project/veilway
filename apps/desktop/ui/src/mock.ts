@@ -1,12 +1,15 @@
 // Development only: stands in for the Tauri side so the screens can run in a plain browser. main.tsx loads it only when Vite runs in "mock" mode, so a production build never contains it.
-// The address picks the scene and the display: ?scene=empty|question|connected|fallback|offer|xray&lang=en|fa&scheme=dark|light. "offer" holds pasted links with no Xray add-on, "xray" is connected through it.
-import type {BundleReview, Host, LegacyOffer, Running, StatusView, Subscription, XrayState} from "./tauri.ts";
+// The address picks the scene and the display: ?scene=empty|question|connected|fallback|offer|xray&lang=en|fa&scheme=dark|light&proxy=on|only (the local proxy, already on). "offer" holds pasted links with no Xray add-on, "xray" is connected through it.
+import type {BundleReview, Host, LegacyOffer, ProxySettings, Running, Settings, StatusView, Subscription, XrayState} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
 try { localStorage.setItem("veilway-desktop", JSON.stringify({scheme: query.get("scheme") ?? "system", choice: query.get("profile") ? {subscription: "sub-harbor", profile: query.get("profile")} : null, hidden: []})); } catch { /* private window */ }
 const LOGO = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAAAsUlEQVR42u3awQ2AMAwDwE7AtAzCqHx5lQUQCk2dNMaR+saHUKEJramIatuPblklQy+H8QZPg8wOHgpBh4chooJDIFnhpyCyw7sRpQEjFzqvblpwxOidQgI+IUoDPM8qGmBClAZ4d4sIwCtCgEzAjBdOFOARIYAAAggggAClAfoWEmCBM4FOZNnnYnUlsntDyzS2RhEowH+bu+Xb6xQDDooRE82Qj2LMSjPopvnVQOWsG6NWRf9wqO4DAAAAAElFTkSuQmCC";
 // Not a real code: a pattern with the three finder squares, for the screenshots only.
 const QR = (() => { const n = 29, cells: string[] = []; for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) { const finder = (x < 8 && y < 8) || (x >= n - 8 && y < 8) || (x < 8 && y >= n - 8), edge = (a: number, b: number) => a === 0 || a === 6 || b === 0 || b === 6 || (a >= 2 && a <= 4 && b >= 2 && b <= 4); const dark = finder ? (x < 8 && y < 8 ? edge(x, y) : x >= n - 8 && y < 8 ? edge(x - (n - 7), y) : edge(x, y - (n - 7))) && x % (n - 7) < 7 && y % (n - 7) < 7 || false : ((x * 7 + y * 13 + x * y) % 5 < 2); if (dark) cells.push(`<rect x="${x + 2}" y="${y + 2}" width="1" height="1"/>`); } return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${n + 4} ${n + 4}" shape-rendering="crispEdges"><rect width="100%" height="100%" fill="#fff"/><g fill="#000">${cells.join("")}</g></svg>`; })();
+// The login the app makes when the proxy is turned on, here only a look-alike.
+const fakeLogin = {user: "Wq3k9ZtB-XvN4mLp2sRa", password: "h7Ue_Rj2Kd9QmXz0Pb4c"};
+let proxy: ProxySettings = {on: query.has("proxy"), only: query.get("proxy") === "only", kind: "mixed", port: 10808, lan: false, login: true, user: query.has("proxy") ? fakeLogin.user : "", password: query.has("proxy") ? fakeLogin.password : ""};
 const DAY = 86400, now = () => Math.floor(Date.now() / 1000), GB = 1024 ** 3;
 
 let lan = false, alpha = false, hosts: Host[] = [{key: "backup.harbor.example:443", host: "backup.harbor.example:443", kind: "update", state: "waiting", check: "chain", from: null}, {key: "http://203.0.113.9:8080/s#plain", host: "203.0.113.9:8080", kind: "move", state: "waiting", check: "plain", from: "sub.harbor.example:443"}, {key: "objects.storage.example:443#static", host: "objects.storage.example:443", kind: "static", state: "waiting", check: "chain", from: null}, {key: "raw.codehost.example:443#static", host: "raw.codehost.example:443", kind: "static", state: "allowed", check: "chain", from: null}];
@@ -44,7 +47,8 @@ const status = (): StatusView => {
 		state: scene === "question" ? "connecting" : "connected", name: "Main", exit: selected ?? (scene === "fallback" ? "ams" : "fra"), wait_until: null, say_code: null, say: null,
 		exits: [{tag: "fra", name: "Frankfurt", country: "de", selected: selected === "fra", configured: true, working: scene !== "fallback", load: "low"}, {tag: "ams", name: "Amsterdam", country: "nl", selected: selected === "ams", configured: false, working: true, load: "medium"}, {tag: "hel", name: "Helsinki", country: "fi", selected: selected === "hel", configured: false, working: true, load: "high"}, {tag: "waw", name: "Warsaw", country: "pl", selected: false, configured: false, working: true, load: "unknown"}, {tag: "ist", name: "Istanbul", country: "tr", selected: false, configured: false, working: false, load: "unknown"}],
 		usage: {used_bytes: 31.4 * GB, quota_bytes: 50 * GB, period: "monthly", expires_at: now() + 23 * DAY, up_bytes: 2.1 * GB, down_bytes: 29.3 * GB},
-		notices: [], sent_bytes: sent, received_bytes: received, mtu: 1390, out_of_date: false, connection: scene === "question" ? {...connection, since: null} : connection, applied: null
+		notices: [], sent_bytes: sent, received_bytes: received, mtu: 1390, out_of_date: false, connection: scene === "question" ? {...connection, since: null} : connection, applied: null,
+		proxy: proxy.on ? {listen: (proxy.lan ? "0.0.0.0:" : "127.0.0.1:") + proxy.port, kind: proxy.kind, only: proxy.only, error: null} : null
 	};
 };
 
@@ -65,8 +69,12 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	library: args => { languages = (args.languages as string[]) ?? ["en"]; return list(); },
 	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: false}),
 	log_history: () => ["0.4s client ready", "1.2s connect requested", "2.0s connected through Frankfurt"],
-	get_settings: () => ({auto_update: scene === "update", theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true}),
-	set_settings: () => null,
+	get_settings: (): Settings => ({auto_update: scene === "update", theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true, proxy}),
+	set_settings: args => {
+		const saved = args.settings as Settings;
+		proxy = {...saved.proxy, ...(saved.proxy.on && !saved.proxy.user ? fakeLogin : {})};
+		return {...saved, proxy};
+	},
 	get_autostart: () => false,
 	set_autostart: () => null,
 	open_link: () => null,

@@ -85,6 +85,11 @@ pub fn wrap(plain: &[u8]) -> Option<Vec<u8>> {through_keystore("wrap", plain)}
 
 pub fn unwrap(sealed: &[u8]) -> Option<Vec<u8>> {through_keystore("unwrap", sealed)}
 
+/// Tells the service whether this connection has no VPN interface (proxy only), so that the notification does not say the internet is blocked.
+pub fn proxy_only(on: bool) {
+	let _ = with_bridge(|env, class| env.call_static_method(class, "proxyOnly", "(Z)V", &[JValue::Bool(u8::from(on))]).map(|_| ()));
+}
+
 /// Tells the notification what the tunnel is doing.
 pub fn state(state: &str) {
 	let _ = with_bridge(|env, class| {

@@ -8,7 +8,9 @@ export type Usage = {used_bytes: number, quota_bytes: number, period: string, ex
 export type Connection = {transport: string, address: string, host: string | null, front: string | null, server_name: string | null, check: string | null, since: number | null, alpha: boolean};
 // What the carrier of pasted links counts while it runs. Numbers and a reason code only.
 export type XrayStatus = {open_tcp: number, open_udp: number, failed_flows: number, carried_flows: number, bytes_sent: number, bytes_received: number, unsupported_packets: number, dropped_udp_flows: number, restarts: number, last_restart: number | null, say_code: string | null, say: string | null};
-export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, connection: Connection | null, applied: unknown, xray?: XrayStatus | null};
+export type StatusView = {state: "off" | "connecting" | "connected" | "reconnecting" | "stopped" | "failed", name: string, exit: string | null, wait_until: number | null, say_code: string | null, say: string | null, exits: Exit[], usage: Usage | null, notices: Notice[], sent_bytes: number, received_bytes: number, mtu: number, out_of_date: boolean, connection: Connection | null, applied: unknown, xray?: XrayStatus | null, proxy?: ProxyStatus | null};
+// Where the local proxy listens while it runs, and why it could not start when it could not. `only` is proxy only mode, with no system VPN.
+export type ProxyStatus = {listen: string, kind: string, only: boolean, error: string | null};
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
 // `legacy` is set for a connection of pasted links: its protocol, whether the core caps it at Unsafe (otherwise at Detectable), and the code of the refusal when it cannot connect.
 export type Legacy = {protocol: string, unsafe_cap: boolean, refused: string | null};
@@ -31,7 +33,9 @@ export type Review = {fingerprint: string, replaces: boolean, endpoint_changed: 
 export type PrivateAsk = {ask_private: {host: string, addresses: string[]}};
 export const asksPrivate = (value: unknown): value is PrivateAsk => typeof value === "object" && value !== null && "ask_private" in value;
 export type Running = {connected: boolean, status: StatusView | null, kill_switch_kept: boolean};
-export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean};
+// The local proxy. The login is made by the app when the proxy is turned on; Android never turns it off, and with `lan` it is always on.
+export type ProxySettings = {on: boolean, only: boolean, kind: "mixed" | "socks5" | "http", port: number, lan: boolean, login: boolean, user: string, password: string};
+export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean, proxy: ProxySettings};
 export type UpdateInfo = {available: boolean, version: string, notes: string, current: string};
 export type Options = {local_names: boolean, routes: string[]};
 export type Ended = {error: string | null, kept: boolean};
@@ -77,7 +81,7 @@ type Commands = {
 	check_update: [{}, UpdateInfo],
 	install_update: [{}, null],
 	get_settings: [{}, Settings],
-	set_settings: [{settings: Settings}, null],
+	set_settings: [{settings: Settings}, Settings],
 	open_link: [{url: string}, null],
 	get_autostart: [{}, boolean],
 	set_autostart: [{enabled: boolean}, null],

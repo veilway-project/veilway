@@ -6,7 +6,7 @@ import {call, type Ended, type Exit, type Profile, type Running, type Subscripti
 
 type Choice = {subscription: Subscription, profile: Profile};
 
-export function Home({running, busy, ended, points, choices, chosen, prefs, onPrefs, onConnect, onDisconnect, onRefresh, onLibrary}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void, onLibrary: (found: Subscription[]) => void}) {
+export function Home({running, busy, ended, points, choices, chosen, prefs, proxyBlocked, onPrefs, onConnect, onDisconnect, onRefresh, onLibrary}: {running: Running, busy: boolean, ended: Ended | null, points: TrafficPoint[], choices: Choice[], chosen: Choice | undefined, prefs: Prefs, proxyBlocked: boolean, onPrefs: (next: Partial<Prefs>) => void, onConnect: () => void, onDisconnect: () => void, onRefresh: (id: string) => void, onLibrary: (found: Subscription[]) => void}) {
 	const {t, rate, time, date, locale, number, bytes} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
 	const status = running.status, state = running.connected ? status?.state ?? "connecting" : "off", subscription = chosen?.subscription, logo = useLogo(subscription?.logo ?? null);
 	const link: ConnectState = state === "connected" ? "on" : state === "off" || state === "failed" ? "off" : "connecting";
@@ -42,6 +42,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 		{key: "details.check", shown: check && t(check), plain: check && en[check], code: false}, {key: "details.mtu", shown: number(status?.mtu ?? 0), plain: String(status?.mtu), code: true}, {key: "details.uptime", shown: clock && clock.split(":").map((part, i) => i ? number(Number(part), {minimumIntegerDigits: 2}) : number(Number(part))).join(":"), plain: clock, code: true}
 	].flatMap(row => row.shown ? [{...row, key: row.key as DesktopKey, plain: row.plain ?? row.shown}] : []) : [];
 	const copyDetails = () => navigator.clipboard.writeText(en["details.title"] + "\n" + rows.map(row => en[row.key] + ": " + row.plain).join("\n")).then(() => toast({tone: "success", title: t("details.copied")}), () => toast({tone: "danger", title: t("details.copyFailed")}));
+	const proxy = status?.proxy ?? null, proxyAt = proxy && !proxy.error ? (proxy.listen.startsWith("0.0.0.0:") ? t("home.proxyLan", {port: number(Number(proxy.listen.split(":")[1]), {useGrouping: false})}) : t("home.proxy", {address: `\u2066${proxy.listen}\u2069`})) : null;
 	const kept = ended?.kept || (!running.connected && running.kill_switch_kept);
 	return <div className="d-page">
 		<div className="d-hero">
@@ -50,9 +51,12 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, onPr
 			{chosen?.profile.left_out && <p className="vw-muted vw-small">{t("profile.leftOut")}</p>}
 			{subscription?.unknown_type && <p className="vw-muted vw-small">{t("profile.unknownType")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
-			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
+			{proxyAt && <p className="d-say">{proxyAt}</p>}
+			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null || proxyBlocked) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>
 		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, detail: c.subscription.provider}))}/>}
+		{proxyBlocked && link === "off" && <Banner tone="warning" title={t("home.refused")}>{t("home.proxyOnlyBlocked")}</Banner>}
+		{proxy?.error && <Banner tone="warning" title={t("home.proxyFailed")}>{proxy.error}</Banner>}
 		{refused && link === "off" && <Banner tone="warning" title={t("home.refused")}>{failureText(refused, t)}</Banner>}
 		{pending && subscription && <Banner tone="info" title={t("terms.title", {provider: subscription.provider})} action={<Button size="sm" variant="primary" onClick={() => onPrefs({accepted: {...prefs.accepted, [subscription.id]: terms ?? ""}})}>{t("terms.accept")}</Button>}>
 			{t(accepted === undefined ? "terms.body" : "terms.changed", {provider: subscription.provider})}

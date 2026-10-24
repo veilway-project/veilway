@@ -8,16 +8,22 @@ mod legacy;
 mod link;
 mod logs;
 mod proto;
+mod proxy;
 mod qr;
 mod view;
 use base64::Engine;
 use link::Backend;
 use logs::{LogLayer, START};
 use proto::{Call, Options, Out, Source};
+use proxy::ProxySettings;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem};
@@ -59,9 +65,9 @@ struct UpdateInfo{available:bool, version:String, notes:String, current:String}
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
-struct Settings{auto_update:bool, theme:String, locale:String, kill_switch:bool}
+struct Settings{auto_update:bool, theme:String, locale:String, kill_switch:bool, proxy:ProxySettings}
 
-impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark(), locale:"en".into(), kill_switch:true}}}
+impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark(), locale:"en".into(), kill_switch:true, proxy:ProxySettings::default()}}}
 
 fn dark()->String{"dark".to_string()}
 
@@ -234,8 +240,10 @@ async fn set_alpha(backend:State<'_, Arc<Backend>>, on:bool)->Result<Value, Stri
 #[tauri::command]
 async fn connect(app:AppHandle, backend:State<'_, Arc<Backend>>, subscription:String, profile:String, mut options:Options)->Result<Value, String>{
 	tracing::info!("connect requested");
-	// The kill switch is the app's setting: the window does not send it.
-	options.kill_switch=load_settings(&app)?.kill_switch;
+	// The kill switch and the local proxy are the app's settings: the window does not send them.
+	let settings=load_settings(&app)?;
+	options.kill_switch=settings.kill_switch;
+	options.proxy=settings.proxy;
 	ask(&backend, Call::Connect{subscription, profile, options}).await
 }
 
@@ -331,12 +339,27 @@ fn apply_theme(app:&AppHandle, theme:&str){
 #[tauri::command]
 async fn get_settings(app:AppHandle)->Result<Settings, String>{load_settings(&app)}
 
+/// The settings file holds the local proxy's password, so only its owner may read it.
+fn write_private(path:&std::path::Path, body:&str)->std::io::Result<()>{
+	#[cfg(unix)]
+	{
+		let mut file=std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
+		file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+		file.write_all(body.as_bytes())
+	}
+	#[cfg(not(unix))]
+	std::fs::write(path, body)
+}
+
 #[tauri::command]
-async fn set_settings(app:AppHandle, settings:Settings)->Result<(), String>{
+async fn set_settings(app:AppHandle, mut settings:Settings)->Result<Settings, String>{
+	// With "allow devices on my network" a login is not optional: `needs_login` ignores the switch there.
+	settings.proxy.ensure_login()?;
+	if settings.proxy.on{settings.proxy.config()?;}
 	let body=serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-	std::fs::write(settings_path(&app)?, body).map_err(|e| e.to_string())?;
+	write_private(&settings_path(&app)?, &body).map_err(|e| e.to_string())?;
 	apply_theme(&app, &settings.theme);
-	Ok(())
+	Ok(settings)
 }
 
 /// Brings the window back from the tray.

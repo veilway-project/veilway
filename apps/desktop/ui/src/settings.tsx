@@ -1,11 +1,15 @@
-import {Banner, Button, ConfirmDialog, Glass, Segmented, StateBlock, Switch, useToast} from "@veilway/ui";
+import {Banner, Button, ConfirmDialog, Glass, NumberField, Segmented, SecretField, SelectField, StateBlock, Switch, TextField, useToast} from "@veilway/ui";
 import {useEffect, useState} from "react";
 import {ANDROID, failureText, useD, type Prefs} from "./kit.tsx";
-import {call, type Settings, type UpdateInfo, type XrayState} from "./tauri.ts";
+import {call, type ProxySettings, type Settings, type UpdateInfo, type XrayState} from "./tauri.ts";
 
 export function SettingsPage({prefs, onPrefs, settings, onSettings, logs, onUpdate}: {prefs: Prefs, onPrefs: (next: Partial<Prefs>) => void, settings: Settings, onSettings: (next: Settings) => void, logs: string[], onUpdate: (info: UpdateInfo | null) => void}) {
 	const {t} = useD(), toast = useToast(), [showLog, setShowLog] = useState(false), [checking, setChecking] = useState(false), [checked, setChecked] = useState<UpdateInfo | null>(null), [checkError, setCheckError] = useState<string | null>(null);
 	const [autostart, setAutostart] = useState<boolean | null>(null), [alpha, setAlpha] = useState<boolean | null>(null), [asking, setAsking] = useState(false), [xray, setXray] = useState<XrayState | null>(null), [removing, setRemoving] = useState(false);
+	const proxy = settings.proxy, [port, setPort] = useState<number | "">(proxy.port), [askingLan, setAskingLan] = useState(false), [askingLogin, setAskingLogin] = useState(false);
+	const setProxy = (next: Partial<ProxySettings>) => onSettings({...settings, proxy: {...proxy, ...next}});
+	const portOk = typeof port === "number" && Number.isInteger(port) && port >= 1024 && port <= 65535, loginOn = ANDROID || proxy.login || proxy.lan;
+	const copy = (text: string) => navigator.clipboard.writeText(text).then(() => toast({tone: "success", title: t("settings.proxyCopied")}), () => toast({tone: "danger", title: t("settings.proxyCopyFailed")}));
 	useEffect(() => { if (!ANDROID) { call("get_autostart").then(setAutostart, () => {}); call("xray_state").then(setXray, () => {}); } }, []);
 	useEffect(() => { call("get_alpha").then(found => setAlpha(found.alpha), () => {}); }, []);
 	const saveAlpha = (on: boolean) => call("set_alpha", {on}).then(found => setAlpha(found.alpha), error => toast({tone: "danger", title: t("settings.alphaFailed"), body: error}));
@@ -26,6 +30,25 @@ export function SettingsPage({prefs, onPrefs, settings, onSettings, logs, onUpda
 			<div className="d-setting"><span className="vw-label">{t("settings.theme")}</span><Segmented label={t("settings.theme")} value={prefs.scheme} onChange={value => { const scheme = value === "dark" || value === "light" ? value : "system"; onPrefs({scheme}); onSettings({...settings, theme: scheme === "light" ? "light" : "dark"}); }} options={[{value: "system", label: t("settings.theme.system")}, {value: "dark", label: t("settings.theme.dark")}, {value: "light", label: t("settings.theme.light")}]}/></div>
 			<Switch label={t("settings.alpha")} hint={t("settings.alphaHint")} checked={alpha ?? false} disabled={alpha === null} onChange={on => { if (on) setAsking(true); else saveAlpha(false); }}/>
 		</Glass>
+		<Glass className="d-panel">
+			<Switch label={t("settings.proxy")} hint={t("settings.proxyHint")} checked={proxy.on} onChange={on => setProxy({on})}/>
+			{proxy.on && <>
+				<div className="d-setting"><span className="vw-label">{t("settings.proxyMode")}</span><Segmented label={t("settings.proxyMode")} value={proxy.only ? "only" : "vpn"} onChange={mode => setProxy({only: mode === "only"})} options={[{value: "only", label: t("settings.proxyMode.only")}, {value: "vpn", label: t("settings.proxyMode.vpn")}]}/><span className="vw-muted vw-small">{t(proxy.only ? "settings.proxyModeOnlyHint" : "settings.proxyModeVpnHint")}</span>{!ANDROID && <span className="vw-muted vw-small">{t("settings.proxyLegacy")}</span>}</div>
+				<SelectField label={t("settings.proxyKind")} value={proxy.kind} onChange={kind => setProxy({kind: kind === "socks5" || kind === "http" ? kind : "mixed"})} options={[{value: "mixed", label: t("settings.proxyKind.mixed")}, {value: "socks5", label: t("settings.proxyKind.socks5")}, {value: "http", label: t("settings.proxyKind.http")}]}/>
+				<NumberField label={t("settings.proxyPort")} unit="" value={port} onChange={setPort} error={portOk ? undefined : t("settings.proxyPortBad")} onBlur={() => { if (portOk && port !== proxy.port) setProxy({port}); }}/>
+				<Switch label={t("settings.proxyLan")} hint={t("settings.proxyLanHint")} checked={proxy.lan} onChange={on => { if (on) setAskingLan(true); else setProxy({lan: false}); }}/>
+				{!ANDROID && <Switch label={t("settings.proxyLogin")} hint={t("settings.proxyLoginHint")} checked={loginOn} disabled={proxy.lan} onChange={on => { if (on) setProxy({login: true}); else setAskingLogin(true); }}/>}
+				{loginOn && proxy.user && <div className="d-setting">
+					<TextField label={t("settings.proxyUser")} technical readOnly value={proxy.user} onChange={() => {}}/>
+					<Button icon="copy" onClick={() => copy(proxy.user)}>{t("settings.proxyCopy")}</Button>
+					<SecretField label={t("settings.proxyPassword")} readOnly value={proxy.password} onChange={() => {}}/>
+					<Button icon="copy" onClick={() => copy(proxy.password)}>{t("settings.proxyCopy")}</Button>
+					<span className="vw-muted vw-small">{t("settings.proxyLoginNote")}</span>
+				</div>}
+			</>}
+		</Glass>
+		<ConfirmDialog open={askingLan} onOpenChange={setAskingLan} danger title={t("settings.proxyLanTitle")} body={t("settings.proxyLanBody")} confirmLabel={t("settings.proxyLanConfirm")} onConfirm={() => setProxy({lan: true})}/>
+		<ConfirmDialog open={askingLogin} onOpenChange={setAskingLogin} danger title={t("settings.proxyLoginTitle")} body={t("settings.proxyLoginBody")} confirmLabel={t("settings.proxyLoginOff")} onConfirm={() => setProxy({login: false})}/>
 		<ConfirmDialog open={asking} onOpenChange={setAsking} title={t("alpha.title")} body={t("alpha.warning")} confirmLabel={t("alpha.confirm")} onConfirm={() => { saveAlpha(true); }}/>
 		{!ANDROID && <Glass className="d-panel">
 			<Switch label={t("settings.autostart")} checked={autostart ?? false} disabled={autostart === null} onChange={setStart}/>

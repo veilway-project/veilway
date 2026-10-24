@@ -3,7 +3,8 @@
 //! The code of `Core::call` is the desktop's, line for line, minus `fetch_gate` (there is no kill switch of ours to wait out) and the platform calls; `session` runs `vpn::run` where the helper runs `platform::run`.
 use crate::logs::{LogLayer, START};
 use crate::proto::{Call, Options, Out, Source};
-use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, SubscriptionOut};
+use crate::proxy::ProxySettings;
+use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, ProxyOut, SubscriptionOut};
 use crate::vault::{AndroidVault, KEY_LOST};
 use crate::vpn;
 use anyhow::Context;
@@ -20,7 +21,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex, Notify};
 use veilway_engine::import::{self, Fetcher, Library, Reviewed};
-use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store};
+use veilway_engine::local::Local;
+use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store, Tunnel};
 use veilway_proto::subscription::client::{Fetching, Standing, Offer, NativeOffer, CarriedOffer};
 use veilway_proto::subscription::Kind;
 use veilway_proto::subscription::payload::Id;
@@ -50,6 +52,8 @@ pub struct Core {
 	running: Mutex<Option<Running>>,
 	push: broadcast::Sender<Out>,
 	last: Mutex<Option<crate::view::StatusView>>,
+	/// Where the local proxy listens now, or why it did not start, put in every status the window gets.
+	proxy: Mutex<Option<ProxyOut>>,
 	handle: Mutex<Option<Handle>>,
 }
 
@@ -63,7 +67,7 @@ fn to_value<T: Serialize>(value: T) -> Result<Value, String> {serde_json::to_val
 
 impl Core {
 	pub fn new(library: Library, store: Arc<Store>, dir: PathBuf) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), store, dir, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), handle: Mutex::new(None)})
+		Arc::new(Self {library: AsyncMutex::new(library), store, dir, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), proxy: Mutex::new(None), handle: Mutex::new(None)})
 	}
 
 	pub fn subscribe(&self) -> broadcast::Receiver<Out> {self.push.subscribe()}
@@ -277,6 +281,7 @@ impl Core {
 			core.running.lock().unwrap().take();
 			*core.handle.lock().unwrap() = None;
 			*core.last.lock().unwrap() = None;
+			*core.proxy.lock().unwrap() = None;
 			let error = ended.err().map(|(error, _)| error);
 			core.send(Out::Ended {error: error.clone(), kept: false});
 			crate::bridge::ended(error.as_deref());
@@ -302,14 +307,25 @@ impl Core {
 		settings.languages = self.tags();
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
 		let (key, mut agree, lan_local) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default(), self.store.lan_local(held.id().as_str()));
+		// The local proxy is the app's setting, read when the connection starts: a start at boot has no window to send it.
+		let proxy = crate::load_settings().map(|settings| settings.proxy).unwrap_or_default();
+		let proxy_only = proxy.on && proxy.only;
+		crate::bridge::proxy_only(proxy_only);
 		loop {
+			let (statuses, seen) = watch::channel(None::<Status>);
 			let on_status = |status: &Status| {
-				let view = status_view(status, Some(AppliedOut {interface: "tun".into(), kill_switch: false, dns: "tunnel".into(), split: (!options.routes.is_empty()).then(|| options.routes.iter().map(ToString::to_string).collect()), allow_lan: lan_local}));
+				statuses.send_replace(Some(status.clone()));
+				let mut view = status_view(status, Some(AppliedOut {interface: "tun".into(), kill_switch: false, dns: "tunnel".into(), split: (!options.routes.is_empty()).then(|| options.routes.iter().map(ToString::to_string).collect()), allow_lan: lan_local}));
+				view.proxy = self.proxy.lock().unwrap().clone();
 				crate::bridge::state(&view.state);
 				*self.last.lock().unwrap() = Some(view.clone());
 				self.send(Out::Status(view));
 			};
-			let outcome = vpn::run(&options, lan_local, settings.clone(), &held, &profile, &permit, agree, on_status, stop.notified()).await;
+			// Proxy only asks Android for no VPN interface at all, so there is nothing to set up or take down.
+			let outcome = if proxy_only {self.proxy_run(&proxy, settings.clone(), &held, &profile, &permit, agree, on_status, &stop).await} else {
+				let run = vpn::run(&options, lan_local, settings.clone(), &held, &profile, &permit, agree, on_status, stop.notified());
+				if proxy.on {tokio::select! {outcome = run => outcome, _ = proxy.alongside(seen, |out| self.show_proxy(Some(out))) => Ok(())}} else {run.await}
+			};
 			let _ = self.store.flush();
 			let Err(error) = outcome else {return Ok(())};
 			// The tunnel did not start because the user has still to say something. A no, or a stop, is the user's own end of it.
@@ -338,6 +354,54 @@ impl Core {
 				return Ok(());
 			}
 		}
+	}
+
+	/// The proxy came up (or could not) after the last status went out: the window is given that status again with it.
+	fn show_proxy(&self, proxy: Option<ProxyOut>) {
+		*self.proxy.lock().unwrap() = proxy.clone();
+		if let Some(view) = self.last.lock().unwrap().as_mut() {
+			view.proxy = proxy;
+			self.send(Out::Status(view.clone()));
+		}
+	}
+
+	/// Proxy only: the engine's tunnel with no VPN interface, so the app's own sockets need no `protect`. `Local` is the one reader of the tunnel's packets and opens the proxy's connections inside it. The networks the phone is on are still told to the engine. Ok is a stop the user asked for.
+	#[allow(clippy::too_many_arguments)]
+	async fn proxy_run(&self, proxy: &ProxySettings, mut settings: Settings, held: &veilway_proto::subscription::client::Held, profile: &str, permit: &veilway_proto::subscription::client::Permit, agree: Agree, mut on_status: impl FnMut(&Status), stop: &Notify) -> anyhow::Result<()> {
+		let config = proxy.config().map_err(anyhow::Error::msg)?;
+		let mut own = crate::bridge::own();
+		let at_start = own.borrow_and_update().clone();
+		settings.networks = at_start.networks;
+		settings.network = at_start.description;
+		let tunnel = Tunnel::start(settings, held, profile, permit, agree)?;
+		let local = match Local::in_tunnel(tunnel, config).await {
+			Ok(local) => local,
+			Err((error, tunnel)) => {
+				tunnel.stop().await;
+				return Err(error.into());
+			}
+		};
+		let mut watch = local.watch().context("the proxy has no tunnel under it")?;
+		self.show_proxy(Some(proxy.out(local.addr(), None)));
+		on_status(&watch.borrow_and_update().clone());
+		loop {
+			tokio::select! {
+				changed = watch.changed() => {
+					if changed.is_err() {anyhow::bail!("the engine stopped on its own")}
+					on_status(&watch.borrow_and_update().clone());
+				}
+				changed = own.changed() => {
+					changed?;
+					let found = own.borrow_and_update().clone();
+					tracing::info!(networks = found.networks.len(), "the device's networks changed");
+					local.moved(found.description, found.networks);
+				}
+				() = stop.notified() => break,
+			}
+		}
+		let last = local.stop().await;
+		tracing::info!(state = ?last.map(|status| status.state), "the tunnel stopped");
+		Ok(())
 	}
 
 	/// A running connection is asked to stop, which it does the clean way. With none running, whatever an earlier one left in force is removed.

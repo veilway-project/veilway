@@ -2,7 +2,9 @@
 use anyhow::{anyhow, bail, Context};
 use clap::Args;
 use ipnet::IpNet;
+use std::future::Future;
 use std::io::{BufRead, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -11,7 +13,9 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 #[cfg(windows)]
 use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_logoff, ctrl_shutdown, CtrlBreak, CtrlC, CtrlClose, CtrlLogoff, CtrlShutdown};
 use veilway_engine::import::{self, Fetcher, Library};
-use veilway_engine::{ask_text, default_roots, Agree, Check, Retry, Settings, StartError, State, Status, Store, ALPHA_WARNING};
+use tokio::sync::watch;
+use veilway_engine::local::{Kind, Local, LocalProxy};
+use veilway_engine::{ask_text, default_roots, Agree, Check, Retry, Settings, StartError, State, Status, Store, Tunnel, ALPHA_WARNING};
 #[cfg(target_os = "linux")]
 use veilway_linux as platform;
 #[cfg(target_os = "macos")]
@@ -23,7 +27,7 @@ use platform::vault::SecretVault;
 #[cfg(target_os = "linux")]
 use platform::dns::Restored;
 use platform::{Applied, Options, Routes, Stop};
-use veilway_proto::subscription::client::{Offer, Standing};
+use veilway_proto::subscription::client::{Held, Offer, Permit, Standing};
 use veilway_proto::subscription::payload::Id;
 use veilway_proto::subscription::Tag;
 use veilway_proto::subscription::{legacy, payload::private};
@@ -49,6 +53,14 @@ pub struct Connect {
 	#[arg(long)] alpha: bool,
 	/// Switch the alpha ways of connecting off again
 	#[arg(long, conflicts_with = "alpha")] no_alpha: bool,
+	/// Connect without the system VPN: no network device, no routes, no change to name resolution and no kill switch. Only programs set to use the local proxy go through the tunnel, and it needs neither root nor an administrator account to hold. The proxy listens on 127.0.0.1:10808 unless --local-proxy says otherwise. Not for links of other apps
+	#[arg(long)] proxy_only: bool,
+	/// Listen as a local SOCKS5 and HTTP proxy at this address (for example 127.0.0.1:10808). Without --proxy-only it runs next to the VPN, and starts once the VPN is connected. An address that is not loopback needs --proxy-user, and what goes between the other device and the proxy is not encrypted
+	#[arg(long)] local_proxy: Option<SocketAddr>,
+	/// The user name programs must give to use the local proxy. The password is read from --proxy-password-file, never from the command line
+	#[arg(long, requires = "proxy_password_file")] proxy_user: Option<String>,
+	/// A file with the local proxy's password in it, which only its owner can read (chmod 600). A line break at the end is not part of it
+	#[arg(long, requires = "proxy_user")] proxy_password_file: Option<PathBuf>,
 	/// The name of the tunnel's network device
 	#[cfg_attr(target_os = "linux", arg(long, default_value = "vw0"))]
 	#[cfg_attr(target_os = "macos", arg(long, default_value = "utun"))]
@@ -285,6 +297,35 @@ fn legacy_file(source: &str) -> anyhow::Result<Option<String>> {
 	Ok(Some(text))
 }
 
+/// `--proxy-only`: the engine's tunnel with nothing of the system under it, and the local proxy as its only door. Prints the state when it changes. Ok is a stop the user asked for.
+async fn proxy_only(config: LocalProxy, settings: Settings, held: &Held, profile: &str, permit: &Permit, agree: Agree, stop: impl Future<Output = Stop>) -> anyhow::Result<()> {
+	let tunnel = Tunnel::start(settings, held, profile, permit, agree)?;
+	let local = match Local::in_tunnel(tunnel, config).await {
+		Ok(local) => local,
+		Err((error, tunnel)) => {
+			tunnel.stop().await;
+			return Err(error.into());
+		}
+	};
+	let mut watch = local.watch().context("the proxy has no tunnel under it")?;
+	eprintln!("Proxy only: listening on {}. Only programs set to use it go through the tunnel, and nothing else on this device changes.", local.addr());
+	let (mut shown, mut stop) = (String::new(), std::pin::pin!(stop));
+	loop {
+		let status = watch.borrow_and_update().clone();
+		let key = state_line(&status, 0);
+		if key != shown {
+			println!("{}: {}", status.name, state_line(&status, now()));
+			shown = key;
+		}
+		tokio::select! {
+			changed = watch.changed() => if changed.is_err() {bail!("the engine stopped on its own")},
+			_ = stop.as_mut() => break,
+		}
+	}
+	local.stop().await;
+	Ok(())
+}
+
 /// Connects to pasted links of other apps through the Xray add-on ("Xray in the desktop apps"). Nothing of the links is kept: they are read, checked against the table of what can connect, and used for this run. Steps, in this order: the profile is checked, the add-on is found (or offered for download, with a yes), the add-on is held to its pin, the server's name is resolved and its address checked, and `veilway_xray::run` does the rest.
 async fn connect_xray(args: &Connect, source: &str, data: &Path, signals: &mut Signals) -> anyhow::Result<()> {
 	#[cfg(unix)]
@@ -328,6 +369,33 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))).with_writer(std::io::stderr).init();
 	let (data, run) = (data_dir(args.data_dir.clone())?, Options::default().run_dir);
 	let mut signals = Signals::new()?;
+	let proxy = if args.proxy_only || args.local_proxy.is_some() {
+		let mut config = LocalProxy::new(args.local_proxy.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 10808))), Kind::Mixed);
+		if let (Some(user), Some(file)) = (&args.proxy_user, &args.proxy_password_file) {
+			let meta = std::fs::symlink_metadata(file).with_context(|| format!("cannot read {}", file.display()))?;
+			if !meta.is_file() || meta.len() > 4096 {bail!("{} is not a file a password can be in", file.display())}
+			#[cfg(unix)]
+			{
+				use std::os::unix::fs::MetadataExt;
+				if meta.mode() & 0o077 != 0 {bail!("proxy_password_file_open: {} can be read by others: run chmod 600 on it", file.display())}
+				if meta.uid() != 0 && std::env::var("SUDO_UID").ok().and_then(|id| id.parse::<u32>().ok()) != Some(meta.uid()) {bail!("proxy_password_file_owner: {} is owned by a user who is neither root nor the one who ran sudo", file.display())}
+			}
+			let password = std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
+			config.auth = Some((user.clone(), password.trim_end_matches(['\r', '\n']).to_owned()));
+		}
+		if config.auth.is_none() {
+			// A login is always on, also on 127.0.0.1: other programs on this computer must not use the proxy freely. It is told once, on the standard output and not in the log.
+			let mut bytes = [0u8; 40];
+			ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| anyhow!("no source of random numbers was found to make the proxy's login"))?;
+			let text: Vec<char> = bytes.iter().map(|byte| b"useandom-26T198340PX75pxJACKVERYMINDBUSHWOLF_GQZbfghjklqvwyzrict"[(byte & 63) as usize] as char).collect();
+			let (user, password) = (text[..20].iter().collect::<String>(), text[20..].iter().collect::<String>());
+			println!("Local proxy login: user {user} password {password}");
+			config.auth = Some((user, password));
+		}
+		config.check()?;
+		Some(config)
+	} else {None};
+	if proxy.is_some() && (args.source.as_deref().is_some_and(is_legacy) || args.source.as_deref().map(legacy_file).transpose()?.flatten().is_some()) {bail!("the local proxy is not available for links of other apps, which connect through the Xray add-on")}
 	if args.source.as_deref().is_some_and(is_legacy) {bail!("legacy_link_on_command_line: a link of another app carries its credential, and a command line can be read by every user of this computer. Put the link in a file that only you can read (chmod 600) and give the file to `veilway connect`")}
 	if let Some(text) = args.source.as_deref().map(legacy_file).transpose()?.flatten() {return connect_xray(&args, &text, &data, &mut signals).await}
 	let (mut library, damaged) = Library::open(Box::new(SecretVault::new(data.join("vault")))).map_err(|error| anyhow!("{error}"))?;
@@ -360,16 +428,44 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	}
 	let options = Options {interface: args.interface, kill_switch: !args.no_kill_switch, allow_lan: args.allow_lan, local_names: args.local_names, routes: if args.routes.is_empty() {Routes::Full} else {Routes::Split(args.routes)}, run_dir: run.clone(), ..Options::default()};
 	// The one lock every command takes, held from here to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
-	let lock = state::lock(&run).await?;
+	// Proxy only has nothing of the system to lock or undo.
+	let lock = if args.proxy_only {None} else {Some(state::lock(&run).await?)};
 	let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile.id), Agree::default());
 	loop {
-		let mut shown = String::new();
-		let on_status = |status: &Status, applied: &Applied| announce(&run, &mut shown, status, applied);
+		let (mut shown, (statuses, mut seen)) = (String::new(), watch::channel(None::<Status>));
+		let on_status = |status: &Status, applied: &Applied| {
+			statuses.send_replace(Some(status.clone()));
+			announce(&run, &mut shown, status, applied);
+		};
 		#[cfg(unix)]
 		let stop = signals.next();
 		#[cfg(windows)]
-		let stop = async {tokio::select! {reason = signals.next() => reason, () = lock.stop_asked() => Stop::Asked}};
-		let outcome = platform::run(&options, &lock, settings.clone(), held, &profile.id, &permit, agree, on_status, stop).await;
+		let stop = async {tokio::select! {reason = signals.next() => reason, () = async {match &lock {Some(lock) => lock.stop_asked().await, None => std::future::pending().await}} => Stop::Asked}};
+		let outcome = match (&lock, &proxy) {
+			(Some(lock), Some(config)) => {
+				let run = platform::run(&options, lock, settings.clone(), held, &profile.id, &permit, agree, on_status, stop);
+				// Beside the VPN the proxy is given the tunnel's status, and the engine refuses what it takes while the tunnel is not connected.
+				let beside = async {
+					if let Some(first) = seen.wait_for(Option::is_some).await.ok().and_then(|found| found.clone()) {
+						let (tx, rx) = watch::channel(first);
+						match Local::alongside(config.clone(), rx).await {
+							Ok(local) => {
+								eprintln!("Local proxy: listening on {}.", local.addr());
+								while seen.changed().await.is_ok() {
+									if let Some(status) = seen.borrow_and_update().clone() {tx.send_replace(status);}
+								}
+							}
+							Err(error) => eprintln!("The local proxy did not start: {error}"),
+						}
+					}
+					std::future::pending::<()>().await
+				};
+				tokio::select! {outcome = run => outcome, _ = beside => Ok(())}
+			}
+			(Some(lock), None) => platform::run(&options, lock, settings.clone(), held, &profile.id, &permit, agree, on_status, stop).await,
+			(None, None) => bail!("proxy only needs the local proxy"),
+			(None, Some(config)) => proxy_only(config.clone(), settings.clone(), held, &profile.id, &permit, agree, stop).await.map_err(|error| platform::Failure {error, kept: false}),
+		};
 		let _ = store.flush();
 		let Err(failure) = outcome else {break};
 		// The tunnel did not start because the user has still to say something. The kill switch is in force while the question waits. A no, or a stop, is the user's own end of it, and lifts what is in force; any other end is not.
@@ -394,9 +490,9 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 			Some(_) | None => bail!(kept_message(&failure)),
 		};
 		// The terminal going away is not an answer: nobody is there, and the kill switch stays like after any other end.
-		if answer.as_ref().err().is_some_and(|error| error.downcast_ref::<HangUp>().is_some()) {bail!(kept_message(&platform::Failure {error: anyhow!("the terminal went away (SIGHUP)"), kept: true}))}
+		if answer.as_ref().err().is_some_and(|error| error.downcast_ref::<HangUp>().is_some()) {bail!(kept_message(&platform::Failure {error: anyhow!("the terminal went away (SIGHUP)"), kept: lock.is_some()}))}
 		if !matches!(answer, Ok(true)) {
-			let cleaned = platform::cleanup(&options, &lock);
+			let cleaned = lock.as_ref().map(|lock| platform::cleanup(&options, lock)).transpose();
 			let _ = store.flush();
 			cleaned?;
 			bail!(answer.err().map_or_else(|| "Not connected.".to_owned(), |error| error.to_string()));

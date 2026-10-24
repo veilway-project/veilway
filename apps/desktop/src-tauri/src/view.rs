@@ -25,6 +25,10 @@ pub struct UsageOut {pub used_bytes: u64, pub quota_bytes: u64, pub period: Stri
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct AppliedOut {pub interface: String, pub kill_switch: bool, pub dns: String, pub split: Option<Vec<String>>, pub allow_lan: bool}
 
+/// Where the local proxy listens while it runs, as the window shows it; `error` is why it could not start (the connection itself is up).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct ProxyOut {pub listen: String, pub kind: String, pub only: bool, #[serde(default)] pub error: Option<String>}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ConnectionOut {pub transport: String, pub address: String, pub host: Option<String>, pub front: Option<String>, pub server_name: Option<String>, pub check: Option<String>, pub since: Option<u64>, /// The transport is in alpha: the window says so next to the connection.
 	#[serde(default)] pub alpha: bool}
@@ -54,6 +58,9 @@ pub struct StatusView {
 	/// Set while a profile of pasted links runs through the Xray add-on.
 	#[serde(default)]
 	pub xray: Option<XrayOut>,
+	/// Set while the local proxy runs, or could not start.
+	#[serde(default)]
+	pub proxy: Option<ProxyOut>,
 }
 
 fn lower<T: std::fmt::Debug>(value: T) -> String {format!("{value:?}").to_lowercase()}
@@ -84,6 +91,7 @@ pub fn status_view(status: &Status, applied: Option<AppliedOut>) -> StatusView {
 		out_of_date: status.out_of_date,
 		connection: status.connection.as_ref().map(|found| ConnectionOut {transport: found.transport.into(), address: found.address.to_string(), host: found.host.clone(), front: found.front.clone(), server_name: found.server_name.clone(), check: found.check.map(|check| check.code().into()), since: found.since, alpha: found.alpha}),
 		applied,
+		proxy: None,
 		xray: status.xray.map(|view| {
 			let (found, say): (veilway_engine::XrayCounters, Option<XraySay>) = (view.counters, view.say);
 			XrayOut {open_tcp: found.open_tcp, open_udp: found.open_udp, failed_flows: found.failed_flows, carried_flows: found.carried_flows, bytes_sent: found.bytes_sent, bytes_received: found.bytes_received, unsupported_packets: found.unsupported_packets, dropped_udp_flows: found.dropped_udp_flows, restarts: found.restarts, last_restart: found.last_restart, say_code: say.map(|say| say.code().into()), say: say.map(|say| say.text().into())}

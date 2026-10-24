@@ -12,7 +12,8 @@ use crate::legacy;
 use crate::logs::{LogLayer, START};
 use crate::ipc::{self, Conn, Server};
 use crate::proto::{nonce_ok, proof, random_hex, read_line, verify, write_line, Call, Frame, Options, Out, Phase, Source, NONCE_LEN, REQUEST_MAX, TOKEN_LEN};
-use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, SubscriptionOut};
+use crate::proxy::ProxySettings;
+use crate::view::{library_view, move_view, status_view, subscription_view, tags, AppliedOut, MoveOut, ProxyOut, SubscriptionOut};
 use anyhow::{anyhow, bail, Context};
 use base64::Engine;
 use serde::Serialize;
@@ -27,7 +28,8 @@ use tokio::sync::{broadcast, mpsc, watch, Mutex as AsyncMutex, Notify};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use veilway_engine::import::{self, Fetcher, Library, Reviewed};
-use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store};
+use veilway_engine::local::Local;
+use veilway_engine::{ask_text, default_roots, Agree, Handle, Settings, StartError, Status, Store, Tunnel};
 use veilway_proto::subscription::client::{Fetching, Standing, Offer, NativeOffer, CarriedOffer};
 use veilway_proto::subscription::Kind;
 use veilway_proto::subscription::payload::{private, Id};
@@ -93,6 +95,8 @@ pub struct Core {
 	running: Mutex<Option<Running>>,
 	push: broadcast::Sender<Out>,
 	last: Mutex<Option<crate::view::StatusView>>,
+	/// Where the local proxy listens now, or why it did not start, put in every status the window gets.
+	proxy: Mutex<Option<ProxyOut>>,
 	quit: Notify,
 	clients: AtomicUsize,
 	handle: Mutex<Option<Handle>>,
@@ -112,7 +116,7 @@ fn kept_message(failure: &platform::Failure) -> String {
 
 impl Core {
 	pub fn new(library: Library, pasted: legacy::Store, store: Arc<Store>, run: PathBuf, dir: PathBuf, data: PathBuf, owner: u32) -> Arc<Self> {
-		Arc::new(Self {library: AsyncMutex::new(library), legacy: AsyncMutex::new(pasted), installing: Arc::new(AsyncMutex::new(())), offered: AtomicBool::new(false), store, run, dir, data, owner, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
+		Arc::new(Self {library: AsyncMutex::new(library), legacy: AsyncMutex::new(pasted), installing: Arc::new(AsyncMutex::new(())), offered: AtomicBool::new(false), store, run, dir, data, owner, bundle: AsyncMutex::new(None), languages: Mutex::new(Vec::new()), pending: AsyncMutex::new(None), running: Mutex::new(None), push: broadcast::channel(256).0, last: Mutex::new(None), proxy: Mutex::new(None), quit: Notify::new(), clients: AtomicUsize::new(0), handle: Mutex::new(None)})
 	}
 
 	fn send(&self, out: Out) {let _ = self.push.send(out);}
@@ -405,6 +409,9 @@ impl Core {
 	async fn connect(self: &Arc<Self>, subscription: String, profile: String, options: Options) -> Result<Value, String> {
 		// Held to the end of this call, which is after the connection is registered as running: a removal that comes later sees it, and one that is under way refuses this.
 		let pasted = subscription.starts_with(legacy::PREFIX);
+		let proxy_only = options.proxy.on && options.proxy.only;
+		if proxy_only && pasted {return Err("Proxy only is not available for links of other apps. Turn it off in the settings to connect.".into())}
+		if proxy_only && platform::firewall::present() == Some(true) {return Err(import::Code::KillSwitch.as_str().into())}
 		let mut installing = if pasted {Some(self.installing.try_lock().map_err(|_| "xray_installing")?)} else {None};
 		let job = if pasted {
 			let (checked, name) = self.legacy.lock().await.find(&subscription, &profile).map(|(item, name)| (item.checked.clone(), name)).ok_or("That connection is not in the subscription.")?;
@@ -439,6 +446,7 @@ impl Core {
 			core.running.lock().unwrap().take();
 			*core.handle.lock().unwrap() = None;
 			*core.last.lock().unwrap() = None;
+			*core.proxy.lock().unwrap() = None;
 			core.send(match ended {Ok(()) => Out::Ended {error: None, kept: false}, Err((error, kept)) => Out::Ended {error: Some(error), kept}});
 			let _ = done_tx.send(true);
 		}).map_err(|error| error.to_string())?;
@@ -464,18 +472,30 @@ impl Core {
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
 		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: self.store.lan_local(held.id().as_str()), local_names: options.local_names && self.store.lan_local(held.id().as_str()), routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
 		// The one lock every command takes, held to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
-		let lock = state::lock(&self.run).await.map_err(|error| plain(error.into()))?;
+		// Proxy only has nothing of the system to lock or undo: no device, route, resolver or kill switch.
+		let proxy_only = options.proxy.on && options.proxy.only;
+		let lock = if proxy_only {None} else {Some(state::lock(&self.run).await.map_err(|error| plain(error.into()))?)};
 		let (key, mut agree) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default());
 		loop {
-			let on_status = |status: &Status, applied: &Applied| self.shown(status, applied);
+			let (statuses, seen) = watch::channel(None::<Status>);
+			let on_status = |status: &Status, applied: &Applied| {
+				statuses.send_replace(Some(status.clone()));
+				self.shown(status, applied);
+			};
 			#[cfg(unix)]
 			let stopped = async {
 				stop.notified().await;
 				Stop::Asked
 			};
 			#[cfg(windows)]
-			let stopped = async {tokio::select! {() = stop.notified() => Stop::Asked, () = lock.stop_asked() => Stop::Asked}};
-			let outcome = platform::run(&platform_options, &lock, settings.clone(), &held, &profile, &permit, agree, on_status, stopped).await;
+			let stopped = async {tokio::select! {() = stop.notified() => Stop::Asked, () = async {match &lock {Some(lock) => lock.stop_asked().await, None => std::future::pending().await}} => Stop::Asked}};
+			let outcome = match &lock {
+				Some(lock) => {
+					let run = platform::run(&platform_options, lock, settings.clone(), &held, &profile, &permit, agree, on_status, stopped);
+					if options.proxy.on {tokio::select! {outcome = run => outcome, _ = options.proxy.alongside(seen, |out| self.show_proxy(Some(out))) => Ok(())}} else {run.await}
+				}
+				None => self.proxy_run(&options.proxy, settings.clone(), &held, &profile, &permit, agree, &stop).await.map_err(|error| platform::Failure {error, kept: false}),
+			};
 			let _ = self.store.flush();
 			let Err(failure) = outcome else {return Ok(())};
 			// The tunnel did not start because the user has still to say something. The kill switch is in force while the question waits. A no, or a stop, is the user's own end of it, and lifts what is in force; any other end is not.
@@ -497,7 +517,7 @@ impl Core {
 					true
 				}
 				Some(StartError::Alpha) => {
-					let cleaned = platform::cleanup(&platform_options, &lock);
+					let cleaned = lock.as_ref().map_or(Ok(()), |lock| platform::cleanup(&platform_options, lock).map(drop));
 					let _ = self.store.flush();
 					cleaned.map_err(plain)?;
 					return Err(("alpha_off".into(), false));
@@ -505,7 +525,7 @@ impl Core {
 				Some(_) | None => return Err((kept_message(&failure), failure.kept)),
 			};
 			if !yes {
-				let cleaned = platform::cleanup(&platform_options, &lock);
+				let cleaned = lock.as_ref().map_or(Ok(()), |lock| platform::cleanup(&platform_options, lock).map(drop));
 				let _ = self.store.flush();
 				cleaned.map_err(plain)?;
 				return Ok(());
@@ -514,10 +534,51 @@ impl Core {
 	}
 
 	/// What the platform layer reports goes to every window, and is kept for the next one that comes.
-	fn shown(&self, status: &Status, applied: &Applied) {
-		let view = status_view(status, Some(AppliedOut {interface: applied.interface.clone(), kill_switch: applied.kill_switch, dns: applied.dns.into(), split: applied.split.clone(), allow_lan: applied.allow_lan}));
+	fn shown(&self, status: &Status, applied: &Applied) {self.push_status(status, Some(AppliedOut {interface: applied.interface.clone(), kill_switch: applied.kill_switch, dns: applied.dns.into(), split: applied.split.clone(), allow_lan: applied.allow_lan}))}
+
+	fn push_status(&self, status: &Status, applied: Option<AppliedOut>) {
+		let mut view = status_view(status, applied);
+		view.proxy = self.proxy.lock().unwrap().clone();
 		*self.last.lock().unwrap() = Some(view.clone());
 		self.send(Out::Status(view));
+	}
+
+	/// The proxy came up (or could not) after the last status went out: the window is given that status again with it.
+	fn show_proxy(&self, proxy: Option<ProxyOut>) {
+		*self.proxy.lock().unwrap() = proxy.clone();
+		if let Some(view) = self.last.lock().unwrap().as_mut() {
+			view.proxy = proxy;
+			self.send(Out::Status(view.clone()));
+		}
+	}
+
+	/// Proxy only: the engine's tunnel with nothing of the system under it. `Local` is the one reader of its packets and opens the proxy's connections inside it, and the status the window sees is the tunnel's. Ok is a stop the user asked for.
+	#[allow(clippy::too_many_arguments)]
+	async fn proxy_run(&self, proxy: &ProxySettings, settings: Settings, held: &veilway_proto::subscription::client::Held, profile: &str, permit: &veilway_proto::subscription::client::Permit, agree: Agree, stop: &Notify) -> anyhow::Result<()> {
+		let config = proxy.config().map_err(anyhow::Error::msg)?;
+		let tunnel = Tunnel::start(settings, held, profile, permit, agree)?;
+		let local = match Local::in_tunnel(tunnel, config).await {
+			Ok(local) => local,
+			Err((error, tunnel)) => {
+				tunnel.stop().await;
+				return Err(error.into());
+			}
+		};
+		let mut watch = local.watch().context("the proxy has no tunnel under it")?;
+		self.show_proxy(Some(proxy.out(local.addr(), None)));
+		self.push_status(&watch.borrow_and_update().clone(), None);
+		loop {
+			tokio::select! {
+				changed = watch.changed() => {
+					if changed.is_err() {anyhow::bail!("the engine stopped on its own")}
+					self.push_status(&watch.borrow_and_update().clone(), None);
+				}
+				() = stop.notified() => break,
+			}
+		}
+		let last = local.stop().await;
+		tracing::info!(state = ?last.map(|status| status.state), "the tunnel stopped");
+		Ok(())
 	}
 
 	/// `veilway connect` with pasted links, without the terminal: the add-on is held to its pin and the server is looked up before anything is in force, a private address is asked about, and `veilway_xray::run` does the rest under the one lock. Ok and an error mean what they mean for `session`.

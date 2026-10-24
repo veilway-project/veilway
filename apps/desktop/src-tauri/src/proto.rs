@@ -2,6 +2,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use crate::proxy::ProxySettings;
 use crate::view::StatusView;
 
 /// The longest line the helper reads from the app: a subscription file is at most a few hundred kilobytes before base64.
@@ -57,6 +58,9 @@ pub struct Options {
 	pub local_names: bool,
 	/// Networks to send through the tunnel and nothing else. Empty is everything.
 	pub routes: Vec<ipnet::IpNet>,
+	/// Set by the app from its settings, like `kill_switch`.
+	#[serde(default)]
+	pub proxy: ProxySettings,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

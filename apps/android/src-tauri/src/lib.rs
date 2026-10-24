@@ -8,6 +8,8 @@ mod logs;
 #[path = "../../../desktop/src-tauri/src/proto.rs"]
 #[allow(dead_code)]
 mod proto;
+#[path = "../../../desktop/src-tauri/src/proxy.rs"]
+mod proxy;
 #[path = "../../../desktop/src-tauri/src/qr.rs"]
 mod qr;
 #[path = "../../../desktop/src-tauri/src/view.rs"]
@@ -23,6 +25,7 @@ mod vpn;
 use base64::Engine;
 use ring::digest::{Context, SHA256};
 use proto::{Call, Options, Out, Source};
+use proxy::ProxySettings;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -43,13 +46,16 @@ struct Vpn(tauri::plugin::PluginHandle<Wry>);
 #[derive(Serialize)]
 struct UpdateInfo {available: bool, version: String, notes: String, current: String}
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
-struct Settings {auto_update: bool, theme: String, locale: String, kill_switch: bool}
+struct Settings {auto_update: bool, theme: String, locale: String, kill_switch: bool, proxy: ProxySettings}
 
 impl Default for Settings {
-	fn default() -> Self {Settings {auto_update: true, theme: "dark".into(), locale: "en".into(), kill_switch: false}}
+	fn default() -> Self {Settings {auto_update: true, theme: "dark".into(), locale: "en".into(), kill_switch: false, proxy: ProxySettings::default()}}
 }
+
+/// What the proxy's password looks like in the settings file: sealed by the Android Keystore, never in the clear.
+const SEALED: &str = "k1:";
 
 #[derive(Deserialize)]
 struct Granted {granted: bool}
@@ -168,9 +174,11 @@ async fn set_alpha(on: bool) -> Result<Value, String> {host::call(Call::SetAlpha
 #[tauri::command]
 async fn connect(vpn: State<'_, Arc<Vpn>>, subscription: String, profile: String, options: Options) -> Result<Value, String> {
 	tracing::info!("connect requested");
-	let Granted {granted} = plugin(&vpn, "prepare", json!({})).await?;
+	// Proxy only has no VPN interface, so there is no VPN consent to ask for; the notification permission still is.
+	let proxy = load_settings()?.proxy;
+	let Granted {granted} = plugin(&vpn, "prepare", json!({"vpn": !(proxy.on && proxy.only)})).await?;
 	if !granted {return Err("Veilway needs your permission to set up a VPN connection. Tap Connect again and allow it.".into())}
-	let options = serde_json::to_string(&Options {kill_switch: false, ..options}).map_err(|error| error.to_string())?;
+	let options = serde_json::to_string(&Options {kill_switch: false, proxy: ProxySettings::default(), ..options}).map_err(|error| error.to_string())?;
 	plugin::<Value>(&vpn, "start", json!({"subscription": subscription, "profile": profile, "options": options})).await?;
 	Ok(Value::Null)
 }
@@ -330,13 +338,27 @@ async fn bundle_install(vpn: State<'_, Arc<Vpn>>) -> Result<(), String> {
 
 fn settings_path() -> Result<std::path::PathBuf, String> {Ok(host::get().ok_or("Veilway is still starting.")?.dir.join("settings.json"))}
 
-#[tauri::command]
-async fn get_settings() -> Result<Settings, String> {Ok(std::fs::read_to_string(settings_path()?).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default())}
+/// The settings with the proxy's password opened. A password that does not open (the Keystore key is gone) is empty, and the proxy then does not start until the settings are saved again. The proxy's login is never optional here.
+fn load_settings() -> Result<Settings, String> {
+	let mut settings: Settings = std::fs::read_to_string(settings_path()?).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default();
+	settings.proxy.password = settings.proxy.password.strip_prefix(SEALED).and_then(|sealed| base64::engine::general_purpose::STANDARD.decode(sealed).ok()).and_then(|sealed| bridge::unwrap(&sealed)).and_then(|plain| String::from_utf8(plain).ok()).unwrap_or_default();
+	settings.proxy.login = true;
+	Ok(settings)
+}
 
 #[tauri::command]
-async fn set_settings(settings: Settings) -> Result<(), String> {
-	let body = serde_json::to_string_pretty(&settings).map_err(|error| error.to_string())?;
-	std::fs::write(settings_path()?, body).map_err(|error| error.to_string())
+async fn get_settings() -> Result<Settings, String> {load_settings()}
+
+#[tauri::command]
+async fn set_settings(mut settings: Settings) -> Result<Settings, String> {
+	settings.proxy.login = true;
+	settings.proxy.ensure_login()?;
+	if settings.proxy.on {settings.proxy.config()?;}
+	let mut stored = settings.clone();
+	if !stored.proxy.password.is_empty() {stored.proxy.password = format!("{SEALED}{}", base64::engine::general_purpose::STANDARD.encode(bridge::wrap(stored.proxy.password.as_bytes()).ok_or("The Android Keystore would not keep the proxy's password.")?))}
+	let body = serde_json::to_string_pretty(&stored).map_err(|error| error.to_string())?;
+	std::fs::write(settings_path()?, body).map_err(|error| error.to_string())?;
+	Ok(settings)
 }
 
 fn vpn_plugin() -> TauriPlugin<Wry> {

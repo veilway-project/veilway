@@ -36,6 +36,11 @@ internal class StartArgs {
 }
 
 @InvokeArg
+internal class PrepareArgs {
+	var vpn: Boolean = true
+}
+
+@InvokeArg
 internal class SaveArgs {
 	lateinit var name: String
 	lateinit var data: String
@@ -60,7 +65,8 @@ class VpnPlugin(private val activity: Activity) : Plugin(activity) {
 		if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
 			activity.requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
 		}
-		val consent = VpnService.prepare(activity)
+		// Proxy only has no VPN interface, so it needs no VPN consent.
+		val consent = if (invoke.parseArgs(PrepareArgs::class.java).vpn) VpnService.prepare(activity) else null
 		if (consent == null) invoke.resolve(JSObject().put("granted", true)) else startActivityForResult(invoke, consent, "prepareResult")
 	}
 

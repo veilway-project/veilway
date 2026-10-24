@@ -11,6 +11,8 @@ object Bridge {
 
 	@JvmStatic fun unwrap(sealed: ByteArray): ByteArray? = Keystore.unwrap(sealed)
 
+	@JvmStatic fun proxyOnly(on: Boolean) { VeilwayVpnService.instance?.proxyOnly = on }
+
 	@JvmStatic fun state(state: String) { VeilwayVpnService.instance?.show(state) }
 
 	@JvmStatic fun ended(error: String?) { VeilwayVpnService.instance?.finish(error) }
