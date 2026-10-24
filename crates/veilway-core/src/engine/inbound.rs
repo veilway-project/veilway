@@ -271,6 +271,8 @@ impl Shared {
 	pub(super) async fn ingress(self: &Arc<Self>, plan: &Arc<Plan>, at: usize, peer: [u8; 32], mut raw: Vec<u8>, session: Option<RuleTransport>) {
 		// What comes out of a node link this node is the entry half of answers flows it sent, or is dropped. What comes out of one it is the exit half of is held to the link's record as a device's packets are held to the device: "The exit treats the link as one peer and trusts nothing it says."
 		let linked = plan.link_of(at, &peer);
+		// Management through the link, before the entry half's early return and every rule: see `manage`.
+		if let Some(link) = linked.filter(|link| plan.links[*link].manage.is_some()) {if self.manage_ingress(plan, link, &raw).await {return}}
 		if let Some(link) = linked.filter(|link| plan.links[*link].entry) {return self.chain_back(plan, link, raw).await}
 		// A device this plan does not know was cut off between its packet being decrypted and now, and so was a link.
 		let Some(device) = linked.map_or_else(|| plan.by_key.get(&peer).copied(), |link| plan.links[link].device) else {return self.count(Reason::Stale)};

@@ -125,7 +125,9 @@ fn operation(method: &str, path: &str) -> Option<(&'static str, &'static Value)>
 	let path = path.split('?').next().unwrap_or(path);
 	OPENAPI["paths"].as_object().unwrap().iter().find(|(template, _)| {
 		let (wanted, given): (Vec<&str>, Vec<&str>) = (template.split('/').collect(), path.split('/').collect());
-		wanted.len() == given.len() && wanted.iter().zip(&given).all(|(wanted, given)| wanted == given || (wanted.starts_with('{') && !given.is_empty()))
+		// The path of the relay route is the other node's own, which has more segments than the template has.
+		let relay = template.contains("/api/{path}") && given.len() > wanted.len();
+		(wanted.len() == given.len() || relay) && wanted.iter().zip(&given).all(|(wanted, given)| wanted == given || (wanted.starts_with('{') && !given.is_empty()))
 	}).and_then(|(template, methods)| Some((template.as_str(), methods.get(method.to_lowercase())?)))
 }
 
@@ -544,6 +546,12 @@ async fn every_route_answers() {
 	// A node without links lists none.
 	assert_eq!(get(&node.socket, "/v1/links").await.json, json!({"links": []}));
 	ask("GET", "/v1/links");
+	// A link the node does not have is not found, and what is not on the list of routes a managed node serves is never carried. The relay through a link that exists is held against two nodes in the tests of `veilway-core`.
+	for (method, path, code) in [("GET", "/v1/links/nobody/api/v1/status", "no_such_link"), ("PUT", "/v1/links/nobody/api/v1/status", "not_allowed_through_link"), ("POST", "/v1/links/nobody/api/v1/events", "not_allowed_through_link"), ("DELETE", "/v1/links/nobody/api/v1/config", "not_allowed_through_link")] {
+		let relayed = call(&node.socket, method, path, &[], None).await;
+		ask(method, path);
+		assert_eq!((relayed.status, relayed.code()), (404, code), "{method} {path}");
+	}
 	assert_eq!(get(&node.socket, "/v1/inbounds").await.json["inbounds"][0]["tag"], json!("home"));
 	ask("GET", "/v1/inbounds");
 	// A node without upstreams lists none, and an upstream or a preview it does not have is not found. The routes that do something are asked against a provider, see the test of the upstream routes.
@@ -1553,7 +1561,7 @@ async fn the_node_names_its_public_addresses_and_refuses_one_with_a_port() {
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json"), ("GET", "/v1/links/{tag}/api/{path}"), ("PUT", "/v1/links/{tag}/api/{path}"), ("POST", "/v1/links/{tag}/api/{path}"), ("DELETE", "/v1/links/{tag}/api/{path}")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();

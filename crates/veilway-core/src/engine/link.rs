@@ -74,10 +74,12 @@ pub struct State {
 	warned: Mutex<Option<Instant>>,
 	/// The cause a proxy chain last gave for not carrying the link, None while it carries it. Each change is logged once.
 	chain: Mutex<Option<String>>,
+	/// What the management connections of the link count, see `manage`.
+	pub manage: super::manage::Counters,
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default(), manage: Default::default()}}
 }
 
 impl State {
@@ -86,6 +88,9 @@ impl State {
 		let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
 		(status.0, status.1.elapsed())
 	}
+
+	/// What the dialler's last attempt came to when it failed: the state the link is reported in until an attempt succeeds.
+	pub fn failed(&self) -> Option<Status> {self.attempt.lock().unwrap_or_else(|e| e.into_inner()).0}
 
 	/// The transport and the candidate or endpoint the dialler is at.
 	pub fn at(&self) -> Option<(usize, usize)> {self.attempt.lock().unwrap_or_else(|e| e.into_inner()).1}

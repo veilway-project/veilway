@@ -1,6 +1,6 @@
 //! The routes: one table that both the router and the OpenAPI document are built from, and the handlers behind it.
 use crate::model::{self, key};
-use crate::{Api, Frame};
+use crate::{manage, Api, Frame};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, Request, State};
 use axum::handler::Handler;
@@ -33,6 +33,8 @@ const USERS: &str = "/v1/users/";
 const RESET: &str = "/usage/reset";
 const REPLAY_RESET: &str = "/v1/replay/reset";
 const UPSTREAMS: &str = "/v1/upstreams";
+/// A call to the control API of another node through one of this node's links, by the link's tag and the other node's path.
+const RELAY: &str = "/v1/links/{tag}/api/{*path}";
 /// A preview fetches from a provider, which takes as long as the provider does. It keeps the time itself, see `preview_upstream`.
 const PREVIEW: &str = "/v1/upstreams/preview";
 /// How many times the body limit a request may send before the node stops taking its body off the connection.
@@ -52,7 +54,7 @@ pub(crate) struct Route {
 }
 
 /// An answer that is not a success, in the one shape every such answer has.
-pub(crate) struct Failure {status: StatusCode, code: &'static str, message: String, details: Vec<model::Problem>, revision: Option<String>}
+pub(crate) struct Failure {status: StatusCode, code: &'static str, message: String, pub(crate) details: Vec<model::Problem>, revision: Option<String>}
 
 impl Failure {
 	pub(crate) fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Failure {Failure {status, code, message: message.into(), details: Vec::new(), revision: None}}
@@ -165,6 +167,8 @@ async fn difference(State(api): State<Arc<Api>>, request: Request) -> Response {
 }
 
 async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
+	// A request that came through a node link is held to what that link needs, see `manage`.
+	let via = request.extensions().get::<manage::Via>().cloned();
 	// The revision is compared as text: what is not the revision that runs is stale, whatever it is.
 	let given = request.headers().get(IF_MATCH).map(|given| given.to_str().unwrap_or_default().trim().trim_matches('"').to_string());
 	// The time a request gets is held against everything up to the moment the engine is given the config, and a request that runs out of it there has changed nothing.
@@ -177,18 +181,22 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 		if given != snapshot.revision.to_string() {return Err(Failure::stale(snapshot.revision.to_string()))}
 		let (config, report) = check(&api, snapshot.clone(), bytes, false).await?;
 		let (config, _) = config.ok_or_else(|| Failure::refused(&report))?;
+		let removal = via.as_ref().map(|via| manage::guard(&api, &snapshot, &config, via)).transpose()?.unwrap_or(false);
 		// What is applied and saved is the document with its real secrets, written out again by this build: the bytes that were sent may hold markers.
 		let mut bytes = serde_json::to_vec_pretty(&config).map_err(|_| Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "The document could not be written out."))?;
 		bytes.push(b'\n');
-		Ok((bytes, snapshot))
+		Ok((bytes, snapshot, removal))
 	}).await;
-	let (bytes, snapshot) = match checked {
+	let (bytes, snapshot, removal) = match checked {
 		Ok(Ok(checked)) => checked,
 		Ok(Err(failure)) => return failure.into_response(),
 		Err(_) => return Failure::late(&api).into_response(),
 	};
+	let previous = via.as_ref().filter(|_| !removal).and_then(|_| serde_json::to_vec_pretty(&*snapshot.config).ok());
 	match api.engine.apply(bytes, snapshot.revision, &api.config).await {
 		Ok((applied, saved)) => {
+			// On trial: put back after `limits.trial` unless the other node asks for anything through the link first. A document that changed nothing has nothing to put back.
+			if let (Some(via), Some(previous)) = (&via, previous) {if applied.snapshot.revision != snapshot.revision {api.on_trial(via, previous, applied.snapshot.revision)}}
 			if let Err(e) = &saved {tracing::error!("control api: config generation {} is in force and could not be written to {} ({}): a restart comes back with the config before", applied.snapshot.generation, api.config.display(), e.kind())}
 			let mut response = json(StatusCode::OK, &model::Applied {revision: applied.snapshot.revision.to_string(), generation: applied.snapshot.generation, saved: saved.is_ok(), save_error: saved.err().map(|e| e.kind().to_string()), diff: (&applied.diff).into(), report: (&applied.report).into()});
 			if let Ok(tag) = HeaderValue::from_str(&format!("\"{}\"", applied.snapshot.revision)) {response.headers_mut().insert(ETAG, tag);}
@@ -456,6 +464,7 @@ async fn links(State(api): State<Arc<Api>>) -> Response {
 			Denied::Quota => model::Denied::Quota,
 		}),
 		exit: link.exit, flows: link.flows, dropped: link.dropped, state_flips: link.flips, traffic: link.traffic.into(),
+		management: model::Management {opened: link.management.opened, open: link.management.open, refused: link.management.refused, failed: link.management.failed, reset: link.management.reset, idled: link.management.idled, dropped: link.management.dropped, denied: link.management.denied, up_bytes: link.management.up_bytes, down_bytes: link.management.down_bytes},
 	}).collect()})
 }
 
@@ -493,7 +502,8 @@ pub(crate) async fn not_allowed() -> Response {Failure::new(StatusCode::METHOD_N
 /// An apply keeps the time itself, see `apply`: it must never be ended here while the engine is putting its config in force. So does a usage reset, see `reset_usage`, and a reset of the replay memory, which the node gives up on by itself.
 pub(crate) async fn deadline(State(api): State<Arc<Api>>, request: Request, next: Next) -> Response {
 	let path = request.uri().path();
-	if path == EVENTS || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && (path == REPLAY_RESET || path == PREVIEW || path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET)))) {return next.run(request).await}
+	// A request through a node link keeps its own time, see `manage::relay`: a preview waits for the provider, and the answer to an apply is the other node's to give.
+	if path == EVENTS || (path.starts_with("/v1/links/") && path.contains("/api/")) || (path == CONFIG && request.method() == Method::PUT) || (request.method() == Method::POST && (path == REPLAY_RESET || path == PREVIEW || path.strip_prefix(USERS).is_some_and(|rest| rest.ends_with(RESET)))) {return next.run(request).await}
 	tokio::time::timeout(api.limits.request, next.run(request)).await.unwrap_or_else(|_| Failure::late(&api).into_response())
 }
 
@@ -553,6 +563,18 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 	for response in preview.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was fetched: once the node has begun to fetch, the answer waits for the provider and is never this one."}
 	let mut confirm = route::<model::UpstreamConfirmed, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/confirm", "confirmUpstream", "Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting.", confirm_upstream, true, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a confirmation takes. Nothing was changed."), (StatusCode::INTERNAL_SERVER_ERROR, "state_unwritten: the state file of the upstreams could not be written, so the answer is not kept.")]);
 	confirm.body = Some((schemas.subschema_for::<model::UpstreamConfirm>(), false));
+	let relayed = |schemas: &mut SchemaGenerator, method: Method, operation: &'static str, summary: &'static str| {
+		let mut relay = route::<serde_json::Value, _, _>(schemas, method.clone(), RELAY, operation, summary, manage::relay, false, &[(StatusCode::NOT_FOUND, "no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves."), (StatusCode::FORBIDDEN, "not_managed: the link does not have manage peer on this node."), (StatusCode::BAD_GATEWAY, "peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself."), (StatusCode::GATEWAY_TIMEOUT, "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made.")]);
+		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::SERVICE_UNAVAILABLE) {response.1 = "link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself."}
+		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream."}
+		if method == Method::PUT || method == Method::POST {relay.body = Some((schemars::json_schema!({"description": "The body of the call to the other node, as the call takes it, up to 4 MiB. It is forwarded as it is, and the other node reads it.", "type": "object"}), false))}
+		if method == Method::PUT {relay.responses.push((StatusCode::PRECONDITION_REQUIRED, "The answer of the other node itself: an apply of its config needs If-Match.", Some(schemas.subschema_for::<model::ErrorBody>())))}
+		relay
+	};
+	let relay_get = relayed(schemas, Method::GET, "relayGet", "Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it.");
+	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: unless a request comes through the same link within 120 seconds, the config before is back. A document that would cut the link this request came through is refused with 422 managing_link.");
+	let relay_post = relayed(schemas, Method::POST, "relayPost", "The same call with POST.");
+	let relay_delete = relayed(schemas, Method::DELETE, "relayDelete", "The same call with DELETE.");
 	vec![
 		route::<model::Status, _, _>(schemas, Method::GET, "/v1/status", "status", "What runs: the version, the config in force and how much of everything there is.", status, false, &[]),
 		route::<model::Running, _, _>(schemas, Method::GET, "/v1/config", "getConfig", "The running config with every secret replaced by the marker \"<redacted>\", and its revision, which is also the ETag.", running, false, &[]),
@@ -574,6 +596,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		route::<model::UpstreamRemoved, _, _>(schemas, Method::DELETE, "/v1/upstreams/{tag}", "removeUpstream", "Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. When it did not, the document stays in the state file and the same call again tells the provider again; the answer is 404 only when the running config has no such upstream, so a removal that was not confirmed can be retried while the config still names it. The upstream stops, and a config that still names it does not start it again, not even after a restart (a tombstone in the state file keeps it down until a config that no longer names it that way has been in force); apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything.", remove_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
 		confirm,
 		route::<model::UpstreamRetried, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/retry", "retryUpstream", "Asks the upstream to connect again now, at the operator's word: every wait it was in starts over.", retry_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
+		relay_get, relay_put, relay_post, relay_delete,
 		stream,
 		route::<BTreeMap<String, serde_json::Value>, _, _>(schemas, Method::GET, "/v1/openapi.json", "openapi", "This document.", openapi, false, &[]),
 	]

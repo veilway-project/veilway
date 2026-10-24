@@ -451,11 +451,11 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 }
 
 /// The packets of one connection's userspace stack: what arrived from the link waits in `rx`, and what the stack made waits in `tx` to be sent into the link.
-struct Wire {rx: VecDeque<Vec<u8>>, tx: Vec<Vec<u8>>, mtu: usize}
+pub(super) struct Wire {pub(super) rx: VecDeque<Vec<u8>>, pub(super) tx: Vec<Vec<u8>>, pub(super) mtu: usize}
 
-struct Received(Vec<u8>);
+pub(super) struct Received(Vec<u8>);
 
-struct Made<'a>(&'a mut Vec<Vec<u8>>);
+pub(super) struct Made<'a>(&'a mut Vec<Vec<u8>>);
 
 impl phy::RxToken for Received {
 	fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {f(&self.0)}

@@ -2,6 +2,7 @@
 //! Whoever can open the socket is the administrator of the node: they can read the config (without its secrets), replace it, and watch every user. The socket is made with mode 600, so that is the user the node runs as, and root.
 //! Every route is under `/v1`, see `routes`. `openapi` is the OpenAPI 3.1 document of all of it.
 #![cfg(unix)]
+mod manage;
 mod model;
 mod openapi;
 mod routes;
@@ -69,10 +70,14 @@ pub struct Limits {
 	pub events: usize,
 	/// How far apart the counters are sampled, which is how often a `stats` event is made. The rates of a snapshot are taken over the last `WINDOW` of these.
 	pub sample: Duration,
+	/// How long a request through a node link may take when it is the preview of an upstream, which waits for the provider.
+	pub preview: Duration,
+	/// How long a config that was pushed through a node link is on trial: it is put back after this unless a request comes through the same link first.
+	pub trial: Duration,
 }
 
 impl Default for Limits {
-	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256, sample: Duration::from_secs(1)}}
+	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256, sample: Duration::from_secs(1), preview: Duration::from_secs(75), trial: Duration::from_secs(120)}}
 }
 
 pub struct Options {
@@ -104,6 +109,9 @@ pub(crate) struct Api {
 	pub samples: Mutex<VecDeque<Sample>>,
 	/// The snapshot the last `stats` event stands for, as JSON.
 	latest: RwLock<Arc<str>>,
+	/// The config applied through a node link that is not confirmed yet, see `manage`, and a count that tells one trial from the next.
+	pub trial: Mutex<Option<manage::Trial>>,
+	pub trials: AtomicU64,
 }
 
 impl Api {
@@ -137,7 +145,7 @@ impl AsyncWrite for Stalled {
 }
 
 /// The API as it runs. `shutdown` ends it and removes the socket file, and so does dropping it, without waiting for its connections to end.
-pub struct Server {path: PathBuf, identity: (u64, u64), stop: Arc<Notify>, accept: Option<JoinHandle<()>>, hub: JoinHandle<()>}
+pub struct Server {path: PathBuf, identity: (u64, u64), stop: Arc<Notify>, accept: Option<JoinHandle<()>>, hub: JoinHandle<()>, managed: JoinHandle<()>, quit: Arc<Notify>}
 
 impl Server {
 	/// Ends every connection and waits until nothing of the API holds the engine any more, then removes the socket file.
@@ -145,7 +153,9 @@ impl Server {
 		self.stop.notify_one();
 		if let Some(accept) = self.accept.take() {let _ = accept.await;}
 		self.hub.abort();
+		self.quit.notify_one();
 		let _ = (&mut self.hub).await;
+		let _ = (&mut self.managed).await;
 	}
 }
 
@@ -153,6 +163,7 @@ impl Drop for Server {
 	fn drop(&mut self) {
 		if let Some(accept) = &self.accept {accept.abort()}
 		self.hub.abort();
+		self.managed.abort();
 		// Only the socket this server made: when another node has taken the path since, the file there is that node's.
 		if fs::symlink_metadata(&self.path).is_ok_and(|meta| (meta.dev(), meta.ino()) == self.identity) {let _ = fs::remove_file(&self.path);}
 	}
@@ -276,8 +287,11 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 	let _ = fs::remove_file(&staged);
 	let _ = fs::remove_dir(&staging);
 	let (listener, identity) = made.map_err(|e| io::Error::new(e.kind(), format!("the control socket {} cannot be made: {e}", path.display())))?;
-	let api = Arc::new(Api {engine, config, streams: Arc::new(Semaphore::new(limits.streams)), checks: Arc::new(Semaphore::new(CHECKS)), events: broadcast::Sender::new(limits.events.max(1)), sent: AtomicU64::new(0), samples: Mutex::default(), latest: RwLock::new(Arc::from("{}")), limits});
+	let api = Arc::new(Api {engine, config, streams: Arc::new(Semaphore::new(limits.streams)), checks: Arc::new(Semaphore::new(CHECKS)), events: broadcast::Sender::new(limits.events.max(1)), sent: AtomicU64::new(0), samples: Mutex::default(), latest: RwLock::new(Arc::from("{}")), trial: Mutex::default(), trials: AtomicU64::new(0), limits});
 	let router = routes::routes(&mut SchemaGenerator::default()).into_iter().fold(Router::new(), |router, route| router.route(route.path, route.handler)).fallback(routes::unknown).method_not_allowed_fallback(routes::not_allowed).layer(axum::middleware::from_fn_with_state(api.clone(), routes::deadline)).with_state(api.clone());
+	// What a node that is managed serves to the node that manages it, through its link: the routes of the allowlist alone, and the same limits.
+	let quit = Arc::new(Notify::new());
+	let managed = manage::serve(&api, routes::routes(&mut SchemaGenerator::default()).into_iter().filter(|route| manage::allowed(&route.method, route.path)).fold(Router::new(), |router, route| router.route(route.path, route.handler)).fallback(routes::unknown).method_not_allowed_fallback(routes::not_allowed).layer(axum::middleware::from_fn_with_state(api.clone(), routes::deadline)).layer(axum::middleware::from_fn_with_state(api.clone(), manage::gate)).with_state(api.clone()), quit.clone());
 	let stop = Arc::new(Notify::new());
 	let accept = tokio::spawn({
 		let (api, stop) = (api.clone(), stop.clone());
@@ -364,5 +378,5 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 		}
 	});
 	tracing::info!("control api: serving on the unix socket {}, mode 600: whoever can open it is the administrator of this node", path.display());
-	Ok(Server {path, identity, stop, accept: Some(accept), hub})
+	Ok(Server {path, identity, stop, accept: Some(accept), hub, managed, quit})
 }

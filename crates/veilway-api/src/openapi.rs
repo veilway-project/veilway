@@ -14,12 +14,14 @@ pub fn openapi() -> String {
 			Some(schema) => json!({"description": meaning, "content": {"application/json": {"schema": schema}}}),
 			None => json!({"description": meaning, "content": {"text/event-stream": {"schema": {"type": "string"}}}}),
 		})).collect();
-		let mut parameters: Vec<Value> = route.path.split('/').filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}')).map(parameter).collect();
+		// The wildcard of the relay route is a plain path parameter in the document.
+		let path = route.path.replace("{*", "{");
+		let mut parameters: Vec<Value> = path.split('/').filter_map(|segment| segment.strip_prefix('{')?.strip_suffix('}')).map(parameter).collect();
 		// A route that can answer that the precondition is missing is a route that takes one.
 		if route.responses.iter().any(|(status, ..)| *status == StatusCode::PRECONDITION_REQUIRED) {parameters.push(json!({"name": "If-Match", "in": "header", "required": true, "description": "The revision of the config the change was made on, as GET /v1/config gave it, with or without quotes.", "schema": {"type": "string"}}))}
 		let mut operation = json!({"operationId": route.operation, "summary": route.summary, "parameters": parameters, "responses": responses});
 		if let Some((schema, required)) = &route.body {operation["requestBody"] = json!({"required": required, "content": {"application/json": {"schema": schema}}})}
-		paths.entry(route.path).or_insert_with(|| json!({}))[route.method.as_str().to_lowercase()] = operation;
+		paths.entry(path).or_insert_with(|| json!({}))[route.method.as_str().to_lowercase()] = operation;
 	}
 	let events: Map<String, Value> = event_schemas(&mut schemas).into_iter().map(|(name, schema)| (name.to_string(), json!(schema))).collect();
 	let document = json!({

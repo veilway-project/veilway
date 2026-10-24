@@ -802,6 +802,30 @@ pub struct Link {
 	pub state_flips: u64,
 	/// Inner packets. Up is what this node sent into the link, down what it took out of it.
 	pub traffic: Traffic,
+	/// What the management connections of the link count. All zero on a link that is not managed.
+	pub management: Management,
+}
+
+/// The management connections of one link, which carry the control API of the other node, or this node's to it. Everything but `open` only grows, and none of it is in `traffic`'s numbers of a user.
+#[derive(Serialize, JsonSchema)]
+pub struct Management {
+	/// Connections taken, and open now.
+	pub opened: u64,
+	pub open: u64,
+	/// Refused: a fifth connection, a connection attempt from the other node to a node that manages (which has no listener), a node with no control API to serve, and a stray packet.
+	pub refused: u64,
+	/// Connections that were reset by the other node or got no answer within 10 seconds.
+	pub failed: u64,
+	/// Connections a reset ended, and those closed after 120 seconds of silence.
+	pub reset: u64,
+	pub idled: u64,
+	/// Packets that a full queue of a connection dropped.
+	pub dropped: u64,
+	/// Requests turned away because their route or method is not on the list a managed node serves.
+	pub denied: u64,
+	/// Bytes of the requests this node sent through the link and of the answers it took out of it.
+	pub up_bytes: u64,
+	pub down_bytes: u64,
 }
 
 #[derive(Serialize, JsonSchema)]

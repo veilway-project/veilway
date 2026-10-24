@@ -14,6 +14,7 @@ pub mod l3;
 pub mod limits;
 pub mod link;
 pub mod load;
+pub mod manage;
 pub mod netstack;
 pub mod obfs;
 pub mod plan;
@@ -184,6 +185,8 @@ pub struct LinkReport {
 	pub dropped: u64,
 	pub flips: u64,
 	pub warning: bool,
+	/// What the management connections of the link count.
+	pub management: manage::Totals,
 	/// On the exit half: a link this node cut off for its quota or its expiry.
 	pub denied: Option<Denied>,
 	/// On the entry half: the `chain` exit the link is behind.
@@ -424,12 +427,14 @@ pub struct Shared {
 	proxies: Mutex<Vec<(String, Arc<proxy::State>)>>,
 	/// The subscriptions of other providers the operator was shown, which wait for the config that names them, see `upstream`.
 	previews: upstream::Previews,
+	/// The management connections of the links, see `manage`.
+	manage: manage::State,
 }
 
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), proxies: Mutex::default(), open: Arc::default(), udp: Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER)), previews: upstream::Previews::new(upstream::Hooks::default())}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), proxies: Mutex::default(), open: Arc::default(), udp: Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER)), previews: upstream::Previews::new(upstream::Hooks::default()), manage: manage::State::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -651,10 +656,19 @@ impl Engine {
 					Some(veilway_proto::subscription::payload::Transport::Tls(_)) => "tls",
 					_ => "ws",
 				}, transport, candidate)),
-				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
+				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), management: link.state.manage.totals(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
 			}
 		}).collect()
 	}
+
+	/// Whoever serves management takes the streams of the node that manages this one from here, see `manage`: the control API does, with its allowlist. A node with no such task refuses every management connection, and a second call takes over from the first.
+	pub fn managed(&self) -> mpsc::Receiver<manage::Managed> {self.shared.manage.serve()}
+
+	/// One request through the node link `tag`, which must have `manage: "peer"`, to the control API of the node at its other end, see `manage`.
+	pub async fn manage(&self, tag: &str, request: manage::Request) -> Result<manage::Answer, manage::Error> {self.shared.manage_request(tag, request).await}
+
+	/// The control API turned a request for the link `tag` away for its route: counted with the link's management counters.
+	pub fn manage_denied(&self, tag: &str) {self.shared.manage_denied(tag)}
 
 	/// Every enabled upstream of the config that runs, in its order, with its state, its reason when it is not up and its numbers. No key, no secret and no link.
 	pub fn upstreams(&self) -> Vec<upstream::Report> {self.plan().upstreams().iter().map(|state| state.report()).collect()}

@@ -347,13 +347,15 @@ pub struct Link {
 	pub addresses: Vec<IpAddr>,
 	/// The address of the node that dials, which is where that node's own ICMP errors come from in its link tunnel.
 	pub dialler: Vec<IpAddr>,
+	/// The link address of the node that is dialled, where pairing gave one: in a reverse link and a managed one.
+	pub listened: Vec<IpAddr>,
 	pub mtu: u16,
 	/// On the exit half: the record its flows are held under, while the link is not denied.
 	pub device: Option<usize>,
 	/// On the exit half: the link's account, denied or not.
 	pub user: Option<usize>,
 	pub allow_private: bool,
-	/// Whether this node manages the other one through the link, or is managed by it. Nothing runs on it yet: the link only reports it.
+	/// Whether this node manages the other one through the link, or is managed by it, see `manage`.
 	pub manage: Option<LinkManage>,
 	/// On the entry half: the exit with a `chain` backend that names the link.
 	pub exit: Option<usize>,
@@ -370,6 +372,12 @@ impl Link {
 	/// The entry's address in the link for one family: what a packet into the link is sent from.
 	pub fn address(&self, v4: bool) -> Option<IpAddr> {
 		if let Carrier::Upstream(upstream) = &self.carrier {upstream.addresses().iter().copied().find(|address| address.is_ipv4() == v4)} else {self.addresses.iter().copied().find(|address| address.is_ipv4() == v4)}
+	}
+
+	/// For management through the link: this node's own address in it and the other node's, in one family. The dialler's address is in `dialler` and the listener's in `listened`, and whose is whose depends on the side this node is.
+	pub fn management(&self, v4: bool) -> Option<(IpAddr, IpAddr)> {
+		let (mine, theirs) = if self.listener {(&self.listened, &self.dialler)} else {(&self.dialler, &self.listened)};
+		Some((*mine.iter().find(|ip| ip.is_ipv4() == v4)?, *theirs.iter().find(|ip| ip.is_ipv4() == v4)?))
 	}
 
 	/// Whether `ip` is the entry's address in the link: the one destination a packet out of the link may have.
@@ -664,13 +672,14 @@ impl Plan {
 			}
 			if written.listener() && denied.is_none() {by_link.insert(identity, l);}
 			// What the node learnt of a link stays with it while it is the same link: the same id under the same key.
-			links.push(Link {carrier: Carrier::Paired, tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, mtu, device, user, allow_private: written.allow_private == Some(true), manage: written.manage, exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
+			let listened = written.addresses.listener.iter().flatten().map(|ip| ip.0).collect();
+			links.push(Link {carrier: Carrier::Paired, tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, listened, mtu, device, user, allow_private: written.allow_private == Some(true), manage: written.manage, exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
 		}
 		// An enabled upstream is a link after the node links, with no tunnel of the plan behind it: its carrier is the engine of its state. The tag of a link is looked for among the node links alone from here on.
 		let paired = links.len();
 		for written in config.upstreams.iter().filter(|upstream| upstream.on()) {
 			let upstream = upstreams.iter().find(|upstream| upstream.tag == written.tag).ok_or_else(stale)?;
-			links.push(Link {carrier: Carrier::Upstream(upstream.clone()), tag: written.tag.clone(), id: upstream.id, listener: false, entry: true, inbound: usize::MAX, key: [0; 32], identity: [0; 32], secret: [0; 32], addresses: Vec::new(), dialler: Vec::new(), mtu: 0, device: None, user: None, allow_private: written.allow_private == Some(true), manage: None, exit: None, denied: None, dialled: None, state: upstream.link.clone()});
+			links.push(Link {carrier: Carrier::Upstream(upstream.clone()), tag: written.tag.clone(), id: upstream.id, listener: false, entry: true, inbound: usize::MAX, key: [0; 32], identity: [0; 32], secret: [0; 32], addresses: Vec::new(), dialler: Vec::new(), listened: Vec::new(), mtu: 0, device: None, user: None, allow_private: written.allow_private == Some(true), manage: None, exit: None, denied: None, dialled: None, state: upstream.link.clone()});
 		}
 		// A `chain` exit names its links by tag. One that is not enabled is not among them, and an exit left with none is down. An `upstream` exit is the link of its upstream, and down while the upstream is.
 		for (e, exit) in config.exits.iter().enumerate() {

@@ -3081,6 +3081,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "tracing-subscriber",
+ "veilway-api",
  "veilway-core",
  "veilway-engine",
  "veilway-ipstack",

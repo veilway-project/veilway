@@ -124,6 +124,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/links/{tag}/api/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it. */
+        get: operations["relayGet"];
+        /** The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: unless a request comes through the same link within 120 seconds, the config before is back. A document that would cut the link this request came through is refused with 422 managing_link. */
+        put: operations["relayPut"];
+        /** The same call with POST. */
+        post: operations["relayPost"];
+        /** The same call with DELETE. */
+        delete: operations["relayDelete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/openapi.json": {
         parameters: {
             query?: never;
@@ -672,6 +692,8 @@ export interface components {
             id: components["schemas"]["LinkId"];
             /** @description Null for a link that is not managed. */
             manage: components["schemas"]["LinkManage"] | null;
+            /** @description What the management connections of the link count. All zero on a link that is not managed. */
+            management: components["schemas"]["Management"];
             role: components["schemas"]["LinkRole"];
             /** @description The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns. */
             size_warning: boolean;
@@ -717,6 +739,50 @@ export interface components {
         };
         /** @description What `Load::by` measures. */
         LoadBy: "flows" | "mbps";
+        /** @description The management connections of one link, which carry the control API of the other node, or this node's to it. Everything but `open` only grows, and none of it is in `traffic`'s numbers of a user. */
+        Management: {
+            /**
+             * Format: uint64
+             * @description Requests turned away because their route or method is not on the list a managed node serves.
+             */
+            denied: number;
+            /** Format: uint64 */
+            down_bytes: number;
+            /**
+             * Format: uint64
+             * @description Packets that a full queue of a connection dropped.
+             */
+            dropped: number;
+            /**
+             * Format: uint64
+             * @description Connections that were reset by the other node or got no answer within 10 seconds.
+             */
+            failed: number;
+            /** Format: uint64 */
+            idled: number;
+            /** Format: uint64 */
+            open: number;
+            /**
+             * Format: uint64
+             * @description Connections taken, and open now.
+             */
+            opened: number;
+            /**
+             * Format: uint64
+             * @description Refused: a fifth connection, a connection attempt from the other node to a node that manages (which has no listener), a node with no control API to serve, and a stray packet.
+             */
+            refused: number;
+            /**
+             * Format: uint64
+             * @description Connections a reset ended, and those closed after 120 seconds of silence.
+             */
+            reset: number;
+            /**
+             * Format: uint64
+             * @description Bytes of the requests this node sent through the link and of the answers it took out of it.
+             */
+            up_bytes: number;
+        };
         /**
          * @description The counters of one outbound: those of the exits that leave through it, added up, with what the node knows of its proxy.
          *     The node learns whether a proxy relays UDP once for each exit, from the flows of that exit, so two exits through one proxy can know different things for a while. This is what they know together.
@@ -2119,6 +2185,334 @@ export interface operations {
             };
             /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    relayGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description not_managed: the link does not have manage peer on this node. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    relayPut: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description The revision of the config the change was made on, as GET /v1/config gave it, with or without quotes. */
+                "If-Match": string;
+            };
+            path: {
+                tag: string;
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description not_managed: the link does not have manage peer on this node. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: an apply of its config needs If-Match. */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    relayPost: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description not_managed: the link does not have manage peer on this node. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    relayDelete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description not_managed: the link does not have manage peer on this node. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            504: {
                 headers: {
                     [name: string]: unknown;
                 };

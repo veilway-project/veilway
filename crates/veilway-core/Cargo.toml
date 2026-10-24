@@ -68,3 +68,7 @@ hyper-util.workspace=true
 http-body-util.workspace=true
 # The tests of the proxy path wait five minutes for a connection to be given up, on a clock that is paused and moved for them.
 tokio={workspace=true, features=["test-util"]}
+
+# The tests of management run the control API on both nodes of a link. The API depends on this crate, which a dependency of a dev-dependency may do when it has no version: the manifest sent to the registry leaves it out.
+[target.'cfg(unix)'.dev-dependencies]
+veilway-api={path="../veilway-api"}
