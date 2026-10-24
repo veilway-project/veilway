@@ -405,6 +405,8 @@ Outbound chaining: an outbound and a node link get one optional `via` naming ano
 
 Split tunneling in the apps, chosen per subscription and kept on the device: by app (Android through `VpnService` allowed and disallowed apps; Linux by putting the chosen programs in a cgroup that the policy routing and the kill switch know; Windows by WFP filters on the program's path; macOS by address and name only, since per-app needs a NetworkExtension) and by address or name on every platform (routes plus the node-side DNS memory). Two modes: everything through the tunnel except the chosen ones, or only the chosen ones. The kill switch keeps blocking whatever is meant for the tunnel while it is down, and a provider can forbid the second mode in the signed profile.
 
+Several nodes from one panel, asked for by the owner on 2026-10-24: one panel pushes its users and their device keys to more than one node, with an address pool per node, and a subscription carries one profile per node (each with its own address, keys and pins). Usage and quotas add up across nodes so one user's limit holds everywhere; a node that is down never blocks changes to the others and catches up at its next sync. Pairing a node to a panel is authenticated both ways. Threat model section first.
+
 ## Real devices (no release set)
 
 Moved out of v0.3.0 by the owner on 2026-10-23. The clients tested on every platform they claim: the macOS app on a real Mac, Windows connected to a real node, the Linux desktop on a real desktop with systemd-resolved. It happens when the machines are at hand, not as part of a release.
@@ -465,7 +467,7 @@ Must have for the first release:
 5. Stats: live and historical traffic per user, inbound, exit and outbound (speed now, and usage over a day, a week and a month, kept by the panel since the node only counts from its last start for inbounds and exits); for each exit and outbound whether it is up, since when, and how long its upstream takes to answer; node health; online users. The core reports an outbound that several exits share as one line of its own, not only through its exits.
 6. An admin API for integrations: everything the panel's own pages do (users, devices, quotas, usage reset, subscription links, inbounds, exits, DNS sets, stats) over HTTP + JSON under the panel's path prefix, with an OpenAPI document and a generated TypeScript client like the core's. The panel's own pages use this same API, so nothing can be done in the panel that an integration cannot do. Access is by API tokens made in the panel: each has a name, a scope (read only, users only, or full), an optional expiry and an optional list of allowed source addresses, is shown once, is stored hashed, can be revoked, is rate limited, and every call it makes is in the audit log. A token never gives access to another admin's login, to the signing keys or to making new tokens.
 
-Later: reseller accounts and roles, several nodes managed from one panel, ACME certificate management UI, backup/restore, webhooks, Telegram bot, per-IP limits, WARP-style outbound presets.
+Later: reseller accounts and roles, ACME certificate management UI, backup/restore, webhooks, Telegram bot, per-IP limits, WARP-style outbound presets.
 
 ## Client features
 
