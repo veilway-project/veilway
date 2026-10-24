@@ -1,6 +1,6 @@
 [package]
 name="veilway-android"
-version="0.2.19"
+version="0.2.20"
 edition="2021"
 license="Apache-2.0"
 publish=false
@@ -42,7 +42,7 @@ ipnet= {version="2", features= ["serde"] }
 image= {version="0.25", default-features=false, features= ["png", "jpeg"] }
 rqrr="0.11"
 # The picture of a code for a link the user passes on.
-qrcode={version="0.14", default-features=false, features=["svg"]}
+qrcode= {version="0.14", default-features=false, features= ["svg"] }
 # Calls into the Kotlin side (the VpnService, the Keystore) and the natives it calls back.
 jni="0.21"
 libc="0.2.150"

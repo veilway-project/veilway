@@ -22,8 +22,8 @@ fuzz=[]
 unexpected_cfgs={level="warn", check-cfg=["cfg(fuzzing)", "cfg(veilway_release_tests)"]}
 
 [dependencies]
-veilway-proto={path="../veilway-proto", version="0.2.19"}
-veilway-transport={path="../veilway-transport", version="0.2.19"}
+veilway-proto={path="../veilway-proto", version="0.2.20"}
+veilway-transport={path="../veilway-transport", version="0.2.20"}
 tokio.workspace=true
 tracing.workspace=true
 # WireGuard itself, unchanged: one `Tunn` for the one node a tunnel talks to.
