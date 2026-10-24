@@ -701,6 +701,27 @@ A node may carry an exit through a VLESS, VMess, Trojan or Shadowsocks server of
 
 **Testing:** `crates/veilway-core/tests/config_xray_outbound.rs` (config, links, secrets), `tests/xray_outbound.rs` (a node in the process with a stand-in for the host that makes the sockets), and the unit tests of `engine/xray_out.rs`, `engine/xray_trojan.rs` and `engine/xray.rs`, the last of which runs the pinned Xray against a VLESS server and loads every kind of stream and security the node writes into it when `VEILWAY_TEST_XRAY` names the executable (not run in CI). Not yet reviewed by anyone outside the project.
 
+### 5.18 The local proxy of the apps
+
+The desktop app, the Android app and `veilway connect` can run a local SOCKS5 and HTTP proxy (`veilway_engine::local`): either in place of the system VPN (proxy only), where each connection is opened inside the tunnel by a userspace TCP/IP stack and names are asked of the node's resolver, or next to a running VPN, where connections are opened with system sockets that the VPN carries.
+
+**Assets:** AS3 and AS4 (what the proxied programs send and to whom), the fact that the device uses Veilway and which server (AS2), and the device's own networks and services.
+
+**Capabilities:** any program on the device can connect to a loopback port, and an Android app needs only the internet permission to do so; apps in censored countries scan local ports for proxies to detect VPN use. With "allow devices on my network", anyone on that network can reach the port. The traffic between a client and the proxy is not encrypted.
+
+| Risk | Design response | Mechanism | Status |
+|---|---|---|---|
+| **L1** Another program or app uses the proxy, or detects through it that the device runs a VPN and to which server | Every connection logs in by default, also on loopback: the apps make a random user name and password the first time the proxy is turned on (`LocalProxy::random_login`). Android always requires the login. Desktop lets it be turned off only for 127.0.0.1, behind a warning | `ProxySettings::ensure_login`, `LocalProxy::check` | Built |
+| **L2** A proxy reachable from the network is open | A listen address that is not loopback is refused without a login, by the engine and by the apps, and the apps confirm before opening it, saying the traffic is not encrypted | `LocalProxy::check`, the settings dialog | Built |
+| **L3** A login is guessed | Logins are compared in constant time. A source that fails five times in a minute is refused for the rest of the minute, checked again before each login, and at most 20 failed logins a minute are taken from all sources together. Loopback sources share one address and count only in the global limit, so one hostile local app cannot lock the others out | `local.rs` login table | Built |
+| **L4** A name leaks to the local network in proxy-only mode | Names are resolved only inside the tunnel, by A and AAAA queries to the gateway; the system resolver is never asked. The cache is cleared when the exit changes or the session is not connected | `local_stack.rs`, `local_dns.rs` | Built |
+| **L5** Traffic leaves outside the tunnel next to a VPN that dropped | The alongside mode watches the tunnel's status and refuses new connections while it is not connected; the platform's kill switch stays the main guard | `Local::alongside` | Built |
+| **L6** A proxy client reaches the device itself or its network | Loopback, unspecified, multicast, broadcast, port 0 and the stack's own addresses are refused, for written addresses and resolved names. Next to the VPN, link-local (with 169.254.169.254), the listener's own address and private ranges (RFC 1918, 100.64/10, fc00::/7) are refused unless `allow_private` is set. Other public addresses of the host are not enumerated | `allowed` in `local.rs` | Built, gap noted |
+| **L7** The proxy exhausts the device's memory | Connections and stack flows are capped at `max_connections` (256), 32 per source on a network address, smaller socket buffers, a handshake deadline of 10 s, socket timeouts of 60 s and an idle limit of an hour in both modes | `local.rs`, `local_stack.rs` | Built |
+| **L8** Logs on a seized device show where the user went | The proxy logs no destination names and no login; `LocalProxy` has no `Debug` and the apps' settings hide the password from `Debug` | `local.rs`, `proxy.rs` | Built |
+
+**Not defended:** a program the user points at the proxy sees its own traffic, as with any proxy. SOCKS5 UDP ASSOCIATE and BIND are refused. On desktop the password is in the app's settings file (mode 600 on Unix), readable by the user's own programs; on Android it is sealed with a Keystore key.
+
 ## 6. Parsers of untrusted input
 
 Every row needs a `cargo-fuzz` target that lands in the same change as the parser (`PLAN.md` "Security requirements" 3). A target must show: no panic, no allocation above a stated cap, no input that takes longer than a stated bound, and for every codec a round-trip property (`decode(encode(x)) == x`, and `encode(decode(b))` accepted). Corpora are committed. Three targets exist, under shorter names than the ones first planned here: `config`, `packet` and `dns` in `fuzz/fuzz_targets`, with seed corpora in `fuzz/corpus` for `config` and `dns`. They are run by hand in Docker as `fuzz/README.md` says, not in CI, and they assert properties of the output and no allocation cap or time bound. No other target in the table exists yet.
