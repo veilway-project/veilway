@@ -242,12 +242,13 @@ impl Core {
 				if id.starts_with(legacy::PREFIX) {self.legacy.lock().await.remove(&id).map_err(|error| format!("The subscription could not be removed: {error}"))?;}
 				let mut library = self.library.lock().await;
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
-				if let Some(found) = found {fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?;}
+				let told = match found {Some(found) => fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?, None => true};
 				drop(library);
 				self.store.set_lan_local(&id, false);
 				self.store.set_exit_choice(&id, None);
 				let _ = self.store.flush();
-				self.library_value().await
+				// Whether the provider was told: the app warns when the device keeps its place there.
+				Ok(json!({"library": self.library_value().await?, "told": told}))
 			}
 			Call::AnswerHosts {subscription: id, allow, decline} => {
 				let mut library = self.library.lock().await;
@@ -884,7 +885,7 @@ mod tests {
 		assert!(vault.contains("edge.example") && vault.contains("8388") && !vault.contains("not a link"), "both links are kept, and the line that is no link is not");
 		let id = pasted["id"].as_str().unwrap().to_owned();
 		assert_eq!(link.call(Call::Connect {subscription: id.clone(), profile: "2".into(), options: Options::default()}).await.unwrap_err(), "profile_refused.cipher", "a refused link never connects, with the add-on or without it");
-		assert_eq!(link.call(Call::Remove {subscription: id}).await.unwrap(), json!([]));
+		assert_eq!(link.call(Call::Remove {subscription: id}).await.unwrap()["library"], json!([]));
 	}
 
 	#[tokio::test]

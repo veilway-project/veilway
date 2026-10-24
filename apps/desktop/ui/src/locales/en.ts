@@ -171,6 +171,8 @@ export const en = {
 	"library.removeTitle": "Remove {provider}?",
 	"library.removeBody": "Its connections and keys are deleted from this computer. To use it again you need the link from your provider.",
 	"library.removed": "Subscription removed",
+	"library.removedUntold": "Removed from this device only",
+	"library.removedUntoldBody": "Veilway could not reach your provider to remove this device, so it may still count toward your device limit. Ask your provider to remove it.",
 	"library.removeFailed": "Could not remove it",
 	"library.lan": "Let apps reach devices on this network",
 	"library.lanHint": "A printer or your router, for example. They are reached outside the VPN, so the network can see that traffic. Applies from the next connect.",

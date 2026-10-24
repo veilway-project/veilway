@@ -109,7 +109,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	import_keep: args => { if (args.keep && lastLegacy) legacyHeld = true; else if (args.keep) held = 1; return list(); },
 	import_cancel: () => null,
 	refresh: () => [subscription(languages[0] === "fa")],
-	remove: args => { if (args.id === "legacy.7c1e") legacyHeld = false; else held = 0; return list(); },
+	remove: args => { if (args.id === "legacy.7c1e") legacyHeld = false; else held = 0; return {library: list(), told: true}; },
 	bundle_pick: () => bundleReview(languages[0] === "fa"),
 	bundle_document: () => [subscription(languages[0] === "fa")],
 	bundle_notices: () => null,

@@ -27,7 +27,7 @@ function Hosts({subscription, review, onClose, onChange}: {subscription: Subscri
 
 export function Library({library, inUse, onAdd, onRefresh, onChange}: {library: Subscription[], inUse: string | null, onAdd: () => void, onRefresh: (id: string) => Promise<void>, onChange: (library: Subscription[]) => void}) {
 	const {t, date, locale} = useD(), toast = useToast(), [removing, setRemoving] = useState<Subscription | null>(null), [refreshing, setRefreshing] = useState<string | null>(null), [hosts, setHosts] = useState<{id: string, review: boolean} | null>(null), [sharing, setSharing] = useState<Subscription | null>(null), reviewing = library.find(found => found.id === hosts?.id);
-	const remove = (subscription: Subscription) => call("remove", {id: subscription.id}).then(found => { onChange(found); toast({tone: "success", title: t("library.removed")}); }, error => toast({tone: "danger", title: t("library.removeFailed"), body: error}));
+	const remove = (subscription: Subscription) => call("remove", {id: subscription.id}).then(found => { onChange(found.library); toast(found.told ? {tone: "success", title: t("library.removed")} : {tone: "warning", title: t("library.removedUntold"), body: t("library.removedUntoldBody")}); }, error => toast({tone: "danger", title: t("library.removeFailed"), body: error}));
 	const setLan = (subscription: Subscription, on: boolean) => call("set_lan", {id: subscription.id, on}).then(onChange, error => toast({tone: "danger", title: t("library.lanFailed"), body: error}));
 	return <div className="d-page">
 		<div className="d-head"><h1 className="vw-h1">{t("library.title")}</h1><Button variant="primary" icon="plus" onClick={onAdd}>{t("library.add")}</Button></div>

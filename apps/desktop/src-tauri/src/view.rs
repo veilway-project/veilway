@@ -205,6 +205,7 @@ pub fn brand(value: &mut serde_json::Value) {
 				map.insert("logo".into(), url.map_or(serde_json::Value::Null, serde_json::Value::String));
 			}
 			if let Some(preview) = map.get_mut("preview") {brand(preview)}
+			if let Some(library) = map.get_mut("library") {brand(library)}
 		}
 		_ => {}
 	}

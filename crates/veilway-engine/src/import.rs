@@ -870,7 +870,7 @@ impl From<ImportError> for RefreshFailed {
 
 impl Library {
 	/// Refreshes the subscription at `at` through `wire`, trying the places in the order of "Order and rate": the endpoint of a confirmed move, the main endpoint, then the confirmed `refresh_urls` in the document's order, then the confirmed static mirrors. A subscription that came as a whole document cannot refresh. Each place gets a request of its own, sealed to the gateway keys it follows, and a document from the endpoint of a move is checked against the move (`Held::refresh_moved`).
-	/// The user removes the subscription `id`: first `leave` to the endpoints of the subscription, in the order a refresh tries them and never to a static mirror, so that the provider removes the device and frees its place, then everything held of it, as `remove`. Best effort and short: a provider that does not take it within `LEAVE_WAIT` keeps the device until its own cleanup or its operator removes it, and the subscription is removed all the same.
+	/// The user removes the subscription `id`: first `leave` to the endpoints of the subscription, in the order a refresh tries them and never to a static mirror, so that the provider removes the device and frees its place, then everything held of it, as `remove`. Best effort and short: a provider that does not take it within `LEAVE_WAIT` keeps the device until its own cleanup or its operator removes it, and the subscription is removed all the same. True when the provider was told (or there was nothing to tell), so an app can say when the device keeps its place.
 	pub async fn leave_over(&mut self, wire: &impl Wire, id: &veilway_proto::subscription::payload::Id) -> io::Result<bool> {
 		let leaving = self.held.iter().find(|held| held.id() == id).and_then(|held| held.leave().map(|request| (request, held.targets().into_iter().map(|target| (target.url.clone(), target.pins.to_vec(), target.keys.to_vec())).collect::<Vec<_>>(), held.private_addresses().to_vec())));
 		if let Some((request, targets, allowed)) = leaving {
@@ -881,8 +881,10 @@ impl Library {
 				false
 			}).await.unwrap_or(false);
 			if told {tracing::info!("the provider was told that this device left the subscription")} else {tracing::info!("the provider could not be told that this device left the subscription: its place stays until the provider removes it")}
+			self.remove(id)?;
+			return Ok(told)
 		}
-		self.remove(id)
+		self.remove(id).map(|_| true)
 	}
 	/// The refresh ends at the first accepted answer from the endpoint or a relay mirror (a newer document or the same bytes again), at a newer document from a static mirror, or at a signed refusal that verifies, wherever it came from. Everything else is a failure of that place and the next is tried: from a static mirror that includes the held document again ("this mirror has nothing newer", no successful refresh), an older one, a 404 and a file that does not open, none of which is a revocation. The reason of a failed refresh is the endpoint's (the last place before the static mirrors), and a static mirror changes it only to ask about a private address.
 	pub async fn refresh_over(&mut self, wire: &impl Wire, at: usize, now: u64) -> Result<(Refreshed, Source), RefreshFailed> {
@@ -1294,8 +1296,9 @@ mod tests {
 		assert_eq!((fake.asked(), library.held.len()), (vec!["POST sub.example.com".to_owned(), "POST relay.example.net".to_owned()], 0));
 		let mut library = self::library("leave", imported());
 		let fake = Fake::new(Vec::new());
-		assert!(runtime.block_on(library.leave_over(&fake, &id)).unwrap() && library.held.is_empty());
-		assert!(!runtime.block_on(library.leave_over(&fake, &id)).unwrap());
+		// Nobody answers: removed all the same, and the app is told the provider was not.
+		assert!(!runtime.block_on(library.leave_over(&fake, &id)).unwrap() && library.held.is_empty());
+		assert!(runtime.block_on(library.leave_over(&fake, &id)).unwrap());
 	}
 
 	#[test]

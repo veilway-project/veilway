@@ -64,7 +64,7 @@ type Commands = {
 	bundle_close: [{}, null],
 	library: [{languages: string[]}, Subscription[]],
 	refresh: [{id: string, private?: string[]}, Subscription[] | PrivateAsk],
-	remove: [{id: string}, Subscription[]],
+	remove: [{id: string}, {library: Subscription[], told: boolean}],
 	answer_hosts: [{id: string, allow: string[], decline: string[]}, Subscription[]],
 	set_lan: [{id: string, on: boolean}, Subscription[]],
 	get_alpha: [{}, {alpha: boolean}],

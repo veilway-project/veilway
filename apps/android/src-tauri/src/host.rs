@@ -180,12 +180,13 @@ impl Core {
 				if self.running.lock().unwrap().as_ref().is_some_and(|running| running.subscription == id) {return Err("Disconnect before removing the subscription that is in use.".into())}
 				let mut library = self.library.lock().await;
 				let found: Option<Id> = library.held().iter().find(|held| held.id().as_str() == id).map(|held| held.id().clone());
-				if let Some(found) = found {fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?;}
+				let told = match found {Some(found) => fetcher().leave(&mut library, &found).await.map_err(|error| format!("The subscription could not be removed: {error}"))?, None => true};
 				drop(library);
 				self.store.set_lan_local(&id, false);
 				self.store.set_exit_choice(&id, None);
 				let _ = self.store.flush();
-				self.library_value().await
+				// Whether the provider was told: the app warns when the device keeps its place there.
+				Ok(json!({"library": self.library_value().await?, "told": told}))
 			}
 			Call::AnswerHosts {subscription: id, allow, decline} => {
 				let mut library = self.library.lock().await;

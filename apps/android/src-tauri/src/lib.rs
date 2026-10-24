@@ -89,7 +89,7 @@ async fn call_branded(call: Call) -> Result<Value, String> {
 /// The provider links the library shows are the only ones `open_link` opens. Each whole list the core sends replaces the last one; an import's preview adds its own, so its terms open before the user keeps it.
 fn remember_links(value: &Value) {
 	if let Some(preview) = value.get("preview") {linkset().lock().unwrap().extend(view::provider_links(preview)); return}
-	let Some(list) = value.as_array() else {return};
+	let Some(list) = value.get("library").unwrap_or(value).as_array() else {return};
 	*linkset().lock().unwrap() = list.iter().flat_map(view::provider_links).collect();
 }
 

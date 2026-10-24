@@ -522,8 +522,7 @@ pub async fn remove(args: Remove) -> anyhow::Result<()> {
 		None if library.held().is_empty() => bail!("There is no subscription to remove."),
 		None => bail!("More than one subscription is held, pick one with --subscription: {}", library.held().iter().map(|held| format!("{} ({})", short(held.id()), held.subscription().provider.as_str())).collect::<Vec<_>>().join(", ")),
 	}.id().clone();
-	Fetcher::new(default_roots(), None).leave(&mut library, &id).await.context("the subscription could not be removed")?;
-	println!("Removed. The provider was asked to free this device's place.");
+	if Fetcher::new(default_roots(), None).leave(&mut library, &id).await.context("the subscription could not be removed")? {println!("Removed. The provider was asked to free this device's place.")} else {println!("Removed from this device only. The provider could not be reached, so this device may still count toward your device limit there: ask the provider to remove it.")}
 	Ok(())
 }
 
