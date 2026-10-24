@@ -1,8 +1,7 @@
 //! The HTTP of a proxy inbound without any IO: `read` takes the bytes received so far and says that it needs more (`None`), that it has one whole request head and how many bytes it used, or why the head is refused. A request is attacker input, so the reader is strict, and everything it holds is bounded: the head is at most `MAX_HEAD` bytes with at most `MAX_HEADERS` fields.
 //! What it takes is a CONNECT with a `host:port` target, or a request for an absolute `http://` URI. A request with an origin-form target, a `https://` URI, a URI with userinfo or a fragment, an obsolete folded line, both `Content-Length` and `Transfer-Encoding`, two `Content-Length` or two `Proxy-Authorization` fields, a bare CR or LF, a control character or a field name that is no token is refused whole.
 //! A plain request is forwarded with its request line in origin form, its `Host` made from the URI (whatever the client sent is dropped), the fields of the hop (`Proxy-Authorization`, `Proxy-Connection`, `Connection`, `Keep-Alive`, `TE`, `Trailer`, `Upgrade`) left out and `Connection: close` in their place. So one request is carried to a connection, and the node keeps no state between two.
-use super::proxy::destination;
-use super::xray::Target;
+use super::{destination, Target};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::net::Ipv6Addr;

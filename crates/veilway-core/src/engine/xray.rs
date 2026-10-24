@@ -4,7 +4,6 @@
 //! The hop answers CONNECT, and UDP ASSOCIATE for UDP (`xray_udp`). Destinations that are names are resolved here, the way the tunnel's resolver does it: with the DNS servers of the user's set, through the exit the rules give that query.
 //! What follows a login is `connect` and `relay` below and `xray_udp::associate`, which the `socks5`, `http` and `mixed` inbounds (`proxy`) run as well after their own login: one code decides and carries a user's connection, whoever the front door is.
 use super::plan::{Action, Backend, Outbound, Plan};
-use super::proxy_http::Body;
 use crate::config::RuleTransport;
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
@@ -31,6 +30,7 @@ use tokio::net::UnixStream as Link;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
+use veilway_proto::proxy::http::Body;
 
 /// The release of Xray-core this build runs. The installer pins its archives and `PIN` pins what they hold.
 pub const RELEASE: &str = "v26.3.27";
@@ -441,9 +441,7 @@ pub(super) async fn accept(shared: Arc<Shared>, listener: TcpListener, secret: S
 	}
 }
 
-/// The destination of a request: an address, or a name that is resolved here.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum Target {Address(SocketAddr), Name(String, u16)}
+pub use veilway_proto::proxy::Target;
 
 /// Closes the write side after a refusal was written and discards what the client still sends, for up to 64 KiB and 1 s. Closing a socket with unread bytes in it makes the system reset the connection, and a reset can take the answer with it before the client has read it.
 pub(super) async fn linger(client: &mut TcpStream) {

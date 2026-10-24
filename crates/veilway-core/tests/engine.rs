@@ -1353,3 +1353,160 @@ async fn a_node_that_says_a_higher_mtu_than_the_one_in_force_does_not_raise_the_
 	assert!(run.tunnel.status().mtu == 1285 && !told.iter().any(|event| matches!(event, Event::Mtu(1390 | 1500 | 1420))) && told.iter().filter(|event| matches!(event, Event::Mtu(1300))).count() <= 1, "{told:?}");
 	run.tunnel.stop().await;
 }
+
+/// A SOCKS5 proxy for the exit of a node that forwards each CONNECT to a server of the test: the connections to port 53 to `dns`, every other to `echo`. It has no UDP, so the node's resolver asks its upstream over TCP.
+async fn forwarding(echo: SocketAddr, dns: SocketAddr) -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut client, _)) = listener.accept().await else {return};
+			tokio::spawn(async move {
+				let (mut head, mut request) = ([0u8; 2], [0u8; 10]);
+				if client.read_exact(&mut head).await.is_err() {return}
+				let mut methods = vec![0u8; usize::from(head[1])];
+				if client.read_exact(&mut methods).await.is_err() || client.write_all(&[5, 0]).await.is_err() || client.read_exact(&mut request).await.is_err() {return}
+				if request[1] != 1 {
+					let _ = client.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await;
+					return;
+				}
+				let Ok(mut far) = tokio::net::TcpStream::connect(if u16::from_be_bytes([request[8], request[9]]) == 53 {dns} else {echo}).await else {return};
+				if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {return}
+				let _ = tokio::io::copy_bidirectional(&mut client, &mut far).await;
+			});
+		}
+	});
+	addr
+}
+
+/// A DNS server over TCP that answers every A question with `PUBLIC` and counts the questions.
+async fn zone() -> (SocketAddr, Arc<AtomicU64>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let (addr, asked) = (listener.local_addr().unwrap(), Arc::new(AtomicU64::new(0)));
+	tokio::spawn({
+		let asked = asked.clone();
+		async move {
+			loop {
+				let Ok((mut client, _)) = listener.accept().await else {return};
+				let asked = asked.clone();
+				tokio::spawn(async move {
+					loop {
+						let mut length = [0u8; 2];
+						if client.read_exact(&mut length).await.is_err() {return}
+						let mut query = vec![0u8; usize::from(u16::from_be_bytes(length))];
+						if client.read_exact(&mut query).await.is_err() || query.len() < 17 {return}
+						asked.fetch_add(1, Ordering::SeqCst);
+						let end = 12 + query[12..].iter().position(|b| *b == 0).unwrap() + 5;
+						let mut reply = query[..end].to_vec();
+						(reply[2], reply[3], reply[10], reply[11]) = (0x81, 0x80, 0, 0);
+						if query[end - 4..end - 2] == [0, 1] {
+							reply[7] = 1;
+							reply.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+						}
+						if client.write_all(&[&(reply.len() as u16).to_be_bytes()[..], &reply].concat()).await.is_err() {return}
+					}
+				});
+			}
+		}
+	});
+	(addr, asked)
+}
+
+/// A TCP server that sends back what it is sent.
+async fn echo() -> SocketAddr {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let addr = listener.local_addr().unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut client, _)) = listener.accept().await else {return};
+			tokio::spawn(async move {
+				let mut buf = [0u8; 4096];
+				while let Ok(n) = client.read(&mut buf).await {
+					if n == 0 || client.write_all(&buf[..n]).await.is_err() {return}
+				}
+			});
+		}
+	});
+	addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_local_proxy_opens_socks5_and_http_connections_inside_the_tunnel_and_the_node_resolves_the_names() {
+	use veilway_engine::local::{Error, Kind, Local, LocalProxy};
+	let (time, echo, (dns, asked)) = (time!(), echo().await, zone().await);
+	let proxy = forwarding(echo, dns).await;
+	let net = net("engine-local", time, |doc| doc["outbounds"][0]["server"] = json!(proxy.to_string())).await;
+	let library = library(&net, "local", &payload(time, vec![profile(&net, 0, &["tls"])])).await;
+	let tunnel = start(&net, net.settings("local"), &library, PRIVATE).unwrap();
+	// A listen address that is not loopback is refused without a login, and the tunnel comes back to be used again.
+	let Err((Error::Open, tunnel)) = Local::in_tunnel(tunnel, LocalProxy::new("0.0.0.0:0".parse().unwrap(), Kind::Mixed)).await else {panic!("a proxy open to the network was started")};
+	let mut config = LocalProxy::new("127.0.0.1:0".parse().unwrap(), Kind::Mixed);
+	config.auth = Some(("user".into(), "pass".into()));
+	let Ok(local) = Local::in_tunnel(tunnel, config).await else {panic!("the proxy did not start")};
+	let (mut watch, deadline) = (local.watch().unwrap(), tokio::time::Instant::now() + Duration::from_secs(40));
+	while !matches!(watch.borrow_and_update().state, State::Connected {..}) {timeout(deadline.saturating_duration_since(tokio::time::Instant::now()), watch.changed()).await.expect("the tunnel did not connect").unwrap()}
+	let at = local.addr();
+	let login = [&[5, 1, 2][..], &[1, 4], b"user", &[4], b"pass"].concat();
+	// What a SOCKS5 client reads of the login, and then of a request.
+	let socks = |request: Vec<u8>| {
+		let login = login.clone();
+		async move {
+			let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+			client.write_all(&[&login[..], &request].concat()).await.unwrap();
+			let mut answer = [0u8; 14];
+			timeout(Duration::from_secs(15), client.read_exact(&mut answer)).await.expect("no answer").expect("the proxy closed");
+			(client, answer)
+		}
+	};
+	let by_address = [5, 1, 0, 1, 93, 184, 216, 34, 0, 80];
+	let by_name = [&[5, 1, 0, 3, 9][..], b"echo.test", &[0, 80]].concat();
+	for request in [by_address.to_vec(), by_name.clone()] {
+		let (mut client, answer) = socks(request).await;
+		assert_eq!(answer, [5, 2, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
+		client.write_all(b"through the tunnel").await.unwrap();
+		let mut echoed = [0u8; 18];
+		timeout(Duration::from_secs(10), client.read_exact(&mut echoed)).await.expect("no echo").unwrap();
+		assert_eq!(&echoed, b"through the tunnel");
+	}
+	assert!(asked.load(Ordering::SeqCst) >= 1, "the name was not asked of the node's resolver");
+	// BIND, UDP ASSOCIATE and the addresses the proxy never connects to are refused with the codes of the RFC.
+	assert_eq!(socks(vec![5, 2, 0, 1, 93, 184, 216, 34, 0, 80]).await.1[4..], [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+	assert_eq!(socks(vec![5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).await.1[4..], [5, 7, 0, 1, 0, 0, 0, 0, 0, 0]);
+	assert_eq!(socks(vec![5, 1, 0, 1, 127, 0, 0, 1, 0, 80]).await.1[4..], [5, 2, 0, 1, 0, 0, 0, 0, 0, 0]);
+	assert_eq!(socks(vec![5, 1, 0, 1, 10, 7, 0, 2, 0, 80]).await.1[4..], [5, 2, 0, 1, 0, 0, 0, 0, 0, 0], "the stack's own address");
+	// A client without the login, and one with a wrong password, are not let in.
+	let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+	client.write_all(&[5, 1, 0]).await.unwrap();
+	let mut answer = [0u8; 2];
+	client.read_exact(&mut answer).await.unwrap();
+	assert_eq!(answer, [5, 0xff]);
+	let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+	client.write_all(&[&[5, 1, 2][..], &[1, 4], b"user", &[5], b"wrong"].concat()).await.unwrap();
+	let mut answer = [0u8; 4];
+	client.read_exact(&mut answer).await.unwrap();
+	assert_eq!(answer, [5, 2, 1, 1]);
+	// HTTP: CONNECT to an address and to a name, and a plain request, which the destination sees in origin form.
+	let ok = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+	for target in ["93.184.216.34:80", "echo.test:80"] {
+		let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+		client.write_all(format!("CONNECT {target} HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\nearly").as_bytes()).await.unwrap();
+		let mut answer = vec![0u8; ok.len() + 5];
+		timeout(Duration::from_secs(15), client.read_exact(&mut answer)).await.expect("no answer").unwrap();
+		assert_eq!(answer, [&ok[..], b"early"].concat(), "{target}: the answer and the bytes that came with the request");
+	}
+	let http = |request: &'static str, wanted: usize| async move {
+		let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+		client.write_all(request.as_bytes()).await.unwrap();
+		let mut answer = vec![0u8; wanted];
+		timeout(Duration::from_secs(15), client.read_exact(&mut answer)).await.expect("no answer").expect("the proxy closed");
+		answer
+	};
+	let origin = "GET /page?q=1 HTTP/1.1\r\nHost: echo.test\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+	assert_eq!(http("GET http://echo.test/page?q=1 HTTP/1.1\r\nHost: other.example\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\nAccept: */*\r\n\r\n", origin.len()).await, origin.as_bytes());
+	assert!(http("CONNECT 93.184.216.34:80 HTTP/1.1\r\n\r\n", 12).await.starts_with(b"HTTP/1.1 407"));
+	assert!(http("CONNECT 127.0.0.1:80 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n", 12).await.starts_with(b"HTTP/1.1 403"));
+	let totals = local.totals();
+	assert!(totals.accepted >= 13 && totals.login_failures == 1 && totals.refused_destination >= 3 && totals.up_bytes > 0 && totals.down_bytes > 0, "{totals:?}");
+	let status = local.stop().await.expect("a proxy on a tunnel gives its status");
+	assert_eq!(status.state, State::Off);
+}

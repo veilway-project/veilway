@@ -1,8 +1,7 @@
 //! The SOCKS5 of a proxy inbound (RFC 1928 and RFC 1929) without any IO: each reader takes the bytes received so far and says that it needs more (`None`), that it has a whole message and how many bytes it used, or why the message is refused. Everything a client sends is attacker input, so nothing is trusted to be whole, and nothing allocates by a length before the bytes of it are there.
 //! Datagrams of UDP ASSOCIATE are read by `xray_udp::parse`, the same code the Xray hop runs.
 //! The only method the node offers is username and password. A client that does not offer it is answered `0xff` and closed, so there is no anonymous way in.
-use super::proxy::destination;
-use super::xray::Target;
+use super::{destination, Target};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// RFC 1928 reply codes.

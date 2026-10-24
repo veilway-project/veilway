@@ -1,8 +1,8 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use veilway_core::engine::proxy_http::{self, MAX_HEAD, MAX_HEADERS};
-use veilway_core::engine::proxy_socks as socks;
-use veilway_core::engine::xray::Target;
+use veilway_proto::proxy::http::{self as proxy_http, MAX_HEAD, MAX_HEADERS};
+use veilway_proto::proxy::socks;
+use veilway_proto::proxy::Target;
 
 // What a proxy inbound reads from a client before it knows who is there: the SOCKS5 greeting, login and request, and the head of an HTTP request. The first byte of an input picks the reader, with the rest fed to it whole.
 // The body that follows a head must end at the same byte whether it is read whole or byte by byte. A message that is read must be exactly as long as the reader says and every shorter prefix of it must be waited for, never refused. The HTTP reader takes at most `MAX_HEAD` bytes and `MAX_HEADERS` fields, and what it would send on to an origin holds one request in one head: no byte but CR, LF and tab below 0x20, the head ends at its first empty line, and it names `Host` and `Connection` once each and no field of the hop. A destination that is a name is lower case, at most 253 bytes, and made of letters, digits, hyphens, underscores and dots.

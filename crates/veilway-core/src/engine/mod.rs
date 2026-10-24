@@ -19,8 +19,6 @@ pub mod obfs;
 pub mod plan;
 pub mod probe;
 pub mod proxy;
-pub mod proxy_http;
-pub mod proxy_socks;
 pub mod replay;
 pub mod resolver;
 pub mod route;

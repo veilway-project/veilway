@@ -24,6 +24,9 @@ pub mod import;
 pub mod ip;
 #[cfg(not(feature = "fuzz"))]
 mod ip;
+pub mod local;
+mod local_dns;
+mod local_stack;
 mod mtu;
 /// Public with the `fuzz` feature, for the fuzz targets that feed it packets.
 #[cfg(feature = "fuzz")]
@@ -61,7 +64,7 @@ pub use veilway_transport::Clock;
 /// The system's secure random source, as `veilway-proto` takes one.
 pub(crate) fn random(bytes: &mut [u8]) -> Result<(), NoRandom> {ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), bytes).map_err(|_| NoRandom)}
 
-use std::{future::Future, net::SocketAddr, pin::Pin, time::Duration};
+use std::{future::Future, net::{IpAddr, SocketAddr}, pin::Pin, time::Duration};
 
 /// How a wait is made. A test hands in its own to run the client's waits, which are seconds and minutes long, against a clock it moves itself. Only with the `testing` feature: a wait that returns at once removes every backoff of the client rules, and no build that ships has the field.
 pub type Pause = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -186,6 +189,8 @@ pub struct Tunnel {
 	out: mpsc::Receiver<Vec<u8>>,
 	refused: Arc<AtomicU64>,
 	task: JoinHandle<()>,
+	device: Vec<IpAddr>,
+	gateways: Vec<IpAddr>,
 }
 
 impl Tunnel {
@@ -222,9 +227,12 @@ impl Tunnel {
 		*settings.handle.0.lock().unwrap() = Some(commands.clone());
 		let ((into, from), (to, out), (events, _), refused) = (mpsc::channel(engine::QUEUE), mpsc::channel(engine::QUEUE), broadcast::channel(64), Arc::new(AtomicU64::new(0)));
 		let (status_tx, status) = watch::channel(Status::off(profile.name.as_str().to_owned(), profile.mtu));
+		let (device, gateways) = (profile.device.addresses.clone(), profile.gateways.clone());
 		let core = engine::Core::new(engine::Parts {settings, profile: profile.clone(), subscription: Arc::new(subscription.clone()), link, key, store_key, kept, commands: input, from_platform: from, to_platform: to, status: status_tx, events: events.clone(), refused: refused.clone(), private: agree.private});
-		Ok(Self {commands, status, events, into, out, refused, task: tokio::spawn(core.run())})
+		Ok(Self {commands, status, events, into, out, refused, task: tokio::spawn(core.run()), device, gateways})
 	}
+	/// The device's addresses inside the tunnel and the gateways, one per family in the same order, as the signed profile gives them. The gateway answers DNS.
+	pub fn addresses(&self) -> (&[IpAddr], &[IpAddr]) {(&self.device, &self.gateways)}
 	/// The state of the tunnel and everything an app shows of it.
 	pub fn status(&self) -> Status {self.status.borrow().clone()}
 	/// The status as something to wait on: it changes at every state change and about once a second while the counters move.

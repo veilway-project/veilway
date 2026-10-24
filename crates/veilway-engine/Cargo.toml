@@ -43,6 +43,8 @@ socket2.workspace=true
 # The Xray carrier (`xray`): the userspace stack the device's packets enter, and the packets it writes for itself (echo replies, resets, unreachable errors).
 ipstack.workspace=true
 etherparse.workspace=true
+# The local proxy's userspace TCP/IP stack, which takes over a tunnel's packet interface.
+smoltcp.workspace=true
 
 [dev-dependencies]
 proptest.workspace=true

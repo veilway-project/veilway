@@ -1,13 +1,11 @@
 //! Proxy inbounds: `socks5`, `http` and `mixed` listeners that let other software use this node as a plain proxy. Every connection logs in as a user, with that user's name and `proxy_password`, and then is a flow of that user like any other: it runs the same code the Xray add-on's hop runs after its own login (`xray::connect` and `xray::relay`), so the destination gate, the rules, the user's exits and entitlement, the quota and the counters of the user and of the exit all apply, and a user who is cut off loses the connection within a second. UDP ASSOCIATE is `xray_udp::associate`, with a relay on the node's own address that carries only what the client's IP address sends.
 //! There is no way in without a login, and no method but username and password. Nothing here is encrypted, so an address that strangers reach is only taken with the operator's `public`, and is then a warning (config validation).
 //! What the listener holds is bounded: connections in all and for each source, logins in flight, and a handshake that must finish in `HANDSHAKE`. A source that fails `FAILURES` logins to one user name within `WINDOW` is refused that name until the window is over, and answers to a name that many logins failed for are delayed, whoever asks. A loopback peer is a front the operator runs, with every user behind one address, so it is held to neither the share of a source nor the block. A login that fails is counted and said at info, at most once in `NOTED`, with no password in it. The passwords are compared as two tags of one key, which takes the same time whatever the guess is, and a name that is no user's takes it as well.
-//! The front ends are `proxy_socks` and `proxy_http`, which read the bytes and do no IO. `mixed` looks at the first byte: 0x05 is SOCKS5, anything else is read as HTTP.
+//! The front ends are `veilway_proto::proxy::socks` and `veilway_proto::proxy::http`, which read the bytes and do no IO. `mixed` looks at the first byte: 0x05 is SOCKS5, anything else is read as HTTP.
 use super::plan::{Backend, Plan};
-use super::proxy_http::{self, Body};
-use super::proxy_socks as socks;
 use super::route::Reason;
 use super::tunnel::{reset, source};
-use super::xray::{connect, linger, relay, reply, Refused, Target};
+use super::xray::{connect, linger, relay, reply, Refused};
 use super::xray_owner::{self, Lookup};
 use super::xray_udp::{self, Via};
 use super::Shared;
@@ -25,6 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{sleep, timeout};
+use veilway_proto::proxy::http::{self as proxy_http, Body};
+use veilway_proto::proxy::{socks, Target};
 
 /// How long a connection has to log in and say what it wants, and to be written an answer.
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -58,13 +58,6 @@ pub fn tag(password: &[u8]) -> [u8; 32] {
 	let mut out = [0u8; 32];
 	out.copy_from_slice(hmac::sign(&KEY, password).as_ref());
 	out
-}
-
-/// The destination a client names with a host and a port: an address, or a name in lower case that is resolved by the node. A name may hold letters, digits, hyphens, underscores and dots, up to 253 bytes, with no empty label. A trailing dot is dropped.
-pub fn destination(host: &str, port: u16) -> Option<Target> {
-	let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
-	if let Ok(ip) = host.parse::<IpAddr>() {return Some(Target::Address(SocketAddr::new(ip, port)))}
-	(!host.is_empty() && host.len() <= 253 && !host.starts_with('.') && !host.contains("..") && host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))).then_some(Target::Name(host, port))
 }
 
 #[derive(Clone, Copy, Debug)]

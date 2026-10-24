@@ -568,7 +568,7 @@ async fn a_reload_that_removes_an_inbound_closes_its_connections_and_its_port() 
 /// The seeds of the `proxy_front` fuzz target read as what their names say, so that a change to a reader that breaks one is noticed.
 #[test]
 fn the_seeds_of_the_fuzz_target_read() {
-	use veilway_core::engine::{proxy_http, proxy_socks};
+	use veilway_proto::proxy::{http as proxy_http, socks as proxy_socks};
 	let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/corpus/proxy_front");
 	let mut seen = 0;
 	for entry in std::fs::read_dir(dir).unwrap() {

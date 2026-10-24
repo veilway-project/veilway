@@ -1,6 +1,6 @@
 //! Wire formats of the Veilway protocol, as pure code: no sockets, no clocks and no randomness of its own. Time and random bytes are parameters.
 //!
-//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the keys (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), the timer table (`session`), the stream proof (`proof`), the packets of `udp-obfs` (`udp_obfs`), the replay rule and the replay file (`replay`), the request line of a stream listener (`request`) and where a request and its answer end on its proxy path (`http`), the WebSocket frames of `tls` and `ws` (`websocket`), the bodies of `fronted` (`fronted`) and its shapes (`shape`, the numbering and the placement of the data in `shaped`, the event stream in `sse`), of node links the two pairing codes, the fingerprint and the link's transport secret (`pairing`), and of the subscription format the link, the signed document, the request and what a client decides (`subscription`). There is no listener, no socket and no file here. The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
+//! Only the parts the protocol overview lists as "Settled enough to implement" are here: the keys (`keys`), chunk framing and padding (`chunk`), the control channel's messages (`control`) with its opening exchange (`opening`), the timer table (`session`), the stream proof (`proof`), the packets of `udp-obfs` (`udp_obfs`), the replay rule and the replay file (`replay`), the request line of a stream listener (`request`) and where a request and its answer end on its proxy path (`http`), the WebSocket frames of `tls` and `ws` (`websocket`), the bodies of `fronted` (`fronted`) and its shapes (`shape`, the numbering and the placement of the data in `shaped`, the event stream in `sse`), of a proxy front end the readers of the SOCKS5 and HTTP requests of a client (`proxy`), of node links the two pairing codes, the fingerprint and the link's transport secret (`pairing`), and of the subscription format the link, the signed document, the request and what a client decides (`subscription`). There is no listener, no socket and no file here. The specification is a draft that nobody outside the project has reviewed, so nothing here is a security claim.
 #![forbid(unsafe_code)]
 
 pub mod chunk;
@@ -13,6 +13,7 @@ pub mod http;
 pub mod keys;
 pub mod opening;
 pub mod pairing;
+pub mod proxy;
 pub mod proof;
 pub mod replay;
 pub mod request;
