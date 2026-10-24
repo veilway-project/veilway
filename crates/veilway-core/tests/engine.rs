@@ -1440,6 +1440,10 @@ async fn the_local_proxy_opens_socks5_and_http_connections_inside_the_tunnel_and
 	let tunnel = start(&net, net.settings("local"), &library, PRIVATE).unwrap();
 	// A listen address that is not loopback is refused without a login, and the tunnel comes back to be used again.
 	let Err((Error::Open, tunnel)) = Local::in_tunnel(tunnel, LocalProxy::new("0.0.0.0:0".parse().unwrap(), Kind::Mixed)).await else {panic!("a proxy open to the network was started")};
+	// A login too long to send as an HTTP credential is refused too.
+	let mut long = LocalProxy::new("127.0.0.1:0".parse().unwrap(), Kind::Mixed);
+	long.auth = Some(("u".repeat(255), "p".repeat(255)));
+	let Err((Error::Login, tunnel)) = Local::in_tunnel(tunnel, long).await else {panic!("a login that HTTP cannot carry was accepted")};
 	let mut config = LocalProxy::new("127.0.0.1:0".parse().unwrap(), Kind::Mixed);
 	config.auth = Some(("user".into(), "pass".into()));
 	let Ok(local) = Local::in_tunnel(tunnel, config).await else {panic!("the proxy did not start")};
@@ -1485,6 +1489,14 @@ async fn the_local_proxy_opens_socks5_and_http_connections_inside_the_tunnel_and
 	let mut answer = [0u8; 4];
 	client.read_exact(&mut answer).await.unwrap();
 	assert_eq!(answer, [5, 2, 1, 1]);
+	// Loopback is one source for every program on the device: its failures do not block a second client on it.
+	for _ in 0..6 {
+		let mut client = tokio::net::TcpStream::connect(at).await.unwrap();
+		client.write_all(&[&[5, 1, 2][..], &[1, 4], b"user", &[5], b"wrong"].concat()).await.unwrap();
+		client.read_exact(&mut answer).await.unwrap();
+		assert_eq!(answer, [5, 2, 1, 1]);
+	}
+	assert_eq!(socks(by_address.to_vec()).await.1, [5, 2, 1, 0, 5, 0, 0, 1, 0, 0, 0, 0, 0, 0], "a right login after failures from the same loopback source");
 	// HTTP: CONNECT to an address and to a name, and a plain request, which the destination sees in origin form.
 	let ok = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 	for target in ["93.184.216.34:80", "echo.test:80"] {
@@ -1506,7 +1518,7 @@ async fn the_local_proxy_opens_socks5_and_http_connections_inside_the_tunnel_and
 	assert!(http("CONNECT 93.184.216.34:80 HTTP/1.1\r\n\r\n", 12).await.starts_with(b"HTTP/1.1 407"));
 	assert!(http("CONNECT 127.0.0.1:80 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n", 12).await.starts_with(b"HTTP/1.1 403"));
 	let totals = local.totals();
-	assert!(totals.accepted >= 13 && totals.login_failures == 1 && totals.refused_destination >= 3 && totals.up_bytes > 0 && totals.down_bytes > 0, "{totals:?}");
+	assert!(totals.accepted >= 13 && totals.login_failures == 7 && totals.refused_blocked == 0 && totals.refused_destination >= 3 && totals.up_bytes > 0 && totals.down_bytes > 0, "{totals:?}");
 	let status = local.stop().await.expect("a proxy on a tunnel gives its status");
 	assert_eq!(status.state, State::Off);
 }

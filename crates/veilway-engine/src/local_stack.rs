@@ -12,6 +12,7 @@ use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -26,15 +27,18 @@ const CONNECT: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(3600);
 /// How often the task looks at its deadlines when nothing else wakes it.
 const TICK: Duration = Duration::from_secs(1);
-/// What each side of a connection buffers, in the socket and in the pipe to the proxy task.
-const WINDOW: usize = 131072;
+/// What each side of a connection buffers: in the socket, and in the pipe to the proxy task.
+const SOCKET: usize = 65536;
+const PIPE: usize = 32768;
+/// A socket that hears nothing for `DEAD` is aborted, which ends a peer that went away and a closing that the far side never finishes. It is probed every `PROBE` so that a quiet but live connection is not taken for one.
+const DEAD: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
+const PROBE: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(20);
 /// The most that is moved at once between a socket and its pipe.
 const CHUNK: usize = 16384;
 /// Packets that wait to be handed to the stack, and that the stack made and waits to send.
 const QUEUE: usize = 256;
 const MADE: usize = 64;
-/// The most connections and lookups at once, and the names remembered.
-const FLOWS: usize = 1024;
+/// The most lookups at once, and the names remembered.
 const LOOKUPS: usize = 32;
 const CACHE: usize = 256;
 /// A lookup is asked again once after `RETRY` and given up after `LOOKUP`. An answer is kept for its TTL, within these bounds.
@@ -66,11 +70,13 @@ impl Fail {
 	pub(crate) fn status(self) -> &'static str {match self {Fail::Forbidden => "403 Forbidden", Fail::Timeout => "504 Gateway Timeout", Fail::Down | Fail::Busy => "503 Service Unavailable", _ => "502 Bad Gateway"}}
 }
 
-type Connected = oneshot::Sender<Result<DuplexStream, Fail>>;
+/// What a connection hands back once it is open: the proxy's end, and a flag the stack sets when the connection ended any other way than the far side's orderly close.
+type Connected = oneshot::Sender<Result<(DuplexStream, Arc<AtomicBool>), Fail>>;
 
 enum Command {
 	Connect(SocketAddr, Connected),
 	Resolve(String, oneshot::Sender<Result<Vec<IpAddr>, Fail>>),
+	Flush,
 }
 
 /// The way to the stack, for as many proxy connections as want one. `own` are the device's addresses in the tunnel.
@@ -78,12 +84,15 @@ enum Command {
 pub(crate) struct Stack {commands: mpsc::Sender<Command>, pub(crate) own: Arc<[IpAddr]>}
 
 impl Stack {
-	/// A TCP connection inside the tunnel. The stream is the far side's, already open.
-	pub(crate) async fn connect(&self, to: SocketAddr) -> Result<DuplexStream, Fail> {
+	/// A TCP connection inside the tunnel. The stream is the far side's, already open, and the flag says that it ended in a reset or a timeout instead of a close.
+	pub(crate) async fn connect(&self, to: SocketAddr) -> Result<(DuplexStream, Arc<AtomicBool>), Fail> {
 		let (reply, answer) = oneshot::channel();
 		self.commands.send(Command::Connect(to, reply)).await.map_err(|_| Fail::Down)?;
 		answer.await.map_err(|_| Fail::Down)?
 	}
+
+	/// Forgets the names remembered, for when the exit changes.
+	pub(crate) fn flush(&self) {let _ = self.commands.try_send(Command::Flush);}
 
 	/// The addresses of a name from the node's resolver, IPv4 first, only of the families the device has.
 	pub(crate) async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, Fail> {
@@ -109,38 +118,53 @@ fn draw_port() -> u16 {
 	33000 + u16::from_le_bytes(bytes) % 27000
 }
 
-struct Flow {handle: SocketHandle, port: u16, app: DuplexStream, peer: Option<DuplexStream>, reply: Option<Connected>, started: Instant, idle_at: Instant, out: Vec<u8>, written: usize, client_eof: bool, far_done: bool, shut: bool, done: bool}
+struct Flow {handle: SocketHandle, port: u16, app: DuplexStream, peer: Option<DuplexStream>, reset: Arc<AtomicBool>, reply: Option<Connected>, started: Instant, idle_at: Instant, out: Vec<u8>, written: usize, client_eof: bool, far_done: bool, shut: bool, done: bool}
 
 struct Lookup {name: String, pending: Vec<(u16, u16)>, found: Vec<(IpAddr, u32)>, failed: bool, started: Instant, retried: bool, reply: Option<oneshot::Sender<Result<Vec<IpAddr>, Fail>>>}
 
-/// Starts the stack on `tunnel`. The task ends when `stop` is sent or dropped or when the tunnel does, and gives the tunnel's last status.
-pub(crate) fn start(tunnel: Tunnel) -> (Stack, oneshot::Sender<()>, JoinHandle<Status>) {
-	let (commands, input) = mpsc::channel(64);
-	let (stop, stopped) = oneshot::channel();
-	let own: Arc<[IpAddr]> = tunnel.device.clone().into();
-	(Stack {commands, own}, stop, tokio::spawn(run(tunnel, input, stopped)))
-}
-
-async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop: oneshot::Receiver<()>) -> Status {
-	let (own, server) = (tunnel.device.clone(), tunnel.gateways.first().map(|gateway| IpEndpoint::new((*gateway).into(), 53)));
-	let (started, wake) = (Instant::now(), Arc::new(Wake(Notify::new())));
-	let waker = Waker::from(wake.clone());
-	let clock = || Clock::from_micros(started.elapsed().as_micros() as i64);
-	let mut device = Wire {rx: VecDeque::new(), tx: Vec::new(), mtu: usize::from(tunnel.status.borrow().mtu)};
+/// The smoltcp interface for the device's addresses. It copies the device's capabilities once, so a new MTU needs a new interface: the sockets live in the set and carry on.
+fn interface(device: &mut Wire, mtu: usize, own: &[IpAddr], now: Clock) -> Interface {
+	device.mtu = mtu;
 	let mut seed = [0u8; 8];
 	let _ = random(&mut seed);
 	let mut config = Config::new(HardwareAddress::Ip);
 	config.random_seed = u64::from_le_bytes(seed);
-	let mut iface = Interface::new(config, &mut device, clock());
+	let mut iface = Interface::new(config, device, now);
 	// Every address is on the link: there are no neighbours to ask and no route to look up.
-	iface.update_ip_addrs(|addresses| {for address in &own {let _ = addresses.push(IpCidr::new((*address).into(), 0));}});
+	iface.update_ip_addrs(|addresses| {for address in own {let _ = addresses.push(IpCidr::new((*address).into(), 0));}});
+	iface
+}
+
+/// Starts the stack on `tunnel`, with at most `flows` connections at once. The task ends when `stop` is sent or dropped or when the tunnel does, and gives the tunnel's last status.
+pub(crate) fn start(tunnel: Tunnel, flows: usize) -> (Stack, oneshot::Sender<()>, JoinHandle<Status>) {
+	let (commands, input) = mpsc::channel(64);
+	let (stop, stopped) = oneshot::channel();
+	let own: Arc<[IpAddr]> = tunnel.device.clone().into();
+	(Stack {commands, own}, stop, tokio::spawn(run(tunnel, flows, input, stopped)))
+}
+
+async fn run(mut tunnel: Tunnel, max_flows: usize, mut commands: mpsc::Receiver<Command>, mut stop: oneshot::Receiver<()>) -> Status {
+	let (own, server) = (tunnel.device.clone(), tunnel.gateways.first().map(|gateway| IpEndpoint::new((*gateway).into(), 53)));
+	let (started, wake) = (Instant::now(), Arc::new(Wake(Notify::new())));
+	let waker = Waker::from(wake.clone());
+	let clock = || Clock::from_micros(started.elapsed().as_micros() as i64);
+	let mut device = Wire {rx: VecDeque::new(), tx: Vec::new(), mtu: 0};
+	let mut iface = interface(&mut device, usize::from(tunnel.status.borrow().mtu), &own, clock());
 	let mut sockets = SocketSet::new(Vec::new());
 	let mut resolver = udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 16 * 1500]), udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 16 * 1500]));
 	let _ = resolver.bind(draw_port());
 	let resolver = sockets.add(resolver);
 	let (mut flows, mut lookups, mut cache, mut buf) = (Vec::<Flow>::new(), Vec::<Lookup>::new(), HashMap::<String, (Instant, Vec<IpAddr>)>::new(), vec![0u8; CHUNK]);
+	let mut exit = None;
 	loop {
-		device.mtu = usize::from(tunnel.status.borrow().mtu);
+		let (mtu, up, now_exit) = {
+			let status = tunnel.status.borrow();
+			(usize::from(status.mtu), matches!(status.state, State::Connected {..}), if let State::Connected {exit} = &status.state {exit.clone()} else {None})
+		};
+		if mtu != device.mtu {iface = interface(&mut device, mtu, &own, clock())}
+		// Names answered over another session or another exit may not be the ones the next lookup would get.
+		if !up || now_exit != exit {cache.clear()}
+		exit = now_exit;
 		let now = Instant::now();
 		iface.poll(clock(), &mut device, &mut sockets);
 		let socket = sockets.get_mut::<udp::Socket>(resolver);
@@ -180,7 +204,7 @@ async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop
 				cache.insert(lookup.name.clone(), (now + Duration::from_secs(ttl), addresses.clone()));
 				Ok(addresses)
 			} else if !lookup.pending.is_empty() {
-				tracing::info!(name = %lookup.name, "the node's resolver did not answer a lookup of the local proxy within {} s", LOOKUP.as_secs());
+				tracing::debug!("the node's resolver did not answer a lookup of the local proxy within {} s", LOOKUP.as_secs());
 				Err(Fail::Timeout)
 			} else if lookup.failed {
 				Err(Fail::Unreachable)
@@ -197,7 +221,7 @@ async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop
 				let socket = sockets.get_mut::<tcp::Socket>(flow.handle);
 				if flow.reply.is_some() {
 					if socket.may_send() {
-						if let (Some(reply), Some(peer)) = (flow.reply.take(), flow.peer.take()) {let _ = reply.send(Ok(peer));}
+						if let (Some(reply), Some(peer)) = (flow.reply.take(), flow.peer.take()) {let _ = reply.send(Ok((peer, flow.reset.clone())));}
 						flow.idle_at = now + IDLE;
 					} else if socket.state() == tcp::State::Closed || now >= flow.started + CONNECT || flow.reply.as_ref().is_some_and(|reply| reply.is_closed()) {
 						let fail = if now >= flow.started + CONNECT {Fail::Timeout} else {Fail::Refused};
@@ -230,6 +254,12 @@ async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop
 						}
 						Poll::Pending => {}
 					}
+				}
+				// An empty write fails once the proxy's end was dropped. Unless the far side's close was already delivered, that is an abort and the far side is told with a reset.
+				if flow.out.is_empty() && !flow.shut && matches!(Pin::new(&mut flow.app).poll_write(&mut cx, &[]), Poll::Ready(Err(_))) {
+					socket.abort();
+					flow.done = true;
+					continue;
 				}
 				if flow.out.is_empty() && !flow.far_done {
 					let taken = socket.recv(|data| {
@@ -269,7 +299,10 @@ async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop
 		iface.poll(clock(), &mut device, &mut sockets);
 		for raw in device.tx.drain(..) {tunnel.send(raw);}
 		flows.retain(|flow| {
-			if flow.done {sockets.remove(flow.handle);}
+			if flow.done {
+				if !flow.shut {flow.reset.store(true, Ordering::Relaxed)}
+				sockets.remove(flow.handle);
+			}
 			!flow.done
 		});
 		if progress || !device.rx.is_empty() {wake.0.notify_one()}
@@ -295,19 +328,22 @@ async fn run(mut tunnel: Tunnel, mut commands: mpsc::Receiver<Command>, mut stop
 							let _ = reply.send(Err(if local.is_none() {Fail::Unreachable} else {Fail::Busy}));
 							continue;
 						};
-						if !up || flows.len() >= FLOWS {
+						if !up || flows.len() >= max_flows {
 							let _ = reply.send(Err(if up {Fail::Busy} else {Fail::Down}));
 							continue;
 						}
-						let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; WINDOW]), tcp::SocketBuffer::new(vec![0u8; WINDOW]));
+						let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; SOCKET]), tcp::SocketBuffer::new(vec![0u8; SOCKET]));
 						socket.set_nagle_enabled(false);
+						socket.set_timeout(Some(DEAD));
+						socket.set_keep_alive(Some(PROBE));
 						if socket.connect(iface.context(), to, (local, port)).is_err() {
 							let _ = reply.send(Err(Fail::Busy));
 							continue;
 						}
-						let (app, peer) = duplex(WINDOW);
-						flows.push(Flow {handle: sockets.add(socket), port, app, peer: Some(peer), reply: Some(reply), started: Instant::now(), idle_at: Instant::now() + IDLE, out: Vec::new(), written: 0, client_eof: false, far_done: false, shut: false, done: false});
+						let (app, peer) = duplex(PIPE);
+						flows.push(Flow {handle: sockets.add(socket), port, app, peer: Some(peer), reset: Arc::new(AtomicBool::new(false)), reply: Some(reply), started: Instant::now(), idle_at: Instant::now() + IDLE, out: Vec::new(), written: 0, client_eof: false, far_done: false, shut: false, done: false});
 					}
+					Command::Flush => cache.clear(),
 					Command::Resolve(name, reply) => {
 						if let Some((_, addresses)) = cache.get(&name).filter(|(expires, _)| *expires > now) {
 							let _ = reply.send(Ok(addresses.clone()));
@@ -388,5 +424,43 @@ impl Device for Wire {
 		capabilities.medium = Medium::Ip;
 		capabilities.max_transmission_unit = self.mtu;
 		capabilities
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use smoltcp::phy::ChecksumCapabilities;
+	use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv4Packet, Ipv4Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
+
+	#[test]
+	fn a_new_mtu_makes_a_new_interface_so_that_the_segments_follow_it() {
+		let (own, remote): (IpAddr, SocketAddr) = ("10.7.0.2".parse().unwrap(), "93.184.216.34:80".parse().unwrap());
+		let (mut device, mut sockets, at) = (Wire {rx: VecDeque::new(), tx: Vec::new(), mtu: 0}, SocketSet::new(Vec::new()), Clock::from_millis(0));
+		let mut iface = interface(&mut device, 1500, &[own], at);
+		let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; SOCKET]), tcp::SocketBuffer::new(vec![0u8; SOCKET]));
+		socket.connect(iface.context(), remote, (own, 33000)).unwrap();
+		let handle = sockets.add(socket);
+		iface.poll(at, &mut device, &mut sockets);
+		let syn = device.tx.remove(0);
+		let seq = TcpPacket::new_checked(Ipv4Packet::new_checked(&syn[..]).unwrap().payload()).unwrap().seq_number();
+		// The tunnel's MTU drops after the opening was sent and before the far side answers with a segment size for the old one.
+		iface = interface(&mut device, 1280, &[own], at);
+		assert_eq!(device.mtu, 1280);
+		let (from, to) = (Ipv4Address::new(93, 184, 216, 34), Ipv4Address::new(10, 7, 0, 2));
+		let tcp_repr = TcpRepr {src_port: 80, dst_port: 33000, control: TcpControl::Syn, seq_number: TcpSeqNumber(5000), ack_number: Some(seq + 1), window_len: 65535, window_scale: None, max_seg_size: Some(1460), sack_permitted: false, sack_ranges: [None; 3], timestamp: None, payload: &[]};
+		let ip_repr = Ipv4Repr {src_addr: from, dst_addr: to, next_header: IpProtocol::Tcp, payload_len: tcp_repr.buffer_len(), hop_limit: 64};
+		let mut raw = vec![0u8; ip_repr.buffer_len() + tcp_repr.buffer_len()];
+		ip_repr.emit(&mut Ipv4Packet::new_unchecked(&mut raw[..]), &ChecksumCapabilities::default());
+		tcp_repr.emit(&mut TcpPacket::new_unchecked(&mut raw[ip_repr.buffer_len()..]), &IpAddress::Ipv4(from), &IpAddress::Ipv4(to), &ChecksumCapabilities::default());
+		device.rx.push_back(raw);
+		iface.poll(at, &mut device, &mut sockets);
+		let socket = sockets.get_mut::<tcp::Socket>(handle);
+		assert!(socket.may_send());
+		socket.send_slice(&[7u8; 8000]).unwrap();
+		device.tx.clear();
+		iface.poll(at, &mut device, &mut sockets);
+		let sizes: Vec<usize> = device.tx.iter().map(Vec::len).collect();
+		assert!(sizes.iter().any(|size| *size > 1000) && sizes.iter().all(|size| *size <= 1280), "{sizes:?}");
 	}
 }

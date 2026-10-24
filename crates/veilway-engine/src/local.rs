@@ -2,29 +2,32 @@
 //!
 //! Two ways to run it, with the same listener, login, limits and readers (`veilway_proto::proxy`, the code the node's proxy inbounds read their clients with):
 //! `Local::in_tunnel` takes over a running `Tunnel`'s packet interface and opens each accepted connection as a TCP connection inside the tunnel, with a userspace TCP/IP stack that has the device's tunnel address. No system VPN, no TUN device. Names are looked up through the tunnel, by A and AAAA queries to the gateway (the node's resolver), never by the system. The platform layer must not read the tunnel's packets itself while this runs: the stack is their only reader.
-//! `Local::alongside` is for a system VPN that already carries the device: connections are dialled with plain system sockets and names are resolved by the system (the VPN pins DNS to the tunnel).
+//! `Local::alongside` is for a system VPN that already carries the device: connections are dialled with plain system sockets and names are resolved by the system (the VPN pins DNS to the tunnel). It takes the VPN's status and refuses connections while that is not `Connected`, and it refuses the device's own side of the network: link-local addresses (with the cloud metadata address), the listener's own address, and private ranges (RFC 1918, 100.64/10, fc00::/7) unless `allow_private` is set. The system has no portable list of the host's own addresses here, so what a LAN address reaches is held by the private ranges only.
 //!
-//! What it takes: SOCKS5 CONNECT with an address or a name, HTTP CONNECT, and plain `http://` requests (one request to a connection). `mixed` reads the first byte, 5 is SOCKS5 and anything else is HTTP. With a login set, SOCKS5 offers only username and password and HTTP needs `Proxy-Authorization: Basic`, both compared in constant time, and a source that fails five times in a minute is refused for a minute. A listen address that is not loopback is refused without a login, so a proxy reachable from the network is never open.
+//! What it takes: SOCKS5 CONNECT with an address or a name, HTTP CONNECT, and plain `http://` requests (one request to a connection). `mixed` reads the first byte, 5 is SOCKS5 and anything else is HTTP. With a login set, SOCKS5 offers only username and password and HTTP needs `Proxy-Authorization: Basic`, both compared in constant time, a source that fails five times in a minute is refused for a minute, and 20 failed logins in a minute from all sources together close logins for the rest of that minute. Loopback sources share one address, so they count only in that total. Apps should always set a login (`LocalProxy::random_login`): any program on the device can reach a loopback port, and a browser page can send requests to it. A listen address that is not loopback is refused without a login, so a proxy reachable from the network is never open.
 //! A connection is refused for a destination that is loopback, unspecified, multicast or broadcast, port 0, or an address of the tunnel stack itself, whether it was written or a name resolved to it.
 //!
-//! Known limits: no SOCKS5 UDP ASSOCIATE (answered "command not supported") and no BIND; plain HTTP and SOCKS5 are not encrypted on the way to the app, so a non-loopback listen address needs a network the user trusts; a connection that sits silent is closed after an hour in the tunnel mode only; a DNS answer that does not fit one UDP datagram is used for the records it has; the stack has the same single path as the tunnel, so what the exit does not carry (UDP, ICMP) is not carried here either.
+//! Known limits: no SOCKS5 UDP ASSOCIATE (answered "command not supported") and no BIND; plain HTTP and SOCKS5 are not encrypted on the way to the app, so a non-loopback listen address needs a network the user trusts; a connection that sits silent is closed after an hour; a DNS answer that does not fit one UDP datagram is used for the records it has; the stack has the same single path as the tunnel, so what the exit does not carry (UDP, ICMP) is not carried here either.
 use crate::engine::Command;
 use crate::local_stack::{self, Fail, Stack};
+use crate::status::State as Phase;
 use crate::{random, Event, Status, Tunnel};
 use ring::hmac;
 use socket2::SockRef;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{copy, copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
+use tokio::io::{copy, copy_bidirectional, split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tokio::time::{sleep, timeout, Instant};
-use veilway_proto::proxy::http::{self, Body, MAX_HEAD};
+use tokio::time::{sleep, sleep_until, timeout, Instant};
+use veilway_proto::proxy::http::{self, Body, MAX_CREDENTIAL, MAX_HEAD};
 use veilway_proto::proxy::socks;
 use veilway_proto::proxy::Target;
 use veilway_proto::subscription::payload::{Network, Usage};
@@ -32,6 +35,10 @@ use veilway_proto::subscription::payload::{Network, Usage};
 /// Failed logins from one source that block it, within `WINDOW`, and for how long it stays blocked after the last.
 const FAILURES: u32 = 5;
 const WINDOW: Duration = Duration::from_secs(60);
+/// Failed logins from all sources together that close logins for the rest of the window.
+const GLOBAL: u32 = 20;
+/// A connection with no byte either way for this long is closed.
+const IDLE: Duration = Duration::from_secs(3600);
 /// Sources whose failures are remembered at most, before the old ones are forgotten.
 const SOURCES: usize = 1024;
 /// One attempt at an address when the system connects, and how many addresses of a name are tried.
@@ -53,23 +60,38 @@ pub enum Kind {Socks5, Http, Mixed}
 pub struct LocalProxy {
 	pub listen: SocketAddr,
 	pub kind: Kind,
-	/// A user name and a password, each 1 to 255 bytes, and the name without a colon. When set, every connection must log in.
+	/// A user name and a password, each 1 to 255 bytes, and the name without a colon (the pair as base64 must also fit `MAX_CREDENTIAL` for HTTP). When set, every connection must log in. Apps must set one, with `LocalProxy::random_login` unless the user chose their own: only a listen address that is not loopback is refused without it, because the check cannot know what else runs on the device.
 	pub auth: Option<(String, String)>,
 	/// Connections open at once, and from one source (an IPv4 address or an IPv6 /64).
 	pub max_connections: usize,
 	pub per_source: usize,
 	/// Time for a client to get from its first byte to a request that is read and checked.
 	pub handshake: Duration,
+	/// Alongside a system VPN only: allow destinations in the private ranges (RFC 1918, 100.64/10, fc00::/7). Off by default, so that the proxy cannot be used to reach the device's own network.
+	pub allow_private: bool,
 }
 
 impl LocalProxy {
 	/// 256 connections, and from one source all of them on a loopback address and 32 on any other. 10 s to the request.
-	pub fn new(listen: SocketAddr, kind: Kind) -> Self {Self {listen, kind, auth: None, max_connections: 256, per_source: if listen.ip().is_loopback() {256} else {32}, handshake: Duration::from_secs(10)}}
+	pub fn new(listen: SocketAddr, kind: Kind) -> Self {Self {listen, kind, auth: None, max_connections: 256, per_source: if listen.ip().is_loopback() {256} else {32}, handshake: Duration::from_secs(10), allow_private: false}}
+
+	/// A user name and a password of 20 letters and digits each, from the system's random source, for `auth`.
+	pub fn random_login() -> (String, String) {
+		const ALPHABET: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+		let mut chars = Vec::with_capacity(64);
+		while chars.len() < 40 {
+			let mut bytes = [0u8; 64];
+			random(&mut bytes).expect("the system has no random source");
+			// 248 is the last multiple of 62 in a byte: the rest is dropped so that no character is likelier.
+			chars.extend(bytes.iter().filter(|byte| **byte < 248).map(|byte| ALPHABET[usize::from(*byte % 62)] as char));
+		}
+		(chars[..20].iter().collect(), chars[20..40].iter().collect())
+	}
 
 	/// Whether this can be started: a listen address that is not loopback has a login, and a login can be sent by the protocols.
 	pub fn check(&self) -> Result<(), Error> {
 		if !self.listen.ip().is_loopback() && self.auth.is_none() {return Err(Error::Open)}
-		if self.auth.as_ref().is_some_and(|(user, pass)| user.is_empty() || user.len() > 255 || user.contains(':') || pass.is_empty() || pass.len() > 255) {return Err(Error::Login)}
+		if self.auth.as_ref().is_some_and(|(user, pass)| user.is_empty() || user.len() > 255 || user.contains(':') || pass.is_empty() || pass.len() > 255 || (user.len() + 1 + pass.len()).div_ceil(3) * 4 > MAX_CREDENTIAL) {return Err(Error::Login)}
 		Ok(())
 	}
 }
@@ -79,7 +101,7 @@ impl LocalProxy {
 pub enum Error {
 	/// The listen address is not loopback and no login is set.
 	Open,
-	/// The login cannot be used: empty, over 255 bytes, or a user name with a colon.
+	/// The login cannot be used: empty, over 255 bytes, a user name with a colon, or too long for an HTTP credential.
 	Login,
 	/// The address could not be listened on.
 	Listen(io::Error),
@@ -89,7 +111,7 @@ impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Error::Open => f.write_str("a proxy that is not on a loopback address needs a user name and a password"),
-			Error::Login => f.write_str("the user name and the password must be 1 to 255 bytes, and the name has no colon"),
+			Error::Login => f.write_str("the user name and the password must be 1 to 255 bytes, together short enough for an HTTP credential, and the name has no colon"),
 			Error::Listen(error) => write!(f, "the proxy could not listen: {error}"),
 		}
 	}
@@ -103,7 +125,7 @@ pub struct Totals {
 	/// Connections taken, and those open now.
 	pub accepted: u64,
 	pub open: usize,
-	/// Connections turned away because the proxy held its `max_connections`, because the source held its `per_source`, and because the source was blocked for its failed logins.
+	/// Connections turned away because the proxy held its `max_connections`, because the source held its `per_source`, and because the source was blocked for its failed logins (logins refused while logins are closed count here too).
 	pub refused_limit: u64,
 	pub refused_source: u64,
 	pub refused_blocked: u64,
@@ -132,6 +154,12 @@ struct Table {
 	by: HashMap<IpAddr, usize>,
 	/// A source's first failed login of its window and how many it made in it.
 	failures: HashMap<IpAddr, (Instant, u32)>,
+	/// The first failed login of the window across all sources and how many there were.
+	all: Option<(Instant, u32)>,
+}
+
+impl Table {
+	fn blocked(&self, from: IpAddr, now: Instant) -> bool {self.failures.get(&from).is_some_and(|(first, failed)| *failed >= FAILURES && now.saturating_duration_since(*first) < WINDOW)}
 }
 
 struct State {
@@ -178,7 +206,7 @@ impl State {
 	fn admit(self: &Arc<State>, ip: IpAddr, now: Instant) -> Option<Slot> {
 		let from = source(ip);
 		let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-		if table.failures.get(&from).is_some_and(|(first, failed)| *failed >= FAILURES && now.saturating_duration_since(*first) < WINDOW) {
+		if table.blocked(from, now) {
 			self.count(Count::Blocked);
 			return None;
 		}
@@ -198,21 +226,42 @@ impl State {
 		Some(Slot {state: self.clone(), source: from})
 	}
 
-	/// A wrong login from `ip`: counted, logged now and then, and the source blocked at the fifth in a window.
+	/// Whether a login from `ip` is looked at: not while the source is blocked, and not once the sources together failed `GLOBAL` times in the window. Asked right before each login is checked, because the connection was admitted before its failures were known.
+	fn login_open(&self, ip: IpAddr, now: Instant) -> bool {
+		let table = self.table.lock().unwrap_or_else(|e| e.into_inner());
+		let shut = table.all.is_some_and(|(first, failed)| failed >= GLOBAL && now.saturating_duration_since(first) < WINDOW);
+		if shut || table.blocked(source(ip), now) {
+			drop(table);
+			self.count(Count::Blocked);
+			return false;
+		}
+		true
+	}
+
+	/// A wrong login from `ip`: counted, logged now and then, and the source blocked at the fifth in a window. A loopback source is never blocked by itself, since every program on the device shares it, and only counts in the total of all sources.
 	fn failed(&self, ip: IpAddr, now: Instant) {
 		self.count(Count::Login);
 		let from = source(ip);
 		let mut table = self.table.lock().unwrap_or_else(|e| e.into_inner());
-		if table.failures.len() >= SOURCES {table.failures.retain(|_, (first, _)| now.saturating_duration_since(*first) < WINDOW)}
-		let entry = table.failures.entry(from).or_insert((now, 0));
-		if now.saturating_duration_since(entry.0) >= WINDOW {*entry = (now, 0)}
-		entry.1 += 1;
-		let failed = entry.1;
+		let all = match table.all {
+			Some((first, failed)) if now.saturating_duration_since(first) < WINDOW => (first, failed + 1),
+			_ => (now, 1),
+		};
+		table.all = Some(all);
+		let mut failed = all.1;
+		if !from.is_loopback() {
+			if table.failures.len() >= SOURCES {table.failures.retain(|_, (first, _)| now.saturating_duration_since(*first) < WINDOW)}
+			let entry = table.failures.entry(from).or_insert((now, 0));
+			if now.saturating_duration_since(entry.0) >= WINDOW {*entry = (now, 0)}
+			entry.1 += 1;
+			failed = entry.1;
+		}
 		drop(table);
 		let mut logged = self.logged.lock().unwrap_or_else(|e| e.into_inner());
-		if failed == FAILURES || logged.is_none_or(|last| now.saturating_duration_since(last) >= LOG_EVERY) {
+		if all.1 == GLOBAL {tracing::info!("local proxy: {GLOBAL} logins failed within {} s, logins are refused for the rest of that time", WINDOW.as_secs())}
+		if (!from.is_loopback() && failed == FAILURES) || logged.is_none_or(|last| now.saturating_duration_since(last) >= LOG_EVERY) {
 			*logged = Some(now);
-			tracing::info!(%from, failed, "local proxy: a login was refused{}", if failed >= FAILURES {format!(", and the source is refused for {} s", WINDOW.as_secs())} else {String::new()});
+			tracing::info!(%from, failed, "local proxy: a login was refused{}", if !from.is_loopback() && failed >= FAILURES {format!(", and the source is refused for {} s", WINDOW.as_secs())} else {String::new()});
 		}
 	}
 
@@ -242,12 +291,20 @@ fn allowed(ip: IpAddr, own: &[IpAddr]) -> bool {
 	!(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || ip == IpAddr::V4(Ipv4Addr::BROADCAST) || own.contains(&ip))
 }
 
-/// How connections are opened: inside the tunnel by the stack, or by the system.
-#[derive(Clone)]
-enum Dialer {System, Tunnel(Stack)}
+/// What the system dialer also refuses: link-local addresses (which holds the metadata address of the clouds) always, and private ranges (RFC 1918, 100.64/10 and fc00::/7) unless `private` is set. `ip` is canonical.
+fn host_side(ip: IpAddr, private: bool) -> bool {
+	match ip {
+		IpAddr::V4(v4) => !(v4.is_link_local() || !private && (v4.is_private() || v4.octets()[0] == 100 && v4.octets()[1] & 0xc0 == 64)),
+		IpAddr::V6(v6) => !(v6.segments()[0] & 0xffc0 == 0xfe80 || !private && v6.segments()[0] & 0xfe00 == 0xfc00),
+	}
+}
 
-/// An open connection to a destination, by either dialer.
-enum Upstream {System(TcpStream), Tunnel(DuplexStream)}
+/// How connections are opened: inside the tunnel by the stack, or by the system. `own` is the listener's address and `private` the setting of `allow_private`.
+#[derive(Clone)]
+enum Dialer {System {own: Arc<[IpAddr]>, private: bool}, Tunnel(Stack)}
+
+/// An open connection to a destination, by either dialer. The flag of a tunnel connection says that it ended in a reset.
+enum Upstream {System(TcpStream), Tunnel(DuplexStream, Arc<AtomicBool>)}
 
 impl Dialer {
 	/// Opens a connection to `target`. A name is resolved by the dialer's own way, the addresses that are not allowed are left out, and at most two of the rest are tried.
@@ -255,16 +312,16 @@ impl Dialer {
 		let (addresses, port) = match target {
 			Target::Address(address) => (vec![address.ip()], address.port()),
 			Target::Name(name, port) => (match self {
-				Dialer::System => timeout(ATTEMPT, lookup_host((name.as_str(), port))).await.map_err(|_| Fail::Timeout)?.map_err(|_| Fail::NotFound)?.map(|address| address.ip()).collect(),
+				Dialer::System {..} => timeout(ATTEMPT, lookup_host((name.as_str(), port))).await.map_err(|_| Fail::Timeout)?.map_err(|_| Fail::NotFound)?.map(|address| address.ip()).collect(),
 				Dialer::Tunnel(stack) => stack.resolve(&name).await?,
 			}, port),
 		};
-		let own: &[IpAddr] = match self {Dialer::System => &[], Dialer::Tunnel(stack) => &stack.own};
+		let (own, private) = match self {Dialer::System {own, private} => (&**own, Some(*private)), Dialer::Tunnel(stack) => (&*stack.own, None)};
 		let mut last = Fail::Forbidden;
-		for ip in addresses.into_iter().filter(|ip| port != 0 && allowed(*ip, own)).take(ADDRESSES) {
+		for ip in addresses.into_iter().filter(|ip| port != 0 && allowed(*ip, own) && private.is_none_or(|private| host_side(ip.to_canonical(), private))).take(ADDRESSES) {
 			let to = SocketAddr::new(ip.to_canonical(), port);
 			match self {
-				Dialer::System => match timeout(ATTEMPT, TcpStream::connect(to)).await {
+				Dialer::System {..} => match timeout(ATTEMPT, TcpStream::connect(to)).await {
 					Ok(Ok(stream)) => {
 						let _ = stream.set_nodelay(true);
 						return Ok(Upstream::System(stream));
@@ -273,7 +330,7 @@ impl Dialer {
 					Err(_) => last = Fail::Timeout,
 				},
 				Dialer::Tunnel(stack) => match stack.connect(to).await {
-					Ok(stream) => return Ok(Upstream::Tunnel(stream)),
+					Ok((stream, reset)) => return Ok(Upstream::Tunnel(stream, reset)),
 					Err(fail) => last = fail,
 				},
 			}
@@ -287,7 +344,8 @@ struct Asked {target: Target, front: Front, first: Vec<u8>}
 
 enum Front {Socks, Connect, Plain(Body)}
 
-struct Shared {config: LocalProxy, login: Option<Login>, dialer: Dialer, state: Arc<State>}
+/// `vpn` is the status of the system VPN that a proxy alongside it relies on.
+struct Shared {config: LocalProxy, login: Option<Login>, dialer: Dialer, state: Arc<State>, vpn: Option<watch::Receiver<Status>>}
 
 /// Reads more of the client's bytes, within the cap.
 async fn more(client: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -352,6 +410,10 @@ async fn handshake(shared: &Shared, client: &mut TcpStream, from: IpAddr) -> io:
 				}
 			};
 			buf.drain(..used);
+			if !shared.state.login_open(from, Instant::now()) {
+				client.write_all(&[1, 1]).await?;
+				return Ok(None);
+			}
 			if !login.check(&user, &pass) {
 				shared.state.failed(from, Instant::now());
 				client.write_all(&[1, 1]).await?;
@@ -390,6 +452,10 @@ async fn handshake(shared: &Shared, client: &mut TcpStream, from: IpAddr) -> io:
 		}
 	};
 	if let Some(login) = shared.login.as_ref() {
+		if request.authorization.is_some() && !shared.state.login_open(from, Instant::now()) {
+			client.write_all(&http_answer("429 Too Many Requests", false)).await?;
+			return Ok(None);
+		}
 		let given = request.authorization.as_deref().and_then(http::basic);
 		if !given.is_some_and(|(user, pass)| login.check(&user, &pass)) {
 			if request.authorization.is_some() {shared.state.failed(from, Instant::now())}
@@ -404,31 +470,77 @@ async fn handshake(shared: &Shared, client: &mut TcpStream, from: IpAddr) -> io:
 	Ok(Some(Asked {target: request.target, front: Front::Plain(request.body), first}))
 }
 
-/// Carries bytes both ways between the client and the destination. `first` goes to the destination before anything else. A plain request carries only what its framing says of the client's bytes, and then the destination's answer up to its close.
-async fn carry<S: AsyncRead + AsyncWrite + Unpin>(shared: &Shared, client: &mut TcpStream, up: &mut S, first: Vec<u8>, body: Option<Body>) {
+/// One end of a connection while it is carried: every byte that is read is counted (`count`), the time of the last byte either way is kept for the idle timeout, and a read that ends where the stack says the connection was reset is an error, so that the other end is reset too instead of being closed cleanly.
+struct Watched<S> {inner: S, state: Arc<State>, count: Count, seen: Arc<AtomicU64>, began: Instant, reset: Option<Arc<AtomicBool>>}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Watched<S> {
+	fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+		let before = buf.filled().len();
+		let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+		if let Poll::Ready(Ok(())) = &result {
+			let got = buf.filled().len() - before;
+			if got > 0 {
+				self.state.add(self.count, got as u64);
+				self.seen.store(self.began.elapsed().as_millis() as u64, Ordering::Relaxed);
+			} else if self.reset.as_ref().is_some_and(|reset| reset.load(Ordering::Relaxed)) {return Poll::Ready(Err(io::ErrorKind::ConnectionReset.into()))}
+		}
+		result
+	}
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Watched<S> {
+	fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+		let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+		if matches!(result, Poll::Ready(Ok(n)) if n > 0) {self.seen.store(self.began.elapsed().as_millis() as u64, Ordering::Relaxed)}
+		result
+	}
+
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {Pin::new(&mut self.inner).poll_flush(cx)}
+
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {Pin::new(&mut self.inner).poll_shutdown(cx)}
+}
+
+/// Carries bytes both ways between the client and the destination, until either ends or nothing moves for `IDLE`. `first` goes to the destination before anything else. A plain request carries only what its framing says of the client's bytes, with the destination's answer coming back meanwhile (so `Expect: 100-continue` works), and then the answer up to the destination's close. A reset on either side resets the other.
+async fn carry<S: AsyncRead + AsyncWrite + Unpin>(shared: &Shared, client: &mut TcpStream, up: &mut S, reset: Option<Arc<AtomicBool>>, first: Vec<u8>, body: Option<Body>) {
+	let (seen, began) = (Arc::new(AtomicU64::new(0)), Instant::now());
+	let mut client = Watched {inner: client, state: shared.state.clone(), count: Count::Up, seen: seen.clone(), began, reset: None};
+	let mut up = Watched {inner: up, state: shared.state.clone(), count: Count::Down, seen: seen.clone(), began, reset};
+	shared.state.add(Count::Up, first.len() as u64);
 	if !first.is_empty() && up.write_all(&first).await.is_err() {return}
-	let (mut sent, got) = (first.len() as u64, 0);
-	let (sent, got) = match body {
-		None => match copy_bidirectional(client, up).await {
-			Ok((to, from)) => (sent + to, from),
-			Err(_) => (sent, got),
-		},
-		Some(mut body) => {
-			let mut buf = vec![0u8; CHUNK];
-			while !body.done() {
-				let Ok(n) = client.read(&mut buf).await else {return};
-				if n == 0 {return}
-				let used = body.take(&buf[..n]);
-				if up.write_all(&buf[..used]).await.is_err() {return}
-				sent += used as u64;
+	let work = async {
+		match body {
+			None => copy_bidirectional(&mut client, &mut up).await.map(|_| ()),
+			Some(mut body) => {
+				let ((mut from_client, mut to_client), (mut from_up, mut to_up)) = (split(&mut client), split(&mut up));
+				let upload = async {
+					let mut buf = vec![0u8; CHUNK];
+					while !body.done() {
+						let n = from_client.read(&mut buf).await?;
+						if n == 0 {return Err(io::ErrorKind::UnexpectedEof.into())}
+						let used = body.take(&buf[..n]);
+						to_up.write_all(&buf[..used]).await?;
+					}
+					Ok::<(), io::Error>(())
+				};
+				let download = async {
+					copy(&mut from_up, &mut to_client).await?;
+					let _ = to_client.shutdown().await;
+					Ok::<(), io::Error>(())
+				};
+				tokio::try_join!(upload, download).map(|_| ())
 			}
-			let from = copy(up, client).await.unwrap_or(0);
-			let _ = client.shutdown().await;
-			(sent, from)
 		}
 	};
-	shared.state.add(Count::Up, sent);
-	shared.state.add(Count::Down, got);
+	let idle = async {
+		loop {
+			let due = began + Duration::from_millis(seen.load(Ordering::Relaxed)) + IDLE;
+			if Instant::now() >= due {return}
+			sleep_until(due).await;
+		}
+	};
+	let ended = tokio::select! {result = work => Some(result), _ = idle => None};
+	// An error is an abort, not a close: the client is reset, not told the data is complete.
+	if !matches!(ended, Some(Ok(()))) {let _ = SockRef::from(&*client.inner).set_linger(Some(Duration::ZERO));}
 }
 
 async fn connection(shared: Arc<Shared>, mut client: TcpStream, peer: SocketAddr, _slot: Slot) {
@@ -443,7 +555,8 @@ async fn connection(shared: Arc<Shared>, mut client: TcpStream, peer: SocketAddr
 		}
 	};
 	let Asked {target, front, first} = asked;
-	let upstream = match shared.dialer.dial(target).await {
+	let dialed = if shared.vpn.as_ref().is_some_and(|vpn| !matches!(vpn.borrow().state, Phase::Connected {..})) {Err(Fail::Down)} else {shared.dialer.dial(target).await};
+	let upstream = match dialed {
 		Ok(upstream) => {
 			if shared.state.failing.swap(false, Ordering::Relaxed) {tracing::info!("local proxy: connections are opening again")}
 			upstream
@@ -467,8 +580,8 @@ async fn connection(shared: Arc<Shared>, mut client: TcpStream, peer: SocketAddr
 	};
 	if let Some(answer) = answer {if client.write_all(answer).await.is_err() {return}}
 	match upstream {
-		Upstream::System(mut stream) => carry(&shared, &mut client, &mut stream, first, body).await,
-		Upstream::Tunnel(mut stream) => carry(&shared, &mut client, &mut stream, first, body).await,
+		Upstream::System(mut stream) => carry(&shared, &mut client, &mut stream, None, first, body).await,
+		Upstream::Tunnel(mut stream, reset) => carry(&shared, &mut client, &mut stream, Some(reset), first, body).await,
 	}
 }
 
@@ -513,22 +626,24 @@ impl Local {
 			Err(error) => return Err((Error::Listen(error), tunnel)),
 		};
 		let control = Control {commands: tunnel.commands.clone(), status: tunnel.status.clone(), events: tunnel.events.clone()};
-		let (stack, stop, task) = local_stack::start(tunnel);
+		let (stack, stop, task) = local_stack::start(tunnel, config.max_connections);
 		tracing::info!(listen = %config.listen, "local proxy: listening, connections go through the tunnel");
-		Ok(Local::spawn(listener, config, Dialer::Tunnel(stack), Some(Carried {control, stop, task})))
+		Ok(Local::spawn(listener, config, Dialer::Tunnel(stack), None, Some(Carried {control, stop, task})))
 	}
 
-	/// Starts the proxy for a device that a system VPN already carries: connections are dialled by the system and names are resolved by it.
-	pub async fn alongside(config: LocalProxy) -> Result<Local, Error> {
+	/// Starts the proxy for a device that a system VPN already carries: connections are dialled by the system and names are resolved by it. `vpn` is that VPN's status: while it is not `Connected` new connections are refused (SOCKS5 reply 1, HTTP 503), so that nothing leaves outside the VPN. The listener's own address, link-local addresses and, unless `allow_private` is set, the private ranges are never connected to.
+	pub async fn alongside(config: LocalProxy, vpn: watch::Receiver<Status>) -> Result<Local, Error> {
 		config.check()?;
 		let listener = TcpListener::bind(config.listen).await.map_err(Error::Listen)?;
+		let own: Arc<[IpAddr]> = listener.local_addr().map(|address| address.ip().to_canonical()).into_iter().collect();
 		tracing::info!(listen = %config.listen, "local proxy: listening, connections go out by the system");
-		Ok(Local::spawn(listener, config, Dialer::System, None))
+		let dialer = Dialer::System {own, private: config.allow_private};
+		Ok(Local::spawn(listener, config, dialer, Some(vpn), None))
 	}
 
-	fn spawn(listener: TcpListener, config: LocalProxy, dialer: Dialer, carried: Option<Carried>) -> Local {
+	fn spawn(listener: TcpListener, config: LocalProxy, dialer: Dialer, vpn: Option<watch::Receiver<Status>>, carried: Option<Carried>) -> Local {
 		let addr = listener.local_addr().unwrap_or(config.listen);
-		let shared = Arc::new(Shared {login: config.auth.as_ref().map(|(user, pass)| Login::new(user, pass)), state: Arc::new(State::new(&config)), config, dialer});
+		let shared = Arc::new(Shared {login: config.auth.as_ref().map(|(user, pass)| Login::new(user, pass)), state: Arc::new(State::new(&config)), config, dialer, vpn});
 		Local {addr, listener: tokio::spawn(accept(shared.clone(), listener)), shared, carried}
 	}
 
@@ -540,7 +655,11 @@ impl Local {
 	pub fn watch(&self) -> Option<watch::Receiver<Status>> {self.carried.as_ref().map(|carried| carried.control.status.clone())}
 	pub fn events(&self) -> Option<broadcast::Receiver<Event>> {self.carried.as_ref().map(|carried| carried.control.events.subscribe())}
 	/// What `Tunnel` offers an app that owns it, for the tunnel under this proxy. They do nothing for a proxy that runs alongside a system VPN.
-	pub fn select_exit(&self, tag: Option<String>) {self.send(Command::Exit(tag))}
+	pub fn select_exit(&self, tag: Option<String>) {
+		if let Dialer::Tunnel(stack) = &self.shared.dialer {stack.flush()}
+		self.send(Command::Exit(tag));
+	}
+
 	pub fn connect_again(&self) {self.send(Command::Again)}
 	pub fn moved(&self, network: String, networks: Vec<Network>) {self.send(Command::Moved(network, networks))}
 	pub fn reprobe(&self) {self.send(Command::Reprobe)}
@@ -573,7 +692,13 @@ mod tests {
 		config
 	}
 
-	async fn start(config: LocalProxy) -> Local {Local::alongside(config).await.unwrap()}
+	fn vpn(connected: bool) -> (watch::Sender<Status>, watch::Receiver<Status>) {
+		let mut status = Status::off(String::new(), 1400);
+		if connected {status.state = Phase::Connected {exit: None}}
+		watch::channel(status)
+	}
+
+	async fn start(config: LocalProxy) -> Local {Local::alongside(config, vpn(true).1).await.unwrap()}
 
 	/// A connected client that has sent `bytes`, and what the proxy answered with.
 	async fn ask(local: &Local, bytes: &[u8]) -> Vec<u8> {
@@ -597,7 +722,8 @@ mod tests {
 			assert!(on(address, Some(("a", "b"))), "{address} with one");
 		}
 		assert!(!on("127.0.0.1:1", Some(("", "b"))) && !on("127.0.0.1:1", Some(("a", ""))) && !on("127.0.0.1:1", Some(("a:b", "c"))) && !on("127.0.0.1:1", Some((&"a".repeat(256), "c"))));
-		assert!(on("127.0.0.1:1", Some((&"a".repeat(255), &"p".repeat(255)))));
+		assert!(!on("127.0.0.1:1", Some((&"a".repeat(255), &"p".repeat(255)))), "255 and 255 bytes do not fit an HTTP credential");
+		assert!(!on("127.0.0.1:1", Some((&"a".repeat(200), &"p".repeat(190)))) && on("127.0.0.1:1", Some((&"a".repeat(200), &"p".repeat(180)))));
 	}
 
 	#[test]
@@ -676,6 +802,63 @@ mod tests {
 	#[tokio::test]
 	async fn a_proxy_that_is_not_loopback_does_not_start_without_a_login() {
 		let config = LocalProxy::new("0.0.0.0:0".parse().unwrap(), Kind::Mixed);
-		assert!(matches!(Local::alongside(config).await, Err(Error::Open)));
+		assert!(matches!(Local::alongside(config, vpn(true).1).await, Err(Error::Open)));
+	}
+
+	#[test]
+	fn a_random_login_is_twenty_letters_and_digits_each_and_never_the_same_twice() {
+		let ((user, pass), (other, _)) = (LocalProxy::random_login(), LocalProxy::random_login());
+		assert!(user.len() == 20 && pass.len() == 20 && user != pass && user != other);
+		assert!(user.chars().chain(pass.chars()).all(|c| c.is_ascii_alphanumeric()));
+		let mut config = config(None);
+		config.auth = Some((user, pass));
+		assert!(config.check().is_ok());
+	}
+
+	#[test]
+	fn the_system_dialer_keeps_off_the_hosts_own_side_of_the_network() {
+		for ip in ["169.254.169.254", "169.254.1.1", "fe80::1", "10.0.0.1", "172.16.5.5", "192.168.1.1", "100.64.0.1", "100.127.255.1", "fd00::1", "fc00::1"] {assert!(!host_side(ip.parse().unwrap(), false), "{ip}");}
+		for ip in ["169.254.169.254", "fe80::1"] {assert!(!host_side(ip.parse().unwrap(), true), "{ip} even when private is allowed");}
+		for ip in ["10.0.0.1", "192.168.1.1", "100.64.0.1", "fd00::1"] {assert!(host_side(ip.parse().unwrap(), true), "{ip} when private is allowed");}
+		for ip in ["93.184.216.34", "100.63.0.1", "100.128.0.1", "172.32.0.1", "2606:4700::1111"] {assert!(host_side(ip.parse().unwrap(), false), "{ip}");}
+	}
+
+	#[tokio::test]
+	async fn loopback_failures_do_not_block_a_second_loopback_client_but_all_sources_together_close_logins() {
+		let state = Arc::new(State::new(&config(None)));
+		let (now, loopback, far): (Instant, IpAddr, IpAddr) = (Instant::now(), "127.0.0.1".parse().unwrap(), "192.0.2.9".parse().unwrap());
+		for _ in 0..FAILURES + 3 {state.failed(loopback, now)}
+		assert!(state.admit(loopback, now).is_some() && state.login_open(loopback, now), "loopback is not blocked by source");
+		for _ in 0..GLOBAL - FAILURES - 3 {state.failed(loopback, now)}
+		assert!(!state.login_open(far, now) && !state.login_open(loopback, now), "the total closes logins for everyone");
+		assert!(state.admit(far, now).is_some(), "connections are still taken");
+		assert!(state.login_open(far, now + WINDOW + Duration::from_secs(1)), "and it lasts one window");
+		assert_eq!(state.totals().refused_blocked, 2);
+		let far_state = Arc::new(State::new(&config(None)));
+		for _ in 0..FAILURES {far_state.failed(far, now)}
+		assert!(!far_state.login_open(far, now) && far_state.login_open("192.0.2.10".parse().unwrap(), now), "another source is let in");
+	}
+
+	#[tokio::test]
+	async fn a_login_that_began_before_the_block_is_not_checked_once_logins_are_closed() {
+		let local = start(config(Some(("user", "pass")))).await;
+		let login = [&[5, 1, 2][..], &[1, 4], b"user", &[4], b"pass"].concat();
+		for _ in 0..GLOBAL {assert_eq!(ask(&local, &[&[5, 1, 2][..], &[1, 4], b"user", &[4], b"nope"].concat()).await, [5, 2, 1, 1])}
+		assert_eq!(ask(&local, &login).await, [5, 2, 1, 1], "the right login is refused too");
+		assert!(ask(&local, b"CONNECT 93.184.216.34:443 HTTP/1.1\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n").await.starts_with(b"HTTP/1.1 429 "));
+		assert!(local.totals().refused_blocked >= 2, "{:?}", local.totals());
+	}
+
+	#[tokio::test]
+	async fn alongside_a_vpn_nothing_is_dialled_while_it_is_not_connected_and_the_hosts_side_is_refused() {
+		let (sender, receiver) = vpn(false);
+		let local = Local::alongside(config(None), receiver).await.unwrap();
+		let request = |ip: [u8; 4]| [&[5, 1, 0][..], &[5, 1, 0, 1], &ip, &[0, 80]].concat();
+		assert_eq!(ask(&local, &request([93, 184, 216, 34])).await[2..], [5, 1, 0, 1, 0, 0, 0, 0, 0, 0], "down: general failure");
+		assert!(ask(&local, b"GET http://93.184.216.34/ HTTP/1.1\r\n\r\n").await.starts_with(b"HTTP/1.1 503 "));
+		sender.send_modify(|status| status.state = Phase::Connected {exit: None});
+		for ip in [[10, 0, 0, 1], [169, 254, 169, 254], [100, 64, 0, 1], [192, 168, 0, 1]] {assert_eq!(ask(&local, &request(ip)).await[2..], [5, 2, 0, 1, 0, 0, 0, 0, 0, 0], "{ip:?}");}
+		assert!(ask(&local, b"CONNECT [fd00::1]:80 HTTP/1.1\r\n\r\n").await.starts_with(b"HTTP/1.1 403 "));
+		assert_eq!((local.totals().refused_destination, local.totals().dial_failed), (5, 2));
 	}
 }

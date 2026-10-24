@@ -10,7 +10,8 @@ use std::net::Ipv6Addr;
 pub const MAX_HEAD: usize = 8192;
 pub const MAX_HEADERS: usize = 64;
 /// The longest `Proxy-Authorization` credential taken, as base64: a user name of 64 characters and a password of 128 come to 256.
-const MAX_CREDENTIAL: usize = 512;
+/// The most bytes of a base64 `Proxy-Authorization` credential that `basic` reads.
+pub const MAX_CREDENTIAL: usize = 512;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Bad {Malformed, TooLarge}
