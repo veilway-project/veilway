@@ -893,6 +893,15 @@ impl Library {
 			match ask(wire, &request, &endpoint, &Trust::of(&pins), &keys, &allowed, now).await {
 				Ok(envelope) => match if role == Role::Move {self.held[at].refresh_moved(&envelope, now)} else {self.held[at].refresh(&envelope, now)} {
 					Ok(refreshed) => {
+						// The provider lost this device (its operator removed it) and took it back as pending, which a node never gets: a subscription the user accepted confirms it again, as its import did. Best effort, the refresh stands either way.
+						if self.held[at].subscription().devices.iter().any(|device| device.this && device.pending) {
+							if let Some(confirm) = self.held[at].rename(None) {
+								if let Ok(envelope) = ask(wire, &confirm, &endpoint, &Trust::of(&pins), &keys, &allowed, now).await {
+									tracing::info!("this device was pending at the provider and is confirmed again");
+									let _ = if role == Role::Move {self.held[at].refresh_moved(&envelope, now)} else {self.held[at].refresh(&envelope, now)};
+								}
+							}
+						}
 						self.save().map_err(ImportError::Store)?;
 						return Ok((refreshed, match role {Role::Move => Source::Moved, Role::Main => Source::Endpoint, Role::Relay => Source::Relay}));
 					}
@@ -1121,13 +1130,15 @@ mod tests {
 	}
 
 	// The document of vectors.py at `serial`, listing a relay mirror and two static mirrors.
-	fn listed(serial: u64) -> String {
+	fn listed(serial: u64) -> String {sign(&payload(serial))}
+
+	fn payload(serial: u64) -> serde_json::Value {
 		let key = veilway_proto::subscription::envelope::SigningKey::new(ring::signature::KeyPair::public_key(&pair()).as_ref().try_into().unwrap()).unwrap();
 		let mut payload: serde_json::Value = serde_json::from_slice(veilway_proto::subscription::envelope::verify(&corpus("fuzz_sub_envelope/document")[1..], &[key], BODY_MAX).unwrap().payload()).unwrap();
 		payload["serial"] = serial.into();
 		payload["refresh_urls"] = serde_json::json!(["https://relay.example.net/s"]);
 		payload["static_mirrors"] = serde_json::json!([BASE, OTHER]);
-		sign(&payload)
+		payload
 	}
 
 	fn disabled() -> String {sign(&serde_json::json!({"v": 1, "subscription_id": "example-account-0001", "issued_at": NOW - 10, "refusal": "disabled"}))}
@@ -1194,6 +1205,20 @@ mod tests {
 	fn run(library: &mut Library, fake: &Fake) -> Result<(Refreshed, Source), RefreshFailed> {tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(library.refresh_over(fake, 0, NOW))}
 
 	fn ok(document: String) -> Result<Vec<u8>, FetchError> {Ok(document.into_bytes())}
+
+	#[test]
+	fn a_refresh_that_finds_this_device_pending_confirms_it_again_and_one_that_does_not_asks_once() {
+		let mut pending = payload(2);
+		pending["devices"] = serde_json::json!([{"name": "", "enrolled_at": NOW, "this": true, "pending": true}]);
+		let mut library = library("pending", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", ok(sign(&pending)))]);
+		assert!(matches!(run(&mut library, &fake), Ok((Refreshed::Updated(_), Source::Endpoint))));
+		assert_eq!(fake.asked(), ["POST sub.example.com", "POST sub.example.com"]);
+		let mut library = self::library("pending", imported());
+		let fake = Fake::new(vec![("POST sub.example.com", ok(listed(2)))]);
+		assert!(run(&mut library, &fake).is_ok());
+		assert_eq!(fake.asked(), ["POST sub.example.com"]);
+	}
 
 	#[test]
 	fn the_endpoint_comes_first_then_the_relay_mirrors_and_a_static_mirror_only_after_both_failed() {
