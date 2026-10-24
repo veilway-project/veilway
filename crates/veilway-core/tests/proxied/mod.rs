@@ -547,7 +547,8 @@ pub async fn front(upstream: SocketAddr) -> Front {
 }
 
 /// The directory of one test's node.
-pub fn folder(test: &str) -> PathBuf {std::env::temp_dir().join(format!("veilway-proxied-{}-{test}", std::process::id()))}
+// Under /tmp on Unix: a control socket in it must fit in 104 bytes on macOS, and its own temporary folder is long.
+pub fn folder(test: &str) -> PathBuf {(if cfg!(unix) {PathBuf::from("/tmp")} else {std::env::temp_dir()}).join(format!("vw-{}-{test}", std::process::id()))}
 
 /// A new directory for one test.
 pub fn scratch(test: &str) -> PathBuf {
