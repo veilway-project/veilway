@@ -188,8 +188,10 @@ detect_target() {
 	[ "$(uname -s)" = Linux ] || die "this script is for Linux servers"
 }
 
+# A fresh server often runs its automatic updates for the first minutes: apt waits up to 10 minutes for their lock instead of failing, and needrestart does not scan every process after each install.
+export NEEDRESTART_SUSPEND=1
 pkg_install() {
-	if has apt-get; then [ "$DRY" = 1 ] || apt-get update -qq >/dev/null 2>&1 || true; act env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+	if has apt-get; then [ "$DRY" = 1 ] || apt-get -o DPkg::Lock::Timeout=600 update -qq >/dev/null 2>&1 || true; act env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -qq "$@"
 	elif has dnf; then act dnf install -y -q "$@"
 	elif has yum; then act yum install -y -q "$@"
 	elif has apk; then act apk add --no-cache -q "$@"
@@ -1527,7 +1529,7 @@ do_uninstall_relay() {
 	[ -f "$NFT_CONF" ] && act sed -i "\#^include \"$NFT_RELAY\"\$#d" "$NFT_CONF"
 	if [ "${was_fwd:-1}" = 0 ]; then act sysctl -q -w net.ipv4.ip_forward=0; fi
 	if [ "${was_svc:-0}" = 1 ]; then svc disable nftables.service; fi
-	if [ "${was_pkg:-0}" = 1 ]; then act env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq nftables; fi
+	if [ "${was_pkg:-0}" = 1 ]; then act env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 remove -y -qq nftables; fi
 	act rm -f -- "$RELAY_STATE"
 	[ "$DRY" = 1 ] || step "relay removed: its table, files and the settings it added"
 }
@@ -1734,7 +1736,7 @@ web_caddy() {
 		fresh=1
 		if [ "$DRY" = 1 ]; then dry "install caddy from the system packages if they are 2.6 or newer, else from Caddy's apt repository (signing key from dl.cloudsmith.io)"
 		else
-			apt-get update -qq >/dev/null 2>&1 || true
+			apt-get -o DPkg::Lock::Timeout=600 update -qq >/dev/null 2>&1 || true
 			cand="$(apt-cache policy caddy 2>/dev/null | sed -n 's/^ *Candidate: //p')"
 			if [ -z "$cand" ] || [ "$cand" = "(none)" ] || ! dpkg --compare-versions "$cand" ge 2.6; then
 				info "the system's caddy is ${cand:-missing} (2.6 is needed): using Caddy's own apt repository"
@@ -1742,7 +1744,7 @@ web_caddy() {
 				curl -fsSL --proto '=https' --tlsv1.2 https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || die "cannot get Caddy's signing key"
 				printf '%s\n' "deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main" >/etc/apt/sources.list.d/caddy-stable.list
 				web_note caddy_repo 1
-				apt-get update -qq >/dev/null 2>&1 || die "apt-get update failed after adding Caddy's repository"
+				apt-get -o DPkg::Lock::Timeout=600 update -qq >/dev/null 2>&1 || die "apt-get update failed after adding Caddy's repository"
 			fi
 			web_pkg caddy
 		fi
@@ -1966,11 +1968,11 @@ do_uninstall_web() {
 	fi
 	for p in $pkgs; do case "$p" in caddy | nginx) svc stop "$p.service" || true ;; esac; done
 	# shellcheck disable=SC2086
-	[ -z "$pkgs" ] || act env DEBIAN_FRONTEND=noninteractive apt-get remove -y -qq $pkgs
+	[ -z "$pkgs" ] || act env DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 remove -y -qq $pkgs
 	[[ " $pkgs " == *" $web "* ]] || svc reload "$web.service" || true
 	if [ "$(web_state caddy_repo)" = 1 ]; then
 		act rm -f /etc/apt/sources.list.d/caddy-stable.list /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-		[ "$DRY" = 1 ] || apt-get update -qq >/dev/null 2>&1 || true
+		[ "$DRY" = 1 ] || apt-get -o DPkg::Lock::Timeout=600 update -qq >/dev/null 2>&1 || true
 	fi
 	moved="$(web_state node_moved)"; [ -n "$moved" ] || [ -z "$(web_state node_443_moved)" ] || moved="443 8443"; if [ -n "$moved" ]; then read -r from to <<<"$moved"; warn "the node's TCP transports stay on $to: move them back in the panel if you want $from"; fi
 	act rm -f -- "$WEB_STATE"
