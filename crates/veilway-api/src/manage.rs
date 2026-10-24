@@ -68,7 +68,7 @@ pub enum Restore {Put, Changed}
 pub(crate) fn digest(bytes: &[u8]) -> String {ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|byte| format!("{byte:02x}")).collect()}
 
 /// The trial file of a config file: the same name with `.trial` added. It holds keys and passwords, as the config does, and is written the way the config is.
-fn trial_file(config: &Path) -> PathBuf {
+pub fn trial_file(config: &Path) -> PathBuf {
 	let mut name = config.as_os_str().to_owned();
 	name.push(".trial");
 	name.into()

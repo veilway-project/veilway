@@ -310,7 +310,7 @@ export const en = {
 	"say.unreachable": "The server cannot be reached on this network. Trying another way.",
 	"say.silence": "The server did not answer. It may be down, or the network may be blocking it.",
 	"say.answered": "The network or the server answered, and it was not the connection. The app cannot tell which. It tries again later.",
-	"say.offline": "This computer has no working network connection.",
+	"say.offline": "Veilway could not use this device's network connection.",
 	"say.budget-spent": "Many addresses were tried on this network in the last hour. Waiting before trying more.",
 	"say.lost": "The connection to the server was lost. Reconnecting.",
 	"say.alpha-off": "This connection can only be made in a way that is still being tested, and that is switched off. Turn on Alpha transports in Settings to use it.",

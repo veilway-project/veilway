@@ -8,7 +8,7 @@
 //! Nothing here can skip a check, and no failure is tried again with fewer. Validity is held against the system's clock, never against a clock offset: an offset comes from a `Date`, and a `Date` is read only behind a certificate that was accepted.
 //! The dial address, the server name and the `Host` of the request are three fields of a candidate and are used as that: the address is dialled as it is, with no lookup. The protocol offered is `http/1.1` alone. The hello is a browser's, made by BoringSSL (`fingerprint.rs`), and the checks below run on what it brought back, the suite included: it must be key-agreed with an AEAD (`acceptable_cipher`).
 use crate::fingerprint::{self, Stream};
-use crate::{End, Ended, Front, Hook, Refuse, Unreachable};
+use crate::{offline, Ended, Front, Hook, Refuse, Unreachable};
 use boring::ssl::SslVersion;
 use ring::digest::{digest, SHA256};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -75,11 +75,11 @@ pub(crate) async fn tcp(candidate: &Front, hook: &Option<Hook>, deadline: Instan
 	let stream = match &candidate.connect {
 		Some(connect) => connect(candidate.address, deadline).await?,
 		None => {
-			let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|_| End::Offline)?;
-			if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|_| End::Offline)?}
+			let socket = if candidate.address.is_ipv4() {TcpSocket::new_v4()} else {TcpSocket::new_v6()}.map_err(|error| offline(&error))?;
+			if let Some(hook) = hook {hook(SockRef::from(&socket)).map_err(|error| offline(&error))?}
 			match timeout_at(deadline, socket.connect(candidate.address)).await {
 				Ok(Ok(stream)) => stream,
-				Ok(Err(error)) if matches!(error.kind(), ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::AddrNotAvailable | ErrorKind::NetworkDown) => return Err(End::Offline.into()),
+				Ok(Err(error)) if matches!(error.kind(), ErrorKind::NetworkUnreachable | ErrorKind::HostUnreachable | ErrorKind::AddrNotAvailable | ErrorKind::NetworkDown) => return Err(offline(&error).into()),
 				Ok(Err(_)) => return Err(Ended::Unreachable(Unreachable::Connect)),
 				Err(_) => return Err(Ended::Unreachable(Unreachable::Timeout)),
 			}

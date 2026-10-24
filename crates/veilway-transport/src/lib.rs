@@ -70,6 +70,20 @@ pub type Clock = Arc<dyn Fn() -> u64 + Send + Sync>;
 /// What a caller does to every socket of a session after it is made and before it is connected, for TCP and UDP alike: keep it out of its own tunnel, bind it to an interface, mark it for its firewall. A failure ends the attempt as `End::Offline`, and nothing is dialled.
 pub type Hook = Arc<dyn Fn(SockRef<'_>) -> std::io::Result<()> + Send + Sync>;
 
+const OFFLINE_LOG_EVERY: Duration = Duration::from_secs(60);
+static OFFLINE_LOG: Mutex<Option<(String, Instant)>> = Mutex::new(None);
+
+/// The end of an attempt whose device could not use a socket: the OS error is logged at info, once and again when its text changes or a minute has passed, so that a retry loop does not flood the log.
+pub fn offline(error: &std::io::Error) -> End {
+	let text = error.to_string();
+	let mut logged = OFFLINE_LOG.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+	if logged.as_ref().is_none_or(|(last, at)| *last != text || at.elapsed() >= OFFLINE_LOG_EVERY) {
+		tracing::info!(%error, "an engine socket could not be used, so the attempt ends as offline");
+		*logged = Some((text, Instant::now()));
+	}
+	End::Offline
+}
+
 /// Dials one address on the caller's behalf, through a proxy chain, before the deadline of the attempt: the stream a TCP transport of a link with a `via` runs over. It replaces the socket and its hook. What it fails with is the caller's classification of the failure: `End::Offline` where the node's own path failed, `Unreachable::Connect` where a candidate or a proxy after the first refused, and `Unreachable::Timeout` where the destination did not answer in time.
 pub type Connect = Arc<dyn Fn(SocketAddr, Instant) -> Pin<Box<dyn Future<Output = Result<TcpStream, Ended>> + Send>> + Send + Sync>;
 

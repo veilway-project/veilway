@@ -7,7 +7,7 @@ mod model;
 mod openapi;
 mod routes;
 
-pub use manage::{restore_trial, Restore};
+pub use manage::{restore_trial, trial_file, Restore};
 pub use openapi::openapi;
 
 use axum::body::{to_bytes, Body};

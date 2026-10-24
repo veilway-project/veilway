@@ -94,7 +94,7 @@ impl Say {
 			Self::Unreachable => "Could not reach the server on this network. Trying another way.",
 			Self::Silence => "The server did not answer. It may be down or the network may be blocking it.",
 			Self::Answered => "The network or the server answered and it was not the connection. The app cannot tell which. It tries again later.",
-			Self::Offline => "This device has no working network connection.",
+			Self::Offline => "Veilway could not use this device's network connection.",
 			Self::BudgetSpent => "Many addresses were tried on this network in the last hour. Waiting before trying more.",
 			Self::Lost => "The connection to the server was lost. Reconnecting.",
 			Self::NothingToTry => "Nothing in this connection can be used as it stands. Refresh the subscription or choose another connection.",

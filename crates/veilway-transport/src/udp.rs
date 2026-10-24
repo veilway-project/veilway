@@ -5,7 +5,7 @@
 //! Who makes what: the WireGuard layer makes every WireGuard datagram, the opening one and the idle keepalive included (`Want`). This module decides when one is due and wraps it.
 //!
 //! Outer packets are sent with fragmentation prohibited ("No outer fragmentation"). On Linux and Android the socket is put into the probing mode of path MTU discovery, the option the node sets. On other systems no dependency of the tree sets the option without `unsafe`: it is not set, a line at warn says so once for each session, and the rule is not kept there.
-use crate::{lone, pause, random, wide, Ask, End, Ended, Hook, Kind, Link, Port, Unreachable, Want, ATTEMPT};
+use crate::{lone, offline, pause, random, wide, Ask, End, Ended, Hook, Kind, Link, Port, Unreachable, Want, ATTEMPT};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use rustix::net::sockopt;
 use socket2::SockRef;
@@ -170,7 +170,7 @@ enum Event {Packet(std::io::Result<usize>), Send(Vec<u8>, Kind), Ask(Option<Ask>
 
 pub(crate) async fn run(port: &mut Port, link: &Link, to: SocketAddr) -> Ended {
 	let hook = port.env.socket.clone();
-	let Ok(mut socket) = bound(to, &hook).await else {return End::Offline.into()};
+	let mut socket = match bound(to, &hook).await {Ok(socket) => socket, Err(error) => return offline(&error).into()};
 	// The largest packet of the node is the `mtu` and 62 bytes, far below this. A longer datagram is cut by the system and then does not open.
 	let (mut machine, mut out, mut buf, mut failed, source, clock) = (Machine::new(link, Instant::now()), Vec::new(), [0u8; 2048], false, port.source.clone(), port.env.now.clone());
 	let mut ask = move |want| source.lock().ok().and_then(|mut source| source(want));
@@ -210,7 +210,7 @@ pub(crate) async fn run(port: &mut Port, link: &Link, to: SocketAddr) -> Ended {
 					socket = fresh;
 					machine.moved(&mut io)
 				}
-				Err(_) => return End::Offline.into(),
+				Err(error) => return offline(&error).into(),
 			},
 			// There is nothing to say to the node: a session of `udp-obfs` ends by its idle time. What the caller handed over before it closed goes out first.
 			Event::Ask(Some(Ask::Power)) => Ok(()),

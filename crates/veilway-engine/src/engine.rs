@@ -493,7 +493,7 @@ impl Core {
 		#[allow(unused_mut)]
 		let Some(mut to) = endpoints.get(candidate).map(|endpoint| endpoint.address()) else {return Err(Ended::Unreachable(Unreachable::Connect))};
 		if let Some(redirect) = &self.settings.hooks.redirect {to = redirect(to)}
-		veilway_transport::udp::bound(to, &self.settings.socket).await.map_err(|_| Ended::Closed(End::Offline))
+		veilway_transport::udp::bound(to, &self.settings.socket).await.map_err(|error| Ended::Closed(veilway_transport::offline(&error)))
 	}
 	// One attempt: one candidate, or two raced. A candidate that wins is carried for as long as its session lasts.
 	async fn attempt(&mut self, transport: usize, picks: Vec<usize>, added: &[usize]) -> Done {

@@ -537,6 +537,60 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			},
 		}
 	}
+	// The management of node links (node links page, "Managing a node"): a node that manages another asks it through the link, and a managed node counts what its manager asked and keeps a config on trial until the manager confirms it.
+	#[cfg(unix)]
+	{
+		let managed: Vec<(usize, &config::Link)> = config.links.iter().enumerate().filter(|(_, link)| link.enabled != Some(false) && link.manage.is_some()).collect();
+		if managed.iter().any(|(_, link)| link.manage == Some(config::LinkManage::ByPeer)) {
+			let trial = veilway_api::trial_file(file);
+			lines.push(match std::fs::read(&trial) {
+				Err(e) if e.kind() == io::ErrorKind::NotFound => line(Status::Ok, "trial", trial.display().to_string(), "no config is on trial"),
+				Err(e) => line(Status::Warn, "trial", trial.display().to_string(), format!("it cannot be read ({}): a node that starts reads it to put back the config from before a push", e.kind())),
+				Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|saved| Some((saved["link"].as_str()?.to_string(), saved["due"].as_u64()?))) {
+					None => line(Status::Warn, "trial", trial.display().to_string(), "it is not a trial file of this version: a node that starts reads it, so look at it before the next start"),
+					Some((tag, due)) if due as i64 > now => line(Status::Warn, "trial", trial.display().to_string(), format!("a config pushed through link {tag} is on trial for {} s more. It is put back at the deadline unless the managing node confirms it through the link, so check that the link is up", due as i64 - now)),
+					Some((tag, _)) => line(Status::Warn, "trial", trial.display().to_string(), format!("a config pushed through link {tag} is on trial and its deadline has passed: the config from before the push is put back at the next start, unless the config file has changed since the push")),
+				},
+			});
+		}
+		let socket = api.as_deref().filter(|_| answering);
+		let listed = match socket.filter(|_| !managed.is_empty()) {
+			Some(socket) => veilway_api::request(socket, "GET", "/v1/links", None, wait).await.ok().filter(|(status, _)| *status == 200).and_then(|(_, body)| serde_json::from_slice::<serde_json::Value>(&body).ok()),
+			None => None,
+		};
+		for (i, link) in managed {
+			let subject = format!("link {}", link.tag);
+			let reported = listed.as_ref().and_then(|answer| answer["links"].as_array()).and_then(|links| links.iter().find(|reported| reported["tag"] == link.tag.as_str()));
+			let (state, secs) = (reported.and_then(|reported| reported["state"].as_str()), reported.and_then(|reported| reported["state_secs"].as_u64()).unwrap_or(0));
+			if link.manage == Some(config::LinkManage::Peer) {
+				lines.push(match (socket, state) {
+					(None, _) => line(Status::Skipped, "manage", subject.as_str(), "no node answers on the control socket, so the management relay is not tried: run doctor again while the node runs"),
+					(Some(socket), None | Some("up")) => match veilway_api::request(socket, "GET", &format!("/v1/links/{}/api/v1/status", link.tag), None, wait).await {
+						Ok((200, _)) => line(Status::Ok, "manage", subject.as_str(), "the managed node answers its control API through the link"),
+						Ok((code, body)) => {
+							let error = serde_json::from_slice::<serde_json::Value>(&body).unwrap_or_default();
+							line(Status::Fail, "manage", subject.as_str(), format!("the managed node did not answer through the link ({code} {}): {}", error["error"]["code"].as_str().unwrap_or("?"), error["error"]["message"].as_str().unwrap_or("no message")))
+						}
+						Err(e) => line(Status::Warn, "manage", subject.as_str(), format!("the relay through the link gave no answer ({e}): run doctor again, and look at the log of this node if it repeats")),
+					},
+					(Some(_), Some(state)) => {
+						let reach = if link.listener() {format!("the other server can reach this one on {}", config.inbounds.iter().filter(|inbound| Some(&inbound.tag) == link.inbound.as_ref()).flat_map(|inbound| &inbound.transports).filter(|transport| transport.on()).map(|transport| transport.listen().to_string()).collect::<Vec<_>>().join(" or "))} else {format!("this server can reach the other one at the address in links[{i}].peer")};
+						line(if state == "ended" {Status::Fail} else {Status::Warn}, "manage", subject.as_str(), format!("the link is {state} for {secs} s, so the managed node cannot be reached through it: check that {reach}"))
+					}
+				});
+			}
+			if link.manage == Some(config::LinkManage::ByPeer) {
+				lines.push(match (socket, reported) {
+					(None, _) => line(Status::Skipped, "manage", subject.as_str(), "no node answers on the control socket, so its management counters are not told: run doctor again while the node runs"),
+					(Some(_), None) => line(Status::Warn, "manage", subject.as_str(), "the node that runs did not list the link, so its management counters are not told"),
+					(Some(_), Some(reported)) => match (reported["management"]["refused"].as_u64().unwrap_or(0), reported["management"]["denied"].as_u64().unwrap_or(0)) {
+						(0, 0) => line(Status::Ok, "manage", subject.as_str(), "no connection of the managing node was refused and no request of it was denied since start"),
+						(refused, denied) => line(Status::Warn, "manage", subject.as_str(), format!("the managing node had {refused} refused and {denied} denied since start. A refusal is a fifth connection at once or a node that runs without its control API; a denial is a request for a route a managed node does not serve, which means the two nodes run different versions. Check that this node runs its control API and that both nodes run the same version")),
+					},
+				});
+			}
+		}
+	}
 	// An exit on a direct outbound and an l3 exit with `masquerade` send the queries of the node's resolver from the node itself.
 	let direct = config.exits.iter().any(|exit| match &exit.backend {
 		Backend::Netstack(netstack) => config.outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Direct {tag, ..} if *tag == netstack.outbound)),

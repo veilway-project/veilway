@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream, UdpSocket};
 
@@ -199,6 +200,13 @@ fn status<'a>(document: &'a Value, check: &str, subject: &str) -> &'a str {
 	let found: Vec<&Value> = document["checks"].as_array().unwrap().iter().filter(|line| line["check"] == check && line["subject"].as_str().unwrap().starts_with(subject)).collect();
 	assert_eq!(found.len(), 1, "{check} {subject} in {document:#}");
 	found[0]["status"].as_str().unwrap()
+}
+
+/// The message of the one check of the JSON document whose subject begins with `subject`.
+fn message<'a>(document: &'a Value, check: &str, subject: &str) -> &'a str {
+	let found: Vec<&Value> = document["checks"].as_array().unwrap().iter().filter(|line| line["check"] == check && line["subject"].as_str().unwrap().starts_with(subject)).collect();
+	assert_eq!(found.len(), 1, "{check} {subject} in {document:#}");
+	found[0]["message"].as_str().unwrap()
 }
 
 fn listing(dir: &Path) -> BTreeSet<String> {std::fs::read_dir(dir).unwrap().map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect()}
@@ -780,6 +788,83 @@ async fn a_link_is_looked_at_without_dialling_it() {
 		assert_eq!((status(&parsed, "link", "clock"), status(&parsed, "link", "links[0]"), status(&parsed, "link", "state")), ("ok", check, "skipped"), "{parsed:#}");
 		// The secret and the private key of the link are in no line.
 		assert!(!printed.contains(&key(0x41)) && !printed.contains(&key(0x31)));
+	}
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A node on `path` that answers each route with its status and body, and 404 to any other route.
+fn routed(path: &Path, routes: Vec<(String, u16, String)>) -> tokio::task::JoinHandle<()> {
+	let listener = tokio::net::UnixListener::bind(path).unwrap();
+	tokio::spawn(async move {
+		loop {
+			let Ok((mut stream, _)) = listener.accept().await else {continue};
+			let routes = routes.clone();
+			tokio::spawn(async move {
+				let mut request = [0u8; 1024];
+				let read = stream.read(&mut request).await.unwrap_or(0);
+				let asked = String::from_utf8_lossy(&request[..read]).split(' ').nth(1).unwrap_or_default().to_string();
+				let (status, body) = routes.iter().find(|(route, _, _)| *route == asked).map_or((404, String::new()), |(_, status, body)| (*status, body.clone()));
+				let _ = stream.write_all(format!("HTTP/1.1 {status} routed\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).as_bytes()).await;
+			});
+		}
+	})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_link_is_looked_at_by_the_node_that_manages_and_by_the_node_it_manages() {
+	let (dir, server) = (scratch("manage"), dns(false).await);
+	let (socket, key) = (dir.join("veilway.sock"), |byte: u8| veilway_wg::encode_key(&[byte; 32]));
+	let routes = json!({"version": 1, "dns": {"servers": [server.to_string()]}, "outbounds": [{"tag": "plain", "type": "direct"}], "routing": {"default": "main", "rules": [{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}, {"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]}, "users": [{"name": "a", "exits": "all", "devices": [{"name": "phone", "public_key": key(0x21), "addresses": ["10.7.0.2"]}]}]});
+	let home = json!([{"tag": "home", "type": "wireguard", "private_key": key(0x11), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": free().to_string()}]}]);
+	let managing = json!({"inbounds": home, "exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}, {"tag": "far", "backend": {"type": "chain", "links": ["far"]}}], "links": [{"tag": "far", "id": "AAECAwQFBgcICQoLDA0ODw", "direction": "forward", "manage": "peer", "addresses": {"dialler": ["10.9.0.2"], "listener": ["10.9.0.3"]}, "transport_secret": key(0x41), "private_key": key(0x31), "peer": {"inbound_public_key": key(0x61), "transports": [{"type": "udp-obfs", "endpoints": ["203.0.113.9:51821"]}]}}]});
+	let managed = json!({"inbounds": [home[0], {"tag": "links", "type": "veilway", "private_key": key(0x12), "address": ["10.9.0.1/24"], "transports": [{"type": "udp-obfs", "listen": free().to_string()}]}], "exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}], "links": [{"tag": "far", "id": "AAECAwQFBgcICQoLDA0ODw", "direction": "reverse", "manage": "by_peer", "addresses": {"dialler": ["10.9.0.2"], "listener": ["10.9.0.3"]}, "inbound": "links", "public_key": key(0x62), "transport_secret": key(0x41)}]});
+	let with = |extra: &Value| {let mut document = routes.clone(); document.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); document.to_string()};
+	let running = json!({"revision": "0".repeat(64), "generation": 1, "document": {"version": 1, "inbounds": [], "exits": []}}).to_string();
+	let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+	// Nothing is dialled and no node runs: the managing link is skipped, and the managed one tells whether a config is on trial.
+	private(&dir, "config.json", &with(&managed));
+	let (_, printed, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	let parsed: Value = serde_json::from_str(&printed).unwrap();
+	assert_eq!((status(&parsed, "trial", ""), status(&parsed, "manage", "link far")), ("ok", "skipped"), "{parsed:#}");
+	assert!(message(&parsed, "trial", "").contains("no config is on trial"), "{parsed:#}");
+	private(&dir, "config.json.trial", &json!({"link": "far", "due": now + 600, "pushed": "0".repeat(64), "previous": {}}).to_string());
+	let (_, printed, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	let parsed: Value = serde_json::from_str(&printed).unwrap();
+	assert_eq!(status(&parsed, "trial", ""), "warn", "{parsed:#}");
+	assert!(message(&parsed, "trial", "").contains("on trial for"), "{parsed:#}");
+	private(&dir, "config.json.trial", &json!({"link": "far", "due": now - 5, "pushed": "0".repeat(64), "previous": {}}).to_string());
+	let (_, printed, _) = doctor(&dir, &["--json", "--no-api"]).await;
+	let parsed: Value = serde_json::from_str(&printed).unwrap();
+	assert_eq!(status(&parsed, "trial", ""), "warn", "{parsed:#}");
+	assert!(message(&parsed, "trial", "").contains("deadline has passed"), "{parsed:#}");
+	std::fs::remove_file(dir.join("config.json.trial")).unwrap();
+	// The managing node asks the managed one through the link: the link has to be up and the relayed status has to answer.
+	private(&dir, "config.json", &with(&managing));
+	let refused = json!({"error": {"code": "peer_refused", "message": "The other node reset the connection: it does not serve management on this link, or runs without a control API."}}).to_string();
+	for (state, relay, want, said) in [("up", (200, json!({"status": "ok"}).to_string()), "ok", "answers its control API"), ("up", (502, refused), "fail", "peer_refused"), ("connecting", (404, String::new()), "warn", "cannot be reached")] {
+		let answer = json!({"links": [{"tag": "far", "state": state, "state_secs": 42, "management": {"refused": 0, "denied": 0}}]}).to_string();
+		let node = routed(&socket, vec![("/v1/config".to_string(), 200, running.clone()), ("/v1/links".to_string(), 200, answer), ("/v1/links/far/api/v1/status".to_string(), relay.0, relay.1)]);
+		let (_, printed, _) = doctor(&dir, &["--json"]).await;
+		node.abort();
+		let _ = node.await;
+		std::fs::remove_file(&socket).unwrap();
+		let parsed: Value = serde_json::from_str(&printed).unwrap();
+		assert_eq!(status(&parsed, "manage", "link far"), want, "{parsed:#}");
+		assert!(message(&parsed, "manage", "link far").contains(said), "{parsed:#}");
+	}
+	// The managed node counts what its manager asked: refused and denied are said, and a config on trial is still reported with the node running.
+	private(&dir, "config.json", &with(&managed));
+	private(&dir, "config.json.trial", &json!({"link": "far", "due": now + 600, "pushed": "0".repeat(64), "previous": {}}).to_string());
+	for (refused, denied, want, said) in [(0, 0, "ok", "no connection of the managing node was refused"), (2, 1, "warn", "had 2 refused and 1 denied")] {
+		let answer = json!({"links": [{"tag": "far", "state": "up", "state_secs": 42, "management": {"refused": refused, "denied": denied}}]}).to_string();
+		let node = routed(&socket, vec![("/v1/config".to_string(), 200, running.clone()), ("/v1/links".to_string(), 200, answer)]);
+		let (_, printed, _) = doctor(&dir, &["--json"]).await;
+		node.abort();
+		let _ = node.await;
+		std::fs::remove_file(&socket).unwrap();
+		let parsed: Value = serde_json::from_str(&printed).unwrap();
+		assert_eq!((status(&parsed, "manage", "link far"), status(&parsed, "trial", "")), (want, "warn"), "{parsed:#}");
+		assert!(message(&parsed, "manage", "link far").contains(said), "{parsed:#}");
 	}
 	std::fs::remove_dir_all(&dir).unwrap();
 }
