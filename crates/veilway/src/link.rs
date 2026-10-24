@@ -251,7 +251,7 @@ pub async fn remove(path: &Path, tag: &str, empty: bool, yes: bool, apply: Optio
 	let socket = apply.map(|api| api.unwrap_or_else(|| path.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 	let wait = Duration::from_secs(30);
 	// The running config comes with its secrets as markers, which the node takes back as they are; the file has them in full.
-	let (revision, mut doc) = match &socket {
+	let (revision, mut doc): (Option<String>, Value) = match &socket {
 		#[cfg(unix)]
 		Some(socket) => match veilway_api::request(socket, "GET", "/v1/config", None, wait).await {
 			Ok((200, body)) => {
