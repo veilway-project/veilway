@@ -386,7 +386,15 @@ A theme is a small JSON file (`.veilway-theme`) of color tokens plus glass tint 
 8. If there is room: `ws-plain` with the media appearance, bonded connections, the gateway's timing measurement the subscription format requires before it leaves draft, and a design for certificates from the panel (ACME) without a probe surface.
 9. Design only, no build: the `dns` transport (the table above), WebRTC carriers through allowed calling services, and domestic CDN pull zones as a documented setup.
 
-## v0.3.0: the first beta
+## v0.3.0: several nodes from one panel
+
+The owner cut v0.3.0 to this one feature on 2026-10-24.
+
+Several nodes from one panel, asked for by the owner on 2026-10-24: one panel pushes its users and their device keys to more than one node, with an address pool per node, and a subscription carries one profile per node (each with its own address, keys and pins). Usage and quotas add up across nodes so one user's limit holds everywhere; a node that is down never blocks changes to the others and catches up at its next sync. Pairing a node to a panel is authenticated both ways. Threat model section first.
+
+## After v0.3.0
+
+Moved out of v0.3.0 by the owner on 2026-10-24, which holds only several nodes from one panel. Still wanted, with no release set:
 
 Asked for by the owner on 2026-10-23, after v0.2.17: Xray outbounds through the add-on (VLESS, VMess, Trojan and Shadowsocks as outbound types behind a `netstack` exit, TCP and UDP only, the node writing Xray's config); a plugin system, which needs signed packages, a sandbox and its own threat model section before any code; a plugin marketplace on top of it, with review and signatures from the project; and the `dns` transport as an add-on, built on the design that v0.2.0 item 9 asked for, with its own review of what it costs third-party resolvers.
 
@@ -405,8 +413,6 @@ GeoIP and geosite as the "GeoIP and geosite" section above describes: the data f
 Outbound chaining: an outbound and a node link get one optional `via` naming another outbound, so a `socks5` outbound can dial through another (any length) and a link can reach the other node through a proxy when the direct path is blocked. A loop or a missing name is a config error. TCP transports of a link go through any `socks5` outbound; UDP ones need the proxy's UDP ASSOCIATE and are refused with a clear error otherwise. Spec page first, then code, tests and the panel's forms.
 
 Split tunneling in the apps, chosen per subscription and kept on the device: by app (Android through `VpnService` allowed and disallowed apps; Linux by putting the chosen programs in a cgroup that the policy routing and the kill switch know; Windows by WFP filters on the program's path; macOS by address and name only, since per-app needs a NetworkExtension) and by address or name on every platform (routes plus the node-side DNS memory). Two modes: everything through the tunnel except the chosen ones, or only the chosen ones. The kill switch keeps blocking whatever is meant for the tunnel while it is down, and a provider can forbid the second mode in the signed profile.
-
-Several nodes from one panel, asked for by the owner on 2026-10-24: one panel pushes its users and their device keys to more than one node, with an address pool per node, and a subscription carries one profile per node (each with its own address, keys and pins). Usage and quotas add up across nodes so one user's limit holds everywhere; a node that is down never blocks changes to the others and catches up at its next sync. Pairing a node to a panel is authenticated both ways. Threat model section first.
 
 ## Real devices (no release set)
 
