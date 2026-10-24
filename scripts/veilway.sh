@@ -985,6 +985,7 @@ do_install() {
 		both) install_node; install_panel ;;
 		mirror) install_mirror ;;
 	esac
+	[ "$what" != node ] || [ "$DRY" = 1 ] || info "to let a panel manage this node, run: sudo -u veilway $BIN_DIR/veilway link answer --config $NODE_DIR/config.json --tag panel --apply=/run/veilway/control.sock"
 	printf '\n'
 	step "done. Check the state any time with: sudo bash veilway.sh status"
 }
