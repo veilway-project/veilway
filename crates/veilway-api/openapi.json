@@ -4454,7 +4454,7 @@
             "description": "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1."
           }
         },
-        "summary": "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link."
+        "summary": "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link, except the removal of the node: no users and no such link, answered 202 before it goes into force two seconds later, since the answer goes back through that link."
       }
     },
     "/v1/openapi.json": {

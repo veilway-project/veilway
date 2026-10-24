@@ -27,7 +27,7 @@ use platform::vault::SecretVault;
 #[cfg(target_os = "linux")]
 use platform::dns::Restored;
 use platform::{Applied, Options, Routes, Stop};
-use veilway_proto::subscription::client::{Held, Offer, Permit, Standing};
+use veilway_proto::subscription::client::{Held, Offer, Permit, Refreshed, Standing};
 use veilway_proto::subscription::payload::Id;
 use veilway_proto::subscription::Tag;
 use veilway_proto::subscription::{legacy, payload::private};
@@ -41,6 +41,8 @@ pub struct Connect {
 	#[arg(long)] subscription: Option<String>,
 	/// Which connection of the subscription, when it has more than one. For pasted links of other apps: the number of the link, from 1
 	#[arg(long)] profile: Option<String>,
+	/// Ask the provider for the latest copy of the subscription before connecting, so that new connections and changed addresses are used. When it cannot be reached, the copy this device has is used
+	#[arg(long)] refresh: bool,
 	/// Send only this network through the tunnel (and the tunnel's own gateway), and let the rest leave as it always did. Repeat for more. Without it everything goes through the tunnel
 	#[arg(long = "route")] routes: Vec<IpNet>,
 	/// Let programs reach devices on the networks this device is connected to (a printer, the router) outside the tunnel: only the private subnets it is on, not the whole private ranges. The network can see that traffic. Without it the local network goes through the tunnel. Names are still only asked through the tunnel
@@ -402,18 +404,36 @@ pub async fn connect(args: Connect) -> anyhow::Result<()> {
 	for _ in damaged {eprintln!("A stored subscription does not read any more and is left out.")}
 	if let Some(source) = &args.source {import_source(&mut library, source, &mut signals).await?}
 	if library.held().is_empty() {bail!("There is no subscription yet. Run `veilway connect <link>` with the link your provider gave you.")}
-	let held = match &args.subscription {
-		Some(prefix) => library.held().iter().find(|held| held.id().as_str().starts_with(prefix.as_str())).ok_or_else(|| anyhow!("No subscription starts with {prefix}."))?,
-		None if library.held().len() == 1 => &library.held()[0],
+	let at = match &args.subscription {
+		Some(prefix) => library.held().iter().position(|held| held.id().as_str().starts_with(prefix.as_str())).ok_or_else(|| anyhow!("No subscription starts with {prefix}."))?,
+		None if library.held().len() == 1 => 0,
 		None => bail!("More than one subscription is held, pick one with --subscription: {}", library.held().iter().map(|held| format!("{} ({})", short(held.id()), held.subscription().provider.as_str())).collect::<Vec<_>>().join(", ")),
 	};
+	if args.refresh {
+		let fetcher = Fetcher::new(default_roots(), None);
+		for asked in [false, true] {
+			match fetcher.refresh(&mut library, at, now()).await {
+				Ok(Refreshed::Unchanged) => eprintln!("The subscription is up to date."),
+				Ok(Refreshed::Updated(_)) => eprintln!("The subscription was refreshed."),
+				Err(import::ImportError::PrivateEndpoint {addresses, ..}) if !asked => {
+					eprintln!("This subscription is on a private address ({}). Only continue if you run this server yourself, for example at home.", addresses.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
+					if !ask("Refresh from it?", &mut signals).await? {break}
+					library.allow_private(at, &addresses).context("the choice could not be saved")?;
+					continue
+				}
+				Err(error) => eprintln!("The subscription could not be refreshed, so the copy on this device is used: {}", error.text()),
+			}
+			break
+		}
+	}
+	let held = &library.held()[at];
 	let profiles = &held.subscription().profiles;
 	let profile = match &args.profile {
 		Some(id) => profiles.iter().find(|profile| &profile.id == id).ok_or_else(|| anyhow!("The subscription has no connection with the id {id}."))?,
 		None if profiles.len() == 1 => &profiles[0],
 		None => bail!("The subscription has more than one connection, pick one with --profile: {}", profiles.iter().map(|profile| format!("{} ({})", profile.id, profile.name.as_str())).collect::<Vec<_>>().join(", ")),
 	};
-	if held.standing(now()) != Standing::Current {eprintln!("This subscription is out of date. It keeps working; refresh it when you can.")}
+	if held.standing(now()) != Standing::Current {eprintln!("This subscription is out of date. It keeps working; connect with --refresh when the provider can be reached.")}
 	if held.subscription().has_unknown_transport() {eprintln!("This subscription offers a way of connecting this app does not know. Update the app to use it.")}
 	let permit = match held.connect(now()) {
 		Ok(permit) => permit,

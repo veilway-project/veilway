@@ -758,9 +758,11 @@ async fn a_config_that_would_cut_the_managing_link_is_refused_and_a_removal_with
 	let mut gone = config["document"].clone();
 	gone["links"] = json!([]);
 	let (status, answer) = relay(&mine, "PUT", "/v1/config", &[("if-match", config["revision"].as_str().unwrap())], Some(gone.to_string().into_bytes())).await;
-	// The answer goes back through the link the document removed, so it may never arrive: the panel reads the revision instead.
-	assert!(status == 200 || code(&answer) == "peer_silent", "{status} {answer}");
-	assert!(net.remote().links().is_empty());
+	// The answer is sent before the removal goes into force, since it goes back through the link the document removes.
+	assert_eq!(status, 202, "{answer}");
+	assert_eq!(net.remote().links().len(), 1, "the removal was applied before its answer left");
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	assert!(net.remote().links().is_empty(), "the removal was not applied");
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	assert!(net.remote().links().is_empty(), "a removal was put back");
 	net.end().await;
