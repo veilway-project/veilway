@@ -392,6 +392,8 @@ The owner cut v0.3.0 to this one feature on 2026-10-24.
 
 Several nodes from one panel, asked for by the owner on 2026-10-24: one panel pushes its users and their device keys to more than one node, with an address pool per node, and a subscription carries one profile per node (each with its own address, keys and pins). Usage and quotas add up across nodes so one user's limit holds everywhere; a node that is down never blocks changes to the others and catches up at its next sync. Pairing a node to a panel is authenticated both ways. Threat model section first.
 
+Decided by the owner on 2026-10-24, from the design: a remote node always dials the panel (sealed requests to the panel's subscription endpoint, end-to-end sealed with keys made at pairing; nothing new listens on a node, and the node next to the panel stays on its unix socket); quotas count what the other nodes counted, so one limit holds everywhere and a small overrun is accepted; a node that cannot reach the panel keeps serving its last users and limits; transport secrets and proxy passwords are derived per node, so a seized node gives nothing usable on another; remote nodes see opaque user ids, the first node keeps the names. A node's profile appears in a document once that node has the device; sync through relay mirrors and links, and automatic choice between nodes in the apps, come after v0.3.0; a down node's inbounds and exits cannot be edited, while users and devices always can; the single-node API routes stay as node 1 until v0.4.0.
+
 ## After v0.3.0
 
 Moved out of v0.3.0 by the owner on 2026-10-24, which holds only several nodes from one panel. Still wanted, with no release set:
