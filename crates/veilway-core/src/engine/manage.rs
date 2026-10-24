@@ -133,16 +133,20 @@ pub enum Standing {
 	Changed(&'static str),
 }
 
-/// "A document in which that link is missing, disabled, or has a different `id`, keys, addresses, `manage`, `inbound` or `peer`." `running` is the config in force and `id` the link the request came through.
+/// "A document in which that link is missing, disabled, or has a different `id`, `direction`, keys, addresses, `manage`, `transport_secret`, `inbound` or `peer`, or an inbound that differs in what the link is carried by (its whole content: the key, the transports and their listen addresses)." `running` is the config in force and `id` the link the request came through.
 pub fn standing(running: &Config, pushed: &Config, id: [u8; 16]) -> Standing {
 	let Some(held) = running.links.iter().find(|link| link.id.0 == id) else {return Standing::Kept};
 	let Some(now) = pushed.links.iter().find(|link| link.id.0 == id) else {return Standing::Removed};
+	let inbound = |config: &Config| held.inbound.as_ref().and_then(|tag| config.inbounds.iter().find(|inbound| inbound.tag == *tag)).cloned();
 	match () {
 		_ if now.enabled == Some(false) => Standing::Changed("it is disabled"),
 		_ if now.manage != held.manage => Standing::Changed("its manage is not what it was"),
+		_ if now.direction != held.direction => Standing::Changed("its direction is not what it was"),
 		_ if now.addresses != held.addresses => Standing::Changed("its addresses are not what they were"),
 		_ if now.inbound != held.inbound => Standing::Changed("its inbound is not what it was"),
+		_ if inbound(running) != inbound(pushed) => Standing::Changed("the inbound it is carried by is not what it was"),
 		_ if now.public_key != held.public_key || now.private_key != held.private_key => Standing::Changed("its keys are not what they were"),
+		_ if now.transport_secret != held.transport_secret => Standing::Changed("its transport secret is not what it was"),
 		_ if now.peer != held.peer => Standing::Changed("its peer is not what it was"),
 		_ => Standing::Kept,
 	}
@@ -442,6 +446,21 @@ impl Shared {
 	pub(super) fn manage_denied(&self, tag: &str) {
 		if let Some(link) = self.plan().links.iter().find(|link| matches!(link.carrier, Carrier::Paired) && link.tag == tag) {link.state.manage.denied.fetch_add(1, Ordering::Relaxed);}
 	}
+
+	/// How long ago the last WireGuard handshake of link `tag` completed on this node, None when it has none.
+	pub(super) fn manage_heard(&self, tag: &str) -> Option<Duration> {
+		let plan = self.plan();
+		plan.links.iter().position(|link| matches!(link.carrier, Carrier::Paired) && link.tag == tag).and_then(|at| plan.handshake(at))
+	}
+
+	/// Ends the session of link `tag` when this node dials it, and forgets its WireGuard session, so the next session opens with a handshake under the config in force. A link this node listens for has nothing to end here: the node that dials it makes the new session.
+	pub(super) fn manage_renew(&self, tag: &str) {
+		let plan = self.plan();
+		let Some(link) = plan.links.iter().find(|link| matches!(link.carrier, Carrier::Paired) && link.tag == tag && link.dialled.is_some()) else {return};
+		plan.inbounds[link.inbound].tunnel.lock().wg.drop_sessions(&link.key);
+		link.state.renew.notify_one();
+		tracing::info!("link {tag}: a config was pushed through it, so its session ends and the next one opens with a handshake");
+	}
 }
 
 /// One request and its answer on a stream, read as hostile input: HTTP/1.1 with a `Content-Length`, bounded, three headers kept.
@@ -580,6 +599,12 @@ mod tests {
 		assert_eq!(pushed(&|next| next["links"][0]["addresses"]["dialler"] = serde_json::json!(["10.9.0.9"])), Standing::Changed("its addresses are not what they were"));
 		assert_eq!(pushed(&|next| drop(next["links"][0].as_object_mut().unwrap().remove("manage"))), Standing::Changed("its manage is not what it was"));
 		assert_eq!(pushed(&|next| next["links"][0]["public_key"] = serde_json::json!(key(0x32))), Standing::Changed("its keys are not what they were"));
+		assert_eq!(pushed(&|next| next["links"][0]["transport_secret"] = serde_json::json!(key(0x42))), Standing::Changed("its transport secret is not what it was"));
+		assert_eq!(pushed(&|next| next["inbounds"][0]["transports"][0]["listen"] = serde_json::json!("127.0.0.1:10")), Standing::Changed("the inbound it is carried by is not what it was"));
+		assert_eq!(pushed(&|next| next["inbounds"][0]["private_key"] = serde_json::json!(key(0x12))), Standing::Changed("the inbound it is carried by is not what it was"));
+		let mut reversed = running.clone();
+		reversed.links[0].direction = crate::config::LinkDirection::Reverse;
+		assert_eq!(standing(&running, &reversed, id), Standing::Changed("its direction is not what it was"));
 		doc["links"][0]["id"] = serde_json::json!("AQECAwQFBgcICQoLDA0ODw");
 		assert_eq!(standing(&running, &Config::parse(doc.to_string().as_bytes()).unwrap(), id), Standing::Removed);
 	}

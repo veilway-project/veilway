@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
@@ -193,10 +193,42 @@ async fn apply(State(api): State<Arc<Api>>, request: Request) -> Response {
 		Err(_) => return Failure::late(&api).into_response(),
 	};
 	let previous = via.as_ref().filter(|_| !removal).and_then(|_| serde_json::to_vec_pretty(&*snapshot.config).ok());
-	match api.engine.apply(bytes, snapshot.revision, &api.config).await {
+	// What changes the trial of a link runs to its end on a task of its own: the request may be gone by the time the config is in force, since a reload ends the session that carried it, and the trial must still be saved, kept in step with its file and rolled back in time.
+	// The trial of a push is saved before the push is applied, so that a restart once the new config is in force finds the config before in the file next to the config. Everything that changes the trial happens under its lock.
+	let task = tokio::spawn({
+		let (api, via) = (api.clone(), via.clone());
+		async move {
+			let mut trial = api.trial.lock().await;
+			let due = SystemTime::now() + api.limits.trial;
+			let pushed = manage::digest(&bytes);
+			let kept = match (&via, &previous) {
+				(Some(via), Some(before)) => {
+					let kept = trial.as_ref().filter(|pending| pending.link == via.id).map_or_else(|| before.clone(), |pending| pending.previous.clone());
+					if let Err(e) = manage::save(&api.config, &via.tag, &kept, &pushed, due) {return Err(Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "trial_unsaved", format!("The trial of the config could not be saved next to the config file ({}), so nothing was changed.", e.kind())))}
+					Some(kept)
+				}
+				_ => None,
+			};
+			let outcome = api.engine.apply(bytes, snapshot.revision, &api.config).await;
+			match (matches!(&outcome, Ok((applied, _)) if applied.snapshot.revision != snapshot.revision), &via, kept, &outcome) {
+				// On trial: put back after `limits.trial` unless a request confirms it through the link, see `manage::gate`.
+				(true, Some(via), Some(kept), Ok((applied, _))) => api.on_trial(&mut trial, via, kept, pushed, applied.snapshot.revision, due),
+				// A change that starts no trial ends the trial in force: its rollback would be refused, since the config has changed since. A link removed with its node has none left to put back.
+				(true, ..) => *trial = None,
+				_ => {}
+			}
+			if let Err(e) = manage::mirror(&api.config, trial.as_ref()) {tracing::error!("control api: the trial file of the config could not be written ({}): a restart would not put the config before back", e.kind())}
+			drop(trial);
+			Ok(outcome)
+		}
+	});
+	let outcome = match task.await {
+		Ok(Ok(outcome)) => outcome,
+		Ok(Err(failure)) => return failure.into_response(),
+		Err(_) => return Failure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "The change did not finish.").into_response(),
+	};
+	match outcome {
 		Ok((applied, saved)) => {
-			// On trial: put back after `limits.trial` unless the other node asks for anything through the link first. A document that changed nothing has nothing to put back.
-			if let (Some(via), Some(previous)) = (&via, previous) {if applied.snapshot.revision != snapshot.revision {api.on_trial(via, previous, applied.snapshot.revision)}}
 			if let Err(e) = &saved {tracing::error!("control api: config generation {} is in force and could not be written to {} ({}): a restart comes back with the config before", applied.snapshot.generation, api.config.display(), e.kind())}
 			let mut response = json(StatusCode::OK, &model::Applied {revision: applied.snapshot.revision.to_string(), generation: applied.snapshot.generation, saved: saved.is_ok(), save_error: saved.err().map(|e| e.kind().to_string()), diff: (&applied.diff).into(), report: (&applied.report).into()});
 			if let Ok(tag) = HeaderValue::from_str(&format!("\"{}\"", applied.snapshot.revision)) {response.headers_mut().insert(ETAG, tag);}
@@ -564,15 +596,15 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 	let mut confirm = route::<model::UpstreamConfirmed, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/confirm", "confirmUpstream", "Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting.", confirm_upstream, true, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a confirmation takes. Nothing was changed."), (StatusCode::INTERNAL_SERVER_ERROR, "state_unwritten: the state file of the upstreams could not be written, so the answer is not kept.")]);
 	confirm.body = Some((schemas.subschema_for::<model::UpstreamConfirm>(), false));
 	let relayed = |schemas: &mut SchemaGenerator, method: Method, operation: &'static str, summary: &'static str| {
-		let mut relay = route::<serde_json::Value, _, _>(schemas, method.clone(), RELAY, operation, summary, manage::relay, false, &[(StatusCode::NOT_FOUND, "no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves."), (StatusCode::FORBIDDEN, "not_managed: the link does not have manage peer on this node."), (StatusCode::BAD_GATEWAY, "peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself."), (StatusCode::GATEWAY_TIMEOUT, "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made.")]);
-		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::SERVICE_UNAVAILABLE) {response.1 = "link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself."}
+		let mut relay = route::<serde_json::Value, _, _>(schemas, method.clone(), RELAY, operation, summary, manage::relay, false, &[(StatusCode::NOT_FOUND, "no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1."), (StatusCode::FORBIDDEN, "not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1."), (StatusCode::BAD_GATEWAY, "peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it."), (StatusCode::GATEWAY_TIMEOUT, "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1.")]);
+		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::SERVICE_UNAVAILABLE) {response.1 = "link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it."}
 		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream."}
 		if method == Method::PUT || method == Method::POST {relay.body = Some((schemars::json_schema!({"description": "The body of the call to the other node, as the call takes it, up to 4 MiB. It is forwarded as it is, and the other node reads it.", "type": "object"}), false))}
 		if method == Method::PUT {relay.responses.push((StatusCode::PRECONDITION_REQUIRED, "The answer of the other node itself: an apply of its config needs If-Match.", Some(schemas.subschema_for::<model::ErrorBody>())))}
 		relay
 	};
 	let relay_get = relayed(schemas, Method::GET, "relayGet", "Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it.");
-	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: unless a request comes through the same link within 120 seconds, the config before is back. A document that would cut the link this request came through is refused with 422 managing_link.");
+	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link.");
 	let relay_post = relayed(schemas, Method::POST, "relayPost", "The same call with POST.");
 	let relay_delete = relayed(schemas, Method::DELETE, "relayDelete", "The same call with DELETE.");
 	vec![

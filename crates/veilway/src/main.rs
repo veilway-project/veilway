@@ -283,6 +283,9 @@ async fn main() -> anyhow::Result<()> {
 			Ok(())
 		}
 		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, xray_dir, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+			// A config pushed by the managing node and not confirmed before the last stop is put back before the config is read.
+			#[cfg(unix)]
+			let restored = veilway_api::restore_trial(&config)?;
 			let (loaded, report) = veilway_core::config::load(&config, false);
 			let failed = print(&report, &config);
 			let Some(loaded) = loaded.filter(|_| !failed) else {std::process::exit(1)};
@@ -294,6 +297,11 @@ async fn main() -> anyhow::Result<()> {
 			#[cfg_attr(not(unix), allow(unused_variables))]
 			let (level, relog) = tracing_subscriber::reload::Layer::new(filter(&loaded.log));
 			tracing_subscriber::registry().with(level).with(tracing_subscriber::fmt::layer()).init();
+			#[cfg(unix)]
+			if let Some(restore) = restored {match restore {
+				veilway_api::Restore::Put => tracing::info!("a config pushed by the managing node was not confirmed before the restart and is rolled back"),
+				veilway_api::Restore::Changed => tracing::info!("a config pushed by the managing node was not confirmed before the restart, and the config file has changed since the push: the file is kept as it is"),
+			}}
 			// SIGTERM is how a service manager and `docker stop` end the node. An l3 exit has firewall rules and sysctls to take back before it goes, so it stops the node the way Ctrl-C does. SIGHUP reads the config file again.
 			#[cfg(unix)]
 			let (mut terminate, mut hangup) = (tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?, tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?);

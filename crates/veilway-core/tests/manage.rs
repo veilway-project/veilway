@@ -285,13 +285,13 @@ fn opened(packet: &[u8]) -> bool {segment(packet).is_some_and(|(tcp, _)| tcp.syn
 fn reset(packet: &[u8]) -> bool {segment(packet).is_some_and(|(tcp, _)| tcp.rst)}
 
 /// Two nodes with a managed link between them. Node 1 manages. `user` is alice's device on the entry, when the entry is node 1.
-struct Net {node1: Arc<Engine>, remote: Option<Arc<Engine>>, node1_api: Option<Server>, remote_api: Option<Server>, node1_dir: PathBuf, remote_dir: PathBuf, pair: Pair, home: SocketAddr, user: Option<Peer>, remote_doc: Value, roots: Arc<RootCertStore>, time: Time, trial: Duration, _site: Site}
+struct Net {node1: Arc<Engine>, remote: Option<Arc<Engine>>, node1_api: Option<Server>, remote_api: Option<Server>, node1_dir: PathBuf, remote_dir: PathBuf, pair: Pair, home: SocketAddr, user: Option<Peer>, remote_doc: Value, roots: Arc<RootCertStore>, time: Time, trial: Duration, renew: Duration, settle: Duration, _site: Site}
 
-/// What `up` is asked for: the link's direction and transport, whether node 1 is the entry, whether the control API runs, how long a pushed config is on trial on the remote, and whether the remote starts at all.
-struct Setup {forward: bool, over: Over, node1_entry: bool, api: bool, trial: Duration, remote: bool, change: fn(&mut Value)}
+/// What `up` is asked for: the link's direction and transport, whether node 1 is the entry, whether the control API runs, the timers of a pushed config on trial on the remote (how long it is on trial, when its session is renewed, and how soon after the push a request may confirm it), how many relays node 1 runs at once, and whether the remote starts at all.
+struct Setup {forward: bool, over: Over, node1_entry: bool, api: bool, trial: Duration, renew: Duration, settle: Duration, relays: usize, remote: bool, change: fn(&mut Value)}
 
 impl Setup {
-	fn new(forward: bool, over: Over, node1_entry: bool) -> Setup {Setup {forward, over, node1_entry, api: true, trial: Duration::from_secs(120), remote: true, change: |_| {}}}
+	fn new(forward: bool, over: Over, node1_entry: bool) -> Setup {Setup {forward, over, node1_entry, api: true, trial: Duration::from_secs(120), renew: Duration::from_secs(1), settle: Duration::from_secs(2), relays: 8, remote: true, change: |_| {}}}
 }
 
 async fn up(test: &'static str, want: Setup, time: Time) -> Net {
@@ -311,9 +311,9 @@ async fn up(test: &'static str, want: Setup, time: Time) -> Net {
 		let remote = if want.remote {Some(run(&remote_doc, &remote_dir, time, &roots).await)} else {None};
 		(run(&node1_doc, &node1_dir, time, &roots).await, remote)
 	};
-	let node1_api = want.api.then(|| serve(&node1, &node1_dir, Limits {request: Duration::from_secs(8), ..Limits::default()}));
-	let remote_api = remote.as_ref().filter(|_| want.api).map(|remote| serve(remote, &remote_dir, Limits {trial: want.trial, ..Limits::default()}));
-	let mut net = Net {node1, remote, node1_api, remote_api, node1_dir, remote_dir, pair, home, user: None, remote_doc, roots, time, trial: want.trial, _site: site};
+	let node1_api = want.api.then(|| serve(&node1, &node1_dir, Limits {request: Duration::from_secs(8), relays: want.relays, ..Limits::default()}));
+	let remote_api = remote.as_ref().filter(|_| want.api).map(|remote| serve(remote, &remote_dir, Limits {trial: want.trial, renew: want.renew, settle: want.settle, ..Limits::default()}));
+	let mut net = Net {node1, remote, node1_api, remote_api, node1_dir, remote_dir, pair, home, user: None, remote_doc, roots, time, trial: want.trial, renew: want.renew, settle: want.settle, _site: site};
 	if want.remote {net.arrive().await}
 	net
 }
@@ -342,7 +342,7 @@ impl Net {
 	/// Starts the remote of a net that was started without it, with its control API.
 	async fn start_remote(&mut self) {
 		let remote = run(&self.remote_doc, &self.remote_dir, self.time, &self.roots).await;
-		self.remote_api = Some(serve(&remote, &self.remote_dir, Limits {trial: self.trial, ..Limits::default()}));
+		self.remote_api = Some(serve(&remote, &self.remote_dir, Limits {trial: self.trial, renew: self.renew, settle: self.settle, ..Limits::default()}));
 		self.remote = Some(remote);
 		self.arrive().await;
 	}
@@ -364,13 +364,39 @@ async fn call(socket: &Path, method: &str, path: &str, headers: &[(&str, &str)],
 /// A request through the link `far` of the node whose socket is `socket`, to the other node's `path`.
 async fn relay(socket: &Path, method: &str, path: &str, headers: &[(&str, &str)], body: Option<Vec<u8>>) -> (u16, Value) {call(socket, method, &format!("/v1/links/far/api{path}"), headers, body).await}
 
+/// GET through the link until it answers 200, which it does once the link is up again after a push. The answer is the body of the first 200.
+async fn settled(socket: &Path, path: &str) -> Value {
+	let deadline = Instant::now() + Duration::from_secs(30);
+	loop {
+		let (status, answer) = relay(socket, "GET", path, &[], None).await;
+		if status == 200 {return answer}
+		assert!(Instant::now() < deadline, "GET {path} through the link did not answer 200 in 30 s: {status} {answer}");
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+}
+
+/// The whole answer to one GET on the socket at `socket`, with its status line and headers as they came.
+async fn raw(socket: &Path, path: &str) -> String {
+	let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+	stream.write_all(format!("GET {path} HTTP/1.1\r\nhost: veilway\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+	let mut answer = String::new();
+	stream.read_to_string(&mut answer).await.unwrap();
+	answer
+}
+
+/// Starts a node again from the document `doc` on the files of `dir`, as a restart does. The UDP port of a node that was stopped in this process is not let go, so the caller moves the listener of the link to a port that is free.
+async fn restarted(doc: &Value, dir: &Path, time: Time, roots: &Arc<RootCertStore>) -> Arc<Engine> {
+	let config = parsed(doc);
+	Arc::new(veilway_core::start(&config, Options {now: time.now, replay: Some(dir.join("replay")), roots: Some(roots.clone()), ..Options::new(dir)}).await.unwrap_or_else(|e| panic!("the node did not start again: {e:#}")))
+}
+
 fn code(answer: &Value) -> &str {answer["error"]["code"].as_str().unwrap_or("")}
 
 fn ask(method: &str, path: &str, body: Vec<u8>) -> manage::Request {manage::Request {method: method.to_string(), path: path.to_string(), query: None, if_match: None, content_type: Some("application/json".to_string()), body, within: Duration::from_secs(100)}}
 
 /// What every direction and transport must do: the other node's own answers come through the link, a config is read and replaced with its revision, and the counters of both sides say so.
 async fn works(test: &'static str, forward: bool, over: Over, node1_entry: bool) {
-	let net = up(test, Setup {trial: Duration::from_secs(3), ..Setup::new(forward, over, node1_entry)}, time!()).await;
+	let net = up(test, Setup {trial: Duration::from_secs(8), ..Setup::new(forward, over, node1_entry)}, time!()).await;
 	let (mine, theirs) = (net.socket(false), net.socket(true));
 	let (status, through) = relay(&mine, "GET", "/v1/status", &[], None).await;
 	let (_, direct) = call(&theirs, "GET", "/v1/status", &[], None).await;
@@ -386,10 +412,11 @@ async fn works(test: &'static str, forward: bool, over: Over, node1_entry: bool)
 	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
 	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
 	assert_eq!((status, &applied["generation"], &applied["saved"]), (200, &json!(2), &json!(true)), "{applied}");
-	// The request that follows is the confirmation: the config is still the new one after the trial would have ended.
-	let (_, after) = relay(&mine, "GET", "/v1/status", &[], None).await;
+	// The link makes its session again after the push, and a request from the settle time on, over that session, confirms the config: it is still the new one after the trial would have ended.
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let after = settled(&mine, "/v1/status").await;
 	assert_eq!(after["revision"], applied["revision"]);
-	tokio::time::sleep(Duration::from_secs(4)).await;
+	tokio::time::sleep(Duration::from_secs(6)).await;
 	assert_eq!((net.remote().snapshot().generation, net.remote().snapshot().config.dns.servers.len()), (2, 1), "a confirmed config was put back");
 	// A stale revision is the remote's own refusal, with its code, through the link.
 	let (status, stale) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
@@ -726,8 +753,8 @@ async fn a_config_that_would_cut_the_managing_link_is_refused_and_a_removal_with
 	let mut same = document.clone();
 	same["exits"][0]["name"] = json!("Main");
 	assert_eq!(relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(same.to_string().into_bytes())).await.0, 200);
-	let (_, config) = relay(&mine, "GET", "/v1/config", &[], None).await;
-	// "Remove node": no users, no link. It is not put on trial, so it is not put back.
+	let config = settled(&mine, "/v1/config").await;
+	// "Remove node": no users, no link. It is not put on trial, so it is not put back, and the trial of the change before it goes with it.
 	let mut gone = config["document"].clone();
 	gone["links"] = json!([]);
 	let (status, answer) = relay(&mine, "PUT", "/v1/config", &[("if-match", config["revision"].as_str().unwrap())], Some(gone.to_string().into_bytes())).await;
@@ -772,10 +799,11 @@ async fn a_config_pushed_through_the_link_is_put_back_when_nothing_follows_it() 
 	assert_eq!(net.remote().snapshot().config.dns.servers, before);
 	let file: Value = serde_json::from_slice(&std::fs::read(net.remote_dir.join("config.json")).unwrap()).unwrap();
 	assert_eq!(file["dns"]["servers"], json!(["1.1.1.1:53"]));
-	// The link was never cut: the next request goes through and shows the old config.
-	assert_eq!(relay(&mine, "GET", "/v1/config", &[], None).await.1["document"]["dns"]["servers"], json!(["1.1.1.1:53"]));
+	assert!(!net.remote_dir.join("config.json.trial").exists(), "the trial file stayed after the rollback");
+	// The link was never cut: it comes back after the new session, and shows the old config.
+	assert_eq!(settled(&mine, "/v1/config").await["document"]["dns"]["servers"], json!(["1.1.1.1:53"]));
 	// A config somebody changed at the remote since is not put back over theirs.
-	let (_, config) = relay(&mine, "GET", "/v1/config", &[], None).await;
+	let config = settled(&mine, "/v1/config").await;
 	let mut next = config["document"].clone();
 	next["dns"]["servers"] = json!(["9.9.9.9:53"]);
 	assert_eq!(relay(&mine, "PUT", "/v1/config", &[("if-match", config["revision"].as_str().unwrap())], Some(next.to_string().into_bytes())).await.0, 200);
@@ -788,41 +816,225 @@ async fn a_config_pushed_through_the_link_is_put_back_when_nothing_follows_it() 
 	net.end().await;
 }
 
-/// The push that moves the port the link is dialled at: node 1 can neither reach the remote nor confirm, and the remote puts its config back by itself. With `back`, waits for the link to come back too, which is the dialler's own recovery and takes minutes.
-async fn moves_the_port(test: &'static str, back: bool) {
-	let net = up(test, Setup {trial: Duration::from_secs(2), ..Setup::new(true, Over::Obfs, true)}, time!()).await;
+// "Refused at once (422 managing_link)": the listen port and the key of the inbound the link is carried by are held to what the link depends on, with the whole inbound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_that_moves_the_listen_port_or_changes_the_key_of_the_link_is_refused_at_once() {
+	let net = up("manage-port", Setup::new(true, Over::Obfs, true), time!()).await;
 	let mine = net.socket(false);
-	let (_, config) = relay(&mine, "GET", "/v1/config", &[], None).await;
-	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
-	let wanted = document["inbounds"][0]["transports"][0]["listen"].clone();
-	document["inbounds"][0]["transports"][0]["listen"] = json!(SocketAddr::new(outward(), port()).to_string());
-	let started = Instant::now();
-	let (status, answer) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
-	println!("the push that moves the port: {status} {} after {:?}", code(&answer), started.elapsed());
-	assert!(net.remote().snapshot().generation >= 2, "the push was not applied");
-	let deadline = Instant::now() + Duration::from_secs(20);
-	while net.remote().snapshot().generation < 3 {
-		assert!(Instant::now() < deadline, "the remote did not put its config back");
-		tokio::time::sleep(Duration::from_millis(100)).await;
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	let mut moved = document.clone();
+	moved["inbounds"][0]["transports"][0]["listen"] = json!(SocketAddr::new(outward(), port()).to_string());
+	let mut rekeyed = document.clone();
+	rekeyed["inbounds"][0]["private_key"] = json!(text(&OTHER));
+	for (what, doc) in [("the listen port", moved), ("the key", rekeyed)] {
+		let (status, answer) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(doc.to_string().into_bytes())).await;
+		assert_eq!((status, code(&answer)), (422, "managing_link"), "{what}: {answer}");
 	}
-	assert_eq!(serde_json::to_value(&*net.remote().snapshot().config).unwrap()["inbounds"][0]["transports"][0]["listen"], wanted);
-	println!("the config was back {:?} after the push", started.elapsed());
-	if back {
-		// The link comes back, as any link does when the other node is there, and node 1 manages the remote again.
-		let deadline = Instant::now() + Duration::from_secs(400);
-		while net.node1.links()[0].status != Status::Up || relay(&mine, "GET", "/v1/status", &[], None).await.0 != 200 {
-			assert!(Instant::now() < deadline, "the link did not come back in 400 s: {:?}", net.node1.links());
-			tokio::time::sleep(Duration::from_millis(500)).await;
-		}
-		println!("the link was managed again {:?} after the push", started.elapsed());
-	}
+	assert_eq!(net.remote().snapshot().generation, 1, "something was applied");
+	assert!(!net.remote_dir.join("config.json.trial").exists(), "a refused push left a trial file");
+	assert_eq!(settled(&mine, "/v1/status").await["generation"], json!(1));
 	net.end().await;
 }
 
-// "Catches what guard 1 cannot judge (the listen port or transports of the link inbound)."
+// "Every relayed PUT is applied on trial": a push that breaks the next session is put back, however soon requests come after it, since they travel on the session the push began with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_push_that_moves_the_ports_of_the_link_is_put_back_by_the_remote_itself() {moves_the_port("manage-port", false).await}
+async fn a_push_that_breaks_the_next_session_is_put_back_even_when_requests_follow_it() {
+	let net = up("manage-break", Setup {trial: Duration::from_secs(6), ..Setup::new(false, Over::Tls, true)}, time!()).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	// The remote dials node 1 through a SOCKS5 outbound that refuses. Guard 1 does not look at the outbound of a link, so the push is applied on trial.
+	document["outbounds"].as_array_mut().unwrap().push(json!({"tag": "dead", "type": "socks5", "server": SocketAddr::new(outward(), port()).to_string()}));
+	document["links"][0]["via"] = json!("dead");
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	// The remote restarts the session of a link whose outbound changed, so the answer may be cut off: the push is then read from the remote, as the panel does.
+	assert!(matches!(status, 200 | 502 | 504), "{status} {applied}");
+	assert!(net.remote().snapshot().generation >= 2, "the push was not applied");
+	let started = Instant::now();
+	while net.remote().snapshot().generation < 3 {
+		assert!(started.elapsed() < Duration::from_secs(20), "the config was not put back");
+		let _ = relay(&mine, "GET", "/v1/status", &[], None).await;
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	assert!(net.remote().snapshot().config.links[0].via.is_none(), "the outbound of the link was not put back");
+	assert!(!net.remote_dir.join("config.json.trial").exists(), "the trial file stayed after the rollback");
+	assert_eq!(settled(&mine, "/v1/status").await["generation"], json!(3));
+	net.end().await;
+}
 
+// "A request confirms a config on trial only from the settle time on": requests that come before it do not, even over a session the push made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "real time: the dialler finds the other node again by its own waits, which takes minutes"]
-async fn a_push_that_moves_the_ports_of_the_link_is_put_back_and_the_link_comes_back() {moves_the_port("manage-port-back", true).await}
+async fn requests_before_the_settle_time_do_not_confirm_a_config_on_trial() {
+	// Requests sent up to 6 s after the push reach the remote within 10 s of being sent (a management connection gives up then), so all of them arrive before the settle time of 20 s.
+	let net = up("manage-early", Setup {trial: Duration::from_secs(30), settle: Duration::from_secs(20), ..Setup::new(false, Over::Obfs, true)}, time!()).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	assert_eq!((status, &applied["generation"]), (200, &json!(2)), "{applied}");
+	let started = Instant::now();
+	let mut answered = 0;
+	while started.elapsed() < Duration::from_secs(6) {
+		if let Ok((200, _)) = tokio::time::timeout(Duration::from_millis(500), relay(&mine, "GET", "/v1/status", &[], None)).await {answered += 1}
+		tokio::time::sleep(Duration::from_millis(250)).await;
+	}
+	assert!(answered > 0, "no request reached the remote before the settle time, so the test proves nothing");
+	let started = Instant::now();
+	while net.remote().snapshot().generation < 3 {
+		assert!(started.elapsed() < Duration::from_secs(40), "the config was not put back");
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert_eq!(serde_json::to_value(&net.remote().snapshot().config.dns.servers).unwrap(), json!(["1.1.1.1:53"]), "an early request confirmed the config");
+	assert!(!net.remote_dir.join("config.json.trial").exists(), "the trial file stayed after the rollback");
+	net.end().await;
+}
+
+// "A request from the settle time on, over a session the push made, confirms the config on trial, which then stays."
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_from_the_settle_time_on_confirms_a_config_on_trial() {
+	let net = up("manage-settle", Setup {trial: Duration::from_secs(6), settle: Duration::from_secs(2), ..Setup::new(false, Over::Obfs, true)}, time!()).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	assert_eq!((status, &applied["generation"]), (200, &json!(2)), "{applied}");
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let after = settled(&mine, "/v1/status").await;
+	assert_eq!(after["revision"], applied["revision"]);
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	assert_eq!((net.remote().snapshot().generation, serde_json::to_value(&net.remote().snapshot().config.dns.servers).unwrap()), (2, json!(["9.9.9.9:53"])), "a confirmed config was put back");
+	net.end().await;
+}
+
+// "The routes with a name are served through a link": the router takes the templates of the list as they are, and a name is answered by the remote's own handler.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_routes_with_a_name_are_served_through_the_link() {
+	let net = up("manage-names", Setup::new(true, Over::Obfs, false), time!()).await;
+	let mine = net.socket(false);
+	let (status, user) = relay(&mine, "GET", "/v1/users/alice", &[], None).await;
+	assert_eq!((status, &user["name"]), (200, &json!("alice")), "{user}");
+	let (status, missing) = relay(&mine, "GET", "/v1/users/x", &[], None).await;
+	assert_eq!((status, code(&missing)), (404, "user_not_found"), "{missing}");
+	let (status, missing) = relay(&mine, "POST", "/v1/users/x/usage/reset", &[], None).await;
+	assert_eq!((status, code(&missing)), (404, "user_not_found"), "{missing}");
+	let (status, reset) = relay(&mine, "POST", "/v1/users/alice/usage/reset", &[], None).await;
+	assert_eq!((status, &reset["name"]), (200, &json!("alice")), "{reset}");
+	assert_eq!(net.node1.links()[0].management.denied, 0, "a route with a name was turned away");
+	net.end().await;
+}
+
+// "A fifth waits up to 5 s, then 503 busy": the places are one count for all links of the node, and a relay past them waits 5 s and is busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_past_the_places_of_the_node_is_busy() {
+	let net = up("manage-places", Setup {relays: 1, ..Setup::new(true, Over::Obfs, true)}, time!()).await;
+	let standing = stand_in(net.remote(), |_, _| Reply::Hold);
+	let mine = net.socket(false);
+	let held = tokio::spawn({
+		let mine = mine.clone();
+		async move {relay(&mine, "GET", "/v1/status", &[], None).await}
+	});
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	let started = Instant::now();
+	let (status, answer) = relay(&mine, "GET", "/v1/status", &[], None).await;
+	assert_eq!((status, code(&answer)), (503, "busy"), "{answer}");
+	assert!(started.elapsed() >= Duration::from_secs(4) && started.elapsed() < Duration::from_secs(7), "{:?}", started.elapsed());
+	assert_eq!(held.await.unwrap().0, 504);
+	standing.task.abort();
+	net.end().await;
+}
+
+// "Node 1's own answers of the relay route carry `veilway-relay: node1`, which the other node cannot set: its answer crosses the relay with status, ETag and Content-Type only."
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn node_1s_relay_answers_say_so_and_the_other_nodes_do_not() {
+	let own = up("manage-header-own", Setup {remote: false, ..Setup::new(true, Over::Obfs, true)}, time!()).await;
+	let answer = raw(&own.socket(false), "/v1/links/far/api/v1/status").await;
+	assert!(answer.starts_with("HTTP/1.1 503") && answer.contains("link_down") && answer.to_ascii_lowercase().contains("veilway-relay: node1"), "{answer}");
+	own.end().await;
+	let net = up("manage-header-theirs", Setup::new(true, Over::Obfs, true), time!()).await;
+	let standing = stand_in(net.remote(), |_, _| {
+		let body = r#"{"error":{"code":"link_down","message":"the other node says so","details":[]}}"#;
+		Reply::Raw(format!("HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len()).into_bytes())
+	});
+	let answer = raw(&net.socket(false), "/v1/links/far/api/v1/status").await;
+	assert!(answer.starts_with("HTTP/1.1 503") && answer.contains("the other node says so") && !answer.to_ascii_lowercase().contains("veilway-relay"), "{answer}");
+	standing.task.abort();
+	net.end().await;
+}
+
+// "A config on trial is saved next to the config file until it is confirmed": a restart before that puts the config before back, and the file goes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_on_trial_is_put_back_by_a_restart_before_it_is_confirmed() {
+	let time = time!();
+	let mut net = up("manage-restart", Setup::new(true, Over::Obfs, true), time).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	assert_eq!((status, &applied["generation"]), (200, &json!(2)), "{applied}");
+	let (config_file, trial_file) = (net.remote_dir.join("config.json"), net.remote_dir.join("config.json.trial"));
+	let saved: Value = serde_json::from_slice(&std::fs::read(&trial_file).expect("the trial was not saved next to the config")).unwrap();
+	assert_eq!(saved["previous"]["dns"]["servers"], json!(["1.1.1.1:53"]));
+	assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&trial_file).unwrap().permissions()) & 0o777, 0o600);
+	// The node stops before the push is confirmed, and starts again from the same files.
+	net.remote_api.take().unwrap().shutdown().await;
+	Arc::try_unwrap(net.remote.take().unwrap()).ok().expect("something still holds the remote").shutdown().await;
+	assert_eq!(veilway_api::restore_trial(&config_file).unwrap(), Some(veilway_api::Restore::Put), "there was no trial file to restore");
+	assert!(!trial_file.exists(), "the trial file stayed");
+	let mut doc: Value = serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+	doc["inbounds"][0]["transports"][0]["listen"] = json!(SocketAddr::new(outward(), port()).to_string());
+	net.remote = Some(restarted(&doc, &net.remote_dir, time, &net.roots).await);
+	net.remote_api = Some(serve(net.remote(), &net.remote_dir, Limits {trial: net.trial, renew: net.renew, settle: net.settle, ..Limits::default()}));
+	let (_, config) = call(&net.socket(true), "GET", "/v1/config", &[], None).await;
+	assert_eq!((&config["document"]["dns"]["servers"], net.remote().snapshot().generation), (&json!(["1.1.1.1:53"]), 1), "{config}");
+	assert!(!trial_file.exists(), "the trial file came back");
+	net.end().await;
+}
+
+// "A confirmed trial leaves no file behind": the file goes with the confirmation, before the answer to the request that confirmed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_confirmed_trial_leaves_nothing_behind() {
+	let net = up("manage-confirm", Setup::new(true, Over::Obfs, true), time!()).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	assert_eq!((status, &applied["generation"]), (200, &json!(2)), "{applied}");
+	assert!(net.remote_dir.join("config.json.trial").exists(), "the trial was not saved");
+	tokio::time::sleep(Duration::from_secs(3)).await;
+	let after = settled(&mine, "/v1/status").await;
+	assert_eq!(after["revision"], applied["revision"]);
+	assert!(!net.remote_dir.join("config.json.trial").exists(), "a confirmed trial left its file");
+	net.end().await;
+}
+
+// "The config file is kept as it is when it was changed since the push": a restart puts back nothing over a change made by hand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_changed_since_a_push_on_trial_is_kept_by_a_restart() {
+	let time = time!();
+	let mut net = up("manage-changed", Setup::new(true, Over::Obfs, true), time).await;
+	let mine = net.socket(false);
+	let config = settled(&mine, "/v1/config").await;
+	let (revision, mut document) = (config["revision"].as_str().unwrap().to_string(), config["document"].clone());
+	document["dns"]["servers"] = json!(["9.9.9.9:53"]);
+	let (status, applied) = relay(&mine, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes())).await;
+	assert_eq!((status, &applied["generation"]), (200, &json!(2)), "{applied}");
+	let (config_file, trial_file) = (net.remote_dir.join("config.json"), net.remote_dir.join("config.json.trial"));
+	net.remote_api.take().unwrap().shutdown().await;
+	Arc::try_unwrap(net.remote.take().unwrap()).ok().expect("something still holds the remote").shutdown().await;
+	let mut by_hand: Value = serde_json::from_slice(&std::fs::read(&config_file).unwrap()).unwrap();
+	by_hand["dns"]["servers"] = json!(["8.8.8.8:53"]);
+	std::fs::write(&config_file, by_hand.to_string()).unwrap();
+	assert_eq!(veilway_api::restore_trial(&config_file).unwrap(), Some(veilway_api::Restore::Changed));
+	assert!(!trial_file.exists(), "the trial file stayed");
+	by_hand["inbounds"][0]["transports"][0]["listen"] = json!(SocketAddr::new(outward(), port()).to_string());
+	net.remote = Some(restarted(&by_hand, &net.remote_dir, time, &net.roots).await);
+	net.remote_api = Some(serve(net.remote(), &net.remote_dir, Limits {trial: net.trial, renew: net.renew, settle: net.settle, ..Limits::default()}));
+	let (_, config) = call(&net.socket(true), "GET", "/v1/config", &[], None).await;
+	assert_eq!((&config["document"]["dns"]["servers"], net.remote().snapshot().generation), (&json!(["8.8.8.8:53"]), 1), "{config}");
+	net.end().await;
+}

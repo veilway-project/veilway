@@ -670,6 +670,12 @@ impl Engine {
 	/// The control API turned a request for the link `tag` away for its route: counted with the link's management counters.
 	pub fn manage_denied(&self, tag: &str) {self.shared.manage_denied(tag)}
 
+	/// How long ago this node last completed a WireGuard handshake with the other end of the link `tag`, None when it has none. A config pushed through the link is confirmed only by a handshake made after the push, see `manage`.
+	pub fn manage_heard(&self, tag: &str) -> Option<std::time::Duration> {self.shared.manage_heard(tag)}
+
+	/// Ends the session of the link `tag` when this node dials it, so the next one is made under the config in force, see `manage`. Nothing happens for a link this node listens for.
+	pub fn manage_renew(&self, tag: &str) {self.shared.manage_renew(tag)}
+
 	/// Every enabled upstream of the config that runs, in its order, with its state, its reason when it is not up and its numbers. No key, no secret and no link.
 	pub fn upstreams(&self) -> Vec<upstream::Report> {self.plan().upstreams().iter().map(|state| state.report()).collect()}
 

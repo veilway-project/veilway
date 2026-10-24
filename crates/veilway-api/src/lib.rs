@@ -7,6 +7,7 @@ mod model;
 mod openapi;
 mod routes;
 
+pub use manage::{restore_trial, Restore};
 pub use openapi::openapi;
 
 use axum::body::{to_bytes, Body};
@@ -72,12 +73,18 @@ pub struct Limits {
 	pub sample: Duration,
 	/// How long a request through a node link may take when it is the preview of an upstream, which waits for the provider.
 	pub preview: Duration,
-	/// How long a config that was pushed through a node link is on trial: it is put back after this unless a request comes through the same link first.
+	/// How long a config that was pushed through a node link is on trial: it is put back after this unless a request comes through the same link, over a WireGuard session made after the push and `settle` after it.
 	pub trial: Duration,
+	/// How long after a push through a node link the session of that link is ended, when this node dials the link, so that the next session is made under the config. The answer to the push goes back first.
+	pub renew: Duration,
+	/// How long after a push through a node link a request must come to confirm the config on trial.
+	pub settle: Duration,
+	/// Relays through node links at once, across all of them. One more waits 5 seconds for a place and is then answered `busy`.
+	pub relays: usize,
 }
 
 impl Default for Limits {
-	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256, sample: Duration::from_secs(1), preview: Duration::from_secs(75), trial: Duration::from_secs(120)}}
+	fn default() -> Limits {Limits {body: 4 << 20, connections: 64, streams: 32, request: Duration::from_secs(30), keep_alive: Duration::from_secs(15), events: 256, sample: Duration::from_secs(1), preview: Duration::from_secs(75), trial: Duration::from_secs(120), renew: Duration::from_secs(2), settle: Duration::from_secs(10), relays: 8}}
 }
 
 pub struct Options {
@@ -109,9 +116,11 @@ pub(crate) struct Api {
 	pub samples: Mutex<VecDeque<Sample>>,
 	/// The snapshot the last `stats` event stands for, as JSON.
 	latest: RwLock<Arc<str>>,
-	/// The config applied through a node link that is not confirmed yet, see `manage`, and a count that tells one trial from the next.
-	pub trial: Mutex<Option<manage::Trial>>,
+	/// The config applied through a node link that is not confirmed yet, see `manage`, and a count that tells one trial from the next. Held for every change of a trial and of its file, see `manage::mirror`.
+	pub trial: tokio::sync::Mutex<Option<manage::Trial>>,
 	pub trials: AtomicU64,
+	/// The relays through node links that may run at once, across all links, see `Limits::relays`.
+	pub relays: Arc<Semaphore>,
 }
 
 impl Api {
@@ -287,11 +296,11 @@ pub fn serve(engine: Arc<Engine>, options: Options) -> io::Result<Server> {
 	let _ = fs::remove_file(&staged);
 	let _ = fs::remove_dir(&staging);
 	let (listener, identity) = made.map_err(|e| io::Error::new(e.kind(), format!("the control socket {} cannot be made: {e}", path.display())))?;
-	let api = Arc::new(Api {engine, config, streams: Arc::new(Semaphore::new(limits.streams)), checks: Arc::new(Semaphore::new(CHECKS)), events: broadcast::Sender::new(limits.events.max(1)), sent: AtomicU64::new(0), samples: Mutex::default(), latest: RwLock::new(Arc::from("{}")), trial: Mutex::default(), trials: AtomicU64::new(0), limits});
+	let api = Arc::new(Api {engine, config, streams: Arc::new(Semaphore::new(limits.streams)), checks: Arc::new(Semaphore::new(CHECKS)), events: broadcast::Sender::new(limits.events.max(1)), sent: AtomicU64::new(0), samples: Mutex::default(), latest: RwLock::new(Arc::from("{}")), trial: tokio::sync::Mutex::default(), trials: AtomicU64::new(0), relays: Arc::new(Semaphore::new(limits.relays)), limits});
 	let router = routes::routes(&mut SchemaGenerator::default()).into_iter().fold(Router::new(), |router, route| router.route(route.path, route.handler)).fallback(routes::unknown).method_not_allowed_fallback(routes::not_allowed).layer(axum::middleware::from_fn_with_state(api.clone(), routes::deadline)).with_state(api.clone());
 	// What a node that is managed serves to the node that manages it, through its link: the routes of the allowlist alone, and the same limits.
 	let quit = Arc::new(Notify::new());
-	let managed = manage::serve(&api, routes::routes(&mut SchemaGenerator::default()).into_iter().filter(|route| manage::allowed(&route.method, route.path)).fold(Router::new(), |router, route| router.route(route.path, route.handler)).fallback(routes::unknown).method_not_allowed_fallback(routes::not_allowed).layer(axum::middleware::from_fn_with_state(api.clone(), routes::deadline)).layer(axum::middleware::from_fn_with_state(api.clone(), manage::gate)).with_state(api.clone()), quit.clone());
+	let managed = manage::serve(&api, routes::routes(&mut SchemaGenerator::default()).into_iter().filter(|route| manage::ALLOWED.iter().any(|(method, path)| *method == route.method.as_str() && *path == route.path)).fold(Router::new(), |router, route| router.route(route.path, route.handler)).fallback(routes::unknown).method_not_allowed_fallback(routes::not_allowed).layer(axum::middleware::from_fn_with_state(api.clone(), routes::deadline)).layer(axum::middleware::from_fn_with_state(api.clone(), manage::gate)).with_state(api.clone()), quit.clone());
 	let stop = Arc::new(Notify::new());
 	let accept = tokio::spawn({
 		let (api, stop) = (api.clone(), stop.clone());

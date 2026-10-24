@@ -133,7 +133,7 @@ export interface paths {
         };
         /** Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it. */
         get: operations["relayGet"];
-        /** The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: unless a request comes through the same link within 120 seconds, the config before is back. A document that would cut the link this request came through is refused with 422 managing_link. */
+        /** The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link. */
         put: operations["relayPut"];
         /** The same call with POST. */
         post: operations["relayPost"];
@@ -2215,7 +2215,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description not_managed: the link does not have manage peer on this node. */
+            /** @description not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2224,7 +2224,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2242,7 +2242,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it. */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -2251,7 +2251,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -2260,7 +2260,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1. */
             504: {
                 headers: {
                     [name: string]: unknown;
@@ -2299,7 +2299,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description not_managed: the link does not have manage peer on this node. */
+            /** @description not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2308,7 +2308,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2335,7 +2335,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it. */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -2344,7 +2344,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -2353,7 +2353,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1. */
             504: {
                 headers: {
                     [name: string]: unknown;
@@ -2389,7 +2389,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description not_managed: the link does not have manage peer on this node. */
+            /** @description not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2398,7 +2398,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2416,7 +2416,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it. */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -2425,7 +2425,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -2434,7 +2434,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1. */
             504: {
                 headers: {
                     [name: string]: unknown;
@@ -2466,7 +2466,7 @@ export interface operations {
                     "application/json": unknown;
                 };
             };
-            /** @description not_managed: the link does not have manage peer on this node. */
+            /** @description not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2475,7 +2475,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. */
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2493,7 +2493,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length. Or the answer of the other node itself. */
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it. */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -2502,7 +2502,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open and none was freed in 5 seconds. Or the answer of the other node itself. */
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it. */
             503: {
                 headers: {
                     [name: string]: unknown;
@@ -2511,7 +2511,7 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorBody"];
                 };
             };
-            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. */
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1. */
             504: {
                 headers: {
                     [name: string]: unknown;

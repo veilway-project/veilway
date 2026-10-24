@@ -20,6 +20,7 @@ schemars.workspace=true
 tracing.workspace=true
 time.workspace=true
 futures-util.workspace=true
+ring.workspace=true
 axum.workspace=true
 # The client is what `held` asks a node that already runs with, and what the tests talk to the socket with.
 hyper={workspace=true, features=["client"]}
@@ -36,5 +37,4 @@ tracing-subscriber.workspace=true
 rcgen.workspace=true
 rustls.workspace=true
 tokio-rustls.workspace=true
-ring.workspace=true
 base64.workspace=true

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio::task::AbortHandle;
 use veilway_engine::import::Named;
 use veilway_proto::session::{self, KEEPALIVE, REKEY};
@@ -76,10 +76,12 @@ pub struct State {
 	chain: Mutex<Option<String>>,
 	/// What the management connections of the link count, see `manage`.
 	pub manage: super::manage::Counters,
+	/// Ends the session the dialler has now, so that the next one opens with a handshake, see `manage_renew`.
+	pub renew: Notify,
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default(), manage: Default::default()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
 }
 
 impl State {
@@ -253,7 +255,7 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 		let mut peers = tunnel.lock();
 		if let Some(peer) = peers.wg.index(&key) {peers.heard(peer, Via::Dial(me.clone()))}
 	}
-	let (started, mut live, mut full, mut buf, mut tick) = (Instant::now(), false, 0u64, vec![0u8; MAX_PACKET], tokio::time::interval(Duration::from_secs(1)));
+	let (started, mut live, mut announced, mut full, mut buf, mut tick) = (Instant::now(), false, false, 0u64, vec![0u8; MAX_PACKET], tokio::time::interval(Duration::from_secs(1)));
 	// Plain `udp` has no transport to ask for an idle keepalive, so this asks the source itself, which is also where the rekey comes from.
 	let mut idle = Instant::now() + session::delay(&KEEPALIVE, &mut random).unwrap_or(Duration::from_secs(30));
 	loop {
@@ -283,6 +285,21 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 					}
 				}
 				if !bound.is_some_and(|bound| bound.proven) {continue}
+				// The node that listens keeps sending on the session it had until a datagram of this one arrives, so the first proof of a session is answered with a keepalive at once.
+				if !announced {
+					announced = true;
+					let mut keepalive = Vec::new();
+					{
+						let mut peers = tunnel.lock();
+						if let Some(peer) = peers.wg.index(&key) {peers.wg.encapsulate(peer, &[], &mut keepalive)}
+					}
+					for datagram in keepalive {
+						match &carrier {
+							Carrier::Native(session) => full += u64::from(!session.send(datagram, Kind::Packet {flow: 0, control: false})),
+							Carrier::Plain(socket) => drop(socket.send(&datagram).await),
+						}
+					}
+				}
 				if !live && matches!(carrier, Carrier::Plain(_)) {
 					live = true;
 					opened();
@@ -317,6 +334,7 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 					}
 				}
 			}
+			_ = state.renew.notified() => return Ended::Closed(End::Asked),
 			_ = tick.tick() => match &carrier {
 				Carrier::Native(session) => {
 					if !live && session.state() == Opened::Established {
