@@ -28,10 +28,10 @@ boringtun={version="0.7", default-features=false}
 ipstack={package="veilway-ipstack", version="1.0.1-veilway.1", path="vendor/ipstack"}
 ipnet={version="2", features=["serde"]}
 base64="0.23"
-rand_core={version="0.6", features=["getrandom"]}
+rand_core={version="0.10", features=["getrandom"]}
 etherparse="0.21"
 # The userspace TCP of a tunnel (node links page, "Tunnels"): the entry opens its own connection inside the link with it. Only the TCP socket over IP packets, no device, no ARP, no DHCP.
-smoltcp={version="0.12", default-features=false, features=["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"]}
+smoltcp={version="0.14", default-features=false, features=["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp"]}
 wintun-bindings="0.7"
 windows-sys="0.61"
 security-framework="3"
@@ -64,9 +64,9 @@ boring-sys="5.3"
 # Wipes the secrets of the `faketls` handshake (the key agreement results, the traffic secrets, the ML-KEM private key) when they are done with. It is a crate the tree already has (argon2, hpke and the RustCrypto crates bring it), so `cargo deny` sees no new package, and it is what those crates wipe their own keys with.
 zeroize="1"
 # P-256 arithmetic for the leaf key of `faketls` in `veilway-proto`, the scalar times the generator and nothing else. Pure Rust (RustCrypto).
-p256={version="0.13", default-features=false, features=["arithmetic"]}
+p256={version="0.14", default-features=false, features=["arithmetic"]}
 # Argon2id for the sealed subscription file, as a plain function over bytes the caller drew. Pure Rust, no features beyond heap memory.
-argon2={version="0.5", default-features=false, features=["alloc"]}
+argon2={version="0.6", default-features=false, features=["alloc"]}
 
 
 # Argon2 at 64 MiB and three passes is too slow unoptimized for the tests that open a sealed file.
