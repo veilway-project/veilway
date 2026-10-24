@@ -723,6 +723,60 @@ The desktop app, the Android app and `veilway connect` can run a local SOCKS5 an
 
 **Not defended:** a program the user points at the proxy sees its own traffic, as with any proxy. SOCKS5 UDP ASSOCIATE and BIND are refused. On desktop the password is in the app's settings file (mode 600 on Unix), readable by the user's own programs; on Android it is sealed with a Keystore key.
 
+### 5.19 Several nodes from one panel
+
+Designed for v0.3.0, nothing of it is built. One panel may manage several nodes. The node next to the panel stays on the control socket (B8) as node 1. Every other node joins with a one-time code and then dials the panel's subscription endpoint: it sends small requests sealed with HPKE in Auth mode, under its node key, to the panel's node-channel key. The panel's answers carry the node's users and the control calls the panel wants run, and the node runs them in its own process against its own API router. Nothing on a remote node listens for the panel. The wire format is in `protocol/panel-nodes.md` of the docs.
+
+**Assets:** AS2 (a node's address, which a join or a sync must not reveal, and the panel endpoint's role), AS5 (users' identities and device public keys on each remote node, per-node transport secrets, proxy passwords and Xray secrets, the node keys, and the panel's node-channel key), AS7 (the panel, which controls every node), AS8 (upstream credentials on a node, which stay on it), AS12 (isolation between users, which now includes isolation between nodes). Quotas count as an asset too: one limit per user must hold across nodes.
+
+**Capabilities considered:**
+
+- A censor or network attacker between a node and the panel who reads, drops, delays, replays or changes requests and answers, and who may run the CDN or the front that ends TLS for the endpoint.
+- Someone who copies a join code before or after it is used, for example from the chat the admin sent it through.
+- A seized remote node, or a stolen node key: the holder has the node's config, its `panel.state` and everything the node holds for its users.
+- A compromised panel or a stolen node-channel key.
+- A node that lies: in its usage reports and in the answers to control calls.
+- A replaying observer who recorded earlier requests or answers.
+- A scanner that probes the panel endpoint or a node.
+
+| Risk | Design response | Mechanism | Status |
+|---|---|---|---|
+| **M1** A scanner finds a management port on a node | There is none. The node dials out and the control API stays socket-only. The channel runs as a task inside `veilway run` and calls the API router in-process. | Channel task, `veilway-api` library header | Designed |
+| **M2** A CDN, front or web server reads or changes configs or control calls | Requests and answers are sealed end to end between the node key and the panel key. TLS may end anywhere. A changed byte makes the open fail. | `panel_channel.rs`, HPKE Auth mode | Designed |
+| **M3** A copied join code makes a stranger a node | The code works once and for one hour, and the join request is sealed with the code's secret as the PSK. The panel sends no user until an admin types the fingerprint that the real node shows, with re-authentication. A stranger who joins first gets an empty config, and the fingerprint on the real host will not match. | `vwjoin1` code, AuthPSK join, fingerprint confirm, invariant 41 | Designed |
+| **M4** Someone speaks as the panel to a node | The panel's key comes inside the join code and is pinned in `panel.state`. Only the holder of the private key can derive the answer key. A next panel key is accepted only from an answer under the pinned one. | HPKE Auth mode, `panel.state` | Designed |
+| **M5** A replayed or reordered request or answer | A sequence number that strictly increases per node and is stored before sending, a clock window of 10 minutes, and an answer bound to the HPKE context of its own request. A replayed request gets the decoy answer and is counted. | `seq` and `sent_at` rules, `channel.rs` | Designed |
+| **M6** The channel shows the panel endpoint's role, or a node's address, to a censor or a scanner | Requests go to the same URL as subscription fetches, are padded to buckets and come at a random rhythm. The endpoint tells a node request from a subscription request by length before any crypto. Anything that does not open gets the decoy `not_found`, identical to any unknown request. A removed node gets the same. | `subs.rs` dispatch by length, padding buckets | Designed. A steady request every 25 s from a server is still a pattern a censor can learn. |
+| **M7** A seized node exposes users on other nodes | Transport secrets, proxy passwords and Xray client secrets are derived per node (HKDF of the stored secret with the node's uid). Device private keys never exist on nodes (invariant 30). Remote nodes see opaque user ids; the node next to the panel keeps real names. | `fill`, HKDF derivation | Designed |
+| **M8** A seized or lying node cuts users off everywhere with false usage, or hides real usage | Usage counters are absolute and a report is idempotent. Growth per report is capped by the node's maximum rate times the time since the last report, clipped and logged. Usage is shown per node, and an admin can stop counting a node. | `channel.rs` usage merge, per-node `max_rate` | Designed. A node can still report less than it counted; that only lets users pass the quota (see "Not defended"). |
+| **M9** A node answers control calls with hostile data | Every answer is untrusted input to the panel, read with size caps and strict JSON. The node also checks the allowlist of routes again before it runs a job. | `request` for remote nodes, job allowlist, invariant 40 | Designed |
+| **M10** A node that cannot reach the panel stops serving, or serves forever on stale rights | It keeps serving its last applied config, including the last `quota_offset` and `expires_at`. The panel shows "out of date since" on the node and on each affected user. An optional `stop_after_days` makes the node apply an empty user list after that many days without contact, off by default. | 3.5 of the design, `panel.state` | Designed |
+| **M11** A config push cuts a node off from the panel for good | The channel's endpoints, keys and counters are in `panel.state`, outside the config document, so a push cannot change them. A `via` outbound that is gone is skipped with a log line, never latched. The node keeps the old endpoint list until a request on the new one works. | `panel.state`, poll loop | Designed |
+| **M12** A removed or taken node keeps working against the panel | Its key is deleted and every later request gets the decoy. "Leave" empties its users when it is online. "This node was taken" skips asking the node and can rotate the panel's node-channel key, so a node that kept the old key cannot identify the current one. | `DELETE /nodes/{id}`, rotation | Designed |
+| **M13** A down node blocks changes to the others | The panel only answers requests. A sync waits for a node at most 25 s and then returns "queued". Each node has its own lock and backoff. | `upkeep_once`, per-node state | Designed |
+| **M14** Quotas pass the limit, or cut a user early at a period boundary | Each node enforces the one limit against its own counter plus `quota_offset`, the bytes the other nodes counted. The offset carries the period's start and counts only while the node's own period starts there, so a stale offset never cuts a user in a new period. A counter that falls within a period is banked, so a node that lost its count does not erase usage. | `quota_offset`, `node_usage` merge | Designed. The overrun is accepted, see "Not defended". |
+| **M15** A key is rotated and a node is lost on the way | The panel holds the old and the new node key until the first request under the new one opens. The panel's next key is pinned by nodes from answers, and the retired key stays for 30 days. A node that is offline rotates at its next contact. | Rotation, 2.7 of the design | Designed |
+| **M16** A join by an attacker who sees the whole exchange | The join code travels outside the channel and is the only secret the stranger lacks. The fingerprint covers the code's object, the node key and the first transcript, so a man in the middle who has the code still shows a different fingerprint on each side. | Join transcript hash, `pairing::Fingerprint` | Designed |
+
+**Not defended:**
+
+- A compromised panel or a stolen panel node-channel key controls every node.
+- A remote node sees the users who connect to it, their traffic and their addresses, as section 5.5 says for any node. Opaque ids hide names, not behavior.
+- A seized node gives its holder that node's own config and secrets, and lets them report false usage within the rate cap.
+- Changes made while a node is out of contact (a disabled user, a removed device, a user moved off the node) do not reach it until it is back, unless `stop_after_days` is set.
+- With "others' usage", a user may pass the quota by what they move through other nodes in the seconds before a report, and by the remaining quota on a node out of contact. Nothing is reserved, so no user is cut early.
+- A censor who can tell the panel endpoint from the traffic pattern (a steady request every 20 to 30 s from one address) can single out a node.
+- The panel endpoint is a single point of reach: if it is blocked for a node, that node cannot be managed, and it keeps serving as M10 says.
+- Sync through relay mirrors and over node links does not exist in v0.3.0.
+
+**Residual risks:**
+
+1. The HPKE composition (Auth mode for requests, AuthPSK for the join) has had no outside review. It is the standard modes of the `hpke` crate with test vectors, and no part of HPKE is written by hand.
+2. Clocks. A node more than 10 minutes off cannot talk to the panel, and its row says so. A node a few minutes off ignores an offset in the minutes where its period and the panel's disagree.
+3. A node's long-poll may be cut or buffered by a CDN or an Iranian network. The short-poll fallback covers it, at a more visible rhythm.
+
+**Testing:** designed, not written. Planned: unit tests and test vectors of `panel_channel.rs`, fuzz targets `panel_channel` (node side: answers) and `panel_node_request` (panel side: requests and usage reports), merge tests (idempotent, banking, period change, clipping), and the two-node Docker gate `scripts/gate-nodes.sh`. Not reviewed by anyone outside the project.
+
 ## 6. Parsers of untrusted input
 
 Every row needs a `cargo-fuzz` target that lands in the same change as the parser (`PLAN.md` "Security requirements" 3). A target must show: no panic, no allocation above a stated cap, no input that takes longer than a stated bound, and for every codec a round-trip property (`decode(encode(x)) == x`, and `encode(decode(b))` accepted). Corpora are committed. Three targets exist, under shorter names than the ones first planned here: `config`, `packet` and `dns` in `fuzz/fuzz_targets`, with seed corpora in `fuzz/corpus` for `config` and `dns`. They are run by hand in Docker as `fuzz/README.md` says, not in CI, and they assert properties of the output and no allocation cap or time bound. No other target in the table exists yet.
@@ -949,6 +1003,7 @@ Found by reading the code while writing this document, and extended when the Pha
 | G63 | `pin_only`, the subscription fetch, still sends rustls's ClientHello, which no browser sends. | `tls.rs` (`pin_only`) | The fetch of a pinned subscription page has a non-browser fingerprint. | Open. Move it to the BoringSSL hello with the same pin check, and test its JA4 as `tls` is tested. |
 | G64 | `faketls` is a design and nothing of it is built. Its proof (a static-ephemeral Diffie-Hellman whose ephemeral is the TLS key share, a sealed carrier with the hello as associated data, an hourly device tag and a 16 byte binder), the node's purpose-built TLS 1.3 handshake, its throwaway key derived from a shared secret and its copy of a site's flights are new constructions with no analysis, and nobody outside the project has reviewed them. | Borrowed-site mode page | If it is built as alpha, a flaw in any of them can make users or a node recognizable, or let a hostile party answer as the node. Tunnel content stays protected by WireGuard. | Open. Offered as alpha only: off by default, labeled new and unreviewed, rated Detectable until its tests pass. An outside review stays wanted. |
 | G65 | `faketls` puts every stranger's connection, every probe and an early connection for each user's handshake on a third-party site that has not agreed, from the node's address. The site learns when users connect and how many strangers come. | Borrowed-site mode page, "The third party" | The site can be harmed, blocked or move to act against the node, and the operator may break its terms or the law. | Open by design. The operator chooses the site and acknowledges it, none is shipped or suggested, and the connections are capped per source, in total and per second. |
+| G66 | The panel channel of v0.3.0 (section 5.19) seals every request and answer with HPKE in Auth mode, and the join with AuthPSK. This composition is new and has had no outside review. | Design of `protocol/panel-nodes.md` | A flaw in the composition could let a path attacker impersonate a node or the panel. | Open until built and reviewed. Standard modes of the `hpke` crate only, test vectors, and an outside review before the beta. |
 
 ## 9. Non-goals
 
