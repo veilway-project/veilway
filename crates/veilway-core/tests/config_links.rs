@@ -1,6 +1,6 @@
 //! Node links in config version 1: `links[]` on both nodes, the `chain` backend and the `link` condition of a rule, each rule of the node links page by changing one thing in a document that is good.
 use serde_json::{json, Value};
-use veilway_core::config::{Config, Diff, LinkDirection, Report, DEFAULT_MTU, DEFAULT_MTU_OBFS, MAX_LINKS, REDACTED};
+use veilway_core::config::{Config, Diff, LinkDirection, LinkManage, Report, DEFAULT_MTU, DEFAULT_MTU_OBFS, MAX_LINKS, REDACTED};
 
 /// An obviously fake key: one byte repeated.
 fn key(byte: u8) -> String {veilway_wg::encode_key(&[byte; 32])}
@@ -316,4 +316,71 @@ fn a_reload_says_which_links_changed() {
 	new["links"].as_array_mut().unwrap().push(json!({"tag": "third", "id": "ICEiIyQlJicoKSorLC0uLw", "direction": "forward", "addresses": {"dialler": ["10.9.0.5"]}, "transport_secret": key(0x45), "inbound": "links", "public_key": key(0x55), "exits": ["main"]}));
 	let diff = Diff::between(&old, &Config::parse(new.to_string().as_bytes()).unwrap(), time::OffsetDateTime::UNIX_EPOCH);
 	assert_eq!((diff.links.added, diff.links.changed, diff.links.removed.len()), (vec!["third".to_string()], vec!["out".to_string()], 0));
+}
+
+/// `node()` with the link it is dialled for managed by its peer, and the link it dials left alone.
+fn managed() -> Value {
+	let mut doc = node();
+	(doc["links"][0]["manage"], doc["links"][0]["addresses"]["listener"]) = (json!("by_peer"), json!(["10.9.0.3", "fd00:9::3"]));
+	doc
+}
+
+/// `node()` with the link it dials managing the other node.
+fn manager() -> Value {
+	let mut doc = node();
+	(doc["links"][1]["manage"], doc["links"][1]["addresses"]["listener"]) = (json!("peer"), json!(["10.20.0.3"]));
+	doc
+}
+
+#[test]
+fn a_managed_link_has_both_addresses_in_either_direction() {
+	// A forward link, dialled for: managed by its peer. The other half of the same pairing dials, and manages.
+	let report = check(&managed());
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	let report = check(&manager());
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	let config = Config::parse(manager().to_string().as_bytes()).unwrap();
+	assert_eq!((config.links[0].manage, config.links[1].manage), (None, Some(LinkManage::Peer)));
+	// A reverse link as well, on either side.
+	let mut reverse = reversed();
+	reverse["links"][0]["manage"] = json!("by_peer");
+	let report = check(&reverse);
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	reverse["links"][0].as_object_mut().unwrap().remove("manage");
+	reverse["links"][1]["manage"] = json!("peer");
+	let report = check(&reverse);
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	// Without the listener's address a managed link is refused, whichever direction it has.
+	refused(managed, "links[0].addresses.listener", "a managed link has one", |doc| drop(doc["links"][0]["addresses"].as_object_mut().unwrap().remove("listener")));
+	refused(managed, "links[0].addresses.listener", "none of them the dialler's own", |doc| doc["links"][0]["addresses"]["listener"] = json!(["10.9.0.2", "fd00:9::3"]));
+	refused(managed, "links[0].addresses.listener", "each family", |doc| doc["links"][0]["addresses"]["listener"] = json!(["10.9.0.3"]));
+	refused(managed, "links[0].addresses.listener[0]", "inside the pool", |doc| doc["links"][0]["addresses"]["listener"] = json!(["10.20.0.9", "fd00:9::3"]));
+	refused(node, "links[1].addresses.listener", "a managed link has one", |doc| doc["links"][1]["manage"] = json!("peer"));
+	refused(reversed, "links[0].addresses.listener", "a reverse link has one", |doc| {
+		doc["links"][0]["manage"] = json!("by_peer");
+		doc["links"][0]["addresses"].as_object_mut().unwrap().remove("listener");
+	});
+	// A link that is not managed still has no second address in a forward link.
+	refused(node, "links[0].addresses.listener", "only a reverse link", |doc| doc["links"][0]["addresses"]["listener"] = json!(["10.9.0.3", "fd00:9::3"]));
+	// The values are the two words.
+	for value in [json!("listener"), json!("manager"), json!(true), json!(null)] {
+		let mut doc = managed();
+		doc["links"][0]["manage"] = value.clone();
+		assert!(value.is_null() || Config::parse(doc.to_string().as_bytes()).is_err(), "{value}");
+	}
+}
+
+#[test]
+fn a_node_is_managed_by_one_link_and_a_managed_node_manages_none() {
+	let second = |peer: Value| json!({"tag": "second", "id": "ICEiIyQlJicoKSorLC0uLw", "direction": "forward", "addresses": {"dialler": ["10.21.0.2"], "listener": ["10.21.0.3"]}, "manage": "peer", "transport_secret": key(0x45), "private_key": key(0x55), "peer": peer});
+	// Two links that this node is managed by: one panel per node.
+	refused(managed, "links[2].manage", "at most one", |doc| doc["links"].as_array_mut().unwrap().push(json!({"tag": "second", "id": "ICEiIyQlJicoKSorLC0uLw", "direction": "forward", "addresses": {"dialler": ["10.9.0.5"], "listener": ["10.9.0.6"]}, "manage": "by_peer", "transport_secret": key(0x45), "inbound": "links", "public_key": key(0x55), "exits": ["main"]})));
+	// A node that is managed is no managing node: no chain of management.
+	refused(managed, "links[1].manage", "no peer link", |doc| (doc["links"][1]["manage"], doc["links"][1]["addresses"]["listener"]) = (json!("peer"), json!(["10.20.0.3"])));
+	// A node may manage several others, and be managed by none.
+	let mut doc = manager();
+	let peer = doc["links"][1]["peer"].clone();
+	doc["links"].as_array_mut().unwrap().push(second(peer));
+	let report = check(&doc);
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
 }

@@ -54,7 +54,7 @@ const ANSWER: &str = "vwlinka1.";
 const SUM_CHARS: usize = 6;
 const ANSWER_BODY: usize = 107;
 // Every member an offer may have: "a member this page does not define refuses the code".
-const MEMBERS: [&str; 11] = ["v", "id", "direction", "expires_at", "name", "inbound_public_key", "transport_public_key", "pairing_public_key", "addresses", "mtu", "transports"];
+const MEMBERS: [&str; 12] = ["v", "id", "direction", "manage", "expires_at", "name", "inbound_public_key", "transport_public_key", "pairing_public_key", "addresses", "mtu", "transports"];
 
 /// Why a code is no code, or is not taken. It names a member by the word the page has for it and never holds text of the code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +106,16 @@ impl Direction {
 	pub fn word(self) -> &'static str {if self == Self::Forward {"forward"} else {"reverse"}}
 }
 
+/// Which side of a link manages the other: the side that may call the other node's control API through the link. Absent from an offer, the link is not managed, which is every link of a code made before v0.3.0. A node that does not know the member refuses the whole offer as having an unknown member, so a managed link can never be paired by a node that would drop the term.
+/// In a config the managing side writes `manage: "peer"` and the managed side `manage: "by_peer"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Manage {Listener, Dialler}
+
+impl Manage {
+	/// The value as a code writes it.
+	pub fn word(self) -> &'static str {if self == Self::Listener {"listener"} else {"dialler"}}
+}
+
 // The two parts of a code after its prefix, once the checksum of the first holds. `body` is how many characters the first part has, where a code has one length.
 fn checked(code: &str, prefix: &str, body: Option<usize>) -> Result<Vec<u8>, CodeError> {
 	let (encoded, sum) = code.strip_prefix(prefix).and_then(|rest| rest.split_once('.')).ok_or(CodeError::Shape)?;
@@ -131,8 +141,10 @@ pub struct Terms {
 	pub transport_public_key: Option<[u8; 32]>,
 	/// The dialler's address: one or two, IPv4 first, from the listener's inbound pool.
 	pub dialler: Vec<IpAddr>,
-	/// The listener's link address, in a reverse link and in no other.
+	/// The listener's link address, in a reverse link and in a managed link, and in no other.
 	pub listener: Vec<IpAddr>,
+	/// The side that manages the other, when the link is managed.
+	pub manage: Option<Manage>,
 	pub mtu: u16,
 	/// The listener's transports in its order of preference.
 	pub transports: Vec<Transport>,
@@ -207,8 +219,10 @@ pub struct Offer {
 	pub pairing_public_key: [u8; 32],
 	/// One or two, IPv4 first, inside the ranges a pool may lie in.
 	pub dialler: Vec<IpAddr>,
-	/// Empty in a forward link. In a reverse link one for each family of `dialler`, in the same order.
+	/// Empty in a forward link that is not managed. In a reverse link and in a managed link one for each family of `dialler`, in the same order.
 	pub listener: Vec<IpAddr>,
+	/// The side that manages the other. None for a link that is not managed.
+	pub manage: Option<Manage>,
 	pub mtu: u16,
 	/// 1 to 8 of `udp`, `udp-obfs`, `tls` and `ws`, none with an Encrypted Client Hello configuration.
 	pub transports: Vec<Transport>,
@@ -236,6 +250,12 @@ impl Offer {
 			"reverse" => Direction::Reverse,
 			_ => return Err(CodeError::Member("direction")),
 		};
+		let manage = match members.string("manage", 8)? {
+			None => None,
+			Some("listener") => Some(Manage::Listener),
+			Some("dialler") => Some(Manage::Dialler),
+			Some(_) => return Err(CodeError::Member("manage")),
+		};
 		let expires_at = member("expires_at", members.uint("expires_at", 0..=INTEGER_MAX))?;
 		// A name the filter would change, or cut, is refused: what the other operator is shown is then what the creator wrote.
 		let name = member("name", members.string("name", 4 * NAME_MAX))?;
@@ -245,13 +265,13 @@ impl Offer {
 		let addresses = member("addresses", members.object("addresses"))?;
 		if addresses.0.keys().any(|name| name != "dialler" && name != "listener") {return Err(CodeError::Unknown)}
 		let dialler = payload::addresses(addresses, "dialler")?;
-		// "A reverse link fixes one more, the listener's link address. A forward link has no use for a second address and has none."
+		// "A reverse link fixes one more, the listener's link address. A forward link has no use for a second address and has none", unless it is managed: the managing side calls the other at its link address, so a managed link has both addresses in either direction.
 		let listener = if addresses.get("listener").is_some() {payload::addresses(addresses, "listener")?} else {Vec::new()};
-		if (direction == Direction::Reverse) == listener.is_empty() || (!listener.is_empty() && (listener.len() != dialler.len() || listener.iter().zip(&dialler).any(|(listener, dialler)| listener.is_ipv4() != dialler.is_ipv4() || listener == dialler))) {return Err(CodeError::Member("addresses"))}
+		if (direction == Direction::Reverse || manage.is_some()) == listener.is_empty() || (!listener.is_empty() && (listener.len() != dialler.len() || listener.iter().zip(&dialler).any(|(listener, dialler)| listener.is_ipv4() != dialler.is_ipv4() || listener == dialler))) {return Err(CodeError::Member("addresses"))}
 		let mtu = member("mtu", members.uint("mtu", MTU))? as u16;
 		let transports = member("transports", members.list("transports", 1..=TRANSPORTS_MAX))?.iter().map(listed).collect::<Result<Vec<_>, _>>()?;
 		if transport_public_key.is_none() && transports.iter().any(|transport| matches!(transport, Transport::Tls(_) | Transport::Ws(_))) {return Err(CodeError::Member("transport_public_key"))}
-		Ok(Offer {id, direction, expires_at, name: name.to_owned(), inbound_public_key, transport_public_key, pairing_public_key, dialler, listener, mtu, transports, object})
+		Ok(Offer {id, direction, expires_at, name: name.to_owned(), inbound_public_key, transport_public_key, pairing_public_key, dialler, listener, manage, mtu, transports, object})
 	}
 	/// "The offer is refused after this time."
 	pub fn expired(&self, now: u64) -> bool {now > self.expires_at}
@@ -398,7 +418,7 @@ impl Offers {
 		let (mut id, pairing, text) = ([0; 16], private(random)?, |text: &str| serde_json::to_string(text).unwrap_or_default());
 		random(&mut id).map_err(|_| CodeError::Random)?;
 		let list = |addresses: &[IpAddr]| addresses.iter().map(|address| text(&address.to_string())).collect::<Vec<_>>().join(",");
-		let object = format!("{{\"v\":{VERSION},\"id\":{},\"direction\":\"{}\",\"expires_at\":{},\"name\":{},\"inbound_public_key\":{},{}\"pairing_public_key\":{},\"addresses\":{{\"dialler\":[{}]{}}},\"mtu\":{},\"transports\":{}}}", text(&sealed(&id)), terms.direction.word(), now.saturating_add(lifetime), text(&terms.name), text(&key_text(&terms.inbound_public_key)), terms.transport_public_key.map(|key| format!("\"transport_public_key\":{},", text(&key_text(&key)))).unwrap_or_default(), text(&key_text(&x25519(pairing, X25519_BASEPOINT_BYTES))), list(&terms.dialler), if terms.listener.is_empty() {String::new()} else {format!(",\"listener\":[{}]", list(&terms.listener))}, terms.mtu, transports_json(&terms.transports));
+		let object = format!("{{\"v\":{VERSION},\"id\":{},\"direction\":\"{}\",{}\"expires_at\":{},\"name\":{},\"inbound_public_key\":{},{}\"pairing_public_key\":{},\"addresses\":{{\"dialler\":[{}]{}}},\"mtu\":{},\"transports\":{}}}", text(&sealed(&id)), terms.direction.word(), terms.manage.map(|manage| format!("\"manage\":\"{}\",", manage.word())).unwrap_or_default(), now.saturating_add(lifetime), text(&terms.name), text(&key_text(&terms.inbound_public_key)), terms.transport_public_key.map(|key| format!("\"transport_public_key\":{},", text(&key_text(&key)))).unwrap_or_default(), text(&key_text(&x25519(pairing, X25519_BASEPOINT_BYTES))), list(&terms.dialler), if terms.listener.is_empty() {String::new()} else {format!(",\"listener\":[{}]", list(&terms.listener))}, terms.mtu, transports_json(&terms.transports));
 		let code = coded(OFFER, object.as_bytes());
 		self.open.push((Offer::parse(&code)?, Secret::new(pairing)));
 		Ok(code)
@@ -466,8 +486,11 @@ mod tests {
 	fn candidate(pinned: bool) -> Candidate {Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), sni: Some("node.example".into()), host: "node.example".into(), verify_name: None, ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}, self_signed: false, http2: Default::default()}}
 
 	fn terms(direction: Direction) -> Terms {
-		Terms {direction, name: "exit in the north".into(), inbound_public_key: x25519([1; 32], X25519_BASEPOINT_BYTES), transport_public_key: Some(x25519([2; 32], X25519_BASEPOINT_BYTES)), dialler: vec!["10.9.0.2".parse().unwrap(), "fd00:9::2".parse().unwrap()], listener: if direction == Direction::Reverse {vec!["10.9.0.3".parse().unwrap(), "fd00:9::3".parse().unwrap()]} else {Vec::new()}, mtu: 1390, transports: vec![Transport::UdpObfs(vec![Dial::parse("203.0.113.9:51821").unwrap(), Dial::parse("[2001:db8::9]:51821").unwrap()]), Transport::Tls(Stream {path: "/assets/app-3f9c2e71.js".into(), candidates: vec![candidate(true)]}), Transport::Ws(Stream {path: "/assets/live-7c1d0a52.js".into(), candidates: vec![candidate(false)]}), Transport::Udp(vec![Dial::parse("10.1.2.3:51820").unwrap()])]}
+		Terms {direction, name: "exit in the north".into(), inbound_public_key: x25519([1; 32], X25519_BASEPOINT_BYTES), transport_public_key: Some(x25519([2; 32], X25519_BASEPOINT_BYTES)), dialler: vec!["10.9.0.2".parse().unwrap(), "fd00:9::2".parse().unwrap()], listener: if direction == Direction::Reverse {vec!["10.9.0.3".parse().unwrap(), "fd00:9::3".parse().unwrap()]} else {Vec::new()}, manage: None, mtu: 1390, transports: vec![Transport::UdpObfs(vec![Dial::parse("203.0.113.9:51821").unwrap(), Dial::parse("[2001:db8::9]:51821").unwrap()]), Transport::Tls(Stream {path: "/assets/app-3f9c2e71.js".into(), candidates: vec![candidate(true)]}), Transport::Ws(Stream {path: "/assets/live-7c1d0a52.js".into(), candidates: vec![candidate(false)]}), Transport::Udp(vec![Dial::parse("10.1.2.3:51820").unwrap()])]}
 	}
+
+	// The same terms with a managing side, and so with the listener's address in either direction.
+	fn managed(direction: Direction, manage: Manage) -> Terms {Terms {manage: Some(manage), listener: vec!["10.9.0.3".parse().unwrap(), "fd00:9::3".parse().unwrap()], ..terms(direction)}}
 
 	// An offer with the object `object`, whatever that is.
 	fn offer(object: &str) -> Result<Offer, CodeError> {Offer::parse(&coded(OFFER, object.as_bytes()))}
@@ -497,7 +520,10 @@ mod tests {
 		for agreed in [&listener, &dialler] {assert_eq!(hex(agreed.paired.secret.expose()), "90c11986cd5e68916c33277d624746c06fa9970b6fbf82ea771c3bab5cccfd6b")}
 		// The two values of the fingerprint, from SHA-256 over each label and the pairing hash, as Python's hashlib gives them.
 		assert_eq!((listener.shown(), dialler.shown()), ("4aa1 3baf ae4a 800c b147 2457 386e 3da3".to_string(), "5566 cf11 74f3 c7ae 9f30 9d6d b18e 7f11".to_string()));
-		assert!(Offer::parse(&seed("offer-reverse")).is_ok_and(|offer| offer.direction == Direction::Reverse && offer.listener.len() == 2));
+		assert!(Offer::parse(&seed("offer-reverse")).is_ok_and(|offer| offer.direction == Direction::Reverse && offer.listener.len() == 2 && offer.manage.is_none()));
+		// A code of the format before `manage` still reads, as a link that is not managed, and the managed seed carries the member and both addresses.
+		assert!(Offer::parse(&seed("offer")).is_ok_and(|offer| offer.manage.is_none() && !offer.object().windows(8).any(|window| window == b"\"manage\"")));
+		assert!(Offer::parse(&seed("offer-managed")).is_ok_and(|offer| offer.direction == Direction::Forward && offer.manage == Some(Manage::Dialler) && offer.listener.len() == 2));
 		// "A `shared` of all zero bytes refuses the pairing": no code that reads carries such a key, and a key that got here some other way is refused all the same.
 		assert_eq!(Agreed::new(offer, &answer, &[5; 32], &[0; 32], None, false).err(), Some(CodeError::Agreement));
 	}
@@ -531,6 +557,64 @@ mod tests {
 			assert_eq!(x25519(*dialler.private_key.unwrap().expose(), X25519_BASEPOINT_BYTES), listener.public_key);
 			assert_eq!(format!("{listener:?} {offer:?} {:?}", terms(direction)), format!("Paired(..) Offer({0}, 4 transports) Terms({0}, 4 transports)", direction.word()));
 		}
+	}
+
+	#[test]
+	fn a_managed_link_pairs_in_either_direction_with_both_addresses() {
+		for (direction, manage) in [(Direction::Forward, Manage::Listener), (Direction::Forward, Manage::Dialler), (Direction::Reverse, Manage::Listener), (Direction::Reverse, Manage::Dialler)] {
+			let (mut offers, mut pastes) = (Offers::default(), Pastes::default());
+			let code = offers.issue(&managed(direction, manage), NOW, LIFETIME, &mut seeded(1)).unwrap();
+			let offer = Offer::parse(&code).unwrap();
+			assert_eq!((offer.direction, offer.manage, offer.dialler.len(), offer.listener.len(), offer.code()), (direction, Some(manage), 2, 2, code));
+			let (answer, dialler) = pastes.answer(&offer, NOW, &mut seeded(2)).unwrap();
+			let listener = offers.answer(&answer, NOW).unwrap();
+			assert_eq!(listener.offer().manage, Some(manage));
+			let (ours, theirs) = (listener.shown(), dialler.shown());
+			let (listener, dialler) = (listener.confirm(&theirs, NOW).unwrap(), dialler.confirm(&ours, NOW).unwrap());
+			assert!(listener.secret == dialler.secret && dialler.offer.manage == Some(manage));
+		}
+	}
+
+	// "A code changed on the way to add or drop it shows as two different fingerprints": the member is part of the object that the pairing hash covers.
+	#[test]
+	fn the_fingerprint_changes_when_manage_changes() {
+		let print = |terms: &Terms| {
+			let (mut offers, mut pastes) = (Offers::default(), Pastes::default());
+			let offer = Offer::parse(&offers.issue(terms, NOW, LIFETIME, &mut seeded(1)).unwrap()).unwrap();
+			let (answer, dialler) = pastes.answer(&offer, NOW, &mut seeded(2)).unwrap();
+			(offers.answer(&answer, NOW).unwrap().shown(), dialler.shown(), offer)
+		};
+		let (a, b, c, plain) = (print(&managed(Direction::Forward, Manage::Listener)), print(&managed(Direction::Forward, Manage::Dialler)), print(&terms(Direction::Forward)), print(&terms(Direction::Reverse)));
+		assert!(a.0 != b.0 && a.1 != b.1 && a.0 != c.0 && a.1 != c.1 && b.0 != c.0 && c.0 != plain.0);
+		// A code that had the member put in or taken out by hand reads, as the other offer, and pairs under another hash.
+		let mut object: serde_json::Value = serde_json::from_slice(a.2.object()).unwrap();
+		object.as_object_mut().unwrap().remove("manage");
+		let (kept, dropped) = (pairing_hash(a.2.object(), &[0; ANSWER_BYTES]), pairing_hash(object.to_string().as_bytes(), &[0; ANSWER_BYTES]));
+		assert_ne!(kept, dropped);
+	}
+
+	#[test]
+	fn manage_is_held_to_its_rule() {
+		use serde_json::json;
+		let managed_object = |change: fn(&mut serde_json::Value)| {
+			let code = Offers::default().issue(&managed(Direction::Forward, Manage::Listener), NOW, LIFETIME, &mut seeded(1)).unwrap();
+			let mut object: serde_json::Value = serde_json::from_slice(Offer::parse(&code).unwrap().object()).unwrap();
+			change(&mut object);
+			offer(&object.to_string()).err()
+		};
+		assert_eq!(managed_object(|_| {}), None);
+		// Present, it needs the listener's address in a forward link too, and the address then follows the rules of a reverse link's.
+		assert_eq!(managed_object(|doc| drop(doc["addresses"].as_object_mut().unwrap().remove("listener"))), Some(CodeError::Member("addresses")));
+		assert_eq!(managed_object(|doc| doc["addresses"]["listener"] = json!(["10.9.0.3"])), Some(CodeError::Member("addresses")));
+		assert_eq!(managed_object(|doc| doc["addresses"]["listener"] = json!(["10.9.0.2", "fd00:9::3"])), Some(CodeError::Member("addresses")));
+		// Only the two words, in text.
+		for value in [json!("both"), json!("Listener"), json!(""), json!(1), json!(null), json!(["listener"]), json!(true), json!("dialler ")] {
+			let mut object: serde_json::Value = serde_json::from_slice(Offer::parse(&Offers::default().issue(&managed(Direction::Forward, Manage::Listener), NOW, LIFETIME, &mut seeded(1)).unwrap()).unwrap().object()).unwrap();
+			object["manage"] = value.clone();
+			assert_eq!(offer(&object.to_string()).err(), Some(CodeError::Member("manage")), "{value}");
+		}
+		// Terms that name a managing side without the listener's address are refused when the offer is issued.
+		assert_eq!(Offers::default().issue(&Terms {manage: Some(Manage::Dialler), ..terms(Direction::Forward)}, NOW, LIFETIME, &mut seeded(1)).err(), Some(CodeError::Member("addresses")));
 	}
 
 	#[test]

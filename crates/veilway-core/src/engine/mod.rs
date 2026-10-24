@@ -46,7 +46,7 @@ pub use plan::{Denied, Plan};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
 
-use crate::config::{Applied, ApplyError, Config, Diff, Revision, RuleTransport, Snapshot, Store};
+use crate::config::{Applied, ApplyError, Config, Diff, LinkManage, Revision, RuleTransport, Snapshot, Store};
 use host::Host;
 use rustls::RootCertStore;
 use resolver::{Names, Resolver};
@@ -169,6 +169,8 @@ pub struct LinkReport {
 	/// Whether this node is the entry half, and whether it is the node the link connects to.
 	pub entry: bool,
 	pub listener: bool,
+	/// Whether this node manages the other one through the link or is managed by it. None for a link that is not managed.
+	pub manage: Option<LinkManage>,
 	pub status: link::Status,
 	/// How long the link has been in that state.
 	pub since: Duration,
@@ -642,7 +644,7 @@ impl Engine {
 		plan.links.iter().enumerate().filter(|(_, link)| matches!(link.carrier, plan::Carrier::Paired)).map(|(at, link)| {
 			let (status, since) = link.state.status();
 			LinkReport {
-				tag: link.tag.clone(), id: link.id, entry: link.entry, listener: link.listener, status, since, handshake: plan.handshake(at),
+				tag: link.tag.clone(), id: link.id, entry: link.entry, listener: link.listener, manage: link.manage, status, since, handshake: plan.handshake(at),
 				transport: link.dialled.as_ref().zip(link.state.at()).map(|(dialled, (transport, candidate))| (match dialled.transports.get(transport) {
 					Some(veilway_proto::subscription::payload::Transport::Udp(_)) => "udp",
 					Some(veilway_proto::subscription::payload::Transport::UdpObfs(_)) => "udp-obfs",

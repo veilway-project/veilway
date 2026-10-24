@@ -1,14 +1,16 @@
 //! `veilway link offer` and `veilway link answer`: the pairing of a node link from a terminal (node links page, "Pairing"), one command on each node.
 //! Each command is one process that holds its side of the pairing from the first code to the typed half of the fingerprint, in memory and nowhere else: a pairing that is not confirmed leaves nothing behind, and a command that is stopped has cancelled it.
-//! Neither writes the config. What a confirmed pairing gives is the `links[]` entry of this node, printed for the operator to put there: "Only then is the link put into that node's config."
+//! Neither writes the config file. What a confirmed pairing gives is the `links[]` entry of this node, printed for the operator to put there: "Only then is the link put into that node's config." With `--apply` the entry is instead put into the config of the node that runs, through its control socket, and is not printed.
+//! A managed link has a managing side that may call the other node's control API through the link. Its operators agree to it twice: in the offer code, whose fingerprint covers it, and by typing `yes` after being told in plain words what it means for the node that is managed.
 //! The codes and the entry go to standard output and everything else to standard error. The entry of the node that dials holds a private key and both hold the link's secret, so they are for the config file and no chat.
 use serde_json::{json, Value};
 use std::io::BufRead;
 use std::net::IpAddr;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use veilway_core::config::{self, Config, InboundType, LinkId, Transport, DEFAULT_MTU, DEFAULT_MTU_OBFS};
-use veilway_proto::pairing::{self, Agreed, CodeError, Direction, Offer, Offers, Paired, Pastes, Terms, Unconfirmed};
+use veilway_proto::pairing::{self, Agreed, CodeError, Direction, Manage, Offer, Offers, Paired, Pastes, Terms, Unconfirmed};
 use veilway_proto::subscription::payload::Transport as Listed;
 
 /// How often a code or a half of the fingerprint may be typed again before the command gives up.
@@ -61,8 +63,15 @@ fn entry(tag: &str, paired: &Paired) -> Value {
 	entry
 }
 
+/// What the node that is managed is told before it agrees: in plain words, what the other node will be able to do.
+fn consent(prompt: &str) -> bool {
+	eprintln!("The other node will manage this node. Through this link it can read and change everything this node does: users, inbounds, exits, links and their keys. Whoever controls the other node controls this node. It cannot get a shell, and this node cannot manage the other one. You can end it by removing the link from this node's config.");
+	line(prompt).as_deref() == Some("yes")
+}
+
 /// Prints the entry, after holding it against the config it is for: what validation says of the config with the link in it is said here, so that nobody finds it out at the next reload.
-fn done(mut doc: Value, entry: Value, exit: bool, default: &str) -> i32 {
+/// With a `socket` the entry is added to the config of the node that runs, once it validates, and is not printed unless that failed.
+async fn done(mut doc: Value, entry: Value, exit: bool, default: &str, socket: Option<PathBuf>) -> i32 {
 	let mut entry = entry;
 	// The exit half says what the link may leave through. It starts with `routing.default` and nothing else, for the operator to change.
 	if exit {entry["exits"] = json!([default])}
@@ -80,6 +89,33 @@ fn done(mut doc: Value, entry: Value, exit: bool, default: &str) -> i32 {
 			true
 		}
 	};
+	#[cfg(unix)]
+	if let Some(socket) = socket.as_ref().filter(|_| !failed) {
+		let (wait, said) = (Duration::from_secs(30), |body: &[u8]| serde_json::from_slice::<Value>(body).unwrap_or_default());
+		let applied = match veilway_api::request(socket, "GET", "/v1/config", None, wait).await {
+			Ok((200, body)) => {
+				let mut running = said(&body);
+				let (revision, mut document) = (running["revision"].as_str().unwrap_or_default().to_string(), running["document"].take());
+				if let Some(Value::Array(links)) = document.as_object_mut().map(|doc| doc.entry("links").or_insert_with(|| json!([]))) {links.push(entry.clone())}
+				match veilway_api::request_with(socket, "PUT", "/v1/config", &[("if-match", &revision)], Some(document.to_string().into_bytes()), wait).await {
+					Ok((200, _)) => Ok(()),
+					Ok((status, body)) => Err(format!("the node answered {status}: {}", said(&body)["error"]["message"].as_str().unwrap_or("with no message"))),
+					Err(e) => Err(format!("the node did not answer the change ({e}), so whether it was made is not known: look at its links before pairing again")),
+				}
+			}
+			Ok((status, _)) => Err(format!("the node answered {status} when its config was read")),
+			Err(e) => Err(format!("no node answers on the control socket {} ({})", socket.display(), e.kind())),
+		};
+		match applied {
+			Ok(()) => {
+				eprintln!("The link is paired and is in the config of the node that runs{}.", if exit {". Set `exits` of the link to what it may leave through"} else {". Name the link in the `links` of an exit with a `chain` backend"});
+				return 0;
+			}
+			Err(e) => eprintln!("error: the entry was not put into the config ({e}). It is printed below: put it into `links` by hand"),
+		}
+	}
+	#[cfg(not(unix))]
+	if socket.is_some() {eprintln!("error: --apply needs the control socket, which this platform does not have. The entry is printed below: put it into `links` by hand")}
 	// The entry is printed either way: the pairing cannot be made again from it, and the operator may fix the config around it. The exit status says it does not validate yet.
 	eprintln!("The link is paired{}. Put this entry into `links` of this node's config{}. It holds the link's secret{}: it is for the config file and nowhere else.", if failed {", but this node's config does not validate with it: fix the errors above first"} else {""}, if exit {", and set `exits` to what the link may leave through"} else {", and name the link in the `links` of an exit with a `chain` backend"}, if entry.get("private_key").is_some() {" and a private key"} else {""});
 	println!("{entry:#}");
@@ -88,7 +124,8 @@ fn done(mut doc: Value, entry: Value, exit: bool, default: &str) -> i32 {
 
 /// Steps 1, 3 and 4 on the node the link connects to.
 #[allow(clippy::too_many_arguments)]
-pub fn offer(config: &Path, tag: &str, inbound: &str, reverse: bool, name: &str, dialler: Vec<IpAddr>, listener: Vec<IpAddr>, transports: &Path, mtu: Option<u16>, lifetime: u64) -> i32 {
+pub async fn offer(config: &Path, tag: &str, inbound: &str, reverse: bool, name: &str, dialler: Vec<IpAddr>, listener: Vec<IpAddr>, manage: Option<Manage>, transports: &Path, mtu: Option<u16>, lifetime: u64, apply: Option<Option<PathBuf>>) -> i32 {
+	let socket = apply.map(|api| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 	let Some((doc, config)) = loaded(config) else {return 1};
 	let Some(inbound) = config.inbounds.iter().find(|one| one.tag == inbound && one.kind == InboundType::Veilway) else {
 		eprintln!("error: the config has no veilway inbound with the tag {inbound}");
@@ -102,12 +139,17 @@ pub fn offer(config: &Path, tag: &str, inbound: &str, reverse: bool, name: &str,
 		}
 	};
 	let stream = listed.iter().any(|transport| matches!(transport, Listed::Tls(_) | Listed::Ws(_)));
-	let terms = Terms {direction: if reverse {Direction::Reverse} else {Direction::Forward}, name: name.to_string(), inbound_public_key: veilway_wg::public_key(&inbound.private_key.expose().0), transport_public_key: inbound.transport_keys.iter().flatten().next().filter(|_| stream).map(|key| veilway_proto::proof::public_key(&key.0)), dialler, listener, mtu: mtu.unwrap_or(if inbound.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..})) {DEFAULT_MTU_OBFS} else {DEFAULT_MTU}), transports: listed};
+	let terms = Terms {direction: if reverse {Direction::Reverse} else {Direction::Forward}, name: name.to_string(), inbound_public_key: veilway_wg::public_key(&inbound.private_key.expose().0), transport_public_key: inbound.transport_keys.iter().flatten().next().filter(|_| stream).map(|key| veilway_proto::proof::public_key(&key.0)), dialler, listener, manage, mtu: mtu.unwrap_or(if inbound.transports.iter().any(|transport| matches!(transport, Transport::UdpObfs {..})) {DEFAULT_MTU_OBFS} else {DEFAULT_MTU}), transports: listed};
+	// The offer is the one place this node agrees to be managed: it is not made before the operator has said yes.
+	if manage == Some(Manage::Dialler) && !consent("Type yes to offer a link that the other node manages:") {
+		eprintln!("The offer was not made, and nothing was changed.");
+		return DECLINED;
+	}
 	let mut offers = Offers::default();
 	let code = match offers.issue(&terms, now(), lifetime, &mut config::random) {
 		Ok(code) => code,
 		Err(e) => {
-			eprintln!("error: these terms make no offer ({e}). A member that is named is the one that is wrong: `addresses` need one or two addresses from the inbound's pool, IPv4 first, and in a reverse link as many for this node, `transport_public_key` means the inbound has no transport key for its tls or ws transport, and `Length` means the code would be longer than 2,048 characters");
+			eprintln!("error: these terms make no offer ({e}). A member that is named is the one that is wrong: `addresses` need one or two addresses from the inbound's pool, IPv4 first, and in a reverse link or a managed link as many for this node, `transport_public_key` means the inbound has no transport key for its tls or ws transport, and `Length` means the code would be longer than 2,048 characters");
 			return 1;
 		}
 	};
@@ -134,11 +176,14 @@ pub fn offer(config: &Path, tag: &str, inbound: &str, reverse: bool, name: &str,
 	};
 	let mut entry = entry(tag, &paired);
 	(entry["inbound"], entry["public_key"]) = (json!(inbound.tag), json!(veilway_wg::encode_key(&paired.public_key)));
-	done(doc, entry, !reverse, &config.routing.default)
+	// The offer's `manage` names the side that manages, and this node is the listener.
+	if let Some(manage) = paired.offer.manage {entry["manage"] = json!(if manage == Manage::Listener {"peer"} else {"by_peer"})}
+	done(doc, entry, !reverse, &config.routing.default, socket).await
 }
 
 /// Steps 2 and 4 on the node that dials.
-pub fn answer(config: &Path, tag: &str) -> i32 {
+pub async fn answer(config: &Path, tag: &str, apply: Option<Option<PathBuf>>) -> i32 {
+	let socket = apply.map(|api| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 	let Some((doc, config)) = loaded(config) else {return 1};
 	let Some(offer) = (0..TRIES).find_map(|_| match Offer::parse(&line("Paste the offer code of the other node:")?) {
 		Ok(offer) => Some(offer),
@@ -174,7 +219,8 @@ pub fn answer(config: &Path, tag: &str) -> i32 {
 		std::iter::repeat_n(name, count)
 	}).zip(offer.dials()) {eprintln!("  {transport} {address}{}", if private {"  (a private address: right only where the two nodes share a network)"} else {""})}
 	if offer.transports.iter().any(|transport| matches!(transport, Listed::Ws(_))) {eprintln!("A ws transport may go through a CDN: its terms may forbid this, its operator pays for the traffic, and the CDN sees it.")}
-	if line("Type yes to accept these addresses and answer the offer:").as_deref() != Some("yes") {
+	if offer.manage == Some(Manage::Dialler) {eprintln!("This link is managed from this node: this node will be able to read and change everything the other node does, through the link. The other operator agreed to that when they made the offer.")}
+	if line("Type yes to accept these addresses and answer the offer:").as_deref() != Some("yes") || (offer.manage == Some(Manage::Listener) && !consent("Type yes to let the other node manage this node:")) {
 		eprintln!("The offer was declined, and nothing was changed.");
 		return DECLINED;
 	}
@@ -195,5 +241,7 @@ pub fn answer(config: &Path, tag: &str) -> i32 {
 	let mut peer = json!({"inbound_public_key": veilway_wg::encode_key(&offer.inbound_public_key), "transports": serde_json::from_str::<Value>(&pairing::transports_json(&offer.transports)).unwrap_or_default()});
 	if let Some(key) = offer.transport_public_key {peer["transport_public_key"] = json!(veilway_wg::encode_key(&key))}
 	(entry["private_key"], entry["peer"]) = (json!(veilway_wg::encode_key(private.expose())), peer);
-	done(doc, entry, reverse, &config.routing.default)
+	// The offer's `manage` names the side that manages, and this node is the dialler.
+	if let Some(manage) = paired.offer.manage {entry["manage"] = json!(if manage == Manage::Dialler {"peer"} else {"by_peer"})}
+	done(doc, entry, reverse, &config.routing.default, socket).await
 }

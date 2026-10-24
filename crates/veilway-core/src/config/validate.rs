@@ -666,6 +666,12 @@ impl Config {
 		// The flow table keeps a quarter of its places from links, and links whose shares come to more than half of it can still leave the node's own users less than their shares add up to.
 		let shares: u64 = links.iter().filter(|link| !link.entry() && link.enabled != Some(false)).map(|link| u64::from(link.max_flows.unwrap_or(DEFAULT_LINK_FLOWS))).sum();
 		if shares > (route::MAX_FLOWS / 2) as u64 {r.warning("links", format!("the max_flows of the links this node is the exit of come to {shares}, more than half of the {} flows the node holds: links that fill their shares leave this node's own users with less", route::MAX_FLOWS))}
+		// One panel manages a node, and a node that is managed manages no other: a seized node can then not be a way into the rest.
+		let by_peer = links.iter().enumerate().filter(|(_, link)| link.manage == Some(LinkManage::ByPeer)).map(|(i, _)| i).collect::<Vec<_>>();
+		for i in by_peer.iter().skip(1) {r.error(format!("links[{i}].manage"), format!("expected at most one link with by_peer: links[{}] is already managed by its peer", by_peer[0]))}
+		if !by_peer.is_empty() {
+			for (i, _) in links.iter().enumerate().filter(|(_, link)| link.manage == Some(LinkManage::Peer)) {r.error(format!("links[{i}].manage"), format!("expected no peer link on a node that is managed: links[{}] is managed by its peer, and a managed node does not manage another", by_peer[0]))}
+		}
 		let (lowest, mut link_ids, mut link_keys, mut foreign) =(self.inbounds.iter().take(MAX_INBOUNDS).map(Inbound::mtu).min(), HashSet::new(), HashSet::new(), HashSet::new());
 		for (i, link) in links.iter().enumerate() {
 			let at = |key: &str| format!("links[{i}].{key}");
@@ -702,11 +708,12 @@ impl Config {
 					if small && home.is_some_and(|home| peopled.has(home)) {r.error(at("inbound"), "expected an inbound that carries no users' devices: a link has an inbound to itself, or shares one only with other links")}
 				}
 			}
-			let (dialler, listener) = (&link.addresses.dialler, link.addresses.listener.as_deref());
+			let (dialler, listener, managed) = (&link.addresses.dialler, link.addresses.listener.as_deref(), link.manage.is_some());
 			if !(1..=2).contains(&dialler.len()) || (dialler.len() == 2 && dialler[0].0.is_ipv4() == dialler[1].0.is_ipv4()) {r.error(at("addresses.dialler"), "expected 1 or 2 addresses, at most one IPv4 and one IPv6")}
 			match listener {
 				None if reverse => r.error(at("addresses.listener"), "expected the link address of the node that is dialled: a reverse link has one for each family of `dialler`"),
-				Some(_) if !reverse => r.error(at("addresses.listener"), "expected no such key: only a reverse link has a second address"),
+				None if managed => r.error(at("addresses.listener"), "expected the link address of the node that is dialled: a managed link has one for each family of `dialler`, in either direction, because the node that manages calls the other at it"),
+				Some(_) if !reverse && !managed => r.error(at("addresses.listener"), "expected no such key: only a reverse link and a managed link have a second address"),
 				Some(listener) if listener.len() != dialler.len() || listener.iter().zip(dialler).any(|(listener, dialler)| listener.0.is_ipv4() != dialler.0.is_ipv4() || listener == dialler) => r.error(at("addresses.listener"), "expected one address for each family of `dialler`, in the same order, and none of them the dialler's own"),
 				_ => {}
 			}

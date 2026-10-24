@@ -861,6 +861,17 @@
           "id": {
             "$ref": "#/components/schemas/LinkId"
           },
+          "manage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LinkManage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Null for a link that is not managed."
+          },
           "role": {
             "$ref": "#/components/schemas/LinkRole"
           },
@@ -915,6 +926,7 @@
           "id",
           "half",
           "role",
+          "manage",
           "state",
           "state_secs",
           "handshake_secs",
@@ -949,6 +961,21 @@
         "description": "the id of a link: 22 characters of base64url without padding",
         "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$",
         "type": "string"
+      },
+      "LinkManage": {
+        "description": "Which side of a managed link this node is.",
+        "oneOf": [
+          {
+            "const": "peer",
+            "description": "This node manages the other one.",
+            "type": "string"
+          },
+          {
+            "const": "by_peer",
+            "description": "The other node manages this one.",
+            "type": "string"
+          }
+        ]
       },
       "LinkRole": {
         "oneOf": [

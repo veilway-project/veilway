@@ -760,6 +760,16 @@ pub enum LinkRole {
 	Dialler,
 }
 
+/// Which side of a managed link this node is.
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkManage {
+	/// This node manages the other one.
+	Peer,
+	/// The other node manages this one.
+	ByPeer,
+}
+
 /// One node link. It holds no key and no secret.
 #[derive(Serialize, JsonSchema)]
 pub struct Link {
@@ -767,6 +777,8 @@ pub struct Link {
 	pub id: veilway_core::config::LinkId,
 	pub half: LinkHalf,
 	pub role: LinkRole,
+	/// Null for a link that is not managed.
+	pub manage: Option<LinkManage>,
 	pub state: LinkState,
 	/// Seconds the link has been in `state`.
 	pub state_secs: u64,

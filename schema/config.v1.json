@@ -730,6 +730,10 @@
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
           "type": "string"
         },
+        "manage": {
+          "$ref": "#/$defs/LinkManage",
+          "description": "Set when the link is managed: `peer` on the node that manages the other, `by_peer` on the node that is managed. A managed link has both `addresses` in either direction. A node has at most one `by_peer` link, and a node with one has no `peer` link. Absent, the link carries traffic only."
+        },
         "max_flows": {
           "description": "On the exit half: the flows the link may have at once. Defaults to 16384.",
           "format": "uint32",
@@ -828,7 +832,7 @@
           "uniqueItems": true
         },
         "listener": {
-          "description": "The link address of the node that is dialled, in a reverse link and in no other: one for each family of `dialler`.",
+          "description": "The link address of the node that is dialled, in a reverse link and in a link with `manage`, and in no other: one for each family of `dialler`.",
           "items": {
             "$ref": "#/$defs/Ip"
           },
@@ -897,6 +901,21 @@
       "description": "the id of a link: 22 characters of base64url without padding",
       "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$",
       "type": "string"
+    },
+    "LinkManage": {
+      "description": "Whether this node manages the other node of a link, or is managed by it: the side that manages may call the other node's control API through the link. Pairing fixes it and both operators agreed to it, and it holds only while this node's own config says so.",
+      "oneOf": [
+        {
+          "const": "peer",
+          "description": "This node manages the other one.",
+          "type": "string"
+        },
+        {
+          "const": "by_peer",
+          "description": "The other node manages this one.",
+          "type": "string"
+        }
+      ]
     },
     "LinkPeer": {
       "additionalProperties": false,

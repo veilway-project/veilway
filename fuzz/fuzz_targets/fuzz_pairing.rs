@@ -38,12 +38,12 @@ fn offered(code: &str) {
 	let Ok(offer) = Offer::parse(code) else {return};
 	assert!(code.len() <= OFFER_MAX && offer.code() == code, "an offer was read as another text than it is");
 	assert!((1..=NAME_MAX).contains(&offer.name.chars().count()) && (1280..=1500).contains(&offer.mtu) && (1..=TRANSPORTS_MAX).contains(&offer.transports.len()) && (1..=2).contains(&offer.dialler.len()));
-	assert!(offer.listener.is_empty() == (offer.direction == Direction::Forward) && (offer.listener.is_empty() || offer.listener.len() == offer.dialler.len()));
+	assert!(offer.listener.is_empty() == (offer.direction == Direction::Forward && offer.manage.is_none()) && (offer.listener.is_empty() || offer.listener.len() == offer.dialler.len()));
 	assert!(offer.dialler.iter().chain(&offer.listener).enumerate().all(|(at, address)| !offer.dialler.iter().chain(&offer.listener).skip(at + 1).any(|other| other == address)), "one address twice in a link");
 	let mut stream = false;
 	for transport in &offer.transports {
 		match transport {
-			Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} => panic!("an offer lists fronted or faketls"),
+			Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} | Transport::WsPlain {..} => panic!("an offer lists fronted, faketls or ws-plain"),
 			Transport::Tls(listed) | Transport::Ws(listed) => {
 				stream = true;
 				assert!(listed.candidates.iter().all(|candidate| candidate.ech.is_none() && (!matches!(transport, Transport::Tls(_)) || !candidate.pins.is_empty())));
@@ -63,14 +63,14 @@ fn offered(code: &str) {
 	assert_eq!(pastes.answer(&offer, now, &mut seeded(2)).err(), Some(CodeError::Spent));
 	assert_eq!(dialler.shown(), Fingerprint::of(&pairing_hash(offer.object(), &read.bytes()), false).shown());
 	// A listener that issues the same terms pairs with a dialler of its own offer, and the two hold one secret.
-	let (terms, mut offers) = (Terms {direction: offer.direction, name: offer.name.clone(), inbound_public_key: offer.inbound_public_key, transport_public_key: offer.transport_public_key, dialler: offer.dialler.clone(), listener: offer.listener.clone(), mtu: offer.mtu, transports: offer.transports.clone()}, Offers::default());
+	let (terms, mut offers) = (Terms {direction: offer.direction, name: offer.name.clone(), inbound_public_key: offer.inbound_public_key, transport_public_key: offer.transport_public_key, dialler: offer.dialler.clone(), listener: offer.listener.clone(), manage: offer.manage, mtu: offer.mtu, transports: offer.transports.clone()}, Offers::default());
 	let issued = match offers.issue(&terms, 1_700_000_000, LIFETIME, &mut seeded(3)) {
 		Ok(issued) => issued,
 		// The same terms written out again may be a longer text than the one that was read, which had its own expiry and its own spelling.
 		Err(error) => return assert_eq!(error, CodeError::Length),
 	};
 	let again = Offer::parse(&issued).expect("an offer that was issued does not read");
-	assert!((again.direction, &again.name, &again.dialler, &again.listener, again.mtu, &again.transports) == (offer.direction, &offer.name, &offer.dialler, &offer.listener, offer.mtu, &offer.transports), "terms that were read and written out again are other terms");
+	assert!((again.direction, &again.name, &again.dialler, &again.listener, again.manage, again.mtu, &again.transports) == (offer.direction, &offer.name, &offer.dialler, &offer.listener, offer.manage, offer.mtu, &offer.transports), "terms that were read and written out again are other terms");
 	let (answer, dialler) = Pastes::default().answer(&again, 1_700_000_000, &mut seeded(4)).unwrap();
 	let listener = offers.answer(&answer, 1_700_000_000).expect("the listener did not take the answer to its own offer");
 	let (ours, theirs) = (listener.shown(), dialler.shown());

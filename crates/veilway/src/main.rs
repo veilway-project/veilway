@@ -168,18 +168,26 @@ enum Link {
 		#[arg(long, required = true)] address: Vec<IpAddr>,
 		/// In a reverse link: this node's own link address, from the same pool, one for each --address
 		#[arg(long)] listener_address: Vec<IpAddr>,
+		/// This node will be managed by the other one: the other node may read and change this node's config through the link. Needs --listener-address in either direction, and asks for a yes first
+		#[arg(long, requires = "listener_address", conflicts_with = "manages")] managed: bool,
+		/// This node manages the other one: it may read and change the other node's config through the link. Needs --listener-address in either direction. The other operator is asked for a yes
+		#[arg(long, requires = "listener_address")] manages: bool,
 		/// A JSON file with the transports the other node may dial, in this node's order of preference and in the shape a profile of a subscription has
 		#[arg(long)] transports: PathBuf,
 		/// The link's mtu [default: 1390 with a udp-obfs transport on the inbound, 1420 without]
 		#[arg(long, value_parser = clap::value_parser!(u16).range(1280..=1500))] mtu: Option<u16>,
 		/// Seconds the offer is good for
 		#[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..=3600))] lifetime: u64,
+		/// Put the entry into the config of the node that runs, through its control socket, instead of printing it. The socket can be named as --apply=SOCKET [default: veilway.sock next to the config file]
+		#[arg(long, num_args = 0..=1, require_equals = true, value_name = "SOCKET")] apply: Option<Option<PathBuf>>,
 	},
 	/// On the node that dials: read an offer code, show where it dials, make the answer code, and confirm. Exit status as for offer
 	Answer {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
 		/// The tag the link gets in this node's config
 		#[arg(long)] tag: String,
+		/// Put the entry into the config of the node that runs, through its control socket, instead of printing it. The socket can be named as --apply=SOCKET [default: veilway.sock next to the config file]
+		#[arg(long, num_args = 0..=1, require_equals = true, value_name = "SOCKET")] apply: Option<Option<PathBuf>>,
 	},
 }
 
@@ -465,8 +473,8 @@ async fn main() -> anyhow::Result<()> {
 				}
 			})
 		}
-		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, transports, mtu, lifetime}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, &transports, mtu, lifetime)),
-		Command::Link {command: Link::Answer {config, tag}} => std::process::exit(link::answer(&config, &tag)),
+		Command::Link {command: Link::Offer {config, tag, inbound, reverse, name, address, listener_address, managed, manages, transports, mtu, lifetime, apply}} => std::process::exit(link::offer(&config, &tag, &inbound, reverse, &name, address, listener_address, if managed {Some(veilway_proto::pairing::Manage::Dialler)} else if manages {Some(veilway_proto::pairing::Manage::Listener)} else {None}, &transports, mtu, lifetime, apply).await),
+		Command::Link {command: Link::Answer {config, tag, apply}} => std::process::exit(link::answer(&config, &tag, apply).await),
 		Command::Bundle {command: Bundle::Make {key, out, bundle_id, apps, packs, notices}} => bundle::make(&key, &out, bundle_id.as_deref(), &apps, &packs, &notices),
 		Command::Bundle {command: Bundle::Inspect {file, keys}} => std::process::exit(if bundle::inspect(&file, &keys)? {0} else {1}),
 		#[cfg(any(target_os = "linux", target_os = "macos", windows))]

@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use proptest::{collection::vec, option, prelude::*, sample::select};
 use ring::digest::{digest, SHA256};
 use std::net::IpAddr;
-use veilway_proto::pairing::{pairing_hash, transports, transports_json, Answer, CodeError, Direction, Fingerprint, Offer, Offers, Pastes, Terms, Unconfirmed, ANSWER_CHARS, LIFETIME_MAX, OFFER_MAX};
+use veilway_proto::pairing::{pairing_hash, transports, transports_json, Answer, CodeError, Direction, Fingerprint, Manage, Offer, Offers, Pastes, Terms, Unconfirmed, ANSWER_CHARS, LIFETIME_MAX, OFFER_MAX};
 use veilway_proto::proof::public_key;
 use veilway_proto::subscription::payload::{Candidate, Dial, Stream, Transport};
 use veilway_proto::NoRandom;
@@ -40,9 +40,9 @@ fn transport() -> impl Strategy<Value = Transport> {prop_oneof![vec(dial(), 1..=
 fn key() -> impl Strategy<Value = [u8; 32]> {any::<[u8; 32]>().prop_map(|private| public_key(&private))}
 
 fn terms() -> impl Strategy<Value = Terms> {
-	(any::<bool>(), "[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,40}", key(), key(), any::<bool>(), 1280u16..=1500, vec(transport(), 1..=3)).prop_map(|(reverse, name, inbound, transport, two, mtu, transports)| {
+	(any::<bool>(), "[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,40}", key(), key(), any::<bool>(), 1280u16..=1500, vec(transport(), 1..=3), proptest::option::of(prop_oneof![Just(Manage::Listener), Just(Manage::Dialler)])).prop_map(|(reverse, name, inbound, transport, two, mtu, transports, manage)| {
 		let addresses = |last: u8| -> Vec<IpAddr> {[format!("10.9.0.{last}"), format!("fd00:9::{last}")][..if two {2} else {1}].iter().map(|address| address.parse().unwrap()).collect()};
-		Terms {direction: if reverse {Direction::Reverse} else {Direction::Forward}, name, inbound_public_key: inbound, transport_public_key: Some(transport), dialler: addresses(2), listener: if reverse {addresses(3)} else {Vec::new()}, mtu, transports}
+		Terms {direction: if reverse {Direction::Reverse} else {Direction::Forward}, name, inbound_public_key: inbound, transport_public_key: Some(transport), dialler: addresses(2), listener: if reverse || manage.is_some() {addresses(3)} else {Vec::new()}, manage, mtu, transports}
 	})
 }
 
@@ -59,7 +59,7 @@ proptest! {
 		};
 		prop_assert!(code.len() <= OFFER_MAX);
 		let offer = Offer::parse(&code).unwrap();
-		prop_assert_eq!((offer.direction, &offer.name, offer.inbound_public_key, offer.transport_public_key, &offer.dialler, &offer.listener, offer.mtu, &offer.transports, offer.expires_at, offer.code()), (terms.direction, &terms.name, terms.inbound_public_key, terms.transport_public_key, &terms.dialler, &terms.listener, terms.mtu, &terms.transports, now + lifetime, code));
+		prop_assert_eq!((offer.direction, &offer.name, offer.inbound_public_key, offer.transport_public_key, &offer.dialler, &offer.listener, offer.manage, offer.mtu, &offer.transports, offer.expires_at, offer.code()), (terms.direction, &terms.name, terms.inbound_public_key, terms.transport_public_key, &terms.dialler, &terms.listener, terms.manage, terms.mtu, &terms.transports, now + lifetime, code));
 		prop_assert_eq!(offer.dials().len(), offer.transports.iter().map(|transport| match transport {
 			Transport::Udp(list) | Transport::UdpObfs(list) => list.len(),
 			Transport::Tls(stream) | Transport::Ws(stream) | Transport::Fronted(stream) | Transport::FrontedShaped(stream, _) => stream.candidates.len(),

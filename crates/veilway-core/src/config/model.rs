@@ -1746,6 +1746,16 @@ text_value!(Pin, "a certificate pin: 44 characters of standard base64 with paddi
 #[serde(rename_all = "snake_case")]
 pub enum LinkDirection {Forward, Reverse}
 
+/// Whether this node manages the other node of a link, or is managed by it: the side that manages may call the other node's control API through the link. Pairing fixes it and both operators agreed to it, and it holds only while this node's own config says so.
+#[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkManage {
+	/// This node manages the other one.
+	Peer,
+	/// The other node manages this one.
+	ByPeer,
+}
+
 /// The addresses pairing fixed for a link, all from the inbound pool of the node the link connects to.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1753,7 +1763,7 @@ pub struct LinkAddresses {
 	/// The address of the node that dials: at most one IPv4 and one IPv6.
 	#[schemars(length(min = 1, max = 2))]
 	pub dialler: Vec<Ip>,
-	/// The link address of the node that is dialled, in a reverse link and in no other: one for each family of `dialler`.
+	/// The link address of the node that is dialled, in a reverse link and in a link with `manage`, and in no other: one for each family of `dialler`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = 2))]
 	pub listener: Option<Vec<Ip>>,
@@ -1835,6 +1845,9 @@ pub struct Link {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub enabled: Option<bool>,
 	pub addresses: LinkAddresses,
+	/// Set when the link is managed: `peer` on the node that manages the other, `by_peer` on the node that is managed. A managed link has both `addresses` in either direction. A node has at most one `by_peer` link, and a node with one has no `peer` link. Absent, the link carries traffic only.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub manage: Option<LinkManage>,
 	/// Defaults to 1390 when the link lists `udp-obfs`, and to 1420 otherwise.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(range(min = 1280, max = 1500))]

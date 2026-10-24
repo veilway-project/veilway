@@ -373,9 +373,13 @@ subscription_seeds.update({
     "fuzz_subscription/refresh-confirmed-new-pin": b"\x1c" + payload(3, [sub_pk1], at=issued + 60, refresh_urls=[{"url": "https://203.0.113.7:8443/s", "pins": [key64(pin_next)]}]),
     "fuzz_subscription/list-for-unpinned-link": b"\x04" + payload(2, [sub_pk1], at=issued + 60, endpoint_pins=[key64(pin_active)]),
 })
+# A managed link names the side that manages the other, and has the listener's address in a forward link too.
+def link_managed(side): return link_object.replace(b"\"direction\":\"forward\",", b"\"direction\":\"forward\",\"manage\":\"" + side + b"\",").replace(b"\"fd00:9::2\"]", b"\"fd00:9::2\"],\"listener\":[\"10.9.0.3\",\"fd00:9::3\"]")
 subscription_seeds.update({
     "fuzz_pairing/offer": b"\x00" + link_offer_code,
     "fuzz_pairing/offer-reverse": b"\x00" + code(b"vwlink1.", link_object.replace(b"\"forward\"", b"\"reverse\"").replace(b"\"fd00:9::2\"]", b"\"fd00:9::2\"],\"listener\":[\"10.9.0.3\",\"fd00:9::3\"]")),
+    "fuzz_pairing/offer-managed": b"\x00" + code(b"vwlink1.", link_managed(b"dialler")),
+    "fuzz_pairing/offer-managed-listener": b"\x00" + code(b"vwlink1.", link_managed(b"listener")),
     "fuzz_pairing/offer-object": b"\x02" + link_object,
     "fuzz_pairing/answer": b"\x01" + link_answer_code,
     "fuzz_pairing/answer-bytes": b"\x03" + link_answer,

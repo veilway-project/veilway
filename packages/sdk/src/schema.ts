@@ -670,6 +670,8 @@ export interface components {
              */
             handshake_secs: number | null;
             id: components["schemas"]["LinkId"];
+            /** @description Null for a link that is not managed. */
+            manage: components["schemas"]["LinkManage"] | null;
             role: components["schemas"]["LinkRole"];
             /** @description The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns. */
             size_warning: boolean;
@@ -695,6 +697,8 @@ export interface components {
         LinkHalf: "entry" | "exit";
         /** @description the id of a link: 22 characters of base64url without padding */
         LinkId: string;
+        /** @description Which side of a managed link this node is. */
+        LinkManage: "peer" | "by_peer";
         LinkRole: "listener" | "dialler";
         LinkState: "up" | "connecting" | "unreachable" | "refused" | "ended";
         Links: {

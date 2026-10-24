@@ -192,10 +192,14 @@ pub fn standing(path: &Path) -> io::Result<Standing> {
 /// One request to whatever answers on the socket at `path`, on a connection of its own, with `body` sent as JSON: the status of the answer and its body. This is what the command line talks to a node that runs with.
 /// An error is the one of the connect (nothing at the path, nobody answers there, this user may not open it), `TimedOut` when the answer was not whole within `wait`, and anything else when what answered does not speak HTTP.
 /// An answer is read up to the size of the largest there is, a running config, which is no longer than a config file: its secrets are markers that are shorter than they were.
-pub async fn request(path: &Path, method: &str, uri: &str, body: Option<Vec<u8>>, wait: Duration) -> io::Result<(u16, Vec<u8>)> {
+pub async fn request(path: &Path, method: &str, uri: &str, body: Option<Vec<u8>>, wait: Duration) -> io::Result<(u16, Vec<u8>)> {request_with(path, method, uri, &[], body, wait).await}
+
+/// `request` with more headers, such as the `If-Match` of a change of the config.
+pub async fn request_with(path: &Path, method: &str, uri: &str, headers: &[(&str, &str)], body: Option<Vec<u8>>, wait: Duration) -> io::Result<(u16, Vec<u8>)> {
 	tokio::time::timeout(wait, async {
 		let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(UnixStream::connect(path).await?)).await.map_err(io::Error::other)?;
 		let asked = if body.is_some() {hyper::Request::builder().header("content-type", "application/json")} else {hyper::Request::builder()};
+		let asked = headers.iter().fold(asked, |asked, (name, value)| asked.header(*name, *value));
 		let asked = asked.method(method).uri(uri).header("host", "veilway").body(body.map_or_else(Body::empty, Body::from)).map_err(io::Error::other)?;
 		// The connection ends once the request, which holds the sender, is through.
 		tokio::join!(connection, async move {

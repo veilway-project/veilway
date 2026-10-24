@@ -430,6 +430,10 @@ async fn links(State(api): State<Arc<Api>>) -> Response {
 		tag: link.tag, id: veilway_core::config::LinkId(link.id),
 		half: if link.entry {model::LinkHalf::Entry} else {model::LinkHalf::Exit},
 		role: if link.listener {model::LinkRole::Listener} else {model::LinkRole::Dialler},
+		manage: link.manage.map(|manage| match manage {
+			veilway_core::config::LinkManage::Peer => model::LinkManage::Peer,
+			veilway_core::config::LinkManage::ByPeer => model::LinkManage::ByPeer,
+		}),
 		state: match link.status {
 			Status::Up => model::LinkState::Up,
 			Status::Connecting => model::LinkState::Connecting,
