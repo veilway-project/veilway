@@ -2026,6 +2026,10 @@
           "type": "array",
           "uniqueItems": true
         },
+        "outbound": {
+          "description": "The tag of one of the node's `outbounds`. Every connection the node makes to the site (strangers, probes, a user's early connection) then leaves through it, as a connection of an exit with that outbound does, and not from the node's own address. When the outbound is down those connections fail and are said in the log; none goes around it. Without it they leave from the node's own address.",
+          "type": "string"
+        },
         "port": {
           "description": "The site's port. Defaults to 443.",
           "format": "uint16",

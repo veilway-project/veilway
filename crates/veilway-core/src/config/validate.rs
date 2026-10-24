@@ -321,6 +321,11 @@ impl Config {
 		}
 		if self.outbounds.len() > MAX_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_OUTBOUNDS} outbounds"))}
 		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag.as_str()}));
+		// Borrowed-site page: the outbound a site's connections leave by must exist.
+		for (at, transport) in &listeners {
+			let Transport::FakeTls {site: Site {outbound: Some(tag), ..}, ..} = transport else {continue};
+			if !outbound_tags.contains_key(tag.as_str()) {r.error(format!("{at}.site.outbound"), "expected the tag of an outbound, found a tag no outbound has")}
+		}
 		if self.outbounds.iter().filter(|outbound| matches!(outbound, Outbound::Xray {..})).count() > MAX_XRAY_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_XRAY_OUTBOUNDS} outbounds of type xray"))}
 		let tunnels: Vec<&str> = self.exits.iter().filter_map(|exit| if let Backend::L3(l3) = &exit.backend {Some(l3.interface.as_deref().unwrap_or(DEFAULT_INTERFACE))} else {None}).collect();
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {

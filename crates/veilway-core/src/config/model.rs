@@ -905,6 +905,9 @@ pub struct Site {
 	/// An address and port to connect to instead of resolving `host`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub address: Option<Addr>,
+	/// The tag of one of the node's `outbounds`. Every connection the node makes to the site (strangers, probes, a user's early connection) then leaves through it, as a connection of an exit with that outbound does, and not from the node's own address. When the outbound is down those connections fail and are said in the log; none goes around it. Without it they leave from the node's own address.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub outbound: Option<String>,
 	/// Must be true. Every stranger's connection and every early connection of a user is a connection to a site whose owner has not agreed, from this node's address, and using its name may break its terms of use or the law where the operator is.
 	#[schemars(extend("const" = true))]
 	pub acknowledged: bool,

@@ -5,6 +5,7 @@
 //! Timers of a session follow the node's wall clock, as those of `udp-obfs` do. The deadlines of a connection that has proven nothing follow the runtime's clock.
 //! A `ws` or `fronted` listener is the other kind: it is meant for the operator's own web server, whose connections carry the requests of many visitors one after another. Such a connection is read request by request (`front`). A request that is not a user's is handed to the origin as it was read, head and body,
 //! and the answer is handed back as the origin sent it. The node follows both only to know where they end (`veilway_proto::http`), and where it cannot tell with certainty it stops telling requests apart on that connection: it relays to the end of the answer and closes. A `fronted` session is a row in the listener's table that requests come to (`Polling`).
+use super::flows::Conn;
 #[cfg(feature = "bench")]
 use super::inbound::Peers;
 use super::inbound::{Tunnel, Via};
@@ -107,6 +108,10 @@ impl Io for tokio_rustls::server::TlsStream<TcpStream> {
 }
 
 impl Io for DuplexStream {}
+
+impl Io for Conn {
+	fn reset(&self) {if let Conn::Tcp(tcp) = self {tcp.reset()}}
+}
 
 pub(super) type Stream = Box<dyn Io>;
 

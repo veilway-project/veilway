@@ -121,6 +121,32 @@ async fn proxy() -> SocketAddr {
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {Arc::new(rustls::crypto::ring::default_provider())}
 
 /// The site the node borrows: a real TLS 1.3 server (rustls) with a certificate for `NAME` that nobody but the site has, and one page. It answers a request and closes, the way a site does that has nothing to keep a connection for.
+/// A SOCKS5 proxy without authentication that connects every CONNECT to `to` whatever the target said, and records the targets it was asked for.
+async fn forwarding(to: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<SocketAddr>>>, JoinHandle<()>) {
+	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let (addr, asked) = (listener.local_addr().unwrap(), Arc::new(Mutex::new(Vec::new())));
+	let task = tokio::spawn({
+		let asked = asked.clone();
+		async move {
+			loop {
+				let Ok((mut client, _)) = listener.accept().await else {return};
+				let asked = asked.clone();
+				tokio::spawn(async move {
+					let (mut hello, mut head, mut target) = ([0u8; 2], [0u8; 4], [0u8; 6]);
+					if client.read_exact(&mut hello).await.is_err() {return}
+					let mut methods = vec![0u8; usize::from(hello[1])];
+					if client.read_exact(&mut methods).await.is_err() || client.write_all(&[5, 0]).await.is_err() || client.read_exact(&mut head).await.is_err() || head[3] != 1 || client.read_exact(&mut target).await.is_err() {return}
+					asked.lock().unwrap().push(SocketAddr::from((Ipv4Addr::new(target[0], target[1], target[2], target[3]), u16::from_be_bytes([target[4], target[5]]))));
+					let Ok(mut site) = TcpStream::connect(to).await else {return};
+					if client.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.is_err() {return}
+					let _ = tokio::io::copy_bidirectional(&mut client, &mut site).await;
+				});
+			}
+		}
+	});
+	(addr, asked, task)
+}
+
 struct Site {addr: SocketAddr, der: CertificateDer<'static>, connections: Arc<AtomicUsize>, task: JoinHandle<()>}
 
 impl Drop for Site {
@@ -1058,5 +1084,68 @@ async fn a_connection_that_sends_nothing_and_has_no_connection_to_the_site_is_cl
 	assert!(started.elapsed() >= Duration::from_millis(100) && started.elapsed() < Duration::from_millis(1400), "{:?} against the site's {:?}", started.elapsed(), shown.after);
 	assert_eq!(answer.len(), 5 + shown.alert.map_or(0, |(size, ..)| size));
 	assert_eq!(node.totals().idled, 1);
+	node.engine.shutdown().await;
+}
+
+/// Points the site of the node at an address nobody answers at and gives it an outbound `site-proxy`, a SOCKS5 server at `proxy`.
+fn by_proxy(proxy: SocketAddr, site: SocketAddr) -> impl FnOnce(&mut Value) {
+	move |doc| {
+		doc["outbounds"].as_array_mut().unwrap().push(json!({"tag": "site-proxy", "type": "socks5", "server": proxy.to_string()}));
+		doc["inbounds"][0]["transports"][0]["site"]["address"] = json!(site.to_string());
+		doc["inbounds"][0]["transports"][0]["site"]["outbound"] = json!("site-proxy");
+	}
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_connections_to_the_site_leave_by_its_outbound_and_by_no_other_way() {
+	let time = time!();
+	let nowhere = SocketAddr::from(([192, 0, 2, 7], 443));
+	let real = site_after(Duration::ZERO).await;
+	let (proxy, asked, task) = forwarding(real.addr).await;
+	let node = launch("outbound", time, by_proxy(proxy, nowhere)).await;
+	// The site can only be reached through the proxy, which forwards what it is asked for to it, so a probe that kept a shape and a page that came back went through it.
+	assert!(node.totals().probes >= 1 && node.totals().probe_failed == 0, "a probe did not go through the outbound");
+	assert!(logged("through outbound site-proxy"));
+	let before = asked.lock().unwrap().len();
+	assert!(before >= 8);
+	let hello = tap(node.addr).await;
+	let mut tls = trusting(&real.der).connect(ServerName::try_from(NAME).unwrap(), TcpStream::connect(hello.addr).await.unwrap()).await.unwrap();
+	tls.write_all(format!("GET / HTTP/1.1\r\nHost: {NAME}\r\n\r\n").as_bytes()).await.unwrap();
+	let (mut page, mut buf) = (Vec::new(), vec![0u8; 4096]);
+	while let Ok(Ok(count)) = timeout(SECOND, tls.read(&mut buf)).await {
+		if count == 0 {break}
+		page.extend_from_slice(&buf[..count]);
+	}
+	assert!(String::from_utf8_lossy(&page).ends_with(PAGE), "{}", String::from_utf8_lossy(&page));
+	assert_eq!(real.connections.load(Ordering::SeqCst), asked.lock().unwrap().len());
+	assert!(asked.lock().unwrap().iter().all(|target| *target == nowhere));
+	assert_eq!(asked.lock().unwrap().len(), before + 1);
+	let totals = node.totals();
+	assert_eq!((totals.relays, totals.early_connections, totals.site_down), (1, 1, 0));
+	node.engine.shutdown().await;
+	task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_outbound_that_is_down_fails_the_connections_to_the_site_and_never_falls_back_to_the_nodes_own_address() {
+	let time = time!();
+	let gone = {
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		listener.local_addr().unwrap()
+	};
+	// The site is reachable from this machine, directly, at the address the config gives.
+	let reachable = site_after(Duration::ZERO).await;
+	let node = launch("outbound-down", time, by_proxy(gone, reachable.addr)).await;
+	assert_eq!(node.totals().probes, 0);
+	let (answer, closed) = ask(node.addr, b"GET / HTTP/1.1\r\n\r\n", if cfg!(windows) {Duration::from_secs(12)} else {SECOND}).await;
+	assert!(answer.is_empty() && closed);
+	eventually("the site was not counted as down", || node.totals().site_down == 1).await;
+	assert!(logged("through outbound site-proxy cannot be reached: outbound site-proxy:"));
+	assert!(logged("through outbound site-proxy failed: the connection failed, outbound site-proxy:"));
+	assert_eq!(node.site.connections.load(Ordering::SeqCst), 0);
+	assert_eq!(reachable.connections.load(Ordering::SeqCst), 0, "a connection went to the site around the outbound");
+	let mut peer = node.peer(0, &link(0, &TRANSPORT), 0);
+	peer.connect().await.unwrap_or_else(|ended| panic!("a user was refused while the outbound was down: {ended:?}"));
+	peer.session.close().await;
 	node.engine.shutdown().await;
 }

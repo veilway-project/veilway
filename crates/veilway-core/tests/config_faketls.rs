@@ -228,3 +228,14 @@ fn the_key_is_a_secret_that_a_marker_stands_for() {
 	let diff = Diff::between(&config, &other, time::OffsetDateTime::UNIX_EPOCH);
 	assert_eq!((diff.inbound_changes[0].transports_stopped.clone(), diff.inbound_changes[0].transports_started.clone()), (vec![0], vec![0]));
 }
+
+#[test]
+fn the_outbound_a_site_leaves_by_must_exist() {
+	let report = check(&with(|doc| transport(doc)["site"]["outbound"] = json!("plain")));
+	assert!(report.errors.is_empty(), "{report:#?}");
+	let config = parse(&with(|doc| transport(doc)["site"]["outbound"] = json!("plain"))).unwrap();
+	let Transport::FakeTls {site, ..} = &config.inbounds[0].transports[0] else {panic!("not a faketls transport")};
+	assert_eq!(site.outbound.as_deref(), Some("plain"));
+	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);
+	error_at(&format!("{AT}.site.outbound"), |doc| transport(doc)["site"]["outbound"] = json!("nowhere"));
+}

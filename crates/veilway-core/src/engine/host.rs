@@ -130,7 +130,7 @@ pub struct Staged {
 	streams: HashMap<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>,
 	/// The `faketls` listeners the node does not have yet, and for every address a `faketls` transport listens on, where its site is now: the address of the config, or what its name resolved to.
 	borrowed: Vec<(SocketAddr, TcpListener)>,
-	sites: HashMap<SocketAddr, SocketAddr>,
+	sites: HashMap<SocketAddr, (SocketAddr, Option<(String, Arc<Outbound>)>)>,
 	/// The self-signed certificates of those listeners, each with whether it was made now.
 	certified: Vec<(certificate::Made, bool)>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
@@ -267,7 +267,7 @@ impl Host {
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
 		let (mut listeners, mut streams, mut certified) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new());
-		let (mut borrowed, mut sites) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, SocketAddr>::new());
+		let (mut borrowed, mut sites) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (SocketAddr, Option<(String, Arc<Outbound>)>)>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
 				match transport {
@@ -322,7 +322,8 @@ impl Host {
 						};
 						// A site at an address and port the node itself listens on would send every stranger's connection back to the node.
 						if plan.inbounds.iter().flat_map(|inbound| &inbound.transports).any(|other| !other.datagram() && loops(other.listen(), address)) {anyhow::bail!("inbounds[{i}].transports[{t}].site.host: the site of inbound `{}` is an address and port the node itself listens on, so every stranger's connection would come back to the node", inbound.tag)}
-						sites.insert(listen.0, address);
+						let outbound = site.outbound.as_ref().map(|tag| Outbound::of(&config.outbounds, &plan.latency, &plan.hops, tag).map(|found| (tag.clone(), Arc::new(found))).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].site.outbound: inbound `{}` names no outbound `{tag}`", inbound.tag))).transpose()?;
+						sites.insert(listen.0, (address, outbound));
 					}
 					Transport::Ws {listen, tls, ..} => {
 						if !self.ws.contains_key(&listen.0) && !relays.iter().any(|(addr, _)| *addr == listen.0) {
@@ -541,8 +542,8 @@ impl Host {
 		let mut borrowing: HashMap<SocketAddr, faketls::Served> = HashMap::new();
 		for inbound in &plan.inbounds {
 			for transport in inbound.transports.iter().filter(|transport| transport.on()) {
-				let (Transport::FakeTls {listen, site, transport_key, limits, ..}, Some(address)) = (transport, sites.get(&transport.listen())) else {continue};
-				borrowing.insert(listen.0, faketls::Served {tunnel: inbound.tunnel.clone(), key: transport_key.0, host: site.host.clone(), names: std::iter::once(&site.host).chain(site.names.iter().flatten()).map(|name| name.as_bytes().to_vec()).collect(), site: *address, relayed: limits.and_then(|limits| limits.relayed).unwrap_or(DEFAULT_SITE_RELAYED) as usize, rate: limits.and_then(|limits| limits.site_rate).unwrap_or(DEFAULT_SITE_RATE)});
+				let (Transport::FakeTls {listen, site, transport_key, limits, ..}, Some((address, outbound))) = (transport, sites.get(&transport.listen())) else {continue};
+				borrowing.insert(listen.0, faketls::Served {tunnel: inbound.tunnel.clone(), key: transport_key.0, host: site.host.clone(), names: std::iter::once(&site.host).chain(site.names.iter().flatten()).map(|name| name.as_bytes().to_vec()).collect(), site: *address, outbound: outbound.clone(), relayed: limits.and_then(|limits| limits.relayed).unwrap_or(DEFAULT_SITE_RELAYED) as usize, rate: limits.and_then(|limits| limits.site_rate).unwrap_or(DEFAULT_SITE_RATE)});
 			}
 		}
 		self.released = self.udp.keys().filter(|addr| !wanted.contains_key(addr)).chain(self.ws.keys().filter(|addr| !routes.contains_key(addr))).chain(self.tls.keys().filter(|addr| !serving.contains_key(addr))).chain(self.faketls.keys().filter(|addr| !borrowing.contains_key(addr))).copied().collect();
@@ -622,7 +623,7 @@ impl Host {
 		});
 		for (addr, socket) in borrowed {
 			let Some(served) = borrowing.remove(&addr) else {continue};
-			tracing::info!("faketls listener {addr}: alpha, new and unreviewed. Whoever is not a user is relayed to the site {}, at most {} at once and {} new connections a second to it, and a user gets a handshake the node makes with the sizes and times of the site's own flight, copied live from its answer to the user's hello and from probes of the site (eight now, two seconds apart, then one every 6 h). Nothing of this has been measured against a real site, so this build is Detectable", served.host, served.relayed, served.rate);
+			tracing::info!("faketls listener {addr}: alpha, new and unreviewed. Whoever is not a user is relayed to the site {}{}, at most {} at once and {} new connections a second to it, and a user gets a handshake the node makes with the sizes and times of the site's own flight, copied live from its answer to the user's hello and from probes of the site (eight now, two seconds apart, then one every 6 h). Nothing of this has been measured against a real site, so this build is Detectable", served.host, served.outbound.as_ref().map_or_else(String::new, |(tag, _)| format!(" through outbound {tag}")), served.relayed, served.rate);
 			let listener = shared.faketls.listen(addr, served, Clock::of((shared.now)()).ms);
 			self.faketls.insert(addr, (listener.clone(), [Task(faketls::probing(shared, &listener)), Task(faketls::accept(shared, listener.clone(), socket))]));
 		}

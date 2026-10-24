@@ -12,7 +12,8 @@
 //! - `veilway doctor` does not check the site yet.
 use super::inbound::{Tunnel, Via};
 use super::limits::{Bucket, Clock, Ended, Handshakes, Initiation, Seat, Seated, Source, Spent, ENDS};
-use super::plan::{Native, Proved};
+use super::flows::{connect_from, dial_conn, Conn};
+use super::plan::{Native, Outbound, Proved};
 use super::stream::{random, relay, Relayed, Stream, Undecided, DECOY_CONNECT, HELD, RELAY_IDLE, SEND_QUEUE, TLS_HANDSHAKE};
 use super::Shared;
 use crate::config::{ProofRate, DEFAULT_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE};
@@ -39,7 +40,7 @@ use veilway_proto::session::{self, Transport, ECHO, LONE_KEEPALIVE};
 use veilway_proto::tls13::{Keys, Suite, HEADER, RECORD, TAG};
 use veilway_proto::uniform;
 use veilway_transport::mlkem;
-use veilway_transport::probe::{probe, Mode, Patience};
+use veilway_transport::probe::{probe_over, Mode, Patience};
 
 /// "ClientHello read: at most 8,192 bytes of handshake in at most 4 records."
 const HELLO_BYTES: usize = 8192;
@@ -234,6 +235,8 @@ pub struct Served {
 	pub names: Vec<Vec<u8>>,
 	/// The address of the site, from `site.address` or from the name when `prepare` resolved it.
 	pub site: SocketAddr,
+	/// `site.outbound`: its tag and the outbound as the engine dials through it. Every connection to the site leaves by it when it is set.
+	pub outbound: Option<(String, Arc<Outbound>)>,
 	/// `limits.relayed` and `limits.site_rate`.
 	pub relayed: usize,
 	pub rate: u32,
@@ -370,10 +373,10 @@ struct Heard {at: Duration, wire: Vec<Item>, hello: Option<(Suite, u16, bool)>}
 enum Event {Heard(Heard), End, Bad}
 
 /// "Live copy": the hello written to the connection opened at accept, and the site's answer to it read as it arrives. `events` gives each burst when it comes, and `End` when the flight is complete: its encrypted bytes are as many as a kept shape's, or a record the size of a Finished came last, or encrypted records came and then nothing for `quiet` (at least twice the round trip the probes measured, so that a flight of more than one window is not cut; before the first encrypted record the wait is the 5 s), or 5 s have passed, or the site ended the connection. `Bad` says the answer is no flight the client could take (see `MAX_FLIGHT`). The connection stays open until the `Live` is dropped, as a client that went away, or `finish` hands it back with every byte the site sent.
-struct Live {events: mpsc::UnboundedReceiver<Event>, stop: Arc<Notify>, task: Option<JoinHandle<Option<(TcpStream, Vec<u8>)>>>, base: Instant}
+struct Live {events: mpsc::UnboundedReceiver<Event>, stop: Arc<Notify>, task: Option<JoinHandle<Option<(Stream, Vec<u8>)>>>, base: Instant}
 
 impl Live {
-	fn start(mut site: TcpStream, sent: Vec<u8>, session: Vec<u8>, known: Vec<usize>, quiet: Duration) -> Live {
+	fn start(mut site: Stream, sent: Vec<u8>, session: Vec<u8>, known: Vec<usize>, quiet: Duration) -> Live {
 		let (stop, base) = (Arc::new(Notify::new()), Instant::now());
 		let (events, receiver) = mpsc::unbounded_channel();
 		let held = stop.clone();
@@ -415,7 +418,7 @@ impl Live {
 	}
 
 	/// Stops reading and gives back the site's connection and every byte it sent.
-	async fn finish(mut self) -> Option<(TcpStream, Vec<u8>)> {
+	async fn finish(mut self) -> Option<(Stream, Vec<u8>)> {
 		self.stop.notify_one();
 		self.task.take()?.await.ok().flatten()
 	}
@@ -704,7 +707,7 @@ impl Listener {
 		*permits = if wanted < *permits {*permits - self.room.forget_permits(*permits - wanted)} else {wanted};
 		let old = std::mem::replace(&mut *self.served.write().unwrap_or_else(|e| e.into_inner()), Arc::new(served));
 		let current = self.served();
-		if old.host != current.host || old.site != current.site {self.reprobe.notify_one()}
+		if old.host != current.host || old.site != current.site || old.outbound.as_ref().map(|(tag, _)| tag) != current.outbound.as_ref().map(|(tag, _)| tag) {self.reprobe.notify_one()}
 	}
 
 	/// The end of a listener whose address no config has any more: its sessions end, and so does every connection it holds.
@@ -833,7 +836,14 @@ impl Listener {
 	async fn probe_once(&self, shared: &Shared, round: usize) {
 		let (served, patience, now) = (self.served(), shared.faketls.patience(), Clock::of((shared.now)()));
 		let mode = [Mode::Wait, Mode::Notify, Mode::Garbage][round % 3];
-		match probe(served.site, &served.host, mode, now.secs, patience).await {
+		let opened = Instant::now();
+		let probed = match reach(&served).await {
+			Ok(tcp) => probe_over(tcp, opened.elapsed(), &served.host, mode, now.secs, patience).await.map_err(str::to_string),
+			Err(e) if served.outbound.is_some() => Err(format!("the connection failed, {e}")),
+			Err(e) if e.kind() == io::ErrorKind::TimedOut => Err("the connection timed out".to_string()),
+			Err(_) => Err("the connection was refused".to_string()),
+		};
+		match probed {
 			Ok(shape) => {
 				let mut kept = self.kept();
 				let (was_stale, size) = (kept.stale(now.ms), shape.flight.total());
@@ -844,15 +854,18 @@ impl Listener {
 				drop(kept);
 				self.counters.count(Count::Probes);
 				if was_stale {tracing::info!("faketls listener {}: a probe of the site succeeded, so proofs are taken again", self.addr)}
-				else if count == 1 {tracing::info!("faketls listener {}: probed the site {}: {suite:?}, group {group:#06x}, {size} encrypted bytes in its flight. {PROBES} probes are made at start, then one every 6 h, and the last {SHAPES} are kept", self.addr, served.host)}
+				else if count == 1 {tracing::info!("faketls listener {}: probed the site {}{}: {suite:?}, group {group:#06x}, {size} encrypted bytes in its flight. {PROBES} probes are made at start, then one every 6 h, and the last {SHAPES} are kept", self.addr, served.host, through(&served))}
 			}
 			Err(why) => {
 				self.counters.count(Count::ProbeFailed);
-				if self.say(3) {tracing::warn!("faketls listener {}: a probe of the site {} failed: {why}. The flight of a user is then copied from the live answer of the site alone, or from an older shape. Saying so once a minute while it lasts", self.addr, served.host)}
+				if self.say(3) {tracing::warn!("faketls listener {}: a probe of the site {}{} failed: {why}. The flight of a user is then copied from the live answer of the site alone, or from an older shape. Saying so once a minute while it lasts", self.addr, served.host, through(&served))}
 			}
 		}
 	}
 }
+
+/// What a log line adds when the connections to the site leave by an outbound.
+fn through(served: &Served) -> String {served.outbound.as_ref().map_or_else(String::new, |(tag, _)| format!(" through outbound {tag}"))}
 
 /// What the flight of a user was made from.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -909,11 +922,22 @@ pub fn probing(shared: &Arc<Shared>, listener: &Arc<Listener>) -> AbortHandle {
 	}).abort_handle()
 }
 
-/// One connection to the site, within the connect timeout.
-async fn reach(site: SocketAddr) -> io::Result<TcpStream> {
-	let tcp = timeout(DECOY_CONNECT, TcpStream::connect(site)).await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-	let _ = tcp.set_nodelay(true);
-	Ok(tcp)
+/// One connection to the site, within the connect timeout: from the node's own address, or through `site.outbound` as an exit with that outbound dials a destination. An outbound that is down fails the connection, and the node's own address is never the fallback.
+async fn reach(served: &Served) -> io::Result<Stream> {
+	let site = served.site;
+	let Some((tag, outbound)) = &served.outbound else {
+		let tcp = timeout(DECOY_CONNECT, TcpStream::connect(site)).await.map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+		let _ = tcp.set_nodelay(true);
+		return Ok(Box::new(tcp));
+	};
+	let failed = |why: String| io::Error::other(format!("outbound {tag}: {why}"));
+	let conn = match &**outbound {
+		Outbound::Socks5(up) => dial_conn(up, site, Instant::now() + DECOY_CONNECT).await.map_err(|failure| failed(failure.error.to_string()))?,
+		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != site.is_ipv4() => return Err(failed("its address is of the other family".to_string())),
+		Outbound::Direct {bind, interface} => Conn::Tcp(timeout(DECOY_CONNECT, connect_from(*bind, interface.as_deref(), site)).await.map_err(|_| failed("timed out".to_string()))?.map_err(|e| failed(e.kind().to_string()))?),
+	};
+	if let Conn::Tcp(tcp) = &conn {let _ = tcp.set_nodelay(true);}
+	Ok(Box::new(conn))
 }
 
 /// Accepts on the socket of one listener until the handle it returns is aborted.
@@ -962,8 +986,8 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 	// 1. "If the budget for new connections to the site has room, open one connection to the site now, with the connect timeout, and watch it." It is never waited for before the decision, so a site that cannot be reached touches no user.
 	let early = listener.spend(served.rate, Clock::of((shared.now)()).ms);
 	listener.counters.count(if early {Count::Early} else {Count::Skipped});
-	let mut dial = Box::pin(reach(served.site));
-	let (mut origin, mut said, mut scanner, mut buf, mut read, mut heard, mut hold) = (None::<io::Result<TcpStream>>, None::<io::Result<usize>>, Scanner::default(), Vec::new(), [0u8; READ], [0u8; READ], None::<Instant>);
+	let mut dial = Box::pin(reach(&served));
+	let (mut origin, mut said, mut scanner, mut buf, mut read, mut heard, mut hold) = (None::<io::Result<Stream>>, None::<io::Result<usize>>, Scanner::default(), Vec::new(), [0u8; READ], [0u8; READ], None::<Instant>);
 	// "A close timer for silent connections": with no connection to the site to close this one on the site's schedule, the node closes it as a site does that has been sent nothing.
 	let silent = Instant::now() + listener.reaction(Which::Idle).after.min(REACT_MOST);
 	// 2. "Read the hello", and 3. "Forward at once when a byte arrives that makes the bytes no candidate, or when a limit or the hold is reached."
@@ -1074,7 +1098,7 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 		None if listener.spend(served.rate, Clock::of((shared.now)()).ms) => tokio::select! {
 			biased;
 			_ = slot.kill.notified() => return,
-			dialed = reach(served.site) => Some(dialed),
+			dialed = reach(&served) => Some(dialed),
 		},
 		None => None,
 	};
@@ -1087,13 +1111,13 @@ async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>,
 				Some(Ok(count)) => (*count, Ok(*count > 0)),
 				Some(Err(e)) => (0, Err(e.kind())),
 			};
-			let (io, site): (Stream, Stream) = (Box::new(tcp), Box::new(site));
+			let io: Stream = Box::new(tcp);
 			relay(shared.now, io, site, &buf, &heard[..first], open, &slot).await
 		}
 		// "If the site cannot be reached, close the peer's connection, count it as `site_down`, and log at warn at most once a minute", and the same with `site_budget` where the budget has no room. Nothing was written to the peer.
 		failed => {
 			listener.counters.count(if failed.is_some() {Count::SiteDown} else {Count::SiteBudget});
-			if failed.is_some() && listener.say(0) {tracing::warn!("faketls listener {}: its site cannot be reached, so whoever is not a user is closed with no answer, which shows the node for as long as it lasts. Users are not affected. {} such connections since start. Saying so once a minute while it lasts", listener.addr, listener.counters.counts[Count::SiteDown as usize].load(Ordering::Relaxed))}
+			if failed.is_some() && listener.say(0) {tracing::warn!("faketls listener {}: its site{} cannot be reached{}, so whoever is not a user is closed with no answer, which shows the node for as long as it lasts. Users are not affected. {} such connections since start. Saying so once a minute while it lasts", listener.addr, through(&served), match &failed {Some(Err(e)) if served.outbound.is_some() => format!(": {e}"), _ => String::new()}, listener.counters.counts[Count::SiteDown as usize].load(Ordering::Relaxed))}
 			if failed.is_none() && listener.say(1) {tracing::warn!("faketls listener {}: the budget for new connections to its site has no room, so a stranger that needs one is closed with no answer. Users are not affected. {} such connections since start. Saying so once a minute while it lasts", listener.addr, listener.counters.counts[Count::SiteBudget as usize].load(Ordering::Relaxed))}
 			tokio::select! {
 				biased;
@@ -1250,7 +1274,7 @@ async fn decoy(shared: &Arc<Shared>, listener: &Listener, served: &Served, tcp: 
 			None => None,
 		} {
 			listener.counters.count(Count::Relayed);
-			let (io, site): (Stream, Stream) = (Box::new(tcp), Box::new(site));
+			let io: Stream = Box::new(tcp);
 			relay(shared.now, io, site, &[], &raw, Ok(true), &slot).await;
 		}
 		return;
@@ -1542,7 +1566,7 @@ mod tests {
 			}
 			while stream.read(&mut sink).await.is_ok_and(|count| count > 0) {}
 		});
-		Live::start(TcpStream::connect(addr).await.unwrap(), vec![22, 3, 1, 0, 1, 1], SESSION.to_vec(), Vec::new(), quiet)
+		Live::start(Box::new(TcpStream::connect(addr).await.unwrap()), vec![22, 3, 1, 0, 1, 1], SESSION.to_vec(), Vec::new(), quiet)
 	}
 
 	// The encrypted records the events gave before the flight was said to be whole, whether it was said bad, and how long the wait for that took.

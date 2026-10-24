@@ -31,9 +31,9 @@ impl Default for Patience {
 pub enum Mode {Wait, Notify, Garbage}
 
 /// A connection that remembers what was read from it and when, from the first byte written to it: the hello.
-struct Timed {tcp: TcpStream, start: Option<Instant>, reads: Vec<(Duration, Vec<u8>)>}
+struct Timed<S> {tcp: S, start: Option<Instant>, reads: Vec<(Duration, Vec<u8>)>}
 
-impl AsyncRead for Timed {
+impl<S: AsyncRead + Unpin> AsyncRead for Timed<S> {
 	fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
 		let before = buf.filled().len();
 		let ready = Pin::new(&mut self.tcp).poll_read(cx, buf);
@@ -44,7 +44,7 @@ impl AsyncRead for Timed {
 	}
 }
 
-impl AsyncWrite for Timed {
+impl<S: AsyncWrite + Unpin> AsyncWrite for Timed<S> {
 	fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
 		self.start.get_or_insert_with(Instant::now);
 		Pin::new(&mut self.tcp).poll_write(cx, buf)
@@ -56,7 +56,7 @@ impl AsyncWrite for Timed {
 }
 
 /// What the site did, from `since`: the first thing it sent after `receive` and how it ended the connection, within `patience`. None when it did neither. `records` is what was read already.
-async fn reaction(io: &mut TcpStream, records: &mut crate::faketls::Records, receive: &mut Keys, since: Instant, patience: Duration) -> Option<React> {
+async fn reaction<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S, records: &mut crate::faketls::Records, receive: &mut Keys, since: Instant, patience: Duration) -> Option<React> {
 	let (mut alert, mut first, mut read) = (None, None::<Duration>, vec![0; 4096]);
 	let until = since + patience;
 	loop {
@@ -86,6 +86,11 @@ pub async fn probe(site: SocketAddr, name: &str, mode: Mode, now: u64, patience:
 	let tcp = timeout(CONNECT, TcpStream::connect(site)).await.map_err(|_| "the connection timed out")?.map_err(|_| "the connection was refused")?;
 	let rtt = opened.elapsed();
 	let _ = tcp.set_nodelay(true);
+	probe_over(tcp, rtt, name, mode, now, patience).await
+}
+
+/// `probe` over a connection the caller opened to the site, by whatever way, with `rtt` the time it took to open: the node's own address, or an outbound.
+pub async fn probe_over<S: AsyncRead + AsyncWrite + Unpin>(tcp: S, rtt: Duration, name: &str, mode: Mode, now: u64, patience: Patience) -> Result<Shape, &'static str> {
 	let (record, x, hybrid) = capture(name).map_err(|_| "no hello could be made")?;
 	let (mut io, mut seen) = (Timed {tcp, start: None, reads: Vec::new()}, Seen::default());
 	let mut opened = timeout(HANDSHAKE, handshake(&mut io, &record, &x, hybrid.as_ref(), &[], &mut seen)).await.map_err(|_| "the handshake timed out")?.map_err(|_| "the site did not complete a TLS 1.3 handshake with the template hello")?;
