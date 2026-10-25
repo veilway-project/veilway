@@ -25,7 +25,8 @@ fn free() -> SocketAddr {
 	loop {
 		let at = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
 		let mut given = GIVEN.lock().unwrap();
-		if !given.contains(&at.port()) {given.push(at.port()); return at}
+		// the port also carries a UDP listener, and Windows refuses UDP on ports of its reserved ranges that TCP got
+		if !given.contains(&at.port()) && std::net::UdpSocket::bind(at).is_ok() {given.push(at.port()); return at}
 	}
 }
 
