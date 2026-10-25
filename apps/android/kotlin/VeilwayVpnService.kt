@@ -68,6 +68,7 @@ class VeilwayVpnService : VpnService() {
 		instance = this
 		Native.init(filesDir.absolutePath)
 		ensureChannel(this)
+		Toggle.refresh(this)
 	}
 
 	override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -200,6 +201,7 @@ class VeilwayVpnService : VpnService() {
 		unwatchNetworks()
 		unwatchIdle()
 		instance = null
+		Toggle.refresh(this)
 		worker.shutdown()
 		super.onDestroy()
 	}
