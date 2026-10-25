@@ -113,10 +113,16 @@ for folder, tile, short, long in (("values", "Veilway", "Connect or disconnect",
     <string name="veilway_toggle_long">{long}</string>
 </resources>
 """)
-# The tile icon is a white shape on nothing, as the system tints it: a shield with the V of the app icon cut out.
+# The tile icon is the app's mark in one color, as the system tints it: the bold stroke and the three lines behind it, which stop where the stroke crosses them (icon.svg does this with a mask). The thin lines are a little wider than in the app icon, so that they still show at 24dp.
 (res / "drawable" / "ic_veilway_tile.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
-<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="24" android:viewportHeight="24">
-    <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd" android:pathData="M12,2L4,5v6c0,5 3.4,9.7 8,11c4.6,-1.3 8,-6 8,-11V5L12,2zM8,8.2h2.1L12,13.6l1.9,-5.4H16l-3.1,8h-1.8L8,8.2z" />
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="1024" android:viewportHeight="1024">
+    <group android:translateX="-238.4" android:translateY="-204.8" android:scaleX="1.4" android:scaleY="1.4">
+        <clip-path android:pathData="M0,262h1024v500h-1024z" />
+        <path android:pathData="M734.1,200L530.3,624.5" android:strokeColor="#FFFFFFFF" android:strokeWidth="44" android:strokeLineCap="butt" />
+        <path android:pathData="M781.8,200L554.2,674.1" android:strokeColor="#FFFFFFFF" android:strokeAlpha="0.7" android:strokeWidth="44" android:strokeLineCap="butt" />
+        <path android:pathData="M829.5,200L577.7,724.5" android:strokeColor="#FFFFFFFF" android:strokeAlpha="0.45" android:strokeWidth="44" android:strokeLineCap="butt" />
+        <path android:pathData="M242.2,200L543.7,828" android:strokeColor="#FFFFFFFF" android:strokeWidth="120" android:strokeLineCap="butt" />
+    </group>
 </vector>
 """)
 print("overlay applied")
