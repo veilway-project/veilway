@@ -268,6 +268,8 @@ impl Up {
 			Ok(()) => tracing::info!("the kill switch was removed"),
 			Err(error) => problems.push(format!("the kill switch is still in force and `veilway disconnect` removes it: {error}")),
 		}
+		// Last, once nothing blocks names any more: a flush before the kill switch went would fill the cache with failures again.
+		if let Err(error) = dns::flush() {tracing::warn!(%error, "the name cache could not be emptied")}
 		problems
 	}
 }
@@ -290,6 +292,7 @@ pub fn cleanup(options: &Options, _lock: &state::Lock) -> anyhow::Result<Cleaned
 			Err(error) => problems.push(format!("the kill switch: {error}")),
 		}
 	}
+	if cleaned.resolver || cleaned.kill_switch {if let Err(error) = dns::flush() {tracing::warn!(%error, "the name cache could not be emptied")}}
 	tracing::info!(?cleaned, ?problems, "cleaned up");
 	if problems.is_empty() {Ok(cleaned)} else {Err(anyhow::anyhow!("{}", problems.join("; ")))}
 }

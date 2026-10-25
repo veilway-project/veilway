@@ -69,6 +69,9 @@ mod pin {
 	/// Removes the rules that are ours.
 	pub fn clear() -> io::Result<()> {powershell(&clear_script()).map(drop)}
 
+	/// Empties the system's name cache. Lookups made while the kill switch still blocked them are kept there as failures, and without this the names they asked for stay unresolved after the connection is gone, until the user turns the network off and on again.
+	pub fn flush() -> io::Result<()> {powershell("Clear-DnsClientCache").map(drop)}
+
 	/// Whether Group Policy sets name resolution rules. Those win over a rule made with the cmdlets, so names would not go through the tunnel, and the connection is refused and not left to leak.
 	pub fn group_policy() -> io::Result<bool> {
 		use windows_sys::Win32::Foundation::ERROR_SUCCESS;
