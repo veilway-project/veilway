@@ -1089,7 +1089,7 @@ do_update() {
 				decoy="$CADDY_DECOY"
 				write_unit "$decoy" <<EOF
 # Written by veilway.sh update. Remove it with: sudo bash veilway.sh uninstall web
-http://127.0.0.1:$DECOY_PORT {
+http://:$DECOY_PORT {
 	bind 127.0.0.1
 	root * $WEB_ROOT
 	file_server
@@ -1119,6 +1119,15 @@ EOF
 				warn "$web did not accept the decoy site on 127.0.0.1:$DECOY_PORT, so it was taken back: a node's decoy origin needs a web page there, add one by hand"
 			fi
 		fi
+		# Before v0.3.1 Caddy's decoy site answered only the host 127.0.0.1, and the node passes on the visitor's own host, so a prober got an empty 200 at a transport's path where any other path gets the site's 404.
+		for decoy in "$CADDY_SITE" "$CADDY_DECOY"; do
+			if [ "$web" = caddy ] && [ -f "$decoy" ] && grep -q "^http://127.0.0.1:$DECOY_PORT {\$" "$decoy"; then
+				if [ "$DRY" = 1 ]; then dry "let the decoy site in $decoy answer every host name, and reload caddy"; continue; fi
+				act sed -i "s#^http://127.0.0.1:$DECOY_PORT {\$#http://:$DECOY_PORT {#" "$decoy"
+				if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then svc reload caddy.service; step "the decoy site in $decoy now answers every host name, as the site does"
+				else act sed -i "s#^http://:$DECOY_PORT {\$#http://127.0.0.1:$DECOY_PORT {#" "$decoy"; warn "caddy did not accept the decoy site for every host name in $decoy, so it was put back"; fi
+			fi
+		done
 	fi
 	update_self
 	warn "a node restart drops every live tunnel for a moment"
@@ -1778,7 +1787,7 @@ https://:$HTTPS_PORT {
 		respond 404
 	}
 }
-$([ "$DECOY_ON" = 1 ] && printf 'http://127.0.0.1:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
+$([ "$DECOY_ON" = 1 ] && printf 'http://:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
 EOF
 	else write_unit "$CADDY_SITE" <<EOF
 # Written by veilway.sh install panel --domain. Remove it with: sudo bash veilway.sh uninstall web
@@ -1794,7 +1803,7 @@ $HTTPS_HOST {$tls
 		file_server
 	}
 }
-$([ "$DECOY_ON" = 1 ] && printf 'http://127.0.0.1:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
+$([ "$DECOY_ON" = 1 ] && printf 'http://:%s {\n\tbind 127.0.0.1\n\troot * %s\n\tfile_server\n}' "$DECOY_PORT" "$WEB_ROOT")
 EOF
 	fi
 	if has_systemd && [ "$DRY" = 0 ]; then
