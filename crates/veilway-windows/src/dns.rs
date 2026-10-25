@@ -44,7 +44,7 @@ pub fn netsh_calls(index: u32, servers: &[IpAddr]) -> Vec<Vec<String>> {
 }
 
 #[cfg(windows)]
-pub use pin::{clear, group_policy, present, Pinned};
+pub use pin::{clear, flush, group_policy, present, Pinned};
 
 #[cfg(windows)]
 mod pin {
