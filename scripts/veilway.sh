@@ -895,7 +895,7 @@ panel_summary() {
 		if [ -n "$token" ]; then lines+=("Setup token (one time): $token"); else lines+=("Setup token: sudo journalctl -u veilway-panel | grep 'Setup token'"); fi
 		lines+=("Open the admin pages in a browser and paste the token there." "It asks for your username, password and the terms." "")
 		lines+=("Web server: $WEB, site file $([ "$WEB" = caddy ] && echo "$CADDY_SITE" || echo "$NGINX_SITE")")
-		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site is $WEB_ROOT/index.html: edit it as you like." "  It is also served over http on 127.0.0.1:$DECOY_PORT (this machine only) for a node's decoy origin." "  A transport behind $WEB (ws, fronted) needs its path added to the site file: the panel shows the lines." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
+		lines+=("  $prefix and $sub go to the panel; every other path shows a plain site." "  The plain site $WEB_ROOT/index.html was drawn for this server." "  Put a page of your own there: a real site hides the server best." "  It is also served over http on 127.0.0.1:$DECOY_PORT (this machine only) for a node's decoy origin." "  A transport behind $WEB (ws, fronted) needs its path added to the site file: the panel shows the lines." "  The panel's not_found is now $WEB's own 404, so the panel paths look" "  like any other missing page.")
 		if [ "$WEB" = caddy ]; then lines+=("  Caddy gets and renews the certificate for $DOMAIN by itself."); else lines+=("  certbot renews the certificate with its own timer."); fi
 		lines+=("  Port 80 must stay reachable: the certificate is checked over it.")
 		moved="$(web_state node_moved)"; [ -n "$moved" ] || [ -z "$(web_state node_443_moved)" ] || moved="443 8443"; if [ -n "$moved" ]; then read -r from to <<<"$moved"; lines+=("The node's TCP transports moved from $from to $to: publish the profiles again."); fi
@@ -1037,7 +1037,7 @@ do_install() {
 }
 
 do_update() {
-	local comp="${1:-both}" cur web decoy
+	local comp="${1:-both}" cur web decoy sha
 	need_root
 	refuse_links
 	detect_target
@@ -1118,6 +1118,11 @@ EOF
 				rm -f -- "$decoy"
 				warn "$web did not accept the decoy site on 127.0.0.1:$DECOY_PORT, so it was taken back: a node's decoy origin needs a web page there, add one by hand"
 			fi
+		fi
+		# Before v0.3.3 every install wrote the same page, so a search for it found Veilway servers. A page nobody edited is drawn again for this server; an edited one is never touched.
+		sha="$(web_state decoy_sha)"
+		if [ -n "$sha" ] && [ -f "$WEB_ROOT/index.html" ] && [ "$(sha256sum "$WEB_ROOT/index.html" | cut -d' ' -f1)" = "$sha" ] && grep -q "<title>Notes from the garden</title>" "$WEB_ROOT/index.html"; then
+			if [ "$DRY" = 1 ]; then dry "draw a new plain page for this server in place of the one every install shared"; else rm -f -- "$WEB_ROOT/index.html"; web_decoy; fi
 		fi
 		# Before v0.3.1 Caddy's decoy site answered only the host 127.0.0.1, and the node passes on the visitor's own host, so a prober got an empty 200 at a transport's path where any other path gets the site's 404.
 		for decoy in "$CADDY_SITE" "$CADDY_DECOY"; do
@@ -1698,45 +1703,68 @@ web_free_https() {
 	step "moved the node's TCP transports from $HTTPS_PORT to $move_to"
 }
 
-# Written once and never over an edit: the operator owns the page.
+# Written once and never over an edit: the operator owns the page. Each server draws its own from these parts (topic, title, entries, dates, type and colors), so no two serve the same text or bytes and a search for one page finds one server. A page of the operator's own is still the better cover.
 web_decoy() {
 	if [ "$DRY" = 1 ]; then dry "write a plain static page to $WEB_ROOT/index.html if there is none"; return 0; fi
 	if [ -e "$WEB_ROOT/index.html" ]; then info "kept existing $WEB_ROOT/index.html"; return 0; fi
+	local cls title titles=() tags=() items=() fonts palette pal width size lead i n pick picked=() day body="" tag align foot when
+	rnd() { echo $(( $(od -An -N2 -tu2 /dev/urandom) % $1 )); }
+	case "$(rnd 6)" in
+		0) titles=("Vegetable diary" "Back plot" "Beds and borders"); tags=("Vegetables, weather, and a record of what to do differently." "What grew, what didn't, and what the slugs thought of it.")
+			items=("Tomatoes|Planted late and staked badly. They still gave more than the two of us could eat, and the neighbors took the rest." "The compost pile|It works when it is wet and does nothing when it is dry. Grass clippings in thin layers, never a heap." "Watering|A barrel under the gutter covers the beds for most of the summer. A lid keeps the leaves out." "Garlic in October|Planted the cloves from the market, not the ones from the seed catalog. Next summer will tell if that was cheap or clever." "The bean frame|Bamboo and string held up until the first real wind. Rebuilt it lower, which the beans did not seem to mind." "Seed packets|Half the packets in the drawer are older than the drawer. A germination test on a wet towel sorted out which ones still count.") ;;
+		1) titles=("Kitchen notebook" "Mostly soup" "What we ate this week"); tags=("Recipes that worked, written down before they are forgotten." "Plain cooking for two, with notes on what to change next time.")
+			items=("Lentil soup|Red lentils, one onion, a spoon of cumin and enough water. It is better on the second day, so make twice as much." "Bread that rises|The trick was a warmer kitchen, not more yeast. The oven with only the light on is warm enough." "Using up rice|Day old rice fries better than fresh. A beaten egg and whatever is left in the fridge does the rest." "Pickled onions|Vinegar, sugar, salt, and a jar that has been in hot water. Ready in an hour, gone in two days." "A failed cake|Too much baking soda tastes like a coin. Half a teaspoon would have been plenty." "Tea for guests|A pot of black tea with cardamom pods keeps people at the table longer than any dessert.") ;;
+		2) titles=("Trail log" "Weekend walks" "Up the hill"); tags=("Short notes from walks near home, with the bits worth remembering." "Where we went, how long it took, and where the mud was.")
+			items=("The ridge path|Two hours up, one and a half down. The last stretch is loose stones, so good shoes matter more than good legs." "Early start|Leaving at six meant the car park was empty and the light was low and gold on the fields." "Lost the trail|The markers stop after the second gate. Following the stream brought us back to the road eventually." "Rain gear|The cheap jacket kept the rain out and the sweat in. Next time, something that breathes." "The lake loop|Flat, short, and full of families on a Sunday. Better on a weekday morning." "Maps|The paper map was right about the bridge being closed. The phone was not.") ;;
+		3) titles=("Workbench notes" "Fixing things" "The repair shelf"); tags=("Small repairs around the house and what each one took." "Things that were broken, and some that still are.")
+			items=("The dripping tap|A new washer cost almost nothing. Finding the right size took three trips to the hardware shop." "Bike chain|Cleaned and oiled after a winter outside. It still skips in the smallest gear, so a new one is on the list." "A wobbly chair|Wood glue and a clamp overnight. Firm again, as long as nobody leans back." "Old radio|The volume knob crackled. Contact cleaner fixed it in a minute, after an hour of opening the case." "Door that sticks|Planed a few millimeters off the bottom edge. Painted it again so the bare wood does not swell." "Lamp cord|Replaced the frayed cord with a new one and a proper strain relief. It was safer than it looked, but not by much.") ;;
+		4) titles=("Reading list" "Books this year" "Shelf notes"); tags=("Short thoughts on what I read, mostly so I remember reading it." "Notes in the margin, collected in one place.")
+			items=("Slow start|The first hundred pages were hard going. The rest made up for it, which is not always the case." "A short one|Finished in two evenings. It said what it had to say and stopped, which more books should do." "Library finds|The best book this month came from the returns trolley, not from any list." "Rereading|Picked up a book from school years. It was shorter and funnier than I remembered." "Gave up|Stopped halfway through a long novel. Life is short and the shelf is long." "Notes|Writing two lines after each chapter helped more than underlining ever did.") ;;
+		*) titles=("Photo notes" "Contact sheet" "Film and light"); tags=("Notes on pictures taken, the settings, and what I would change." "A place to keep what I learn about taking pictures.")
+			items=("Morning fog|Everything looked better at six. By eight the fog had gone and so had the pictures." "One lens|A week with only the old fifty. Walking closer worked better than any zoom." "Windows|Side light from a window beats the flash on the camera every time." "Night street|A high ISO and a steady wall made up for not carrying a tripod." "Printing|Small prints on matte paper look better on the wall than large glossy ones. Hard to say why." "Old film|A roll from a drawer came back with odd colors. Some of them are the best of the year.") ;;
+	esac
+	fonts=("Georgia, 'Times New Roman', serif" "'Iowan Old Style', Palatino, 'Book Antiqua', serif" "Charter, 'Bitstream Charter', Cambria, serif" "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" "'Helvetica Neue', Helvetica, Arial, sans-serif" "Verdana, Geneva, sans-serif")
+	palette=("#f6f4ee #2b2b26 #7a776b #5b6b3a" "#ffffff #222222 #777777 #2a5d8f" "#fbf8f3 #33302b #8a8378 #8a4b2a" "#f3f5f4 #1f2a27 #6f7d78 #2f6f5e" "#fdfcf8 #2e2a24 #8c8577 #6a4c93" "#f7f7f5 #262626 #737373 #a33b3b")
+	read -r -a pal <<<"${palette[$(rnd ${#palette[@]})]}"
+	width=$((34 + $(rnd 9))); size=$((16 + $(rnd 3))); lead="1.$((5 + $(rnd 3)))"; align=$([ "$(rnd 3)" = 0 ] && echo center || echo left)
+	n=$((3 + $(rnd 3))); day=$((3 + $(rnd 40))); cls=(meta date note small sub when); cls=${cls[$(rnd 6)]}
+	while [ "${#picked[@]}" -lt "$n" ]; do pick=$(rnd ${#items[@]}); [[ " ${picked[*]} " == *" $pick "* ]] || picked+=("$pick"); done
+	tag=$([ "$(rnd 2)" = 0 ] && echo article || echo section)
+	for i in "${picked[@]}"; do
+		when="$(date -u -d "-$day days" "+%B %-d, %Y")"; day=$((day + 6 + $(rnd 30)))
+		if [ "$(rnd 2)" = 0 ]; then body+="<$tag><h2>${items[$i]%%|*}</h2><p class=\"$cls\">$when</p><p>${items[$i]#*|}</p></$tag>"$'\n'; else body+="<$tag><p class=\"$cls\">$when</p><h2>${items[$i]%%|*}</h2><p>${items[$i]#*|}</p></$tag>"$'\n'; fi
+	done
+	foot=("Updated when there is something to say." "Written for myself, read by a few." "No comments, but thanks for reading." "More when the weather changes." "Last updated $(date -u -d "-$((3 + $(rnd 20))) days" "+%B %Y").")
+	title="${titles[$(rnd ${#titles[@]})]}"
 	install -d -m 0755 "$WEB_ROOT"
-	cat >"$WEB_ROOT/index.html" <<'EOF'
+	cat >"$WEB_ROOT/index.html" <<EOF
 <!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Notes from the garden</title>
+<title>$title</title>
 <style>
-body { font: 17px/1.6 Georgia, serif; color: #2b2b26; background: #f6f4ee; margin: 0; }
-main { max-width: 38rem; margin: 0 auto; padding: 3rem 1.25rem; }
-h1 { font-size: 1.8rem; margin: 0 0 .25rem; }
-h2 { font-size: 1.15rem; margin: 2rem 0 .25rem; }
+body { font: ${size}px/$lead ${fonts[$(rnd ${#fonts[@]})]}; color: ${pal[1]}; background: ${pal[0]}; margin: 0; }
+main { max-width: ${width}rem; margin: 0 auto; padding: $((2 + $(rnd 3)))rem 1.25rem; }
+header { text-align: $align; margin-bottom: 2rem; }
+h1 { font-size: 1.$((6 + $(rnd 4)))rem; margin: 0 0 .25rem; color: ${pal[3]}; }
+h2 { font-size: 1.$((1 + $(rnd 2)))rem; margin: 1.8rem 0 .2rem; }
 p { margin: .4rem 0; }
-.meta { color: #7a776b; font-size: .9rem; }
-footer { margin-top: 3rem; color: #7a776b; font-size: .85rem; }
+.$cls { color: ${pal[2]}; font-size: .9rem; }
+footer { margin-top: 3rem; color: ${pal[2]}; font-size: .85rem; }
 </style>
 </head>
 <body>
 <main>
-<h1>Notes from the garden</h1>
-<p class="meta">A small notebook about vegetables, weather and what went wrong this year.</p>
-<h2>Tomatoes, again</h2>
-<p>Six plants went in late, after the last frost warning. The two by the fence did best, which says more about the fence than about the plants.</p>
-<h2>Compost, a year in</h2>
-<p>Turning the pile every other week made less difference than keeping it damp. Eggshells still show up whole in spring.</p>
-<h2>Rain barrels</h2>
-<p>One barrel is enough for the beds. The second one mostly collects leaves and mosquitoes.</p>
-<footer>Updated when there is something to say.</footer>
+<header><h1>$title</h1><p class="$cls">${tags[$(rnd ${#tags[@]})]}</p></header>
+${body}<footer>${foot[$(rnd ${#foot[@]})]}</footer>
 </main>
 </body>
 </html>
 EOF
 	web_note decoy_sha "$(sha256sum "$WEB_ROOT/index.html" | cut -d' ' -f1)"
-	step "wrote the plain site $WEB_ROOT/index.html"
+	step "wrote the plain site $WEB_ROOT/index.html, drawn for this server"
 }
 
 web_caddy() {
