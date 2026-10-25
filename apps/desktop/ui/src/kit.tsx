@@ -19,12 +19,13 @@ export const ANDROID = /Android/i.test(navigator.userAgent);
 export const CAMERA = ANDROID || (!/Linux/.test(navigator.userAgent) && typeof navigator.mediaDevices?.getUserMedia === "function");
 
 // What only this window remembers. The theme, the language and the kill switch also go to the app's settings file, which is what the native title bar and the helper read.
-export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[], accepted: Record<string, string>};
+/** `transports` is the transport picked for a connection, by `subscription\nprofile`. A connection that is not in it uses the automatic choice. */
+export type Prefs = {scheme: "system" | "dark" | "light", choice: {subscription: string, profile: string} | null, hidden: string[], accepted: Record<string, string>, transports: Record<string, string>};
 const PREFS = "veilway-desktop";
 
 export function loadPrefs(): Prefs {
 	const stored = (() => { try { return JSON.parse(localStorage.getItem(PREFS) ?? "{}") as Partial<Prefs>; } catch { return {}; } })();
-	return {scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : [], accepted: typeof stored.accepted === "object" && stored.accepted !== null && !Array.isArray(stored.accepted) ? stored.accepted : {}};
+	return {scheme: stored.scheme === "dark" || stored.scheme === "light" ? stored.scheme : "system", choice: stored.choice ?? null, hidden: Array.isArray(stored.hidden) ? stored.hidden : [], accepted: typeof stored.accepted === "object" && stored.accepted !== null && !Array.isArray(stored.accepted) ? stored.accepted : {}, transports: typeof stored.transports === "object" && stored.transports !== null && !Array.isArray(stored.transports) ? stored.transports : {}};
 }
 
 export function savePrefs(prefs: Prefs) {

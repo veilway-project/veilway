@@ -88,6 +88,8 @@ pub struct Settings {
 	pub networks: Vec<Network>,
 	/// Dials the stream of a TCP transport on the caller's behalf, through a proxy chain, in place of a socket of the engine. With it the datagram transports (`udp`, `udp-obfs`) are not used: they cannot go through a proxy chain. A node that runs the engine for another provider's subscription sets it when its config names a proxy for it.
 	pub connect: Option<Connect>,
+	/// The type of transport the user picked for this connection, such as `ws`. None is the automatic choice, from every transport of the profile.
+	pub only: Option<String>,
 	/// A description of the network the device is on, "what the system exposes": interface type, gateway address, wireless network name or operator code. It is kept only as a hash.
 	pub network: String,
 	/// The languages of the app, in order of preference, for the texts a signed profile has in several.
@@ -103,7 +105,7 @@ struct Hooks {pause: Option<Pause>, redirect: Option<Redirect>}
 
 impl Settings {
 	/// The settings of a tunnel with the three things every platform has: where the client remembers things, the device's clock and the roots. The rest starts empty and is set as the fields are: the hook for the sockets, the device's own networks, the app's languages.
-	pub fn new(store: Arc<Store>, clock: Clock, roots: Arc<rustls::RootCertStore>, network: String) -> Self {Self {store, clock, roots, socket: None, networks: Vec::new(), connect: None, network, languages: Vec::new(), handle: Handle::default(), hooks: Hooks::default()}}
+	pub fn new(store: Arc<Store>, clock: Clock, roots: Arc<rustls::RootCertStore>, network: String) -> Self {Self {store, clock, roots, socket: None, networks: Vec::new(), connect: None, only: None, network, languages: Vec::new(), handle: Handle::default(), hooks: Hooks::default()}}
 	/// Makes the waits of the client rules with `pause` and not with the runtime's sleep. Only with the `testing` feature.
 	#[cfg(feature = "testing")]
 	pub fn with_pause(mut self, pause: Pause) -> Self {
@@ -218,12 +220,12 @@ impl Tunnel {
 			kept = settings.store.kept(&store_key);
 		}
 		let (stream_first, network) = (kept.stream_first.unwrap_or(profile.stream_first), kept.network(&store::network_key(settings.store.seed(), &settings.network)));
-		let mut plan = choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, alpha);
+		let mut plan = choice::plan_for(&profile.transports, settings.only.as_deref(), stream_first, &network, &kept.standing, now, alpha);
 		if settings.connect.is_some() {plan.order.retain(|at| !matches!(profile.transports[*at], Transport::Udp(_) | Transport::UdpObfs(_)))}
 		let ask: Vec<Class> = plan.ask.into_iter().filter(|class| !kept.declined.contains(class)).collect();
 		if !ask.is_empty() {return Err(StartError::Ask(ask))}
 		// Alpha is the reason only if turning it on would give something to try.
-		if plan.order.is_empty() {return Err(if !alpha && !choice::plan(&profile.transports, stream_first, &network, &kept.standing, now, true).order.is_empty() {StartError::Alpha} else {StartError::Nothing})}
+		if plan.order.is_empty() {return Err(if !alpha && !choice::plan_for(&profile.transports, settings.only.as_deref(), stream_first, &network, &kept.standing, now, true).order.is_empty() {StartError::Alpha} else {StartError::Nothing})}
 		let (commands, input) = mpsc::unbounded_channel();
 		// The user's saved choice for this subscription goes in first, so the node is asked for it once the control channel opens.
 		if let Some(tag) = settings.store.exit_choice(held.id().as_str()) {let _ = commands.send(Command::Exit(Some(tag)));}

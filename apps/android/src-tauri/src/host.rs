@@ -306,6 +306,7 @@ impl Core {
 		};
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
+		settings.only = options.transport.clone().filter(|name| ["udp", "udp-obfs", "tls", "ws", "ws-plain", "fronted", "fronted-shaped", "faketls"].contains(&name.as_str()));
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
 		let (key, mut agree, lan_local) = (veilway_engine::store::profile_key(held.id().as_str(), &profile), Agree::default(), self.store.lan_local(held.id().as_str()));
 		// The local proxy is the app's setting, read when the connection starts: a start at boot has no window to send it.

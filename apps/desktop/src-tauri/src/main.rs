@@ -65,9 +65,9 @@ struct UpdateInfo{available:bool, version:String, notes:String, current:String}
 
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
-struct Settings{auto_update:bool, theme:String, locale:String, kill_switch:bool, proxy:ProxySettings}
+struct Settings{auto_update:bool, theme:String, locale:String, kill_switch:bool, proxy:ProxySettings, mirrors:Vec<String>}
 
-impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark(), locale:"en".into(), kill_switch:true, proxy:ProxySettings::default()}}}
+impl Default for Settings{fn default()->Self{Settings{auto_update:true, theme:dark(), locale:"en".into(), kill_switch:true, proxy:ProxySettings::default(), mirrors:Vec::new()}}}
 
 fn dark()->String{"dark".to_string()}
 
@@ -253,7 +253,7 @@ async fn xray_state(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(
 
 /// Installs the add-on after the user's yes to the offer that `connect` gave. The window connects again when it is in.
 #[tauri::command]
-async fn xray_install(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::XrayInstall).await}
+async fn xray_install(app:AppHandle, backend:State<'_, Arc<Backend>>)->Result<Value, String>{let mirrors=load_settings(&app)?.mirrors; ask(&backend, Call::XrayInstall{mirrors}).await}
 
 #[tauri::command]
 async fn xray_remove(backend:State<'_, Arc<Backend>>)->Result<Value, String>{ask(&backend, Call::XrayRemove).await}
@@ -356,6 +356,10 @@ async fn set_settings(app:AppHandle, mut settings:Settings)->Result<Settings, St
 	// With "allow devices on my network" a login is not optional: `needs_login` ignores the switch there.
 	settings.proxy.ensure_login()?;
 	if settings.proxy.on{settings.proxy.config()?;}
+	// Up to 4 mirrors of the Xray add-on, https and of GitHub's layout; the helper checks them again.
+	settings.mirrors=settings.mirrors.iter().map(|mirror| mirror.trim().trim_end_matches('/').to_string()).filter(|mirror| !mirror.is_empty()).collect();
+	if settings.mirrors.len()>4{return Err("mirrors_too_many".into())}
+	if let Some(bad)=settings.mirrors.iter().find(|mirror| !mirror.starts_with("https://") || mirror.len()>256 || mirror.contains(char::is_whitespace)){return Err(format!("mirror_invalid:{bad}"))}
 	let body=serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
 	write_private(&settings_path(&app)?, &body).map_err(|e| e.to_string())?;
 	apply_theme(&app, &settings.theme);

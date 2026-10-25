@@ -17,7 +17,7 @@ const IDLE: Running = {connected: false, status: null, kill_switch_kept: false};
 const QUESTIONS: [string, string][] = [["private", "private address"], ["unsafe", "does not check who"], ["stale", "expired more than 30 days"], ["cover", "looks like ordinary web traffic"], ["nocover", "does not look like web traffic"], ["plain", "plain tunnel"], ["exposed", "can tell that you use this app"]];
 
 // Used only until the helper's settings arrive, and when they cannot be read.
-const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true, proxy: {on: false, only: false, kind: "mixed", port: 10808, lan: false, login: true, user: "", password: ""}};
+const FALLBACK: Settings = {auto_update: true, theme: "dark", locale: "en", kill_switch: true, proxy: {on: false, only: false, kind: "mixed", port: 10808, lan: false, login: true, user: "", password: ""}, mirrors: []};
 // The add-on has not run on a real Mac yet, which its offer says there.
 const MAC = /Macintosh|Mac OS X/.test(navigator.userAgent);
 
@@ -92,7 +92,7 @@ function Root({prefs, onPrefs, settings, onSettings}: {prefs: Prefs, onPrefs: (n
 		if (!chosen) return;
 		setBusy(true);
 		setEnded(null);
-		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {local_names: false, routes: []}}).then(found => { if (offersXray(found)) return setXrayOffer(found.xray_offer); setRunning(old => ({...old, connected: true})); }, error => toast({tone: "danger", title: t("home.connectFailed"), body: failureText(error, t)})).finally(() => setBusy(false));
+		call("connect", {subscription: chosen.subscription.id, profile: chosen.profile.id, options: {local_names: false, routes: [], transport: prefs.transports[chosen.subscription.id + "\n" + chosen.profile.id] ?? null}}).then(found => { if (offersXray(found)) return setXrayOffer(found.xray_offer); setRunning(old => ({...old, connected: true})); }, error => toast({tone: "danger", title: t("home.connectFailed"), body: failureText(error, t)})).finally(() => setBusy(false));
 	};
 	// The add-on is installed only after the yes to its offer. The helper answers at once and tells how it goes with pushes, so Disconnect and the questions are not held up; the connection is made again once it is in.
 	const installXray = () => { setInstalling(true); setDownloaded(0); call("xray_install").catch(error => { setInstalling(false); toast({tone: "danger", title: t("xray.installFailed"), body: failureText(error, t)}); }); };

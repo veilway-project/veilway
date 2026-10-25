@@ -22,7 +22,7 @@ function bundleReview(fa: boolean): BundleReview {
 function subscription(fa: boolean): Subscription {
 	return {
 		id: "sub-harbor", provider: fa ? "هاربر نت" : "Harbor Net", standing: "current", expires_at: now() + 23 * DAY, can_refresh: true,
-		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]], left_out: false}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]], left_out: true}],
+		profiles: [{id: "main", name: fa ? "اتصال اصلی" : "Main", exits: [["fra", "Frankfurt"], ["ams", "Amsterdam"], ["hel", "Helsinki"], ["ist", "Istanbul"]], left_out: false, transports: ["tls", "ws", "udp-obfs", "faketls"]}, {id: "backup", name: fa ? "اتصال پشتیبان" : "Backup", exits: [["fra", "Frankfurt"]], left_out: true, transports: ["ws"]}],
 		usage: [31.4 * GB, 50 * GB, "monthly"],
 		cards: [{kind: "stat", label: fa ? "دستگاه‌ها" : "Devices", value: "2 / 3", unit: null}, {kind: "notice", severity: "information", text: fa ? "سرور هلسینکی شنبه ساعت ۲ بامداد برای نگهداری یک ساعت خاموش است." : "Helsinki is down for maintenance on Saturday from 02:00 for about an hour."}, {kind: "link", label: fa ? "تمدید اشتراک" : "Renew your plan", url: "https://harbor.example/renew"}],
 		notices: [], support: [[fa ? "پشتیبانی" : "Support", "https://t.me/harbor_support"]], terms: "https://harbor.example/terms", privacy: "https://harbor.example/privacy", logo: LOGO, accent: "#0e7490", left_out: 0, lan_local: lan, exit_choice: selected, hosts
@@ -69,7 +69,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	library: args => { languages = (args.languages as string[]) ?? ["en"]; return list(); },
 	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: false}),
 	log_history: () => ["0.4s client ready", "1.2s connect requested", "2.0s connected through Frankfurt"],
-	get_settings: (): Settings => ({auto_update: scene === "update", theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true, proxy}),
+	get_settings: (): Settings => ({auto_update: scene === "update", theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true, proxy, mirrors: []}),
 	set_settings: args => {
 		const saved = args.settings as Settings;
 		proxy = {...saved.proxy, ...(saved.proxy.on && !saved.proxy.user ? fakeLogin : {})};

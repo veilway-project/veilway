@@ -406,6 +406,22 @@ pub enum Transport {
 	WsPlain {key: [u8; 32], cookie: String, stream: Stream},
 }
 
+impl Transport {
+	/// The transport's type as the profile names it, which is also how a user picks one.
+	pub fn name(&self) -> &'static str {
+		match self {
+			Self::Udp(_) => "udp",
+			Self::UdpObfs(_) => "udp-obfs",
+			Self::Tls(_) => "tls",
+			Self::Ws(_) => "ws",
+			Self::WsPlain {..} => "ws-plain",
+			Self::Fronted(_) => "fronted",
+			Self::FrontedShaped(..) => "fronted-shaped",
+			Self::FakeTls {..} => "faketls",
+		}
+	}
+}
+
 /// A candidate of a `faketls` transport: the node's address, and in `sni` the name of the site the node borrows, never the node's own.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Borrowed {pub address: Dial, pub sni: String}

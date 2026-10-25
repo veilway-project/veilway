@@ -49,14 +49,15 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 	return <div className="d-page">
 		<div className="d-hero">
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
-			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{chosen?.profile.legacy ? [subscription.provider, t("xray.tcpUdp")].join(locale === "fa" ? "، " : ", ") : subscription.provider}</span>}</p>
+			<p className="d-place"><span>{state === "connected" && current ? t("home.through", {exit: current.name}) : chosen?.profile.name}</span>{subscription && <span className="vw-muted vw-small">{[subscription.provider, chosen?.profile.legacy ? t("xray.tcpUdp") : null, state === "connected" && connection?.transport ? `\u2066${connection.transport}\u2069` : null].filter(Boolean).join(locale === "fa" ? "، " : ", ")}</span>}</p>
 			{chosen?.profile.left_out && <p className="vw-muted vw-small">{t("profile.leftOut")}</p>}
 			{subscription?.unknown_type && <p className="vw-muted vw-small">{t("profile.unknownType")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
 			{proxyAt && <p className="d-say">{proxyAt}</p>}
 			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null || proxyBlocked) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
 		</div>
-		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, detail: c.subscription.provider}))}/>}
+		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, group: new Set(choices.map(other => other.subscription.id)).size > 1 ? c.subscription.provider : undefined}))}/>}
+		{link === "off" && chosen && (chosen.profile.transports?.length ?? 0) > 1 && <SelectField label={t("home.transport")} value={prefs.transports[chosen.subscription.id + "\n" + chosen.profile.id] ?? "auto"} onChange={value => { const key = chosen.subscription.id + "\n" + chosen.profile.id, {[key]: _, ...rest} = prefs.transports; onPrefs({transports: value === "auto" ? rest : {...rest, [key]: value}}); }} options={[{value: "auto", label: t("home.transportAuto"), detail: t("home.transportAutoDetail")}, ...(chosen.profile.transports ?? []).map(name => ({value: name, label: name, detail: ("transport." + name) in en ? t(("transport." + name) as DesktopKey) : undefined}))]}/>}
 		{proxyBlocked && link === "off" && <Banner tone="warning" title={t("home.refused")}>{t("home.proxyOnlyBlocked")}</Banner>}
 		{proxy?.error && <Banner tone="warning" title={t("home.proxyFailed")}>{proxy.error}</Banner>}
 		{refused && link === "off" && <Banner tone="warning" title={t("home.refused")}>{failureText(refused, t)}</Banner>}

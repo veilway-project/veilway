@@ -122,6 +122,9 @@ pub struct ProfileOut {
 	pub left_out: bool,
 	#[serde(default)]
 	pub legacy: Option<LegacyOut>,
+	/// The types of transport the profile has, in its order, each once: what the window offers next to the automatic choice.
+	#[serde(default)]
+	pub transports: Vec<String>,
 }
 
 /// A backup update host of a subscription, or the endpoint a move asks for. `key` is what the user's answer names it by: the host and port with `#pinned`, `#plain` or `#static`, or for a move its URL and kind, never the token. `kind` is `update` for an entry of `refresh_urls`, which sees the token, `static` for a static mirror, which never does, and `move` for the endpoint of a move, which would become the main one. `state` is `waiting`, `allowed` or `declined`. `check` is how the host is reached: `chain`, `pinned` or `plain`, and over `plain` the network can tell that the device uses this app. `from` is the main endpoint a move leaves.
@@ -233,7 +236,7 @@ pub fn subscription_view(subscription: &Subscription, standing: Standing, can_re
 		standing: match standing {Standing::Current => "current", Standing::OutOfDate => "out_of_date", _ => "stale"}.into(),
 		expires_at: subscription.expires_at,
 		can_refresh,
-		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect(), left_out: !profile.dropped.is_empty(), legacy: None}).collect(),
+		profiles: subscription.profiles.iter().map(|profile| ProfileOut {id: profile.id.clone(), name: profile.name.pick(languages).0.into(), exits: profile.exits.iter().map(|exit| (exit.tag.clone(), exit.name.pick(languages).0.into())).collect(), left_out: !profile.dropped.is_empty(), legacy: None, transports: profile.transports.iter().fold(Vec::new(), |mut names: Vec<String>, transport| {if !names.iter().any(|name| name == transport.name()) {names.push(transport.name().into())} names})}).collect(),
 		usage: subscription.usage.as_ref().map(|usage| (usage.used_bytes, usage.quota_bytes, lower(usage.period))),
 		cards: subscription.cards.iter().map(|card| match card {
 			Card::Stat {label, value, unit} => CardOut::Stat {label: label.pick(languages).0.into(), value: value.pick(languages).0.into(), unit: unit.as_ref().map(|unit| unit.pick(languages).0.into())},

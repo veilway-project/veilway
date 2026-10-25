@@ -177,11 +177,16 @@ pub struct Plan {pub order: Vec<usize>, pub ask: Vec<Class>}
 /// The order is the provider's. The transport that last worked on this network comes first, and with `stream_first` "the client tries every cover transport before any other". Where the two disagree `stream_first` wins. A transport that is set aside is left out, unless that would leave none: "The last transport of a profile that the client is allowed to use is never set aside."
 /// A `faketls` transport is left out while `alpha` is off, and the best class is then the best of the others: the profile is planned as if it did not list it.
 /// A `ws-plain` transport is never the remembered one: "A `ws-plain` candidate ... is never the remembered candidate a covered one is passed over for". It stays where the provider put it.
-pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, standing: &Standing, now: u64, alpha: bool) -> Plan {
+pub fn plan(transports: &[Transport], stream_first: bool, network: &Network, standing: &Standing, now: u64, alpha: bool) -> Plan {plan_for(transports, None, stream_first, network, standing, now, alpha)}
+
+/// `plan` with only the transports of one type, the one the user picked in place of the automatic choice. The rules stay: a lower class still needs its consent and `faketls` still needs `alpha`, and with no transport of that type there is nothing to try.
+pub fn plan_for(transports: &[Transport], only: Option<&str>, stream_first: bool, network: &Network, standing: &Standing, now: u64, alpha: bool) -> Plan {
+	let allowed = |transport: &Transport| usable(transport, alpha) && only.map_or(true, |name| transport.name() == name);
 	let (mut network, mut standing) = (network.clone(), standing.clone());
 	sound(&mut network, &mut standing, digest(transports), now);
+	// The best class is the profile's, so a picked transport of a lower class is asked about as it would be when the automatic choice fell back to it.
 	let Some(best) = transports.iter().filter(|transport| usable(transport, alpha)).map(class).min() else {return Plan::default()};
-	let (mut ask, mut order): (Vec<Class>, Vec<usize>) = (transports.iter().filter(|transport| usable(transport, alpha)).map(class).filter(|class| *class > best && !standing.consent.contains(class)).collect(), (0..transports.len()).filter(|at| usable(&transports[*at], alpha) && (class(&transports[*at]) == best || standing.consent.contains(&class(&transports[*at])))).collect());
+	let (mut ask, mut order): (Vec<Class>, Vec<usize>) = (transports.iter().filter(|transport| allowed(transport)).map(class).filter(|class| *class > best && !standing.consent.contains(class)).collect(), (0..transports.len()).filter(|at| allowed(&transports[*at]) && (class(&transports[*at]) == best || standing.consent.contains(&class(&transports[*at])))).collect());
 	ask.sort();
 	ask.dedup();
 	if let Some(first) = network.worked.filter(|(worked, _, _)| transports.get(*worked).is_some_and(|transport| class(transport) != Class::Exposed)).and_then(|(worked, _, _)| order.iter().position(|at| *at == worked)) {order[..=first].rotate_right(1)}
@@ -404,6 +409,19 @@ mod tests {
 	const ANSWERED: Option<Ended> = Some(Ended::Unreachable(Unreachable::Answered));
 
 	fn states() -> (Network, Standing) {(Network {profile: P, ..Network::default()}, Standing {profile: P, ..Standing::default()})}
+
+	#[test]
+	fn a_picked_transport_is_the_only_one_planned_and_keeps_its_rules() {
+		let (listed, network, mut standing) = (transports(&["udp-obfs", "tls", "udp", "fronted"]), Network::default(), Standing::default());
+		assert_eq!(plan_for(&listed, Some("fronted"), false, &network, &standing, NOW, false), Plan {order: vec![3], ask: vec![]});
+		// A lower class picked alone is asked about as the automatic choice would ask before falling back to it.
+		assert_eq!(plan_for(&listed, Some("udp-obfs"), false, &network, &standing, NOW, false), Plan {order: vec![], ask: vec![Class::NoCover]});
+		assert_eq!(plan_for(&listed, Some("ws"), false, &network, &standing, NOW, false), Plan::default());
+		assert_eq!(plan_for(&listed, None, false, &network, &standing, NOW, false), plan(&listed, false, &network, &standing, NOW, false));
+		assert_eq!(plan_for(&listed, Some("udp"), false, &network, &standing, NOW, false).ask, [Class::Plain]);
+		standing.consent.push(Class::Plain);
+		assert_eq!(plan_for(&listed, Some("udp"), false, &network, &standing, NOW, false), Plan {order: vec![2], ask: vec![]});
+	}
 
 	#[test]
 	fn a_lower_class_needs_the_users_yes_for_the_first_attempt_too() {

@@ -320,11 +320,11 @@ impl Core {
 			}
 			self.answers();
 			let alpha = self.settings.store.alpha_transports();
-			let mut plan = choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), alpha);
+			let mut plan = choice::plan_for(&self.transports, self.settings.only.as_deref(), self.stream_first(), &self.network, &self.standing, self.unix(), alpha);
 			if self.settings.connect.is_some() {plan.order.retain(|at| !matches!(self.transports[*at], Transport::Udp(_) | Transport::UdpObfs(_)))}
 			if plan.order.is_empty() {
 				// Alpha is the reason only if turning it on would give something to try.
-				let alpha_off = !alpha && !choice::plan(&self.transports, self.stream_first(), &self.network, &self.standing, self.unix(), true).order.is_empty();
+				let alpha_off = !alpha && !choice::plan_for(&self.transports, self.settings.only.as_deref(), self.stream_first(), &self.network, &self.standing, self.unix(), true).order.is_empty();
 				self.change(State::Failed, Some(if alpha_off {Say::AlphaOff} else {Say::NothingToTry}));
 				match self.rest(Duration::from_secs(365 * 86_400)).await {
 					Rested::Stop => return,

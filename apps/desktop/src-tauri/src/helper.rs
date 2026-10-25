@@ -277,7 +277,7 @@ impl Core {
 			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
 			Call::Xray => Ok(self.xray_state()),
-			Call::XrayInstall => {
+			Call::XrayInstall {mirrors} => {
 				self.fetch_gate()?;
 				if !self.offered.load(Ordering::SeqCst) {return Err("xray_no_offer".into())}
 				let installing = self.installing.clone().try_lock_owned().map_err(|_| "xray_installing")?;
@@ -291,7 +291,9 @@ impl Core {
 				// The install runs in a task of its own, and the window is told how it goes by pushes, so that this window's Disconnect and Answer are not held up for the five minutes it can take.
 				tokio::spawn(async move {
 					let addons = veilway_xray::addons_dir(&core.data);
-					let (progress, mirrors) = (AtomicU64::new(0), if cfg!(debug_assertions) {veilway_xray::mirrors_from_env()} else {Vec::new()});
+					// The mirrors are the app's setting, sent with the call; a release build never takes them from the environment it inherited.
+					let mirrors: Vec<String> = if cfg!(debug_assertions) && mirrors.is_empty() {veilway_xray::mirrors_from_env()} else {mirrors.into_iter().filter(|mirror| mirror.starts_with("https://") && mirror.len() <= 256).take(4).collect()};
+					let progress = AtomicU64::new(0);
 					let outcome = if veilway_xray::installed(&addons) {Ok(())} else {
 						let install = veilway_xray::fetch_install(&addons, pin.target, pin, &mirrors, &progress);
 						tokio::pin!(install);
@@ -470,6 +472,7 @@ impl Core {
 		};
 		let mut settings = Settings::new(self.store.clone(), Arc::new(now), default_roots(), String::new());
 		settings.languages = self.tags();
+		settings.only = options.transport.clone().filter(|name| ["udp", "udp-obfs", "tls", "ws", "ws-plain", "fronted", "fronted-shaped", "faketls"].contains(&name.as_str()));
 		*self.handle.lock().unwrap() = Some(settings.handle.clone());
 		let platform_options = platform::Options {kill_switch: options.kill_switch, allow_lan: self.store.lan_local(held.id().as_str()), local_names: options.local_names && self.store.lan_local(held.id().as_str()), routes: if options.routes.is_empty() {Routes::Full} else {Routes::Split(options.routes.clone())}, run_dir: self.run.clone(), ..platform::Options::default()};
 		// The one lock every command takes, held to the end, also while the user is asked something: nothing else changes what is in force meanwhile.
@@ -910,10 +913,10 @@ mod tests {
 		if veilway_xray::target().and_then(xray::pin).is_none() {return}
 		let (core, socket, _task) = start("lock", euid()).await.unwrap();
 		let link = link(&socket, &token()).await.unwrap();
-		assert_eq!(link.call(Call::XrayInstall).await.unwrap_err(), "xray_no_offer");
+		assert_eq!(link.call(Call::XrayInstall {mirrors: Vec::new()}).await.unwrap_err(), "xray_no_offer");
 		core.offered.store(true, Ordering::SeqCst);
 		let held = state::lock(&core.run).await.unwrap();
-		assert_eq!(link.call(Call::XrayInstall).await.unwrap_err(), "xray_busy");
+		assert_eq!(link.call(Call::XrayInstall {mirrors: Vec::new()}).await.unwrap_err(), "xray_busy");
 		assert_eq!(link.call(Call::XrayRemove).await.unwrap_err(), "xray_busy");
 		assert_eq!(link.call(Call::Xray).await.unwrap()["installing"], false, "a refused install leaves nothing running");
 		drop(held);

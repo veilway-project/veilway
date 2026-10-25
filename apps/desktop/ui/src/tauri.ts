@@ -14,7 +14,7 @@ export type ProxyStatus = {listen: string, kind: string, only: boolean, error: s
 export type Card = {kind: "stat", label: string, value: string, unit: string | null} | {kind: "progress", label: string, used: number, total: number} | {kind: "notice", severity: string, text: string} | {kind: "link", label: string, url: string};
 // `legacy` is set for a connection of pasted links: its protocol, whether the core caps it at Unsafe (otherwise at Detectable), and the code of the refusal when it cannot connect.
 export type Legacy = {protocol: string, unsafe_cap: boolean, refused: string | null};
-export type Profile = {id: string, name: string, exits: [string, string][], left_out: boolean, legacy?: Legacy | null};
+export type Profile = {id: string, name: string, exits: [string, string][], left_out: boolean, legacy?: Legacy | null, transports?: string[]};
 // A backup update address of a subscription, or the new main address a move asks for. `key` is what an answer names it by (host and port, never a path or the token). An `update` host sees the token, a `static` one never does, and a `move` would become the main one. Over `plain` the network can tell that the device uses this app. `from` is the address a move leaves.
 export type Host = {key: string, host: string, kind: "update" | "static" | "move", state: "waiting" | "allowed" | "declined", check: "chain" | "pinned" | "plain", from: string | null};
 export type Subscription = {id: string, provider: string, standing: "current" | "out_of_date" | "stale", expires_at: number, can_refresh: boolean, profiles: Profile[], usage: [number, number, string] | null, cards: Card[], notices: Notice[], support: [string, string][], terms: string | null, privacy: string | null, logo: string | null, accent: string | null, left_out: number, unknown_type?: boolean, lan_local: boolean, exit_choice: string | null, hosts: Host[], legacy?: boolean, bundle_notices?: {severity: string, text: string, issued_at: number}[]};
@@ -35,9 +35,9 @@ export const asksPrivate = (value: unknown): value is PrivateAsk => typeof value
 export type Running = {connected: boolean, status: StatusView | null, kill_switch_kept: boolean};
 // The local proxy. The login is made by the app when the proxy is turned on; Android never turns it off, and with `lan` it is always on.
 export type ProxySettings = {on: boolean, only: boolean, kind: "mixed" | "socks5" | "http", port: number, lan: boolean, login: boolean, user: string, password: string};
-export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean, proxy: ProxySettings};
+export type Settings = {auto_update: boolean, theme: string, locale: string, kill_switch: boolean, proxy: ProxySettings, mirrors: string[]};
 export type UpdateInfo = {available: boolean, version: string, notes: string, current: string};
-export type Options = {local_names: boolean, routes: string[]};
+export type Options = {local_names: boolean, routes: string[], transport?: string | null};
 export type Ended = {error: string | null, kept: boolean};
 export type Progress = {downloaded: number, total: number | null};
 // A bundle as the helper reviewed it (src-tauri/src/bundle.rs). `signer` is the provider's name when `release` is false. `subscription` is set where a newer document can be applied.

@@ -61,6 +61,9 @@ pub struct Options {
 	/// Set by the app from its settings, like `kill_switch`.
 	#[serde(default)]
 	pub proxy: ProxySettings,
+	/// The transport the user picked for this connection, such as `ws`. None, or a name this app does not know, is the automatic choice.
+	#[serde(default)]
+	pub transport: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -92,7 +95,11 @@ pub enum Call {
 	/// Whether this system can have the Xray add-on, whether the release this app pins is installed, the release and the most its download can be.
 	Xray,
 	/// Downloads and installs the add-on, after the user's yes to the offer; refused when no offer was made. The answer comes at once, with null: the install runs in a task of the helper and is told by `Out::XrayInstall` pushes, and the window connects again when it hears that the add-on is in.
-	XrayInstall,
+	XrayInstall {
+		/// The app's own setting, `https://host/prefix` with GitHub's layout under it, tried after GitHub. The archive is checked against the pin whichever answers.
+		#[serde(default)]
+		mirrors: Vec<String>,
+	},
 	/// Removes the add-on, after a disconnect if a profile that uses it runs. The pasted links stay.
 	XrayRemove,
 	/// "Let apps reach devices on this network" for one subscription, saved and used from the next connect. The local network goes through the tunnel unless this is on.
@@ -191,7 +198,7 @@ mod tests {
 
 	#[test]
 	fn every_call_survives_the_frame_around_it() {
-		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Xray, Call::XrayInstall, Call::XrayRemove, Call::Alpha, Call::SetAlpha {on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {subscription: "s".into(), tag: Some("x".into())}, Call::Status, Call::Quit];
+		let calls = vec![Call::Hello {nonce: "n".into()}, Call::Auth {proof: "p".into()}, Call::Library {languages: vec!["fa".into()]}, Call::ImportOpen {source: Source::Link {text: "x".into()}}, Call::ImportOpen {source: Source::File {data: "eA==".into()}}, Call::ImportProceed {private: vec!["192.168.1.20".into()]}, Call::ImportKeep {keep: true}, Call::ImportOpen {source: Source::Sealed {data: "eA==".into(), password: "a long password".into()}}, Call::ImportCancel, Call::ShareLink {subscription: "s".into()}, Call::ShareFile {subscription: "s".into(), password: "a long password".into()}, Call::Refresh {subscription: "s".into(), private: Vec::new()}, Call::Remove {subscription: "s".into()}, Call::AnswerHosts {subscription: "s".into(), allow: vec!["a.example:443".into()], decline: vec!["b.example:443#static".into()]}, Call::Connect {subscription: "s".into(), profile: "p".into(), options: Options::default()}, Call::SetLan {subscription: "s".into(), on: true}, Call::Xray, Call::XrayInstall {mirrors: vec!["https://mirror.example/xray".into()]}, Call::XrayRemove, Call::Alpha, Call::SetAlpha {on: true}, Call::Answer {yes: false}, Call::Disconnect, Call::SelectExit {subscription: "s".into(), tag: Some("x".into())}, Call::Status, Call::Quit];
 		for call in calls {
 			let frame = Frame {id: 42, call};
 			assert_eq!(serde_json::from_str::<Frame>(&serde_json::to_string(&frame).unwrap()).unwrap(), frame);
