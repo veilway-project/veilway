@@ -33,11 +33,11 @@ use tokio::task::{JoinHandle, JoinSet};
 use veilway_proto::proxy::http::Body;
 
 /// The release of Xray-core this build runs. The installer pins its archives and `PIN` pins what they hold.
-pub const RELEASE: &str = "v26.3.27";
+pub const RELEASE: &str = "v26.10.21";
 #[cfg(target_arch = "x86_64")]
-pub(super) const PIN: &str = "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed";
+pub(super) const PIN: &str = "a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e";
 #[cfg(target_arch = "aarch64")]
-pub(super) const PIN: &str = "c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04";
+pub(super) const PIN: &str = "dc3324f437132d70d29ddadea19b202949c2d1230b5d90dac469b03f68829c8b";
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub(super) const PIN: &str = "";
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -817,7 +817,8 @@ mod tests {
 		});
 		let id = "3f2b8c1e-5d4a-4e7b-9a6c-1d2e3f4a5b6c";
 		let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-		let server = json!({"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": provider, "protocol": "vless", "settings": {"clients": [{"id": id}], "decryption": "none"}, "streamSettings": {"network": "tcp"}}], "outbounds": [{"protocol": "freedom"}]});
+		let server = json!({"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": provider, "protocol": "vless", "settings": {"clients": [{"id": id}], "decryption": "none"}, "streamSettings": {"network": "tcp"}}], "outbounds": [{"protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.0/8"]}]}}]});
+		// Xray from v26.10 blackholes private and loopback targets of freedom unless a final rule allows them, and the echo servers here are on loopback.
 		let _provider = xray(&path, &server.to_string(), provider).await;
 		let document = |outbound: serde_json::Value| Config::parse(json!({
 			"version": 1,

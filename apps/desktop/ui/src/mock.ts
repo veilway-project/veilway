@@ -34,7 +34,7 @@ const pasted = (): Subscription => ({id: "legacy.7c1e", provider: "", standing: 
 const legacyOffer: LegacyOffer = {kind: "legacy", connections: [{name: "Edge Frankfurt", protocol: "vless", unsafe_cap: false}, {name: "Backup", protocol: "trojan", unsafe_cap: false}], refused: [{name: "Old KCP", code: "profile_refused.stream"}], skipped: 0, cut: false};
 const xrayScene = scene === "offer" || scene === "xray";
 let xrayInstalled = scene === "xray", legacyHeld = xrayScene, lastLegacy = false;
-const xrayState = (): XrayState => ({supported: true, installed: xrayInstalled, release: "v26.3.27", size: 64 * 1024 ** 2, installing: false});
+const xrayState = (): XrayState => ({supported: true, installed: xrayInstalled, release: "v26.10.21", size: 64 * 1024 ** 2, installing: false});
 const list = () => [...(legacyHeld ? [pasted()] : []), ...(held ? [subscription(languages[0] === "fa")] : [])];
 
 const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened, alpha: query.get("transport") === "faketls"};

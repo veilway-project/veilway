@@ -7,7 +7,8 @@ query = dict(urllib.parse.parse_qsl(link.query))
 uuid = link.username
 if "--wrong" in sys.argv:
 	uuid = "00000000-0000-4000-8000-" + uuid[-12:]
-tls = {"network": query.get("type", "tcp"), "security": query.get("security", "tls"), "tlsSettings": {"serverName": query.get("sni", link.hostname)}}
+# Xray from v26.10 trusts only the roots built into it, not the system store, so the test CA is given to it directly.
+tls = {"network": query.get("type", "tcp"), "security": query.get("security", "tls"), "tlsSettings": {"serverName": query.get("sni", link.hostname), "certificates": [{"usage": "verify", "certificateFile": "/ca.pem"}]}}
 if link.scheme == "trojan":
 	outbound = {"protocol": "trojan", "settings": {"servers": [{"address": link.hostname, "port": link.port, "password": uuid}]}, "streamSettings": tls}
 elif link.scheme == "ss":

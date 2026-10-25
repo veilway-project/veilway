@@ -3,7 +3,7 @@ pub mod document;
 pub mod profile;
 
 /// The release of Xray-core the apps and the node run.
-pub const RELEASE: &str = "v26.3.27";
+pub const RELEASE: &str = "v26.10.21";
 
 /// The SHA-256 of a target's archive as the release publishes it, and of the `xray` executable the archive holds. A target without a pair is not installed.
 pub struct Pin {
@@ -14,12 +14,12 @@ pub struct Pin {
 
 // Linux: the archive values are from the installer's pins (scripts/veilway.sh) and the executables from the node's (engine/xray.rs). macOS and Windows: the archive values are the `.dgst` files of the release, each checked against its archive, and the executables are the `xray` or `xray.exe` entry of that archive, hashed as delivered.
 pub const PINS: [Pin; 6] = [
-	Pin {target: "linux-64", archive: "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae", executable: "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed"},
-	Pin {target: "linux-arm64-v8a", archive: "4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c", executable: "c2d20a7045250497083afea0d79db0672f6c89a25aaaf37c92de034d6b764b04"},
-	Pin {target: "macos-64", archive: "f5b0471d3459eff1b82e48af0aeac186abcc3298210070afbbbd8437a4e8b203", executable: "afd0eaebb77994a18f29b00c5f50a4f7fbb77da06e24352d43035f3cad3c3786"},
-	Pin {target: "macos-arm64-v8a", archive: "2e93a67e8aa1936ecefb307e120830fcbd4c643ab9b1c46a2d0838d5f8409eaf", executable: "5d9dd24c0aba4b6cfcc6a33a5d67f854816ee17f392bf932ec8176da46f7e404"},
-	Pin {target: "windows-64", archive: "d004c39288ce9ada487c6f398c7c545f7d749e44bdfdd59dbc9f865afba4e1ad", executable: "15c2d007954ac53ba69b80ec91242786b3c0b71d52649165b4ca1d5cc96ef8f1"},
-	Pin {target: "windows-arm64-v8a", archive: "35d4ed6ec21224fb22b07c2c3f672e2350cd536f2c74d309150175a76365ea88", executable: "e3340409afd87c1cd928e19208c78cb7271e9f95777aa5122db30759b6d2dc81"},
+	Pin {target: "linux-64", archive: "0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978", executable: "a27e3f95ab6ce270956d0cecd32eda4686a811afc71c64a6a734a3dede14883e"},
+	Pin {target: "linux-arm64-v8a", archive: "d1304946c486d98e6b886e9b931eaaaebb23835b30e217638037b7f2721d4e9c", executable: "dc3324f437132d70d29ddadea19b202949c2d1230b5d90dac469b03f68829c8b"},
+	Pin {target: "macos-64", archive: "8e5169b429e76ce5f550c8294db465bc259f30c158ba900aa40802b76ad2f66e", executable: "c91e9832e57eb0ef3bc84d1846a05585b30d24eda99429aa4d9a656063eb6a57"},
+	Pin {target: "macos-arm64-v8a", archive: "926cc55fda2a8757dabe4f22dc98772f218ace025f101bd0b68aee232e59d5dc", executable: "94a9bfc0df6a0462552d535861f8a1580a0a6c94f7b0d30fe312daa0024ede2e"},
+	Pin {target: "windows-64", archive: "fc58c39ee2f2717b4c54d28d374362389e5319b20ae44aea76ea45a5243ec827", executable: "c77a00eb84fb93ae044c2d771a1cabcc033b81e487253fbc35b12df6879c1e15"},
+	Pin {target: "windows-arm64-v8a", archive: "bb44af3380c9975f951ce7645c04d56ab600040e68f23974a2806e08e0a3f872", executable: "bf47164a9be92afc87f50f1e22d25730f044222bfd6cedf9a524201379be023f"},
 ];
 
 pub fn pin(target: &str) -> Option<&'static Pin> {PINS.iter().find(|pin| pin.target == target)}

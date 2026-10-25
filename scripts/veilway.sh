@@ -65,7 +65,7 @@ NODE_DIR="$CONF_DIR/node"
 STATE_DIR="/var/lib/veilway"
 MIRROR_DIR="/etc/veilway-mirror"
 ADDON_DIR="/usr/local/lib/veilway/addons"
-XRAY_RELEASE="v26.3.27"
+XRAY_RELEASE="v26.10.21"
 # Only where the package manager has no minisign. The hash was pinned after the tarball's signature was checked with the author's key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3.
 MINISIGN_VERSION="0.11"
 MINISIGN_URL="https://github.com/jedisct1/minisign/releases/download/$MINISIGN_VERSION/minisign-$MINISIGN_VERSION-linux.tar.gz"
@@ -1373,8 +1373,8 @@ menu() {
 # SHA-256 of the archives of the one Xray-core release this Veilway runs, from the .dgst files the release publishes. Nothing else is trusted: an archive that does not match is refused, and the node checks the executable inside against its own pin before every start.
 xray_pin() {
 	case "$1" in
-		linux-64) printf '%s' 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ;;
-		linux-arm64-v8a) printf '%s' 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ;;
+		linux-64) printf '%s' 0eec3ed4163c273d8c8bf821f7d219e257921cf584aa3fb970715e458e631978 ;;
+		linux-arm64-v8a) printf '%s' d1304946c486d98e6b886e9b931eaaaebb23835b30e217638037b7f2721d4e9c ;;
 	esac
 }
 

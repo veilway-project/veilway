@@ -21,7 +21,7 @@ A=11.95.7; B=11.96.7
 CLIENT=$A.40; RA=$A.2; RB=$B.2; SERVER=$B.10; RESP=$B.20; REL=$B.30
 HOST=node.gate.test; RELHOST=releases.gate.test
 TAG=v0.0.1-gate
-XRAY=v26.3.27
+XRAY=v26.10.21
 REL_VOL=veilway-alpha-rel; TGT_VOL=veilway-alpha-target
 LIMITS="--cpus 1 --memory 512m"
 FAILS=0
@@ -49,7 +49,7 @@ ARCH="$(docker run --rm alpine:3.22 uname -m)"; TARGET="$ARCH-unknown-linux-musl
 echo "== xray gate: $TARGET, work dir $WORK, screenshots in $OUT"
 case "$ARCH" in x86_64) XARCH=linux-64 ;; *) XARCH=linux-arm64-v8a ;; esac
 docker volume create $REL_VOL >/dev/null; docker volume create $TGT_VOL >/dev/null; docker volume create veilway-alpha-zig >/dev/null
-docker run --rm -v $REL_VOL:/rel alpine:3.22 sh -c "test -s /rel/Xray-$XARCH.zip || { apk add -q --no-cache curl >/dev/null && curl -fsSL --proto '=https' -o /rel/Xray-$XARCH.zip https://github.com/XTLS/Xray-core/releases/download/$XRAY/Xray-$XARCH.zip; }" || die "fetching the Xray-core archive"
+docker run --rm -v $REL_VOL:/rel alpine:3.22 sh -c "test -s /rel/Xray-$XRAY-$XARCH.zip || { apk add -q --no-cache curl >/dev/null && curl -fsSL --proto '=https' -o /rel/Xray-$XRAY-$XARCH.zip https://github.com/XTLS/Xray-core/releases/download/$XRAY/Xray-$XARCH.zip; }" || die "fetching the Xray-core archive"
 # 1. Builds. The node is built the way the release workflow does it, with cargo zigbuild for the musl target (BoringSSL in the client needs libclang in its build script, which a musl host cannot load). The panel has no such dependency and builds natively on Alpine.
 if [ -z "${SKIP_BUILD:-}" ] || ! docker run --rm -v $REL_VOL:/rel:ro alpine:3.22 sh -c "test -x /rel/veilway-bin -a -x /rel/veilway-panel-bin"; then
 	build_wait
@@ -94,8 +94,8 @@ cp /rel/veilway-panel-bin $D/veilway-panel/releases/download/$TAG/veilway-panel-
 cp /example.json /w/site/raw/veilway-project/veilway/$TAG/config.example.json
 X=/w/site/XTLS/Xray-core/releases/download/$XRAY
 mkdir -p $X /w/xrayc
-cp /rel/Xray-$XARCH.zip $X/
-unzip -p /rel/Xray-$XARCH.zip xray >/w/xrayc/xray
+cp /rel/Xray-$XRAY-$XARCH.zip $X/Xray-$XARCH.zip
+unzip -p /rel/Xray-$XRAY-$XARCH.zip xray >/w/xrayc/xray
 chmod 755 /w/xrayc/xray
 minisign -S -s node.key -m $D/veilway/releases/download/$TAG/veilway-$TARGET -t "veilway $TAG veilway-$TARGET" </dev/null >/dev/null
 minisign -S -s panel.key -m $D/veilway-panel/releases/download/$TAG/veilway-panel-$TARGET -t "veilway-panel $TAG veilway-panel-$TARGET" </dev/null >/dev/null

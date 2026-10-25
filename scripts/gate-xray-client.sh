@@ -9,7 +9,7 @@ P=veilway-gx
 NET=172.31.95
 SERVER=$NET.10; CLIENT=$NET.40
 WEB=203.0.113.80; RESOLVER=1.1.1.1; GATEWAY=198.18.0.1
-XRAY=v26.3.27
+XRAY=v26.10.21
 VOL=veilway-target-usage; REL=veilway-alpha-rel
 BIN=/t/linux-client/debug
 FAILS=0
@@ -86,7 +86,7 @@ docker exec -i $P-server sh -c "cat > /gx/server.json" <<EOF
 {"port":8004,"protocol":"trojan","settings":{"clients":[{"password":"$PASS"}]},"streamSettings":{"network":"ws","wsSettings":{"path":"/ws"},$(tls)}},
 {"port":8005,"protocol":"shadowsocks","settings":{"method":"aes-128-gcm","password":"$SS_KEY","network":"tcp,udp"}},
 {"port":8006,"protocol":"vless","settings":{"clients":[{"id":"$ID"}],"decryption":"none"},"streamSettings":{"network":"grpc","grpcSettings":{"serviceName":"gate"},$(tls)}}],
-"outbounds":[{"protocol":"freedom"}]}
+"outbounds":[{"protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16"]}]}}]}
 EOF
 docker exec -d $P-server /opt/xray run -config /gx/server.json
 wait_for 10 s sh -c 'ss -Hltn | grep -q ":8006"' || die "the server's Xray did not listen"
