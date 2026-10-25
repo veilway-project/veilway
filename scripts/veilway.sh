@@ -1064,6 +1064,11 @@ do_update() {
 			svc restart veilway.service
 		else info "node is not installed, skipped"; fi
 	fi
+	# The node starts only the Xray-core it pins, so an add-on of another release would stop Xray's users after this update. It is installed again here; an add-on installed before v0.3.4 has no release file and counts as another release.
+	if [ -x "$ADDON_DIR/xray/xray" ] && [ "$(cat "$ADDON_DIR/xray/release" 2>/dev/null)" != "$XRAY_RELEASE" ]; then
+		info "the Xray add-on is not Xray-core $XRAY_RELEASE, which this node pins: installing it again"
+		( do_addon xray install ) || warn "the Xray add-on could not be installed again: run sudo bash veilway.sh addon xray install, or Xray's users stay cut off"
+	fi
 	if [ "$comp" = mirror ]; then
 		if [ -f "$UNIT_DIR/veilway-mirror.service" ] || [ "$DRY" = 1 ]; then
 			info "node binary is at $(installed_version node || true)"
@@ -1407,6 +1412,7 @@ do_addon() {
 			install -d -m 0755 -o root -g root "$ADDON_DIR" "$ADDON_DIR/xray"
 			install -m 0755 -o root -g root "$TMP/xray" "$ADDON_DIR/xray/xray.new"
 			mv -f "$ADDON_DIR/xray/xray.new" "$ADDON_DIR/xray/xray"
+			printf '%s\n' "$XRAY_RELEASE" >"$ADDON_DIR/xray/release"
 			step "installed Xray-core $XRAY_RELEASE in $ADDON_DIR/xray"
 			xray_units
 			xray_node_group
