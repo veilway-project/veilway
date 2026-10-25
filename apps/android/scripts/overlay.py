@@ -68,6 +68,9 @@ if "VeilwayTile" not in text:
             android:theme="@android:style/Theme.Translucent.NoTitleBar" />
     </application>""", 1)
     text = re.sub(r'(android:name="\.MainActivity"[\s\S]*?</intent-filter>)', lambda m: m.group(1) + '\n            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />', text, count=1)
+# A long press on the tile opens the app: Android sends this action to the activity that declares it.
+if "QS_TILE_PREFERENCES" not in text:
+    text = re.sub(r'(android:name="\.MainActivity"[\s\S]*?</intent-filter>)', lambda m: m.group(1) + '\n            <intent-filter>\n                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />\n            </intent-filter>', text, count=1)
 # The vault and its key are not backed up or transferred: the key is wrapped by a Keystore key that no restore brings back, so a restored vault could not be opened.
 text = re.sub(r"\s+android:(allowBackup|dataExtractionRules|fullBackupContent)=\"[^\"]*\"", "", text)
 text = re.sub(r"<application\b", "<application android:allowBackup=\"false\" android:dataExtractionRules=\"@xml/data_extraction_rules\" android:fullBackupContent=\"@xml/backup_rules\"", text, count=1)
