@@ -19,10 +19,10 @@ path="src/main.rs"
 embedded-wintun=["veilway-windows/embedded-wintun"]
 
 [dependencies]
-veilway-core={path="../veilway-core", version="0.3.1"}
-veilway-wg={path="../veilway-wg", version="0.3.1"}
+veilway-core={path="../veilway-core", version="0.3.2"}
+veilway-wg={path="../veilway-wg", version="0.3.2"}
 # The window and the step of the replay rule, which `doctor` holds a replay file against.
-veilway-proto={path="../veilway-proto", version="0.3.1"}
+veilway-proto={path="../veilway-proto", version="0.3.2"}
 tokio.workspace=true
 anyhow.workspace=true
 clap.workspace=true
@@ -41,29 +41,29 @@ webpki-roots.workspace=true
 ipnet.workspace=true
 
 [target.'cfg(unix)'.dependencies]
-veilway-api={path="../veilway-api", version="0.3.1"}
+veilway-api={path="../veilway-api", version="0.3.2"}
 # The one `access` call `doctor` asks the system with whether a directory can be written.
 libc.workspace=true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # `connect`, `disconnect` and `status`: the client engine and its Linux layer.
-veilway-linux={path="../veilway-linux", version="0.3.1"}
+veilway-linux={path="../veilway-linux", version="0.3.2"}
 # Whether the client runs as root, which decides where it keeps its files.
 rustix={workspace=true, features=["process"]}
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The same commands on macOS: the engine and its macOS layer, which only root can run.
-veilway-macos={path="../veilway-macos", version="0.3.1"}
+veilway-macos={path="../veilway-macos", version="0.3.2"}
 rustix={workspace=true, features=["process"]}
 
 [target.'cfg(windows)'.dependencies]
 # The same commands on Windows: the engine and its Windows layer.
-veilway-windows={path="../veilway-windows", version="0.3.1"}
+veilway-windows={path="../veilway-windows", version="0.3.2"}
 
 [target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
-veilway-engine={path="../veilway-engine", version="0.3.1"}
+veilway-engine={path="../veilway-engine", version="0.3.2"}
 # The Xray add-on that `connect` runs a legacy profile through.
-veilway-xray={path="../veilway-xray", version="0.3.1"}
+veilway-xray={path="../veilway-xray", version="0.3.2"}
 
 [dev-dependencies]
 rcgen.workspace=true
