@@ -2976,7 +2976,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "veilway"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-api"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-client"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "etherparse 0.21.0",
@@ -3055,7 +3055,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-core"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "boringtun",
@@ -3117,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-ffi"
-version = "0.3.2"
+version = "0.3.3"
 
 [[package]]
 name = "veilway-hpack"
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-linux"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3174,7 +3174,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-macos"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -3192,7 +3192,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-proto"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -3211,7 +3211,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-transport"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "base64 0.23.1",
  "boring",
@@ -3237,7 +3237,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-wg"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -3255,7 +3255,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-windows"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -3273,7 +3273,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-xray"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "libc",

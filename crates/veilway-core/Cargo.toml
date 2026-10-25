@@ -17,8 +17,8 @@ bench=["veilway-proto/bench"]
 upstream-tests=["veilway-engine/testing"]
 
 [dependencies]
-veilway-wg={path="../veilway-wg", version="0.3.2"}
-veilway-proto={path="../veilway-proto", version="0.3.2"}
+veilway-wg={path="../veilway-wg", version="0.3.3"}
+veilway-proto={path="../veilway-proto", version="0.3.3"}
 tokio.workspace=true
 anyhow.workspace=true
 serde.workspace=true
@@ -38,9 +38,9 @@ socket2.workspace=true
 tokio-rustls.workspace=true
 rustls.workspace=true
 # The client side of the native transports, which a node link this node dials is opened with, and the root certificates its TLS is validated against when no other roots are given.
-veilway-transport={path="../veilway-transport", version="0.3.2"}
+veilway-transport={path="../veilway-transport", version="0.3.3"}
 # The client engine runs inside the node as the carrier of an upstream (another provider's subscription used as an exit). Without its `testing` and `unencrypted-vault` features: the dev-dependency below turns them on for tests alone, and a release build of the engine refuses them.
-veilway-engine={path="../veilway-engine", version="0.3.2"}
+veilway-engine={path="../veilway-engine", version="0.3.3"}
 webpki-roots.workspace=true
 # The self-signed certificate of a `tls` transport with `self_signed`: made with rcgen, whose crates the tree already has, and read back with x509-parser, which the binary already links, for the name it keeps and the dates it is renewed by.
 rcgen.workspace=true
