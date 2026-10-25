@@ -10,8 +10,8 @@ keywords=["vpn", "xray", "veilway"]
 categories=["network-programming"]
 
 [dependencies]
-veilway-proto={path="../veilway-proto", version="0.3.3"}
-veilway-engine={path="../veilway-engine", version="0.3.3"}
+veilway-proto={path="../veilway-proto", version="0.3.4"}
+veilway-engine={path="../veilway-engine", version="0.3.4"}
 tokio.workspace=true
 anyhow.workspace=true
 tracing.workspace=true
@@ -26,13 +26,13 @@ zip.workspace=true
 libc.workspace=true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-veilway-linux={path="../veilway-linux", version="0.3.3"}
+veilway-linux={path="../veilway-linux", version="0.3.4"}
 
 [target.'cfg(target_os = "macos")'.dependencies]
-veilway-macos={path="../veilway-macos", version="0.3.3"}
+veilway-macos={path="../veilway-macos", version="0.3.4"}
 
 [target.'cfg(windows)'.dependencies]
-veilway-windows={path="../veilway-windows", version="0.3.3"}
+veilway-windows={path="../veilway-windows", version="0.3.4"}
 
 [dev-dependencies]
 rustix={workspace=true, features=["process"]}

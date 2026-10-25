@@ -38,7 +38,7 @@ The core also has a web panel, desktop and Android clients, and documentation in
 
 ## Status
 
-> **Alpha.** The current release is `v0.3.3-alpha`. The first was `v0.1.0-alpha`. Veilway has had no outside security review. The tunnel uses WireGuard's encryption, but nothing here has been tested against deep packet inspection or active probing. Every transport is rated Detectable. Plain WireGuard over UDP is easy to fingerprint. The other transports are harder to spot, but not invisible. Do not rely on it where a failure would put you at risk.
+> **Alpha.** The current release is `v0.3.4-alpha`. The first was `v0.1.0-alpha`. Veilway has had no outside security review. The tunnel uses WireGuard's encryption, but nothing here has been tested against deep packet inspection or active probing. Every transport is rated Detectable. Plain WireGuard over UDP is easy to fingerprint. The other transports are harder to spot, but not invisible. Do not rely on it where a failure would put you at risk.
 
 Tested so far:
 
