@@ -22,6 +22,7 @@
 #          --mirror <url> (repeatable, https only; tried in order, then GitHub), --mirror-only (never fall back to GitHub),
 #          --domain <name>, --web caddy|nginx and --https-port <port> (install panel and both; default 443, else the panel is at https://name:port/<prefix>/)
 #          --no-domain and --ip <address> (this server's IPv4, found by itself when not given) instead of --domain
+#          --no-two-step (fresh install of the panel: password only, no authenticator code; not recommended)
 #
 # Every download is checked with minisign against the public key below, and the signature's trusted
 # comment must read "veilway <tag> <asset>" for the node and "veilway-panel <tag> <asset>" for the panel.
@@ -102,6 +103,7 @@ WEB=""
 HTTPS_PORT=""
 HTTPS_HOST=""
 NO_DOMAIN=0
+TWO_STEP=on
 PUBLIC_IP=""
 NODE_HTTPS=0
 TAG_OUT=""
@@ -858,7 +860,7 @@ panel_config() {
 	"trusted_proxies": ["127.0.0.1", "::1"],
 	"allowed_hosts": [],
 	"secure_cookies": true,
-	"two_step": "on"
+	"two_step": "$TWO_STEP"
 }
 EOF
 	chown root:veilway-panel "$f"
@@ -984,6 +986,12 @@ do_install() {
 		elif confirm "No domain name? Then the subscriptions are served on this server's IP, with a self-signed certificate that the apps check by its pin."; then NO_DOMAIN=1
 		fi
 	fi
+	# Two-step sign-in is on unless the operator says no at a fresh install of the panel, and the question's default is yes. --no-two-step says no for a script. A panel that has its config keeps it: the switch is then only in that file.
+	if [ "$TWO_STEP" = off ] && [ -f "$CONF_DIR/panel.json" ]; then warn "--no-two-step only applies to a fresh install: $CONF_DIR/panel.json is kept as it is"
+	elif { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ ! -f "$CONF_DIR/panel.json" ] && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
+		case "$(ask "Ask for an authenticator code at sign-in (two-step sign-in)? Recommended: without it, anyone who learns the admin password gets the panel, the node and every user's link. [Y/n]" y | tr '[:upper:]' '[:lower:]')" in n | no) TWO_STEP=off ;; esac
+	fi
+	[ "$TWO_STEP" = on ] || [ -f "$CONF_DIR/panel.json" ] || warn "two-step sign-in will be off: the panel asks for the password only. Not recommended for a panel with real users. To turn it on later, see \"Two-step sign-in off\" in the panel manual"
 	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--web needs --domain or --no-domain"
 	[ -z "$HTTPS_PORT" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--https-port needs --domain or --no-domain"
 	if [ "$NO_DOMAIN" = 1 ]; then
@@ -2044,11 +2052,12 @@ main() {
 			--https-port) [ $# -gt 1 ] || die "--https-port needs a port number"; HTTPS_PORT="$2"; shift ;;
 			--https-port=*) HTTPS_PORT="${1#*=}" ;;
 			--no-domain) NO_DOMAIN=1 ;;
+			--no-two-step) TWO_STEP=off ;;
 			--ip) [ $# -gt 1 ] || die "--ip needs an IPv4 address"; PUBLIC_IP="$2"; shift ;;
 			--ip=*) PUBLIC_IP="${1#*=}" ;;
 			--version=*) WANT_VERSION="${1#*=}" ;;
 			--version) if [ $# -gt 1 ] && [ "${2#-}" = "$2" ]; then WANT_VERSION="$2"; shift; else args+=(version); fi ;;
-			-h | --help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+			-h | --help) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 			*) args+=("$1") ;;
 		esac
 		shift
