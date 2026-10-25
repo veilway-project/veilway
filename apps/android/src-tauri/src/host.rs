@@ -215,7 +215,7 @@ impl Core {
 			}
 			Call::Connect {subscription, profile, options} => self.connect(subscription, profile, options).await,
 			// Android cannot run a downloaded program, so pasted links of other apps never reach the add-on here.
-			Call::Xray | Call::XrayInstall | Call::XrayRemove => Err("xray_unsupported".into()),
+			Call::Xray | Call::XrayInstall {..} | Call::XrayRemove => Err("xray_unsupported".into()),
 			Call::Answer {yes} => {
 				let sent = self.running.lock().unwrap().as_ref().is_some_and(|running| running.answers.send(yes).is_ok());
 				if sent {Ok(Value::Null)} else {Err("There is no question waiting.".into())}
