@@ -17,6 +17,7 @@ pub mod load;
 pub mod manage;
 pub mod netstack;
 pub mod obfs;
+pub mod pins;
 pub mod plan;
 pub mod probe;
 pub mod proxy;
@@ -434,6 +435,8 @@ pub struct Shared {
 	dialling: Arc<()>,
 	/// The self-signed certificates the node made for the `tls` listeners of the config in force, by listen address.
 	certificates: Mutex<Vec<certificate::Made>>,
+	/// What every `tls` transport of the config in force serves: its pin, and a key change the node found, see `pins`.
+	tls_pins: Mutex<Vec<pins::Report>>,
 	/// The tunnels that run, in the order of the config, with what each counts.
 	tunnels: Mutex<Vec<(String, Arc<tunnel::State>)>>,
 	/// The connections each user holds through the hop of Xray and every proxy inbound together, and the UDP they relay: one count for all of those doors, so that a user's cap is the user's and not each door's.
@@ -450,7 +453,7 @@ pub struct Shared {
 impl Shared {
 	/// What an engine shares before any of its tasks run. `plan` is the plan before the first one, which holds what the state file remembered, `state` the state file when the node may write one, and `replay` where the replay file is.
 	fn new(plan: Plan, is_local: fn(IpAddr) -> bool, now: fn() -> OffsetDateTime, state: Option<PathBuf>, replay: Option<PathBuf>, usage_push: RangeInclusive<u32>, roots: Arc<RootCertStore>) -> Shared {
-		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tunnels: Mutex::default(), proxies: Mutex::default(), open: Arc::default(), udp: Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER)), previews: upstream::Previews::new(upstream::Hooks::default()), manage: manage::State::default()}
+		Shared {plan: RwLock::new(Arc::new(plan)), flows: Flows::default(), drops: Default::default(), resolver: Resolver::default(), pings: Mutex::default(), relays: Arc::default(), is_local, now, over: Notify::new(), save: Notify::new(), saver: tokio::sync::Mutex::new(usage::Saver {path: state, written: Vec::new(), failing: None, left_out: 0}), unwritten: AtomicU64::new(0), events: broadcast::Sender::new(MAX_EVENTS), control: control::Channel::new(usage_push), obfs: obfs::State::default(), limits: limits::State::default(), stream: stream::State::default(), faketls: faketls::State::default(), replay: OnceLock::new(), replay_path: replay, nat: chain::Nat::default(), roots, dialling: Arc::default(), certificates: Mutex::default(), tls_pins: Mutex::default(), tunnels: Mutex::default(), proxies: Mutex::default(), open: Arc::default(), udp: Arc::new(xray_udp::Limits::new(xray_udp::MAX_ASSOCIATIONS_PER_USER, xray_udp::MAX_ASSOCIATIONS, xray_udp::MAX_FLOWS, xray_udp::MAX_FLOWS_PER_USER)), previews: upstream::Previews::new(upstream::Hooks::default()), manage: manage::State::default()}
 	}
 
 	/// Never waits and never fails: with nobody listening the event is gone, and a listener that is too slow loses its oldest.
@@ -809,6 +812,9 @@ impl Engine {
 
 	/// The self-signed certificates the node made for its `tls` listeners, each with the pin a profile carries for it.
 	pub fn certificates(&self) -> Vec<certificate::Made> {self.shared.certificates.lock().unwrap_or_else(|e| e.into_inner()).clone()}
+
+	/// The pin of every `tls` transport, whatever its certificate comes from, and the key change the node found for it, if one is shown.
+	pub fn tls_pins(&self) -> Vec<pins::Report> {self.shared.tls_pins.lock().unwrap_or_else(|e| e.into_inner()).clone()}
 
 	/// The replay memory of the obfuscated transports right now. None for a node that never ran one, which keeps no replay memory.
 	pub fn replay(&self) -> Option<ReplayStatus> {self.shared.replay.get().map(|replay| replay.status(replay::seconds((self.shared.now)())))}

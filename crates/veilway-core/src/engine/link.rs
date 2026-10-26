@@ -39,6 +39,8 @@ pub enum Status {
 	Unreachable,
 	/// "Dialler only: the listener answers and does not accept the proof."
 	Refused,
+	/// Dialler only: the other node's certificate has a key that matches none of the pins of the candidate. Not a network problem: the other node has a new key, and the link has to be paired again.
+	PinMismatch,
 	/// "Ended or misconfigured", and a link this node itself cut off for its quota or its expiry.
 	Ended,
 }
@@ -51,6 +53,7 @@ impl Status {
 			Status::Connecting => "connecting",
 			Status::Unreachable => "unreachable",
 			Status::Refused => "refused",
+			Status::PinMismatch => "pin_mismatch",
 			Status::Ended => "ended",
 		}
 	}
@@ -72,6 +75,8 @@ pub struct State {
 	attempt: Mutex<(Option<Status>, Option<(usize, usize)>)>,
 	/// When the system last refused an outer packet of the link for its size.
 	warned: Mutex<Option<Instant>>,
+	/// When a pin mismatch was last said, so that a link that dials again and again says it once in `WARNED`.
+	pinned: Mutex<Option<Instant>>,
 	/// The cause a proxy chain last gave for not carrying the link, None while it carries it. Each change is logged once.
 	chain: Mutex<Option<String>>,
 	/// What the management connections of the link count, see `manage`.
@@ -81,7 +86,7 @@ pub struct State {
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), pinned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
 }
 
 impl State {
@@ -102,6 +107,10 @@ impl State {
 
 	pub(super) fn warn(&self, tag: &str) {
 		if self.warned.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::info!("link {tag}: the system refused an outer packet of the link for its size, so the link's mtu is likely too high for the path between the two nodes. Full-size packets are lost until it is lowered on both nodes. The warning clears {}s after the last such report", WARNED.as_secs())}
+	}
+
+	fn mismatch(&self, tag: &str) {
+		if self.pinned.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::warn!("link {tag}: the other node's key no longer matches the pin (pin mismatch, not a network problem). Pair the link again")}
 	}
 
 	fn tried(&self, failed: Option<Status>, at: Option<(usize, usize)>) {*self.attempt.lock().unwrap_or_else(|e| e.into_inner()) = (failed, at)}
@@ -420,8 +429,10 @@ pub fn dial(shared: &Arc<Shared>, tunnel: Arc<Tunnel>, tag: String, dialled: Arc
 						if open {next = choice::outcome(&mut network, &mut standing, profile, transport, candidate, None, now(), &mut random)}
 						if next.is_ok() {next = choice::outcome(&mut network, &mut standing, profile, transport, candidate, Some(ended), now(), &mut random)}
 						offset.store(choice::clock(now(), &standing) as i64 - now() as i64, Ordering::Relaxed);
+						if ended == Ended::Unreachable(Unreachable::Pin) {state.mismatch(&tag)}
 						state.tried(match ended {
 							Ended::Refused(_) => Some(Status::Refused),
+							Ended::Unreachable(Unreachable::Pin) => Some(Status::PinMismatch),
 							Ended::Unreachable(_) | Ended::Closed(End::Unanswered | End::Offline) => Some(Status::Unreachable),
 							Ended::Closed(_) => None,
 						}, None);

@@ -3,6 +3,8 @@
 //! What is tried goes through `veilway_core::engine::probe` and the other code the node itself runs. Only three things are done here because the engine has no code for them that could be called without a node:
 //! the DNS query that is sent (the engine only ever forwards the queries of its users), the reading of a certificate's dates and names (the node serves a certificate and never looks inside it),
 //! and the two requests to a decoy origin (the node asks it for its page from inside a listener, and never for the path of a transport).
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde_json::json;
 use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
@@ -23,7 +25,7 @@ use veilway_core::config::{self, Backend, Certificate, Http2, Policy, Transport}
 use veilway_core::engine::plan::Outbound;
 use veilway_core::engine::usage::{self, Found};
 use veilway_core::engine::xray_out::Hops;
-use veilway_core::engine::{certificate, dns, icmp, probe, replay, stream};
+use veilway_core::engine::{certificate, dns, icmp, pins, probe, replay, stream};
 use veilway_proto::replay::{STEP, WINDOW};
 use veilway_wg::ws::{self, TlsFiles};
 use x509_parser::extensions::GeneralName;
@@ -445,6 +447,44 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 			if !read.insert((cert.clone(), key.clone())) {continue}
 			let (status, message) = certificate(&cert, &key, now);
 			lines.push(line(status, "certificate", format!("inbound {}, transports[{t}].tls", inbound.tag), message));
+		}
+	}
+	// The pin of every `tls` transport, whatever its certificate comes from, held against what the node served the last time it ran and against the links that name it: the links that pin a transport of this node, by its address (a link that dials this node's own address, as a node and its panel's other half do on one host).
+	let remembered = pins::read(&dir.join(pins::FILE));
+	for inbound in config.inbounds.iter().filter(|inbound| inbound.on()) {
+		for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
+			let (listen, current) = match transport {
+				Transport::Tls {listen, tls: Certificate::Files(tls), ..} => (listen.0, certificate::file_pin(&TlsFiles {cert: dir.join(&tls.cert), key: dir.join(&tls.key)}).map(|(pin, ..)| pin)),
+				Transport::Tls {listen, tls: Certificate::SelfSigned(_), ..} => (listen.0, certificate::read(certificate::files(dir, &certificate::stem(&inbound.tag, &inbound.transports, t)), listen.0).ok().flatten().map(|made| made.pin)),
+				_ => continue,
+			};
+			let subject = format!("inbound {}, transports[{t}].tls", inbound.tag);
+			let Some(current) = current else {continue};
+			let text = STANDARD.encode(current);
+			let mut said = format!("the pin of this transport is {text}, the one a link or a profile pins for it (by hand: openssl x509 -in <cert> -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | base64)");
+			let links: Vec<&str> = config.links.iter().filter(|link| link.inbound.as_deref() == Some(inbound.tag.as_str())).map(|link| link.tag.as_str()).collect();
+			let mut status = Status::Ok;
+			match remembered.get(&(inbound.tag.clone(), listen)) {
+				Some(held) if held.pin != current => {
+					status = Status::Warn;
+					said.push_str(&format!(". It is not the pin the node served the last time it ran ({}): the node says the change at its next start{}", STANDARD.encode(held.pin), if links.is_empty() {String::new()} else {format!(", and link {} pins the old one and fails until it is paired again", links.join(", "))}));
+				}
+				Some(held) if held.changed_at.is_some_and(|at| now - at < pins::KEEP) => {
+					status = Status::Warn;
+					said.push_str(&format!(". The node found a new key {} days ago (it was {}){}", (now - held.changed_at.unwrap_or(now)) / DAY, held.previous.map(|pin| STANDARD.encode(pin)).unwrap_or_default(), if links.is_empty() {String::new()} else {format!(": link {} pins the old one and fails until it is paired again", links.join(", "))}));
+				}
+				_ => {}
+			}
+			lines.push(line(status, "pin", subject.as_str(), said));
+			// Where this node dials its own listener, it knows what the link expects.
+			for link in &config.links {
+				for candidate in link.peer.iter().flat_map(|peer| &peer.transports).filter(|other| other.kind == config::LinkTransportType::Tls).flat_map(|other| other.candidates.iter().flatten()) {
+					let address = candidate.address.0;
+					if address.port() != listen.port() || !(address.ip() == listen.ip() || (listen.ip().is_unspecified() && config.public_addresses.contains(&config::Host::Ip(address.ip())))) {continue}
+					let expected: Vec<String> = candidate.pins.iter().flatten().map(|pin| STANDARD.encode(pin.0)).collect();
+					lines.push(if expected.contains(&text) {line(Status::Ok, "pin", format!("link {}", link.tag), format!("it pins this node's own tls transport on :{}, and the pin is the one it serves now", listen.port()))} else {line(Status::Fail, "pin", format!("link {}", link.tag), format!("it pins this node's own tls transport on :{} as {}, and the node serves {text}: the link fails as a pin mismatch until it is paired again", listen.port(), expected.join(", ")))});
+				}
+			}
 		}
 	}
 	// The decoy origin of every `tls` transport, once for each origin and path. It is asked directly, with or without a node that runs.

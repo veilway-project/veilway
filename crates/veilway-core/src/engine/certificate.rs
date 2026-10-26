@@ -95,6 +95,13 @@ fn held(files: &TlsFiles, key: &KeyPair) -> Option<(Option<String>, i64, i64)> {
 	Some((name, cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp()))
 }
 
+/// The pin of the leaf of a certificate file the operator supplies, with its validity in Unix seconds: the SHA-256 of the leaf's SubjectPublicKeyInfo, the same pin a profile or a link carries for it. None when the file has no certificate that reads.
+pub fn file_pin(files: &TlsFiles) -> Option<([u8; 32], i64, i64)> {
+	let der = CertificateDer::from_pem_file(&files.cert).ok()?;
+	let (_, cert) = x509_parser::parse_x509_certificate(&der).ok()?;
+	Some((digest(&SHA256, cert.public_key().raw).as_ref().try_into().ok()?, cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp()))
+}
+
 /// What `veilway doctor` reads, writing nothing: the pin of the key kept for `files` and, when the certificate file holds a certificate of that key, its validity, which is 0 to 0 otherwise. None while there is no key: the node makes it at its next start.
 pub fn read(files: TlsFiles, listen: SocketAddr) -> anyhow::Result<Option<Made>> {
 	let Some(key) = key(&files)? else {return Ok(None)};

@@ -1794,10 +1794,13 @@ pub struct LinkCandidate {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = 253))]
 	pub verify_name: Option<String>,
-	/// Needed by a `tls` candidate. The certificate chain is always validated, and a pin is a second condition.
+	/// Needed by a `tls` candidate. The certificate chain is validated and a pin is a second condition, unless `self_signed` is true: then the pins are the only check.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = 1, max = MAX_LINK_PINS))]
 	pub pins: Option<Vec<Pin>>,
+	/// Only on a `tls` candidate, with 1 to 4 pins and no `verify_name`: the certificate is trusted through its pins alone, with no chain, name or date checked. Absent means false.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub self_signed: Option<bool>,
 }
 
 /// One transport of the node a link dials, in the shape a profile of a subscription has: `endpoints` for `udp` and `udp-obfs`, `path` and `candidates` for `tls` and `ws`.

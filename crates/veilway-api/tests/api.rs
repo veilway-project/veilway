@@ -1513,8 +1513,8 @@ async fn an_inbound_lists_the_public_keys_a_profile_takes_and_the_rating_of_each
 	let transport_public = veilway_wg::encode_key(&veilway_proto::proof::public_key(&node_key));
 	assert_eq!(answer.status, 200);
 	assert_eq!(answer.json, json!({"inbounds": [
-		{"tag": "home", "kind": "wireguard", "enabled": true, "public_key": public(&private), "transport_public_key": null, "transports": [{"transport": "udp", "enabled": true, "rating": "detectable"}]},
-		{"tag": "native", "kind": "veilway", "enabled": true, "public_key": public(&native), "transport_public_key": transport_public, "transports": [{"transport": "udp-obfs", "enabled": true, "rating": "detectable"}, {"transport": "fronted", "enabled": false, "rating": "detectable"}]}
+		{"tag": "home", "kind": "wireguard", "enabled": true, "public_key": public(&private), "transport_public_key": null, "transports": [{"transport": "udp", "enabled": true, "rating": "detectable", "pin": null, "previous_pin": null, "key_changed_at": null}]},
+		{"tag": "native", "kind": "veilway", "enabled": true, "public_key": public(&native), "transport_public_key": transport_public, "transports": [{"transport": "udp-obfs", "enabled": true, "rating": "detectable", "pin": null, "previous_pin": null, "key_changed_at": null}, {"transport": "fronted", "enabled": false, "rating": "detectable", "pin": null, "previous_pin": null, "key_changed_at": null}]}
 	], "public_addresses": []}));
 	no_secret_in(&answer.body, "the inbounds listing");
 	node.end().await;

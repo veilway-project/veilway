@@ -190,14 +190,14 @@ pub fn transports(text: &[u8]) -> Result<Vec<Transport>, CodeError> {
 	items.iter().map(listed).collect()
 }
 
-// "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use. A `self_signed` candidate is refused too: a link's `peer.transports` has no such member, so the pairing would end in a link the other node cannot hold.
+// "`udp`, `udp-obfs`, `tls` and `ws`. Not `ws-plain`. Not `fronted` in version 1." A type this build does not know is refused like any other, and so is a candidate that asks for Encrypted Client Hello, which no dialler of this build can use. A `self_signed` candidate is kept: it is a `tls` candidate whose pins are its only check, and `payload::candidate` already refuses it on `ws` and without pins.
 // A profile drops a candidate that does not read and keeps the rest. An offer is the operator's own text, so it is held to every candidate: one that does not read refuses the list.
 fn listed(item: &json::Json) -> Result<Transport, CodeError> {
 	let written = Members::of(item).and_then(|members| members.list("candidates", 0..=usize::MAX).ok().flatten()).map(<[_]>::len);
 	payload::transport(item).ok().and_then(|read| read.transport).filter(|transport| match transport {
 		Transport::Fronted(_) | Transport::FrontedShaped(..) | Transport::FakeTls {..} | Transport::WsPlain {..} => false,
 		Transport::Tls(stream) | Transport::Ws(stream) if written != Some(stream.candidates.len()) => false,
-		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none() && !candidate.self_signed),
+		Transport::Tls(stream) | Transport::Ws(stream) => stream.candidates.iter().all(|candidate| candidate.ech.is_none()),
 		_ => true,
 	}).ok_or(CodeError::Member("transports"))
 }

@@ -146,7 +146,7 @@ pub struct Status {
 	pub users: usize,
 	/// Flows in the flow table right now.
 	pub flows: usize,
-	/// The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none.
+	/// The certificate of every `tls` transport, one for each listen address, with its pin: the ones the node made for transports with `"self_signed": true` (`self_signed` true), and the ones read from the `cert` file of the others (`self_signed` false: a chain from an authority, the pin is the second condition). Empty for a node that has none.
 	pub certificates: Vec<SelfSigned>,
 	/// The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none.
 	pub public_addresses: Vec<config::Host>,
@@ -164,16 +164,18 @@ pub struct XrayAddon {
 	pub release: String,
 }
 
-/// A certificate the node made for a `tls` listener, with the key it keeps.
+/// The certificate of a `tls` listener, with the pin of its key.
 #[derive(Serialize, JsonSchema)]
 pub struct SelfSigned {
 	/// The listen address, as the config writes it.
 	pub listen: String,
-	/// The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's candidate carries with `self_signed`. It stays the same when the certificate is made anew.
+	/// The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's or a link's candidate carries. For a self-signed certificate it stays the same when the certificate is made anew.
 	pub pin: String,
-	/// Unix seconds. The node makes the certificate anew with the same key 20 days before `not_after`.
+	/// True for a certificate the node made itself: the candidate that pins it is marked `self_signed`, and the pin is its only check. False for a certificate from the config's `cert` file: the chain is checked as well and the candidate is not marked `self_signed`.
+	pub self_signed: bool,
+	/// Unix seconds. For a self-signed certificate the node makes it anew with the same key 20 days before `not_after`.
 	pub not_before: i64,
-	/// Unix seconds, 80 to 100 days after `not_before`, drawn per certificate. Clients do not check it.
+	/// Unix seconds. For a self-signed certificate 80 to 100 days after `not_before`, drawn per certificate, and clients do not check it.
 	pub not_after: i64,
 }
 
@@ -663,6 +665,12 @@ pub struct InboundTransport {
 	/// False for a transport the config switched off: it does not listen.
 	pub enabled: bool,
 	pub rating: config::Rating,
+	/// Only on a `tls` transport that is listening: the SHA-256 of the key's SubjectPublicKeyInfo of its certificate, in standard base64, the pin a link or a profile carries for it.
+	pub pin: Option<String>,
+	/// Only when the node found that the pin is not the one it served before, for 30 days after: the pin that was served before. A link or a profile that pins it fails until it is paired or refreshed again.
+	pub previous_pin: Option<String>,
+	/// Unix seconds: when the node found the new key (at a start, a reload or when the certificate file was read again). The node does not refuse the certificate.
+	pub key_changed_at: Option<i64>,
 }
 
 /// An inbound with what a client profile takes from it. No private key.
@@ -738,6 +746,8 @@ pub enum LinkState {
 	Unreachable,
 	/// The node dials and the other node answers and does not take the proof.
 	Refused,
+	/// The node dials and the certificate of the other node has a key that matches none of the pins of the candidate it dialled: the other node has a new key, and the link has to be paired again. It is no network problem.
+	PinMismatch,
 	/// No handshake for 24 hours, so the other node has ended the link or one of the two is misconfigured, or this node cut the link off for its quota or its expiry (`denied`). A node that dials tries once a day from here on.
 	Ended,
 }

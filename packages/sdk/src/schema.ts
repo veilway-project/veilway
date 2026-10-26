@@ -652,6 +652,15 @@ export interface components {
         InboundTransport: {
             /** @description False for a transport the config switched off: it does not listen. */
             enabled: boolean;
+            /**
+             * Format: int64
+             * @description Unix seconds: when the node found the new key (at a start, a reload or when the certificate file was read again). The node does not refuse the certificate.
+             */
+            key_changed_at: number | null;
+            /** @description Only on a `tls` transport that is listening: the SHA-256 of the key's SubjectPublicKeyInfo of its certificate, in standard base64, the pin a link or a profile carries for it. */
+            pin: string | null;
+            /** @description Only when the node found that the pin is not the one it served before, for 30 days after: the pin that was served before. A link or a profile that pins it fails until it is paired or refreshed again. */
+            previous_pin: string | null;
             rating: components["schemas"]["Rating"];
             transport: components["schemas"]["Transport"];
         };
@@ -724,7 +733,7 @@ export interface components {
         /** @description Which side of a managed link this node is. */
         LinkManage: "peer" | "by_peer";
         LinkRole: "listener" | "dialler";
-        LinkState: "up" | "connecting" | "unreachable" | "refused" | "ended";
+        LinkState: "up" | "connecting" | "unreachable" | "refused" | "pin_mismatch" | "ended";
         Links: {
             links: components["schemas"]["Link"][];
         };
@@ -971,22 +980,24 @@ export interface components {
             generation: number;
             revision: string;
         };
-        /** @description A certificate the node made for a `tls` listener, with the key it keeps. */
+        /** @description The certificate of a `tls` listener, with the pin of its key. */
         SelfSigned: {
             /** @description The listen address, as the config writes it. */
             listen: string;
             /**
              * Format: int64
-             * @description Unix seconds, 80 to 100 days after `not_before`, drawn per certificate. Clients do not check it.
+             * @description Unix seconds. For a self-signed certificate 80 to 100 days after `not_before`, drawn per certificate, and clients do not check it.
              */
             not_after: number;
             /**
              * Format: int64
-             * @description Unix seconds. The node makes the certificate anew with the same key 20 days before `not_after`.
+             * @description Unix seconds. For a self-signed certificate the node makes it anew with the same key 20 days before `not_after`.
              */
             not_before: number;
-            /** @description The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's candidate carries with `self_signed`. It stays the same when the certificate is made anew. */
+            /** @description The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's or a link's candidate carries. For a self-signed certificate it stays the same when the certificate is made anew. */
             pin: string;
+            /** @description True for a certificate the node made itself: the candidate that pins it is marked `self_signed`, and the pin is its only check. False for a certificate from the config's `cert` file: the chain is checked as well and the candidate is not marked `self_signed`. */
+            self_signed: boolean;
         };
         /** @description A device with a live session on one inbound. The address the device connects from is not part of it. */
         Session: {
@@ -1068,7 +1079,7 @@ export interface components {
         };
         Status: {
             addons: components["schemas"]["Addons"];
-            /** @description The self-signed certificates the node made for its `tls` transports with `"self_signed": true`, one for each listen address. Empty for a node that has none. */
+            /** @description The certificate of every `tls` transport, one for each listen address, with its pin: the ones the node made for transports with `"self_signed": true` (`self_signed` true), and the ones read from the `cert` file of the others (`self_signed` false: a chain from an authority, the pin is the second condition). Empty for a node that has none. */
             certificates: components["schemas"]["SelfSigned"][];
             /** Format: uint */
             exits: number;

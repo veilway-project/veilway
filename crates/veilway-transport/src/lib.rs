@@ -281,6 +281,8 @@ pub enum Unreachable {
 	Tls,
 	/// The certificate did not pass its candidate's check: it did not validate for the name, matched no pin of the candidate, or on a self-signed candidate the handshake was not signed with the pinned key. On `faketls` it is the leaf not being the one the client derives, or the handshake not being signed with it: the real site, an interceptor, or a node that refused the hello, and the node's refusal cannot be told from the other two. It is never the node refusing the device, since nothing of the answer was authenticated: the app says "the server's certificate does not match this profile; the network may be interfering".
 	Certificate,
+	/// The certificate was valid for the name, or the candidate has no chain to check, and its key matched none of the candidate's pins: the other node has a new key, or something answers in its place. A node link says so apart from `Certificate`, so that the operator pairs it again. A client treats it as `Certificate`.
+	Pin,
 	/// The certificate is not valid at the time the device's clock shows: it ran out, or is not valid yet. The attempt ends as for any certificate that is not accepted. It marks nothing, since the first thing to check is the device's clock.
 	CertificateTime,
 	/// After the TLS handshake and before a whole answer, the connection was reset or ended without a `close_notify`. Anyone on the path can cause that, so it is no refusal.

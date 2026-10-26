@@ -642,7 +642,7 @@ impl Plan {
 						LinkTransportType::UdpObfs => payload::Transport::UdpObfs(transport.endpoints.iter().flatten().map(dial).collect::<Option<_>>()?),
 						LinkTransportType::Fronted => return None,
 						kind => {
-							let stream = Stream {path: transport.path.clone()?, candidates: transport.candidates.iter().flatten().map(|candidate| Some(Candidate {address: dial(&candidate.address)?, sni: Some(candidate.sni.clone()).filter(|sni| !sni.is_empty()), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), ech: None, pins: candidate.pins.iter().flatten().map(|pin| pin.0).collect(), self_signed: false, http2: Default::default()})).collect::<Option<_>>()?};
+							let stream = Stream {path: transport.path.clone()?, candidates: transport.candidates.iter().flatten().map(|candidate| Some(Candidate {address: dial(&candidate.address)?, sni: Some(candidate.sni.clone()).filter(|sni| !sni.is_empty()), host: candidate.host.clone(), verify_name: candidate.verify_name.clone(), ech: None, pins: candidate.pins.iter().flatten().map(|pin| pin.0).collect(), self_signed: candidate.self_signed == Some(true), http2: Default::default()})).collect::<Option<_>>()?};
 							if kind == LinkTransportType::Tls {payload::Transport::Tls(stream)} else {payload::Transport::Ws(stream)}
 						}
 					})).collect::<Option<Vec<_>>>().ok_or_else(stale)?;

@@ -135,7 +135,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 
 async fn status(State(api): State<Arc<Api>>) -> Response {
 	let (snapshot, plan) = (api.engine.snapshot(), api.engine.plan());
-	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), not_before: made.not_before, not_after: made.not_after}).collect(), public_addresses: snapshot.config.public_addresses.clone(), addons: model::Addons {xray: model::XrayAddon {installed: api.engine.xray_installed(), release: veilway_core::engine::xray::RELEASE.to_string()}}})
+	json(StatusCode::OK, &model::Status {version: env!("CARGO_PKG_VERSION").to_string(), generation: snapshot.generation, revision: snapshot.revision.to_string(), uptime_secs: api.engine.uptime().as_secs(), inbounds: plan.listening, exits: plan.exits.len(), users: plan.people, flows: api.engine.flows(), certificates: api.engine.certificates().into_iter().map(|made| model::SelfSigned {listen: made.listen.to_string(), pin: made.pin_text(), self_signed: true, not_before: made.not_before, not_after: made.not_after}).chain(api.engine.tls_pins().into_iter().map(|report| report.seen).filter(|seen| !seen.self_signed).map(|seen| model::SelfSigned {listen: seen.listen.to_string(), pin: seen.pin_text(), self_signed: false, not_before: seen.not_before, not_after: seen.not_after})).collect(), public_addresses: snapshot.config.public_addresses.clone(), addons: model::Addons {xray: model::XrayAddon {installed: api.engine.xray_installed(), release: veilway_core::engine::xray::RELEASE.to_string()}}})
 }
 
 async fn running(State(api): State<Arc<Api>>) -> Response {
@@ -494,14 +494,16 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 }
 
 async fn inbounds(State(api): State<Arc<Api>>) -> Response {
-	let snapshot = api.engine.snapshot();
+	let (snapshot, pins) = (api.engine.snapshot(), api.engine.tls_pins());
 	json(StatusCode::OK, &model::Inbounds {inbounds: snapshot.config.inbounds.iter().map(|inbound| model::InboundInfo {
 		tag: inbound.tag.clone(),
 		kind: match inbound.kind {veilway_core::config::InboundType::Wireguard => model::InboundKind::Wireguard, veilway_core::config::InboundType::Veilway => model::InboundKind::Veilway},
 		enabled: inbound.on(),
 		public_key: inbound.public_key(),
 		transport_public_key: inbound.transport_public_key(),
-		transports: inbound.transports.iter().map(|transport| model::InboundTransport {
+		transports: inbound.transports.iter().map(|transport| {
+			let report = pins.iter().find(|report| matches!(transport, veilway_core::config::Transport::Tls {..}) && report.seen.inbound == inbound.tag && report.seen.listen == transport.listen());
+			model::InboundTransport {
 			transport: match transport {
 				veilway_core::config::Transport::Udp {..} => model::Transport::Udp,
 				veilway_core::config::Transport::Ws {..} | veilway_core::config::Transport::WsNative {..} => model::Transport::Ws,
@@ -514,6 +516,10 @@ async fn inbounds(State(api): State<Arc<Api>>) -> Response {
 			},
 			enabled: transport.on(),
 			rating: transport.rating(),
+			pin: report.map(|report| report.seen.pin_text()),
+			previous_pin: report.and_then(|report| report.previous_text()),
+			key_changed_at: report.and_then(|report| report.changed_at),
+			}
 		}).collect(),
 	}).collect(), public_addresses: snapshot.config.public_addresses.clone()})
 }
@@ -532,6 +538,7 @@ async fn links(State(api): State<Arc<Api>>) -> Response {
 			Status::Connecting => model::LinkState::Connecting,
 			Status::Unreachable => model::LinkState::Unreachable,
 			Status::Refused => model::LinkState::Refused,
+			Status::PinMismatch => model::LinkState::PinMismatch,
 			Status::Ended => model::LinkState::Ended,
 		},
 		state_secs: link.since.as_secs(), handshake_secs: link.handshake.map(|age| age.as_secs()),

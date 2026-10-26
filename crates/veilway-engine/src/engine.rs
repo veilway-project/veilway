@@ -133,7 +133,7 @@ fn say_of(ended: &Ended) -> Option<Say> {
 	match ended {
 		Ended::Refused(refusal) if refusal.offset.is_some_and(|offset| offset.unsigned_abs() > 60) => Some(Say::ClockWrong),
 		Ended::Refused(_) => Some(Say::Refused),
-		Ended::Unreachable(Unreachable::Certificate) => Some(Say::CertificateMismatch),
+		Ended::Unreachable(Unreachable::Certificate | Unreachable::Pin) => Some(Say::CertificateMismatch),
 		Ended::Unreachable(Unreachable::CertificateTime) => Some(Say::CertificateTime),
 		Ended::Unreachable(Unreachable::Silence) => Some(Say::Silence),
 		Ended::Unreachable(Unreachable::Answered) => Some(Say::Answered),

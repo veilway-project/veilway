@@ -205,7 +205,7 @@ pub async fn answer(config: &Path, tag: &str, apply: Option<Option<PathBuf>>) ->
 	eprintln!("The other operator calls this link: {}", offer.name);
 	eprintln!("It is a {} link: this node dials, and is the {} half. {}", offer.direction.word(), if reverse {"exit"} else {"entry"}, if reverse {"What arrives from the link leaves from this node, under this node's own rules and limits."} else {"Users of this node that are routed to the link leave from the other node, whose operator sees their destinations and what they send unencrypted."});
 	eprintln!("This node would dial, in this order:");
-	for (transport, (address, private)) in offer.transports.iter().flat_map(|transport| {
+	for ((transport, (address, private)), pinned_only) in offer.transports.iter().flat_map(|transport| {
 		let (name, count) = match transport {
 			Listed::Udp(list) => ("udp", list.len()),
 			Listed::UdpObfs(list) => ("udp-obfs", list.len()),
@@ -217,7 +217,11 @@ pub async fn answer(config: &Path, tag: &str, apply: Option<Option<PathBuf>>) ->
 			Listed::WsPlain {stream, ..} => ("ws-plain", stream.candidates.len()),
 		};
 		std::iter::repeat_n(name, count)
-	}).zip(offer.dials()) {eprintln!("  {transport} {address}{}", if private {"  (a private address: right only where the two nodes share a network)"} else {""})}
+	}).zip(offer.dials()).zip(offer.transports.iter().flat_map(|transport| match transport {
+		Listed::Tls(stream) | Listed::Ws(stream) | Listed::Fronted(stream) | Listed::FrontedShaped(stream, _) | Listed::WsPlain {stream, ..} => stream.candidates.iter().map(|candidate| candidate.self_signed).collect::<Vec<_>>(),
+		Listed::Udp(list) | Listed::UdpObfs(list) => vec![false; list.len()],
+		Listed::FakeTls {candidates, ..} => vec![false; candidates.len()],
+	})) {eprintln!("  {transport} {address}{}{}", if pinned_only {"  (self-signed, pin only: this node trusts the certificate only because its pin is in the offer, so the fingerprint you compare is the whole check)"} else {""}, if private {"  (a private address: right only where the two nodes share a network)"} else {""})}
 	if offer.transports.iter().any(|transport| matches!(transport, Listed::Ws(_))) {eprintln!("A ws transport may go through a CDN: its terms may forbid this, its operator pays for the traffic, and the CDN sees it.")}
 	if offer.manage == Some(Manage::Dialler) {eprintln!("This link is managed from this node: this node will be able to read and change everything the other node does, through the link. The other operator agreed to that when they made the offer.")}
 	if line("Type yes to accept these addresses and answer the offer:").as_deref() != Some("yes") || (offer.manage == Some(Manage::Listener) && !consent("Type yes to let the other node manage this node:")) {

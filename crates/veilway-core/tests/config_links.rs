@@ -173,6 +173,14 @@ fn a_link_that_dials_holds_addresses_of_the_other_node_and_dials_only_what_a_nod
 	refused(node, "links[1].peer.transports[1].candidates[0].sni", "a lowercase host name", |doc| doc["links"][1]["peer"]["transports"][1]["candidates"][0]["sni"] = json!("Node.Example"));
 	refused(node, "links[1].peer.transports[1].candidates[0].verify_name", "when sni is empty", |doc| doc["links"][1]["peer"]["transports"][1]["candidates"][0]["verify_name"] = json!("node.example"));
 	refused(node, "links[1].peer.transports[2].candidates[0].verify_name", "when sni is empty", |doc| drop(doc["links"][1]["peer"]["transports"][2]["candidates"][0].as_object_mut().unwrap().remove("verify_name")));
+	// A tls candidate trusted through its pins alone: pins needed, no verify_name, no ws, and an empty sni is fine.
+	let pinned = |doc: &mut Value| {let candidate = &mut doc["links"][1]["peer"]["transports"][1]["candidates"][0]; (candidate["sni"], candidate["self_signed"]) = (json!(""), json!(true))};
+	let mut alone = node();
+	pinned(&mut alone);
+	assert!(check(&alone).errors.is_empty(), "{:#?}", check(&alone).errors);
+	refused(node, "links[1].peer.transports[1].candidates[0].pins", "every candidate of a tls transport", |doc| {pinned(doc); drop(doc["links"][1]["peer"]["transports"][1]["candidates"][0].as_object_mut().unwrap().remove("pins"))});
+	refused(node, "links[1].peer.transports[1].candidates[0].verify_name", "only check", |doc| {pinned(doc); doc["links"][1]["peer"]["transports"][1]["candidates"][0]["verify_name"] = json!("node.example")});
+	refused(node, "links[1].peer.transports[2].candidates[0].self_signed", "on a ws transport", |doc| doc["links"][1]["peer"]["transports"][2]["candidates"][0]["self_signed"] = json!(true));
 	refused(node, "links[1].peer.transport_public_key", "sealed to it", |doc| drop(doc["links"][1]["peer"].as_object_mut().unwrap().remove("transport_public_key")));
 	refused(node, "links[1].peer.transports", "1 to 8 transports", |doc| doc["links"][1]["peer"]["transports"] = json!([]));
 	// "No loopback, link-local, unspecified or multicast address, and none of the forms that carry an IPv4 address inside an IPv6 one."

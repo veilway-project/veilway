@@ -750,6 +750,28 @@
             "description": "False for a transport the config switched off: it does not listen.",
             "type": "boolean"
           },
+          "key_changed_at": {
+            "description": "Unix seconds: when the node found the new key (at a start, a reload or when the certificate file was read again). The node does not refuse the certificate.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pin": {
+            "description": "Only on a `tls` transport that is listening: the SHA-256 of the key's SubjectPublicKeyInfo of its certificate, in standard base64, the pin a link or a profile carries for it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "previous_pin": {
+            "description": "Only when the node found that the pin is not the one it served before, for 30 days after: the pin that was served before. A link or a profile that pins it fails until it is paired or refreshed again.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rating": {
             "$ref": "#/components/schemas/Rating"
           },
@@ -760,7 +782,10 @@
         "required": [
           "transport",
           "enabled",
-          "rating"
+          "rating",
+          "pin",
+          "previous_pin",
+          "key_changed_at"
         ],
         "type": "object"
       },
@@ -1016,6 +1041,11 @@
           {
             "const": "refused",
             "description": "The node dials and the other node answers and does not take the proof.",
+            "type": "string"
+          },
+          {
+            "const": "pin_mismatch",
+            "description": "The node dials and the certificate of the other node has a key that matches none of the pins of the candidate it dialled: the other node has a new key, and the link has to be paired again. It is no network problem.",
             "type": "string"
           },
           {
@@ -1565,30 +1595,35 @@
         "type": "object"
       },
       "SelfSigned": {
-        "description": "A certificate the node made for a `tls` listener, with the key it keeps.",
+        "description": "The certificate of a `tls` listener, with the pin of its key.",
         "properties": {
           "listen": {
             "description": "The listen address, as the config writes it.",
             "type": "string"
           },
           "not_after": {
-            "description": "Unix seconds, 80 to 100 days after `not_before`, drawn per certificate. Clients do not check it.",
+            "description": "Unix seconds. For a self-signed certificate 80 to 100 days after `not_before`, drawn per certificate, and clients do not check it.",
             "format": "int64",
             "type": "integer"
           },
           "not_before": {
-            "description": "Unix seconds. The node makes the certificate anew with the same key 20 days before `not_after`.",
+            "description": "Unix seconds. For a self-signed certificate the node makes it anew with the same key 20 days before `not_after`.",
             "format": "int64",
             "type": "integer"
           },
           "pin": {
-            "description": "The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's candidate carries with `self_signed`. It stays the same when the certificate is made anew.",
+            "description": "The SHA-256 of the key's SubjectPublicKeyInfo, in standard base64: the pin a profile's or a link's candidate carries. For a self-signed certificate it stays the same when the certificate is made anew.",
             "type": "string"
+          },
+          "self_signed": {
+            "description": "True for a certificate the node made itself: the candidate that pins it is marked `self_signed`, and the pin is its only check. False for a certificate from the config's `cert` file: the chain is checked as well and the candidate is not marked `self_signed`.",
+            "type": "boolean"
           }
         },
         "required": [
           "listen",
           "pin",
+          "self_signed",
           "not_before",
           "not_after"
         ],
@@ -1826,7 +1861,7 @@
             "$ref": "#/components/schemas/Addons"
           },
           "certificates": {
-            "description": "The self-signed certificates the node made for its `tls` transports with `\"self_signed\": true`, one for each listen address. Empty for a node that has none.",
+            "description": "The certificate of every `tls` transport, one for each listen address, with its pin: the ones the node made for transports with `\"self_signed\": true` (`self_signed` true), and the ones read from the `cert` file of the others (`self_signed` false: a chain from an authority, the pin is the second condition). Empty for a node that has none.",
             "items": {
               "$ref": "#/components/schemas/SelfSigned"
             },

@@ -8,7 +8,7 @@ use super::route::{self, By, Decision, Ended, Key};
 use super::limits::Clock;
 use super::upstream::{self, UpstreamState};
 use super::upstream_state::{UpstreamFile, UpstreamVault};
-use super::{certificate, control, faketls, l3, link, obfs, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use super::{certificate, control, faketls, l3, link, obfs, pins, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -33,6 +33,7 @@ use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use veilway_proto::control::{ByeReason, NodeMessage, PORT};
 use veilway_proto::subscription::{DeviceSecret, Secret};
+use veilway_engine::store::write_atomic;
 use veilway_wg::ws::{self, TlsFiles};
 use veilway_wg::Wg;
 
@@ -83,6 +84,9 @@ pub struct Wired {wanted: l3::Wanted, port: l3::Port, queue: l3::Queue, pub runn
 pub struct Host {
 	/// The directory of the config file.
 	dir: PathBuf,
+	/// The pin each `tls` transport served the last time, and the bytes of `tls-pins.state` as they were last written, see `pins`.
+	pinned: pins::Book,
+	pins_written: Vec<u8>,
 	/// The config the plan in force was compiled from.
 	config: Option<Arc<Config>>,
 	/// Every `udp` and `udp-obfs` transport by its listen address: its socket, and the task that reads it with what it reads it for.
@@ -133,6 +137,8 @@ pub struct Staged {
 	sites: HashMap<SocketAddr, (SocketAddr, Option<(String, Arc<Outbound>)>)>,
 	/// The self-signed certificates of those listeners, each with whether it was made now.
 	certified: Vec<(certificate::Made, bool)>,
+	/// What every `tls` listener serves, whatever its certificate comes from.
+	pinned: Vec<pins::Seen>,
 	/// The tunnels that are new or restart, each with its stack and what the stack sends back.
 	tunnels: Vec<(Arc<Tunnel>, IpStack, Receiver<Vec<u8>>)>,
 	loopbacks: Vec<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>,
@@ -194,7 +200,7 @@ pub(super) fn farewell(plan: &Plan, flow: &Ended) -> Option<(Holder, Vec<u8>)> {
 }
 
 impl Host {
-	pub fn new(dir: PathBuf) -> Host {Host {dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new(), proxies: HashMap::new(), upstream_file: None, upstreams: HashMap::new(), left: HashMap::new()}}
+	pub fn new(dir: PathBuf) -> Host {Host {pinned: pins::read(&dir.join(pins::FILE)), pins_written: Vec::new(), dir, config: None, udp: HashMap::new(), ws: HashMap::new(), tls: HashMap::new(), faketls: HashMap::new(), tunnels: HashMap::new(), l3: Arc::default(), routes: 0, released: HashSet::new(), shapes: HashMap::new(), diallers: HashMap::new(), forwards: HashMap::new(), proxies: HashMap::new(), upstream_file: None, upstreams: HashMap::new(), left: HashMap::new()}}
 
 	/// Ends the task of every upstream, and with it its tunnel: the node is going away, and a device of a provider should not stay connected from a node that is not there.
 	pub fn stop_upstreams(&mut self) {self.upstreams.clear()}
@@ -266,7 +272,7 @@ impl Host {
 			if shared.replay.set(guard.clone()).is_ok() {tokio::spawn(guard.run(shared.now));}
 		}
 		let (mut udp, mut relays, mut acceptors, mut loopbacks) = (Vec::new(), Vec::<(SocketAddr, TcpListener)>::new(), HashMap::new(), Vec::<(Arc<Tunnel>, SocketAddr, Arc<UdpSocket>)>::new());
-		let (mut listeners, mut streams, mut certified) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new());
+		let (mut listeners, mut streams, mut certified, mut pinned) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (Option<ws::Acceptor>, SocketAddr)>::new(), Vec::new(), Vec::<pins::Seen>::new());
 		let (mut borrowed, mut sites) = (Vec::<(SocketAddr, TcpListener)>::new(), HashMap::<SocketAddr, (SocketAddr, Option<(String, Arc<Outbound>)>)>::new());
 		for (i, inbound) in plan.inbounds.iter().enumerate() {
 			for (t, transport) in inbound.transports.iter().enumerate().filter(|(_, transport)| transport.on()) {
@@ -288,12 +294,15 @@ impl Host {
 								let files = TlsFiles {cert: self.dir.join(&tls.cert), key: self.dir.join(&tls.key)};
 								#[cfg(unix)]
 								if std::fs::metadata(&files.key).is_ok_and(|meta| std::os::unix::fs::MetadataExt::mode(&meta) & 0o077 != 0) {tracing::warn!("inbounds[{i}].transports[{t}].tls.key: group or others can read the key file of inbound {}. Whoever reads it can answer for the node's name: restrict it (chmod 600)", inbound.tag)}
-								Some(ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?)
+								let acceptor = ws::acceptor(&files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls: inbound `{}` cannot load its certificate: {e:#}", inbound.tag))?;
+								if let Some((pin, not_before, not_after)) = certificate::file_pin(&files) {pinned.push(pins::Seen {inbound: inbound.tag.clone(), listen: listen.0, pin, self_signed: false, not_before, not_after})}
+								Some(acceptor)
 							}
 							// The key is made on the first start and kept. The certificate is read again on every reload, and made anew when it is due.
 							Transport::Tls {tls: Certificate::SelfSigned(own), ..} => {
 								let (made, fresh) = certificate::ensure(certificate::files(&self.dir, &certificate::stem(&inbound.tag, &inbound.transports, t)), listen.0, own.name.as_deref(), (shared.now)()).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls.self_signed: inbound `{}` has no self-signed certificate: {e:#}", inbound.tag))?;
 								let acceptor = ws::acceptor(&made.files).map_err(|e| anyhow!("inbounds[{i}].transports[{t}].tls.self_signed: inbound `{}` cannot load the certificate the node made: {e:#}", inbound.tag))?;
+								pinned.push(pins::Seen {inbound: inbound.tag.clone(), listen: listen.0, pin: made.pin, self_signed: true, not_before: made.not_before, not_after: made.not_after});
 								certified.push((made, fresh));
 								Some(acceptor)
 							}
@@ -438,12 +447,12 @@ impl Host {
 				}
 			}
 		}
-		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels: fresh, loopbacks, forwards, proxies, l3: staged, upstreams})
+		Ok(Staged {plan, config: config.clone(), udp, ws: relays, acceptors, tls: listeners, streams, borrowed, sites, certified, pinned, tunnels: fresh, loopbacks, forwards, proxies, l3: staged, upstreams})
 	}
 
 	/// Puts what `prepare` staged in force: the plan in one step, see `switch`, then the tasks and listeners that go with it. What the config no longer names is stopped and given back to the host.
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
-		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, tunnels, loopbacks, forwards, proxies, l3, upstreams} = staged;
+		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, pinned, tunnels, loopbacks, forwards, proxies, l3, upstreams} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
@@ -636,6 +645,20 @@ impl Host {
 		// The pin is said at every start and reload: it is what the operator copies into profiles, and the log is where a node without the control API shows it.
 		for (made, fresh) in &certified {tracing::info!("stream listener {}: tls with a self-signed certificate the node {}, valid until {}, pin {}", made.listen, if *fresh {"made now"} else {"keeps"}, OffsetDateTime::from_unix_timestamp(made.not_after).map_or_else(|_| made.not_after.to_string(), |at| at.date().to_string()), made.pin_text())}
 		*shared.certificates.lock().unwrap_or_else(|e| e.into_inner()) = certified.into_iter().map(|(made, _)| made).collect();
+		// A new key is the operator's to make and is never refused: it is said once, with the links that pin the old one, and shown for a month.
+		let clock = (shared.now)().unix_timestamp();
+		for change in pins::observe(&mut self.pinned, &pinned, clock) {
+			let links: Vec<&str> = self.config.iter().flat_map(|config| &config.links).filter(|link| link.inbound.as_deref() == Some(change.inbound.as_str())).map(|link| link.tag.as_str()).collect();
+			tracing::warn!("inbound {}: tls on :{} has a new key (pin {} is now {}): {}", change.inbound, change.listen.port(), veilway_wg::encode_key(&change.old), veilway_wg::encode_key(&change.new), if links.is_empty() {"profiles and links that pin the old key fail until they are refreshed or paired again".to_owned()} else {format!("link {} pin{} the old one and will fail until {} paired again", links.join(", "), if links.len() == 1 {"s"} else {""}, if links.len() == 1 {"it is"} else {"they are"})});
+		}
+		let written = pins::render(&self.pinned);
+		if written != self.pins_written {
+			match write_atomic(&self.dir.join(pins::FILE), &written) {
+				Ok(()) => self.pins_written = written,
+				Err(e) => tracing::warn!("{}: the pins of the tls transports could not be written ({}), so a key change after a restart is not told", self.dir.join(pins::FILE).display(), e.kind()),
+			}
+		}
+		*shared.tls_pins.lock().unwrap_or_else(|e| e.into_inner()) = pinned.into_iter().filter_map(|seen| self.pinned.get(&(seen.inbound.clone(), seen.listen)).map(|held| pins::Report {previous: held.previous, changed_at: held.changed_at, seen})).collect();
 		for (addr, socket) in udp {self.udp.insert(addr, (socket, None));}
 		// A socket is read for the tunnel and the transport that have its address now. One whose address nobody has any more is closed, and so is its reader. A `udp-obfs` listener that keeps its tunnel keeps its sessions.
 		self.udp.retain(|addr, (socket, reader)| match wanted.get(addr) {

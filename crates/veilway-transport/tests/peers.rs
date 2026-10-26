@@ -171,6 +171,8 @@ const REFUSED: Ended = Ended::Refused(Refusal {answer: Answer::Status(404), offs
 // The servers of these tests write the `Date` the device's clock shows, so the offset of a pinned refusal is nothing.
 const DATED: Ended = Ended::Refused(Refusal {answer: Answer::Status(404), offset: Some(0)});
 const NO_CERTIFICATE: Ended = Ended::Unreachable(Unreachable::Certificate);
+// A key that matches none of the candidate's pins, where nothing else about the certificate was refused.
+const NO_PIN: Ended = Ended::Unreachable(Unreachable::Pin);
 const WRONG_TIME: Ended = Ended::Unreachable(Unreachable::CertificateTime);
 
 // Fail-closed rule 4: "A certificate that does not validate, or does not match a pin where the profile has one, ends the attempt. There is no continue anyway and no retry without the check."
@@ -187,8 +189,8 @@ async fn a_certificate_is_held_against_the_roots_the_name_the_clock_and_the_pins
 	assert_eq!(tried(&root.roots, ws(front(at(0), "node.test", &[pin]))).await, DATED);
 	assert_eq!(tried(&root.roots, Target::Tls {path: PATH.into(), candidate: front(at(0), "node.test", &[other_pin, pin])}).await, DATED);
 	// A pin that does not match ends it, though the chain validates.
-	assert_eq!(tried(&root.roots, ws(front(at(0), "node.test", &[other_pin]))).await, NO_CERTIFICATE);
-	assert_eq!(tried(&root.roots, Target::Tls {path: PATH.into(), candidate: front(at(0), "node.test", &[other_pin, old_pin, alone_pin, unknown_pin])}).await, NO_CERTIFICATE);
+	assert_eq!(tried(&root.roots, ws(front(at(0), "node.test", &[other_pin]))).await, NO_PIN);
+	assert_eq!(tried(&root.roots, Target::Tls {path: PATH.into(), candidate: front(at(0), "node.test", &[other_pin, old_pin, alone_pin, unknown_pin])}).await, NO_PIN);
 	// Another name, a certificate that ran out, one that signed itself and one from a root the client does not hold: each ends it, without a pin and with the pin of that very key. A pin is a second condition and never replaces the first.
 	// The one that ran out is told apart, because the device's clock is the first thing to look at then. It is refused all the same.
 	for (server, pin, wanted) in [(1, other_pin, NO_CERTIFICATE), (2, old_pin, WRONG_TIME), (3, alone_pin, NO_CERTIFICATE), (4, unknown_pin, NO_CERTIFICATE)] {
@@ -233,7 +235,7 @@ async fn a_self_signed_candidate_is_held_to_its_pins_and_to_the_key_that_signs_t
 	// A pin that does not match ends it at once, and so does the pinned certificate from a server that does not hold its key: a certificate is public, the key is what is proven.
 	for (server, pins) in [(0, vec![renamed_pin, expired_pin]), (3, vec![pin])] {
 		let started = Instant::now();
-		assert_eq!(tried(&root.roots, alone(server, None, &pins)).await, NO_CERTIFICATE, "server {server}");
+		assert_eq!(tried(&root.roots, alone(server, None, &pins)).await, if server == 0 {NO_PIN} else {NO_CERTIFICATE}, "server {server}");
 		assert!(started.elapsed() < 2 * SECOND, "server {server} took {:?}", started.elapsed());
 	}
 	// TLS 1.3 or nothing.

@@ -702,9 +702,9 @@ async fn a_node_makes_its_own_certificate_and_a_profile_that_pins_it_reaches_the
 	let (other, mut roots) = (rcgen::generate_simple_self_signed(vec!["node.test".to_string()]).unwrap(), RootCertStore::empty());
 	roots.add(CertificateDer::from(other.cert.der().to_vec())).unwrap();
 	let other_pin: [u8; 32] = digest(&SHA256, &other.signing_key.subject_public_key_info()).as_ref().try_into().unwrap();
-	for (target, roots) in [(candidate(vec![other_pin], None, true), RootCertStore::empty()), (candidate(vec![made.pin], Some("node.test"), false), roots)] {
+	for (target, roots, says) in [(candidate(vec![other_pin], None, true), RootCertStore::empty(), Unreachable::Pin), (candidate(vec![made.pin], Some("node.test"), false), roots, Unreachable::Certificate)] {
 		let started = Instant::now();
-		assert_eq!(peer(2, &link(2), target, 1, env(roots), wireguard(2)).ended().await, Ended::Unreachable(Unreachable::Certificate));
+		assert_eq!(peer(2, &link(2), target, 1, env(roots), wireguard(2)).ended().await, Ended::Unreachable(says));
 		assert!(started.elapsed() < 2 * SECOND, "{:?}", started.elapsed());
 	}
 	// A reload keeps the key, and the certificate with it.
@@ -722,6 +722,41 @@ async fn a_node_makes_its_own_certificate_and_a_profile_that_pins_it_reaches_the
 	device.connect().await.unwrap();
 	assert!(device.session.numbers().heard.is_some());
 	device.session.close().await;
+	node.engine.shutdown().await;
+}
+
+// Node links page, "A key that changed": the node remembers the pin of each tls transport in its own state, says a new key once with the links that pin the old one, shows it in the transport's report and never refuses the certificate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_key_on_a_tls_transport_is_reported_with_the_old_pin_and_is_never_refused() {
+	let (time, tls, test) = (time!(), listen(), "client-key-change");
+	let write = |dir: &Path| {
+		let made = rcgen::generate_simple_self_signed(vec!["node.test".to_string()]).unwrap();
+		std::fs::write(dir.join("cert.pem"), made.cert.pem()).unwrap();
+		std::fs::write(dir.join("key.pem"), made.signing_key.serialize_pem()).unwrap();
+		let pin: [u8; 32] = digest(&SHA256, &made.signing_key.subject_public_key_info()).as_ref().try_into().unwrap();
+		pin
+	};
+	let (site, dir) = (site().await, folder(test));
+	let mut first = [0u8; 32];
+	let mut node = launch_at(test, time, site, |doc| {
+		first = write(&dir);
+		let origin = doc["inbounds"][0]["transports"][0]["decoy"].clone();
+		doc["inbounds"].as_array_mut().unwrap().push(json!({"tag": "links", "type": "veilway", "private_key": text(&[0x12; 32]), "address": ["10.9.0.1/24"], "transport_keys": [text(&[0x13; 32])], "upgrade_cookie": "sid", "transports": [{"type": "tls", "listen": tls.to_string(), "path": TLS_PATH, "tls": {"cert": "cert.pem", "key": "key.pem"}, "decoy": origin}]}));
+		doc["links"] = json!([{"tag": "vps-de", "id": "AAECAwQFBgcICQoLDA0ODw", "direction": "forward", "addresses": {"dialler": ["10.9.0.2"]}, "transport_secret": text(&[0x41; 32]), "inbound": "links", "public_key": text(&public(&[0x31; 32])), "exits": ["main"]}]);
+	}).await;
+	let reported = |engine: &veilway_core::Engine| engine.tls_pins().into_iter().map(|report| (report.seen.listen, report.seen.pin, report.seen.self_signed, report.previous, report.changed_at)).collect::<Vec<_>>();
+	assert_eq!(reported(&node.engine), [(tls, first, false, None, None)]);
+	let second = write(&dir);
+	assert_ne!(first, second);
+	node.reload(|doc| doc["inbounds"][1]["transports"][0]["limits"] = json!({"sessions": 100})).await;
+	let now = time.secs() as i64;
+	assert!(matches!(reported(&node.engine)[..], [(_, pin, false, Some(previous), Some(at))] if pin == second && previous == first && (at - now).abs() < 5), "{:?}", reported(&node.engine));
+	assert!(logged(&format!("tls on :{} has a new key", tls.port())) && logged("link vps-de pins the old one and will fail until it is paired again"));
+	assert_eq!(node.engine.certificates().len(), 0);
+	assert_eq!(shown(tls).await, CertificateDer::from_pem_file(dir.join("cert.pem")).unwrap().to_vec());
+	// The memory is a file, which is what a node that starts again reads: it holds the new pin with the old one.
+	let state = std::fs::read(dir.join("tls-pins.state")).unwrap();
+	assert!(veilway_core::engine::pins::parse(&state).unwrap().values().any(|held| held.pin == second && held.previous == Some(first)));
 	node.engine.shutdown().await;
 }
 

@@ -115,9 +115,13 @@ proptest! {
 }
 
 #[test]
-fn a_self_signed_candidate_is_no_candidate_of_a_link() {
-	let candidate = |self_signed| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: Some("example.org".to_owned()), host: "example.org".to_owned(), ech: None, pins: vec![[7; 32]], self_signed, http2: Default::default()};
-	let stream = |self_signed| vec![Transport::Tls(Stream {path: "/abcdefghijk".to_owned(), candidates: vec![candidate(self_signed)]})];
-	assert!(transports(transports_json(&stream(false)).as_bytes()).is_ok());
-	assert_eq!(transports(transports_json(&stream(true)).as_bytes()).err(), Some(CodeError::Member("transports")));
+fn a_self_signed_candidate_is_a_candidate_of_a_tls_transport_with_pins_and_of_no_other() {
+	let candidate = |self_signed, pinned: bool| Candidate {address: Dial::parse("203.0.113.9:443").unwrap(), verify_name: None, sni: None, host: "example.org".to_owned(), ech: None, pins: if pinned {vec![[7; 32]]} else {Vec::new()}, self_signed, http2: Default::default()};
+	let tls = |self_signed, pinned| vec![Transport::Tls(Stream {path: "/abcdefghijk".to_owned(), candidates: vec![candidate(self_signed, pinned)]})];
+	let ws = vec![Transport::Ws(Stream {path: "/abcdefghijk".to_owned(), candidates: vec![candidate(true, true)]})];
+	let written = transports_json(&tls(true, true));
+	assert!(written.contains("\"self_signed\":true"));
+	assert_eq!(transports(written.as_bytes()).unwrap(), tls(true, true));
+	assert_eq!(transports(transports_json(&tls(true, false)).as_bytes()).err(), Some(CodeError::Member("transports")));
+	assert_eq!(transports(transports_json(&ws).as_bytes()).err(), Some(CodeError::Member("transports")));
 }

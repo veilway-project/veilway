@@ -804,10 +804,13 @@ impl Config {
 					dialled_at.push((format!("{at}.address"), candidate.address.0));
 					if !candidate.sni.is_empty() && !is_host(&candidate.sni) {r.error(format!("{at}.sni"), "expected a lowercase host name, or an empty string for no server name")}
 					if !is_host(&candidate.host) {r.error(format!("{at}.host"), "expected a lowercase host name")}
-					// "Required when `sni` is empty and not allowed otherwise."
-					if candidate.verify_name.is_some() != candidate.sni.is_empty() || candidate.verify_name.as_ref().is_some_and(|name| !is_host(name)) {r.error(format!("{at}.verify_name"), "expected a lowercase host name when sni is empty, and no such key otherwise")}
+					let pinned_only = candidate.self_signed == Some(true);
+					if candidate.self_signed.is_some() && transport.kind != LinkTransportType::Tls {r.error(format!("{at}.self_signed"), "expected no `self_signed` on a ws transport: only a tls candidate can be trusted through its pins alone")}
+					if pinned_only && candidate.verify_name.is_some() {r.error(format!("{at}.verify_name"), "expected no `verify_name` on a self-signed candidate: its pins are the only check")}
+					// "Required when `sni` is empty and not allowed otherwise." A self-signed candidate has no chain to hold a name against.
+					if !pinned_only && (candidate.verify_name.is_some() != candidate.sni.is_empty() || candidate.verify_name.as_ref().is_some_and(|name| !is_host(name))) {r.error(format!("{at}.verify_name"), "expected a lowercase host name when sni is empty, and no such key otherwise")}
 					match &candidate.pins {
-						None if transport.kind == LinkTransportType::Tls => r.error(format!("{at}.pins"), "expected 1 to 4 pins: every candidate of a tls transport has one, on top of a certificate chain that validates"),
+						None if transport.kind == LinkTransportType::Tls => r.error(format!("{at}.pins"), "expected 1 to 4 pins: every candidate of a tls transport has one, on top of a certificate chain that validates, or alone with `self_signed`"),
 						Some(pins) if !(1..=MAX_LINK_PINS).contains(&pins.len()) => r.error(format!("{at}.pins"), format!("expected 1 to {MAX_LINK_PINS} pins")),
 						_ => {}
 					}

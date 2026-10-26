@@ -63,9 +63,18 @@ fn certify(dir: &Path) -> ([u8; 32], Arc<RootCertStore>) {
 	(digest(&SHA256, &made.signing_key.subject_public_key_info()).as_ref().try_into().unwrap(), Arc::new(roots))
 }
 
-/// How the two nodes reach each other.
+/// The key of a self-signed `tls` transport, put where the node keeps it, so that its pin is known before the node starts. The node makes the certificate of it itself. No root is needed.
+fn seeded(dir: &Path) -> ([u8; 32], Arc<RootCertStore>) {
+	let (made, _) = (rcgen::generate_simple_self_signed(vec!["node.test".to_string()]).unwrap(), std::fs::create_dir_all(dir));
+	std::fs::write(dir.join("tls-links.key"), made.signing_key.serialize_pem()).unwrap();
+	#[cfg(unix)]
+	std::fs::set_permissions(dir.join("tls-links.key"), std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+	(digest(&SHA256, &made.signing_key.subject_public_key_info()).as_ref().try_into().unwrap(), Arc::new(RootCertStore::empty()))
+}
+
+/// How the two nodes reach each other. `Pinned` is `Tls` to a transport whose certificate the node makes itself, trusted through its pin alone.
 #[derive(Clone, Copy, PartialEq)]
-enum Over {Obfs, Tls}
+enum Over {Obfs, Tls, Pinned}
 
 /// The two halves of one link. `forward`: the entry dials the exit. Otherwise the exit dials the entry. The node that is dialled listens on `at`.
 struct Pair {forward: bool, over: Over, at: SocketAddr, pin: [u8; 32], origin: SocketAddr}
@@ -75,6 +84,7 @@ impl Pair {
 		match self.over {
 			Over::Obfs => json!([{"type": "udp-obfs", "endpoints": [self.at.to_string()]}]),
 			Over::Tls => json!([{"type": "tls", "path": PATH, "candidates": [{"address": self.at.to_string(), "sni": "node.test", "host": "node.test", "pins": [text(&self.pin)]}]}]),
+			Over::Pinned => json!([{"type": "tls", "path": PATH, "candidates": [{"address": self.at.to_string(), "sni": "", "host": "node.test", "pins": [text(&self.pin)], "self_signed": true}]}]),
 		}
 	}
 
@@ -83,9 +93,10 @@ impl Pair {
 		let transport = match self.over {
 			Over::Obfs => json!({"type": "udp-obfs", "listen": self.at.to_string()}),
 			Over::Tls => json!({"type": "tls", "listen": self.at.to_string(), "path": PATH, "tls": {"cert": "cert.pem", "key": "key.pem"}, "decoy": {"origin": format!("http://{}", self.origin)}}),
+			Over::Pinned => json!({"type": "tls", "listen": self.at.to_string(), "path": PATH, "tls": {"self_signed": true}, "decoy": {"origin": format!("http://{}", self.origin)}}),
 		};
 		let mut inbound = json!({"tag": "links", "type": "veilway", "private_key": text(key), "address": ["10.9.0.1/24"], "transports": [transport]});
-		if self.over == Over::Tls {(inbound["transport_keys"], inbound["upgrade_cookie"]) = (json!([text(&NODE_KEY)]), json!("sid"))}
+		if self.over != Over::Obfs {(inbound["transport_keys"], inbound["upgrade_cookie"]) = (json!([text(&NODE_KEY)]), json!("sid"))}
 		inbound
 	}
 
@@ -95,7 +106,7 @@ impl Pair {
 		// The node that is dialled is the exit in a forward link and the entry in a reverse one.
 		if entry != self.forward {(link["inbound"], link["public_key"]) = (json!("links"), json!(text(&public(&DIALLER))))} else {
 			(link["private_key"], link["peer"]) = (json!(text(&DIALLER)), json!({"inbound_public_key": text(&public(if self.forward {&EXIT} else {&RECEIVER})), "transports": self.transports()}));
-			if self.over == Over::Tls {link["peer"]["transport_public_key"] = json!(text(&veilway_proto::proof::public_key(&NODE_KEY)))}
+			if self.over != Over::Obfs {link["peer"]["transport_public_key"] = json!(text(&veilway_proto::proof::public_key(&NODE_KEY)))}
 		}
 		if !entry {link["exits"] = json!(["main"])}
 		link
@@ -288,7 +299,7 @@ struct Linked {entry: Engine, exit: Engine, user: Peer, pair: Pair, home: Socket
 /// `edit` changes the entry's document before it starts, for a test that puts a proxy chain in front of the link.
 async fn linked(test: &'static str, forward: bool, over: Over, edit: impl FnOnce(&mut Value), time: Time) -> Linked {
 	let (dir, site) = (scratch(test), site().await);
-	let (pin, roots) = certify(&dir.join(if forward {"exit"} else {"entry"}));
+	let (pin, roots) = if over == Over::Pinned {seeded(&dir.join(if forward {"exit"} else {"entry"}))} else {certify(&dir.join(if forward {"exit"} else {"entry"}))};
 	let (home, pair) = (listen(), Pair {forward, over, at: SocketAddr::new(outward(), port()), pin, origin: site.addr});
 	// The node that is dialled starts first, so the first dial finds it.
 	let exit_doc = pair.exit(socks().await);
@@ -371,6 +382,52 @@ async fn a_forward_link_over_tls_carries_a_users_traffic_out_of_the_exit() {
 	let net = linked("links-forward-tls", true, Over::Tls, |_| {}, time).await;
 	assert_eq!(net.entry.links()[0].transport.map(|(name, ..)| name), Some("tls"));
 	carries(net, 41000).await;
+}
+
+// Node links page, "Pin-only candidates": a node with no domain is linked to through its own certificate, trusted through the pin alone, and the pin holds across the node's renewals of the certificate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_to_a_self_signed_tls_transport_comes_up_and_reconnects_after_the_certificate_is_renewed() {
+	let time = time!();
+	for (forward, test) in [(true, "links-pinned-forward"), (false, "links-pinned-reverse")] {
+		let mut net = linked(test, forward, Over::Pinned, |_| {}, time).await;
+		assert_eq!(net.user.leaves(PUBLIC, 43000).await.as_deref(), Some("main"));
+		let (dialled, dialler) = if forward {(&net.exit, &net.entry)} else {(&net.entry, &net.exit)};
+		assert_eq!(dialler.links()[0].transport.map(|(name, ..)| name), Some("tls"));
+		let before = dialled.certificates();
+		assert_eq!((before.len(), before[0].pin), (1, net.pair.pin));
+		time.ahead.fetch_add(85 * 86_400, Ordering::SeqCst);
+		eventually("the certificate was not made anew", || dialled.certificates().first().is_some_and(|again| again.not_before > before[0].not_before)).await;
+		assert_eq!(dialled.certificates()[0].pin, net.pair.pin);
+		eventually("the replay limit did not follow the clock", || [&net.entry, &net.exit].iter().all(|node| node.replay().is_none_or(|replay| replay.limit >= time.secs()))).await;
+		let mut doc = if forward {net.pair.entry(net.home)} else {net.pair.exit(socks().await)};
+		doc["links"][0]["mtu"] = json!(1380);
+		dialler.reload(doc.to_string().into_bytes(), None).await.unwrap_or_else(|e| panic!("the reload was refused: {e}"));
+		eventually("the link did not come back with the same pin", || dialler.links()[0].status == Status::Up && dialler.links()[0].handshake.is_some_and(|age| age < Duration::from_secs(10))).await;
+		net.user.connect().await;
+		assert_eq!(net.user.leaves(PUBLIC, 43001).await.as_deref(), Some("main"));
+		net.entry.shutdown().await;
+		net.exit.shutdown().await;
+	}
+}
+
+// "A link whose dial fails because the other node's key matches none of the pins says so, apart from an unreachable node", and it never latches: a link with the right pin comes up at the next dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_whose_pin_does_not_match_says_pin_mismatch_and_comes_up_with_the_right_pin() {
+	let time = time!();
+	let (dir, site) = (scratch("links-pin-mismatch"), site().await);
+	let (pin, roots) = seeded(&dir.join("exit"));
+	let (home, pair) = (listen(), Pair {forward: true, over: Over::Pinned, at: SocketAddr::new(outward(), port()), pin, origin: site.addr});
+	let exit = run(&pair.exit(socks().await), &dir.join("exit"), time, &roots).await;
+	let mut wrong = pair.entry(home);
+	wrong["links"][0]["peer"]["transports"][0]["candidates"][0]["pins"] = json!([text(&[7; 32])]);
+	let entry = run(&wrong, &dir.join("entry"), time, &roots).await;
+	eventually("the link did not say pin mismatch", || entry.links()[0].status == Status::PinMismatch).await;
+	assert_eq!(entry.links()[0].status.name(), "pin_mismatch");
+	assert_ne!(exit.links()[0].status, Status::Up);
+	entry.reload(pair.entry(home).to_string().into_bytes(), None).await.unwrap_or_else(|e| panic!("the reload was refused: {e}"));
+	eventually("the link did not come up with the right pin", || entry.links()[0].status == Status::Up).await;
+	entry.shutdown().await;
+	exit.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -125,6 +125,7 @@ pub(crate) async fn dial(candidate: &Front, roots: &Arc<RootCertStore>, hook: &O
 	match verdict {
 		Ok(()) => Ok(Stream(stream)),
 		Err(rustls::Error::InvalidCertificate(CertificateError::Expired | CertificateError::NotValidYet | CertificateError::ExpiredContext {..} | CertificateError::NotValidYetContext {..})) => Err(Ended::Unreachable(Unreachable::CertificateTime)),
+		Err(rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)) => Err(Ended::Unreachable(Unreachable::Pin)),
 		Err(rustls::Error::InvalidCertificate(_)) => Err(Ended::Unreachable(Unreachable::Certificate)),
 		Err(_) => Err(tls()),
 	}
