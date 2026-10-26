@@ -680,6 +680,11 @@ export interface components {
         Link: {
             /** Format: uint */
             candidate_index: number | null;
+            /**
+             * Format: uint64
+             * @description On the exit half: packets this node forwarded from the link into another link, which happens only for a link with allow_chain. Zero otherwise.
+             */
+            chained: number;
             /** @description On the exit half: why this node cut the link off. Null for a link that may run. */
             denied: components["schemas"]["Denied"] | null;
             /**

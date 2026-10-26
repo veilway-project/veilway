@@ -1878,10 +1878,13 @@ pub struct Link {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(pattern(TAG_PATTERN))]
 	pub exit: Option<String>,
-	/// On the exit half, where it is needed: the exits the link may leave through. None of them is a `chain` exit.
+	/// On the exit half, where it is needed: the exits the link may leave through. A `chain` exit is among them only with `allow_chain`, and an `upstream` exit never.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(max = MAX_EXITS), inner(pattern(TAG_PATTERN)))]
 	pub exits: Option<Vec<String>>,
+	/// On the exit half: whether the link may continue through a `chain` exit of this node, into another link. Defaults to false. The node the traffic leaves from then sees this node's link address, and the entry is not told.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub allow_chain: Option<bool>,
 	/// On the exit half: whether private networks are decided by the rules for this link. Defaults to false, which refuses them whatever the rules say.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub allow_private: Option<bool>,

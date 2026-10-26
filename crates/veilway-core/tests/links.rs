@@ -2,6 +2,8 @@
 //! The node that dials reaches the other on an address of this host that is not loopback: validation never lets a link dial loopback, as a subscription never lets a client.
 #[macro_use]
 mod proxied;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
 use etherparse::{PacketBuilder, TcpHeader};
@@ -783,4 +785,87 @@ async fn answers_from_a_hostile_exit_keep_no_flow_its_user_has_closed() {
 	// The flows have gone all the same, and the user opens a new one on another exit.
 	assert_eq!(user.leaves(OTHER, 51000).await.as_deref(), Some("main"), "answers from the exit kept flows the user had closed, and the user is locked out");
 	entry.shutdown().await;
+}
+
+/// Leg `k` of a chain of nodes, over `udp-obfs` and dialled at `at`: the node before it dials and the node after it listens. The entry half is the link `far` and the exit half the link `up`.
+fn leg(k: u8, at: SocketAddr, entry: bool) -> Value {
+	let dialler = [0x30 + k; 32];
+	let mut link = json!({"tag": if entry {"far"} else {"up"}, "id": URL_SAFE_NO_PAD.encode([k; 16]), "direction": "forward", "addresses": {"dialler": [format!("10.9.{k}.2")]}, "transport_secret": text(&[0x40 + k; 32])});
+	if entry {(link["private_key"], link["peer"]) = (json!(text(&dialler)), json!({"inbound_public_key": text(&public(&[0x60 + k; 32])), "transports": [{"type": "udp-obfs", "endpoints": [at.to_string()]}]}))} else {(link["inbound"], link["public_key"], link["exits"]) = (json!("links"), json!(text(&public(&dialler))), json!(["far"]))}
+	link
+}
+
+/// Node `k` of a chain, the one that listens for leg `k` at `ats[k - 1]`. A relay leaves through the next leg, and the last node leaves through `proxy`. A relay's link has `allow_chain`.
+fn relay(k: u8, last: bool, ats: &[SocketAddr], proxy: SocketAddr) -> Value {
+	let at = ats[usize::from(k) - 1];
+	let mut up = leg(k, at, false);
+	let mut doc = json!({"version": 1, "dns": {"servers": ["1.1.1.1:53"]}, "users": [], "inbounds": [{"tag": "links", "type": "veilway", "private_key": text(&[0x60 + k; 32]), "address": [format!("10.9.{k}.1/24")], "transports": [{"type": "udp-obfs", "listen": at.to_string()}]}]});
+	if last {
+		up["exits"] = json!(["main"]);
+		(doc["outbounds"], doc["exits"], doc["routing"], doc["links"]) = (json!([{"tag": "proxy", "type": "socks5", "server": proxy.to_string()}]), json!([{"tag": "main", "backend": {"type": "netstack", "outbound": "proxy"}}]), json!({"default": "main", "rules": [{"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]}), json!([up]));
+	} else {
+		up["allow_chain"] = json!(true);
+		(doc["outbounds"], doc["exits"], doc["routing"], doc["links"]) = (json!([]), json!([{"tag": "far", "backend": {"type": "chain", "links": ["far"]}}]), json!({"default": "far", "rules": [{"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}]}), json!([up, leg(k + 1, ats[usize::from(k)], true)]));
+	}
+	doc
+}
+
+/// A user on the entry and `links` links in a row over `udp-obfs`, each node but the first one listening for the link before it and dialling the next. `nodes[0]` is the entry.
+struct Chain {nodes: Vec<Engine>, user: Peer, ats: Vec<SocketAddr>, proxy: SocketAddr}
+
+async fn chain(test: &'static str, links: u8, time: Time) -> Chain {
+	let (dir, roots, home) = (scratch(test), Arc::new(RootCertStore::empty()), listen());
+	let (ats, proxy): (Vec<SocketAddr>, SocketAddr) = ((0..links).map(|_| SocketAddr::new(outward(), port())).collect(), socks().await);
+	let mut entry = Pair {forward: true, over: Over::Obfs, at: ats[0], pin: [0; 32], origin: listen()}.entry(home);
+	entry["links"] = json!([leg(1, ats[0], true)]);
+	let mut nodes = Vec::new();
+	// The node that is dialled starts before the one that dials it, so the first dial finds it.
+	for k in (1..=links).rev() {nodes.insert(0, run(&relay(k, k == links, &ats, proxy), &dir.join(format!("node{k}")), time, &roots).await)}
+	nodes.insert(0, run(&entry, &dir.join("node0"), time, &roots).await);
+	for (n, node) in nodes.iter().enumerate() {eventually(&format!("a link of node {n} is not up"), || node.links().iter().all(|link| link.status == Status::Up)).await}
+	let mut user = Peer::device(&USER, &ENTRY, home, USER_ADDRESS).await;
+	user.connect().await;
+	Chain {nodes, user, ats, proxy}
+}
+
+// Node links page, "A link leaves through another link only with allow_chain": A to B to C. The last node sees nothing but the middle's link address, and the answers find their way back to A's user.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chained_link_carries_tcp_pings_and_udp_through_the_middle_node_and_is_cut_when_allow_chain_goes_off() {
+	let time = time!();
+	let mut net = chain("links-chained", 2, time).await;
+	assert_eq!(net.user.leaves(PUBLIC, 52000).await.as_deref(), Some("main"), "a connection did not leave through two links");
+	let reply = net.user.ping(PUBLIC, 4242, 200).await.expect("a ping through two links was not answered");
+	assert_eq!((reply.len(), reply[20], &reply[12..16], &reply[16..20], &reply[24..26]), (200, 0, &PUBLIC[..], &USER_ADDRESS[..], &4242u16.to_be_bytes()[..]), "the answer is not the user's own echo reply");
+	// A datagram goes the same way, and what the last node does with it is its own business: it only has to arrive from the middle's link address.
+	let (before, mut datagram) = (net.nodes[2].links()[0].traffic.down_packets, Vec::new());
+	PacketBuilder::ipv4(USER_ADDRESS, PUBLIC, 64).udp(52100, 9999).write(&mut datagram, b"datagram").unwrap();
+	net.user.send(&datagram).await;
+	eventually("the datagram did not reach the last node", || net.nodes[2].links()[0].traffic.down_packets > before).await;
+	let (middle, last) = (&net.nodes[1], &net.nodes[2]);
+	assert!(middle.links()[0].chained >= 4, "{:?}", middle.links());
+	assert_eq!((last.dropped(Reason::SpoofedSource), last.dropped(Reason::LinkHops), middle.dropped(Reason::LinkHops)), (0, 0, 0), "the last node saw a source that is not the middle's link address, or a packet was dropped for its hops");
+	assert_eq!((net.nodes[0].links()[0].chained, last.links()[0].chained), (0, 0));
+	// Turning allow_chain off at the middle ends the flows that pass through it within a second, and a new one is refused there.
+	let mut doc = relay(1, false, &net.ats, net.proxy);
+	doc["exits"].as_array_mut().unwrap().push(json!({"tag": "shut", "backend": {"type": "block"}}));
+	(doc["routing"]["default"], doc["links"][0]["exits"]) = (json!("shut"), json!(["shut"]));
+	doc["links"][0].as_object_mut().unwrap().remove("allow_chain");
+	net.nodes[1].reload(doc.to_string().into_bytes(), None).await.unwrap();
+	eventually("the flows of the link were not cut", || net.nodes[1].links()[0].flows == 0).await;
+	let (chained, blocked) = (net.nodes[1].links()[0].chained, net.nodes[1].dropped(Reason::BlockExit));
+	assert_eq!(net.user.leaves(PUBLIC, 52200).await, None, "a flow went through the middle with allow_chain off");
+	assert!(net.nodes[1].dropped(Reason::BlockExit) > blocked && net.nodes[1].links()[0].chained == chained);
+	for node in net.nodes {node.shutdown().await}
+}
+
+// "outgoing = min(received, 64) - 1" and "MIN_FORWARD_HOPS = 62": four links in a row end at the third middle node, which counts the packets and sends nothing on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_chain_of_four_links_drops_at_the_third_middle_node_and_counts_it() {
+	let time = time!();
+	let mut net = chain("links-four", 4, time).await;
+	assert_eq!(net.user.leaves(PUBLIC, 52400).await, None, "a connection went through four links");
+	let (second, third, last) = (&net.nodes[2], &net.nodes[3], &net.nodes[4]);
+	assert!(third.dropped(Reason::LinkHops) >= 1 && third.links()[0].dropped >= 1, "{:?}", third.links());
+	assert_eq!((second.dropped(Reason::LinkHops), third.links()[0].chained, last.links()[0].traffic.down_packets), (0, 0, 0));
+	for node in net.nodes {node.shutdown().await}
 }

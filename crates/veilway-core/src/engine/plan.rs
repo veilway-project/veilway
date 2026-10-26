@@ -355,6 +355,8 @@ pub struct Link {
 	/// On the exit half: the link's account, denied or not.
 	pub user: Option<usize>,
 	pub allow_private: bool,
+	/// On the exit half: whether the link's flows may leave through a `chain` exit, into another link.
+	pub chain: bool,
 	/// Whether this node manages the other one through the link, or is managed by it, see `manage`.
 	pub manage: Option<LinkManage>,
 	/// On the entry half: the exit with a `chain` backend that names the link.
@@ -673,13 +675,13 @@ impl Plan {
 			if written.listener() && denied.is_none() {by_link.insert(identity, l);}
 			// What the node learnt of a link stays with it while it is the same link: the same id under the same key.
 			let listened = written.addresses.listener.iter().flatten().map(|ip| ip.0).collect();
-			links.push(Link {carrier: Carrier::Paired, tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, listened, mtu, device, user, allow_private: written.allow_private == Some(true), manage: written.manage, exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
+			links.push(Link {carrier: Carrier::Paired, tag: written.tag.clone(), id: written.id.0, listener: written.listener(), entry, inbound, key, identity, secret: written.transport_secret.0, addresses, dialler, listened, mtu, device, user, allow_private: written.allow_private == Some(true), chain: written.allow_chain == Some(true), manage: written.manage, exit: None, denied, dialled, state: was_link.get(&written.id.0).filter(|was| was.identity == identity).map(|was| was.state.clone()).unwrap_or_default()});
 		}
 		// An enabled upstream is a link after the node links, with no tunnel of the plan behind it: its carrier is the engine of its state. The tag of a link is looked for among the node links alone from here on.
 		let paired = links.len();
 		for written in config.upstreams.iter().filter(|upstream| upstream.on()) {
 			let upstream = upstreams.iter().find(|upstream| upstream.tag == written.tag).ok_or_else(stale)?;
-			links.push(Link {carrier: Carrier::Upstream(upstream.clone()), tag: written.tag.clone(), id: upstream.id, listener: false, entry: true, inbound: usize::MAX, key: [0; 32], identity: [0; 32], secret: [0; 32], addresses: Vec::new(), dialler: Vec::new(), listened: Vec::new(), mtu: 0, device: None, user: None, allow_private: written.allow_private == Some(true), manage: None, exit: None, denied: None, dialled: None, state: upstream.link.clone()});
+			links.push(Link {carrier: Carrier::Upstream(upstream.clone()), tag: written.tag.clone(), id: upstream.id, listener: false, entry: true, inbound: usize::MAX, key: [0; 32], identity: [0; 32], secret: [0; 32], addresses: Vec::new(), dialler: Vec::new(), listened: Vec::new(), mtu: 0, device: None, user: None, allow_private: written.allow_private == Some(true), chain: false, manage: None, exit: None, denied: None, dialled: None, state: upstream.link.clone()});
 		}
 		// A `chain` exit names its links by tag. One that is not enabled is not among them, and an exit left with none is down. An `upstream` exit is the link of its upstream, and down while the upstream is.
 		for (e, exit) in config.exits.iter().enumerate() {
@@ -847,6 +849,9 @@ impl Plan {
 
 	/// Whether `dst` is a gateway of the profile of an upstream among `links`, the links of an exit: where the engine of the upstream keeps its control channel and its probes, and where no flow of a user goes through that exit, on any port. The address is the provider's to name, so it is refused for the flows of its own exit alone: a provider that names an address it does not hold takes nothing from the flows of any other exit.
 	pub fn reaches_upstream(&self, links: &[usize], dst: IpAddr) -> bool {links.iter().any(|link| matches!(&self.links[*link].carrier, Carrier::Upstream(upstream) if upstream.gateways().contains(&dst)))}
+
+	/// Whether any of `links`, the links of an exit, is carried by an upstream.
+	pub fn upstream_backed(&self, links: &[usize]) -> bool {links.iter().any(|link| matches!(self.links[*link].carrier, Carrier::Upstream(_)))}
 
 	/// The state of every enabled upstream of this plan, in the order of the config.
 	pub fn upstreams(&self) -> Vec<Arc<UpstreamState>> {self.links.iter().filter_map(|link| if let Carrier::Upstream(upstream) = &link.carrier {Some(upstream.clone())} else {None}).collect()}

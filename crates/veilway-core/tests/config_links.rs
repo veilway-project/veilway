@@ -1,6 +1,9 @@
 //! Node links in config version 1: `links[]` on both nodes, the `chain` backend and the `link` condition of a rule, each rule of the node links page by changing one thing in a document that is good.
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use serde_json::{json, Value};
 use veilway_core::config::{Config, Diff, LinkDirection, LinkManage, Report, DEFAULT_MTU, DEFAULT_MTU_OBFS, MAX_LINKS, REDACTED};
+use veilway_proto::subscription::link::Link;
 
 /// An obviously fake key: one byte repeated.
 fn key(byte: u8) -> String {veilway_wg::encode_key(&[byte; 32])}
@@ -44,6 +47,13 @@ fn reversed() -> Value {
 	let peer = doc["links"][1]["peer"].clone();
 	doc["links"][1] = json!({"tag": "out", "id": "EBESExQVFhcYGRobHB0eHw", "direction": "reverse", "addresses": {"dialler": ["10.20.0.2"], "listener": ["10.20.0.3"]}, "transport_secret": key(0x42), "private_key": key(0x52), "peer": peer, "exits": ["main"], "exit": "main", "max_flows": 100, "quota_bytes": 1000, "quota_period": "monthly", "expires_at": "2030-01-01T00:00:00Z", "allow_private": true});
 	doc
+}
+
+/// A native link to a documentation host with made-up keys, and the fingerprint of its signing key.
+fn upstream_link() -> (String, String) {
+	let text = format!("veilway://sub/provider.example.org/sub#v1.{}.{}.{}", URL_SAFE_NO_PAD.encode([7u8; 32]), URL_SAFE_NO_PAD.encode([&[1u8][..], &[9u8; 32][..]].concat()), URL_SAFE_NO_PAD.encode([3u8; 16]));
+	let Ok(Link::Native(native)) = Link::parse(&text) else {panic!("the test link does not read")};
+	(text, native.key().fingerprint().to_string())
 }
 
 fn check(doc: &Value) -> Report {Config::parse(doc.to_string().as_bytes()).unwrap_or_else(|e| panic!("does not parse: {e}")).validate(true)}
@@ -198,8 +208,26 @@ fn a_link_that_dials_holds_addresses_of_the_other_node_and_dials_only_what_a_nod
 fn the_exit_half_says_what_a_link_may_reach_and_the_entry_half_says_nothing_of_it() {
 	refused(node, "links[0].exits", "the exit half of the link", |doc| drop(doc["links"][0].as_object_mut().unwrap().remove("exits")));
 	refused(node, "links[0].exits[1]", "no exit has", |doc| doc["links"][0]["exits"] = json!(["main", "nowhere"]));
-	// "A link may not leave through another link."
-	refused(node, "links[0].exits[1]", "may not leave through another link", |doc| doc["links"][0]["exits"] = json!(["main", "far"]));
+	// "A link leaves through another link only with `allow_chain`, and never through an upstream."
+	refused(node, "links[0].exits[1]", "only with allow_chain on", |doc| doc["links"][0]["exits"] = json!(["main", "far"]));
+	refused(node, "links[0].exits[1]", "only with allow_chain on", |doc| (doc["links"][0]["allow_chain"], doc["links"][0]["exits"]) = (json!(false), json!(["main", "far"])));
+	let mut chaining = node();
+	(chaining["links"][0]["allow_chain"], chaining["links"][0]["exits"]) = (json!(true), json!(["main", "far"]));
+	let report = check(&chaining);
+	assert!(report.errors.is_empty() && report.warnings.is_empty(), "{report:#?}");
+	assert_eq!(Config::parse(chaining.to_string().as_bytes()).unwrap().links[0].allow_chain, Some(true));
+	let mut idle = node();
+	(idle["links"][0]["allow_chain"], idle["links"][0]["exits"]) = (json!(true), json!(["main"]));
+	let report = check(&idle);
+	assert!(report.errors.is_empty() && report.warnings.iter().any(|warning| warning.path == "links[0].allow_chain" && warning.message.contains("names no exit with a chain backend")), "{report:#?}");
+	for allowed in [false, true] {
+		refused(node, "links[0].exits[1]", "not an upstream", |doc| {
+			let (text, fingerprint) = upstream_link();
+			doc["upstreams"] = json!([{"tag": "other", "link": text, "signing_key": fingerprint, "private_key": key(0x71), "device_secret": URL_SAFE_NO_PAD.encode([0x71; 16]), "exit": "main"}]);
+			doc["exits"].as_array_mut().unwrap().push(json!({"tag": "abroad", "backend": {"type": "upstream", "upstream": "other"}}));
+			(doc["links"][0]["allow_chain"], doc["links"][0]["exits"]) = (json!(allowed), json!(["main", "abroad"]));
+		});
+	}
 	refused(node, "links[0].exit", "in this link's exits", |doc| doc["links"][0]["exit"] = json!("node"));
 	refused(node, "links[0].exit", "no exit has", |doc| doc["links"][0]["exit"] = json!("nowhere"));
 	refused(node, "links[0].exits", "routing.default must be in this list", |doc| doc["links"][0]["exits"] = json!(["node"]));
@@ -208,11 +236,11 @@ fn the_exit_half_says_what_a_link_may_reach_and_the_entry_half_says_nothing_of_i
 	refused(node, "links[0].quota_period", "needs quota_bytes", |doc| doc["links"][0]["quota_period"] = json!("daily"));
 	refused(node, "links[0].quota_bytes", "from 1 to", |doc| doc["links"][0]["quota_bytes"] = json!(0));
 	refused(node, "links[0].mtu", "from 1280 to 1500", |doc| doc["links"][0]["mtu"] = json!(1279));
-	for key in ["exit", "exits", "allow_private", "max_flows", "quota_bytes", "expires_at"] {
+	for key in ["exit", "exits", "allow_chain", "allow_private", "max_flows", "quota_bytes", "expires_at"] {
 		refused(node, &format!("links[1].{key}"), "on the entry half of a link", |doc| doc["links"][1][key] = match key {
 			"exit" => json!("main"),
 			"exits" => json!(["main"]),
-			"allow_private" => json!(true),
+			"allow_chain" | "allow_private" => json!(true),
 			"expires_at" => json!("2030-01-01T00:00:00Z"),
 			_ => json!(100),
 		});

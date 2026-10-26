@@ -841,6 +841,12 @@
               "null"
             ]
           },
+          "chained": {
+            "description": "On the exit half: packets this node forwarded from the link into another link, which happens only for a link with allow_chain. Zero otherwise.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "denied": {
             "anyOf": [
               {
@@ -967,6 +973,7 @@
           "exit",
           "flows",
           "dropped",
+          "chained",
           "state_flips",
           "traffic",
           "management"

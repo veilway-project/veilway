@@ -57,12 +57,14 @@ pub enum Reason {
 	IcmpLimited,
 	/// Met a config that was replaced while the packet was on its way through the node. The device sends it again.
 	Stale,
+	/// A packet from a node link that would continue through another link with too low a hop limit: a chain of more than three links, or a loop between links.
+	LinkHops,
 }
 
 impl Reason {
-	pub const COUNT: usize = 15;
+	pub const COUNT: usize = 16;
 	/// Every reason, in the order of their counters.
-	pub const ALL: [Reason; Reason::COUNT] = [Reason::Unparsable, Reason::Fragment, Reason::SpoofedSource, Reason::Gate, Reason::Rule, Reason::Entitlement, Reason::FlowTableFull, Reason::Unreachable, Reason::Unsupported, Reason::BlockExit, Reason::QueueFull, Reason::NoFlow, Reason::TooBig, Reason::IcmpLimited, Reason::Stale];
+	pub const ALL: [Reason; Reason::COUNT] = [Reason::Unparsable, Reason::Fragment, Reason::SpoofedSource, Reason::Gate, Reason::Rule, Reason::Entitlement, Reason::FlowTableFull, Reason::Unreachable, Reason::Unsupported, Reason::BlockExit, Reason::QueueFull, Reason::NoFlow, Reason::TooBig, Reason::IcmpLimited, Reason::Stale, Reason::LinkHops];
 
 	/// The name the control API gives the counter. It is part of that API and does not change.
 	pub fn name(self) -> &'static str {
@@ -82,6 +84,7 @@ impl Reason {
 			Reason::TooBig => "too_big",
 			Reason::IcmpLimited => "icmp_limited",
 			Reason::Stale => "stale",
+			Reason::LinkHops => "link_hops",
 		}
 	}
 }

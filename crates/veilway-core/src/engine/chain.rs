@@ -22,6 +22,8 @@ pub const PORTS: std::ops::RangeInclusive<u16> = 1024..=65535;
 pub const REST: Duration = Duration::from_secs(120);
 /// "Hop limit the entry writes on a packet it sends into a link: 64."
 pub const HOPS: u8 = 64;
+/// The lowest hop limit a node forwards into a link when a packet from another link continues through it: with `HOPS` written by the entry that is at most three links.
+pub const MIN_FORWARD_HOPS: u8 = 62;
 /// How often a port is drawn for a new flow before the flow is refused: "Ports are drawn at random from about 64,000, so a clash is rare."
 const DRAWS: usize = 32;
 /// Echo identifiers one ping flow of a device holds at once. A flow of ICMP is known by its type and code alone, so its identifiers are bounded here and not by the flow table.
@@ -397,18 +399,21 @@ fn fix(raw: &mut [u8], packet: &Packet) {
 }
 
 /// "Fields that are rewritten on every packet sent into a link, because they show which device a packet came from: the hop limit is set to the one value in the table of numbers, the IPv4 identification field is drawn anew, the IPv6 flow label is set to zero, and the traffic class is set to zero with its two congestion bits kept."
-fn fields(raw: &mut [u8], packet: &Packet) {
+fn fields(raw: &mut [u8], packet: &Packet, hops: u8) {
 	if packet.src.is_ipv4() {
 		let mut id = [0u8; 2];
 		let _ = random(&mut id);
-		(raw[1], raw[8]) = (raw[1] & 0x03, HOPS);
+		(raw[1], raw[8]) = (raw[1] & 0x03, hops);
 		raw[4..6].copy_from_slice(&id);
 	} else {
 		let class = (raw[0] & 0x0f) << 4 | raw[1] >> 4;
-		(raw[0], raw[1], raw[2], raw[3], raw[7]) = (0x60, (class & 0x03) << 4, 0, 0, HOPS);
+		(raw[0], raw[1], raw[2], raw[3], raw[7]) = (0x60, (class & 0x03) << 4, 0, 0, hops);
 	}
 	fix(raw, packet);
 }
+
+/// The hop limit a node writes when a packet that came out of one link continues into another, None when it is too low to go on. What the entry wrote is the most that counts, so an out-of-spec entry cannot stretch the chain with a larger one.
+fn onward(received: u8) -> Option<u8> {Some(received.min(HOPS).saturating_sub(1)).filter(|hops| *hops >= MIN_FORWARD_HOPS)}
 
 /// "Both nodes lower the segment size in every TCP opening packet that crosses the link, in both directions, to what fits the link's MTU." `raw` is a TCP segment `packet` describes.
 pub fn clamp(raw: &mut [u8], packet: &Packet, mtu: u16) {
@@ -463,7 +468,7 @@ impl Shared {
 	/// One packet that a tunnel made, to go into link `link` behind `exit`: the fields that show where a packet came from are rewritten as for any packet sent into a link. The tunnel has chosen the link and holds the translated port, and sizes its packets to the link's MTU. False when it went nowhere.
 	pub(super) async fn tunnelled(&self, plan: &Plan, exit: usize, link: usize, mut raw: Vec<u8>) -> bool {
 		let Some(packet) = netstack::parse(&raw) else {return false};
-		fields(&mut raw, &packet);
+		fields(&mut raw, &packet, HOPS);
 		let sent = self.into_link(plan, link, &raw).await;
 		if sent {plan.exits[exit].traffic.up(raw.len())}
 		sent
@@ -473,6 +478,18 @@ impl Shared {
 	#[allow(clippy::too_many_arguments)]
 	pub(super) async fn chained(self: &Arc<Self>, plan: &Arc<Plan>, from: Holder, mut raw: Vec<u8>, packet: &Packet, key: Key, id: u64, exit: usize) {
 		let Backend::Chain {links} = &plan.exits[exit].backend else {return};
+		// A packet that came out of a link and continues into another: "the hop limit is the loop guard". No error goes back, since it would tell the sender nothing it can act on.
+		let incoming = plan.devices[from.device].link;
+		let hops = match incoming {
+			Some(link) => match onward(raw[if packet.src.is_ipv4() {8} else {7}]) {
+				Some(hops) => hops,
+				None => {
+					self.count(Reason::LinkHops);
+					return plan.links[link].state.hopped(&plan.links[link].tag);
+				}
+			},
+			None => HOPS,
+		};
 		// An echo request is translated by its identifier, and so is a protocol with ports by its port. Any other message of ICMP a device sends would quote a packet with its own tunnel address in it, which the exit must not be given, so it does not leave.
 		let (ports, ident) = match (packet.protocol, packet.icmp) {
 			(Protocol::TCP | Protocol::UDP | Protocol::SCTP, _) => (true, 0),
@@ -493,7 +510,7 @@ impl Shared {
 			}
 			// "A new flow goes to one of the links that are up by the rule the transports page has for parallel connections."
 			None => {
-				let Some(link) = links.iter().copied().filter(|at| plan.up(*at)).max_by_key(|at| self.nat.rank(&key, &plan.links[*at].id)) else {
+				let Some(link) = links.iter().copied().filter(|at| Some(*at) != incoming && plan.up(*at)).max_by_key(|at| self.nat.rank(&key, &plan.links[*at].id)) else {
 					// "While it is down, every flow routed to it is refused with the ICMP error or reset that an unreachable exit gives, new and live flows alike, and the refusal is counted. Nothing routed to it leaves through another exit."
 					for at in links {if let Carrier::Upstream(upstream) = &plan.links[*at].carrier {upstream.refused()}}
 					return self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await;
@@ -513,10 +530,13 @@ impl Shared {
 		}
 		clamp(&mut raw, packet, of.mtu());
 		rewrite(&mut raw, packet, true, address, ports.then_some(port));
-		fields(&mut raw, packet);
+		fields(&mut raw, packet, hops);
 		if packet.protocol == Protocol::TCP && raw.get(packet.upper + 13).is_some_and(|flags| flags & 0x05 != 0) {self.flows.track(&key, id, FLOW_IDLE, true)}
 		let len = raw.len();
-		if self.into_link(plan, link, &raw).await {plan.exits[exit].traffic.up(len)} else {self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await}
+		if self.into_link(plan, link, &raw).await {
+			plan.exits[exit].traffic.up(len);
+			if let Some(link) = incoming {plan.links[link].state.chained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);}
+		} else {self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await}
 	}
 
 	/// One packet that came out of link `link`, of which this node is the entry half. "From the link it accepts only a packet whose destination is its link address and that answers a remembered flow. Everything else from the link is dropped and counted."
@@ -594,6 +614,8 @@ impl Shared {
 		plan.exits[exit].traffic.down(raw.len());
 		// The device may have a smaller MTU than the link. What it set is held to as for any packet from outside, and what cannot reach it is dropped: its sender is out of reach, on the far side of the link.
 		match netstack::forward(&raw, plan.mtu_of(to)) {
+			// "Nothing is fragmented for a link": toward a link device, as at the middle of a chain, what does not fit is too big.
+			Fit::Pieces(_) if plan.devices[to.device].link.is_some() => self.count(Reason::TooBig),
 			Fit::Whole => drop(self.transmit(plan, to, &raw).await),
 			Fit::Pieces(pieces) => for piece in &pieces {self.transmit(plan, to, piece).await;},
 			Fit::TooBig => self.count(Reason::TooBig),
@@ -694,7 +716,7 @@ mod tests {
 			let packet = netstack::parse(&raw).unwrap();
 			let ident = packet.icmp.is_some();
 			rewrite(&mut raw, &packet, true, link, Some(5000));
-			fields(&mut raw, &packet);
+			fields(&mut raw, &packet, HOPS);
 			clamp(&mut raw, &packet, 1390);
 			verified(&raw);
 			let after = netstack::parse(&raw).unwrap();
@@ -769,10 +791,43 @@ mod tests {
 		(raw[0], raw[1], raw[2], raw[3]) = (0x6b, 0x9f, 0x12, 0x34);
 		let packet = netstack::parse(&raw).unwrap();
 		rewrite(&mut raw, &packet, true, "fd00:9::2".parse().unwrap(), Some(2000));
-		fields(&mut raw, &packet);
+		fields(&mut raw, &packet, HOPS);
 		verified(&raw);
 		// Traffic class 0xb9: its two congestion bits are 01.
 		assert_eq!((raw[0], raw[1], raw[2], raw[3], raw[7]), (0x60, 0x10, 0, 0, HOPS));
+	}
+
+	#[test]
+	fn a_packet_continues_into_a_link_with_one_hop_less_for_at_most_three_links() {
+		// The entry writes 64, the first middle 63, the second 62, and a third would write 61: refused.
+		assert_eq!([64, 63, 62, 61].map(onward), [Some(63), Some(62), None, None]);
+		// What an out-of-spec entry wrote above 64 counts as 64, so it cannot stretch the chain.
+		assert_eq!((onward(255), onward(65), onward(0), onward(1)), (Some(63), Some(63), None, None));
+		assert_eq!(onward(HOPS).map(|hops| onward(hops).map(onward)), Some(Some(None)));
+	}
+
+	#[test]
+	fn fields_write_the_hop_limit_they_are_given() {
+		let (mut v4, mut v6) = (Vec::new(), Vec::new());
+		PacketBuilder::ipv4([10, 7, 0, 2], [93, 184, 216, 34], 3).udp(40000, 443).write(&mut v4, b"data").unwrap();
+		PacketBuilder::ipv6([0xfd; 16], [0x20; 16], 3).udp(40000, 443).write(&mut v6, b"data").unwrap();
+		for (mut raw, at) in [(v4, 8), (v6, 7)] {
+			let packet = netstack::parse(&raw).unwrap();
+			fields(&mut raw, &packet, 62);
+			verified(&raw);
+			assert_eq!(raw[at], 62);
+		}
+	}
+
+	#[test]
+	fn a_packet_with_pieces_is_what_a_link_never_gets() {
+		// `chain_back` counts this as too big for a link device instead of sending the pieces, as the exit's own path does.
+		let mut raw = Vec::new();
+		PacketBuilder::ipv4([93, 184, 216, 34], [10, 9, 0, 2], 60).udp(443, 40000).write(&mut raw, &[0x5a; 1300]).unwrap();
+		raw[6] = 0;
+		assert!(matches!(netstack::forward(&raw, 1280), Fit::Pieces(_)));
+		raw[6] = 0x40;
+		assert!(matches!(netstack::forward(&raw, 1280), Fit::TooBig));
 	}
 
 	#[test]

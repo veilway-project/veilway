@@ -529,7 +529,7 @@ async fn every_route_answers() {
 	let stats = get(&node.socket, "/v1/stats").await;
 	ask("GET", "/v1/stats");
 	assert_eq!((&stats.json["replay"], &stats.json["udp_obfs"]["sessions"], &stats.json["udp_obfs"]["unknown"]), (&Value::Null, &json!(0), &json!(0)), "{}", stats.json);
-	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(15)), "{}", stats.json);
+	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(16)), "{}", stats.json);
 	assert!(stats.json["users"][0]["traffic"]["up_packets"].as_u64().unwrap() >= 2 && stats.json["exits"][0]["traffic"]["down_bytes"].as_u64().unwrap() > 0 && stats.json["drops"]["gate"].is_u64() && stats.json["dns"]["answered"].is_u64(), "{}", stats.json);
 	let sessions = get(&node.socket, "/v1/sessions").await;
 	ask("GET", "/v1/sessions");

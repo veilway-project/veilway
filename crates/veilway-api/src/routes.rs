@@ -555,7 +555,7 @@ async fn links(State(api): State<Arc<Api>>) -> Response {
 			Denied::Expired => model::Denied::Expired,
 			Denied::Quota => model::Denied::Quota,
 		}),
-		exit: link.exit, flows: link.flows, dropped: link.dropped, state_flips: link.flips, traffic: link.traffic.into(),
+		exit: link.exit, flows: link.flows, dropped: link.dropped, chained: link.chained, state_flips: link.flips, traffic: link.traffic.into(),
 		management: model::Management {opened: link.management.opened, open: link.management.open, refused: link.management.refused, failed: link.management.failed, reset: link.management.reset, idled: link.management.idled, dropped: link.management.dropped, denied: link.management.denied, up_bytes: link.management.up_bytes, down_bytes: link.management.down_bytes},
 	}).collect()})
 }

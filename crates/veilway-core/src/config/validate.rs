@@ -742,7 +742,7 @@ impl Config {
 				Some(mtu) if mtu > DEFAULT_MTU => r.warning(at("mtu"), format!("above {DEFAULT_MTU} the outer packet is lost on a normal path over a datagram transport, and nothing is fragmented for a link")),
 				_ => {}
 			}
-			let own = [("exit", link.exit.is_some()), ("exits", link.exits.is_some()), ("allow_private", link.allow_private.is_some()), ("max_flows", link.max_flows.is_some()), ("quota_bytes", link.quota_bytes.is_some()), ("quota_period", link.quota_period.is_some()), ("expires_at", link.expires_at.is_some())];
+			let own = [("exit", link.exit.is_some()), ("exits", link.exits.is_some()), ("allow_chain", link.allow_chain.is_some()), ("allow_private", link.allow_private.is_some()), ("max_flows", link.max_flows.is_some()), ("quota_bytes", link.quota_bytes.is_some()), ("quota_period", link.quota_period.is_some()), ("expires_at", link.expires_at.is_some())];
 			if entry {
 				for (key, _) in own.iter().filter(|(_, present)| *present) {r.error(at(key), "expected no such key on the entry half of a link: what a link may reach and use is for the node its traffic leaves from to say")}
 				if dialled != dials && !chained.contains_key(&i) {r.warning(format!("links[{i}]"), "never used: no exit with a chain backend names this link")}
@@ -752,12 +752,14 @@ impl Config {
 					None => r.error(at("exits"), "expected the exits the link may leave through: this node is the exit half of the link"),
 					Some(list) => {
 						if list.is_empty() {r.warning(at("exits"), "an empty list lets this link leave through no exit")}
+						if link.allow_chain == Some(true) && !list.iter().take(MAX_EXITS).any(|tag| exit_tags.get(tag.as_str()).is_some_and(|e| matches!(self.exits[*e].backend, Backend::Chain(_)))) {r.warning(at("allow_chain"), "on, but exits names no exit with a chain backend: nothing of this link continues through another link")}
 						index(&mut r, |j| at(&format!("exits[{j}]")), list.iter().take(MAX_EXITS));
 						for (j, tag) in list.iter().enumerate().take(MAX_EXITS) {
 							match exit_tags.get(tag.as_str()) {
 								None => r.error(at(&format!("exits[{j}]")), "expected the tag of an exit, found a tag no exit has"),
-								// "A link may not leave through another link." A `via` policy never names a `chain` exit, so the list itself is all there is to hold to it.
-								Some(e) if matches!(self.exits[*e].backend, Backend::Chain(_) | Backend::Upstream(_)) => r.error(at(&format!("exits[{j}]")), "expected an exit that leaves from this node: a link may not leave through another link or an upstream"),
+								// "A link leaves through another link only with `allow_chain`, and never through an upstream." A `via` policy never names a `chain` exit, so the list itself is all there is to hold to it.
+								Some(e) if matches!(self.exits[*e].backend, Backend::Upstream(_)) => r.error(at(&format!("exits[{j}]")), "expected an exit that is not an upstream: another provider's account is not for the users of a third node"),
+								Some(e) if matches!(self.exits[*e].backend, Backend::Chain(_)) && link.allow_chain != Some(true) => r.error(at(&format!("exits[{j}]")), "expected an exit that leaves from this node: a link leaves through another link only with allow_chain on"),
 								Some(e) if small => {
 									entitled.set(*e);
 									// "Validation warns when an `l3` exit that a link may use has a larger MTU than the link": the link's `mtu` counts into the MTU of that exit's interface.

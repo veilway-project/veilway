@@ -69,6 +69,10 @@ pub struct State {
 	pub traffic: Traffic,
 	/// Packets that came out of the link and were not carried: on the entry half what answers no flow or is not for the link's address, on the exit half what the gate, the rules or a limit refused.
 	pub dropped: AtomicU64,
+	/// On the exit half: packets this node forwarded from the link into another link, which only a link with `allow_chain` has.
+	pub chained: AtomicU64,
+	/// On the exit half: packets that would have crossed a fourth link and were dropped, and when that was last said.
+	hopped: (AtomicU64, Mutex<Option<Instant>>),
 	/// When the link was last up, or since when the node has had it.
 	heard: Mutex<Instant>,
 	/// What the dialler's last attempt came to when it failed, and the transport and candidate it is at, as places in the other node's list.
@@ -86,7 +90,7 @@ pub struct State {
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), pinned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), chained: AtomicU64::new(0), hopped: Default::default(), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), pinned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
 }
 
 impl State {
@@ -107,6 +111,13 @@ impl State {
 
 	pub(super) fn warn(&self, tag: &str) {
 		if self.warned.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::info!("link {tag}: the system refused an outer packet of the link for its size, so the link's mtu is likely too high for the path between the two nodes. Full-size packets are lost until it is lowered on both nodes. The warning clears {}s after the last such report", WARNED.as_secs())}
+	}
+
+	/// One packet of the link dropped for its hop limit: said at warn at most once in `WARNED`.
+	pub(super) fn hopped(&self, tag: &str) {
+		self.dropped.fetch_add(1, Ordering::Relaxed);
+		let total = self.hopped.0.fetch_add(1, Ordering::Relaxed) + 1;
+		if self.hopped.1.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::warn!("link {tag}: packets from this link would cross a fourth link, {total} dropped so far: a loop between links?")}
 	}
 
 	fn mismatch(&self, tag: &str) {

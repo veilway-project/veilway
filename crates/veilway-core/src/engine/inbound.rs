@@ -243,8 +243,8 @@ impl Shared {
 				match &plan.exits[exit].backend {
 					_ if !entitled(exit) => Decision::Refuse {reason: Reason::Entitlement, reset: true},
 					Backend::Block => Decision::Refuse {reason: Reason::BlockExit, reset: false},
-					// "The engine also refuses, at the moment it decides a flow, to send a packet that arrived from a link into a link."
-					Backend::Chain {..} if linked.is_some() => Decision::Refuse {reason: Reason::Gate, reset: true},
+					// "The engine also refuses, at the moment it decides a flow, to send a packet that arrived from a link into a link", unless the link has `allow_chain`. Never into an upstream, which is one device on another provider's account.
+					Backend::Chain {links} if linked.is_some_and(|link| !plan.links[link].chain || plan.upstream_backed(links)) => Decision::Refuse {reason: Reason::Gate, reset: true},
 					// The gateway of an upstream's profile is the engine's own: its control channel and its probes are there, and no flow of a user shares a tuple with them.
 					Backend::Chain {links} if plan.reaches_upstream(links, key.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 					Backend::L3 {..} | Backend::Chain {..} => Decision::Exit {exit, by: By::Backend},

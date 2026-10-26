@@ -184,6 +184,8 @@ pub struct LinkReport {
 	/// Inner packets: up is what this node sent into the link, down what it took out.
 	pub traffic: Totals,
 	pub dropped: u64,
+	/// On the exit half: packets forwarded from the link into another link.
+	pub chained: u64,
 	pub flips: u64,
 	pub warning: bool,
 	/// What the management connections of the link count.
@@ -675,7 +677,7 @@ impl Engine {
 					Some(veilway_proto::subscription::payload::Transport::Tls(_)) => "tls",
 					_ => "ws",
 				}, transport, candidate)),
-				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), management: link.state.manage.totals(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
+				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), chained: link.state.chained.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), management: link.state.manage.totals(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
 			}
 		}).collect()
 	}

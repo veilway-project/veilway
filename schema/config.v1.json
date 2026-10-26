@@ -657,6 +657,10 @@
         "addresses": {
           "$ref": "#/$defs/LinkAddresses"
         },
+        "allow_chain": {
+          "description": "On the exit half: whether the link may continue through a `chain` exit of this node, into another link. Defaults to false. The node the traffic leaves from then sees this node's link address, and the entry is not told.",
+          "type": "boolean"
+        },
         "allow_private": {
           "description": "On the exit half: whether private networks are decided by the rules for this link. Defaults to false, which refuses them whatever the rules say.",
           "type": "boolean"
@@ -686,7 +690,7 @@
           "type": "string"
         },
         "exits": {
-          "description": "On the exit half, where it is needed: the exits the link may leave through. None of them is a `chain` exit.",
+          "description": "On the exit half, where it is needed: the exits the link may leave through. A `chain` exit is among them only with `allow_chain`, and an `upstream` exit never.",
           "items": {
             "not": {
               "enum": [
@@ -861,7 +865,7 @@
           "type": "string"
         },
         "pins": {
-          "description": "Needed by a `tls` candidate. The certificate chain is always validated, and a pin is a second condition.",
+          "description": "Needed by a `tls` candidate. The certificate chain is validated and a pin is a second condition, unless `self_signed` is true: then the pins are the only check.",
           "items": {
             "$ref": "#/$defs/Pin"
           },
@@ -869,6 +873,10 @@
           "minItems": 1,
           "type": "array",
           "uniqueItems": true
+        },
+        "self_signed": {
+          "description": "Only on a `tls` candidate, with 1 to 4 pins and no `verify_name`: the certificate is trusted through its pins alone, with no chain, name or date checked. Absent means false.",
+          "type": "boolean"
         },
         "sni": {
           "description": "The server name that is shown, or empty for none.",

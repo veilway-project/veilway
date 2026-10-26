@@ -808,6 +808,8 @@ pub struct Link {
 	pub flows: usize,
 	/// Packets that came out of the link and were not carried: on the entry half what answers no flow, on the exit half what the gate, the source check or a limit refused.
 	pub dropped: u64,
+	/// On the exit half: packets this node forwarded from the link into another link, which happens only for a link with allow_chain. Zero otherwise.
+	pub chained: u64,
 	/// How often `state` changed.
 	pub state_flips: u64,
 	/// Inner packets. Up is what this node sent into the link, down what it took out of it.

@@ -863,6 +863,11 @@ impl Host {
 					tracing::info!("link {}: its sessions are dropped: the link was removed, changed or cut off", was.tag);
 				}
 			}
+			for link in plan.links.iter().filter(|link| !link.entry && matches!(link.carrier, Carrier::Paired)) {
+				if !old.links.iter().any(|was| was.id == link.id && matches!(was.carrier, Carrier::Paired) && was.chain != link.chain) {continue}
+				let reaches: Vec<&str> = plan.exits.iter().filter(|exit| matches!(exit.backend, Backend::Chain {..})).filter(|exit| link.user.is_some_and(|user| plan.users[user].entitled.as_ref().is_none_or(|list| list.iter().any(|at| plan.exits[*at].tag == exit.tag)))).map(|exit| exit.tag.as_str()).collect();
+				if link.chain {tracing::info!("link {}: allow_chain is on, so its flows may leave through the chain exits {reaches:?}, which put this node's link address on them", link.tag)} else {tracing::info!("link {}: allow_chain is off, so its flows through chain exits end within a second", link.tag)}
+			}
 			for link in plan.links.iter().filter(|link| link.denied.is_none() && matches!(link.carrier, Carrier::Paired)) {
 				let mut peers = plan.inbounds[link.inbound].tunnel.lock();
 				if peers.wg.index(&link.key).is_none() {peers.add(link.key, None)}
