@@ -955,6 +955,8 @@ impl Config {
 		let inside = |entry: &IpEntry, net: &IpNet| match entry {
 			IpEntry::Net(outer) => outer.contains(net),
 			IpEntry::Private => private.iter().any(|outer| outer.contains(net)) && !pools.iter().any(|(pool, _)| pool.contains(&net.network()) || net.contains(&pool.network())),
+			// The addresses of the host are read at run time, so no network is known to be inside them.
+			IpEntry::HostSelf => false,
 			IpEntry::Users => pools.iter().any(|(pool, _)| pool.contains(net) && !net.contains(&pool.addr())),
 			IpEntry::Tunnel(tag) => inbound_tags.get(tag.as_str()).is_some_and(|inbound| pools.iter().any(|(pool, owner)| owner == inbound && pool.contains(net) && !net.contains(&pool.addr()))),
 		};

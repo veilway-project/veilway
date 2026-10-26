@@ -1266,12 +1266,8 @@ async fn a_direct_outbound_reaches_a_local_responder(){
 		setup.doc["routing"]["rules"].as_array_mut().unwrap().pop();
 		setup
 	};
+	// No rule names the host, so the node's own address is a destination like any other.
 	let node=launch(direct()).await;
-	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
-	assert_eq!(knock(&mut client, PEER_A, host.octets(), 41110, backend.port()).await, Answer::Reset, "the node's own address was not refused");
-	assert_eq!(node.engine.dropped(Reason::Gate), 1);
-	assert_eq!(hits.load(Ordering::SeqCst), 0);
-	let node=launch_with(direct(), Options{is_local:|_| false, ..Options::new("")}).await;
 	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
 	handshake(&mut client, host.octets(), 41111, backend.port()).await;
 	assert_eq!(greeting(&mut client).await, GREETING, "the direct outbound did not reach the responder");
@@ -1283,6 +1279,17 @@ async fn a_direct_outbound_reaches_a_local_responder(){
 	assert_eq!((ip.source, ip.destination), (host.octets(), PEER_A));
 	let PayloadSlice::Udp(payload)=parsed.payload else{panic!("not udp")};
 	assert_eq!(payload, b"echo:ping");
+	assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
+	// A host:self reject rule refuses it, over TCP and over UDP.
+	let mut closed=direct();
+	closed.doc["routing"]["rules"].as_array_mut().unwrap().push(json!({"tag":"no-self", "ip":["host:self"], "action":"reject"}));
+	let node=launch(closed).await;
+	let mut client=Client::connect(node.keys[0], node.public, node.addr).await;
+	assert_eq!(knock(&mut client, PEER_A, host.octets(), 41113, backend.port()).await, Answer::Reset, "the host:self rule did not refuse the node's own address");
+	assert_eq!((node.engine.dropped(Reason::Rule), node.engine.dropped(Reason::Gate)), (1, 0));
+	assert_eq!(hits.load(Ordering::SeqCst), 1);
+	client.send_ip(&ip_udp(PEER_A, host.octets(), 41114, echo.port(), b"ping")).await;
+	assert!(client.recv_ip(Duration::from_secs(2)).await.is_none_or(|reply| PacketHeaders::from_ip_slice(&reply).is_ok_and(|parsed| !matches!(parsed.payload, PayloadSlice::Udp(_)))), "a udp reply came through a host:self rule");
 	assert_eq!(udp_hits.load(Ordering::SeqCst), 1);
 }
 

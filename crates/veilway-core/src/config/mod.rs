@@ -46,7 +46,7 @@ pub const MAX_GROUPS: usize = 256;
 pub const MAX_RULES: usize = 4096;
 pub const MAX_RULE_ENTRIES: usize = 1024;
 pub const MAX_USERS: usize = 65536;
-pub const MAX_DEVICES: usize = 16;
+pub const MAX_DEVICES: usize = 64;
 pub const MAX_DEVICE_ADDRESSES: usize = 16;
 /// A device has two transport secrets only while one is rotated out (protocol overview, "Rotation").
 pub const MAX_TRANSPORT_SECRETS: usize = 2;

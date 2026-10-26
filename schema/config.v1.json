@@ -624,8 +624,8 @@
       "type": "string"
     },
     "IpEntry": {
-      "description": "a network such as 10.7.0.0/24 with no host bits set, geoip:private, tunnel:users or tunnel:<inbound tag>",
-      "pattern": "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|tunnel:[a-z0-9][a-z0-9_-]{0,63})$",
+      "description": "a network such as 10.7.0.0/24 with no host bits set, geoip:private, host:self, tunnel:users or tunnel:<inbound tag>",
+      "pattern": "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|host:self|tunnel:[a-z0-9][a-z0-9_-]{0,63})$",
       "type": "string"
     },
     "Key": {
@@ -2852,7 +2852,7 @@
           "items": {
             "$ref": "#/$defs/Device"
           },
-          "maxItems": 16,
+          "maxItems": 64,
           "type": "array",
           "uniqueItems": true
         },

@@ -304,6 +304,15 @@ async fn socks5_refuses_bind_and_what_the_gate_refuses() {
 }
 
 #[tokio::test]
+async fn a_host_self_rule_refuses_the_address_of_the_node_itself_and_without_one_it_is_reached() {
+	let Some(open) = net(|_| {}).await else {return};
+	assert!(socks_connect(open.socks, "alice", ALICE, &Dest::Addr(open.echo)).await.is_ok(), "an address of the node was refused with no rule that names it");
+	let Some(closed) = net(|doc| doc["routing"]["rules"] = json!([{"tag": "no-self", "ip": ["host:self"], "action": "reject"}])).await else {return};
+	assert!(matches!(socks_connect(closed.socks, "alice", ALICE, &Dest::Addr(closed.echo)).await, Err(2)), "the rule did not refuse an address of the node");
+	assert_eq!((closed.node.dropped(Reason::Rule), closed.node.dropped(Reason::Gate)), (1, 0));
+}
+
+#[tokio::test]
 async fn socks5_resolves_a_name_through_the_nodes_dns() {
 	let Some(net) = net(|_| {}).await else {return};
 	let mut stream = socks_connect(net.socks, "alice", ALICE, &Dest::Name("Anything.Example", net.echo.port())).await.expect("a name was not resolved");

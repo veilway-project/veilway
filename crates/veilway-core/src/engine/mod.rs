@@ -8,6 +8,7 @@ pub mod faketls;
 mod flows;
 pub mod gate;
 mod host;
+pub mod hostaddrs;
 pub mod icmp;
 mod inbound;
 pub mod l3;
@@ -899,6 +900,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 	};
 	host.commit(&shared, staged);
 	tokio::spawn(obfs::tables(shared.clone()));
+	tokio::spawn(hostaddrs::keep());
 	tokio::spawn({
 		let shared = shared.clone();
 		async move {

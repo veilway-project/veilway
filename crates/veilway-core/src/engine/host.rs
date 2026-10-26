@@ -8,7 +8,7 @@ use super::route::{self, By, Decision, Ended, Key};
 use super::limits::Clock;
 use super::upstream::{self, UpstreamState};
 use super::upstream_state::{UpstreamFile, UpstreamVault};
-use super::{certificate, control, faketls, l3, link, obfs, pins, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use super::{certificate, control, faketls, hostaddrs, l3, link, obfs, pins, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -455,6 +455,7 @@ impl Host {
 		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, pinned, tunnels, loopbacks, forwards, proxies, l3, upstreams} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
 		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
+		hostaddrs::refresh();
 		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
 		let (old, plan) = if same {(shared.plan(), shared.plan())} else {self.switch(shared, plan, true)};
 		self.config = Some(config);

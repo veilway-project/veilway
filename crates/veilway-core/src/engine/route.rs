@@ -1,5 +1,5 @@
 //! Routing: the rules a flow's first packet is matched against, and the bounded table that keeps the decision for the rest of the flow.
-use super::gate;
+use super::{gate, hostaddrs};
 use super::netstack::{Packet, ECHO_REPLY_V4, ECHO_REPLY_V6, ECHO_REQUEST_V4, ECHO_REQUEST_V6};
 use super::plan::{Action, IpMatch, Pattern, Plan};
 use crate::config::{Protocol, RuleTransport};
@@ -492,6 +492,7 @@ pub fn evaluate<'a>(plan: &'a Plan, inbound: usize, user: usize, dst: IpAddr, pr
 		IpMatch::Net(net) => within(net),
 		// Addresses inside an inbound pool belong to the `tunnel:` names alone.
 		IpMatch::Private => plan.pool_of(dst).is_none() && plan.private.iter().any(within),
+		IpMatch::HostSelf => plan.pool_of(dst).is_none() && hostaddrs::contains(dst),
 		IpMatch::Users => pool.is_some(),
 		IpMatch::Tunnel(tunnel) => pool == Some(*tunnel),
 	};
@@ -798,5 +799,17 @@ mod tests {
 		let (request, reply) = (Key::of(&packet(Protocol::ICMPV6, 128, 0)), Key::of(&packet(Protocol::ICMPV6, 129, 0)));
 		assert_eq!(reply.reversed(), Some(Key {src: request.dst, dst: request.src, ..request}));
 		assert_eq!(request.reversed(), None);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn host_self_matches_an_address_of_the_host_and_the_ipv4_address_an_ipv6_one_carries() {
+		super::super::hostaddrs::set_for_test(&["192.0.2.7", "2001:db8::7"]);
+		let rule = super::super::plan::Rule {tag: "no-self".into(), inbound: None, user: None, group: None, link: None, transport: None, ip: Some(vec![IpMatch::HostSelf]), domain: None, protocol: None, port: None, icmp_type: None, icmp_code: None, action: Action::Reject};
+		let plan = Plan {rules: vec![rule], ..Plan::default()};
+		let at = |dst: &str| matches!(evaluate(&plan, 0, 0, dst.parse().unwrap(), 6, 443, None, None, &|_| false), Action::Reject);
+		for yes in ["192.0.2.7", "2001:db8::7", "::ffff:192.0.2.7", "64:ff9b::c000:207", "2002:c000:207::1"] {assert!(at(yes), "{yes}")}
+		for no in ["192.0.2.8", "2001:db8::8", "::ffff:192.0.2.8", "1.1.1.1"] {assert!(!at(no), "{no}")}
+		super::super::hostaddrs::refresh();
 	}
 }

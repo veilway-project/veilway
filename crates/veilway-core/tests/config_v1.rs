@@ -392,8 +392,8 @@ fn limits() {
 	error_at("routing.rules", |d| d["routing"]["rules"] = (0..MAX_RULES + 1).map(|i| json!({"tag": format!("r{i}"), "port": [i + 1], "protocol": ["tcp"], "action": "block"})).collect());
 	error_at("routing.rules[2].port", |d| d["routing"]["rules"][2]["port"] = (1..=1025).collect());
 	clean(|d| d["routing"]["rules"][2]["port"] = (1001..=2024).collect());
-	error_at("users[0].devices", |d| d["users"][0]["devices"] = (0..17).map(|i| json!({"name": format!("d{i}"), "public_key": key(0x40 + i), "addresses": [format!("10.7.0.{}", 10 + i)]})).collect());
-	clean(|d| d["users"][0]["devices"] = (0..16).map(|i| json!({"name": format!("d{i}"), "public_key": key(0x40 + i), "addresses": [format!("10.7.0.{}", 10 + i)]})).collect());
+	error_at("users[0].devices", |d| d["users"][0]["devices"] = (0..65).map(|i| json!({"name": format!("d{i}"), "public_key": key(0x40 + i), "addresses": [format!("10.7.0.{}", 10 + i)]})).collect());
+	clean(|d| d["users"][0]["devices"] = (0..64).map(|i| json!({"name": format!("d{i}"), "public_key": key(0x40 + i), "addresses": [format!("10.7.0.{}", 10 + i)]})).collect());
 	error_at("users[0].devices", |d| d["users"][0]["devices"] = json!([]));
 	error_at("users[0].devices[0].addresses", |d| d["users"][0]["devices"][0]["addresses"] = (0..17).map(|i| format!("10.7.0.{}", 10 + i)).collect());
 	error_at("users[0].devices[0].addresses", |d| d["users"][0]["devices"][0]["addresses"] = json!([]));
@@ -1359,4 +1359,16 @@ fn routing_fallback_names_exits_once_and_no_block_exit() {
 	error_at("routing.fallback[0]", |doc| doc["routing"]["fallback"] = json!(["nowhere"]));
 	error_at("routing.fallback[1]", |doc| doc["routing"]["fallback"] = json!(["open", "open"]));
 	error_at("routing.fallback[0]", |doc| doc["routing"]["fallback"] = json!(["sink"]));
+}
+
+#[test]
+fn host_self_names_the_addresses_of_the_machine() {
+	all_clean! {
+		|d| d["routing"]["rules"][1]["ip"] = json!(["geoip:private", "host:self"]);
+		|d| d["routing"]["rules"].as_array_mut().unwrap().insert(1, json!({"tag": "no-self", "ip": ["host:self"], "action": "reject"}));
+	};
+	error_at("routing.rules[1].ip[1]", |d| d["routing"]["rules"][1]["ip"] = json!(["host:self", "host:self"]));
+	for bad in ["host:", "host:Self", "host:self ", "host:self/32", "host:other", "self"] {refused("routing.rules[1].ip[0]", |d| d["routing"]["rules"][1]["ip"] = json!([bad]));}
+	let config = parse(&with(|d| d["routing"]["rules"][1]["ip"] = json!(["host:self"]))).unwrap();
+	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);
 }

@@ -236,8 +236,6 @@ impl Shared {
 			Action::Reject => Decision::Refuse {reason: Reason::Rule, reset: true},
 			// Traffic between users never leaves through an exit: any outcome but a refusal is delivery inside the node.
 			_ if local => Decision::Deliver,
-			// The node's own addresses are known only to the host.
-			_ if (self.is_local)(key.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 			action => {
 				let exit = if let Action::Exit(exit) = action {*exit} else {plan.exit_of(device)};
 				match &plan.exits[exit].backend {

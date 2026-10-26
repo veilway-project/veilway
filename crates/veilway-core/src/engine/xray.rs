@@ -566,7 +566,7 @@ pub(super) async fn connect(shared: &Arc<Shared>, plan: Arc<Plan>, at: usize, ta
 			(Some(name), port, found)
 		}
 	};
-	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools) && !(shared.is_local)(*ip)) else {
+	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools)) else {
 		let why = anyhow::anyhow!("user {user}: {}: {}", plan.show(name.as_deref().unwrap_or("an address")), if found.is_empty() {"no address"} else {"refused by the gate"});
 		return Err(if found.is_empty() {Refused {reason: Reason::Unreachable, code: 4, why}} else {Refused {reason: Reason::Gate, code: 2, why}});
 	};

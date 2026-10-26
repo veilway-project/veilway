@@ -135,7 +135,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name, plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5)).await),
 	};
 	let shown = plan.show(name.map_or_else(|| found.first().map_or_else(String::new, ToString::to_string), str::to_string));
-	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools) && !(shared.is_local)(*ip)) else {
+	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools)) else {
 		let reason = if found.is_empty() {Reason::Unreachable} else {Reason::Gate};
 		shared.count(reason);
 		tracing::debug!("{label}: user {user}: udp to {shown}: {}", if found.is_empty() {"no address"} else {"refused by the gate"});

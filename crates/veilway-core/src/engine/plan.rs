@@ -392,7 +392,7 @@ impl Link {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Holder {pub device: usize, pub inbound: usize}
 
-pub enum IpMatch {Net(IpNet), Private, Users, Tunnel(usize)}
+pub enum IpMatch {Net(IpNet), Private, HostSelf, Users, Tunnel(usize)}
 
 pub enum Action {Exit(usize), User, Block, Reject}
 
@@ -734,6 +734,7 @@ impl Plan {
 				ip: rule.ip.as_ref().map(|list| list.iter().map(|entry| Ok(match entry {
 					IpEntry::Net(net) => IpMatch::Net(*net),
 					IpEntry::Private => IpMatch::Private,
+					IpEntry::HostSelf => IpMatch::HostSelf,
 					IpEntry::Users => IpMatch::Users,
 					IpEntry::Tunnel(tag) => IpMatch::Tunnel(find(&inbound_tags, tag)?),
 				})).collect::<anyhow::Result<Vec<_>>>()).transpose()?,
