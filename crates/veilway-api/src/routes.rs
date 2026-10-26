@@ -301,6 +301,9 @@ fn users_of(api: &Api, only: Option<&str>) -> Vec<model::User> {
 				None => sets.iter().find(|set| set.users.contains(&user.name)).or_else(|| sets.iter().find(|set| user.groups.iter().any(|group| set.groups.contains(group)))),
 			}.map(|set| set.tag.clone()),
 			traffic: usage.map(|usage| usage.traffic).unwrap_or_default().into(),
+			speed_up: user.speed_up,
+			speed_down: user.speed_down,
+			limited: model::Limited {up_packets: usage.map_or(0, |usage| usage.limited[0]), down_packets: usage.map_or(0, |usage| usage.limited[1]), paced_ms: usage.map_or(0, |usage| usage.paced_ms)},
 			devices: user.devices.iter().map(|device| model::Device {name: device.name.clone(), public_key: key(&device.public_key), addresses: device.addresses.iter().map(|address| address.0.to_string()).collect(), handshake_age_secs: handshakes.get(&device.public_key.0).map(Duration::as_secs)}).collect(),
 		}
 	}).collect()

@@ -154,6 +154,7 @@ pub async fn ping(shared: Arc<Shared>, plan: Arc<Plan>, exit: usize, to: Holder,
 						_ => return,
 					};
 					if built.is_err() || out.len() > usize::from(plan.inbounds[to.inbound].mtu) {continue}
+					if !shared.police(&plan.users[plan.devices[to.device].user], false, out.len()) {continue}
 					plan.exits[exit].traffic.down(out.len());
 					shared.send(&plan, to, &out).await;
 				}

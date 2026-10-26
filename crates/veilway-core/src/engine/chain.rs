@@ -611,6 +611,7 @@ impl Shared {
 				self.flows.track(&key, id, idle, closing);
 			}
 		}
+		if !self.police(&plan.users[plan.devices[to.device].user], false, raw.len()) {return}
 		plan.exits[exit].traffic.down(raw.len());
 		// The device may have a smaller MTU than the link. What it set is held to as for any packet from outside, and what cannot reach it is dropped: its sender is out of reach, on the far side of the link.
 		match netstack::forward(&raw, plan.mtu_of(to)) {

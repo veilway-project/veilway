@@ -300,7 +300,14 @@ impl Shared {
 		if control {self.own(&plan.users[user], raw.len())}
 		// The gateway of the inbound a device came in through answers its ping itself, before any rule or exit, so an app can tell that its tunnel carries packets with no exit at all. A link has no gateway to ping.
 		if gateway && linked.is_none() && packet.echo_request() && plan.inbounds[at].pools.iter().any(|pool| pool.addr() == packet.dst) {
-			match netstack::echo_reply(&raw, &packet) {Some(reply) => {self.send(plan, from, &reply).await;}, None => self.count(Reason::Unparsable)}
+			match netstack::echo_reply(&raw, &packet) {
+				Some(reply) => {
+					self.charge(&plan.users[user], true, raw.len());
+					self.charge(&plan.users[user], false, reply.len());
+					self.send(plan, from, &reply).await;
+				}
+				None => self.count(Reason::Unparsable),
+			}
 			return;
 		}
 		// The gate is asked for every packet, so what it refuses takes no place in the flow table. A link address is never a destination, and what is always refused for a link is refused here too.
@@ -331,10 +338,11 @@ impl Shared {
 	/// Does with one packet of a flow what the flow's decision says. `from` is the device that sent it and `id` the flow's entry in the table.
 	#[allow(clippy::too_many_arguments)]
 	pub(super) async fn carry(self: &Arc<Self>, plan: &Arc<Plan>, from: Holder, raw: Vec<u8>, packet: &Packet, key: Key, id: u64, decision: Decision) {
-		let transport = packet.protocol == Protocol::TCP || packet.protocol == Protocol::UDP;
+		let (transport, user) = (packet.protocol == Protocol::TCP || packet.protocol == Protocol::UDP, &plan.users[plan.devices[from.device].user]);
 		match decision {
 			Decision::Refuse {reason, reset} => self.refuse(plan, from, &raw, packet, reason, reset).await,
 			Decision::Deliver => {
+				if !self.police(user, true, raw.len()) {return}
 				let to = plan.by_address.get(&packet.dst).copied().filter(|to| {
 					let peers = plan.inbounds[to.inbound].tunnel.lock();
 					peers.wg.index(&plan.devices[to.device].public_key).is_some_and(|peer| peers.wg.time_since_last_handshake(peer).is_some())
@@ -360,15 +368,21 @@ impl Shared {
 					None => self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await,
 				}
 			}
-			Decision::Dns | Decision::Control => if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)},
+			Decision::Dns | Decision::Control => {
+				self.charge(user, true, raw.len());
+				if plan.inbounds[from.inbound].tunnel.to_stack.try_send(raw).is_err() {self.count(Reason::QueueFull)}
+			}
 			Decision::Exit {exit, by} => {
 				// An exit counts a packet where the packet is handed to it, so one that is dropped on the way counts for none, and only the exit that carries it counts it: what a `via` hands on is the traffic of the exit it was handed to.
 				let (carrier, len) = (if let By::Via(target) = by {target} else {exit}, raw.len());
+				// What the node answers itself is only charged. A TCP segment into the exit's stack is slowed down where its stream is held, see `flows::run`. Anything else over the rate is dropped here.
+				if by == By::Local {self.charge(user, true, len)} else if !(packet.protocol == Protocol::TCP && matches!(plan.exits[carrier].backend, Backend::Netstack {..})) && !self.police(user, true, len) {return}
 				match (by, &plan.exits[carrier].backend) {
 					(By::Local, _) => match netstack::echo_reply(&raw, packet) {
 						Some(reply) => {
 							plan.exits[exit].traffic.up(len);
 							plan.exits[exit].traffic.down(reply.len());
+							self.charge(user, false, reply.len());
 							self.send(plan, from, &reply).await;
 						}
 						None => self.count(Reason::Unsupported),
@@ -437,6 +451,7 @@ impl Shared {
 			};
 			self.flows.track(&key, id, idle, closing);
 		}
+		if !self.police(&plan.users[plan.devices[to.device].user], false, raw.len()) {return}
 		// For this exit alone, which carried it, whichever exit the rules chose for the flow.
 		plan.exits[exit].traffic.down(raw.len());
 		// The device may have set a smaller MTU than its inbound has, and then the node is the router in front of a link of that size: IPv4 that allows it is fragmented, and the sender of anything else is sent "fragmentation needed" or "packet too big" with that MTU,
@@ -505,6 +520,13 @@ pub fn serve(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, mut stack: IpStack, mut
 					shared.count(Reason::Stale);
 					continue;
 				};
+				// A TCP flow of a limited user was slowed down by the handler of its flow. A datagram over the rate is dropped here, and DNS and the control channel are only charged.
+				let user = &plan.users[plan.devices[to.device].user];
+				match decision {
+					Decision::Dns | Decision::Control => shared.charge(user, false, raw.len()),
+					_ if packet.protocol == Protocol::UDP && !shared.police(user, false, raw.len()) => continue,
+					_ => {}
+				}
 				// A datagram was counted when the handler of its flow took it from an outbound. A TCP flow is always carried by the exit the rules chose.
 				if let (Protocol::TCP, Decision::Exit {exit, ..}) = (packet.protocol, decision) {plan.exits[exit].traffic.down(raw.len())}
 				// What the control channel sends is counted as its own with the bytes that really went out, the headers of fragments included.

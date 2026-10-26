@@ -86,6 +86,9 @@ pub const MAX_DOMAIN_BYTES: usize = 253;
 pub const MAX_LABEL_BYTES: usize = 63;
 pub const MAX_CREDENTIAL_BYTES: usize = 255;
 pub const MAX_QUOTA_BYTES: u64 = 9007199254740991;
+/// The range of a user's `speed_up` and `speed_down`, in bytes per second: 128 kbit/s to 100 Gbit/s.
+pub const MIN_SPEED: u64 = 16384;
+pub const MAX_SPEED: u64 = 12500000000;
 pub const KEY_CHARS: usize = 44;
 pub const MIN_MTU: u16 = 1280;
 pub const MAX_MTU: u16 = 1500;

@@ -2,7 +2,7 @@
 use super::plan::{Backend, Fallback, Holder, Outbound, Plan, Upstream};
 use super::ExitState;
 use super::route::{By, Decision, Key, Reason, CLOSED_IDLE};
-use super::{dns, netstack, Event, Shared};
+use super::{dns, netstack, rate, Event, Shared};
 use etherparse::PacketBuilder;
 use ipstack::{IpStackStream, IpStackUdpStream};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -438,7 +438,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 					Outbound::Socks5(up) => match dial_conn(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await {
 						Ok(mut remote) => {
 							heard(&shared, &plan, carrier, Ok(()));
-							tokio::io::copy_bidirectional(&mut stream, &mut remote).await
+							rate::relay(&mut stream, &mut remote, &plan.users[plan.devices[from.device].user]).await
 						}
 						Err(failure) => {
 							// A destination that does not connect says nothing against the proxy, which let the node in to ask. A hop that is down says nothing either: it is the hop that makes the exit not work, and it is the hop that ends that.
@@ -447,7 +447,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 						}
 					},
 					Outbound::Direct {bind, interface} => match tokio::time::timeout(DIAL_TIMEOUT, connect_from(*bind, interface.as_deref(), target)).await {
-						Ok(Ok(mut remote)) => tokio::io::copy_bidirectional(&mut stream, &mut remote).await,
+						Ok(Ok(mut remote)) => rate::relay(&mut stream, &mut remote, &plan.users[plan.devices[from.device].user]).await,
 						Ok(Err(e)) => return tracing::debug!("exit {tag}: tcp to {}: direct connect failed: {}", plan.show(target), e.kind()),
 						Err(_) => return tracing::debug!("exit {tag}: tcp to {}: direct connect timed out", plan.show(target)),
 					},

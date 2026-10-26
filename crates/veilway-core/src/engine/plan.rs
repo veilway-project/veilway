@@ -296,6 +296,8 @@ pub struct User {
 	pub flows: usize,
 	/// What the user's `proxy_password` comes to under `proxy::tag`, and so what a login to a proxy inbound is held against. The password itself is not kept. None for a user without one, and for a link.
 	pub proxy: Option<[u8; 32]>,
+	/// `speed_up` and `speed_down` in bytes per second, None for no limit. Always None for a link, whose traffic is limited on the entry node, see `rate`.
+	pub speed: [Option<u64>; 2],
 }
 
 pub struct Device {
@@ -594,6 +596,7 @@ impl Plan {
 				link: None,
 				flows: route::MAX_FLOWS_PER_USER,
 				proxy: user.proxy_password.as_ref().map(|password| proxy::tag(password.expose().as_bytes())),
+				speed: [user.speed_up, user.speed_down],
 			});
 			// What the channel keeps for a device stays with the device while it is the same user's. A key that is given to another user is another device from here on: it starts with no exit chosen, no MTU and no connection.
 			// The plan before the first one holds what the state file remembered and knows no user, and there the key alone decides.
@@ -663,7 +666,7 @@ impl Plan {
 				denied = if lapsed.is_some() {Some(Denied::Expired)} else if written.quota_bytes.is_some_and(|quota| used >= quota) {Some(Denied::Quota)} else {None};
 				if let (None, Some(at)) = (denied, written.expires_at) {next_expiry = Some(next_expiry.map_or(at.0, |next| next.min(at.0)))}
 				user = Some(users.len());
-				users.push(User {name: name.clone(), groups: Vec::new(), entitled: Some(written.exits.iter().flatten().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?), exit: written.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?, dns: None, quota: written.quota_bytes, period: written.quota_period, expires: written.expires_at.map(|at| at.0.unix_timestamp()), denied, state, link: Some(l), flows: written.max_flows.unwrap_or(DEFAULT_LINK_FLOWS) as usize, proxy: None});
+				users.push(User {name: name.clone(), groups: Vec::new(), entitled: Some(written.exits.iter().flatten().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<_>>()?), exit: written.exit.as_deref().map(|tag| find(&exit_tags, tag)).transpose()?, dns: None, quota: written.quota_bytes, period: written.quota_period, expires: written.expires_at.map(|at| at.0.unix_timestamp()), denied, state, link: Some(l), flows: written.max_flows.unwrap_or(DEFAULT_LINK_FLOWS) as usize, proxy: None, speed: [None, None]});
 				if denied.is_none() {
 					device = Some(devices.len());
 					for address in &addresses {by_address.insert(*address, Holder {device: devices.len(), inbound});}

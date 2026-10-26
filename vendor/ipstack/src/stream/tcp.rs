@@ -315,6 +315,19 @@ impl IpStackTcpStream {
     pub fn stream_sender(&self) -> PacketSender {
         self.stream_sender.clone()
     }
+
+    /// veilway patch: `taken` bytes went to the reader, so they stop counting against the receive window, see `Tcb::queued`. A window
+    /// that was too small for the peer to send into (less than two segments) and is not any more is announced at once: the peer may
+    /// be holding back for it, and nothing else would tell it before its next probe.
+    fn read_taken(&self, taken: usize) {
+        let tcb = self.tcb.lock().unwrap();
+        let before = tcb.get_recv_window();
+        tcb.queued.fetch_sub(taken, std::sync::atomic::Ordering::Relaxed);
+        let (after, floor) = (tcb.get_recv_window(), 2 * u32::from(tcb.get_mtu()));
+        if before < floor && after >= floor {
+            let _ = write_packet_to_device(&self.up_packet_sender, self.network_tuple(), &tcb, None, ACK, None, None);
+        }
+    }
 }
 
 impl AsyncRead for IpStackTcpStream {
@@ -324,6 +337,7 @@ impl AsyncRead for IpStackTcpStream {
             let len = std::cmp::min(buf.remaining(), self.temp_read_buffer.len());
             buf.put_slice(&self.temp_read_buffer[..len]);
             self.temp_read_buffer.drain(..len); // remove the read data from the temp buffer
+            self.read_taken(len);
             return Poll::Ready(Ok(()));
         }
 
@@ -361,10 +375,12 @@ impl AsyncRead for IpStackTcpStream {
                 let capacity = buf.remaining();
                 if capacity >= data.len() {
                     buf.put_slice(&data);
+                    self.read_taken(data.len());
                 } else {
                     // if `buf` is not enough, put the remaining data into the temp buffer
                     buf.put_slice(&data[..capacity]);
                     self.temp_read_buffer.extend_from_slice(&data[capacity..]);
+                    self.read_taken(capacity);
                 }
                 Poll::Ready(Ok(()))
             }
@@ -811,6 +827,7 @@ async fn tcp_main_logic_loop(
                     // those bytes sit before the FIN. Hand them over first, or the ACK below lands in the middle of them and
                     // the reader reaches end of stream without them.
                     if let Some(data) = tcb.consume_unordered_packets(usize::MAX) {
+                        tcb.queued.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
                         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
                     }
                     // The other side is closing the connection, we need to send an ACK and change state to CloseWait
@@ -1001,6 +1018,7 @@ fn extract_data_n_write_upstream(
     if let Some(data) = tcb.consume_unordered_packets(8192) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
+        tcb.queued.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
         write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
@@ -1024,7 +1042,8 @@ pub(crate) fn write_packet_to_device(
     // veilway patch: the window is scaled except on a SYN (RFC 7323 2.2), and a SYN/ACK announces the scale when the peer's SYN had one.
     let (syn, shift) = (flags & SYN != 0, tcb.get_own_shift());
     let window = if syn { tcb.get_recv_window() } else { tcb.get_recv_window() >> shift };
-    let (ack, window_size) = (tcb.get_ack().0, window.max(u32::from(tcb.get_mtu())).min(u32::from(u16::MAX)) as u16);
+    // veilway patch: no floor of one MTU any more. A window of zero is announced as zero, so that a reader that is slow holds the peer back, see `Tcb::queued`.
+    let (ack, window_size) = (tcb.get_ack().0, window.min(u32::from(u16::MAX)) as u16);
     let scaled: Option<Vec<TcpOptions>> = (syn && shift > 0).then(|| options.into_iter().flatten().cloned().chain([TcpOptions::WindowScale(shift)]).collect());
     let options = scaled.as_ref().or(options);
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here

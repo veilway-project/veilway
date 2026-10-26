@@ -106,15 +106,18 @@ struct Pipe {shared: Arc<Shared>, plan: Arc<Plan>, user: usize, from: mpsc::Rece
 
 impl Datagrams for Pipe {
 	async fn recv(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-		let datagram = self.from.recv().await.ok_or(std::io::ErrorKind::BrokenPipe)?;
-		let n = datagram.len().min(buf.len());
-		buf[..n].copy_from_slice(&datagram[..n]);
-		self.shared.spend(&self.plan.users[self.user], true, n + self.overhead);
-		*self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-		Ok(n)
+		loop {
+			let datagram = self.from.recv().await.ok_or(std::io::ErrorKind::BrokenPipe)?;
+			let n = datagram.len().min(buf.len());
+			buf[..n].copy_from_slice(&datagram[..n]);
+			self.shared.spend(&self.plan.users[self.user], true, n + self.overhead);
+			*self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+			if self.shared.police(&self.plan.users[self.user], true, n + self.overhead) {return Ok(n)}
+		}
 	}
 
 	async fn send(&mut self, datagram: &[u8]) -> std::io::Result<()> {
+		if !self.shared.police(&self.plan.users[self.user], false, datagram.len() + self.overhead) {return Ok(())}
 		let mut wrapped = self.header.clone();
 		wrapped.extend_from_slice(datagram);
 		self.back.send(wrapped).await.map_err(|_| std::io::ErrorKind::BrokenPipe)?;
@@ -289,6 +292,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 					answers.spawn(async move {
 						let (counted, resolver) = (&plan.users[at], &shared.resolver);
 						shared.spend(counted, true, message.len() + overhead);
+						shared.charge(counted, true, message.len() + overhead);
 						let Some(query) = dns::query(&message) else {
 							resolver.malformed.fetch_add(1, Ordering::Relaxed);
 							return (header, None);
@@ -319,6 +323,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 						let mut answer = answer.unwrap_or_else(|| query.reply(dns::SERVFAIL));
 						dns::clip(&mut answer, DNS_ANSWER);
 						shared.spend(counted, false, answer.len() + overhead);
+						shared.charge(counted, false, answer.len() + overhead);
 						(header, Some(answer))
 					});
 					continue;

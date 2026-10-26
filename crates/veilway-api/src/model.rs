@@ -244,7 +244,21 @@ pub struct User {
 	/// The tag of the DNS set that names the user, or else one of their groups. Null when no set does: the user's queries then go to the set that names the inbound they come through, or to `dns.servers`.
 	pub dns_set: Option<String>,
 	pub traffic: Traffic,
+	/// The most the user sends and receives through this node, in bytes per second. Null for no limit.
+	pub speed_up: Option<u64>,
+	pub speed_down: Option<u64>,
+	pub limited: Limited,
 	pub devices: Vec<Device>,
+}
+
+/// What the user's speed limits did since the node started.
+#[derive(Serialize, JsonSchema)]
+pub struct Limited {
+	/// Packets dropped for being over the rate: UDP, pings and TCP that does not leave through a netstack exit. TCP that does is slowed down, never dropped.
+	pub up_packets: u64,
+	pub down_packets: u64,
+	/// Milliseconds that TCP streams of the user waited for the limit, added up over streams and both directions.
+	pub paced_ms: u64,
 }
 
 #[derive(Serialize, JsonSchema)]

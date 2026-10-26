@@ -830,6 +830,34 @@
         ],
         "type": "object"
       },
+      "Limited": {
+        "description": "What the user's speed limits did since the node started.",
+        "properties": {
+          "down_packets": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "paced_ms": {
+            "description": "Milliseconds that TCP streams of the user waited for the limit, added up over streams and both directions.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "up_packets": {
+            "description": "Packets dropped for being over the rate: UDP, pings and TCP that does not leave through a netstack exit. TCP that does is slowed down, never dropped.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "up_packets",
+          "down_packets",
+          "paced_ms"
+        ],
+        "type": "object"
+      },
       "Link": {
         "description": "One node link. It holds no key and no secret.",
         "properties": {
@@ -3711,6 +3739,9 @@
               "null"
             ]
           },
+          "limited": {
+            "$ref": "#/components/schemas/Limited"
+          },
           "name": {
             "type": "string"
           },
@@ -3737,6 +3768,23 @@
               }
             ]
           },
+          "speed_down": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "speed_up": {
+            "description": "The most the user sends and receives through this node, in bytes per second. Null for no limit.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "traffic": {
             "$ref": "#/components/schemas/Traffic"
           },
@@ -3758,6 +3806,9 @@
           "period_start",
           "dns_set",
           "traffic",
+          "speed_up",
+          "speed_down",
+          "limited",
           "devices"
         ],
         "type": "object"

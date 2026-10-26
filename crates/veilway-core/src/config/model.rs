@@ -1703,6 +1703,14 @@ pub struct User {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(length(min = MIN_PROXY_PASSWORD, max = MAX_PROXY_PASSWORD))]
 	pub proxy_password: Option<Secret<String>>,
+	/// The most the user sends through this node, in bytes per second, over all their devices and proxy logins together. Per node: the same user on several nodes has the limit on each of them. TCP through a `netstack` exit and through the proxy inbounds is slowed down, everything else over the rate is dropped. DNS and the control channel are never dropped.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 16384, max = 12500000000_u64))]
+	pub speed_up: Option<u64>,
+	/// The same for what the user receives.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(range(min = 16384, max = 12500000000_u64))]
+	pub speed_down: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]

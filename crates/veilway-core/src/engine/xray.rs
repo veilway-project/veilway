@@ -5,6 +5,7 @@
 //! What follows a login is `connect` and `relay` below and `xray_udp::associate`, which the `socks5`, `http` and `mixed` inbounds (`proxy`) run as well after their own login: one code decides and carries a user's connection, whoever the front door is.
 use super::plan::{Action, Backend, Outbound, Plan};
 use crate::config::RuleTransport;
+use super::rate;
 use super::resolver::{self, Step};
 use super::route::{self, Reason};
 use super::xray_owner::{self, Lookup};
@@ -596,6 +597,7 @@ pub(super) async fn relay(shared: &Shared, opened: &mut Opened, client: &mut Tcp
 	let upward = async {
 		let mut buffer = vec![0u8; CHUNK];
 		if !up.is_empty() {
+			rate::pace(counted, true, up.len()).await;
 			to_remote.write_all(up).await?;
 			shared.spend(counted, true, up.len());
 			plan.exits[exit].traffic.up(up.len());
@@ -606,6 +608,7 @@ pub(super) async fn relay(shared: &Shared, opened: &mut Opened, client: &mut Tcp
 			let n = from_client.read(&mut buffer).await?;
 			if n == 0 {return to_remote.shutdown().await}
 			let n = body.as_mut().map_or(n, |body| body.take(&buffer[..n]));
+			rate::pace(counted, true, n).await;
 			to_remote.write_all(&buffer[..n]).await?;
 			shared.spend(counted, true, n);
 			plan.exits[exit].traffic.up(n);
@@ -618,6 +621,7 @@ pub(super) async fn relay(shared: &Shared, opened: &mut Opened, client: &mut Tcp
 		loop {
 			let n = from_remote.read(&mut buffer).await?;
 			if n == 0 {return to_client.shutdown().await}
+			rate::pace(counted, false, n).await;
 			to_client.write_all(&buffer[..n]).await?;
 			shared.spend(counted, false, n);
 			plan.exits[exit].traffic.down(n);
@@ -683,6 +687,8 @@ pub(super) async fn resolve(shared: &Shared, plan: &Arc<Plan>, user: usize, name
 				Step::Answered(answer, _) => {
 					shared.spend(&plan.users[user], true, query.len());
 					shared.spend(&plan.users[user], false, answer.len());
+					shared.charge(&plan.users[user], true, query.len());
+					shared.charge(&plan.users[user], false, answer.len());
 					let Some(response) = dns::response(&answer).filter(|response| response.rcode == 0) else {continue};
 					let found: Vec<IpAddr> = response.addresses.iter().map(|(ip, _)| *ip).filter(|ip| ip.is_ipv4() == (qtype == 1)).collect();
 					if !found.is_empty() {return found}

@@ -676,6 +676,21 @@ export interface components {
             /** Format: uint64 */
             missed: number;
         };
+        /** @description What the user's speed limits did since the node started. */
+        Limited: {
+            /** Format: uint64 */
+            down_packets: number;
+            /**
+             * Format: uint64
+             * @description Milliseconds that TCP streams of the user waited for the limit, added up over streams and both directions.
+             */
+            paced_ms: number;
+            /**
+             * Format: uint64
+             * @description Packets dropped for being over the rate: UDP, pings and TCP that does not leave through a netstack exit. TCP that does is slowed down, never dropped.
+             */
+            up_packets: number;
+        };
         /** @description One node link. It holds no key and no secret. */
         Link: {
             /** Format: uint */
@@ -1806,6 +1821,7 @@ export interface components {
             dns_set: string | null;
             enabled: boolean;
             expires_at: string | null;
+            limited: components["schemas"]["Limited"];
             name: string;
             /**
              * Format: int64
@@ -1815,6 +1831,13 @@ export interface components {
             /** Format: uint64 */
             quota_bytes: number | null;
             quota_period: components["schemas"]["QuotaPeriod"] | null;
+            /** Format: uint64 */
+            speed_down: number | null;
+            /**
+             * Format: uint64
+             * @description The most the user sends and receives through this node, in bytes per second. Null for no limit.
+             */
+            speed_up: number | null;
             traffic: components["schemas"]["Traffic"];
             /**
              * Format: uint64

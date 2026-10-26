@@ -59,12 +59,14 @@ pub enum Reason {
 	Stale,
 	/// A packet from a node link that would continue through another link with too low a hop limit: a chain of more than three links, or a loop between links.
 	LinkHops,
+	/// A packet over the `speed_up` or `speed_down` of its user, where the node sees packets and not a stream it can slow down.
+	RateLimited,
 }
 
 impl Reason {
-	pub const COUNT: usize = 16;
+	pub const COUNT: usize = 17;
 	/// Every reason, in the order of their counters.
-	pub const ALL: [Reason; Reason::COUNT] = [Reason::Unparsable, Reason::Fragment, Reason::SpoofedSource, Reason::Gate, Reason::Rule, Reason::Entitlement, Reason::FlowTableFull, Reason::Unreachable, Reason::Unsupported, Reason::BlockExit, Reason::QueueFull, Reason::NoFlow, Reason::TooBig, Reason::IcmpLimited, Reason::Stale, Reason::LinkHops];
+	pub const ALL: [Reason; Reason::COUNT] = [Reason::Unparsable, Reason::Fragment, Reason::SpoofedSource, Reason::Gate, Reason::Rule, Reason::Entitlement, Reason::FlowTableFull, Reason::Unreachable, Reason::Unsupported, Reason::BlockExit, Reason::QueueFull, Reason::NoFlow, Reason::TooBig, Reason::IcmpLimited, Reason::Stale, Reason::LinkHops, Reason::RateLimited];
 
 	/// The name the control API gives the counter. It is part of that API and does not change.
 	pub fn name(self) -> &'static str {
@@ -85,6 +87,7 @@ impl Reason {
 			Reason::IcmpLimited => "icmp_limited",
 			Reason::Stale => "stale",
 			Reason::LinkHops => "link_hops",
+			Reason::RateLimited => "rate_limited",
 		}
 	}
 }

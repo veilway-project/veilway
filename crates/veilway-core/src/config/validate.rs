@@ -614,6 +614,7 @@ impl Config {
 			}
 			if user.quota_bytes.is_some_and(|quota| !(1..=MAX_QUOTA_BYTES).contains(&quota)) {r.error(format!("{at}.quota_bytes"), format!("expected an integer from 1 to {MAX_QUOTA_BYTES}"))}
 			if user.quota_period.is_some() && user.quota_bytes.is_none() {r.error(format!("{at}.quota_period"), "needs quota_bytes")}
+			for (key, speed) in [("speed_up", user.speed_up), ("speed_down", user.speed_down)] {if speed.is_some_and(|speed| !(MIN_SPEED..=MAX_SPEED).contains(&speed)) {r.error(format!("{at}.{key}"), format!("expected an integer from {MIN_SPEED} to {MAX_SPEED}, in bytes per second"))}}
 			// A user who only logs in to proxy inbounds has no tunnel and so no device.
 			if !(if user.proxy_password.is_some() {0} else {1}..=MAX_DEVICES).contains(&user.devices.len()) {r.error(format!("{at}.devices"), if user.proxy_password.is_some() {format!("expected at most {MAX_DEVICES} devices")} else {format!("expected 1 to {MAX_DEVICES} devices, or none for a user with a proxy_password")})}
 			index(&mut r, |j| format!("{at}.devices[{j}].name"), user.devices.iter().take(MAX_DEVICES).map(|device| device.name.as_str()));

@@ -1209,6 +1209,37 @@ fn users_and_devices() {
 }
 
 #[test]
+fn speed_limits_are_whole_bytes_per_second_within_their_range() {
+	cases! {error_at:
+		"users[0].speed_up": |d| d["users"][0]["speed_up"] = json!(16383);
+		"users[0].speed_up": |d| d["users"][0]["speed_up"] = json!(0);
+		"users[0].speed_down": |d| d["users"][0]["speed_down"] = json!(12500000001_u64);
+		"users[1].speed_down": |d| d["users"][1]["speed_down"] = json!(1);
+	};
+	for bad in [json!(-1), json!(1.5), json!("1000000"), json!(true)] {
+		refused("users[0].speed_up", |d| d["users"][0]["speed_up"] = bad.clone());
+		refused("users[0].speed_down", |d| d["users"][0]["speed_down"] = bad.clone());
+	}
+	all_clean! {
+		|d| d["users"][0]["speed_up"] = json!(16384);
+		|d| d["users"][0]["speed_down"] = json!(12500000000_u64);
+		|d| {
+			d["users"][0]["speed_up"] = json!(125000);
+			d["users"][0]["speed_down"] = json!(1250000);
+			d["users"][0]["quota_bytes"] = json!(1 << 30);
+		};
+	};
+	let doc = with(|d| {
+		d["users"][0]["speed_up"] = json!(125000);
+		d["users"][0]["speed_down"] = json!(1250000);
+	});
+	let config = parse(&doc).unwrap();
+	assert_eq!((config.users[0].speed_up, config.users[0].speed_down, config.users[1].speed_up), (Some(125000), Some(1250000), None));
+	assert_eq!(serde_json::to_value(&config).unwrap()["users"][0]["speed_up"], json!(125000));
+	assert!(serde_json::to_value(&config).unwrap()["users"][1].get("speed_up").is_none());
+}
+
+#[test]
 fn secrets_never_reach_a_diagnostic_or_debug_output() {
 	let marker = "c2VjcmV0LW1hcmtlci1kby1ub3QtcHJpbnQtdGhpcyE";
 	let secret = format!("{marker}=");

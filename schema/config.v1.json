@@ -2909,6 +2909,20 @@
         },
         "quota_period": {
           "$ref": "#/$defs/QuotaPeriod"
+        },
+        "speed_down": {
+          "description": "The same for what the user receives.",
+          "format": "uint64",
+          "maximum": 12500000000,
+          "minimum": 16384,
+          "type": "integer"
+        },
+        "speed_up": {
+          "description": "The most the user sends through this node, in bytes per second, over all their devices and proxy logins together. Per node: the same user on several nodes has the limit on each of them. TCP through a `netstack` exit and through the proxy inbounds is slowed down, everything else over the rate is dropped. DNS and the control channel are never dropped.",
+          "format": "uint64",
+          "maximum": 12500000000,
+          "minimum": 16384,
+          "type": "integer"
         }
       },
       "required": [

@@ -529,7 +529,7 @@ async fn every_route_answers() {
 	let stats = get(&node.socket, "/v1/stats").await;
 	ask("GET", "/v1/stats");
 	assert_eq!((&stats.json["replay"], &stats.json["udp_obfs"]["sessions"], &stats.json["udp_obfs"]["unknown"]), (&Value::Null, &json!(0), &json!(0)), "{}", stats.json);
-	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(16)), "{}", stats.json);
+	assert_eq!((stats.status, &stats.json["users"][0]["name"], &stats.json["inbounds"][0]["name"], &stats.json["exits"][0]["name"], stats.json["drops"].as_object().map(|drops| drops.len())), (200, &json!("a"), &json!("home"), &json!("main"), Some(17)), "{}", stats.json);
 	assert!(stats.json["users"][0]["traffic"]["up_packets"].as_u64().unwrap() >= 2 && stats.json["exits"][0]["traffic"]["down_bytes"].as_u64().unwrap() > 0 && stats.json["drops"]["gate"].is_u64() && stats.json["dns"]["answered"].is_u64(), "{}", stats.json);
 	let sessions = get(&node.socket, "/v1/sessions").await;
 	ask("GET", "/v1/sessions");
@@ -1473,6 +1473,23 @@ async fn a_user_says_the_dns_set_that_names_them_or_their_group() {
 	let applied = send(&node.socket, "PUT", "/v1/config", Some(&revision), &doc).await;
 	assert_eq!((applied.status, &applied.json["diff"]["dns"]), (200, &json!(true)), "{}", applied.json);
 	assert_eq!(sets(&node.socket).await, [Value::Null, Value::Null, Value::Null]);
+	node.end().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_user_shows_their_speed_limits_and_what_they_dropped_and_delayed() {
+	let mut setup = setup().await;
+	setup.doc["users"][0]["speed_up"] = json!(125000);
+	setup.doc["users"][0]["speed_down"] = json!(2500000);
+	let node = launch(setup).await;
+	let users = get(&node.socket, "/v1/users").await.json;
+	let nothing = json!({"up_packets": 0, "down_packets": 0, "paced_ms": 0});
+	assert_eq!((&users["users"][0]["speed_up"], &users["users"][0]["speed_down"], &users["users"][0]["limited"]), (&json!(125000), &json!(2500000), &nothing), "{users}");
+	assert_eq!((&users["users"][1]["speed_up"], &users["users"][1]["speed_down"], &users["users"][1]["limited"]), (&Value::Null, &Value::Null, &nothing), "{users}");
+	let one = get(&node.socket, "/v1/users/a").await.json;
+	assert_eq!((&one["speed_up"], &one["speed_down"]), (&json!(125000), &json!(2500000)));
+	let stats = get(&node.socket, "/v1/stats").await.json;
+	assert_eq!(stats["drops"]["rate_limited"], json!(0), "{stats}");
 	node.end().await;
 }
 

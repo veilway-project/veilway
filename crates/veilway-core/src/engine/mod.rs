@@ -21,6 +21,7 @@ pub mod pins;
 pub mod plan;
 pub mod probe;
 pub mod proxy;
+pub mod rate;
 pub mod replay;
 pub mod resolver;
 pub mod route;
@@ -345,10 +346,15 @@ pub struct Usage {
 	pub period_start: i64,
 	pub quota_bytes: Option<u64>,
 	pub denied: Option<Denied>,
+	/// `speed_up` and `speed_down` in bytes per second.
+	pub speed: [Option<u64>; 2],
+	/// Packets dropped for the rate since start, up and down, and how long paced streams waited in all, in milliseconds.
+	pub limited: [u64; 2],
+	pub paced_ms: u64,
 }
 
 impl Usage {
-	fn of(user: &plan::User) -> Usage {Usage {name: user.name.clone(), traffic: user.state.traffic.totals(), used_bytes: user.state.used(), period_start: user.state.since.load(Ordering::Relaxed), quota_bytes: user.quota, denied: user.denied}}
+	fn of(user: &plan::User) -> Usage {Usage {name: user.name.clone(), traffic: user.state.traffic.totals(), used_bytes: user.state.used(), period_start: user.state.since.load(Ordering::Relaxed), quota_bytes: user.quota, denied: user.denied, speed: user.speed, limited: [user.state.speed.limited[0].load(Ordering::Relaxed), user.state.speed.limited[1].load(Ordering::Relaxed)], paced_ms: user.state.speed.paced_ns.load(Ordering::Relaxed) / 1_000_000}}
 }
 
 /// Every counter of the node at one moment, in the order of the config. They are totals: whoever asks twice works out the rates.
@@ -368,10 +374,12 @@ pub struct UserState {
 	in_flight: Semaphore,
 	/// Bytes of the control channel's own inner packets, which are in `traffic` and in `used` like any others. They are counted once more here so that the channel can tell what the user carried from what it sent itself.
 	control: AtomicU64,
+	/// The buckets of the user's `speed_up` and `speed_down`, and what they dropped and delayed. They belong to the name, so a reload that changes a rate keeps the debt, held to the new rate.
+	pub speed: rate::Speed,
 }
 
 impl Default for UserState {
-	fn default() -> UserState {UserState {traffic: Traffic::default(), used: AtomicU64::new(0), since: AtomicI64::new(0), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT), control: AtomicU64::new(0)}}
+	fn default() -> UserState {UserState {traffic: Traffic::default(), used: AtomicU64::new(0), since: AtomicI64::new(0), names: Mutex::default(), in_flight: Semaphore::new(resolver::MAX_IN_FLIGHT), control: AtomicU64::new(0), speed: rate::Speed::default()}}
 }
 
 impl UserState {
@@ -473,6 +481,18 @@ impl Shared {
 		let before = user.state.used.fetch_add(bytes as u64, Ordering::Relaxed);
 		if user.quota.is_some_and(|quota| before < quota && before.saturating_add(bytes as u64) >= quota) {self.over.notify_one()}
 	}
+
+	/// Whether a packet of `bytes` that goes where the node only sees packets (UDP, l3, chain and upstream exits, pings) is within the user's rate. One that is not is counted as `RateLimited` and the caller drops it. Traffic that is policed is spent before this is asked when it goes up and after when it goes down, so a dropped upload counts against the quota and a dropped download does not.
+	pub(super) fn police(&self, user: &plan::User, up: bool, bytes: usize) -> bool {
+		let Some(rate) = user.speed[usize::from(!up)] else {return true};
+		if user.state.speed.take_at(user.state.speed.now(), up, rate, bytes) {return true}
+		user.state.speed.limited[usize::from(!up)].fetch_add(1, Ordering::Relaxed);
+		self.count(Reason::RateLimited);
+		false
+	}
+
+	/// Charges `bytes` to the user's rate and never drops them: DNS, the control channel and what the node answers itself must go on for a user who is at the limit.
+	pub(super) fn charge(&self, user: &plan::User, up: bool, bytes: usize) {if let Some(rate) = user.speed[usize::from(!up)] {user.state.speed.force_at(user.state.speed.now(), up, rate, bytes)}}
 }
 
 /// A running engine. Its tasks live until the process exits and go on serving the config they have, and `shutdown` takes back what an l3 exit set up on the host. Dropping it does so too, without waiting for the l3 tasks to end.
@@ -860,7 +880,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (users, devices, writable) = usage::load(&path);
 		(users, devices, writable.then_some(path))
 	});
-	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER, proxy: None}).collect(), ..Plan::default()};
+	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER, proxy: None, speed: [None, None]}).collect(), ..Plan::default()};
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let mut shared = Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots);
 	shared.previews = upstream::Previews::new(options.upstream.clone());

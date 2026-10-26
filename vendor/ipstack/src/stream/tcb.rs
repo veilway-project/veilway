@@ -78,6 +78,10 @@ pub(crate) struct Tcb {
     ssthresh: u32,
     recover: SeqNum,
     recovering: bool,
+    // veilway patch: the bytes this stack has taken out of the receive buffer and the stream's reader has not read yet. Upstream
+    // counted none of them, so the window never closed on a reader that was slow: a peer sent as fast as it could and the stack
+    // held all of it in memory. They count against the receive window now, see `get_available_read_buffer_size`.
+    pub(super) queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Tcb {
@@ -117,6 +121,7 @@ impl Tcb {
             ssthresh: u32::MAX,
             recover: seq.into(),
             recovering: false,
+            queued: Default::default(),
         }
     }
 
@@ -201,7 +206,7 @@ impl Tcb {
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
-        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len())
+        self.read_buffer_size.saturating_sub(self.get_unordered_packets_total_len() + self.queued.load(std::sync::atomic::Ordering::Relaxed))
     }
     #[inline]
     pub(crate) fn get_unordered_packets_total_len(&self) -> usize {
