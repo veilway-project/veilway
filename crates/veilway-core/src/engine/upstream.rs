@@ -24,8 +24,8 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use veilway_engine::import::{self, Fetcher, ImportError, Library, RefreshFailed, Resolve, Reviewed, Trust, Vault};
 use veilway_transport::Hook;
-use veilway_engine::{Agree, Class, Event, Settings, StartError, State, Status, Store, Tunnel};
-use veilway_proto::control::ExitStatus;
+use veilway_engine::{Agree, Class, Event, Say, Settings, StartError, State, Status, Stop, Store, Tunnel};
+use veilway_proto::control::{ExitStatus, Period, Severity};
 use veilway_transport::choice;
 use veilway_proto::subscription::client::{Changes, Device, Failure, Held, Offer, Refreshed, Source, Stored};
 use veilway_proto::subscription::envelope::SigningKey;
@@ -59,6 +59,8 @@ pub const PREVIEW_TTL: Duration = Duration::from_secs(600);
 pub const PREVIEWS_MAX: usize = 4;
 /// The longest the provider is given to answer that a device left.
 pub const LEAVE_WAIT: Duration = Duration::from_secs(10);
+/// How long a profile that has not connected is given while the provider cannot be reached, before the next profile is tried (`failover`). A test sets it through `Hooks::profile_wait`.
+const PROFILE_WAIT: Duration = Duration::from_secs(120);
 
 /// How the node reaches a provider when the config names a `via` for the upstream: through the proxy chain of a `socks5` outbound, for the fetch and for the connections of the TCP transports (the datagram transports cannot go through it and are not used), or from the address or interface a `direct` outbound binds its sockets to.
 #[derive(Clone, PartialEq)]
@@ -81,6 +83,8 @@ pub struct Hooks {
 	pub refresh: Option<Duration>,
 	/// How long a preview waits for its config.
 	pub preview: Option<Duration>,
+	/// How long a profile that has not connected is given before `failover` moves on, in place of `PROFILE_WAIT`.
+	pub profile_wait: Option<Duration>,
 	#[cfg(feature = "upstream-tests")]
 	pub redirect: Option<veilway_engine::Redirect>,
 }
@@ -110,9 +114,37 @@ impl Phase {
 	}
 }
 
+/// An exit the provider offers, as the provider names it, cleaned for a person to read.
+#[derive(Clone, Debug)]
+pub struct ExitInfo {pub tag: String, pub name: String, pub country: Option<String>, pub all_protocols: bool, pub selected: bool}
+
+/// What the provider's control channel says about the account besides the bytes used and allowed.
+#[derive(Clone, Debug)]
+pub struct Account {pub period: &'static str, pub period_start: u64, pub expires_at: u64, pub up_bytes: u64, pub down_bytes: u64}
+
+/// A profile of the document held, and whether this node can use it now. Counts and words only, never an address.
+#[derive(Clone, Debug)]
+pub struct ProfileInfo {pub id: String, pub name: String, pub usable: bool, pub reason: String}
+
+/// What the config chooses, as the operator last set it. `exit` is the one asked of the provider now.
+#[derive(Clone, Debug, Default)]
+pub struct Chosen {pub profile: Option<String>, pub failover: bool, pub transport: Option<String>, pub exit: Option<String>}
+
 /// What the carrier of one upstream knows, for the status. Nothing in it is a key, a secret, a token or a link.
 #[derive(Clone, Debug)]
 pub struct Report {
+	/// The exits the provider offers, at most `OFFERED`.
+	pub exits: Vec<ExitInfo>,
+	pub account: Option<Account>,
+	/// Notices with the severity the provider gave them, as plain text.
+	pub notice_list: Vec<(&'static str, String)>,
+	/// What the tunnel itself says: `connecting`, `reconnecting`, `connected`, `stopped:<reason>` or `failed`. None while no tunnel exists.
+	pub engine_state: Option<String>,
+	pub connected_secs: Option<u64>,
+	/// The types of transport the profile in use lists.
+	pub transports: Vec<&'static str>,
+	pub profiles: Vec<ProfileInfo>,
+	pub choice: Chosen,
 	pub tag: String,
 	pub id: [u8; 16],
 	pub phase: Phase,
@@ -160,6 +192,15 @@ pub struct Report {
 }
 
 struct Live {
+	exits: Vec<ExitInfo>,
+	account: Option<Account>,
+	notice_list: Vec<(&'static str, String)>,
+	engine: Option<String>,
+	/// Since when the tunnel has been connected, None while it is not.
+	connected: Option<Instant>,
+	transports: Vec<&'static str>,
+	profiles: Vec<ProfileInfo>,
+	chosen: Chosen,
 	phase: Phase,
 	reason: String,
 	since: Instant,
@@ -191,6 +232,10 @@ struct Live {
 	hosts: Vec<String>,
 }
 
+/// The profiles of the document that ended in the round that runs (`failover`), and the one that carried last, which a round starts with when `profile` names none.
+#[derive(Default)]
+struct Round {failed: Vec<(String, String)>, last: Option<String>}
+
 /// What the node keeps of one upstream while it runs. It belongs to the upstream's tag, link and device, and a reload that keeps all three keeps it, with the tunnel it carries.
 pub struct UpstreamState {
 	pub tag: String,
@@ -209,6 +254,14 @@ pub struct UpstreamState {
 	wake: tokio::sync::Notify,
 	/// Woken when the operator confirms a move: the subscription is refreshed now, which tries the confirmed endpoint first.
 	refresh: tokio::sync::Notify,
+	/// What the engine remembers of each profile's transports and of the classes the operator allowed. One for every attempt and profile of this upstream, in memory only: nothing of it is written to the state file.
+	store: Arc<Store>,
+	/// The exit of the provider that is asked for now: the config's, until the operator switches it on the running upstream. `drive` reads it, so a switch needs no new tunnel.
+	wanted: Mutex<Option<String>>,
+	/// Woken when `wanted` changes.
+	switched: tokio::sync::Notify,
+	/// Profiles that failed in the round that runs, with why, and the one that carried last.
+	round: Mutex<Round>,
 	/// The subscription this upstream holds, shared by the task that runs it and by the operator's answers. Open once the task has first looked at the state file.
 	library: tokio::sync::Mutex<Option<Library>>,
 	live: Mutex<Live>,
@@ -225,8 +278,8 @@ impl UpstreamState {
 	/// A state for the upstream `tag`, whose link and device are bound by `bound` (see `UpstreamVault::bound`).
 	pub fn new(tag: &str, id: [u8; 16], bound: [u8; 32]) -> Arc<UpstreamState> {
 		let (out, inbox) = mpsc::channel(QUEUE);
-		let live = Live {phase: Phase::Fetching, reason: String::new(), since: Instant::now(), up: None, profile: None, transport: None, exit: None, offered: Vec::new(), notices: Vec::new(), usage: None, warned: false, chain: None, provider: None, signing_key: None, expires: None, attempted: Instant::now(), document_usage: None, refreshed: None, failing: None, refusal: None, unusable: false, moving: None, hosts: Vec::new()};
-		Arc::new(UpstreamState {tag: tag.to_owned(), id, bound, link: Arc::default(), mtu: AtomicU16::new(u16::MAX), addresses: RwLock::new(Arc::from(Vec::new())), gateways: RwLock::new(Arc::from(Vec::new())), out, inbox: tokio::sync::Mutex::new(inbox), wake: tokio::sync::Notify::new(), refresh: tokio::sync::Notify::new(), library: tokio::sync::Mutex::new(None), live: Mutex::new(live), sent: AtomicU64::new(0), unsent: AtomicU64::new(0), refused: AtomicU64::new(0), flips: AtomicU64::new(0), starts: AtomicU64::new(0), refreshes: AtomicU64::new(0), refresh_failures: AtomicU64::new(0)})
+		let live = Live {exits: Vec::new(), account: None, notice_list: Vec::new(), engine: None, connected: None, transports: Vec::new(), profiles: Vec::new(), chosen: Chosen::default(), phase: Phase::Fetching, reason: String::new(), since: Instant::now(), up: None, profile: None, transport: None, exit: None, offered: Vec::new(), notices: Vec::new(), usage: None, warned: false, chain: None, provider: None, signing_key: None, expires: None, attempted: Instant::now(), document_usage: None, refreshed: None, failing: None, refusal: None, unusable: false, moving: None, hosts: Vec::new()};
+		Arc::new(UpstreamState {tag: tag.to_owned(), id, bound, link: Arc::default(), mtu: AtomicU16::new(u16::MAX), addresses: RwLock::new(Arc::from(Vec::new())), gateways: RwLock::new(Arc::from(Vec::new())), out, inbox: tokio::sync::Mutex::new(inbox), wake: tokio::sync::Notify::new(), refresh: tokio::sync::Notify::new(), store: Arc::new(Store::volatile()), wanted: Mutex::new(None), switched: tokio::sync::Notify::new(), round: Mutex::default(), library: tokio::sync::Mutex::new(None), live: Mutex::new(live), sent: AtomicU64::new(0), unsent: AtomicU64::new(0), refused: AtomicU64::new(0), flips: AtomicU64::new(0), starts: AtomicU64::new(0), refreshes: AtomicU64::new(0), refresh_failures: AtomicU64::new(0)})
 	}
 
 	/// The hash of the link and the device the state was made for.
@@ -259,6 +312,25 @@ impl UpstreamState {
 	/// Asks the tunnel to connect again now: every mark, count and wait of the engine starts over. The operator's "try again"; nothing else asks it before the pace of `ASK_AGAIN`.
 	pub fn again(&self) {self.wake.notify_one()}
 
+	/// Takes what the config chooses, when its task starts: the profile, failover and transport it names, and the exit asked for.
+	fn choose(&self, config: &Upstream) {
+		self.live().chosen = Chosen {profile: config.profile.clone(), failover: config.failover == Some(true), transport: config.transport.clone(), exit: config.exit.clone()};
+		*self.wanted.lock().unwrap_or_else(|e| e.into_inner()) = config.exit.clone();
+	}
+
+	/// Asks for another exit of the provider on the running upstream. The carrier refuses what is routed to it until the provider says the new exit is the one in use.
+	pub fn want(&self, exit: Option<String>) {
+		let mut wanted = self.wanted.lock().unwrap_or_else(|e| e.into_inner());
+		if *wanted == exit {return}
+		tracing::info!("upstream {}: the exit of the provider is switched to {}", self.tag, exit.as_deref().map_or("its default".to_owned(), |exit| plain(exit, TAG_CHARS)));
+		self.live().chosen.exit = exit.clone();
+		*wanted = exit;
+		if self.live().phase == Phase::Up {self.change(Phase::Connecting, "switching to the exit that was asked for")}
+		self.switched.notify_one();
+	}
+
+	fn wanted(&self) -> Option<String> {self.wanted.lock().unwrap_or_else(|e| e.into_inner()).clone()}
+
 	/// What the proxy chain of `via` did on its last dial: `None` when it carried the connection, else the cause. Logged at info when it changes.
 	fn carried(&self, cause: Option<String>) {
 		let mut live = self.live();
@@ -277,7 +349,7 @@ impl UpstreamState {
 	pub fn report(&self) -> Report {
 		let live = self.live();
 		let mtu = self.mtu();
-		Report {tag: self.tag.clone(), id: self.id, phase: live.phase, reason: live.reason.clone(), since: live.since.elapsed(), profile: live.profile.clone(), transport: live.transport, exit: live.exit.clone(), offered: live.offered.clone(), notices: live.notices.clone(), usage: live.usage.or(live.document_usage), mtu: if mtu == u16::MAX {0} else {mtu}, sent: self.sent.load(Ordering::Relaxed), unsent: self.unsent.load(Ordering::Relaxed), refused: self.refused.load(Ordering::Relaxed), traffic: self.link.traffic.totals(), dropped: self.link.dropped.load(Ordering::Relaxed), flips: self.flips.load(Ordering::Relaxed), starts: self.starts.load(Ordering::Relaxed), provider: live.provider.clone(), signing_key: live.signing_key.clone(), expires_at: live.expires, refreshed_at: live.refreshed, refresh_error: live.failing.clone(), pending_move: live.moving.clone(), pending_hosts: live.hosts.clone(), refreshes: self.refreshes.load(Ordering::Relaxed), refresh_failures: self.refresh_failures.load(Ordering::Relaxed)}
+		Report {exits: live.exits.clone(), account: live.account.clone(), notice_list: live.notice_list.clone(), engine_state: live.engine.clone(), connected_secs: live.connected.map(|since| since.elapsed().as_secs()), transports: live.transports.clone(), profiles: live.profiles.clone(), choice: live.chosen.clone(), tag: self.tag.clone(), id: self.id, phase: live.phase, reason: live.reason.clone(), since: live.since.elapsed(), profile: live.profile.clone(), transport: live.transport, exit: live.exit.clone(), offered: live.offered.clone(), notices: live.notices.clone(), usage: live.usage.or(live.document_usage), mtu: if mtu == u16::MAX {0} else {mtu}, sent: self.sent.load(Ordering::Relaxed), unsent: self.unsent.load(Ordering::Relaxed), refused: self.refused.load(Ordering::Relaxed), traffic: self.link.traffic.totals(), dropped: self.link.dropped.load(Ordering::Relaxed), flips: self.flips.load(Ordering::Relaxed), starts: self.starts.load(Ordering::Relaxed), provider: live.provider.clone(), signing_key: live.signing_key.clone(), expires_at: live.expires, refreshed_at: live.refreshed, refresh_error: live.failing.clone(), pending_move: live.moving.clone(), pending_hosts: live.hosts.clone(), refreshes: self.refreshes.load(Ordering::Relaxed), refresh_failures: self.refresh_failures.load(Ordering::Relaxed)}
 	}
 
 	/// Moves to `phase` for `reason`, and says so when either changed. Packets are taken in `Phase::Up` alone.
@@ -303,7 +375,19 @@ impl UpstreamState {
 		*self.addresses.write().unwrap_or_else(|e| e.into_inner()) = profile.device.addresses.clone().into();
 		*self.gateways.write().unwrap_or_else(|e| e.into_inner()) = profile.gateways.clone().into();
 		self.mtu.store(profile.mtu, Ordering::Relaxed);
-		self.live().profile = Some(profile.id.clone());
+		let mut live = self.live();
+		live.profile = Some(profile.id.clone());
+		live.transports = profile.transports.iter().map(Transport::name).fold(Vec::new(), |mut names, name| {
+			if !names.contains(&name) {names.push(name)}
+			names
+		});
+	}
+
+	/// A profile carried: the round that ran ends, and a round starts with this profile.
+	fn settled(&self, profile: &str) {
+		let mut round = self.round.lock().unwrap_or_else(|e| e.into_inner());
+		round.failed.clear();
+		round.last = Some(profile.to_owned());
 	}
 
 	/// Takes the MTU the engine found when it is lower than the one in force and inside the bounds, and says so.
@@ -433,6 +517,8 @@ enum Ended {
 	Held,
 	/// A refresh changed what the tunnel was made from: it is made again at once, after the checks of a start.
 	Changed,
+	/// `failover` gives the profile up for the reason given: the next profile is tried after a short wait, and no failure is counted until every profile has failed in turn.
+	Next(String),
 }
 
 /// What a refresh task hands back: what the new document changed or why it failed (and whether the provider refused), and the document held then.
@@ -473,6 +559,7 @@ pub(super) fn run(shared: &Arc<Shared>, config: Upstream, reach: Option<Reach>, 
 async fn carry(shared: Arc<Shared>, config: Upstream, reach: Option<Reach>, state: Arc<UpstreamState>, vault: UpstreamVault, hooks: Hooks) {
 	// Held for as long as the task lives: a task that replaces this one finds the queue free.
 	let mut inbox = state.inbox.lock().await;
+	state.choose(&config);
 	let (mut failed, mut held_since) = (0u32, None::<Instant>);
 	loop {
 		state.starts.fetch_add(1, Ordering::Relaxed);
@@ -480,6 +567,11 @@ async fn carry(shared: Arc<Shared>, config: Upstream, reach: Option<Reach>, stat
 		let mut jitter = [0u8; 1];
 		let _ = random(&mut jitter);
 		let wait = match ended {
+			Ended::Next(reason) => {
+				tracing::debug!("upstream {}: the next profile is tried after: {reason}", state.tag);
+				held_since = None;
+				hooks.retry.unwrap_or_else(|| choice::connection_wait(&mut random).unwrap_or(Duration::from_secs(1)))
+			}
 			Ended::Changed => {
 				(failed, held_since) = (0, None);
 				Duration::ZERO
@@ -553,34 +645,58 @@ async fn attempt(shared: &Arc<Shared>, config: &Upstream, reach: Option<&Reach>,
 	state.change(Phase::Connecting, "choosing a profile");
 	let plan = shared.plan();
 	let (allow_private, mut last) = (config.allow_private == Some(true), String::from("the document has no profile"));
-	let (store, allowed) = (Arc::new(Store::volatile()), std::iter::once(Class::Cover).chain(config.allow.iter().map(|allowed| class(*allowed))).collect::<Vec<_>>());
+	let (store, allowed) = (state.store.clone(), std::iter::once(Class::Cover).chain(config.allow.iter().map(|allowed| class(*allowed))).collect::<Vec<_>>());
 	let clock = shared.clone();
 	let mut settings = Settings::new(store.clone(), Arc::new(move || (clock.now)().unix_timestamp().max(0) as u64), shared.roots.clone(), "node".into());
 	(settings.socket, settings.connect) = (fetcher.socket.clone(), fetcher.connect.clone());
+	settings.only = config.transport.clone();
 	settings.networks = plan.pools.iter().filter_map(|(pool, _)| Network::new(pool.network(), pool.prefix_len())).collect();
 	#[cfg(feature = "upstream-tests")]
 	if let Some(redirect) = &hooks.redirect {settings = settings.with_redirect(redirect.clone())}
 	let Ok(permit) = held.connect(now()) else {return fail("the document is out of date, and the provider has not answered with a newer one".into())};
-	for profile in held.subscription().profiles.iter().filter(|profile| config.profile.as_deref().is_none_or(|wanted| profile.id == wanted)) {
-		if let Err(reason) = dialable(profile, &plan.pools, shared.is_local, allow_private) {
-			last = reason;
+	// Without a `profile`, or with `failover`, every profile is tried: the named one first, else the one that carried last, then the rest in the document's order. Whatever the config says, every profile passes the same checks before the engine sees it.
+	let wide = config.profile.is_none() || config.failover == Some(true);
+	let (failed, carried) = {
+		let round = state.round.lock().unwrap_or_else(|e| e.into_inner());
+		(round.failed.clone(), round.last.clone())
+	};
+	let mut order: Vec<&Profile> = held.subscription().profiles.iter().collect();
+	if let Some(at) = config.profile.as_ref().or(carried.as_ref()).and_then(|first| order.iter().position(|profile| profile.id == *first)) {order[..=at].rotate_right(1)}
+	let free = |profile: &Profile| wide || config.profile.as_deref() == Some(profile.id.as_str());
+	let checked: Vec<(&Profile, Option<String>)> = order.into_iter().map(|profile| {
+		let listed: Vec<&Transport> = profile.transports.iter().filter(|transport| config.transport.as_deref().is_none_or(|only| transport.name() == only)).collect();
+		let best = listed.iter().filter(|transport| choice::usable(transport, false)).map(|transport| choice::class(transport)).min();
+		let refused = if !free(profile) {Some("the config names another profile".to_owned())}
+		else if let Err(reason) = dialable(profile, &plan.pools, shared.is_local, allow_private) {Some(reason)}
+		else if config.transport.is_some() && best.is_none() {Some("the profile lists no transport of the type the config chose".to_owned())}
+		else if settings.connect.is_some() && listed.iter().all(|transport| matches!(transport, Transport::Udp(_) | Transport::UdpObfs(_))) {Some("the profile lists only datagram transports, which cannot go through the proxy chain of `via`".to_owned())}
+		else if best.is_some_and(|best| !allowed.contains(&best)) {Some("the best way of connecting the profile lists is one the operator did not allow".to_owned())}
+		else {None};
+		(profile, refused)
+	}).collect();
+	// With one profile to use there is nothing to give way to: the engine's own waits and tries are all there is.
+	let failover = wide && checked.iter().filter(|(_, refused)| refused.is_none()).count() > 1;
+	state.live().profiles = checked.iter().map(|(profile, refused)| {
+		let gone = failed.iter().find(|(id, _)| *id == profile.id);
+		ProfileInfo {id: plain(&profile.id, TAG_CHARS), name: plain(profile.name.as_str(), PROVIDER_CHARS), usable: refused.is_none() && gone.is_none(), reason: refused.clone().or(gone.map(|(_, reason)| format!("it did not connect: {reason}"))).unwrap_or_default()}
+	}).collect();
+	for (profile, refused) in &checked {
+		if let Some(reason) = refused {
+			if free(profile) {last = reason.clone()}
 			continue;
 		}
-		if settings.connect.is_some() && profile.transports.iter().all(|transport| matches!(transport, Transport::Udp(_) | Transport::UdpObfs(_))) {
-			last = "the profile lists only datagram transports, which cannot go through the proxy chain of `via`".into();
-			continue;
-		}
-		let best = profile.transports.iter().filter(|transport| choice::usable(transport, false)).map(choice::class).min();
-		if best.is_some_and(|best| !allowed.contains(&best)) {
-			last = "the best way of connecting the profile lists is one the operator did not allow".into();
-			continue;
-		}
+		if failed.iter().any(|(id, _)| *id == profile.id) {continue}
 		let key = veilway_engine::store::profile_key(held.id().as_str(), &profile.id);
 		for each in [Class::Cover, Class::NoCover, Class::Exposed, Class::Plain] {if allowed.contains(&each) {store.agree(&key, each)} else {store.decline(&key, each)}}
 		match Tunnel::start(settings.clone(), &held, &profile.id, &permit, Agree {private: allow_private, unsafe_profile: false}) {
-			Ok(tunnel) => return drive(shared, config, state, tunnel, profile, inbox, &fetcher, &held, hooks).await,
+			Ok(tunnel) => return drive(shared, state, tunnel, profile, failover, inbox, &fetcher, &held, hooks).await,
 			Err(error) => last = why(&error).into(),
 		}
+	}
+	// Every profile has failed in turn: the round is over, and the wait of a failure that did not carry applies before a new one starts.
+	if !failed.is_empty() {
+		state.round.lock().unwrap_or_else(|e| e.into_inner()).failed.clear();
+		return fail(format!("every profile of the document failed in turn, the last for this reason: {}", failed.last().map_or("none", |(_, reason)| reason.as_str())));
 	}
 	// Nothing in the document can be started: only a newer one may change that, so the next start refreshes first, and waits as a refusal does.
 	state.live().unusable = true;
@@ -630,15 +746,16 @@ async fn refresh(shared: Arc<Shared>, state: Arc<UpstreamState>, fetcher: Fetche
 	Some((state.learned(library, now(), result), library.held().first().cloned()))
 }
 
-/// What the task asks of the tunnel and when: the exit of the provider the config names is asked for once for each connection, and again when the answer was no and `ASK_AGAIN` has passed.
-struct Pace {asked: Option<Instant>, idle: Option<Instant>}
+/// What the task asks of the tunnel and when: the exit of the provider the config names is asked for once for each connection, and again when the answer was no and `ASK_AGAIN` has passed. `clearing` is set when the operator switched back to the provider's default exit, and holds the carrier down until the provider has dropped this device's selection.
+struct Pace {asked: Option<Instant>, idle: Option<Instant>, clearing: bool}
 
-/// Runs the tunnel of `profile`, carrying packets both ways and refreshing the document, until it ends. Dropping the tunnel ends its session.
+/// Runs the tunnel of `profile`, carrying packets both ways and refreshing the document, until it ends. Dropping the tunnel ends its session. With `failover` it also ends, as `Ended::Next`, when the profile cannot be used: the tunnel failed, the provider could not be reached for `PROFILE_WAIT` (or `Hooks::profile_wait`) without a connection, or the exit that is asked for is not one this profile offers. Never because the device is offline or the provider stopped the account on purpose.
 #[allow(clippy::too_many_arguments)]
-async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamState>, mut tunnel: Tunnel, profile: &Profile, inbox: &mut mpsc::Receiver<Vec<u8>>, fetcher: &Fetcher, held: &Held, hooks: &Hooks) -> Ended {
+async fn drive(shared: &Arc<Shared>, state: &Arc<UpstreamState>, mut tunnel: Tunnel, profile: &Profile, failover: bool, inbox: &mut mpsc::Receiver<Vec<u8>>, fetcher: &Fetcher, held: &Held, hooks: &Hooks) -> Ended {
 	state.profile(profile);
 	let (started, mut carried, mut held) = (Instant::now(), false, held.clone());
-	let (mut status, mut events, mut tick, mut pace) = (tunnel.watch(), tunnel.events(), tokio::time::interval(Duration::from_secs(1)), Pace {asked: None, idle: None});
+	let mut unconnected = Instant::now();
+	let (mut status, mut events, mut tick, mut pace) = (tunnel.watch(), tunnel.events(), tokio::time::interval(Duration::from_secs(1)), Pace {asked: None, idle: None, clearing: false});
 	// Ends with this function, and takes a refresh that is still waiting for the provider with it.
 	let (mut refreshing, mut jitter) = (tokio::task::JoinSet::<Option<Done>>::new(), [0u8; 1]);
 	let _ = random(&mut jitter);
@@ -659,15 +776,25 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 			changed = status.changed() => {
 				if changed.is_err() {break}
 				let now = status.borrow_and_update().clone();
-				judge(config, state, &tunnel, &now, profile, &mut pace);
-				carried |= state.up();
+				judge(state, &tunnel, &now, profile, &mut pace);
+				if state.up() && !std::mem::replace(&mut carried, true) {state.settled(&profile.id)}
 			}
 			event = events.recv() => {
 				// A provider that refuses the exit the config names is not asked again until the pace has passed.
-				if let (Ok(Event::Exit {status: ExitStatus::Refused, ..}), Some(wanted)) = (event, config.exit.as_deref()) {
-					state.down(format!("the provider refused the exit {}", plain(wanted, TAG_CHARS)));
+				if let Ok(Event::Exit {status: ExitStatus::Refused, ..}) = event {
+					match state.wanted() {
+						Some(wanted) => state.down(format!("the provider refused the exit {}", plain(&wanted, TAG_CHARS))),
+						None if pace.clearing => state.down("the provider did not return this device to its default exit"),
+						None => continue,
+					}
 					pace.asked = Some(Instant::now());
 				}
+			}
+			_ = state.switched.notified() => {
+				// The exit asked for is another one: nothing is carried until the provider says it is in use.
+				(pace.asked, pace.clearing) = (None, state.wanted().is_none());
+				let now = status.borrow().clone();
+				judge(state, &tunnel, &now, profile, &mut pace);
 			}
 			_ = state.wake.notified() => {
 				tracing::info!("upstream {}: the tunnel is asked to connect again by the operator", state.tag);
@@ -712,8 +839,22 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 					tunnel.connect_again();
 				}
 				if pace.asked.is_some_and(|at| at.elapsed() >= ASK_AGAIN) {pace.asked = None}
-				judge(config, state, &tunnel, &now, profile, &mut pace);
-				carried |= state.up();
+				let missing = judge(state, &tunnel, &now, profile, &mut pace);
+				if state.up() && !std::mem::replace(&mut carried, true) {state.settled(&profile.id)}
+				if matches!(now.state, State::Connected {..}) {unconnected = Instant::now()}
+				if failover {
+					let unreachable = matches!(now.say, Some(Say::Unreachable | Say::Silence | Say::Refused | Say::Answered | Say::CertificateMismatch | Say::CertificateTime | Say::PathTooSmall | Say::NothingToTry | Say::BudgetSpent));
+					let reason = if missing {Some("the profile does not offer the exit that is asked for".to_owned())}
+					else if now.state == State::Failed && now.say != Some(Say::Offline) {Some(now.say.map_or("nothing can be done until the connection is asked for again", |say| say.text()).to_owned())}
+					else if unreachable && unconnected.elapsed() >= hooks.profile_wait.unwrap_or(PROFILE_WAIT) {now.say.map(|say| say.text().to_owned())}
+					else {None};
+					if let Some(reason) = reason {
+						state.down(format!("the profile {} cannot be used, so the next one is tried: {reason}", plain(&profile.id, TAG_CHARS)));
+						state.round.lock().unwrap_or_else(|e| e.into_inner()).failed.push((plain(&profile.id, TAG_CHARS), reason.clone()));
+						state.live().engine = None;
+						return Ended::Next(reason);
+					}
+				}
 				let since_refresh = state.live().attempted.elapsed();
 				if refreshing.is_empty() && since_refresh >= hooks.refresh.unwrap_or_else(|| refresh_wait(held.subscription().update_interval, state.down_for(), jitter[0])) {refreshing.spawn(refresh(shared.clone(), state.clone(), fetcher.clone()));}
 				if held.connect((shared.now)().unix_timestamp().max(0) as u64).is_err() {
@@ -724,11 +865,23 @@ async fn drive(shared: &Arc<Shared>, config: &Upstream, state: &Arc<UpstreamStat
 		}
 	}
 	state.down("the tunnel ended");
+	{let mut live = state.live(); (live.engine, live.connected) = (None, None);}
 	Ended::Lost(carried.then(|| started.elapsed()))
 }
 
-/// Judges the status of the tunnel: whether the carrier is up, and what the status says besides.
-fn judge(config: &Upstream, state: &Arc<UpstreamState>, tunnel: &Tunnel, status: &Status, profile: &Profile, pace: &mut Pace) {
+/// Judges the status of the tunnel: whether the carrier is up, and what the status says besides. True when the exit that is asked for is not one the provider offers.
+fn judge(state: &Arc<UpstreamState>, tunnel: &Tunnel, status: &Status, profile: &Profile, pace: &mut Pace) -> bool {
+	{
+		let mut live = state.live();
+		live.engine = Some(match &status.state {
+			State::Off | State::Connecting {..} => "connecting".to_owned(),
+			State::Reconnecting {..} => "reconnecting".to_owned(),
+			State::Connected {..} => "connected".to_owned(),
+			State::Stopped {reason, ..} => format!("stopped:{}", match reason {Stop::Quota => "quota", Stop::Expired => "expired", Stop::Disabled => "disabled", Stop::NodeStopping => "node-stopping"}),
+			State::Failed => "failed".to_owned(),
+		});
+		live.connected = if matches!(status.state, State::Connected {..}) {live.connected.or(Some(Instant::now()))} else {None};
+	}
 	if !matches!(status.state, State::Connected {..}) {
 		pace.asked = None;
 		match &status.state {
@@ -736,44 +889,66 @@ fn judge(config: &Upstream, state: &Arc<UpstreamState>, tunnel: &Tunnel, status:
 			State::Failed => state.down(status.say.map_or("nothing can be done until the connection is asked for again".to_owned(), |say| say.text().to_owned())),
 			_ => state.change(Phase::Connecting, status.say.map_or(String::new(), |say| say.text().to_owned())),
 		}
-		return;
+		return false;
 	}
 	state.lower(status.mtu, profile.mtu);
 	{
 		let mut live = state.live();
 		live.offered = status.exits.iter().take(OFFERED).map(|exit| plain(&exit.tag, TAG_CHARS)).collect();
+		live.exits = status.exits.iter().take(OFFERED).map(|exit| ExitInfo {tag: plain(&exit.tag, TAG_CHARS), name: plain(&exit.name, PROVIDER_CHARS), country: exit.country.filter(|code| code.iter().all(u8::is_ascii_uppercase)).map(|code| code.iter().map(|letter| char::from(*letter)).collect()), all_protocols: exit.all_protocols, selected: exit.selected}).collect();
+		live.account = status.usage.map(|usage| Account {period: match usage.period {Period::None => "none", Period::Daily => "daily", Period::Weekly => "weekly", Period::Monthly => "monthly"}, period_start: usage.period_start, expires_at: usage.expires_at, up_bytes: usage.up_bytes, down_bytes: usage.down_bytes});
 		live.notices = status.notices.iter().take(NOTICES).map(|notice| plain(&notice.text, NOTICE_CHARS)).collect();
+		live.notice_list = status.notices.iter().take(NOTICES).map(|notice| (match notice.severity {Severity::Information => "information", Severity::Warning => "warning"}, plain(&notice.text, NOTICE_CHARS))).collect();
 		live.usage = status.usage.map(|usage| (usage.used_bytes, usage.quota_bytes));
 		live.transport = status.connection.as_ref().map(|connection| connection.transport);
 		let nearly = status.usage.is_some_and(|usage| usage.quota_bytes > 0 && usage.used_bytes.saturating_mul(10) >= usage.quota_bytes.saturating_mul(9));
 		if nearly && !live.warned {tracing::warn!("upstream {}: 90% of the data the provider allows this device is used", state.tag)}
 		live.warned = nearly;
 	}
-	let Some(wanted) = config.exit.as_deref() else {
+	let Some(wanted) = state.wanted() else {
+		if pace.clearing {
+			if status.exits.iter().any(|exit| exit.selected) {
+				if pace.asked.is_none() {
+					tunnel.select_exit(None);
+					pace.asked = Some(Instant::now());
+				}
+				state.change(Phase::Connecting, "returning to the provider's default exit");
+				return false;
+			}
+			pace.clearing = false;
+		}
 		let shown = status.exits.iter().find(|exit| exit.selected || exit.configured).map(|exit| plain(&exit.tag, TAG_CHARS));
 		{
 			let mut live = state.live();
 			if shown.is_some() && live.exit != shown {tracing::info!("upstream {}: the exit of the provider in use is {}", state.tag, shown.as_deref().unwrap_or_default())}
 			live.exit = shown;
 		}
-		return state.change(Phase::Up, "");
+		state.change(Phase::Up, "");
+		return false;
 	};
 	// The exit the config names, or nothing: the provider's own default is never an answer. Until the provider has said which exits it offers, and until it says this one is in use, the carrier is down.
-	if !status.control || status.exits.is_empty() {return state.change(Phase::Connecting, "waiting for the exits the provider offers")}
+	if !status.control || status.exits.is_empty() {
+		state.change(Phase::Connecting, "waiting for the exits the provider offers");
+		return false;
+	}
 	match status.exits.iter().find(|exit| exit.tag == wanted) {
-		None => state.down(format!("the provider does not offer the exit {}", plain(wanted, TAG_CHARS))),
+		None => {
+			state.down(format!("the provider does not offer the exit {}", plain(&wanted, TAG_CHARS)));
+			return true;
+		}
 		Some(exit) if exit.selected => {
-			state.live().exit = Some(plain(wanted, TAG_CHARS));
+			state.live().exit = Some(plain(&wanted, TAG_CHARS));
 			state.change(Phase::Up, "");
 		}
 		Some(_) => {
 			if pace.asked.is_none() {
-				tunnel.select_exit(Some(wanted.to_owned()));
+				tunnel.select_exit(Some(wanted.clone()));
 				pace.asked = Some(Instant::now());
 			}
-			state.change(Phase::Connecting, format!("asking the provider for the exit {}", plain(wanted, TAG_CHARS)));
+			state.change(Phase::Connecting, format!("asking the provider for the exit {}", plain(&wanted, TAG_CHARS)));
 		}
 	}
+	false
 }
 
 /// An empty vault: what the review of a document is made against, since the document is kept nowhere until a config names it.

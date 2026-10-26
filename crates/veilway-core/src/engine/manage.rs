@@ -399,7 +399,7 @@ impl Shared {
 		let path = |byte: u8| byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte);
 		let query = |byte: u8| byte.is_ascii_alphanumeric() || b"-._~=&%+,".contains(&byte);
 		let header = |byte: u8| (0x20..0x7f).contains(&byte);
-		if !["GET", "PUT", "POST", "DELETE"].contains(&request.method.as_str()) || !request.path.starts_with('/') || request.path.split('/').skip(1).any(|segment| segment.is_empty() || segment == "." || segment == "..") || !valid(&request.path, path, 512) || request.query.as_deref().is_some_and(|text| !valid(text, query, 256)) || [&request.if_match, &request.content_type].into_iter().flatten().any(|text| !valid(text, header, 256)) || request.body.len() > BODY {return Err(Error::BadRequest)}
+		if !["GET", "PUT", "POST", "DELETE", "PATCH"].contains(&request.method.as_str()) || !request.path.starts_with('/') || request.path.split('/').skip(1).any(|segment| segment.is_empty() || segment == "." || segment == "..") || !valid(&request.path, path, 512) || request.query.as_deref().is_some_and(|text| !valid(text, query, 256)) || [&request.if_match, &request.content_type].into_iter().flatten().any(|text| !valid(text, header, 256)) || request.body.len() > BODY {return Err(Error::BadRequest)}
 		let plan = self.plan();
 		let Some(at) = plan.links.iter().position(|link| matches!(link.carrier, Carrier::Paired) && link.tag == tag) else {return Err(Error::NoLink)};
 		let of = &plan.links[at];

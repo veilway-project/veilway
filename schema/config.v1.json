@@ -2722,6 +2722,10 @@
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
           "type": "string"
         },
+        "failover": {
+          "description": "Whether the node goes on to the other profiles of the document when `profile` is unreachable or cannot be used. Defaults to false: a `profile` that is named is the only one used. Without a `profile` every profile is tried whatever this says.",
+          "type": "boolean"
+        },
         "link": {
           "description": "A native `veilway://sub/` link of the provider. It holds the account's token, so it is a secret. Carried, file, legacy and plain links are not accepted.",
           "maxLength": 2048,
@@ -2732,7 +2736,7 @@
           "description": "The WireGuard private key this node made for its device with the provider."
         },
         "profile": {
-          "description": "The profile of the provider's document to use. Without it the first one.",
+          "description": "The profile of the provider's document to use. Without it every profile is tried in the document's order, starting with the last one that carried (automatic).",
           "not": {
             "enum": [
               "all",
@@ -2768,6 +2772,11 @@
             ]
           },
           "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+          "type": "string"
+        },
+        "transport": {
+          "description": "The type of transport to connect over, one of `udp`, `udp-obfs`, `tls`, `ws`, `ws-plain`, `fronted`, `fronted-shaped`. Without it the engine picks from every transport of the profile, as the apps do (automatic). A transport of a class that `allow` does not list is refused.",
+          "maxLength": 16,
           "type": "string"
         },
         "via": {

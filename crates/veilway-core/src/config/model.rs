@@ -1947,10 +1947,17 @@ pub struct Upstream {
 	/// The device secret this node made for its device with the provider: 16 bytes as 22 characters of base64url, as a link's token is written.
 	#[schemars(pattern("^[A-Za-z0-9_-]{22}$"))]
 	pub device_secret: Secret<String>,
-	/// The profile of the provider's document to use. Without it the first one.
+	/// The profile of the provider's document to use. Without it every profile is tried in the document's order, starting with the last one that carried (automatic).
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(pattern(TAG_PATTERN))]
 	pub profile: Option<String>,
+	/// Whether the node goes on to the other profiles of the document when `profile` is unreachable or cannot be used. Defaults to false: a `profile` that is named is the only one used. Without a `profile` every profile is tried whatever this says.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub failover: Option<bool>,
+	/// The type of transport to connect over, one of `udp`, `udp-obfs`, `tls`, `ws`, `ws-plain`, `fronted`, `fronted-shaped`. Without it the engine picks from every transport of the profile, as the apps do (automatic). A transport of a class that `allow` does not list is refused.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	#[schemars(length(max = 16))]
+	pub transport: Option<String>,
 	/// The tag of the provider's exit to leave through. Without it the provider's default.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[schemars(pattern(TAG_PATTERN))]

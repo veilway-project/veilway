@@ -2779,8 +2779,27 @@
       "Upstream": {
         "description": "What the node is doing for one upstream. Nothing in it is a key, a secret, a token or the link.",
         "properties": {
+          "choice": {
+            "$ref": "#/components/schemas/UpstreamChoiceState"
+          },
+          "connected_secs": {
+            "description": "Seconds the tunnel has been connected. Null while it is not.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "counters": {
             "$ref": "#/components/schemas/UpstreamCounters"
+          },
+          "engine_state": {
+            "description": "What the tunnel itself says: connecting, reconnecting, connected, stopped:<reason> (quota, expired, disabled or node-stopping) or failed. Null while no tunnel exists.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "exit": {
             "description": "The exit of the provider in use, and the exits it offers.",
@@ -2788,6 +2807,13 @@
               "string",
               "null"
             ]
+          },
+          "exits": {
+            "description": "The exits the provider offers, at most 16, once the control channel is open.",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamExitState"
+            },
+            "type": "array"
           },
           "expires_at": {
             "description": "When the document stops being current and when it was last refreshed, in Unix seconds.",
@@ -2840,11 +2866,25 @@
               "null"
             ]
           },
+          "profiles": {
+            "description": "Every profile of the document held, in the order they are tried, and whether each is usable.",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamProfileState"
+            },
+            "type": "array"
+          },
           "provider": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "provider_notices": {
+            "description": "The same notices with the severity the provider gave them.",
+            "items": {
+              "$ref": "#/components/schemas/UpstreamNotice"
+            },
+            "type": "array"
           },
           "quota": {
             "anyOf": [
@@ -2902,6 +2942,13 @@
                 "type": "null"
               }
             ]
+          },
+          "transports": {
+            "description": "The types of transport the profile in use lists.",
+            "items": {
+              "$ref": "#/components/schemas/Transport"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -2915,8 +2962,15 @@
           "transport",
           "exit",
           "offered_exits",
+          "exits",
           "notices",
+          "provider_notices",
           "quota",
+          "engine_state",
+          "connected_secs",
+          "transports",
+          "profiles",
+          "choice",
           "expires_at",
           "refreshed_at",
           "refresh_error",
@@ -2924,6 +2978,101 @@
           "pending_move",
           "pending_hosts",
           "counters"
+        ],
+        "type": "object"
+      },
+      "UpstreamChoice": {
+        "additionalProperties": false,
+        "description": "What to choose on an upstream. A field that is left out stays as it is, and null is automatic. The change goes through the same checks and the same apply as a config document does, and is written to the config file. Only the exit is taken on the running tunnel; any other field makes the tunnel again.",
+        "properties": {
+          "exit": {
+            "description": "The tag of the provider's exit to leave through. Null: the provider's default.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failover": {
+            "description": "Whether the other profiles are tried when the named one cannot be used. Null is false.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "profile": {
+            "description": "The profile of the provider's document to use. Null: every profile is tried in the document's order, starting with the last one that carried.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transport": {
+            "description": "The type of transport to connect over: udp, udp-obfs, tls, ws, ws-plain, fronted or fronted-shaped. Null: the engine picks from every transport of the profile.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpstreamChoiceState": {
+        "description": "What the config chooses on an upstream: null is automatic.",
+        "properties": {
+          "exit": {
+            "description": "The exit of the provider that is asked for now, which may be one the operator just switched to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "failover": {
+            "type": "boolean"
+          },
+          "profile": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transport": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "failover",
+          "transport",
+          "exit"
+        ],
+        "type": "object"
+      },
+      "UpstreamChosen": {
+        "description": "What a choice on an upstream came to: the config now in force, and whether only the exit changed, so that the tunnel was kept and asked for the other exit.",
+        "properties": {
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "live": {
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "string"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "revision",
+          "generation",
+          "live"
         ],
         "type": "object"
       },
@@ -3073,6 +3222,64 @@
           "name"
         ],
         "type": "object"
+      },
+      "UpstreamExitState": {
+        "description": "An exit the provider offers, with its name as plain text.",
+        "properties": {
+          "all_protocols": {
+            "type": "boolean"
+          },
+          "country": {
+            "description": "Two uppercase letters.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "selected": {
+            "description": "This node's device has this exit selected at the provider.",
+            "type": "boolean"
+          },
+          "tag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "tag",
+          "name",
+          "country",
+          "all_protocols",
+          "selected"
+        ],
+        "type": "object"
+      },
+      "UpstreamNotice": {
+        "description": "A notice of the provider, as plain text.",
+        "properties": {
+          "severity": {
+            "$ref": "#/components/schemas/UpstreamSeverity"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "text"
+        ],
+        "type": "object"
+      },
+      "UpstreamPeriod": {
+        "enum": [
+          "none",
+          "daily",
+          "weekly",
+          "monthly"
+        ],
+        "type": "string"
       },
       "UpstreamPreview": {
         "description": "The answer to a preview: the document the provider sent, verified under the key of the link, as the operator reads it before saying yes. Fetching it took a place at the provider. The place is given back when the preview is declined or runs out, and made permanent by the config that names the same link and device within `expires_in_secs`.",
@@ -3267,13 +3474,79 @@
         ],
         "type": "object"
       },
+      "UpstreamProfileState": {
+        "description": "A profile of the provider's document and whether this node can use it now. Never an address.",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Plain words for why not. Empty when it is usable.",
+            "type": "string"
+          },
+          "usable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "usable",
+          "reason"
+        ],
+        "type": "object"
+      },
       "UpstreamQuota": {
         "description": "What the provider says an account has used and has. A quota of 0 is none.",
         "properties": {
+          "account_expires_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "down_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "period": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamPeriod"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the provider's control channel says besides, once it is open: how often the quota starts over, when the period began and the account ends (Unix seconds), and the bytes of the device's own traffic, up and down."
+          },
+          "period_start": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "quota_bytes": {
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "up_bytes": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "used_bytes": {
             "format": "uint64",
@@ -3314,6 +3587,13 @@
           "tag"
         ],
         "type": "object"
+      },
+      "UpstreamSeverity": {
+        "enum": [
+          "information",
+          "warning"
+        ],
+        "type": "string"
       },
       "UpstreamStatus": {
         "enum": [
@@ -4231,6 +4511,109 @@
         },
         "summary": "Calls one route of the control API of the node at the other end of the node link `tag`, which must have manage peer here, through the link: GET. Only the routes a managed node serves are carried (status, config, validate and diff, users, usage reset, stats, sessions, exits, inbounds, links, the upstream routes and the replay reset), and only the method, the path with its query, If-Match and Content-Type go to the other node, and only the status, ETag and Content-Type come back. The body of a successful call is the other node's answer, as it gave it."
       },
+      "patch": {
+        "operationId": "relayPatch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "The body of the call to the other node, as the call takes it, up to 4 MiB. It is forwarded as it is, and the other node reads it.",
+                "type": "object"
+              }
+            }
+          },
+          "required": false
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": true
+              }
+            },
+            "description": "The answer."
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream."
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it."
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1."
+          }
+        },
+        "summary": "The same call with PATCH, which is how the choice on an upstream is changed."
+      },
       "post": {
         "operationId": "relayPost",
         "parameters": [
@@ -4935,6 +5318,122 @@
           }
         },
         "summary": "Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. When it did not, the document stays in the state file and the same call again tells the provider again; the answer is 404 only when the running config has no such upstream, so a removal that was not confirmed can be retried while the config still names it. The upstream stops, and a config that still names it does not start it again, not even after a restart (a tombstone in the state file keeps it down until a config that no longer names it that way has been in force); apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything."
+      },
+      "patch": {
+        "operationId": "chooseUpstream",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "tag",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpstreamChoice"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamChosen"
+                }
+              }
+            },
+            "description": "The answer."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not one JSON document, or could not be read to its end."
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config has no upstream of that tag. Nothing was changed."
+          },
+          "408": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not read within 30 seconds. Nothing was changed: once the node has begun to apply the choice, the answer waits for it and is never this one."
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The running config changed twice while the choice was made. Nothing was changed."
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is larger than 4 MiB."
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body was not sent as application/json."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The body is not what a choice takes, or the config with the choice does not validate (the problems name the fields), or the node could not prepare it. Nothing was changed."
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            },
+            "description": "The node already serves as many connections, or as many event streams, as it takes at once."
+          }
+        },
+        "summary": "Changes what the config chooses on an upstream: the profile (null: every profile in turn), failover to the other profiles, the transport (null: automatic) and the exit of the provider. A field that is left out stays. It goes through the same checks and the same apply as a config document, at the revision that runs now (read again once if it moved), and is written to the config file. When only the exit changed the running tunnel is kept and asked for the other exit, and nothing leaves through the old one meanwhile (live: true). The link, the keys, allow, allow_private and via are never changed by it."
       }
     },
     "/v1/upstreams/{tag}/confirm": {

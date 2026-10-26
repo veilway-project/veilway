@@ -30,7 +30,7 @@ use veilway_core::engine::manage::{self, Error, Standing};
 pub(crate) const ALLOWED: &[(&str, &str)] = &[
 	("GET", "/v1/status"), ("GET", "/v1/config"), ("PUT", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"),
 	("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"),
-	("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"),
+	("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("PATCH", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"),
 	("POST", "/v1/replay/reset"),
 ];
 /// The preview of an upstream waits for the provider, so it gets longer than other requests.
@@ -270,10 +270,10 @@ mod tests {
 
 	#[test]
 	fn the_list_is_exact_and_a_name_is_one_plain_segment() {
-		for (method, path) in [("GET", "/v1/status"), ("PUT", "/v1/config"), ("GET", "/v1/users/alice"), ("POST", "/v1/users/a.b-c_d/usage/reset"), ("DELETE", "/v1/upstreams/up1"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/ab12/decline"), ("POST", "/v1/replay/reset")] {
+		for (method, path) in [("GET", "/v1/status"), ("PUT", "/v1/config"), ("GET", "/v1/users/alice"), ("POST", "/v1/users/a.b-c_d/usage/reset"), ("DELETE", "/v1/upstreams/up1"), ("PATCH", "/v1/upstreams/up1"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/ab12/decline"), ("POST", "/v1/replay/reset")] {
 			assert!(allowed(&Method::from_bytes(method.as_bytes()).unwrap(), path), "{method} {path}");
 		}
-		for (method, path) in [("GET", "/v1/events"), ("GET", "/v1/openapi.json"), ("PUT", "/v1/status"), ("DELETE", "/v1/config"), ("GET", "/v1/status/"), ("GET", "/v1//status"), ("GET", "/v1/users/"), ("GET", "/v1/users/.."), ("GET", "/v1/users/."), ("GET", "/v1/users/%2e%2e"), ("GET", "/v1/users/a/b"), ("GET", "/v1/users/a b"), ("GET", "/v1/users/a?b"), ("POST", "/v1/users/alice"), ("GET", "/v1/links/far/api/v1/status"), ("GET", "/v1/links/far/api/v1/links/x/api/v1/status"), ("GET", "v1/status"), ("GET", ""), ("GET", "/V1/status"), ("OPTIONS", "/v1/status"), ("GET", &format!("/v1/users/{}", "a".repeat(65))), ("GET", "/v1/users/{name}")] {
+		for (method, path) in [("GET", "/v1/events"), ("GET", "/v1/openapi.json"), ("PUT", "/v1/status"), ("DELETE", "/v1/config"), ("GET", "/v1/status/"), ("GET", "/v1//status"), ("GET", "/v1/users/"), ("GET", "/v1/users/.."), ("GET", "/v1/users/."), ("GET", "/v1/users/%2e%2e"), ("GET", "/v1/users/a/b"), ("GET", "/v1/users/a b"), ("GET", "/v1/users/a?b"), ("POST", "/v1/users/alice"), ("PATCH", "/v1/upstreams/up1/retry"), ("PATCH", "/v1/users/alice"), ("GET", "/v1/links/far/api/v1/status"), ("GET", "/v1/links/far/api/v1/links/x/api/v1/status"), ("GET", "v1/status"), ("GET", ""), ("GET", "/V1/status"), ("OPTIONS", "/v1/status"), ("GET", &format!("/v1/users/{}", "a".repeat(65))), ("GET", "/v1/users/{name}")] {
 			assert!(!allowed(&Method::from_bytes(method.as_bytes()).unwrap(), path), "{method} {path}");
 		}
 	}

@@ -487,9 +487,15 @@ impl Host {
 					self.left.insert(written.tag.clone(), (written, reach, state));
 					continue;
 				}
-				let kept = running.remove(&written.tag).filter(|(was, was_reach, was_state, _)| *was == written && *was_reach == reach && Arc::ptr_eq(was_state, &state));
+				// Only `exit` may differ for a task to be kept: the running upstream is asked for the other exit and the tunnel stays.
+				let before = running.remove(&written.tag);
+				let replaced = before.as_ref().is_some_and(|(_, _, was_state, _)| Arc::ptr_eq(was_state, &state));
+				let kept = before.filter(|(was, was_reach, was_state, _)| Upstream {exit: written.exit.clone(), ..was.clone()} == written && *was_reach == reach && Arc::ptr_eq(was_state, &state));
+				if kept.as_ref().is_some_and(|(was, ..)| was.exit != written.exit) {state.want(written.exit.clone())}
 				let task = kept.map(|(.., task)| task).unwrap_or_else(|| {
 					tracing::info!("upstream {}: running the provider's subscription as the carrier of an exit", written.tag);
+					// The tunnel of the task that ended is gone: nothing is carried until the new one says so.
+					if replaced {state.down("the config of the upstream changed, so its tunnel is made again")}
 					Task(upstream::run(shared, written.clone(), reach.clone(), state.clone(), vault, hooks.clone()))
 				});
 				self.upstreams.insert(written.tag.clone(), (written, reach, state, task));

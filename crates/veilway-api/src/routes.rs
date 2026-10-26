@@ -23,6 +23,7 @@ use time::OffsetDateTime;
 use tokio::sync::broadcast::error::RecvError;
 use veilway_core::config::{ApplyError, Config, Diff, Outbound, Snapshot, NAME_PATTERN};
 use veilway_core::engine::upstream::{PreviewError, PreviewRequest};
+use veilway_core::engine::{Choose, ChooseError};
 use veilway_core::engine::link::Status;
 use veilway_core::{Denied, Over, Reason, Reset};
 
@@ -408,6 +409,30 @@ async fn retry_upstream(State(api): State<Arc<Api>>, tag: Result<Path<String>, P
 	}
 }
 
+async fn choose_upstream(State(api): State<Arc<Api>>, tag: Result<Path<String>, PathRejection>, request: Request) -> Response {
+	let bytes = match tokio::time::timeout(api.limits.request, document(&api, request, false)).await {
+		Ok(Ok(bytes)) => bytes,
+		Ok(Err(failure)) => return failure.into_response(),
+		Err(_) => return Failure::late(&api).into_response(),
+	};
+	let Some(asked) = serde_json::from_slice::<serde_json::Value>(&bytes).ok().filter(serde_json::Value::is_object).and_then(|body| serde_json::from_value::<model::UpstreamChoice>(body).ok()) else {return Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "body_invalid", "The body of a choice is an object with at most profile, failover, transport and exit, each a value or null. Nothing was changed.").into_response()};
+	let Ok(Path(tag)) = tag else {return no_upstream()};
+	let choose = Choose {profile: asked.profile, failover: asked.failover, transport: asked.transport, exit: asked.exit};
+	// From the moment the engine is given the change the answer waits for it, as an apply's does: it finishes what it has begun whether or not anybody waits.
+	match api.engine.upstream_choose(&tag, &choose, &api.config).await {
+		Ok(chose) => {
+			if let Err(e) = &chose.saved {tracing::error!("control api: config generation {} is in force and could not be written to {} ({}): a restart comes back with the config before", chose.applied.snapshot.generation, api.config.display(), e.kind())}
+			let mut response = json(StatusCode::OK, &model::UpstreamChosen {tag, revision: chose.applied.snapshot.revision.to_string(), generation: chose.applied.snapshot.generation, live: chose.live});
+			if let Ok(etag) = HeaderValue::from_str(&format!("\"{}\"", chose.applied.snapshot.revision)) {response.headers_mut().insert(ETAG, etag);}
+			response
+		}
+		Err(ChooseError::Missing) => no_upstream(),
+		Err(ChooseError::Apply(ApplyError::Stale {current})) => Failure::stale(current.to_string()).into_response(),
+		Err(ChooseError::Apply(ApplyError::Invalid(report))) => Failure::refused(&report).into_response(),
+		Err(ChooseError::Apply(ApplyError::Prepare(e))) => Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "config_not_prepared", format!("The node could not prepare the config and nothing was changed: {e:#}")).into_response(),
+	}
+}
+
 async fn sessions(State(api): State<Arc<Api>>) -> Response {
 	json(StatusCode::OK, &model::Sessions {sessions: api.engine.peers(None).into_iter().filter_map(|peer| Some(model::Session {
 		handshake_age_secs: peer.handshake?.as_secs(),
@@ -623,11 +648,14 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 	for response in preview.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was fetched: once the node has begun to fetch, the answer waits for the provider and is never this one."}
 	let mut confirm = route::<model::UpstreamConfirmed, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/confirm", "confirmUpstream", "Confirms what the node reported as pending for the upstream: the move of the provider's endpoint, which the next refresh then tries first, and the refresh hosts and static mirrors the provider added. Until then the node keeps using the endpoint and hosts it had. Without a body both are confirmed; with one, a field that is left out is false. The answer says what had been waiting.", confirm_upstream, true, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is JSON and not what a confirmation takes. Nothing was changed."), (StatusCode::INTERNAL_SERVER_ERROR, "state_unwritten: the state file of the upstreams could not be written, so the answer is not kept.")]);
 	confirm.body = Some((schemas.subschema_for::<model::UpstreamConfirm>(), false));
+	let mut choose = route::<model::UpstreamChosen, _, _>(schemas, Method::PATCH, "/v1/upstreams/{tag}", "chooseUpstream", "Changes what the config chooses on an upstream: the profile (null: every profile in turn), failover to the other profiles, the transport (null: automatic) and the exit of the provider. A field that is left out stays. It goes through the same checks and the same apply as a config document, at the revision that runs now (read again once if it moved), and is written to the config file. When only the exit changed the running tunnel is kept and asked for the other exit, and nothing leaves through the old one meanwhile (live: true). The link, the keys, allow, allow_private and via are never changed by it.", choose_upstream, true, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed."), (StatusCode::UNPROCESSABLE_ENTITY, "The body is not what a choice takes, or the config with the choice does not validate (the problems name the fields), or the node could not prepare it. Nothing was changed."), (StatusCode::CONFLICT, "The running config changed twice while the choice was made. Nothing was changed.")]);
+	choose.body = Some((schemas.subschema_for::<model::UpstreamChoice>(), true));
+	for response in choose.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The body was not read within 30 seconds. Nothing was changed: once the node has begun to apply the choice, the answer waits for it and is never this one."}
 	let relayed = |schemas: &mut SchemaGenerator, method: Method, operation: &'static str, summary: &'static str| {
 		let mut relay = route::<serde_json::Value, _, _>(schemas, method.clone(), RELAY, operation, summary, manage::relay, false, &[(StatusCode::NOT_FOUND, "no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1."), (StatusCode::FORBIDDEN, "not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1."), (StatusCode::BAD_GATEWAY, "peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it."), (StatusCode::GATEWAY_TIMEOUT, "peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1.")]);
 		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::SERVICE_UNAVAILABLE) {response.1 = "link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it."}
 		for response in relay.responses.iter_mut().filter(|(status, ..)| *status == StatusCode::REQUEST_TIMEOUT) {response.1 = "The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream."}
-		if method == Method::PUT || method == Method::POST {relay.body = Some((schemars::json_schema!({"description": "The body of the call to the other node, as the call takes it, up to 4 MiB. It is forwarded as it is, and the other node reads it.", "type": "object"}), false))}
+		if method == Method::PUT || method == Method::POST || method == Method::PATCH {relay.body = Some((schemars::json_schema!({"description": "The body of the call to the other node, as the call takes it, up to 4 MiB. It is forwarded as it is, and the other node reads it.", "type": "object"}), false))}
 		if method == Method::PUT {relay.responses.push((StatusCode::PRECONDITION_REQUIRED, "The answer of the other node itself: an apply of its config needs If-Match.", Some(schemas.subschema_for::<model::ErrorBody>())))}
 		relay
 	};
@@ -635,6 +663,7 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 	let relay_put = relayed(schemas, Method::PUT, "relayPut", "The same call with PUT, which is how a config is pushed to a managed node. The node puts it on trial: 120 seconds after the push the config before is back, unless a request comes through the same link 10 seconds or more after the push, over a WireGuard session made after it. Both ends of the link make a new session under the config within seconds, so a config that breaks the next session is put back. A document that would cut the link this request came through is refused with 422 managing_link, except the removal of the node: no users and no such link, answered 202 once it is in the config file, and put in force 10 seconds later, since the answer goes back through that link.");
 	let relay_post = relayed(schemas, Method::POST, "relayPost", "The same call with POST.");
 	let relay_delete = relayed(schemas, Method::DELETE, "relayDelete", "The same call with DELETE.");
+	let relay_patch = relayed(schemas, Method::PATCH, "relayPatch", "The same call with PATCH, which is how the choice on an upstream is changed.");
 	vec![
 		route::<model::Status, _, _>(schemas, Method::GET, "/v1/status", "status", "What runs: the version, the config in force and how much of everything there is.", status, false, &[]),
 		route::<model::Running, _, _>(schemas, Method::GET, "/v1/config", "getConfig", "The running config with every secret replaced by the marker \"<redacted>\", and its revision, which is also the ETag.", running, false, &[]),
@@ -654,9 +683,10 @@ pub(crate) fn routes(schemas: &mut SchemaGenerator) -> Vec<Route> {
 		preview,
 		route::<model::UpstreamDeclined, _, _>(schemas, Method::POST, "/v1/upstreams/preview/{id}/decline", "declinePreview", "Says no to a preview: the provider is told to release the place the preview took, and the node keeps nothing.", decline_preview, false, &[(StatusCode::NOT_FOUND, "No preview of that id waits: it was declined, a config took it, or it ran out.")]),
 		route::<model::UpstreamRemoved, _, _>(schemas, Method::DELETE, "/v1/upstreams/{tag}", "removeUpstream", "Removes an upstream: the provider is told that the device left, for at most ten seconds, and the document and the keys leave the state file. The answer says whether the provider took the word. When it did not, the document stays in the state file and the same call again tells the provider again; the answer is 404 only when the running config has no such upstream, so a removal that was not confirmed can be retried while the config still names it. The upstream stops, and a config that still names it does not start it again, not even after a restart (a tombstone in the state file keeps it down until a config that no longer names it that way has been in force); apply a config without it to finish. A config applied without the upstream, with no call to this route, never tells the provider anything.", remove_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
+		choose,
 		confirm,
 		route::<model::UpstreamRetried, _, _>(schemas, Method::POST, "/v1/upstreams/{tag}/retry", "retryUpstream", "Asks the upstream to connect again now, at the operator's word: every wait it was in starts over.", retry_upstream, false, &[(StatusCode::NOT_FOUND, "The running config has no upstream of that tag. Nothing was changed.")]),
-		relay_get, relay_put, relay_post, relay_delete,
+		relay_get, relay_put, relay_post, relay_delete, relay_patch,
 		stream,
 		route::<BTreeMap<String, serde_json::Value>, _, _>(schemas, Method::GET, "/v1/openapi.json", "openapi", "This document.", openapi, false, &[]),
 	]

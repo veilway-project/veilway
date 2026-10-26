@@ -16,6 +16,8 @@ export type Upstream = Schemas["Upstream"];
 export type UpstreamPreview = Schemas["UpstreamPreview"];
 export type UpstreamPreviewRequest = Schemas["UpstreamPreviewRequest"];
 export type UpstreamConfirmed = Schemas["UpstreamConfirmed"];
+export type UpstreamChoice = Schemas["UpstreamChoice"];
+export type UpstreamChosen = Schemas["UpstreamChosen"];
 export type UpstreamRemoved = Schemas["UpstreamRemoved"];
 export type InboundInfo = Schemas["InboundInfo"];
 export type Problem = Schemas["Problem"];
@@ -70,7 +72,7 @@ export class Client {
 		throw new VeilwayError(response.status, "bad_response", "The node answered " + response.status + " with a body that is not an error document.");
 	}
 
-	private async json<T>(method: string, path: string, headers: Record<string, string> = {}, body?: ConfigDocument): Promise<T> {
+	private async json<T>(method: string, path: string, headers: Record<string, string> = {}, body?: ConfigDocument | UpstreamChoice): Promise<T> {
 		const response = await this.send(method, path, body ? {"content-type": "application/json", ...headers} : headers, body && JSON.stringify(body));
 		try {return JSON.parse(await response.text()) as T} catch {throw new VeilwayError(response.status, "bad_response", "The node answered with a body that is not JSON.")}
 	}
@@ -123,6 +125,9 @@ export class Client {
 
 	/** Confirms the move of the provider's endpoint and the new refresh hosts that `listUpstreams` reports as pending. Without options both are confirmed; with them a field that is left out is false. The answer says what had been waiting. */
 	confirmUpstream(tag: string, options: {move?: boolean, hosts?: boolean} = {}): Promise<UpstreamConfirmed> {return this.json("POST", "/v1/upstreams/" + encodeURIComponent(tag) + "/confirm", {}, options)}
+
+	/** Changes what the config chooses on an upstream: `profile`, `failover`, `transport` and `exit`. A field that is left out stays and null is automatic. Only an exit change keeps the running tunnel (`live`). The link, keys, allow, allow_private and via cannot be changed this way. */
+	chooseUpstream(tag: string, choice: UpstreamChoice): Promise<UpstreamChosen> {return this.json("PATCH", "/v1/upstreams/" + encodeURIComponent(tag), {}, choice)}
 
 	/** Asks the upstream to connect again now: every wait it was in starts over. */
 	retryUpstream(tag: string): Promise<{tag: string}> {return this.json("POST", "/v1/upstreams/" + encodeURIComponent(tag) + "/retry")}

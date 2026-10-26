@@ -47,7 +47,7 @@ pub use plan::{Denied, Plan};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
 
-use crate::config::{Applied, ApplyError, Config, Diff, LinkManage, Revision, RuleTransport, Snapshot, Store};
+use crate::config::{Applied, ApplyError, Config, Diff, LinkManage, Revision, RuleTransport, Snapshot, Store, Upstream};
 use host::Host;
 use rustls::RootCertStore;
 use resolver::{Names, Resolver};
@@ -290,6 +290,22 @@ pub struct DnsTotals {
 	pub malformed: u64,
 	/// Turned away because the user already had too many queries waiting.
 	pub throttled: u64,
+}
+
+/// What `Engine::upstream_choose` changes on an upstream: a field left as `None` stays, and `Some(None)` is automatic.
+#[derive(Clone, Debug, Default)]
+pub struct Choose {pub profile: Option<Option<String>>, pub failover: Option<Option<bool>>, pub transport: Option<Option<String>>, pub exit: Option<Option<String>>}
+
+/// What a change of the choice of an upstream came to: the config in force, how its file was written, and whether only the exit changed, so that the tunnel kept running.
+#[derive(Debug)]
+pub struct Chose {pub applied: Applied, pub saved: io::Result<()>, pub live: bool}
+
+/// Why a change of the choice of an upstream changed nothing.
+#[derive(Debug)]
+pub enum ChooseError {
+	/// The running config has no upstream of that tag.
+	Missing,
+	Apply(ApplyError<anyhow::Error>),
 }
 
 /// What the engine has learnt about an exit's upstream while running. It belongs to the exit's tag and outlives a reload that keeps the tag.
@@ -681,6 +697,29 @@ impl Engine {
 
 	/// Asks the tunnel of the upstream `tag` to connect now, as the user's "connect again" does for a client: false when the config that runs has no such upstream.
 	pub fn upstream_again(&self, tag: &str) -> bool {self.plan().upstreams().iter().find(|state| state.tag == tag).map(|state| state.again()).is_some()}
+
+	/// Changes what the config chooses on the upstream `tag`, and nothing else of it: the profile, `failover`, the transport and the exit. A field that is `None` stays, and `Some(None)` is automatic. The change is made on the running config with its real secrets, and goes in force through `apply` on the revision that was read, which also writes the config file. A stale revision is read again once. When only the exit changed the running upstream keeps its tunnel and is asked for the other exit.
+	pub async fn upstream_choose(&self, tag: &str, choose: &Choose, file: &Path) -> Result<Chose, ChooseError> {
+		let mut stale = false;
+		loop {
+			let snapshot = self.snapshot();
+			let mut config = (*snapshot.config).clone();
+			let Some(upstream) = config.upstreams.iter_mut().find(|upstream| upstream.tag == tag) else {return Err(ChooseError::Missing)};
+			let before = upstream.clone();
+			if let Some(profile) = &choose.profile {upstream.profile = profile.clone()}
+			if let Some(failover) = choose.failover {upstream.failover = failover}
+			if let Some(transport) = &choose.transport {upstream.transport = transport.clone()}
+			if let Some(exit) = &choose.exit {upstream.exit = exit.clone()}
+			let live = before.exit != upstream.exit && Upstream {exit: before.exit.clone(), ..upstream.clone()} == before;
+			let mut bytes = serde_json::to_vec_pretty(&config).map_err(|error| ChooseError::Apply(ApplyError::Prepare(error.into())))?;
+			bytes.push(b'\n');
+			match self.apply(bytes, snapshot.revision, file).await {
+				Ok((applied, saved)) => return Ok(Chose {applied, saved, live}),
+				Err(ApplyError::Stale {..}) if !std::mem::replace(&mut stale, true) => continue,
+				Err(error) => return Err(ChooseError::Apply(error)),
+			}
+		}
+	}
 
 	/// Fetches the subscription of another provider with the device the operator made, for the operator to look at before a config names it, see `upstream::preview`. The fetch takes a place at the provider, and runs to its end whether or not whoever asked keeps waiting.
 	pub async fn upstream_preview(&self, request: upstream::PreviewRequest) -> Result<upstream::Reviewing, upstream::PreviewError> {

@@ -300,3 +300,47 @@ fn a_config_with_upstreams_survives_a_round_trip_and_the_diff_sees_them() {
 	}).to_string().as_bytes()).unwrap();
 	assert_eq!(veilway_core::config::Diff::between(&config, &gone, now).upstreams.removed, ["other"]);
 }
+
+#[test]
+fn a_transport_outside_allow_or_a_datagram_transport_through_a_socks_via_is_refused() {
+	for name in ["tls", "ws", "fronted", "fronted-shaped"] {
+		let report = check(&with(|d| d["upstreams"][0]["transport"] = json!(name)));
+		assert!(report.errors.is_empty(), "{name}: {report:#?}");
+	}
+	let report = check(&with(|d| {
+		d["upstreams"][0]["transport"] = json!("udp-obfs");
+		d["upstreams"][0]["allow"] = json!(["no_cover"]);
+	}));
+	assert!(report.errors.is_empty(), "{report:#?}");
+	error_at("upstreams[0].transport", |d| d["upstreams"][0]["transport"] = json!("udp-obfs"));
+	error_at("upstreams[0].transport", |d| {
+		d["upstreams"][0]["transport"] = json!("udp");
+		d["upstreams"][0]["allow"] = json!(["no_cover"]);
+	});
+	error_at("upstreams[0].transport", |d| d["upstreams"][0]["transport"] = json!("ws-plain"));
+	error_at("upstreams[0].transport", |d| d["upstreams"][0]["transport"] = json!("nope"));
+	error_at("upstreams[0].transport", |d| d["upstreams"][0]["transport"] = json!("faketls"));
+	for name in ["udp", "udp-obfs"] {
+		error_at("upstreams[0].transport", |d| {
+			d["upstreams"][0]["transport"] = json!(name);
+			d["upstreams"][0]["allow"] = json!(["no_cover", "plain"]);
+			d["upstreams"][0]["via"] = json!("proxy");
+		});
+	}
+	let direct = check(&with(|d| {
+		d["upstreams"][0]["transport"] = json!("udp");
+		d["upstreams"][0]["allow"] = json!(["plain"]);
+		d["upstreams"][0]["via"] = json!("plain");
+	}));
+	assert!(direct.errors.is_empty(), "a direct via takes a datagram transport: {direct:#?}");
+}
+
+#[test]
+fn failover_without_a_profile_is_a_warning() {
+	warning_at("upstreams[0].failover", |d| d["upstreams"][0]["failover"] = json!(true));
+	let report = check(&with(|d| {
+		d["upstreams"][0]["failover"] = json!(true);
+		d["upstreams"][0]["profile"] = json!("main-profile");
+	}));
+	assert!(report.errors.is_empty() && report.warnings.is_empty(), "{report:#?}");
+}

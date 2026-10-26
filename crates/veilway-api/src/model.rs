@@ -873,8 +873,66 @@ pub struct UpstreamPreview {
 }
 
 /// What the provider says an account has used and has. A quota of 0 is none.
+#[derive(Default, Serialize, JsonSchema)]
+pub struct UpstreamQuota {
+	pub used_bytes: u64,
+	pub quota_bytes: u64,
+	/// What the provider's control channel says besides, once it is open: how often the quota starts over, when the period began and the account ends (Unix seconds), and the bytes of the device's own traffic, up and down.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub period: Option<UpstreamPeriod>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub period_start: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub account_expires_at: Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub up_bytes: Option<u64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub down_bytes: Option<u64>,
+}
+
 #[derive(Serialize, JsonSchema)]
-pub struct UpstreamQuota {pub used_bytes: u64, pub quota_bytes: u64}
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamPeriod {None, Daily, Weekly, Monthly}
+
+/// An exit the provider offers, with its name as plain text.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamExitState {
+	pub tag: String,
+	pub name: String,
+	/// Two uppercase letters.
+	pub country: Option<String>,
+	pub all_protocols: bool,
+	/// This node's device has this exit selected at the provider.
+	pub selected: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamSeverity {Information, Warning}
+
+/// A notice of the provider, as plain text.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamNotice {pub severity: UpstreamSeverity, pub text: String}
+
+/// A profile of the provider's document and whether this node can use it now. Never an address.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamProfileState {
+	pub id: String,
+	pub name: String,
+	pub usable: bool,
+	/// Plain words for why not. Empty when it is usable.
+	pub reason: String,
+}
+
+/// What the config chooses on an upstream: null is automatic.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamChoiceState {
+	pub profile: Option<String>,
+	pub failover: bool,
+	pub transport: Option<String>,
+	/// The exit of the provider that is asked for now, which may be one the operator just switched to.
+	pub exit: Option<String>,
+}
 
 /// One profile of a provider's document.
 #[derive(Serialize, JsonSchema)]
@@ -917,7 +975,7 @@ impl From<&Reviewing> for UpstreamPreview {
 		UpstreamPreview {
 			id: reviewing.id.clone(), expires_in_secs: reviewing.ttl.as_secs(), provider: reviewing.provider.clone(), fingerprint: reviewing.fingerprint.clone(), serial: reviewing.serial,
 			expires_at: reviewing.expires_at as i64,
-			quota: reviewing.quota.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes}),
+			quota: reviewing.quota.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes, ..Default::default()}),
 			account_expires_at: Some(reviewing.account_expires_at as i64).filter(|at| *at > 0),
 			device_limit: Some(reviewing.device_limit).filter(|limit| *limit > 0),
 			devices: reviewing.devices,
@@ -954,9 +1012,22 @@ pub struct Upstream {
 	/// The exit of the provider in use, and the exits it offers.
 	pub exit: Option<String>,
 	pub offered_exits: Vec<String>,
+	/// The exits the provider offers, at most 16, once the control channel is open.
+	pub exits: Vec<UpstreamExitState>,
 	/// What the provider says to the device, as plain text.
 	pub notices: Vec<String>,
+	/// The same notices with the severity the provider gave them.
+	pub provider_notices: Vec<UpstreamNotice>,
 	pub quota: Option<UpstreamQuota>,
+	/// What the tunnel itself says: connecting, reconnecting, connected, stopped:<reason> (quota, expired, disabled or node-stopping) or failed. Null while no tunnel exists.
+	pub engine_state: Option<String>,
+	/// Seconds the tunnel has been connected. Null while it is not.
+	pub connected_secs: Option<u64>,
+	/// The types of transport the profile in use lists.
+	pub transports: Vec<Transport>,
+	/// Every profile of the document held, in the order they are tried, and whether each is usable.
+	pub profiles: Vec<UpstreamProfileState>,
+	pub choice: UpstreamChoiceState,
 	/// When the document stops being current and when it was last refreshed, in Unix seconds.
 	pub expires_at: Option<i64>,
 	pub refreshed_at: Option<i64>,
@@ -999,7 +1070,13 @@ impl From<Carrying> for Upstream {
 			state: match report.phase {Phase::Fetching => UpstreamStatus::Fetching, Phase::Connecting => UpstreamStatus::Connecting, Phase::Up => UpstreamStatus::Up, Phase::Down => UpstreamStatus::Down},
 			reason: report.reason, state_secs: report.since.as_secs(), provider: report.provider, signing_key: report.signing_key, profile: report.profile,
 			transport: report.transport.map(transport_of), exit: report.exit, offered_exits: report.offered, notices: report.notices,
-			quota: report.usage.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes}),
+			exits: report.exits.into_iter().map(|exit| UpstreamExitState {tag: exit.tag, name: exit.name, country: exit.country, all_protocols: exit.all_protocols, selected: exit.selected}).collect(),
+			provider_notices: report.notice_list.into_iter().map(|(severity, text)| UpstreamNotice {severity: if severity == "warning" {UpstreamSeverity::Warning} else {UpstreamSeverity::Information}, text}).collect(),
+			quota: report.usage.map(|(used_bytes, quota_bytes)| UpstreamQuota {used_bytes, quota_bytes, period: report.account.as_ref().map(|account| match account.period {"daily" => UpstreamPeriod::Daily, "weekly" => UpstreamPeriod::Weekly, "monthly" => UpstreamPeriod::Monthly, _ => UpstreamPeriod::None}), period_start: report.account.as_ref().map(|account| account.period_start as i64), account_expires_at: report.account.as_ref().map(|account| account.expires_at as i64), up_bytes: report.account.as_ref().map(|account| account.up_bytes), down_bytes: report.account.as_ref().map(|account| account.down_bytes)}),
+			engine_state: report.engine_state, connected_secs: report.connected_secs,
+			transports: report.transports.into_iter().map(transport_of).collect(),
+			profiles: report.profiles.into_iter().map(|profile| UpstreamProfileState {id: profile.id, name: profile.name, usable: profile.usable, reason: profile.reason}).collect(),
+			choice: UpstreamChoiceState {profile: report.choice.profile, failover: report.choice.failover, transport: report.choice.transport, exit: report.choice.exit},
 			expires_at: report.expires_at.map(|at| at as i64), refreshed_at: report.refreshed_at.map(|at| at as i64), refresh_error: report.refresh_error,
 			mtu: Some(report.mtu).filter(|mtu| *mtu > 0), pending_move: report.pending_move, pending_hosts: report.pending_hosts,
 			counters: UpstreamCounters {sent: report.sent, unsent: report.unsent, refused: report.refused, dropped: report.dropped, state_flips: report.flips, starts: report.starts, refreshes: report.refreshes, refresh_failures: report.refresh_failures, traffic: report.traffic.into()},
@@ -1013,6 +1090,34 @@ pub struct Upstreams {pub upstreams: Vec<Upstream>}
 /// What a removal did. `confirmed` says whether the provider took the word that the device left; when it did not, the place stays until the provider removes it. The upstream is not run again by a config that still names it.
 #[derive(Serialize, JsonSchema)]
 pub struct UpstreamRemoved {pub tag: String, pub confirmed: bool}
+
+/// What the operator chooses on an upstream. A field that is left out stays as it is, and null is automatic: no pinned profile, no failover, every transport, the provider's default exit. The link, the keys, `allow`, `allow_private` and `via` are not part of it and cannot be changed this way.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamChoice {
+	#[serde(default, deserialize_with = "set")] pub profile: Option<Option<String>>,
+	#[serde(default, deserialize_with = "set")] pub failover: Option<Option<bool>>,
+	#[serde(default, deserialize_with = "set")] pub transport: Option<Option<String>>,
+	#[serde(default, deserialize_with = "set")] pub exit: Option<Option<String>>,
+}
+
+/// A field that is present is `Some`, whether its value is null or not.
+fn set<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(from: D) -> Result<Option<Option<T>>, D::Error> {Option::<T>::deserialize(from).map(Some)}
+
+// Written out by hand, like `UpstreamConfirm`.
+impl JsonSchema for UpstreamChoice {
+	fn schema_name() -> Cow<'static, str> {"UpstreamChoice".into()}
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {json_schema!({"type": "object", "description": "What to choose on an upstream. A field that is left out stays as it is, and null is automatic. The change goes through the same checks and the same apply as a config document does, and is written to the config file. Only the exit is taken on the running tunnel; any other field makes the tunnel again.", "properties": {
+		"profile": {"type": ["string", "null"], "description": "The profile of the provider's document to use. Null: every profile is tried in the document's order, starting with the last one that carried."},
+		"failover": {"type": ["boolean", "null"], "description": "Whether the other profiles are tried when the named one cannot be used. Null is false."},
+		"transport": {"type": ["string", "null"], "description": "The type of transport to connect over: udp, udp-obfs, tls, ws, ws-plain, fronted or fronted-shaped. Null: the engine picks from every transport of the profile."},
+		"exit": {"type": ["string", "null"], "description": "The tag of the provider's exit to leave through. Null: the provider's default."}
+	}, "additionalProperties": false})}
+}
+
+/// What a choice on an upstream came to: the config now in force, and whether only the exit changed, so that the tunnel was kept and asked for the other exit.
+#[derive(Serialize, JsonSchema)]
+pub struct UpstreamChosen {pub tag: String, pub revision: String, pub generation: u64, pub live: bool}
 
 /// What a confirmation of the operator is for. A body that is left out confirms both.
 #[derive(Default, Deserialize)]

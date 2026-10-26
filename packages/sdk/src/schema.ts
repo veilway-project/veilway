@@ -141,7 +141,8 @@ export interface paths {
         delete: operations["relayDelete"];
         options?: never;
         head?: never;
-        patch?: never;
+        /** The same call with PATCH, which is how the choice on an upstream is changed. */
+        patch: operations["relayPatch"];
         trace?: never;
     };
     "/v1/openapi.json": {
@@ -294,7 +295,8 @@ export interface paths {
         delete: operations["removeUpstream"];
         options?: never;
         head?: never;
-        patch?: never;
+        /** Changes what the config chooses on an upstream: the profile (null: every profile in turn), failover to the other profiles, the transport (null: automatic) and the exit of the provider. A field that is left out stays. It goes through the same checks and the same apply as a config document, at the revision that runs now (read again once if it moved), and is written to the config file. When only the exit changed the running tunnel is kept and asked for the other exit, and nothing leaves through the old one meanwhile (live: true). The link, the keys, allow, allow_private and via are never changed by it. */
+        patch: operations["chooseUpstream"];
         trace?: never;
     };
     "/v1/upstreams/{tag}/confirm": {
@@ -1510,9 +1512,19 @@ export interface components {
         };
         /** @description What the node is doing for one upstream. Nothing in it is a key, a secret, a token or the link. */
         Upstream: {
+            choice: components["schemas"]["UpstreamChoiceState"];
+            /**
+             * Format: uint64
+             * @description Seconds the tunnel has been connected. Null while it is not.
+             */
+            connected_secs: number | null;
             counters: components["schemas"]["UpstreamCounters"];
+            /** @description What the tunnel itself says: connecting, reconnecting, connected, stopped:<reason> (quota, expired, disabled or node-stopping) or failed. Null while no tunnel exists. */
+            engine_state: string | null;
             /** @description The exit of the provider in use, and the exits it offers. */
             exit: string | null;
+            /** @description The exits the provider offers, at most 16, once the control channel is open. */
+            exits: components["schemas"]["UpstreamExitState"][];
             /**
              * Format: int64
              * @description When the document stops being current and when it was last refreshed, in Unix seconds.
@@ -1531,7 +1543,11 @@ export interface components {
             pending_move: string | null;
             /** @description The profile in use, and the transport it is connected over. */
             profile: string | null;
+            /** @description Every profile of the document held, in the order they are tried, and whether each is usable. */
+            profiles: components["schemas"]["UpstreamProfileState"][];
             provider: string | null;
+            /** @description The same notices with the severity the provider gave them. */
+            provider_notices: components["schemas"]["UpstreamNotice"][];
             quota: components["schemas"]["UpstreamQuota"] | null;
             /** @description Plain words for why the state is what it is. Empty while it is up. */
             reason: string;
@@ -1549,6 +1565,35 @@ export interface components {
             state_secs: number;
             tag: string;
             transport: components["schemas"]["Transport"] | null;
+            /** @description The types of transport the profile in use lists. */
+            transports: components["schemas"]["Transport"][];
+        };
+        /** @description What to choose on an upstream. A field that is left out stays as it is, and null is automatic. The change goes through the same checks and the same apply as a config document does, and is written to the config file. Only the exit is taken on the running tunnel; any other field makes the tunnel again. */
+        UpstreamChoice: {
+            /** @description The tag of the provider's exit to leave through. Null: the provider's default. */
+            exit?: string | null;
+            /** @description Whether the other profiles are tried when the named one cannot be used. Null is false. */
+            failover?: boolean | null;
+            /** @description The profile of the provider's document to use. Null: every profile is tried in the document's order, starting with the last one that carried. */
+            profile?: string | null;
+            /** @description The type of transport to connect over: udp, udp-obfs, tls, ws, ws-plain, fronted or fronted-shaped. Null: the engine picks from every transport of the profile. */
+            transport?: string | null;
+        };
+        /** @description What the config chooses on an upstream: null is automatic. */
+        UpstreamChoiceState: {
+            /** @description The exit of the provider that is asked for now, which may be one the operator just switched to. */
+            exit: string | null;
+            failover: boolean;
+            profile: string | null;
+            transport: string | null;
+        };
+        /** @description What a choice on an upstream came to: the config now in force, and whether only the exit changed, so that the tunnel was kept and asked for the other exit. */
+        UpstreamChosen: {
+            /** Format: uint64 */
+            generation: number;
+            live: boolean;
+            revision: string;
+            tag: string;
         };
         /** @description A class of transports the operator allows an upstream to use, as the client engine ranks them from strongest to weakest. `cover` is always allowed. */
         UpstreamClass: "cover" | "no_cover" | "exposed" | "plain";
@@ -1604,6 +1649,23 @@ export interface components {
             name: string;
             tag: string;
         };
+        /** @description An exit the provider offers, with its name as plain text. */
+        UpstreamExitState: {
+            all_protocols: boolean;
+            /** @description Two uppercase letters. */
+            country: string | null;
+            name: string;
+            /** @description This node's device has this exit selected at the provider. */
+            selected: boolean;
+            tag: string;
+        };
+        /** @description A notice of the provider, as plain text. */
+        UpstreamNotice: {
+            severity: components["schemas"]["UpstreamSeverity"];
+            text: string;
+        };
+        /** @enum {string} */
+        UpstreamPeriod: "none" | "daily" | "weekly" | "monthly";
         /** @description The answer to a preview: the document the provider sent, verified under the key of the link, as the operator reads it before saying yes. Fetching it took a place at the provider. The place is given back when the preview is declined or runs out, and made permanent by the config that names the same link and device within `expires_in_secs`. */
         UpstreamPreview: {
             /**
@@ -1674,10 +1736,28 @@ export interface components {
             /** @description In the provider's order. */
             transports: components["schemas"]["Transport"][];
         };
+        /** @description A profile of the provider's document and whether this node can use it now. Never an address. */
+        UpstreamProfileState: {
+            id: string;
+            name: string;
+            /** @description Plain words for why not. Empty when it is usable. */
+            reason: string;
+            usable: boolean;
+        };
         /** @description What the provider says an account has used and has. A quota of 0 is none. */
         UpstreamQuota: {
+            /** Format: int64 */
+            account_expires_at?: number | null;
+            /** Format: uint64 */
+            down_bytes?: number | null;
+            /** @description What the provider's control channel says besides, once it is open: how often the quota starts over, when the period began and the account ends (Unix seconds), and the bytes of the device's own traffic, up and down. */
+            period?: components["schemas"]["UpstreamPeriod"] | null;
+            /** Format: int64 */
+            period_start?: number | null;
             /** Format: uint64 */
             quota_bytes: number;
+            /** Format: uint64 */
+            up_bytes?: number | null;
             /** Format: uint64 */
             used_bytes: number;
         };
@@ -1690,6 +1770,8 @@ export interface components {
         UpstreamRetried: {
             tag: string;
         };
+        /** @enum {string} */
+        UpstreamSeverity: "information" | "warning";
         /** @enum {string} */
         UpstreamStatus: "fetching" | "connecting" | "up" | "down";
         Upstreams: {
@@ -2522,6 +2604,87 @@ export interface operations {
             };
         };
     };
+    relayPatch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": Record<string, never>;
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description not_managed: the link does not have manage peer on this node. Node 1's own, with the header veilway-relay: node1. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description no_such_link: the running config has no enabled node link of that tag. not_allowed_through_link: the route or the method is not on the list of routes a managed node serves. Node 1's own, with the header veilway-relay: node1. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The answer of the other node itself: the relay keeps its own time, 30 seconds and 75 for the preview of an upstream. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_refused: the other node reset the connection, because it does not serve management or has no control API. answer_too_large: the answer is over 8 MiB. bad_answer: the answer is not HTTP/1.1 with a length, or the connection ended before it was whole, and a change it was sent may still have been made: read its revision. Node 1's own, with the header veilway-relay: node1; any other 502 is the other node's own answer, with none of it. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description link_down: the link is not up, answered at once with nothing sent, and details name its state, since when and what the dialler's last attempt came to. busy: four connections of the link are open, or the node relays as many requests as it takes at once, and none was freed in 5 seconds. Node 1's own answers carry the header veilway-relay: node1; any other 503 is the other node's own, with none of it. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description peer_silent: no answer to the connection within 10 seconds, or none within the request's time. A change the other node was sent may still have been made. Node 1's own, with the header veilway-relay: node1. */
+            504: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     openapi: {
         parameters: {
             query?: never;
@@ -2946,6 +3109,104 @@ export interface operations {
             };
             /** @description The request was not finished within 30 seconds. */
             408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The node already serves as many connections, or as many event streams, as it takes at once. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    chooseUpstream: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                tag: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpstreamChoice"];
+            };
+        };
+        responses: {
+            /** @description The answer. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UpstreamChosen"];
+                };
+            };
+            /** @description The body is not one JSON document, or could not be read to its end. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The running config has no upstream of that tag. Nothing was changed. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not read within 30 seconds. Nothing was changed: once the node has begun to apply the choice, the answer waits for it and is never this one. */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The running config changed twice while the choice was made. Nothing was changed. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is larger than 4 MiB. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body was not sent as application/json. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            /** @description The body is not what a choice takes, or the config with the choice does not validate (the problems name the fields), or the node could not prepare it. Nothing was changed. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };

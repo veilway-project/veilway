@@ -857,6 +857,24 @@ impl Config {
 			for (key, value) in [("profile", &upstream.profile), ("exit", &upstream.exit)] {
 				if value.as_deref().is_some_and(|value| !ident(value, false)) {r.error(at(key), TAG_RULE)}
 			}
+			if let Some(name) = &upstream.transport {
+				let class = match name.as_str() {
+					"tls" | "ws" | "fronted" | "fronted-shaped" => Some(UpstreamClass::Cover),
+					"udp-obfs" => Some(UpstreamClass::NoCover),
+					"udp" => Some(UpstreamClass::Plain),
+					"ws-plain" => Some(UpstreamClass::Exposed),
+					_ => None,
+				};
+				match class {
+					None if name == "faketls" => r.error(at("transport"), "expected a transport the node uses: `faketls` is in alpha, and the node does not use transports in alpha"),
+					None => r.error(at("transport"), "expected one of udp, udp-obfs, tls, ws, ws-plain, fronted, fronted-shaped"),
+					Some(class) => {
+						if class != UpstreamClass::Cover && !upstream.allow.contains(&class) {r.error(at("transport"), "expected a transport of a class `allow` lists: only cover transports are used without it")}
+						if matches!(name.as_str(), "udp" | "udp-obfs") && upstream.via.as_ref().is_some_and(|via| outbound_tags.get(via.as_str()).is_some_and(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..}))) {r.error(at("transport"), "expected a TCP transport: `udp` and `udp-obfs` cannot go through the socks5 outbound of `via`")}
+					}
+				}
+			}
+			if upstream.failover == Some(true) && upstream.profile.is_none() {r.warning(at("failover"), "has no effect without a profile: every profile is tried in the document's order")}
 			if upstream.allow.len() > 4 {r.error(at("allow"), "expected at most 4 classes")}
 			index(&mut r, |j| at(&format!("allow[{j}]")), upstream.allow.iter().take(4));
 			match upstreamed.get(&i) {

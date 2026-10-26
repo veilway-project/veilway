@@ -240,10 +240,10 @@ impl Real {
 }
 
 /// What a test starts node A with.
-struct Setup {time: Time, dir: PathBuf, provider: Provider, redirect: Redirect, allow: Vec<&'static str>, exit: Option<&'static str>, private: bool, refresh: Option<Duration>, preview: Option<Duration>, tag: &'static str}
+struct Setup {time: Time, dir: PathBuf, provider: Provider, redirect: Redirect, allow: Vec<&'static str>, exit: Option<&'static str>, private: bool, refresh: Option<Duration>, preview: Option<Duration>, profile_wait: Option<Duration>, tag: &'static str}
 
 impl Setup {
-	fn new(time: Time, dir: PathBuf, provider: Provider, redirect: Redirect) -> Setup {Setup {time, dir, provider, redirect, allow: vec!["no_cover", "plain"], exit: None, private: true, refresh: None, preview: None, tag: "b"}}
+	fn new(time: Time, dir: PathBuf, provider: Provider, redirect: Redirect) -> Setup {Setup {time, dir, provider, redirect, allow: vec!["no_cover", "plain"], exit: None, private: true, refresh: None, preview: None, profile_wait: None, tag: "b"}}
 
 	/// The document of node A: two users on a plain WireGuard inbound, an exit through the upstream `b`, and one that leaves from A itself and which nothing may reach but a rule that names it.
 	fn document(&self, home: SocketAddr) -> Value {
@@ -264,7 +264,7 @@ impl Setup {
 	}
 
 	async fn start(&self, doc: &Value) -> Engine {
-		let hooks = Hooks {resolve: Some(self.provider.resolver()), retry: Some(Duration::from_secs(1)), refresh: self.refresh, preview: self.preview, redirect: Some(self.redirect.clone())};
+		let hooks = Hooks {resolve: Some(self.provider.resolver()), retry: Some(Duration::from_secs(1)), refresh: self.refresh, preview: self.preview, profile_wait: self.profile_wait, redirect: Some(self.redirect.clone())};
 		seed(&self.dir.join("replay"), self.time.secs() - 100, self.time.secs() - 100);
 		logging();
 		veilway_core::start(&parsed(doc), Options {now: self.time.now, replay: Some(self.dir.join("replay")), upstreams: Some(self.dir.join("upstreams.state")), upstream: hooks, roots: Some(self.provider.roots.clone()), ..Options::new(&self.dir)}).await.unwrap_or_else(|e| panic!("node A did not start: {e:#}"))
@@ -1099,5 +1099,177 @@ async fn previews_that_ask_together_take_no_more_than_four_places() {
 	let answers = [answers.0, answers.1, answers.2, answers.3, answers.4, answers.5];
 	let (kept, full) = (answers.iter().filter(|answer| answer.is_ok()).count(), answers.iter().filter(|answer| matches!(answer, Err(PreviewError::Full))).count());
 	assert_eq!((kept, full, setup.provider.requests("fetch")), (4, 2, 4), "{:?}", answers.iter().map(|answer| answer.as_ref().map(|_| ())).collect::<Vec<_>>());
+	a.shutdown().await;
+}
+
+/// Where a profile that nobody answers at is said to be.
+const DEAD: &str = "10.99.0.7:5007";
+
+fn with_id(mut profile: Value, id: &str) -> Value {
+	profile["id"] = json!(id);
+	profile
+}
+
+/// A provider whose document lists the profiles `listed`, in that order. The profile it was started with is replaced.
+async fn listing(time: Time, listed: Vec<Value>) -> Provider {
+	let provider = Provider::start(time, listed[0].clone()).await;
+	*provider.extra.lock().unwrap() = json!({"profiles": listed});
+	provider
+}
+
+/// Puts `doc` in force on `engine`, the way a reload of the config file does.
+async fn put(engine: &Engine, doc: &Value) {engine.reload(doc.to_string().into_bytes(), None).await.unwrap_or_else(|e| panic!("the reload was refused: {e}"));}
+
+/// "dead" is dialled at an address that never answers, "home" is node B: the first is given up for the second by an upstream that may, and kept by one that is pinned to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreachable_profile_gives_way_to_the_next_and_a_pinned_one_does_not() {
+	let time = time!();
+	let b = Real::start("up-next", time, |_| {}).await;
+	let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let provider = listing(time, vec![with_id(profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [DEAD]})]), "dead"), profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [FAKE_OBFS]})])]).await;
+	let (dir, home) = (scratch("up-next-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, redirect(&[(FAKE_OBFS, b.obfs), (DEAD, silent.local_addr().unwrap())]));
+	setup.tag = "next";
+	setup.profile_wait = Some(Duration::from_secs(2));
+	let mut doc = setup.document(home);
+	let a = setup.start(&doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let report = a.upstreams().remove(0);
+	assert_eq!((report.profile.as_deref(), report.transport), (Some("home"), Some("udp-obfs")), "{report:?}");
+	assert!(lines("upstream next:").iter().any(|line| line.contains("the profile dead cannot be used, so the next one is tried")), "{:?}", lines("upstream next:"));
+	assert!(silent.try_recv_from(&mut [0u8; 64]).is_ok(), "the profile that was given up was never dialled");
+	assert_eq!(report.profiles.iter().map(|profile| (profile.id.as_str(), profile.usable)).collect::<Vec<_>>(), vec![("dead", false), ("home", true)], "{:?}", report.profiles);
+	assert!(report.profiles[0].reason.contains("did not connect"), "{:?}", report.profiles);
+	// Pinned to the one that does not answer: nothing else is tried, however long it takes.
+	doc["upstreams"][0]["profile"] = json!("dead");
+	put(&a, &doc).await;
+	let given = lines("upstream next:").iter().filter(|line| line.contains("cannot be used, so the next one")).count();
+	let deadline = Instant::now() + Duration::from_secs(12);
+	while Instant::now() < deadline {
+		assert_ne!(phase(&a).0, Phase::Up, "a pinned profile gave way to another: {:?}", a.upstreams());
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	assert_eq!((lines("upstream next:").iter().filter(|line| line.contains("cannot be used, so the next one")).count(), a.upstreams()[0].profile.as_deref()), (given, Some("dead")));
+	// Pinned first, with failover: the other one is used once the pinned one has had its time.
+	doc["upstreams"][0]["failover"] = json!(true);
+	put(&a, &doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	assert_eq!(a.upstreams()[0].profile.as_deref(), Some("home"));
+	a.shutdown().await;
+	b.engine.shutdown().await;
+}
+
+// The provider stops the device because its quota is used up. That is not the profile's fault, so no other profile is tried: the engine's own wait for the next period is all there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_that_stops_the_device_for_quota_is_not_tried_on_other_profiles() {
+	let time = time!();
+	let b = Real::start("up-quota", time, |doc| {
+		doc["users"][0]["quota_bytes"] = json!(30_000);
+		doc["users"][0]["quota_period"] = json!("daily");
+	}).await;
+	let obfs = || profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [FAKE_OBFS]})]);
+	let provider = listing(time, vec![with_id(obfs(), "one"), with_id(obfs(), "two")]).await;
+	let (dir, home) = (scratch("up-quota-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, b.redirect());
+	setup.tag = "quota";
+	setup.profile_wait = Some(Duration::from_secs(2));
+	let a = setup.start(&setup.document(home)).await;
+	until_phase(&a, Phase::Up, UP).await;
+	// The stop comes over the control channel, so it has to be open first: it is when the provider has said what the account has used.
+	until(&a, "the control channel did not open", || a.upstreams()[0].account.is_some()).await;
+	let mut alice = Device::start(&ALICE, home, ALICE_ADDRESS).await;
+	for ident in 0..40 {alice.ping(PUBLIC, ident, 1300).await;}
+	until(&a, "the provider did not stop the device", || phase(&a).1.contains("the provider stopped the connection")).await;
+	tokio::time::sleep(Duration::from_secs(8)).await;
+	let report = a.upstreams().remove(0);
+	assert_eq!((report.phase, report.profile.as_deref(), report.starts, report.engine_state.as_deref()), (Phase::Down, Some("one"), 1, Some("stopped:quota")), "{report:?}");
+	assert!(report.profiles.iter().all(|profile| profile.usable), "{:?}", report.profiles);
+	assert!(!lines("upstream quota:").iter().any(|line| line.contains("cannot be used, so the next one")), "{:?}", lines("upstream quota:"));
+	a.shutdown().await;
+	b.engine.shutdown().await;
+}
+
+// `udp` is listed first and would be dialled first. With the config's transport it is not dialled at all, and the other way round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_transport_the_config_picks_is_the_only_one_dialled() {
+	let time = time!();
+	let b = Real::start("up-only", time, |_| {}).await;
+	let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let provider = Provider::start(time, profile(&NODE, vec![json!({"type": "udp", "endpoints": [FAKE_UDP]}), json!({"type": "udp-obfs", "endpoints": [FAKE_OBFS]})])).await;
+	let (dir, home) = (scratch("up-only-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, redirect(&[(FAKE_OBFS, b.obfs), (FAKE_UDP, silent.local_addr().unwrap())]));
+	setup.tag = "only";
+	let mut doc = setup.document(home);
+	doc["upstreams"][0]["transport"] = json!("udp-obfs");
+	let a = setup.start(&doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let report = a.upstreams().remove(0);
+	assert_eq!((report.transport, report.choice.transport.as_deref()), (Some("udp-obfs"), Some("udp-obfs")), "{report:?}");
+	assert!(silent.try_recv_from(&mut [0u8; 64]).is_err(), "the transport that was not picked was dialled");
+	doc["upstreams"][0]["transport"] = json!("udp");
+	put(&a, &doc).await;
+	let mut datagram = [0u8; 2048];
+	timeout(UP, silent.recv_from(&mut datagram)).await.expect("the picked transport was never dialled").unwrap();
+	assert_ne!(phase(&a).0, Phase::Up, "{:?}", a.upstreams());
+	a.shutdown().await;
+	b.engine.shutdown().await;
+}
+
+// Only the exit differs: the tunnel is kept and asked for the other exit, the carrier refuses what is routed to it until the provider says the exit is in use, and the flow then leaves through it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_exit_is_taken_on_the_running_tunnel_and_nothing_leaves_the_old_one_meanwhile() {
+	let time = time!();
+	let b = Real::start("up-switch", time, |_| {}).await;
+	let provider = Provider::start(time, profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [FAKE_OBFS]})])).await;
+	let (dir, home) = (scratch("up-switch-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, b.redirect());
+	setup.tag = "switch";
+	setup.exit = Some("main");
+	let mut doc = setup.document(home);
+	let a = setup.start(&doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let mut alice = Device::start(&ALICE, home, ALICE_ADDRESS).await;
+	assert_eq!(alice.leaves(PUBLIC, 40000).await.as_deref(), Some("main"));
+	let before = a.upstreams().remove(0);
+	doc["upstreams"][0]["exit"] = json!("alt");
+	put(&a, &doc).await;
+	until_phase(&a, Phase::Up, UP).await;
+	let after = a.upstreams().remove(0);
+	assert_eq!((after.exit.as_deref(), after.starts, after.choice.exit.as_deref()), (Some("alt"), before.starts, Some("alt")), "the tunnel was made again, or the exit is not the new one: {after:?}");
+	assert_eq!(after.flips, before.flips + 2, "the carrier did not stop carrying while the exit changed");
+	let said = lines("upstream switch:");
+	let switching = said.iter().position(|line| line.contains("switching to the exit that was asked for")).expect("the carrier was not taken down by the switch");
+	assert!(said[switching..].iter().any(|line| line.ends_with("upstream switch: up")), "{said:?}");
+	assert_eq!(alice.leaves(PUBLIC, 40001).await.as_deref(), Some("alt"), "the flow did not leave through the new exit");
+	// Back to the provider's default: the selection the device made is dropped.
+	doc["upstreams"][0].as_object_mut().unwrap().remove("exit");
+	put(&a, &doc).await;
+	until(&a, "the provider's default exit was not taken", || phase(&a).0 == Phase::Up && a.upstreams()[0].exits.iter().all(|exit| !exit.selected)).await;
+	assert_eq!(alice.leaves(PUBLIC, 40002).await.as_deref(), Some("main"));
+	a.shutdown().await;
+	b.engine.shutdown().await;
+}
+
+// Every profile fails in turn: the round ends as a failure of its own, with the wait of one, and a new round starts with every profile again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_profile_round_ends_in_the_usual_backoff() {
+	let time = time!();
+	let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let dead = |id: &str| with_id(profile(&NODE, vec![json!({"type": "udp-obfs", "endpoints": [DEAD]})]), id);
+	let provider = listing(time, vec![dead("first"), dead("second")]).await;
+	let (dir, home) = (scratch("up-round-a"), listen());
+	let mut setup = Setup::new(time, dir, provider, redirect(&[(DEAD, silent.local_addr().unwrap())]));
+	setup.tag = "round";
+	setup.profile_wait = Some(Duration::from_secs(1));
+	let a = setup.start(&setup.document(home)).await;
+	let deadline = Instant::now() + Duration::from_secs(150);
+	while lines("upstream round:").iter().filter(|line| line.contains("every profile of the document failed in turn")).count() < 2 {
+		assert!(Instant::now() < deadline, "{:?}\n{}", a.upstreams(), lines("upstream").join("\n"));
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	let said = lines("upstream round:");
+	let order: Vec<&str> = said.iter().filter(|line| line.contains("cannot be used, so the next one")).map(|line| if line.contains("profile first") {"first"} else {"second"}).collect();
+	assert_eq!(&order[..4], &["first", "second", "first", "second"], "a new round did not start with every profile: {said:?}");
+	assert_ne!(phase(&a).0, Phase::Up);
 	a.shutdown().await;
 }

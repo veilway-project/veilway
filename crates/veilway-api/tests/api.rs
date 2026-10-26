@@ -547,7 +547,7 @@ async fn every_route_answers() {
 	assert_eq!(get(&node.socket, "/v1/links").await.json, json!({"links": []}));
 	ask("GET", "/v1/links");
 	// A link the node does not have is not found, and what is not on the list of routes a managed node serves is never carried. The relay through a link that exists is held against two nodes in the tests of `veilway-core`.
-	for (method, path, code) in [("GET", "/v1/links/nobody/api/v1/status", "no_such_link"), ("PUT", "/v1/links/nobody/api/v1/status", "not_allowed_through_link"), ("POST", "/v1/links/nobody/api/v1/events", "not_allowed_through_link"), ("DELETE", "/v1/links/nobody/api/v1/config", "not_allowed_through_link")] {
+	for (method, path, code) in [("GET", "/v1/links/nobody/api/v1/status", "no_such_link"), ("PUT", "/v1/links/nobody/api/v1/status", "not_allowed_through_link"), ("POST", "/v1/links/nobody/api/v1/events", "not_allowed_through_link"), ("DELETE", "/v1/links/nobody/api/v1/config", "not_allowed_through_link"), ("PATCH", "/v1/links/nobody/api/v1/config", "not_allowed_through_link"), ("PATCH", "/v1/links/nobody/api/v1/upstreams/up", "no_such_link")] {
 		let relayed = call(&node.socket, method, path, &[], None).await;
 		ask(method, path);
 		assert_eq!((relayed.status, relayed.code()), (404, code), "{method} {path}");
@@ -557,8 +557,8 @@ async fn every_route_answers() {
 	// A node without upstreams lists none, and an upstream or a preview it does not have is not found. The routes that do something are asked against a provider, see the test of the upstream routes.
 	assert_eq!(get(&node.socket, "/v1/upstreams").await.json, json!({"upstreams": []}));
 	ask("GET", "/v1/upstreams");
-	for (method, path, body) in [("POST", "/v1/upstreams/preview/nobody/decline", None), ("DELETE", "/v1/upstreams/nobody", None), ("POST", "/v1/upstreams/nobody/confirm", None), ("POST", "/v1/upstreams/nobody/retry", None)] {
-		let none = call(&node.socket, method, path, &[], body).await;
+	for (method, path, body) in [("POST", "/v1/upstreams/preview/nobody/decline", None), ("DELETE", "/v1/upstreams/nobody", None), ("POST", "/v1/upstreams/nobody/confirm", None), ("POST", "/v1/upstreams/nobody/retry", None), ("PATCH", "/v1/upstreams/nobody", Some(Body::from("{\"exit\": null}")))] {
+		let none = call(&node.socket, method, path, &[JSON], body).await;
 		ask(method, path);
 		assert_eq!((none.status, none.code()), (404, if path.contains("preview") {"preview_not_found"} else {"upstream_not_found"}), "{method} {path}");
 	}
@@ -1561,7 +1561,7 @@ async fn the_node_names_its_public_addresses_and_refuses_one_with_a_port() {
 fn the_openapi_document_has_every_route_and_nothing_dangling() {
 	assert_eq!(OPENAPI["openapi"], json!("3.1.0"));
 	let documented: Vec<(String, String)> = OPENAPI["paths"].as_object().unwrap().iter().flat_map(|(path, methods)| methods.as_object().unwrap().keys().map(move |method| (method.to_uppercase(), path.clone()))).collect();
-	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json"), ("GET", "/v1/links/{tag}/api/{path}"), ("PUT", "/v1/links/{tag}/api/{path}"), ("POST", "/v1/links/{tag}/api/{path}"), ("DELETE", "/v1/links/{tag}/api/{path}")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
+	let mut wanted: Vec<(String, String)> = [("GET", "/v1/status"), ("GET", "/v1/config"), ("POST", "/v1/config/validate"), ("POST", "/v1/config/diff"), ("PUT", "/v1/config"), ("GET", "/v1/users"), ("GET", "/v1/users/{name}"), ("POST", "/v1/users/{name}/usage/reset"), ("POST", "/v1/replay/reset"), ("GET", "/v1/stats"), ("GET", "/v1/sessions"), ("GET", "/v1/exits"), ("GET", "/v1/inbounds"), ("GET", "/v1/links"), ("GET", "/v1/upstreams"), ("POST", "/v1/upstreams/preview"), ("POST", "/v1/upstreams/preview/{id}/decline"), ("DELETE", "/v1/upstreams/{tag}"), ("PATCH", "/v1/upstreams/{tag}"), ("POST", "/v1/upstreams/{tag}/confirm"), ("POST", "/v1/upstreams/{tag}/retry"), ("GET", "/v1/events"), ("GET", "/v1/openapi.json"), ("GET", "/v1/links/{tag}/api/{path}"), ("PUT", "/v1/links/{tag}/api/{path}"), ("POST", "/v1/links/{tag}/api/{path}"), ("DELETE", "/v1/links/{tag}/api/{path}"), ("PATCH", "/v1/links/{tag}/api/{path}")].map(|(method, path)| (method.to_string(), path.to_string())).to_vec();
 	wanted.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
 	assert_eq!(documented, wanted);
 	let mut operations = BTreeSet::new();
@@ -1788,6 +1788,39 @@ async fn an_upstream_is_previewed_declined_taken_listed_confirmed_retried_and_re
 	}
 	let retried = post("/v1/upstreams/b/retry".into(), None).await;
 	assert_eq!((retried.status, &retried.json), (200, &json!({"tag": "b"})));
+	// A choice changes what the config chooses and nothing else: the link, the keys and the trust fields stay as the file holds them, the change is saved, and a change of the exit alone is the one the running tunnel takes.
+	let held = |file: &std::path::Path| serde_json::from_str::<Value>(&std::fs::read_to_string(file).unwrap()).unwrap()["upstreams"][0].clone();
+	let before = held(&node.file);
+	let patch = |body: Value| {
+		let socket = node.socket.clone();
+		async move {call(&socket, "PATCH", "/v1/upstreams/b", &[JSON], Some(Body::from(body.to_string()))).await}
+	};
+	let chosen = patch(json!({"exit": "alt"})).await;
+	assert_eq!((chosen.status, &chosen.json["tag"], &chosen.json["live"], chosen.json["generation"].as_u64() > Some(1)), (200, &json!("b"), &json!(true), true), "{}", chosen.json);
+	assert_eq!(chosen.etag.as_deref(), Some(format!("\"{}\"", chosen.json["revision"].as_str().unwrap()).as_str()));
+	let after = held(&node.file);
+	assert_eq!(after["exit"], json!("alt"), "the choice was not saved to the config file");
+	for field in ["tag", "link", "signing_key", "private_key", "device_secret", "allow", "allow_private", "via"] {assert_eq!(before.get(field), after.get(field), "{field} was changed by a choice")}
+	assert_eq!(get(&node.socket, "/v1/config").await.json["revision"], chosen.json["revision"]);
+	let status = get(&node.socket, "/v1/upstreams").await;
+	assert_eq!((&status.json["upstreams"][0]["choice"]["exit"], &status.json["upstreams"][0]["choice"]["failover"], &status.json["upstreams"][0]["choice"]["profile"]), (&json!("alt"), &json!(false), &Value::Null), "{}", status.json);
+	let chosen = patch(json!({"profile": "home", "failover": true, "transport": "udp"})).await;
+	assert_eq!((chosen.status, &chosen.json["live"]), (200, &json!(false)), "{}", chosen.json);
+	let after = held(&node.file);
+	assert_eq!((&after["profile"], &after["failover"], &after["transport"], &after["exit"]), (&json!("home"), &json!(true), &json!("udp"), &json!("alt")), "a field that was left out changed");
+	let chosen = patch(json!({"profile": null, "failover": null, "transport": null, "exit": null})).await;
+	assert_eq!((chosen.status, &chosen.json["live"]), (200, &json!(false)), "{}", chosen.json);
+	let after = held(&node.file);
+	for field in ["profile", "failover", "transport", "exit"] {assert!(after.get(field).is_none(), "{field} is not automatic: {after}")}
+	// What does not validate changes nothing, and the problems name the field. What is not a choice is not read.
+	let revision = get(&node.socket, "/v1/config").await.json["revision"].clone();
+	let refused = patch(json!({"transport": "faketls"})).await;
+	assert_eq!((refused.status, refused.code(), &refused.json["error"]["details"][0]["path"]), (422, "config_invalid", &json!("upstreams[0].transport")), "{}", refused.json);
+	for bad in [json!({"allow": ["plain"]}), json!({"link": "veilway://sub/x"}), json!({"via": "proxy"}), json!({"allow_private": true}), json!({"private_key": "x"}), json!({"failover": "yes"}), json!({"exit": 1}), json!([1])] {
+		let refused = patch(bad.clone()).await;
+		assert_eq!((refused.status, refused.code()), (422, "body_invalid"), "{bad}: {}", refused.json);
+	}
+	assert_eq!((get(&node.socket, "/v1/config").await.json["revision"].clone(), held(&node.file)), (revision, after), "a choice that was refused changed the config");
 	// Removal tells the provider, and the upstream stays down and out of the state file.
 	let removed = call(&node.socket, "DELETE", "/v1/upstreams/b", &[], None).await;
 	assert_eq!((removed.status, &removed.json, provider.requests("leave")), (200, &json!({"tag": "b", "confirmed": true}), 1), "{}", removed.json);
