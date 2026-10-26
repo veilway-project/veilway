@@ -1378,7 +1378,7 @@ pub enum Outbound {
 		keepalive_secs: Option<u16>,
 		/// The flows through the tunnel at once. Defaults to 1024.
 		#[serde(skip_serializing_if = "Option::is_none")]
-		#[schemars(range(min = 16, max = 16384))]
+		#[schemars(range(min = 16, max = 4096))]
 		max_flows: Option<u32>,
 		/// The local address and the network interface of the UDP socket that talks to the server, as for a `direct` outbound.
 		#[serde(skip_serializing_if = "Option::is_none")]

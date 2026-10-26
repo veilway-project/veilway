@@ -1374,7 +1374,7 @@
             "max_flows": {
               "description": "The flows through the tunnel at once. Defaults to 1024.",
               "format": "uint32",
-              "maximum": 16384,
+              "maximum": 4096,
               "minimum": 16,
               "type": "integer"
             },

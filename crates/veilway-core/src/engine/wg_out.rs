@@ -1,11 +1,12 @@
 //! WireGuard outbounds (`outbounds[]` of type `wireguard`): another WireGuard server as the carrier of a `netstack` exit.
 //! The node is a WireGuard client of it. One task for each outbound owns a UDP socket connected to the server, a boringtun tunnel and the timers, and moves packets between the socket and the userspace stack of `wg_stack`, which re-dials every flow of the exit from the outbound's own addresses. The server sees every flow in clear, and its answers are untrusted bytes that only a flow this node opened may receive (`wg_stack::admit`).
 //! The server's name is looked up by the system's resolver, never through an exit, at start, every `RECHECK` and whenever the node starts a handshake again, and the last address stays while the name still resolves. An address that is loopback, in an inbound's pool or the node's own is refused, and so is a name that gives nothing else.
-//! Health is read off the handshake. The outbound is up while one is younger than `UP_WITHIN`, down when an initiation has gone unanswered for `UNANSWERED` or a send failed, and idle otherwise, which says nothing against it. While it is down a new initiation is forced after 2 s, then 4 s, doubling to 60 s, forever: nothing latches. Every change between working and down is logged at info and drives the exits that use the outbound (`watch`). A flow that finds it down fails at once with the reason, and nothing goes around it.
+//! Health is read off the handshake. The outbound is up while one is younger than `UP_WITHIN` and no initiation sent after it has gone unanswered for `UNANSWERED`, down when one has or a send failed, and idle otherwise, which says nothing against it. A datagram that comes back as an error (a refusal, an unreachable host, which anyone on the path can forge) only forces an initiation now.
+//! A supervisor awaits the stack's task and the tunnel's task: when either ends for any reason the outbound is down with that reason, and both start again with the same settings after the usual wait. While it is down a new initiation is forced after 2 s, then 4 s, doubling to 60 s, forever: nothing latches. Every change between working and down is logged at info and drives the exits that use the outbound (`watch`). A flow that finds it down fails at once with the reason, and nothing goes around it.
 use super::flows::tie;
 use super::plan::{Backend, Outbound, Plan};
 use super::upstream::forbidden;
-use super::wg_stack::{self, Counters, Fail, Stack, Udp};
+use super::wg_stack::{self, Counters, Fail, Stack, Udp, Who};
 use super::{Event, Shared};
 use crate::config::{self, random, Host};
 use boringtun::noise::errors::WireGuardError;
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::io::DuplexStream;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{interval, MissedTickBehavior};
 
 /// A handshake younger than this means the server answers.
@@ -34,6 +35,8 @@ const RETRY_MOST: Duration = Duration::from_secs(60);
 /// How often a name is looked up again, and how long the lookup may take.
 const RECHECK: Duration = Duration::from_secs(300);
 const LOOKUP: Duration = Duration::from_secs(5);
+/// The task that runs for this long is not one that is failing again at once, so its restart starts the waits over.
+const STEADY: Duration = Duration::from_secs(60);
 /// How often the tunnel's timers run.
 const TIMERS: Duration = Duration::from_millis(250);
 /// The largest datagram a tunnel is asked to write: an IP packet at its largest and the message around it.
@@ -76,11 +79,13 @@ impl Link {
 				tracing::debug!("wireguard outbound {tag}: still down, now because: {}", if let State::Down(why) = &to {why} else {""});
 				return;
 			}
-			(State::Down(_), _) => tracing::info!("wireguard outbound {tag}: the server answers again after {}s{}", was.1.elapsed().as_secs(), endpoint.map(|endpoint| format!(" at {endpoint}")).unwrap_or_default()),
+			(State::Down(_), _) => tracing::info!("wireguard outbound {tag}: the server answers again after {}s", was.1.elapsed().as_secs()),
 			(_, State::Down(why)) => tracing::info!("wireguard outbound {tag}: down, so the exits that use it do not work and nothing leaves around it; a new handshake is tried after 2s, then after longer, up to every 60s: {why}"),
-			(State::Idle, State::Up) => tracing::info!("wireguard outbound {tag}: up{}", endpoint.map(|endpoint| format!(", handshake with {endpoint}")).unwrap_or_default()),
+			(State::Idle, State::Up) => tracing::info!("wireguard outbound {tag}: up, handshake done"),
 			_ => tracing::debug!("wireguard outbound {tag}: idle, no handshake in {}s and no initiation unanswered", UP_WITHIN.as_secs()),
 		}
+		// The address the name resolved to stays out of info, which says only what the operator wrote.
+		tracing::debug!("wireguard outbound {tag}: the server's address is {endpoint:?}");
 		if matches!(before, State::Down(_)) || matches!(to, State::Down(_)) {
 			self.flips.fetch_add(1, Ordering::Relaxed);
 			self.changed.send_modify(|moved| *moved = moved.wrapping_add(1));
@@ -93,7 +98,7 @@ impl Link {
 pub struct Report {pub up: bool, pub down_secs: Option<u64>, pub why: Option<String>, pub flips: u64, pub handshake_secs: Option<u64>, pub endpoint: Option<SocketAddr>, pub flows: usize, pub unsolicited: u64, pub full: u64, pub refused: u64}
 
 /// One running WireGuard outbound. Its tasks end when the last plan that holds it is gone.
-pub struct WgOut {pub tag: String, spec: Spec, stack: Stack, counters: Arc<Counters>, link: Arc<Link>, watched: AtomicBool, tasks: [AbortHandle; 2]}
+pub struct WgOut {pub tag: String, spec: Spec, stack: Arc<Mutex<Stack>>, link: Arc<Link>, watched: AtomicBool, task: AbortHandle, #[cfg_attr(not(test), allow(dead_code))] children: Arc<Mutex<Vec<AbortHandle>>>}
 
 impl PartialEq for WgOut {
 	fn eq(&self, other: &WgOut) -> bool {std::ptr::eq(self, other)}
@@ -102,18 +107,18 @@ impl PartialEq for WgOut {
 impl Eq for WgOut {}
 
 impl Drop for WgOut {
-	fn drop(&mut self) {for task in &self.tasks {task.abort()}}
+	fn drop(&mut self) {self.task.abort()}
 }
 
 impl WgOut {
 	fn start(tag: &str, spec: Spec, is_local: fn(IpAddr) -> bool) -> WgOut {
-		let (to_stack, from_wg) = mpsc::channel(wg_stack::QUEUE);
-		let (to_wg, from_stack) = mpsc::channel(wg_stack::QUEUE);
-		let (stack, stacked) = wg_stack::start(spec.addresses.clone(), usize::from(spec.mtu), spec.max_flows, from_wg, to_wg);
 		let link = Arc::new(Link {state: Mutex::new((State::Idle, Instant::now())), flips: AtomicU64::new(0), endpoint: Mutex::new(None), handshake: Mutex::new(None), changed: watch::Sender::new(0)});
-		let task = tokio::spawn(run(tag.to_string(), spec.clone(), is_local, link.clone(), from_stack, to_stack, stack.counters.clone()));
-		WgOut {tag: tag.to_string(), counters: stack.counters.clone(), spec, stack, link, watched: AtomicBool::new(false), tasks: [stacked.abort_handle(), task.abort_handle()]}
+		let (stack, children) = (Arc::new(Mutex::new(Stack::closed())), Arc::new(Mutex::new(Vec::new())));
+		let task = tokio::spawn(supervise(tag.to_string(), spec.clone(), is_local, link.clone(), stack.clone(), children.clone()));
+		WgOut {tag: tag.to_string(), spec, stack, link, watched: AtomicBool::new(false), task: task.abort_handle(), children}
 	}
+
+	fn stack(&self) -> Stack {self.stack.lock().unwrap_or_else(|e| e.into_inner()).clone()}
 
 	/// Why the outbound cannot carry a flow right now. None while it is up or idle.
 	pub fn down(&self) -> Option<String> {if let State::Down(why) = &self.link.state.lock().unwrap_or_else(|e| e.into_inner()).0 {Some(why.clone())} else {None}}
@@ -122,15 +127,15 @@ impl WgOut {
 	pub fn has(&self, ip: IpAddr) -> bool {self.spec.addresses.iter().any(|own| own.is_ipv4() == ip.is_ipv4())}
 
 	/// A TCP connection to `to` from the outbound's address, or why there is none.
-	pub async fn connect(&self, to: SocketAddr) -> Result<DuplexStream, String> {
+	pub async fn connect(&self, to: SocketAddr, who: Who) -> Result<DuplexStream, String> {
 		if let Some(why) = self.down() {return Err(format!("wireguard outbound {} is down: {why}", self.tag))}
-		self.stack.connect(to).await.map_err(|fail| self.failed(fail))
+		self.stack().connect(to, who).await.map_err(|fail| self.failed(fail))
 	}
 
 	/// A UDP flow to `to` from a port of the outbound's address, or why there is none.
-	pub async fn udp(&self, to: SocketAddr) -> Result<Udp, String> {
+	pub async fn udp(&self, to: SocketAddr, who: Who) -> Result<Udp, String> {
 		if let Some(why) = self.down() {return Err(format!("wireguard outbound {} is down: {why}", self.tag))}
-		self.stack.udp(to).await.map_err(|fail| self.failed(fail))
+		self.stack().udp(to, who).await.map_err(|fail| self.failed(fail))
 	}
 
 	fn failed(&self, fail: Fail) -> String {
@@ -144,9 +149,9 @@ impl WgOut {
 	}
 
 	pub fn report(&self) -> Report {
-		let (state, since) = self.link.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+		let (state, since, counters) = {let (state, since) = self.link.state.lock().unwrap_or_else(|e| e.into_inner()).clone(); (state, since, self.stack().counters)};
 		let down = if let State::Down(why) = &state {Some(why.clone())} else {None};
-		Report {up: down.is_none(), down_secs: down.as_ref().map(|_| since.elapsed().as_secs()), why: down, flips: self.link.flips.load(Ordering::Relaxed), handshake_secs: self.link.handshake.lock().unwrap_or_else(|e| e.into_inner()).map(|age| age.as_secs()), endpoint: *self.link.endpoint.lock().unwrap_or_else(|e| e.into_inner()), flows: self.counters.flows.load(Ordering::Relaxed), unsolicited: self.counters.unsolicited.load(Ordering::Relaxed), full: self.counters.full.load(Ordering::Relaxed), refused: self.counters.refused.load(Ordering::Relaxed)}
+		Report {up: down.is_none(), down_secs: down.as_ref().map(|_| since.elapsed().as_secs()), why: down, flips: self.link.flips.load(Ordering::Relaxed), handshake_secs: self.link.handshake.lock().unwrap_or_else(|e| e.into_inner()).map(|age| age.as_secs()), endpoint: *self.link.endpoint.lock().unwrap_or_else(|e| e.into_inner()), flows: counters.flows.load(Ordering::Relaxed), unsolicited: counters.unsolicited.load(Ordering::Relaxed), full: counters.full.load(Ordering::Relaxed), refused: counters.refused.load(Ordering::Relaxed)}
 	}
 }
 
@@ -178,7 +183,7 @@ impl WgOuts {
 		list.retain(|(_, held)| match held.upgrade() {
 			Some(out) if Arc::ptr_eq(&out, current) => true,
 			Some(old) => {
-				for task in &old.tasks {task.abort()}
+				old.task.abort();
 				false
 			}
 			None => false,
@@ -223,6 +228,35 @@ async fn open(spec: &Spec, to: SocketAddr) -> std::io::Result<UdpSocket> {
 	Ok(socket)
 }
 
+/// Aborts a task when it is dropped, so that a supervisor that is aborted takes its children with it.
+struct Guard(JoinHandle<()>);
+
+impl Drop for Guard {
+	fn drop(&mut self) {self.0.abort()}
+}
+
+/// Runs the stack and the tunnel, and starts both again when either ends, which only a panic or an abort does. The outbound is down meanwhile, since a tunnel without its stack (or the other way round) carries nothing and would otherwise stay as it was.
+async fn supervise(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Link>, slot: Arc<Mutex<Stack>>, children: Arc<Mutex<Vec<AbortHandle>>>) {
+	let mut wait = RETRY_FIRST;
+	loop {
+		let (to_stack, from_wg) = mpsc::channel(wg_stack::QUEUE);
+		let (to_wg, from_stack) = mpsc::channel(wg_stack::QUEUE);
+		let (stack, stacked) = wg_stack::start(spec.addresses.clone(), usize::from(spec.mtu), spec.max_flows, from_wg, to_wg);
+		*slot.lock().unwrap_or_else(|e| e.into_inner()) = stack.clone();
+		let (began, mut stacked, mut running) = (Instant::now(), Guard(stacked), Guard(tokio::spawn(run(tag.clone(), spec.clone(), is_local, link.clone(), from_stack, to_stack, stack.counters.clone()))));
+		*children.lock().unwrap_or_else(|e| e.into_inner()) = vec![stacked.0.abort_handle(), running.0.abort_handle()];
+		let which = tokio::select! {
+			_ = &mut stacked.0 => "the stack",
+			_ = &mut running.0 => "the tunnel",
+		};
+		drop((stacked, running));
+		link.set(&tag, State::Down("the outbound's task ended".to_string()));
+		tracing::info!("wireguard outbound {tag}: the task of {which} ended, so both start again in {}s", wait.as_secs());
+		tokio::time::sleep(wait).await;
+		wait = if began.elapsed() >= STEADY {RETRY_FIRST} else {(wait * 2).min(RETRY_MOST)};
+	}
+}
+
 /// Looks the server up in a task of its own, so that a slow resolver holds no packet up.
 fn look(spec: &Spec, is_local: fn(IpAddr) -> bool, current: Option<IpAddr>) -> oneshot::Receiver<Result<IpAddr, String>> {
 	let (reply, answer) = oneshot::channel();
@@ -237,6 +271,8 @@ async fn run(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Li
 	tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 	// Why the outbound cannot work and since when, which the first handshake after it ends. The first initiation not answered since the last handshake. The time of the next attempt while down and the wait after it. The last lookup of the name and the one in flight.
 	let (mut fault, mut asked, mut retry, mut retry_at, mut looked, mut lookup) = (None::<(String, Instant)>, None::<Instant>, RETRY_FIRST, Instant::now(), None::<Instant>, None::<oneshot::Receiver<Result<IpAddr, String>>>);
+	// An initiation asked for by an error from the socket, and when the last one was, so that forged errors cannot make a stream of initiations.
+	let (mut force, mut forced) = (false, Instant::now().checked_sub(RETRY_FIRST).unwrap_or_else(Instant::now));
 	loop {
 		// What this pass has to send, in the order the tunnel wrote it.
 		let mut sending: Vec<Vec<u8>> = Vec::new();
@@ -251,7 +287,7 @@ async fn run(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Li
 								input = &[];
 							}
 							TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => {
-								if to_stack.try_send(packet.to_vec()).is_err() {counters.full.fetch_add(1, Ordering::Relaxed);}
+								if packet.len() > usize::from(spec.mtu) {counters.unsolicited.fetch_add(1, Ordering::Relaxed);} else if to_stack.try_send(packet.to_vec()).is_err() {counters.full.fetch_add(1, Ordering::Relaxed);}
 								break;
 							}
 							TunnResult::Done => break,
@@ -262,7 +298,11 @@ async fn run(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Li
 						}
 					}
 				}
-				Err(e) => fault = Some((format!("the server's port refused a datagram: {}", e.kind()), Instant::now())),
+				Err(e) => {
+					// An error that came back for a datagram says nothing sure: anyone on the path can forge it. It forces a handshake, and only a handshake that is not answered makes the outbound down.
+					tracing::debug!("wireguard outbound {tag}: the socket reported {} for a datagram", e.kind());
+					force = true;
+				}
 			},
 			Some(raw) = from_stack.recv() => {
 				let (mut next, mut taken) = (Some(raw), 0);
@@ -302,12 +342,16 @@ async fn run(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Li
 			if now.checked_sub(age).is_some_and(|shaken| shaken > *at) {fault = None}
 		}
 		let down = matches!(link.state.lock().unwrap_or_else(|e| e.into_inner()).0, State::Down(_));
-		if age.is_some_and(|age| age < UP_WITHIN) && fault.is_none() {
-			(asked, retry) = (None, RETRY_FIRST);
+		// An initiation is answered when a handshake finished after it was sent. The tunnel sends its own while a server is silent, and none of them clears the wait of the first.
+		if let (Some(since), Some(shaken)) = (asked, age.and_then(|age| now.checked_sub(age))) {
+			if shaken > since {(asked, retry) = (None, RETRY_FIRST)}
+		}
+		let unanswered = asked.is_some_and(|since| now.duration_since(since) >= UNANSWERED);
+		if age.is_some_and(|age| age < UP_WITHIN) && fault.is_none() && !unanswered {
 			link.set(&tag, State::Up);
 		} else if let Some((why, _)) = &fault {
 			link.set(&tag, State::Down(why.clone()));
-		} else if asked.is_some_and(|since| now.duration_since(since) >= UNANSWERED) {
+		} else if unanswered {
 			link.set(&tag, State::Down(format!("the server did not answer a handshake for {}s", UNANSWERED.as_secs())));
 		} else if !down {
 			link.set(&tag, State::Idle);
@@ -324,6 +368,13 @@ async fn run(tag: String, spec: Spec, is_local: fn(IpAddr) -> bool, link: Arc<Li
 			retry_at = now + retry;
 			if down {retry = (retry * 2).min(RETRY_MOST)}
 		}
+		if force && now >= forced + RETRY_FIRST {
+			forced = now;
+			if socket.is_some() {
+				if let TunnResult::WriteToNetwork(datagram) = tunn.format_handshake_initiation(&mut out, true) {sending.push(datagram.to_vec())}
+			}
+		}
+		force = false;
 		if lookup.is_none() && matches!(spec.server.host, Host::Name(_)) && looked.is_some_and(|at| now >= at + RECHECK) {(looked, lookup) = (Some(now), Some(look(&spec, is_local, address)))}
 		if let Some(socket) = &socket {
 			for datagram in sending {
@@ -363,5 +414,29 @@ pub(super) fn watch(shared: &Arc<Shared>, plan: &Plan) {
 				if changes.changed().await.is_err() {return}
 			}
 		});
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use tokio::time::sleep;
+
+	/// A task that ends, whichever it is, is not left behind as an outbound that looks up: it is down with that reason and both tasks run again, with a stack that takes flows.
+	#[tokio::test]
+	async fn a_task_that_ends_makes_the_outbound_down_and_both_start_again() {
+		let spec = Spec {server: config::HostPort {host: Host::Ip("198.51.100.7".parse().unwrap()), port: 51820}, public_key: [3; 32], private_key: [4; 32], preshared_key: None, addresses: vec!["10.64.0.2".parse().unwrap()], mtu: 1420, keepalive: 0, max_flows: 16, bind: None, interface: None, pools: Vec::new()};
+		let out = WgOut::start("t", spec, |_| false);
+		sleep(Duration::from_millis(200)).await;
+		for which in 0..2 {
+			out.children.lock().unwrap()[which].abort();
+			sleep(Duration::from_millis(500)).await;
+			assert_eq!(out.down().as_deref(), Some("the outbound's task ended"), "task {which} ended and the outbound looks as it did");
+			assert!(out.connect("198.51.100.9:80".parse().unwrap(), Who::Dns).await.is_err(), "a flow was taken by an outbound with no tasks");
+			// The first wait is 2 s and the next 4 s.
+			sleep(Duration::from_secs(5)).await;
+			assert!(out.children.lock().unwrap().iter().all(|child| !child.is_finished()), "task {which} was not started again");
+			assert!(out.stack().udp("198.51.100.9:53".parse().unwrap(), Who::Dns).await.is_ok(), "the stack of the new tasks does not take flows");
+		}
 	}
 }

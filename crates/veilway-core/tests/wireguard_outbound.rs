@@ -4,7 +4,7 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use etherparse::PacketBuilder;
 use serde_json::{json, Value};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -341,11 +341,12 @@ async fn a_server_that_stops_makes_the_exit_down_and_one_that_returns_makes_it_w
 
 #[tokio::test]
 async fn max_flows_refuses_the_next_flow_and_a_closed_one_frees_a_place() {
-	let Some(net) = net(|o| o["max_flows"] = json!(16)).await else {return};
+	// Of 64 flows a user holds 16 at the most (a quarter), so alice meets the share before the stack is full.
+	let Some(net) = net(|o| o["max_flows"] = json!(64)).await else {return};
 	let mut held = Vec::new();
 	for at in 0..16 {held.push(connect(net.socks, &encode(&net.echo)).await.unwrap_or_else(|code| panic!("flow {at} was refused with {code}")))}
 	assert_eq!(report(&net.near).flows, 16);
-	assert!(connect(net.socks, &encode(&net.echo)).await.is_err(), "a flow past max_flows was carried");
+	assert!(connect(net.socks, &encode(&net.echo)).await.is_err(), "a flow past the user's share of max_flows was carried");
 	assert_eq!(report(&net.near).refused, 1);
 	drop(held.pop());
 	sleep(Duration::from_millis(500)).await;
@@ -378,18 +379,20 @@ async fn a_server_that_resolves_to_an_address_the_node_never_dials_is_refused_an
 	assert!(connect(socks, &encode(&SocketAddr::new(own, 9))).await.is_err());
 }
 
-/// A server that is a test's own end of the tunnel: it answers the handshake, counts the IP packets the node sends it, and sends what the test hands it.
-async fn hostile(listen: SocketAddr, private: u8, client: u8) -> (mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>) {
+/// A server that is a test's own end of the tunnel: it answers the handshake, counts the IP packets the node sends it, and sends what the test hands it. While the flag it also returns is set it reads nothing and sends nothing, as a server whose path went dead.
+async fn hostile(listen: SocketAddr, private: u8, client: u8) -> (mpsc::Sender<Vec<u8>>, Arc<AtomicUsize>, Arc<AtomicBool>) {
 	let socket = UdpSocket::bind(listen).await.unwrap();
 	let (inject, mut injected) = mpsc::channel::<Vec<u8>>(64);
 	let received = Arc::new(AtomicUsize::new(0));
-	let counted = received.clone();
+	let (counted, mute) = (received.clone(), Arc::new(AtomicBool::new(false)));
+	let muted = mute.clone();
 	tokio::spawn(async move {
 		let mut tunn = Tunn::new(StaticSecret::from([private; 32]), PublicKey::from(veilway_wg::public_key(&[client; 32])), None, None, 7, None);
 		let (mut peer, mut buffer, mut out) = (None::<SocketAddr>, vec![0u8; 65535], vec![0u8; 65535 + 64]);
 		loop {
 			tokio::select! {
 				Ok((n, from)) = socket.recv_from(&mut buffer) => {
+					if muted.load(Ordering::Relaxed) {continue}
 					peer = Some(from);
 					let mut input = &buffer[..n];
 					loop {
@@ -407,22 +410,24 @@ async fn hostile(listen: SocketAddr, private: u8, client: u8) -> (mpsc::Sender<V
 					}
 				}
 				Some(packet) = injected.recv() => {
+					if muted.load(Ordering::Relaxed) {continue}
 					if let (Some(to), TunnResult::WriteToNetwork(datagram)) = (peer, tunn.encapsulate(&packet, &mut out)) {let _ = socket.send_to(datagram, to).await;}
 				}
 				_ = sleep(Duration::from_millis(250)) => {
+					if muted.load(Ordering::Relaxed) {continue}
 					if let (Some(to), TunnResult::WriteToNetwork(datagram)) = (peer, tunn.update_timers(&mut out)) {let _ = socket.send_to(datagram, to).await;}
 				}
 			}
 		}
 	});
-	(inject, received)
+	(inject, received, mute)
 }
 
 #[tokio::test]
 async fn what_the_server_sends_unasked_is_dropped_and_never_answered() {
 	let Some(own) = own() else {return};
 	let (listen, socks, dns) = (free(own), free("127.0.0.1".parse().unwrap()), dns(own, own).await);
-	let (inject, received) = hostile(listen, 0x51, 0x61).await;
+	let (inject, received, _) = hostile(listen, 0x51, 0x61).await;
 	let near = start(&near_doc(&listen.to_string(), dns, socks, |_| {})).await;
 	until(&near, 10, "the handshake with the hostile server", |now| now.handshake_secs.is_some()).await;
 	let (mine, theirs) = ([10, 9, 0, 2], [198, 51, 100, 1]);
@@ -450,4 +455,22 @@ async fn what_the_server_sends_unasked_is_dropped_and_never_answered() {
 	assert_eq!(counted.flows, 0);
 	let again = report(&near);
 	assert!(again.up && again.unsolicited >= sent as u64, "{again:?}: a hostile server made the outbound go down");
+}
+
+#[tokio::test]
+async fn a_server_that_goes_silent_is_down_within_25_seconds_and_up_again_when_it_answers() {
+	let Some(own) = own() else {return};
+	let (listen, socks, dns) = (free(own), free("127.0.0.1".parse().unwrap()), dns(own, own).await);
+	let (_inject, _received, mute) = hostile(listen, 0x51, 0x61).await;
+	let near = start(&near_doc(&listen.to_string(), dns, socks, |_| {})).await;
+	until(&near, 10, "the handshake with the server", |now| now.handshake_secs.is_some() && now.up).await;
+	mute.store(true, Ordering::Relaxed);
+	let began = Instant::now();
+	let down = until(&near, 60, "the outbound going down while the server says nothing", |now| !now.up).await;
+	let took = began.elapsed();
+	eprintln!("a silent server made the outbound down after {:.1} s: {:?}", took.as_secs_f64(), down.why);
+	assert!(took < Duration::from_secs(25), "down after {took:?}");
+	mute.store(false, Ordering::Relaxed);
+	let up = until(&near, 90, "the outbound coming back when the server answers", |now| now.up).await;
+	assert!(up.flips >= 2, "{up:?}");
 }

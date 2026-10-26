@@ -426,9 +426,10 @@ impl Config {
 				let inside = pools.iter().any(|(pool, _)| pool.contains(address));
 				if inside || address.is_loopback() || address.is_multicast() || address.is_unspecified() || matches!(address, IpAddr::V4(v4) if v4.is_broadcast()) {r.error(format!("{at}.addresses[{j}]"), if inside {"expected an address outside every inbound's pool: this one is inside one"} else {"expected a host address inside the tunnel: not loopback, multicast or unspecified"})}
 			}
+			r.warning(&at, "users routed through this outbound reach whatever the WireGuard server's own network reaches, its other peers included, unless a rule refuses those ranges: the node's gate only refuses the node's own addresses and networks");
 			if mtu.is_some_and(|mtu| !(1280..=1500).contains(&mtu)) {r.error(format!("{at}.mtu"), "expected an integer from 1280 to 1500")}
 			if keepalive_secs.is_some_and(|secs| secs > 3600) {r.error(format!("{at}.keepalive_secs"), "expected 0 for none, or an integer from 1 to 3600")}
-			if max_flows.is_some_and(|flows| !(16..=16384).contains(&flows)) {r.error(format!("{at}.max_flows"), "expected an integer from 16 to 16384")}
+			if max_flows.is_some_and(|flows| !(16..=4096).contains(&flows)) {r.error(format!("{at}.max_flows"), "expected an integer from 16 to 4096")}
 		}
 		// Outbound chaining, "Outbounds": the named outbound must be a socks5 one, following `via` from any outbound must not come back to it, and a chain holds at most `MAX_CHAIN` of them.
 		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..})), _ => None};

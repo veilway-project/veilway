@@ -41,7 +41,7 @@ fn clean(outbound: Value) {
 fn the_minimal_form_and_every_setting_are_valid() {
 	clean(wireguard());
 	clean(json!({"type": "wireguard", "tag": "up", "server": "198.51.100.7:51820", "public_key": key(0x31), "private_key": key(0x32), "preshared_key": key(0x33), "addresses": ["10.64.0.2/32", "fd00:64::2/128"], "mtu": 1280, "keepalive_secs": 0, "max_flows": 16, "bind": "192.0.2.9", "interface": "eth1"}));
-	clean(json!({"type": "wireguard", "tag": "up", "server": "vpn.example:51820", "public_key": key(0x31), "private_key": key(0x32), "addresses": ["fd00:64::2"], "mtu": 1500, "keepalive_secs": 3600, "max_flows": 16384}));
+	clean(json!({"type": "wireguard", "tag": "up", "server": "vpn.example:51820", "public_key": key(0x31), "private_key": key(0x32), "addresses": ["fd00:64::2"], "mtu": 1500, "keepalive_secs": 3600, "max_flows": 4096}));
 	clean(json!({"type": "wireguard", "tag": "up", "server": "192.168.1.5:51820", "public_key": key(0x31), "private_key": key(0x32), "addresses": ["10.64.0.2"]}));
 	clean(json!({"type": "wireguard", "tag": "up", "server": "[2001:db8::7]:51820", "public_key": key(0x31), "private_key": key(0x32), "addresses": ["10.64.0.2"]}));
 }
@@ -76,7 +76,7 @@ fn what_the_node_may_not_dial_or_hold_is_refused() {
 	refused("outbounds[2].mtu", |o| o["mtu"] = json!(1501));
 	refused("outbounds[2].keepalive_secs", |o| o["keepalive_secs"] = json!(3601));
 	refused("outbounds[2].max_flows", |o| o["max_flows"] = json!(15));
-	refused("outbounds[2].max_flows", |o| o["max_flows"] = json!(16385));
+	refused("outbounds[2].max_flows", |o| o["max_flows"] = json!(4097));
 	refused("outbounds[2].bind", |o| o["bind"] = json!("0.0.0.0"));
 	refused("outbounds[2].interface", |o| o["interface"] = json!("a b"));
 	refused("outbounds[2].interface", |o| o["interface"] = json!("x".repeat(16)));
@@ -163,6 +163,7 @@ fn an_exit_through_one_has_no_way_around_it_and_a_name_and_a_fallback_are_said()
 	named["server"] = json!("vpn.example:51820");
 	assert!(check(&node(named)).warnings.iter().any(|warning| warning.path == "outbounds[2].server"), "a name that the system's resolver looks up says so");
 	assert!(!check(&node(wireguard())).warnings.iter().any(|warning| warning.path == "outbounds[2].server"));
+	assert!(check(&node(wireguard())).warnings.iter().any(|warning| warning.path == "outbounds[2]" && warning.message.contains("other peers")), "the server's own network and peers are reachable unless a rule refuses them");
 	let mut doc = node(wireguard());
 	doc["exits"][1]["backend"]["proxy_only"] = json!(true);
 	assert!(check(&doc).errors.is_empty(), "the exit through it is a proxied one, so proxy_only is its default");

@@ -30,7 +30,7 @@ const IDLE: Duration = Duration::from_secs(MAX_TCP_IDLE_SECS as u64 + 60);
 /// How often the task looks at its deadlines when nothing else wakes it.
 const TICK: Duration = Duration::from_secs(5);
 /// What a connection's socket buffers coming in and going out, and its pipe to the flow's task. A receive buffer over 64 KiB turns on window scaling.
-const RECEIVE: usize = 262_144;
+const RECEIVE: usize = 131_072;
 const SEND: usize = 65_536;
 const PIPE: usize = 32768;
 /// A socket that hears nothing for `DEAD` is aborted, and a quiet but live one is probed every `PROBE`.
@@ -41,6 +41,15 @@ const CHUNK: usize = 16384;
 /// The datagrams a UDP flow holds on each side, and the bytes of each.
 const DATAGRAMS: usize = 16;
 const DATAGRAM: usize = 2048;
+/// The datagrams that wait between a UDP flow's task and the stack, in each direction.
+const UDP_QUEUE: usize = 64;
+/// The flows that only the node's own DNS lookups may use, or a quarter of `max_flows` when that is less, so users filling the stack never leave the resolver without a way out.
+const RESERVED: usize = 16;
+/// The most of an outbound's flows that one user may hold is a quarter of `max_flows`, and never fewer than this.
+const SHARE_LEAST: usize = 16;
+/// Header bytes of a UDP datagram inside an IP packet.
+const UDP_HEADERS: usize = 28;
+const UDP_HEADERS_V6: usize = 48;
 
 /// Why a connection or a flow was not made. The caller says the reason in its log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,12 +83,12 @@ pub(super) struct Counters {
 pub(super) struct Stack {commands: mpsc::Sender<Command>, pub counters: Arc<Counters>}
 
 /// A UDP flow: what the flow's task sends goes out from a port of the stack to the one destination, and what that destination sends back comes out of `recv`.
-pub struct Udp {to: mpsc::Sender<Vec<u8>>, from: mpsc::Receiver<Vec<u8>>, wake: Arc<Wake>}
+pub struct Udp {to: mpsc::Sender<Vec<u8>>, from: mpsc::Receiver<Vec<u8>>, wake: Arc<Wake>, most: usize}
 
 impl Udp {
-	/// Whether the datagram was taken. False when the stack is gone, and when it is full, which drops it like a full queue anywhere.
+	/// Whether the datagram was taken. False when the stack is gone, when it is full, which drops it like a full queue anywhere, and when it is too large for the MTU, which the stack would never send whole.
 	pub fn send(&self, datagram: &[u8]) -> bool {
-		let taken = self.to.try_send(datagram.to_vec()).is_ok();
+		let taken = datagram.len() <= self.most && self.to.try_send(datagram.to_vec()).is_ok();
 		self.wake.0.notify_one();
 		taken
 	}
@@ -93,23 +102,30 @@ impl Drop for Udp {
 	fn drop(&mut self) {self.wake.0.notify_one()}
 }
 
+/// Whose a flow is, which decides how many of them it may hold: a user (index in the plan's users) has its share, the node's own sockets (the decoy of a `tls` transport) count as one holder, and a DNS lookup of the node's resolver may also use the reserved places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Who {User(usize), Node, Dns}
+
 enum Command {
-	Connect(SocketAddr, oneshot::Sender<Result<DuplexStream, Fail>>),
-	Udp(SocketAddr, oneshot::Sender<Result<Udp, Fail>>),
+	Connect(SocketAddr, Who, oneshot::Sender<Result<DuplexStream, Fail>>),
+	Udp(SocketAddr, Who, oneshot::Sender<Result<Udp, Fail>>),
 }
 
 impl Stack {
+	/// A stack that is gone: everything asked of it fails as `Fail::Down`. What an outbound holds before its first stack runs.
+	pub(super) fn closed() -> Stack {Stack {commands: mpsc::channel(1).0, counters: Arc::default()}}
+
 	/// A TCP connection inside the tunnel. The stream is the far side's, already open.
-	pub(super) async fn connect(&self, to: SocketAddr) -> Result<DuplexStream, Fail> {
+	pub(super) async fn connect(&self, to: SocketAddr, who: Who) -> Result<DuplexStream, Fail> {
 		let (reply, answer) = oneshot::channel();
-		self.commands.send(Command::Connect(to, reply)).await.map_err(|_| Fail::Down)?;
+		self.commands.send(Command::Connect(to, who, reply)).await.map_err(|_| Fail::Down)?;
 		answer.await.map_err(|_| Fail::Down)?
 	}
 
 	/// A UDP flow to `to` from a port of the stack.
-	pub(super) async fn udp(&self, to: SocketAddr) -> Result<Udp, Fail> {
+	pub(super) async fn udp(&self, to: SocketAddr, who: Who) -> Result<Udp, Fail> {
 		let (reply, answer) = oneshot::channel();
-		self.commands.send(Command::Udp(to, reply)).await.map_err(|_| Fail::Down)?;
+		self.commands.send(Command::Udp(to, who, reply)).await.map_err(|_| Fail::Down)?;
 		answer.await.map_err(|_| Fail::Down)?
 	}
 }
@@ -162,9 +178,9 @@ fn draw_port() -> u16 {
 	33000 + u16::from_le_bytes(bytes) % 27000
 }
 
-struct Flow {handle: SocketHandle, port: u16, remote: SocketAddr, app: DuplexStream, peer: Option<DuplexStream>, reply: Option<oneshot::Sender<Result<DuplexStream, Fail>>>, started: Instant, idle_at: Instant, out: Vec<u8>, written: usize, client_eof: bool, far_done: bool, shut: bool, done: bool}
+struct Flow {who: Who, handle: SocketHandle, port: u16, remote: SocketAddr, app: DuplexStream, peer: Option<DuplexStream>, reply: Option<oneshot::Sender<Result<DuplexStream, Fail>>>, started: Instant, idle_at: Instant, out: Vec<u8>, written: usize, client_eof: bool, far_done: bool, shut: bool, done: bool}
 
-struct UdpFlow {handle: SocketHandle, port: u16, remote: SocketAddr, from: mpsc::Receiver<Vec<u8>>, to: mpsc::Sender<Vec<u8>>, done: bool}
+struct UdpFlow {who: Who, handle: SocketHandle, port: u16, remote: SocketAddr, from: mpsc::Receiver<Vec<u8>>, to: mpsc::Sender<Vec<u8>>, done: bool}
 
 /// The smoltcp interface for the outbound's addresses. Every address is on the link: there are no neighbours to ask and no route to look up.
 fn interface(device: &mut Wire, mtu: usize, own: &[IpAddr], now: Clock) -> Interface {
@@ -334,12 +350,15 @@ async fn run(own: Arc<[IpAddr]>, mtu: usize, max_flows: usize, mut commands: mps
 				}
 			}
 			Some(command) = commands.recv() => {
-				let (taken, port) = (flows.len() + datagrams.len() >= max_flows, (0..16).map(|_| draw_port()).find(|port| !ports.contains(port)));
-				let to = match &command {Command::Connect(to, _) | Command::Udp(to, _) => *to};
+				let (to, who) = match &command {Command::Connect(to, who, _) | Command::Udp(to, who, _) => (*to, *who)};
+				let (open, mine) = (flows.len() + datagrams.len(), flows.iter().map(|flow| flow.who).chain(datagrams.iter().map(|flow| flow.who)).filter(|held| *held == who).count());
+				// Everyone but the resolver stops short of the reserved places, and a user stops at its share.
+				let taken = open >= max_flows || (who != Who::Dns && (open >= max_flows - (max_flows / 4).min(RESERVED) || mine >= SHARE_LEAST.max(max_flows / 4)));
+				let port = (0..16).map(|_| draw_port()).find(|port| !ports.contains(port));
 				let local = own.iter().find(|address| address.is_ipv4() == to.is_ipv4()).copied();
 				let refuse = |command: Command, fail: Fail| match command {
-					Command::Connect(_, reply) => drop(reply.send(Err(fail))),
-					Command::Udp(_, reply) => drop(reply.send(Err(fail))),
+					Command::Connect(_, _, reply) => drop(reply.send(Err(fail))),
+					Command::Udp(_, _, reply) => drop(reply.send(Err(fail))),
 				};
 				let (Some(local), Some(port)) = (local, port) else {
 					refuse(command, if local.is_none() {Fail::Unsupported} else {Fail::Busy});
@@ -351,7 +370,7 @@ async fn run(own: Arc<[IpAddr]>, mtu: usize, max_flows: usize, mut commands: mps
 					continue;
 				}
 				match command {
-					Command::Connect(to, reply) => {
+					Command::Connect(to, who, reply) => {
 						let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; RECEIVE]), tcp::SocketBuffer::new(vec![0u8; SEND]));
 						socket.set_nagle_enabled(false);
 						socket.set_timeout(Some(DEAD));
@@ -363,19 +382,19 @@ async fn run(own: Arc<[IpAddr]>, mtu: usize, max_flows: usize, mut commands: mps
 						let (app, peer) = duplex(PIPE);
 						ports.insert(port);
 						known.insert((6, to, port));
-						flows.push(Flow {handle: sockets.add(socket), port, remote: to, app, peer: Some(peer), reply: Some(reply), started: Instant::now(), idle_at: Instant::now() + IDLE, out: Vec::new(), written: 0, client_eof: false, far_done: false, shut: false, done: false});
+						flows.push(Flow {who, handle: sockets.add(socket), port, remote: to, app, peer: Some(peer), reply: Some(reply), started: Instant::now(), idle_at: Instant::now() + IDLE, out: Vec::new(), written: 0, client_eof: false, far_done: false, shut: false, done: false});
 					}
-					Command::Udp(to, reply) => {
+					Command::Udp(to, who, reply) => {
 						let mut socket = udp::Socket::new(udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; DATAGRAMS], vec![0u8; DATAGRAMS * DATAGRAM]), udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; DATAGRAMS], vec![0u8; DATAGRAMS * DATAGRAM]));
 						if socket.bind(IpListenEndpoint {addr: Some(IpAddress::from(local)), port}).is_err() {
 							let _ = reply.send(Err(Fail::Busy));
 							continue;
 						}
-						let ((out_to, out_from), (in_to, in_from)) = (mpsc::channel(QUEUE), mpsc::channel(QUEUE));
+						let ((out_to, out_from), (in_to, in_from)) = (mpsc::channel(UDP_QUEUE), mpsc::channel(UDP_QUEUE));
 						ports.insert(port);
 						known.insert((17, to, port));
-						datagrams.push(UdpFlow {handle: sockets.add(socket), port, remote: to, from: out_from, to: in_to, done: false});
-						let _ = reply.send(Ok(Udp {to: out_to, from: in_from, wake: wake.clone()}));
+						datagrams.push(UdpFlow {who, handle: sockets.add(socket), port, remote: to, from: out_from, to: in_to, done: false});
+						let _ = reply.send(Ok(Udp {to: out_to, from: in_from, wake: wake.clone(), most: mtu.saturating_sub(if to.is_ipv4() {UDP_HEADERS} else {UDP_HEADERS_V6})}));
 					}
 				}
 			}
@@ -396,8 +415,8 @@ pub async fn drive(input: &[u8]) -> Result<(), String> {
 	let (own, remote) = ([IpAddr::from([10, 64, 0, 2]), IpAddr::from([0xfd00u16, 0x64, 0, 0, 0, 0, 0, 2])], SocketAddr::from(([198, 51, 100, 7], 443)));
 	let ((to_stack, from_wg), (to_wg, mut from_stack)) = (mpsc::channel(QUEUE), mpsc::channel(QUEUE));
 	let (stack, task) = start(own.to_vec(), 1420, 4, from_wg, to_wg);
-	let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote).await}});
-	let flow = stack.udp(remote).await.map_err(|fail| format!("{fail:?}"))?;
+	let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote, Who::Node).await}});
+	let flow = stack.udp(remote, Who::Node).await.map_err(|fail| format!("{fail:?}"))?;
 	flow.send(b"fuzz");
 	let (mut tcp, mut udp) = (None::<(u16, u32)>, None::<u16>);
 	let mut input = input;
@@ -547,7 +566,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_connection_opens_carries_bytes_and_is_heard_from_its_own_peer_only() {
 		let (stack, to_stack, mut from_stack, task) = stack(vec![own()], 16);
-		let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote(443)).await}});
+		let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote(443), Who::Node).await}});
 		let (port, seq) = syn(&mut from_stack).await;
 		// The right answer from the wrong port, and a segment of no connection at all: dropped, counted, never answered.
 		to_stack.send(build!(PacketBuilder::ipv4(REMOTE, OWN, 64).tcp(444, port, 5000, 65535).syn().ack(seq + 1), &[])).await.unwrap();
@@ -571,7 +590,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_reset_from_the_far_side_refuses_the_connection_and_frees_its_place() {
 		let (stack, to_stack, mut from_stack, task) = stack(vec![own()], 16);
-		let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote(81)).await}});
+		let connecting = tokio::spawn({let stack = stack.clone(); async move {stack.connect(remote(81), Who::Node).await}});
 		let (port, seq) = syn(&mut from_stack).await;
 		to_stack.send(build!(PacketBuilder::ipv4(REMOTE, OWN, 64).tcp(81, port, 0, 0).rst().ack(seq + 1), &[])).await.unwrap();
 		let refused = timeout(Duration::from_secs(1), connecting).await.expect("the reset was not heard").unwrap();
@@ -584,23 +603,49 @@ mod tests {
 	#[tokio::test]
 	async fn flows_past_max_flows_and_of_a_family_without_an_address_are_refused() {
 		let (stack, _to_stack, mut from_stack, task) = stack(vec![own()], 2);
-		let held: Vec<_> = (0..2).map(|at| {let stack = stack.clone(); tokio::spawn(async move {stack.connect(remote(1000 + at)).await})}).collect();
+		let held: Vec<_> = (0..2).map(|at| {let stack = stack.clone(); tokio::spawn(async move {stack.connect(remote(1000 + at), Who::Node).await})}).collect();
 		syn(&mut from_stack).await;
 		syn(&mut from_stack).await;
-		assert_eq!(stack.connect(remote(2000)).await.err(), Some(Fail::Busy));
-		assert_eq!(stack.udp(remote(2000)).await.err(), Some(Fail::Busy), "a UDP flow counts as one");
+		assert_eq!(stack.connect(remote(2000), Who::Node).await.err(), Some(Fail::Busy));
+		assert_eq!(stack.udp(remote(2000), Who::Node).await.err(), Some(Fail::Busy), "a UDP flow counts as one");
 		assert_eq!(stack.counters.refused.load(Ordering::Relaxed), 2);
-		assert_eq!(stack.connect(SocketAddr::new("2001:db8::1".parse().unwrap(), 80)).await.err(), Some(Fail::Unsupported));
-		assert_eq!(stack.udp(SocketAddr::new("2001:db8::1".parse().unwrap(), 80)).await.err(), Some(Fail::Unsupported));
+		assert_eq!(stack.connect(SocketAddr::new("2001:db8::1".parse().unwrap(), 80), Who::Node).await.err(), Some(Fail::Unsupported));
+		assert_eq!(stack.udp(SocketAddr::new("2001:db8::1".parse().unwrap(), 80), Who::Node).await.err(), Some(Fail::Unsupported));
 		assert_eq!(stack.counters.refused.load(Ordering::Relaxed), 2, "a family it has no address of is no flow refused for max_flows");
 		for flow in held {flow.abort()}
 		task.abort();
 	}
 
 	#[tokio::test]
+	async fn one_user_holds_a_quarter_of_the_flows_and_the_reserved_places_are_the_resolvers() {
+		let (stack, _to_stack, _from_stack, task) = stack(vec![own()], 64);
+		let held: Vec<_> = (0..48).map(|at| {let stack = stack.clone(); tokio::spawn(async move {stack.connect(remote(1000 + at), Who::User(usize::from(at) / 16)).await})}).collect();
+		settle().await;
+		assert_eq!(stack.counters.flows.load(Ordering::Relaxed), 48);
+		assert_eq!(stack.connect(remote(2000), Who::User(0)).await.err(), Some(Fail::Busy), "a user past its share of a quarter");
+		assert_eq!(stack.udp(remote(2000), Who::User(1)).await.err(), Some(Fail::Busy), "a UDP flow counts for the user's share");
+		assert_eq!(stack.connect(remote(2001), Who::User(3)).await.err(), Some(Fail::Busy), "the reserved places are not for users: three users hold all the rest");
+		assert_eq!(stack.connect(remote(2002), Who::Node).await.err(), Some(Fail::Busy), "nor for the node's own sockets");
+		let lookup = tokio::spawn({let stack = stack.clone(); async move {stack.udp(remote(53), Who::Dns).await}});
+		let flow = timeout(Duration::from_secs(1), lookup).await.expect("the lookup waited").unwrap();
+		assert!(flow.is_ok(), "the resolver was refused a reserved place");
+		for flow in held {flow.abort()}
+		task.abort();
+	}
+
+	#[tokio::test]
+	async fn a_udp_datagram_over_the_mtu_is_not_taken() {
+		let (stack, _to_stack, _from_stack, task) = stack(vec![own()], 16);
+		let flow = stack.udp(remote(53), Who::Node).await.unwrap();
+		assert!(flow.send(&[1u8; 1392]));
+		assert!(!flow.send(&[1u8; 1393]), "a datagram that would not fit in one packet of 1420 bytes");
+		task.abort();
+	}
+
+	#[tokio::test]
 	async fn a_udp_flow_sends_from_a_port_of_its_own_and_hears_only_its_destination() {
 		let (stack, to_stack, mut from_stack, task) = stack(vec![own()], 16);
-		let mut flow = stack.udp(remote(53)).await.unwrap();
+		let mut flow = stack.udp(remote(53), Who::Node).await.unwrap();
 		assert!(flow.send(b"question"));
 		let port = next(&mut from_stack, |packet| match &packet.transport {Some(TransportSlice::Udp(udp)) if udp.payload() == b"question" && udp.destination_port() == 53 => Some(udp.source_port()), _ => None}).await;
 		assert!(port >= 33000);
@@ -623,7 +668,7 @@ mod tests {
 	#[tokio::test]
 	async fn a_burst_the_flow_does_not_read_is_dropped_and_the_stack_keeps_going() {
 		let (stack, to_stack, mut from_stack, task) = stack(vec![own()], 16);
-		let mut flow = stack.udp(remote(53)).await.unwrap();
+		let mut flow = stack.udp(remote(53), Who::Node).await.unwrap();
 		assert!(flow.send(b"first"));
 		let port = next(&mut from_stack, |packet| match &packet.transport {Some(TransportSlice::Udp(udp)) if udp.payload() == b"first" => Some(udp.source_port()), _ => None}).await;
 		for _ in 0..200 {to_stack.send(build!(PacketBuilder::ipv4(REMOTE, OWN, 64).udp(53, port), &[7u8; 100])).await.unwrap();}

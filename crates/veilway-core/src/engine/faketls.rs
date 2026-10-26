@@ -15,6 +15,7 @@ use super::limits::{Bucket, Clock, Ended, Handshakes, Initiation, Seat, Seated, 
 use super::flows::{connect_from, dial_conn, Conn};
 use super::plan::{Native, Outbound, Proved};
 use super::stream::{random, relay, Relayed, Stream, Undecided, DECOY_CONNECT, HELD, RELAY_IDLE, SEND_QUEUE, TLS_HANDSHAKE};
+use super::wg_stack::Who;
 use super::Shared;
 use crate::config::{ProofRate, DEFAULT_SESSIONS, DEFAULT_UNDECIDED, DEFAULT_UNDECIDED_PER_SOURCE};
 use ring::rand::SystemRandom;
@@ -933,7 +934,7 @@ async fn reach(served: &Served) -> io::Result<Stream> {
 	let failed = |why: String| io::Error::other(format!("outbound {tag}: {why}"));
 	let conn = match &**outbound {
 		Outbound::Socks5(up) => dial_conn(up, site, Instant::now() + DECOY_CONNECT).await.map_err(|failure| failed(failure.error.to_string()))?,
-		Outbound::WireGuard(out) if out.has(site.ip()) => Conn::Stack(timeout(DECOY_CONNECT, out.connect(site)).await.map_err(|_| failed("timed out".to_string()))?.map_err(failed)?),
+		Outbound::WireGuard(out) if out.has(site.ip()) => Conn::Stack(timeout(DECOY_CONNECT, out.connect(site, Who::Node)).await.map_err(|_| failed("timed out".to_string()))?.map_err(failed)?),
 		Outbound::WireGuard(_) => return Err(failed("its address is of the other family".to_string())),
 		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != site.is_ipv4() => return Err(failed("its address is of the other family".to_string())),
 		Outbound::Direct {bind, interface} => Conn::Tcp(timeout(DECOY_CONNECT, connect_from(*bind, interface.as_deref(), site)).await.map_err(|_| failed("timed out".to_string()))?.map_err(|e| failed(e.kind().to_string()))?),

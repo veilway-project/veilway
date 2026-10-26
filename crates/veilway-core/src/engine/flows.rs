@@ -1,6 +1,7 @@
 //! What happens to a TCP or UDP flow once the userspace stack has accepted it: it is re-dialled through the outbound of the exit its routing decision named.
 use super::plan::{Backend, Fallback, Holder, Outbound, Plan, Upstream};
 use super::wg_out::WgOut;
+use super::wg_stack::Who;
 use super::ExitState;
 use super::route::{By, Decision, Key, Reason, CLOSED_IDLE};
 use super::{dns, netstack, rate, Event, Shared};
@@ -454,7 +455,7 @@ pub async fn run(shared: Arc<Shared>, plan: Arc<Plan>, key: Key, id: u64, exit: 
 							return tracing::debug!("exit {tag}: tcp to {}: socks5 connect failed: {}", plan.show(target), failure.error);
 						}
 					},
-					Outbound::WireGuard(out) => match tokio::time::timeout(DIAL_TIMEOUT, out.connect(target)).await {
+					Outbound::WireGuard(out) => match tokio::time::timeout(DIAL_TIMEOUT, out.connect(target, Who::User(plan.devices[from.device].user))).await {
 						Ok(Ok(mut remote)) => rate::relay(&mut stream, &mut remote, &plan.users[plan.devices[from.device].user]).await,
 						Ok(Err(why)) => return tracing::debug!("exit {tag}: tcp to {}: {why}", plan.show(target)),
 						Err(_) => return tracing::debug!("exit {tag}: tcp to {}: wireguard connect timed out", plan.show(target)),
@@ -511,7 +512,7 @@ pub(super) async fn udp_exit<S: Datagrams>(shared: &Shared, plan: &Plan, user: u
 		let up = match outbound {
 			Outbound::Socks5(up) => up,
 			Outbound::WireGuard(out) => {
-				wireguard_udp(&mut stream, plan, tag, carrier, out, target, mtu, overhead).await;
+				wireguard_udp(&mut stream, plan, tag, carrier, out, user, target, mtu, overhead).await;
 				return None;
 			}
 			Outbound::Direct {bind, interface} => {
@@ -552,8 +553,8 @@ pub(super) async fn udp_exit<S: Datagrams>(shared: &Shared, plan: &Plan, user: u
 
 /// A UDP flow sent from a port of a WireGuard outbound's stack to `target`, until the flow's side ends. An outbound that is down ends the flow here and the flow is never sent around it.
 #[allow(clippy::too_many_arguments)]
-async fn wireguard_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrier: usize, out: &WgOut, target: SocketAddr, mtu: u16, overhead: usize) {
-	let mut flow = match out.udp(target).await {
+async fn wireguard_udp<S: Datagrams>(stream: &mut S, plan: &Plan, tag: &str, carrier: usize, out: &WgOut, user: usize, target: SocketAddr, mtu: u16, overhead: usize) {
+	let mut flow = match out.udp(target, Who::User(user)).await {
 		Ok(flow) => flow,
 		Err(why) => return tracing::debug!("exit {tag}: udp to {}: {why}", plan.show(target)),
 	};
@@ -781,7 +782,7 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 			Outbound::Socks5(up) => framed(&mut dial_conn(up, target, tokio::time::Instant::now() + DIAL_TIMEOUT).await.ok()?, query).await.ok()?,
 			Outbound::WireGuard(out) => {
 				// UDP first, and the same query again over TCP when that gets no answer, is truncated or fills the buffer: the server may carry no UDP out of its own network, or a name that needs a big answer.
-				let mut flow = out.udp(target).await.ok()?;
+				let mut flow = out.udp(target, Who::Dns).await.ok()?;
 				let answered = if flow.send(query) {
 					tokio::time::timeout(DNS_UDP_WAIT, async {
 						loop {
@@ -792,7 +793,7 @@ pub async fn lookup(outbound: &Outbound, target: SocketAddr, query: &[u8]) -> Op
 				} else {None};
 				match answered {
 					Some(answer) if answer.len() < DNS_UDP_ANSWER && answer[2] & 0x02 == 0 => answer,
-					_ => framed(&mut out.connect(target).await.ok()?, query).await.ok()?,
+					_ => framed(&mut out.connect(target, Who::Dns).await.ok()?, query).await.ok()?,
 				}
 			}
 			Outbound::Direct {bind, interface} => {
