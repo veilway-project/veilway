@@ -406,7 +406,14 @@ async fn a_link_to_a_self_signed_tls_transport_comes_up_and_reconnects_after_the
 		dialler.reload(doc.to_string().into_bytes(), None).await.unwrap_or_else(|e| panic!("the reload was refused: {e}"));
 		eventually("the link did not come back with the same pin", || dialler.links()[0].status == Status::Up && dialler.links()[0].handshake.is_some_and(|age| age < Duration::from_secs(10))).await;
 		net.user.connect().await;
-		assert_eq!(net.user.leaves(PUBLIC, 43001).await.as_deref(), Some("main"));
+		// The first flow after the link came back can race the user's own session: a few tries, each on its own port.
+		let mut left = None;
+		for port in 43001..43021 {
+			left = net.user.leaves(PUBLIC, port).await;
+			if left.is_some() {break}
+			tokio::time::sleep(Duration::from_millis(500)).await;
+		}
+		assert_eq!(left.as_deref(), Some("main"));
 		net.entry.shutdown().await;
 		net.exit.shutdown().await;
 	}

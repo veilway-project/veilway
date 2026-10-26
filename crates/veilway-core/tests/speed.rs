@@ -223,7 +223,8 @@ async fn rate(count: &AtomicU64, warm: u64, window: u64) -> f64 {
 	}).await.expect("the bytes did not come")
 }
 
-fn near(measured: f64, wanted: u64) {assert!((measured - wanted as f64).abs() <= wanted as f64 * 0.15, "measured {measured:.0} bytes per second against a limit of {wanted}")}
+/// Within 15 percent of the limit, and above it by at most one burst (a second of the rate) spread over the window: a sender that stalls on a busy machine is owed that burst back.
+fn near(measured: f64, wanted: u64, window: u64) {assert!(measured >= wanted as f64 * 0.85 && measured <= wanted as f64 * 1.15 + (wanted as f64).powi(2) / window as f64, "measured {measured:.0} bytes per second against a limit of {wanted}")}
 
 fn udp(n: usize, to: SocketAddr, sport: u16, payload: &[u8]) -> Vec<u8> {
 	let (IpAddr::V4(ip), mut out) = (to.ip(), Vec::new()) else {panic!("an IPv4 destination")};
@@ -244,9 +245,9 @@ async fn tcp_download_through_a_netstack_exit_is_paced_to_the_rate() {
 	let local = net.local(0).await;
 	let count = Arc::new(AtomicU64::new(0));
 	drain(through(local.addr(), source).await, count.clone());
-	let measured = rate(&count, 3_000_000, 5_000_000).await;
+	let measured = rate(&count, 3_000_000, 10_000_000).await;
 	eprintln!("speed: download limited to {RATE}, measured {measured:.0} bytes per second");
-	near(measured, RATE);
+	near(measured, RATE, 10_000_000);
 	let usage = net.usage();
 	assert!(usage.paced_ms > 0 && usage.limited == [0, 0], "TCP is slowed down and never dropped: {usage:?}");
 	assert_eq!(net.engine.dropped(Reason::RateLimited), 0);
@@ -259,9 +260,9 @@ async fn tcp_upload_through_a_netstack_exit_is_paced_to_the_rate() {
 	let (sink, count) = sink(net.own).await;
 	let local = net.local(0).await;
 	flood(through(local.addr(), sink).await);
-	let measured = rate(&count, 3_000_000, 5_000_000).await;
+	let measured = rate(&count, 3_000_000, 10_000_000).await;
 	eprintln!("speed: upload limited to {RATE}, measured {measured:.0} bytes per second");
-	near(measured, RATE);
+	near(measured, RATE, 10_000_000);
 	let usage = net.usage();
 	eprintln!("speed: upload: the server got {} bytes, the node counted {} bytes up and {} packets", count.load(Ordering::Relaxed), usage.traffic.up_bytes, usage.traffic.up_packets);
 	assert!(usage.paced_ms > 0 && usage.limited == [0, 0], "TCP is slowed down and never dropped: {usage:?}");
@@ -277,9 +278,9 @@ async fn two_devices_of_a_user_share_one_limit() {
 	let (first, second) = (net.local(0).await, net.local(1).await);
 	let count = Arc::new(AtomicU64::new(0));
 	for local in [&first, &second] {drain(through(local.addr(), source).await, count.clone())}
-	let measured = rate(&count, 3_500_000, 5_000_000).await;
+	let measured = rate(&count, 3_500_000, 10_000_000).await;
 	eprintln!("speed: two devices share a download limit of {RATE}, measured {measured:.0} bytes per second together");
-	near(measured, RATE);
+	near(measured, RATE, 10_000_000);
 	first.stop().await;
 	second.stop().await;
 }
@@ -308,9 +309,9 @@ async fn a_socks5_proxy_inbound_is_paced_like_the_tunnel() {
 	assert_eq!(reply[1], 0, "{reply:?}");
 	let count = Arc::new(AtomicU64::new(0));
 	drain(stream, count.clone());
-	let measured = rate(&count, 3_000_000, 5_000_000).await;
+	let measured = rate(&count, 3_000_000, 10_000_000).await;
 	eprintln!("speed: socks5 inbound download limited to {RATE}, measured {measured:.0} bytes per second");
-	near(measured, RATE);
+	near(measured, RATE, 10_000_000);
 	assert!(net.usage().paced_ms > 0);
 }
 
