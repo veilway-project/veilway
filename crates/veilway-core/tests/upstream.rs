@@ -1137,7 +1137,8 @@ async fn an_unreachable_profile_gives_way_to_the_next_and_a_pinned_one_does_not(
 	let report = a.upstreams().remove(0);
 	assert_eq!((report.profile.as_deref(), report.transport), (Some("home"), Some("udp-obfs")), "{report:?}");
 	assert!(lines("upstream next:").iter().any(|line| line.contains("the profile dead cannot be used, so the next one is tried")), "{:?}", lines("upstream next:"));
-	assert!(silent.try_recv_from(&mut [0u8; 64]).is_ok(), "the profile that was given up was never dialled");
+	// A wait, not a try: on Windows the socket may not be marked readable yet for a datagram that has arrived.
+	assert!(tokio::time::timeout(Duration::from_secs(2), silent.recv_from(&mut [0u8; 64])).await.is_ok_and(|got| got.is_ok()), "the profile that was given up was never dialled");
 	assert_eq!(report.profiles.iter().map(|profile| (profile.id.as_str(), profile.usable)).collect::<Vec<_>>(), vec![("dead", false), ("home", true)], "{:?}", report.profiles);
 	assert!(report.profiles[0].reason.contains("did not connect"), "{:?}", report.profiles);
 	// Pinned to the one that does not answer: nothing else is tried, however long it takes.
@@ -1205,7 +1206,7 @@ async fn the_transport_the_config_picks_is_the_only_one_dialled() {
 	until_phase(&a, Phase::Up, UP).await;
 	let report = a.upstreams().remove(0);
 	assert_eq!((report.transport, report.choice.transport.as_deref()), (Some("udp-obfs"), Some("udp-obfs")), "{report:?}");
-	assert!(silent.try_recv_from(&mut [0u8; 64]).is_err(), "the transport that was not picked was dialled");
+	assert!(tokio::time::timeout(Duration::from_millis(500), silent.recv_from(&mut [0u8; 64])).await.is_err(), "the transport that was not picked was dialled");
 	doc["upstreams"][0]["transport"] = json!("udp");
 	put(&a, &doc).await;
 	let mut datagram = [0u8; 2048];
