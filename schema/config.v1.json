@@ -458,6 +458,11 @@
       "pattern": "^[0-9A-Za-z.:-]{1,253}$",
       "type": "string"
     },
+    "HostAddress": {
+      "description": "an IPv4 or IPv6 address, optionally with /32 or /128",
+      "pattern": "^[0-9A-Fa-f:.]+(/(32|128))?$",
+      "type": "string"
+    },
     "HostPort": {
       "description": "a host and port such as proxy.example.com:1080, with an IPv6 address in brackets",
       "pattern": "^([a-z0-9.-]{1,253}|\\[[0-9A-Fa-f:.]+\\]):[1-9][0-9]{0,4}$",
@@ -1334,6 +1339,96 @@
           "required": [
             "type",
             "tag"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Another WireGuard server as the carrier of a `netstack` exit: the node is a WireGuard client of it, with its own userspace TCP/IP stack on `addresses`, and re-dials every flow of the exit from there. The server sees every flow in clear, so it is a provider the operator trusts with that. The private key and the preshared key are secrets. Endpoints on private addresses are allowed, loopback, an inbound's pool and the node's own addresses are refused. While the server does not answer, the exit is not working and says so, and nothing leaves around it. This outbound has no `via` and is no `via` of another outbound, a link or an upstream.",
+          "properties": {
+            "addresses": {
+              "description": "The node's addresses inside the tunnel: one or two, at most one of each family. A destination of a family with no address here is refused as unsupported.",
+              "items": {
+                "$ref": "#/$defs/HostAddress"
+              },
+              "maxItems": 2,
+              "minItems": 1,
+              "type": "array",
+              "uniqueItems": true
+            },
+            "bind": {
+              "$ref": "#/$defs/Ip",
+              "description": "The local address and the network interface of the UDP socket that talks to the server, as for a `direct` outbound."
+            },
+            "interface": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$",
+              "type": "string"
+            },
+            "keepalive_secs": {
+              "description": "Seconds between keepalives, 0 for none. Defaults to 25.",
+              "format": "uint16",
+              "maximum": 3600,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "max_flows": {
+              "description": "The flows through the tunnel at once. Defaults to 1024.",
+              "format": "uint32",
+              "maximum": 16384,
+              "minimum": 16,
+              "type": "integer"
+            },
+            "mtu": {
+              "description": "Defaults to 1420.",
+              "format": "uint16",
+              "maximum": 1500,
+              "minimum": 1280,
+              "type": "integer"
+            },
+            "preshared_key": {
+              "$ref": "#/$defs/Key",
+              "description": "A secret. No diagnostic, log line or `Debug` output shows it."
+            },
+            "private_key": {
+              "$ref": "#/$defs/Key",
+              "description": "A secret. No diagnostic, log line or `Debug` output shows it."
+            },
+            "public_key": {
+              "$ref": "#/$defs/Key",
+              "description": "The server's public key."
+            },
+            "server": {
+              "$ref": "#/$defs/HostPort",
+              "description": "The server's UDP endpoint. A name is looked up by the system's resolver at start, every 5 minutes and whenever the node starts a handshake again, and the last address is kept while the name still resolves."
+            },
+            "tag": {
+              "not": {
+                "enum": [
+                  "all",
+                  "any",
+                  "block",
+                  "reject",
+                  "drop",
+                  "local",
+                  "direct",
+                  "user"
+                ]
+              },
+              "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "wireguard",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "tag",
+            "server",
+            "public_key",
+            "private_key",
+            "addresses"
           ],
           "type": "object"
         }

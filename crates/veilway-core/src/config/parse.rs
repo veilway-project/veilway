@@ -376,7 +376,7 @@ impl Config {
 			for (i, outbound) in outbounds.iter_mut().enumerate() {
 				let Json::Obj(outbound) = outbound else {continue};
 				let (tag, server) = (named(outbound, "tag"), outbound.get("server").and_then(|json| HostPort::deserialize(De {json, path: &Path::Root}).ok()));
-				if ["username", "password", "id", "link"].iter().any(|key| outbound.contains_key(*key) && !marked(outbound, *key)) {spelled.extend(tag.clone())}
+				if ["username", "password", "id", "link", "private_key", "preshared_key"].iter().any(|key| outbound.contains_key(*key) && !marked(outbound, *key)) {spelled.extend(tag.clone())}
 				// A secret of an Xray outbound is kept for the same protocol and kind of security as well: the server is the same, and the way the secret is used is not.
 				let (protocol, security) = (named(outbound, "protocol"), match outbound.get("security") {Some(Json::Obj(kind)) => named(kind, "type"), None => Some("none".to_string()), _ => None});
 				for key in ["username", "password", "id"] {
@@ -389,6 +389,19 @@ impl Config {
 					match kept {
 						Some(kept) => drop(outbound.insert(key.to_string(), Json::Str(kept.expose().clone()))),
 						None => report.error(format!("outbounds[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running socks5 outbound with this tag and server, or xray outbound with this tag, server, protocol and kind of security, and no such outbound runs with one. For a server that is new or has changed, the {key} has to be sent itself")),
+					}
+				}
+				// The keys of a WireGuard outbound stand for those of the running one with the same tag, server and public key: a key made for one server never goes to another.
+				let public = named(outbound, "public_key");
+				let kept = tag.as_ref().zip(server.as_ref()).and_then(|(tag, server)| running.outbounds.iter().find_map(|was| match was {
+					Outbound::Wireguard {tag: of, server: at, public_key, private_key, preshared_key, ..} if of == tag && at == server && public.as_deref() == Some(STANDARD.encode(public_key.0).as_str()) => Some((private_key, preshared_key)),
+					_ => None,
+				}));
+				for key in ["private_key", "preshared_key"] {
+					if !marked(outbound, key) {continue}
+					match kept.and_then(|(private, preshared)| if key == "private_key" {Some(private)} else {preshared.as_ref()}) {
+						Some(kept) => drop(outbound.insert(key.to_string(), Json::Str(STANDARD.encode(kept.expose().0)))),
+						None => report.error(format!("outbounds[{i}].{key}"), format!("expected a {key}: the marker stands for the {key} of the running wireguard outbound with this tag, server and public key, and none runs with one. For an outbound that is new or has changed, the {key} has to be sent itself")),
 					}
 				}
 			}

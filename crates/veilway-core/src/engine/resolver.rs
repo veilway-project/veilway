@@ -1,7 +1,7 @@
 //! The node's own resolver: every DNS query from a tunnel is answered here, one query at a time, by asking the configured servers through the exit the rules choose for that query.
 //! What it learns is kept per user, so a rule with a `domain` condition can match the flows that follow.
 use super::flows::{self, HOLD_MARGIN, UDP_OVERHEAD, UDP_OVERHEAD_V6};
-use super::plan::{Action, Backend, DnsSet, Outbound, Pattern, Plan};
+use super::plan::{Action, Backend, DnsSet, Pattern, Plan};
 use super::route::{self, Key, Reason, CLOSED_IDLE};
 use super::{dns, gate, Shared};
 use ipnet::IpNet;
@@ -141,7 +141,7 @@ pub(super) async fn ask(shared: &Shared, plan: &Arc<Plan>, inbound: usize, trans
 	};
 	let Some(failures) = plan.exits[exit].failures.get(list).and_then(|counts| counts.get(at)) else {return Step::Skipped};
 	// An outbound bound to one address family has no way to a server of the other. That server is passed over like one that does not answer.
-	if matches!(outbound, Some(Outbound::Direct {bind: Some(bind), ..}) if bind.is_ipv4() != server.is_ipv4()) {return Step::Skipped}
+	if outbound.is_some_and(|outbound| outbound.other_family(server.ip())) {return Step::Skipped}
 	// A `chain` exit counts the query once it went into a link, which it does not while no link is up.
 	if outbound.is_some() {plan.exits[exit].traffic.up(message.len())}
 	let found = match outbound {

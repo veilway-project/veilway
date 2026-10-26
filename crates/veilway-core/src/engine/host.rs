@@ -8,7 +8,7 @@ use super::route::{self, By, Decision, Ended, Key};
 use super::limits::Clock;
 use super::upstream::{self, UpstreamState};
 use super::upstream_state::{UpstreamFile, UpstreamVault};
-use super::{certificate, control, faketls, hostaddrs, l3, link, obfs, pins, proxy, replay, stream, tunnel, CutOff, Event, Over, Shared, QUEUE};
+use super::{certificate, control, faketls, hostaddrs, l3, link, obfs, pins, proxy, replay, stream, tunnel, wg_out, CutOff, Event, Over, Shared, QUEUE};
 use crate::config::{loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -331,7 +331,7 @@ impl Host {
 						};
 						// A site at an address and port the node itself listens on would send every stranger's connection back to the node.
 						if plan.inbounds.iter().flat_map(|inbound| &inbound.transports).any(|other| !other.datagram() && loops(other.listen(), address)) {anyhow::bail!("inbounds[{i}].transports[{t}].site.host: the site of inbound `{}` is an address and port the node itself listens on, so every stranger's connection would come back to the node", inbound.tag)}
-						let outbound = site.outbound.as_ref().map(|tag| Outbound::of(&config.outbounds, &plan.latency, &plan.hops, tag).map(|found| (tag.clone(), Arc::new(found))).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].site.outbound: inbound `{}` names no outbound `{tag}`", inbound.tag))).transpose()?;
+						let outbound = site.outbound.as_ref().map(|tag| Outbound::of(&config.outbounds, &plan.latency, &plan.hops, &plan.pools, tag).map(|found| (tag.clone(), Arc::new(found))).ok_or_else(|| anyhow!("inbounds[{i}].transports[{t}].site.outbound: inbound `{}` names no outbound `{tag}`", inbound.tag))).transpose()?;
 						sites.insert(listen.0, (address, outbound));
 					}
 					Transport::Ws {listen, tls, ..} => {
@@ -703,6 +703,7 @@ impl Host {
 		for exit in plan.exits.iter().filter(|exit| !old.exits.iter().any(|was| was.tag == exit.tag)) {
 			match &exit.backend {
 				Backend::Netstack {outbound: Outbound::Socks5(_), ..} => tracing::info!("exit {}: netstack through a socks5 proxy", exit.tag),
+				Backend::Netstack {outbound: Outbound::WireGuard(out), ..} => tracing::info!("exit {}: netstack through the WireGuard server of outbound {}", exit.tag, out.tag),
 				Backend::Netstack {..} => tracing::info!("exit {}: netstack, direct from this node", exit.tag),
 				Backend::L3 {masquerade, ..} => if !masquerade && plan.hijack {tracing::warn!("exit {}: l3 without masquerade carries no query of the node's resolver, so dns fails for flows routed to it unless a rule sends the dns servers on port 53 to another exit", exit.tag)},
 				Backend::Block => tracing::info!("exit {}: block", exit.tag),
@@ -881,6 +882,8 @@ impl Host {
 			*shared.plan.write().unwrap_or_else(|e| e.into_inner()) = plan.clone();
 			(out, pings, ended.len())
 		});
+		// The exits of a WireGuard outbound follow its health from here on, and are put right at once with what it is now.
+		wg_out::watch(shared, &plan);
 		// The plan is in force by now, which is the order `control::State::recheck` counts on: every exit a device chose is held against the `exits` its user has from here on, and one that is not among them is dropped.
 		// The plan before the first one holds what the state file remembered, so this is also where a file that names an exit the user may not use is put right.
 		let gone: Vec<(&str, &str, Arc<str>)> = plan.devices.iter().filter(|_| reloaded).filter_map(|device| device.control.recheck(&plan, &plan.users[device.user]).map(|tag| (plan.users[device.user].name.as_str(), device.name.as_str(), tag))).collect();

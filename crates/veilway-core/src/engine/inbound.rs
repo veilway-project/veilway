@@ -2,7 +2,7 @@
 use super::icmp::{self, Kind};
 use super::netstack::{self, Packet};
 use super::netstack::Fit;
-use super::plan::{Action, Backend, Fallback, Holder, Outbound, Plan};
+use super::plan::{Action, Backend, Fallback, Holder, Plan};
 use super::obfs::{self, Room};
 use super::route::{self, By, Decision, Key, Reason, FLOW_IDLE};
 use super::{chain, control, faketls, flows, gate, l3, link, resolver, stream, Over, Shared};
@@ -246,7 +246,7 @@ impl Shared {
 					// The gateway of an upstream's profile is the engine's own: its control channel and its probes are there, and no flow of a user shares a tuple with them.
 					Backend::Chain {links} if plan.reaches_upstream(links, key.dst) => Decision::Refuse {reason: Reason::Gate, reset: true},
 					Backend::L3 {..} | Backend::Chain {..} => Decision::Exit {exit, by: By::Backend},
-					Backend::Netstack {outbound: Outbound::Direct {bind: Some(bind), ..}, ..} if bind.is_ipv4() != key.dst.is_ipv4() => Decision::Refuse {reason: Reason::Unsupported, reset: true},
+					Backend::Netstack {outbound, ..} if outbound.other_family(key.dst) => Decision::Refuse {reason: Reason::Unsupported, reset: true},
 					// Whether the proxy relays UDP is only known once the flow's handler has asked it, so the `udp` policy is applied there, see `flows::run`.
 					Backend::Netstack {..} if transport => Decision::Exit {exit, by: By::Backend},
 					Backend::Netstack {icmp_echo, other, ..} => match if matches!((key.protocol, icmp), (Protocol::ICMP, Some((netstack::ECHO_REQUEST_V4, 0))) | (Protocol::ICMPV6, Some((netstack::ECHO_REQUEST_V6, 0)))) {*icmp_echo} else {*other} {

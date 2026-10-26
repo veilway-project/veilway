@@ -852,7 +852,7 @@ fn egress_never_dials_directly(){
 				assert!(path.ends_with("engine/xray.rs")|| path.ends_with("engine/xray_trojan.rs"), "{} dials a Unix socket in {}", path.display(), line.trim());
 			}
 			for line in text.lines().filter(|l| l.contains("UdpSocket::bind")){
-				assert!(["engine/flows.rs", "engine/xray_udp.rs", "engine/gate.rs", "engine/host.rs", "engine/link.rs", "engine/xray_owner.rs"].iter().any(|file| path.ends_with(file)), "{} binds a datagram socket in {}", path.display(), line.trim());
+				assert!(["engine/flows.rs", "engine/xray_udp.rs", "engine/gate.rs", "engine/host.rs", "engine/link.rs", "engine/wg_out.rs", "engine/xray_owner.rs"].iter().any(|file| path.ends_with(file)), "{} binds a datagram socket in {}", path.display(), line.trim());
 			}
 			// Where that dial goes is made in one place, from the config's `decoy.origin`. The only other line that names it is the one that takes it apart to dial.
 			for line in text.lines().filter(|l| l.contains("Origin::Tcp(")&& !l.trim_start().starts_with("Origin::Tcp(to)=>")&& !l.trim_start().starts_with("Origin::Tcp(to) =>")){

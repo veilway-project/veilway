@@ -122,7 +122,7 @@ async fn check(api: &Api, snapshot: Snapshot, bytes: Vec<u8>, shadow: bool) -> R
 					let mut diff = Diff::between(&snapshot.config, &config, OffsetDateTime::now_utc());
 					// An outbound whose user name or password the document spells out is a changed one whatever they are. "Not changed" would tell whoever guessed a password that the guess was right.
 					diff.outbounds.changed = config.outbounds.iter().map(|outbound| match outbound {
-						Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag,
+						Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} | Outbound::Wireguard {tag, ..} => tag,
 					}).filter(|tag| diff.outbounds.changed.contains(tag) || (spelled.contains(tag) && !diff.outbounds.added.contains(tag))).cloned().collect();
 					diff
 				});
@@ -489,6 +489,13 @@ async fn exits(State(api): State<Arc<Api>>) -> Response {
 			link_up: if let veilway_core::config::Backend::Chain(chain) = &exit.backend {Some(links.iter().any(|link| chain.links.contains(&link.tag) && link.status == Status::Up))} else {None},
 			latency_ms: latency.map(|(took, _)| took.as_millis() as u64),
 			measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64),
+			outbound_up: health.and_then(|health| health.wireguard.as_ref()).map(|report| report.up),
+			outbound_down_secs: health.and_then(|health| health.wireguard.as_ref()).and_then(|report| report.down_secs),
+			outbound_down_reason: health.and_then(|health| health.wireguard.as_ref()).and_then(|report| report.why.clone()),
+			outbound_flips: health.and_then(|health| health.wireguard.as_ref()).map_or(0, |report| report.flips),
+			handshake_secs: health.and_then(|health| health.wireguard.as_ref()).and_then(|report| report.handshake_secs),
+			endpoint: health.and_then(|health| health.wireguard.as_ref()).and_then(|report| report.endpoint).map(|endpoint| endpoint.to_string()),
+			flows: health.and_then(|health| health.wireguard.as_ref()).map(|report| report.flows as u64),
 			load: exit.load,
 			load_level: health.and_then(|health| health.load).map(str::to_string),
 			traffic: counters.exits.iter().find(|(tag, _)| *tag == exit.tag).map(|(_, totals)| *totals).unwrap_or_default().into(),
@@ -744,14 +751,14 @@ impl Api {
 			exits: counters.exits.iter().map(|(tag, totals)| rated(crate::EXIT, tag, *totals)).collect(),
 			outbounds: snapshot.config.outbounds.iter().map(|outbound| {
 				let (tag, proxied) = match outbound {
-					Outbound::Direct {tag, ..} => (tag, false),
+					Outbound::Direct {tag, ..} | Outbound::Wireguard {tag, ..} => (tag, false),
 					Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => (tag, true),
 				};
 				let (totals, (up, down), refused, flips) = sums.get(tag.as_str()).copied().unwrap_or_default();
 				// Only a SOCKS5 proxy can refuse to relay UDP, as in `exits`.
 				let refused = refused.filter(|_| proxied);
 				let latency = latencies.get(tag).copied();
-				model::OutboundStats {down_reason: if matches!(outbound, Outbound::Xray {..}) {self.engine.xray_outbound_down(tag)} else {None}, name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}, latency_ms: latency.map(|(took, _)| took.as_millis() as u64), measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64)}
+				model::OutboundStats {down_reason: match outbound {Outbound::Xray {..} => self.engine.xray_outbound_down(tag), Outbound::Wireguard {..} => self.engine.wireguard_down(tag), _ => None}, name: tag.clone(), traffic: totals.into(), up_bytes_per_sec: up, down_bytes_per_sec: down, udp: proxied.then_some(refused.is_none()), udp_down_secs: refused.map(|since| since.as_secs()), udp_flips: if proxied {flips} else {0}, latency_ms: latency.map(|(took, _)| took.as_millis() as u64), measured_at: latency.and_then(|(_, at)| at.duration_since(UNIX_EPOCH).ok()).map(|since| since.as_secs() as i64)}
 			}).collect(),
 			drops: Reason::ALL.iter().map(|reason| (reason.name().to_string(), self.engine.dropped(*reason))).collect(),
 			dns: model::Dns {answered: dns.answered, refused: dns.refused, failed: dns.failed, malformed: dns.malformed, throttled: dns.throttled},

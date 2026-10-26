@@ -88,13 +88,33 @@ async fn server(subject: String, target: SocketAddr, direct: bool, wait: Duratio
 }
 
 /// One outbound tried the way the engine uses it, towards the DNS servers of the config: a direct one from the node itself, a socks5 one step by step so that each thing a proxy may lack has its own line.
-async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Duration) -> Vec<Line> {
+async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], pools: &[(ipnet::IpNet, usize)], wait: Duration) -> Vec<Line> {
+	// A WireGuard outbound is not started from here, which would be a handshake from a second copy of the node's key: its server's name is looked up and every address it gives is held against the rules the running node applies.
+	if let config::Outbound::Wireguard {tag, server, interface, ..} = outbound {
+		let found: Vec<IpAddr> = match &server.host {
+			config::Host::Ip(ip) => vec![*ip],
+			config::Host::Name(name) => match timeout(wait, tokio::net::lookup_host((name.as_str(), server.port))).await {
+				Ok(Ok(found)) => found.map(|address| address.ip()).collect(),
+				Ok(Err(e)) => return vec![line(Status::Fail, "outbound", tag, format!("the name of the server does not resolve ({}): the node looks it up with this host's resolver, so check the name and that resolver", e.kind()))],
+				Err(_) => return vec![line(Status::Fail, "outbound", tag, format!("the name of the server did not resolve within {} s: check this host's resolver", wait.as_secs()))],
+			},
+		};
+		let allowed: Vec<IpAddr> = found.iter().copied().filter(|ip| veilway_core::engine::upstream::forbidden(*ip, pools, veilway_core::engine::gate::is_local, true).is_none()).collect();
+		let mut lines = vec![match (allowed.first(), found.len()) {
+			(Some(first), total) => line(Status::Ok, "outbound", tag, format!("the server is at {total} address(es), and the node talks to {first}:{}{}. Whether it answers a handshake shows in `veilway status` and in GET /v1/exits of the running node", server.port, if allowed.len() < total {format!(" ({} refused: loopback, in an inbound's pool or the node's own)", total - allowed.len())} else {String::new()})),
+			(None, 0) => line(Status::Fail, "outbound", tag, "the name of the server gave no address"),
+			(None, _) => line(Status::Fail, "outbound", tag, "every address of the server is loopback, in an inbound's pool or the node's own, which the node never dials"),
+		}];
+		if let Some(name) = interface.as_deref().filter(|name| !probe::has_interface(name)) {lines.push(line(Status::Fail, "outbound", tag, format!("tied to the network interface {name}, which this host does not have: check `ip link`, or remove its `interface`")))}
+		return lines;
+	}
 	let tag = match outbound {
 		config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} => tag,
+		config::Outbound::Wireguard {..} => return Vec::new(),
 		config::Outbound::Xray {tag, ..} => return vec![line(Status::Skipped, "outbound", tag, "carried by the Xray add-on, through a Unix socket of Xray that exists only while the node runs, so nothing is tried from here: the xray line says whether the add-on is installed and pinned")],
 	};
 	let (query, started, subject) = (question(), Instant::now(), |step: &str| format!("{tag}, {step}"));
-	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), &Hops::default(), tag) else {return Vec::new()};
+	let Some(route) = Outbound::of(std::slice::from_ref(outbound), &HashMap::from([(tag.to_string(), Arc::default())]), &Hops::default(), &[], tag) else {return Vec::new()};
 	match route {
 		Outbound::Direct {bind, interface} => {
 			if let Some(name) = interface.as_deref().filter(|name| !probe::has_interface(name)) {return vec![line(Status::Fail, "outbound", tag, format!("tied to the network interface {name}, which this host does not have: check `ip link`, or remove its `interface`"))]}
@@ -177,6 +197,7 @@ async fn outbound(outbound: &config::Outbound, servers: &[SocketAddr], wait: Dur
 			lines.extend([line(connect.0, "outbound", subject(STEPS[2]), connect.1), line(relay.0, "outbound", subject(STEPS[3]), relay.1)]);
 			lines
 		}
+		Outbound::WireGuard(_) => Vec::new(),
 	}
 }
 
@@ -651,7 +672,8 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 		let (config, servers, limit, after) = (config.clone(), servers.clone(), limit.clone(), asked.len());
 		tasks.spawn(async move {
 			let _slot = limit.acquire_owned().await;
-			(after + at, outbound(&config.outbounds[at], &servers, wait).await)
+			let pools: Vec<(ipnet::IpNet, usize)> = config.inbounds.iter().enumerate().flat_map(|(i, inbound)| inbound.address.iter().map(move |net| (net.0, i))).collect();
+			(after + at, outbound(&config.outbounds[at], &servers, &pools, wait).await)
 		});
 	}
 	let (began, mut tried) = (Instant::now(), Vec::new());
@@ -661,7 +683,7 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	let ended: HashSet<usize> = tried.iter().map(|(at, _)| *at).collect();
 	let late = format!("it was not tried to its end: doctor ran out of time, which is {} s for everything on the network together. Run it again, with a smaller --timeout if little of this network answers", TOTAL.as_secs());
 	tried.extend((0..asked.len() + config.outbounds.len()).filter(|at| !ended.contains(at)).map(|at| (at, vec![match at.checked_sub(asked.len()).map(|at| &config.outbounds[at]) {
-		Some(config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..}) => line(Status::Skipped, "outbound", tag, late.as_str()),
+		Some(config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..} | config::Outbound::Wireguard {tag, ..}) => line(Status::Skipped, "outbound", tag, late.as_str()),
 		None => line(Status::Skipped, "dns", asked[at].0.as_str(), late.as_str()),
 	}])));
 	// The servers of a set were asked from the node itself and through no outbound, which is said rather than left to be assumed. It is put in first with the place of the first outbound, so the sort leaves it after the last server and before that outbound.

@@ -31,6 +31,8 @@ pub mod tunnel;
 pub mod upstream;
 pub mod upstream_state;
 pub mod usage;
+pub mod wg_out;
+pub mod wg_stack;
 pub mod xray;
 pub mod xray_out;
 mod xray_owner;
@@ -47,6 +49,7 @@ pub use stream::StreamTotals;
 pub use proxy::Totals as ProxyTotals;
 pub use tunnel::Totals as TunnelTotals;
 pub use plan::{Denied, Plan};
+use plan::{Backend, Outbound};
 pub use replay::{ReplayStatus, Reset};
 pub use route::Reason;
 
@@ -215,6 +218,8 @@ pub struct ExitHealth {
 	pub proxy_down: Option<Duration>,
 	/// How often such an exit switched between working and not.
 	pub proxy_flips: u64,
+	/// For an exit through a WireGuard outbound: what the outbound's tunnel says of itself. None for every other exit.
+	pub wireguard: Option<wg_out::Report>,
 }
 
 /// What `start` needs besides the config document.
@@ -609,6 +614,9 @@ impl Engine {
 	/// Why the Xray outbound `tag` cannot carry a flow right now: the add-on is not installed or not running, Xray ended, or its server's name does not resolve to an address the node may dial. None when it carries.
 	pub fn xray_outbound_down(&self, tag: &str) -> Option<String> {self.plan().hops.get(tag).reason()}
 
+	/// Why the WireGuard outbound `tag` cannot carry a flow right now: its server has not answered a handshake, a datagram could not be sent to it, or its name or address is refused. None while it works, and for a tag no exit of the running config uses.
+	pub fn wireguard_down(&self, tag: &str) -> Option<String> {self.plan().exits.iter().find_map(|exit| match &exit.backend {Backend::Netstack {outbound: Outbound::WireGuard(out), ..} if out.tag == tag => out.down(), _ => None})}
+
 	/// Every device that may connect right now, once for each inbound it has an address in, with what its tunnel knows of it, inbound by inbound. The devices of a user who is denied are not peers and not in it.
 	/// With `only`, the devices of the user of that name, and nothing of any other device is looked at.
 	/// A tunnel is locked once, for as long as it takes to read two values for each of its devices that was asked for. That lock is the one every packet of the inbound takes, so whoever polls this holds no packet up for longer.
@@ -644,7 +652,7 @@ impl Engine {
 		let plan = self.plan();
 		plan.exits.iter().enumerate().map(|(at, exit)| {
 			let health = plan.l3.as_ref().filter(|(wired, _)| *wired == at).map(|(_, port)| &port.health);
-			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed)), proxy_down: exit.state.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), proxy_flips: exit.state.down_flips.load(Ordering::Relaxed), load: exit.load.and_then(|_| exit.state.load.name())}
+			ExitHealth {exit: exit.tag.clone(), no_udp: exit.state.no_udp.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), udp_flips: exit.state.udp_flips.load(Ordering::Relaxed), interface_down: health.map(|health| health.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed())), interface_flips: health.map_or(0, |health| health.flips.load(Ordering::Relaxed)), proxy_down: exit.state.down.lock().unwrap_or_else(|e| e.into_inner()).map(|since| since.elapsed()), proxy_flips: exit.state.down_flips.load(Ordering::Relaxed), wireguard: if let Backend::Netstack {outbound: Outbound::WireGuard(out), ..} = &exit.backend {Some(out.report())} else {None}, load: exit.load.and_then(|_| exit.state.load.name())}
 		}).collect()
 	}
 
@@ -881,7 +889,7 @@ pub async fn start(config: &Config, options: Options) -> anyhow::Result<Engine> 
 		let (users, devices, writable) = usage::load(&path);
 		(users, devices, writable.then_some(path))
 	});
-	let remembered = Plan {states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER, proxy: None, speed: [None, None]}).collect(), ..Plan::default()};
+	let remembered = Plan {hops: Arc::new(xray_out::Hops::new(options.is_local)), states: chosen.into_iter().map(|(device, exit)| (device, (0, Arc::new(control::State::remembered(&exit))))).collect(), users: remembered.into_iter().map(|(name, state)| plan::User {name, groups: Vec::new(), entitled: None, exit: None, dns: None, quota: None, period: None, expires: None, denied: Some(Denied::Disabled), state: Arc::new(state), link: None, flows: route::MAX_FLOWS_PER_USER, proxy: None, speed: [None, None]}).collect(), ..Plan::default()};
 	let roots = options.roots.unwrap_or_else(|| Arc::new(RootCertStore {roots: webpki_roots::TLS_SERVER_ROOTS.to_vec()}));
 	let mut shared = Shared::new(remembered, options.is_local, options.now, state.clone(), options.replay, options.usage_push, roots);
 	shared.previews = upstream::Previews::new(options.upstream.clone());

@@ -3,7 +3,7 @@
 //! Each destination is a flow of the user, started by its first datagram and decided the way a flow of the tunnel is: the destination gate, the rules, the user's exits and quota, the counters of the user and of the exit, and the exit's outbound for UDP, which is `flows::udp_exit`, the code the tunnel's flows run. Port 53 follows the tunnel's rule too: with `dns.hijack` on, whatever is sent there is a query for the node's own resolver.
 //! An association lives as long as the TCP connection that asked for it, and is ended sooner when it is quiet, when its user is cut off or removed, and when Xray's side misbehaves. Datagrams that do not parse are dropped and counted, never answered.
 use super::flows::{self, Datagrams, DNS_IDLE, UDP_OVERHEAD, UDP_OVERHEAD_V6};
-use super::plan::{Backend, Outbound, Plan};
+use super::plan::{Backend, Plan};
 use super::resolver::{self, Step, MAX_IN_FLIGHT};
 use super::route::{By, Decision, Reason};
 use crate::config::RuleTransport;
@@ -151,7 +151,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 	};
 	let Backend::Netstack {udp_idle, ..} = &plan.exits[exit].backend else {return None};
 	// The tunnel refuses a destination of the other family than the exit's address the same way.
-	if matches!(outbound, Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4()) {
+	if outbound.other_family(ip) {
 		shared.count(Reason::Unsupported);
 		tracing::debug!("{label}: user {user}: udp to {shown}: the exit's address is of the other family");
 		return Some(Reason::Unsupported);

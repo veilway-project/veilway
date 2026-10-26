@@ -933,6 +933,8 @@ async fn reach(served: &Served) -> io::Result<Stream> {
 	let failed = |why: String| io::Error::other(format!("outbound {tag}: {why}"));
 	let conn = match &**outbound {
 		Outbound::Socks5(up) => dial_conn(up, site, Instant::now() + DECOY_CONNECT).await.map_err(|failure| failed(failure.error.to_string()))?,
+		Outbound::WireGuard(out) if out.has(site.ip()) => Conn::Stack(timeout(DECOY_CONNECT, out.connect(site)).await.map_err(|_| failed("timed out".to_string()))?.map_err(failed)?),
+		Outbound::WireGuard(_) => return Err(failed("its address is of the other family".to_string())),
 		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != site.is_ipv4() => return Err(failed("its address is of the other family".to_string())),
 		Outbound::Direct {bind, interface} => Conn::Tcp(timeout(DECOY_CONNECT, connect_from(*bind, interface.as_deref(), site)).await.map_err(|_| failed("timed out".to_string()))?.map_err(|e| failed(e.kind().to_string()))?),
 	};

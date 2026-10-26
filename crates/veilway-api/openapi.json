@@ -448,6 +448,31 @@
           "backend": {
             "$ref": "#/components/schemas/Backend"
           },
+          "endpoint": {
+            "description": "The address and port of the server the outbound talks to now, which is the one its name resolved to. Null for another exit and before the name resolved.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "flows": {
+            "description": "The flows open through the WireGuard outbound's own stack, TCP and UDP. Null for every other exit.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "handshake_secs": {
+            "description": "Seconds since the last handshake with the server. Null for another exit and before the first handshake.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "interface_down_secs": {
             "description": "Seconds since the interface went down. Null while `interface_up` is not false.",
             "format": "uint64",
@@ -529,6 +554,35 @@
               "null"
             ]
           },
+          "outbound_down_reason": {
+            "description": "Why the WireGuard outbound is down. Null while `outbound_up` is not false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outbound_down_secs": {
+            "description": "Seconds since the WireGuard outbound went down. Null while `outbound_up` is not false.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outbound_flips": {
+            "description": "How often the WireGuard outbound switched between working and down.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outbound_up": {
+            "description": "For an exit through a WireGuard outbound: whether the outbound works. It is false only while it is down: the server has not answered a handshake for 20 seconds or a datagram could not be sent to it. An outbound with no handshake in the last 180 seconds and nothing unanswered is idle and counts as up. While it is false the exit does not work, devices without a choice of exit leave through `routing.fallback`, and nothing leaves around it. Null for every other exit.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "tag": {
             "type": "string"
           },
@@ -573,6 +627,13 @@
           "link_up",
           "latency_ms",
           "measured_at",
+          "outbound_up",
+          "outbound_down_secs",
+          "outbound_down_reason",
+          "outbound_flips",
+          "handshake_secs",
+          "endpoint",
+          "flows",
           "load",
           "load_level",
           "traffic"
@@ -1231,7 +1292,7 @@
             "type": "integer"
           },
           "down_reason": {
-            "description": "Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`.",
+            "description": "Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. For a `wireguard` outbound: its server has not answered a handshake for 20 seconds, a datagram could not be sent to it, or its name or address is refused. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is neither.",
             "type": [
               "string",
               "null"

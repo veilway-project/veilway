@@ -320,7 +320,7 @@ impl Config {
 			if let Some((other, _)) = listeners.iter().find(|(_, other)| !other.datagram() && loops(other.listen(), address.0)) {r.error(format!("{at}.site.address"), format!("expected the real site, found the address and port {other} listens on: every stranger's connection would come back to the node"))}
 		}
 		if self.outbounds.len() > MAX_OUTBOUNDS {r.error("outbounds", format!("expected at most {MAX_OUTBOUNDS} outbounds"))}
-		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} => tag.as_str()}));
+		let outbound_tags = tags(&mut r, "outbounds", self.outbounds.iter().map(|outbound| match outbound {Outbound::Direct {tag, ..} | Outbound::Socks5 {tag, ..} | Outbound::Xray {tag, ..} | Outbound::Wireguard {tag, ..} => tag.as_str()}));
 		// Borrowed-site page: the outbound a site's connections leave by must exist.
 		for (at, transport) in &listeners {
 			let Transport::FakeTls {site: Site {outbound: Some(tag), ..}, ..} = transport else {continue};
@@ -330,9 +330,9 @@ impl Config {
 		let tunnels: Vec<&str> = self.exits.iter().filter_map(|exit| if let Backend::L3(l3) = &exit.backend {Some(l3.interface.as_deref().unwrap_or(DEFAULT_INTERFACE))} else {None}).collect();
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
 			match outbound {
-				Outbound::Direct {bind: Some(Ip(ip)), ..} if ip.is_unspecified() => r.error(format!("outbounds[{i}].bind"), "expected a local address, not a wildcard"),
-				Outbound::Direct {interface: Some(name), ..} if !(1..=MAX_INTERFACE_BYTES).contains(&name.len()) || !name.as_bytes()[0].is_ascii_alphanumeric() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) => r.error(format!("outbounds[{i}].interface"), format!("expected 1 to {MAX_INTERFACE_BYTES} characters from letters, digits, _, - and ., starting with a letter or digit")),
-				Outbound::Direct {interface: Some(name), ..} if tunnels.contains(&name.as_str()) => r.error(format!("outbounds[{i}].interface"), "expected a network interface of the host, found the one an l3 exit makes: this outbound's traffic would go back into the tunnel"),
+				Outbound::Direct {bind: Some(Ip(ip)), ..} | Outbound::Wireguard {bind: Some(Ip(ip)), ..} if ip.is_unspecified() => r.error(format!("outbounds[{i}].bind"), "expected a local address, not a wildcard"),
+				Outbound::Direct {interface: Some(name), ..} | Outbound::Wireguard {interface: Some(name), ..} if !(1..=MAX_INTERFACE_BYTES).contains(&name.len()) || !name.as_bytes()[0].is_ascii_alphanumeric() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)) => r.error(format!("outbounds[{i}].interface"), format!("expected 1 to {MAX_INTERFACE_BYTES} characters from letters, digits, _, - and ., starting with a letter or digit")),
+				Outbound::Direct {interface: Some(name), ..} | Outbound::Wireguard {interface: Some(name), ..} if tunnels.contains(&name.as_str()) => r.error(format!("outbounds[{i}].interface"), "expected a network interface of the host, found the one an l3 exit makes: this outbound's traffic would go back into the tunnel"),
 				Outbound::Socks5 {username, password, ..} => {
 					if username.is_some() != password.is_some() {r.error(format!("outbounds[{i}]"), "expected username and password together, or neither")}
 					for (key, secret) in [("username", username), ("password", password)] {
@@ -412,6 +412,24 @@ impl Config {
 				_ => {}
 			}
 		}
+		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
+			let Outbound::Wireguard {server, addresses, mtu, keepalive_secs, max_flows, ..} = outbound else {continue};
+			let at = format!("outbounds[{i}]");
+			if let Host::Ip(ip) = &server.host {
+				if gate::refused(*ip, &pools) {r.error(format!("{at}.server"), "expected an address the node may dial: not loopback, link-local, unspecified, multicast, a cloud metadata address or an address of an inbound's pool")}
+			} else {
+				r.warning(format!("{at}.server"), "a name, which the system's resolver looks up outside every exit, at start, every 5 minutes and whenever the node starts a handshake again, so whoever sees that traffic learns the server's name: write the address when the name must stay hidden. An address it gives that is loopback, in an inbound's pool or the node's own is refused")
+			}
+			if !(1..=2).contains(&addresses.len()) {r.error(format!("{at}.addresses"), "expected one or two addresses, at most one of each family")}
+			else if addresses.len() == 2 && addresses[0].0.is_ipv4() == addresses[1].0.is_ipv4() {r.error(format!("{at}.addresses"), "expected at most one address of each family")}
+			for (j, HostAddress(address)) in addresses.iter().enumerate().take(2) {
+				let inside = pools.iter().any(|(pool, _)| pool.contains(address));
+				if inside || address.is_loopback() || address.is_multicast() || address.is_unspecified() || matches!(address, IpAddr::V4(v4) if v4.is_broadcast()) {r.error(format!("{at}.addresses[{j}]"), if inside {"expected an address outside every inbound's pool: this one is inside one"} else {"expected a host address inside the tunnel: not loopback, multicast or unspecified"})}
+			}
+			if mtu.is_some_and(|mtu| !(1280..=1500).contains(&mtu)) {r.error(format!("{at}.mtu"), "expected an integer from 1280 to 1500")}
+			if keepalive_secs.is_some_and(|secs| secs > 3600) {r.error(format!("{at}.keepalive_secs"), "expected 0 for none, or an integer from 1 to 3600")}
+			if max_flows.is_some_and(|flows| !(16..=16384).contains(&flows)) {r.error(format!("{at}.max_flows"), "expected an integer from 16 to 16384")}
+		}
 		// Outbound chaining, "Outbounds": the named outbound must be a socks5 one, following `via` from any outbound must not come back to it, and a chain holds at most `MAX_CHAIN` of them.
 		let via_of = |at: usize| match &self.outbounds[at] {Outbound::Socks5 {via: Some(via), ..} => outbound_tags.get(via.as_str()).copied().filter(|to| matches!(self.outbounds[*to], Outbound::Socks5 {..})), _ => None};
 		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
@@ -420,6 +438,7 @@ impl Config {
 				None => r.error(format!("outbounds[{i}].via"), "expected the tag of an outbound, found a tag no outbound has"),
 				Some(Outbound::Direct {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
 				Some(Outbound::Xray {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry a chain"),
+				Some(Outbound::Wireguard {..}) => r.error(format!("outbounds[{i}].via"), "expected a socks5 outbound: a WireGuard outbound carries flows of its own and cannot carry a chain"),
 				Some(Outbound::Socks5 {..}) => {}
 			}
 			let (mut at, mut chain) = (i, vec![i]);
@@ -464,9 +483,9 @@ impl Config {
 					// A chain carries no UDP, and `direct` would send that UDP from this node's own address around the chain.
 					if matches!(outbound, Some(Outbound::Socks5 {via: Some(_), ..})) && netstack.unsupported.udp == Some(Policy::Direct) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject, drop or a via to another exit: this outbound is a chain of proxies, which carry no UDP, and direct would send that UDP from this node's own address, around the chain")}
 					// An Xray outbound carries UDP itself, and when it is down the flow ends: nothing may send that UDP around it.
-					if matches!(outbound, Some(Outbound::Xray {..})) {
-						if matches!(netstack.unsupported.udp, Some(Policy::Direct | Policy::Via(_))) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject or drop: an Xray outbound carries UDP itself, and while it is down the flow ends rather than leave this exit around it")}
-						if self.routing.fallback.iter().any(|tag| *tag != exit.tag) {r.warning(&at, "an Xray outbound and routing.fallback: users routed here fall back to routing.fallback while the outbound is down, and their traffic then leaves by a route this exit was meant to replace")}
+					if matches!(outbound, Some(Outbound::Xray {..} | Outbound::Wireguard {..})) {
+						if matches!(netstack.unsupported.udp, Some(Policy::Direct | Policy::Via(_))) {r.error(format!("{at}.backend.unsupported.udp"), "expected reject or drop: this outbound carries UDP itself, and while it is down the flow ends rather than leave this exit around it")}
+						if self.routing.fallback.iter().any(|tag| *tag != exit.tag) {r.warning(&at, "an Xray or WireGuard outbound and routing.fallback: users routed here fall back to routing.fallback while the outbound is down, and their traffic then leaves by a route this exit was meant to replace")}
 					}
 					if outbound.is_none() {r.error(format!("{at}.backend.outbound"), "expected the tag of an outbound, found a tag no outbound has")}
 					if direct && netstack.proxy_only == Some(true) {r.error(format!("{at}.backend.proxy_only"), "expected false or no key: a direct outbound has no proxy")}
@@ -550,6 +569,15 @@ impl Config {
 		let (mut device_keys, mut addresses, mut secrets) = (HashSet::new(), HashSet::new(), HashSet::new());
 		// Every WireGuard key the document holds, public or not. No transport secret is one of them: a key has one use.
 		let wireguard: HashSet<[u8; 32]> = self.inbounds.iter().take(MAX_INBOUNDS).map(|inbound| inbound.private_key.expose().0).chain(inbound_keys.keys().copied()).chain(self.users.iter().take(MAX_USERS).flat_map(|user| user.devices.iter().take(MAX_DEVICES)).flat_map(|device| std::iter::once(device.public_key.0).chain(device.preshared_key.as_ref().map(|key| key.expose().0)))).collect();
+		// A WireGuard outbound speaks as a client of another server: its key is its own, so that a leak of it opens nothing else, and no two outbounds share one, because the server tells its clients apart by that key.
+		let (mut outbound_keys, linked): (HashSet<[u8; 32]>, HashSet<[u8; 32]>) = (HashSet::new(), self.links.iter().take(MAX_LINKS).filter_map(Link::identity).collect());
+		for (i, outbound) in self.outbounds.iter().enumerate().take(MAX_OUTBOUNDS) {
+			let Outbound::Wireguard {public_key, private_key, ..} = outbound else {continue};
+			let (own, at) = (veilway_wg::public_key(&private_key.expose().0), format!("outbounds[{i}]"));
+			if own == public_key.0 {r.error(format!("{at}.private_key"), "expected a key that is not the server's: this one makes the public_key of the server")}
+			else if wireguard.contains(&own) || wireguard.contains(&private_key.expose().0) || linked.contains(&own) {r.error(format!("{at}.private_key"), "expected a key of its own: this one is a key of an inbound, a device or a link of this config")}
+			else if !outbound_keys.insert(private_key.expose().0) {r.error(format!("{at}.private_key"), "expected a key no other wireguard outbound uses")}
+		}
 		// Protocol overview, "Keys and who holds them": "Validation refuses a node transport key equal to any WireGuard key in the config." No two inbounds share one either, none is given twice, and none is a device's transport secret.
 		let mut node_keys = HashSet::new();
 		for (i, inbound) in self.inbounds.iter().enumerate().take(MAX_INBOUNDS) {
@@ -686,6 +714,7 @@ impl Config {
 					None => r.error(at("via"), "expected the tag of an outbound, found a tag no outbound has"),
 					Some(Outbound::Direct {..}) => r.error(at("via"), "expected a socks5 outbound: a direct outbound has no proxy to dial through"),
 					Some(Outbound::Xray {..}) => r.error(at("via"), "expected a socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry a link"),
+					Some(Outbound::Wireguard {..}) => r.error(at("via"), "expected a socks5 outbound: a WireGuard outbound carries the flows of an exit and cannot carry a link"),
 					Some(Outbound::Socks5 {..}) => {}
 				}
 			}
@@ -851,6 +880,7 @@ impl Config {
 			if let Some(via) = &upstream.via {
 				if !outbound_tags.contains_key(via.as_str()) {r.error(at("via"), "expected the tag of a direct or socks5 outbound, found a tag no outbound has")}
 				if outbound_tags.get(via.as_str()).is_some_and(|to| matches!(self.outbounds[*to], Outbound::Xray {..})) {r.error(at("via"), "expected the tag of a direct or socks5 outbound: an Xray outbound is reached through a Unix socket and cannot carry an upstream")}
+				if outbound_tags.get(via.as_str()).is_some_and(|to| matches!(self.outbounds[*to], Outbound::Wireguard {..})) {r.error(at("via"), "expected the tag of a direct or socks5 outbound: a WireGuard outbound carries the flows of an exit and cannot carry an upstream")}
 				let mut hop = outbound_tags.get(via.as_str()).copied();
 				for _ in 0..MAX_CHAIN {
 					let Some(proxy) = hop else {break};

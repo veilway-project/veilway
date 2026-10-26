@@ -3,6 +3,7 @@
 use super::inbound::Tunnel;
 use super::route;
 use super::upstream::UpstreamState;
+use super::wg_out::{Spec, WgOut};
 use super::xray_out::{Hop, Hops};
 use super::{control, icmp, l3, link, proxy, usage, ExitState, Traffic, UserState};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, LinkManage, LinkTransportType, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_LINK_FLOWS, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
@@ -44,7 +45,7 @@ impl Latency {
 }
 
 #[derive(PartialEq, Eq)]
-pub enum Outbound {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks5(Upstream)}
+pub enum Outbound {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks5(Upstream), WireGuard(Arc<WgOut>)}
 
 impl Upstream {
 	/// The proxy of the `socks5` or `xray` outbound `tag` names, behind the chain its `via` keys give. Validation has refused a loop and a chain longer than `MAX_CHAIN`, so this ends.
@@ -60,15 +61,37 @@ impl Upstream {
 				via: match via {Some(via) => Some(Arc::new(Upstream::of(outbounds, latency, hops, via)?)), None => None},
 				hop: None,
 			}),
-			config::Outbound::Direct {..} => None,
+			config::Outbound::Direct {..} | config::Outbound::Wireguard {..} => None,
 		}
 	}
 }
 
 impl Outbound {
-	/// The outbound `tag` names, as the engine dials through it.
-	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, tag: &str) -> Option<Outbound> {
-		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} | config::Outbound::Xray {tag: name, ..} if name == tag))? {
+	/// Whether the outbound has no address to leave from for a destination `ip`: a `bind` of the other family, or no WireGuard address of its family. Such a flow is refused as unsupported.
+	pub fn other_family(&self, ip: IpAddr) -> bool {
+		match self {
+			Outbound::Direct {bind: Some(bind), ..} => bind.is_ipv4() != ip.is_ipv4(),
+			Outbound::WireGuard(out) => !out.has(ip),
+			_ => false,
+		}
+	}
+
+	/// The outbound `tag` names, as the engine dials through it. `pools` are the inbounds' pools, which a WireGuard outbound's server may not be in. A WireGuard outbound is started here when no running one has these settings, so this needs the runtime.
+	pub fn of(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, pools: &[(IpNet, usize)], tag: &str) -> Option<Outbound> {
+		match outbounds.iter().find(|outbound| matches!(outbound, config::Outbound::Direct {tag: name, ..} | config::Outbound::Socks5 {tag: name, ..} | config::Outbound::Xray {tag: name, ..} | config::Outbound::Wireguard {tag: name, ..} if name == tag))? {
+			config::Outbound::Wireguard {server, public_key, private_key, preshared_key, addresses, mtu, keepalive_secs, max_flows, bind, interface, ..} => Some(Outbound::WireGuard(hops.wireguard.get(tag, Spec {
+				server: server.clone(),
+				public_key: public_key.0,
+				private_key: private_key.expose().0,
+				preshared_key: preshared_key.as_ref().map(|key| key.expose().0),
+				addresses: addresses.iter().map(|address| address.0).collect(),
+				mtu: mtu.unwrap_or(config::DEFAULT_WG_MTU),
+				keepalive: keepalive_secs.unwrap_or(config::DEFAULT_WG_KEEPALIVE_SECS),
+				max_flows: max_flows.unwrap_or(config::DEFAULT_WG_MAX_FLOWS) as usize,
+				bind: bind.map(|ip| ip.0),
+				interface: interface.clone(),
+				pools: pools.iter().map(|(pool, _)| *pool).collect(),
+			}))),
 			config::Outbound::Direct {bind, interface, ..} => Some(Outbound::Direct {bind: bind.map(|ip| ip.0), interface: interface.clone()}),
 			config::Outbound::Socks5 {..} | config::Outbound::Xray {..} => Upstream::of(outbounds, latency, hops, tag).map(Outbound::Socks5),
 		}
@@ -521,12 +544,14 @@ impl Plan {
 				Some(Policy::Via(tag)) => Fallback::Via(find(&exit_tags, tag)?),
 			})
 		};
-		let latency: HashMap<String, Arc<Latency>> = config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..} => (tag.clone(), Arc::new(Latency::default()))}).collect();
+		let latency: HashMap<String, Arc<Latency>> = config.outbounds.iter().map(|outbound| match outbound {config::Outbound::Direct {tag, ..} | config::Outbound::Socks5 {tag, ..} | config::Outbound::Xray {tag, ..} | config::Outbound::Wireguard {tag, ..} => (tag.clone(), Arc::new(Latency::default()))}).collect();
+		// The pools are made again from the inbounds below, which come after the exits: an outbound's server may not be in one.
+		let early: Vec<(IpNet, usize)> = config.inbounds.iter().enumerate().flat_map(|(i, inbound)| inbound.address.iter().map(move |net| (net.0, i))).collect();
 		let mut exits: Vec<Exit> = Vec::with_capacity(config.exits.len());
 		for exit in &config.exits {
 			let backend = match &exit.backend {
 				config::Backend::Netstack(netstack) => Backend::Netstack {
-					outbound: Outbound::of(&config.outbounds, &latency, &previous.hops, &netstack.outbound).ok_or_else(stale)?,
+					outbound: Outbound::of(&config.outbounds, &latency, &previous.hops, &early, &netstack.outbound).ok_or_else(stale)?,
 					tcp_idle: Duration::from_secs(netstack.tcp_idle_secs.unwrap_or(DEFAULT_TCP_IDLE_SECS).into()),
 					udp_idle: Duration::from_secs(netstack.udp_idle_secs.unwrap_or(DEFAULT_UDP_IDLE_SECS).into()),
 					icmp_echo: fallback(&netstack.unsupported.icmp_echo, Fallback::Local)?,
@@ -795,6 +820,7 @@ impl Plan {
 	pub fn working(&self, at: usize) -> bool {
 		match &self.exits[at].backend {
 			Backend::Netstack {outbound: Outbound::Socks5(up), ..} => self.exits[at].state.working() && up.hop.as_ref().is_none_or(|hop| hop.reason().is_none()),
+			Backend::Netstack {outbound: Outbound::WireGuard(out), ..} => self.exits[at].state.working() && out.down().is_none(),
 			Backend::Netstack {..} => self.exits[at].state.working(),
 			Backend::L3 {..} => self.l3.as_ref().is_some_and(|(wired, port)| *wired == at && port.health.down.lock().unwrap_or_else(|e| e.into_inner()).is_none()),
 			Backend::Chain {links} => links.iter().any(|link| self.up(*link)),

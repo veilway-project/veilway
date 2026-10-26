@@ -45,6 +45,8 @@ webpki-roots.workspace=true
 # The self-signed certificate of a `tls` transport with `self_signed`: made with rcgen, whose crates the tree already has, and read back with x509-parser, which the binary already links, for the name it keeps and the dates it is renewed by.
 rcgen.workspace=true
 x509-parser.workspace=true
+# The WireGuard outbounds: the node is a client of another server, with one tunnel from boringtun for each, and reads the public key of its own from `veilway-wg`.
+boringtun.workspace=true
 
 # The one ioctl that makes the TUN device of an l3 exit on Linux, and the flags the state file is opened with.
 [target.'cfg(unix)'.dependencies]
@@ -59,7 +61,6 @@ rustix.workspace=true
 veilway-engine={path="../veilway-engine", features=["testing", "unencrypted-vault"]}
 # The crate's own tests are built with the listener over pipes in memory.
 veilway-core={path=".", features=["bench", "upstream-tests"]}
-boringtun.workspace=true
 # The tests of `udp-obfs` read the node's log: a state in which honest clients are refused has to be said.
 tracing-subscriber.workspace=true
 # The tests of `tls`: a real HTTP/1.1 server as the decoy origin that the node is held against. Their certificates are made with rcgen, a dependency of the crate itself.

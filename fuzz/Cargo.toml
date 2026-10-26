@@ -295,6 +295,13 @@ doc=false
 bench=false
 
 [[bin]]
+name="wg_stack"
+path="fuzz_targets/wg_stack.rs"
+test=false
+doc=false
+bench=false
+
+[[bin]]
 name="xray_packets"
 path="fuzz_targets/xray_packets.rs"
 test=false

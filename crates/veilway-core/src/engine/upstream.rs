@@ -66,11 +66,13 @@ const PROFILE_WAIT: Duration = Duration::from_secs(120);
 #[derive(Clone, PartialEq)]
 pub enum Reach {Direct {bind: Option<IpAddr>, interface: Option<String>}, Socks(Arc<plan::Upstream>)}
 
-/// The outbound `tag` of the config as the node reaches a provider through it. None for a tag that is no `direct`, `socks5` or `xray` outbound, which validation does not let through.
+/// The outbound `tag` of the config as the node reaches a provider through it. None for a tag that is no `direct`, `socks5` or `xray` outbound, which validation does not let through. A WireGuard outbound is never one, and is not looked at here: looking would start it.
 pub fn reach(outbounds: &[config::Outbound], latency: &HashMap<String, Arc<Latency>>, hops: &Hops, tag: &str) -> Option<Reach> {
-	match Outbound::of(outbounds, latency, hops, tag)? {
+	if outbounds.iter().any(|outbound| matches!(outbound, config::Outbound::Wireguard {tag: of, ..} if of == tag)) {return None}
+	match Outbound::of(outbounds, latency, hops, &[], tag)? {
 		Outbound::Direct {bind, interface} => Some(Reach::Direct {bind, interface}),
 		Outbound::Socks5(up) => Some(Reach::Socks(Arc::new(up))),
+		Outbound::WireGuard(_) => None,
 	}
 }
 

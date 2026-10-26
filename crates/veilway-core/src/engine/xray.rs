@@ -577,6 +577,8 @@ pub(super) async fn connect(shared: &Arc<Shared>, plan: Arc<Plan>, at: usize, ta
 	};
 	let dialled = match outbound {
 		Outbound::Socks5(up) => tokio::time::timeout(DIAL, flows::dial_conn(up, dst, tokio::time::Instant::now() + DIAL)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|failure| failure.error)),
+		Outbound::WireGuard(out) if out.has(ip) => tokio::time::timeout(DIAL, out.connect(dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Stack).map_err(|why| anyhow::anyhow!("{why}"))),
+		Outbound::WireGuard(_) => Err(anyhow::anyhow!("the exit's address is of the other family")),
 		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
 		Outbound::Direct {bind, interface} => tokio::time::timeout(DIAL, flows::connect_from(*bind, interface.as_deref(), dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Tcp).map_err(|e| anyhow::anyhow!("{}", e.kind()))),
 	};

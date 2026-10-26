@@ -293,6 +293,15 @@ pub struct Ip(pub IpAddr);
 
 text_value!(Ip, "an IPv4 or IPv6 address without a prefix", "^[0-9A-Fa-f:.]+$", |s| ip(s).map(Ip), |ip| ip.0.to_string());
 
+/// A host address of a WireGuard outbound inside its tunnel. A `/32` or `/128` suffix is accepted, as `wg-quick` writes it, and dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostAddress(pub IpAddr);
+
+text_value!(HostAddress, "an IPv4 or IPv6 address, optionally with /32 or /128", "^[0-9A-Fa-f:.]+(/(32|128))?$", |s| match s.split_once('/') {
+	Some((address, prefix)) => ip(address).map(HostAddress).and_then(|host| if prefix == if host.0.is_ipv4() {"32"} else {"128"} {Ok(host)} else {Err("an address with no prefix, or the whole address as /32 or /128")}),
+	None => ip(s).map(HostAddress),
+}, |host| host.0.to_string());
+
 /// One reverse proxy of a `ws` or `fronted` transport, or a network of them. An address alone is the network of that one address.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Proxy(pub IpNet);
@@ -1345,6 +1354,39 @@ pub enum Outbound {
 		#[serde(skip_serializing_if = "Option::is_none")]
 		security: Option<XraySecurity>,
 	},
+	/// Another WireGuard server as the carrier of a `netstack` exit: the node is a WireGuard client of it, with its own userspace TCP/IP stack on `addresses`, and re-dials every flow of the exit from there. The server sees every flow in clear, so it is a provider the operator trusts with that. The private key and the preshared key are secrets. Endpoints on private addresses are allowed, loopback, an inbound's pool and the node's own addresses are refused. While the server does not answer, the exit is not working and says so, and nothing leaves around it. This outbound has no `via` and is no `via` of another outbound, a link or an upstream.
+	Wireguard {
+		#[schemars(pattern(TAG_PATTERN))]
+		tag: String,
+		/// The server's UDP endpoint. A name is looked up by the system's resolver at start, every 5 minutes and whenever the node starts a handshake again, and the last address is kept while the name still resolves.
+		server: HostPort,
+		/// The server's public key.
+		public_key: Key,
+		private_key: Secret<Key>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		preshared_key: Option<Secret<Key>>,
+		/// The node's addresses inside the tunnel: one or two, at most one of each family. A destination of a family with no address here is refused as unsupported.
+		#[schemars(length(min = 1, max = 2))]
+		addresses: Vec<HostAddress>,
+		/// Defaults to 1420.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(range(min = 1280, max = 1500))]
+		mtu: Option<u16>,
+		/// Seconds between keepalives, 0 for none. Defaults to 25.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(range(min = 0, max = 3600))]
+		keepalive_secs: Option<u16>,
+		/// The flows through the tunnel at once. Defaults to 1024.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(range(min = 16, max = 16384))]
+		max_flows: Option<u32>,
+		/// The local address and the network interface of the UDP socket that talks to the server, as for a `direct` outbound.
+		#[serde(skip_serializing_if = "Option::is_none")]
+		bind: Option<Ip>,
+		#[serde(skip_serializing_if = "Option::is_none")]
+		#[schemars(pattern("^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$"))]
+		interface: Option<String>,
+	},
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1382,24 +1424,29 @@ pub enum XraySecurity {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum OutboundType {Direct, Socks5, Xray}
+enum OutboundType {Direct, Socks5, Xray, Wireguard}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, allow_private: Option<bool>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>}
+struct OutboundKeys {#[serde(rename = "type")] kind: OutboundType, tag: String, bind: Option<Ip>, interface: Option<String>, server: Option<HostPort>, username: Option<Secret<String>>, password: Option<Secret<String>>, via: Option<String>, link: Option<Secret<String>>, protocol: Option<XrayOutboundProtocol>, allow_private: Option<bool>, id: Option<Secret<String>>, flow: Option<XrayFlow>, cipher: Option<String>, transport: Option<XrayTransport>, security: Option<XraySecurity>, public_key: Option<Key>, private_key: Option<Secret<Key>>, preshared_key: Option<Secret<Key>>, addresses: Option<Vec<HostAddress>>, mtu: Option<u16>, keepalive_secs: Option<u16>, max_flows: Option<u32>}
 
 impl<'de> Deserialize<'de> for Outbound {
 	fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outbound, D::Error> {
 		let keys = OutboundKeys::deserialize(d)?;
 		let xray = [("allow_private", keys.allow_private.is_some()), ("link", keys.link.is_some()), ("protocol", keys.protocol.is_some()), ("id", keys.id.is_some()), ("flow", keys.flow.is_some()), ("cipher", keys.cipher.is_some()), ("transport", keys.transport.is_some()), ("security", keys.security.is_some())];
+		let wireguard = [("public_key", keys.public_key.is_some()), ("private_key", keys.private_key.is_some()), ("preshared_key", keys.preshared_key.is_some()), ("addresses", keys.addresses.is_some()), ("mtu", keys.mtu.is_some()), ("keepalive_secs", keys.keepalive_secs.is_some()), ("max_flows", keys.max_flows.is_some())];
 		match keys.kind {
-			OutboundType::Direct => only("direct", &[&[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray].concat()).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
+			OutboundType::Direct => only("direct", &[&[("server", keys.server.is_some()), ("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray, &wireguard].concat()).map(|_| Outbound::Direct {tag: keys.tag, bind: keys.bind, interface: keys.interface}),
 			OutboundType::Socks5 => {
-				only("socks5", &[&[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())][..], &xray].concat())?;
+				only("socks5", &[&[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some())][..], &xray, &wireguard].concat())?;
 				Ok(Outbound::Socks5 {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, username: keys.username, password: keys.password, via: keys.via})
 			}
+			OutboundType::Wireguard => {
+				only("wireguard", &[&[("username", keys.username.is_some()), ("password", keys.password.is_some()), ("via", keys.via.is_some())][..], &xray].concat())?;
+				Ok(Outbound::Wireguard {tag: keys.tag, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, public_key: keys.public_key.ok_or_else(|| de::Error::missing_field("public_key"))?, private_key: keys.private_key.ok_or_else(|| de::Error::missing_field("private_key"))?, preshared_key: keys.preshared_key, addresses: keys.addresses.ok_or_else(|| de::Error::missing_field("addresses"))?, mtu: keys.mtu, keepalive_secs: keys.keepalive_secs, max_flows: keys.max_flows, bind: keys.bind, interface: keys.interface})
+			}
 			OutboundType::Xray => {
-				only("xray", &[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some()), ("username", keys.username.is_some()), ("via", keys.via.is_some())])?;
+				only("xray", &[&[("bind", keys.bind.is_some()), ("interface", keys.interface.is_some()), ("username", keys.username.is_some()), ("via", keys.via.is_some())][..], &wireguard].concat())?;
 				let Some(link) = keys.link else {
 					return Ok(Outbound::Xray {tag: keys.tag, link: None, protocol: keys.protocol.ok_or_else(|| de::Error::missing_field("protocol"))?, server: keys.server.ok_or_else(|| de::Error::missing_field("server"))?, allow_private: keys.allow_private, id: keys.id, password: keys.password, flow: keys.flow, cipher: keys.cipher, transport: keys.transport, security: keys.security})
 				};

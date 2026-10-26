@@ -62,6 +62,10 @@ pub const MAX_INBOUND_ADDRESSES: usize = 2;
 pub const MAX_LINKS: usize = 64;
 pub const MAX_CHAIN_LINKS: usize = 4;
 pub const DEFAULT_LINK_FLOWS: u32 = 16384;
+/// What a `wireguard` outbound uses where the config leaves a setting out.
+pub const DEFAULT_WG_MTU: u16 = 1420;
+pub const DEFAULT_WG_KEEPALIVE_SECS: u16 = 25;
+pub const DEFAULT_WG_MAX_FLOWS: u32 = 1024;
 pub const MAX_LINK_FLOWS: u32 = 65536;
 /// Node links page, "Tunnels": at most 64 tunnels, 1 to 64 networks in `sources`, `max_connections` 1 to 4096 with 256 by default, and "at most 16 of them for one client address".
 pub const MAX_TUNNELS: usize = 64;

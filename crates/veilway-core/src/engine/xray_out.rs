@@ -3,6 +3,7 @@
 //! For each outbound the node writes a `trojan` inbound that listens on a Unix socket in the folder the node and Xray share through a group (`xray_dir`), with a path and a 256 bit password made new for each start, routed to that outbound alone. The node connects to the socket, checks that whoever holds it is Xray's user (`SO_PEERCRED`) before it sends a byte, and speaks Trojan: CONNECT for TCP and one UDP stream for each UDP flow (`xray_trojan`, `flows::dial_conn`). So the exit, the gate, the rules, the quotas and the counters are the ones every flow already meets, nothing is listening on a network address, and UDP has the same login as TCP.
 //! A socket and a password live in a `Hop` that the supervisor in `xray` fills in once Xray is up and the socket is there and is Xray's, and empties before it stops Xray. A flow that finds no endpoint fails there, with the reason, and the exit is not working; nothing falls back to a direct connection.
 //! Where there is no add-on host (every system but Linux) there is no Xray outbound: the hop says so.
+use super::wg_out::WgOuts;
 use super::{dns, flows, upstream, Shared};
 use crate::config::{self, Host, Store, XhttpMode, XrayFlow, XrayOutboundProtocol, XraySecurity, XrayTransport};
 use ipnet::IpNet;
@@ -47,15 +48,18 @@ impl Hop {
 	pub(super) fn down(&self, why: &str) {*self.0.lock().unwrap_or_else(|e| e.into_inner()) = State::Down(why.to_string())}
 }
 
-/// The hops by the tag of their outbound. One registry lives as long as the engine, so a reload keeps the hop of an outbound that stays.
+/// The hops by the tag of their outbound, and the WireGuard outbounds, which are carriers that the engine holds the same way. One registry lives as long as the engine, so a reload keeps the hop of an outbound that stays.
 #[derive(Default)]
-pub struct Hops(Mutex<HashMap<String, Arc<Hop>>>);
+pub struct Hops {hops: Mutex<HashMap<String, Arc<Hop>>>, pub wireguard: WgOuts}
 
 impl Hops {
-	pub fn get(&self, tag: &str) -> Arc<Hop> {self.0.lock().unwrap_or_else(|e| e.into_inner()).entry(tag.to_string()).or_insert_with(|| Arc::new(Hop(Mutex::new(State::Down("the xray add-on has not started yet".to_string()))))).clone()}
+	pub fn get(&self, tag: &str) -> Arc<Hop> {self.hops.lock().unwrap_or_else(|e| e.into_inner()).entry(tag.to_string()).or_insert_with(|| Arc::new(Hop(Mutex::new(State::Down("the xray add-on has not started yet".to_string()))))).clone()}
+
+	/// A registry whose WireGuard outbounds ask `is_local` which addresses are the node's own.
+	pub fn new(is_local: fn(IpAddr) -> bool) -> Hops {Hops {hops: Mutex::default(), wireguard: WgOuts::new(is_local)}}
 
 	/// Every hop down at once, for the moment before Xray is stopped or started again.
-	pub(super) fn all_down(&self, why: &str) {for hop in self.0.lock().unwrap_or_else(|e| e.into_inner()).values() {hop.down(why)}}
+	pub(super) fn all_down(&self, why: &str) {for hop in self.hops.lock().unwrap_or_else(|e| e.into_inner()).values() {hop.down(why)}}
 }
 
 /// One outbound as the add-on's document has it: the socket and password of its inbound, and the address the provider's server is dialed at, which is one the node looked up and checked.

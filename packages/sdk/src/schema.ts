@@ -554,6 +554,18 @@ export interface components {
         };
         Exit: {
             backend: components["schemas"]["Backend"];
+            /** @description The address and port of the server the outbound talks to now, which is the one its name resolved to. Null for another exit and before the name resolved. */
+            endpoint: string | null;
+            /**
+             * Format: uint64
+             * @description The flows open through the WireGuard outbound's own stack, TCP and UDP. Null for every other exit.
+             */
+            flows: number | null;
+            /**
+             * Format: uint64
+             * @description Seconds since the last handshake with the server. Null for another exit and before the first handshake.
+             */
+            handshake_secs: number | null;
             /**
              * Format: uint64
              * @description Seconds since the interface went down. Null while `interface_up` is not false.
@@ -587,6 +599,20 @@ export interface components {
             name: string;
             /** @description The tag of the outbound of a netstack backend. */
             outbound: string | null;
+            /** @description Why the WireGuard outbound is down. Null while `outbound_up` is not false. */
+            outbound_down_reason: string | null;
+            /**
+             * Format: uint64
+             * @description Seconds since the WireGuard outbound went down. Null while `outbound_up` is not false.
+             */
+            outbound_down_secs: number | null;
+            /**
+             * Format: uint64
+             * @description How often the WireGuard outbound switched between working and down.
+             */
+            outbound_flips: number;
+            /** @description For an exit through a WireGuard outbound: whether the outbound works. It is false only while it is down: the server has not answered a handshake for 20 seconds or a datagram could not be sent to it. An outbound with no handshake in the last 180 seconds and nothing unanswered is idle and counts as up. While it is false the exit does not work, devices without a choice of exit leave through `routing.fallback`, and nothing leaves around it. Null for every other exit. */
+            outbound_up: boolean | null;
             tag: string;
             traffic: components["schemas"]["Traffic"];
             /** @description Whether the SOCKS5 proxy of the exit relays UDP as far as the node knows. Null for an exit without one. */
@@ -821,7 +847,7 @@ export interface components {
         OutboundStats: {
             /** Format: uint64 */
             down_bytes_per_sec: number;
-            /** @description Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is not `xray`. */
+            /** @description Why an `xray` outbound cannot carry a flow now, in words: the add-on is not installed or not running, Xray ended and starts again, or the name of its server does not resolve to an address the node may dial. For a `wireguard` outbound: its server has not answered a handshake for 20 seconds, a datagram could not be sent to it, or its name or address is refused. Every exit through it is down with the same reason. Null while it carries, and for an outbound that is neither. */
             down_reason: string | null;
             /**
              * Format: uint64
