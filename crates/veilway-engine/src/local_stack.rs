@@ -27,8 +27,9 @@ const CONNECT: Duration = Duration::from_secs(10);
 const IDLE: Duration = Duration::from_secs(3600);
 /// How often the task looks at its deadlines when nothing else wakes it.
 const TICK: Duration = Duration::from_secs(5);
-/// What each side of a connection buffers: in the socket, and in the pipe to the proxy task.
-const SOCKET: usize = 65536;
+/// What a connection's socket buffers coming in and going out, and its pipe to the proxy task. A receive buffer over 64 KiB turns on window scaling: 64 KiB held one connection to 64 KiB a round trip, about 0.6 MB/s through a server 100 ms away.
+const RECEIVE: usize = 262_144;
+const SEND: usize = 65_536;
 const PIPE: usize = 32768;
 /// A socket that hears nothing for `DEAD` is aborted, which ends a peer that went away and a closing that the far side never finishes. It is probed every `PROBE` so that a quiet but live connection is not taken for one.
 const DEAD: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(60);
@@ -332,7 +333,7 @@ async fn run(mut tunnel: Tunnel, max_flows: usize, mut commands: mpsc::Receiver<
 							let _ = reply.send(Err(if up {Fail::Busy} else {Fail::Down}));
 							continue;
 						}
-						let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; SOCKET]), tcp::SocketBuffer::new(vec![0u8; SOCKET]));
+						let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; RECEIVE]), tcp::SocketBuffer::new(vec![0u8; SEND]));
 						socket.set_nagle_enabled(false);
 						socket.set_timeout(Some(DEAD));
 						socket.set_keep_alive(Some(PROBE));
@@ -438,7 +439,7 @@ mod tests {
 		let (own, remote): (IpAddr, SocketAddr) = ("10.7.0.2".parse().unwrap(), "93.184.216.34:80".parse().unwrap());
 		let (mut device, mut sockets, at) = (Wire {rx: VecDeque::new(), tx: Vec::new(), mtu: 0}, SocketSet::new(Vec::new()), Clock::from_millis(0));
 		let mut iface = interface(&mut device, 1500, &[own], at);
-		let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; SOCKET]), tcp::SocketBuffer::new(vec![0u8; SOCKET]));
+		let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; RECEIVE]), tcp::SocketBuffer::new(vec![0u8; SEND]));
 		socket.connect(iface.context(), remote, (own, 33000)).unwrap();
 		let handle = sockets.add(socket);
 		iface.poll(at, &mut device, &mut sockets);
