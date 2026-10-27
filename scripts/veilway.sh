@@ -111,6 +111,11 @@ PUBLIC_IP=""
 NODE_HTTPS=0
 TAG_OUT=""
 TMP=""
+MENU=0
+MENU_RC=0
+CLS=""
+WEB_NOW=0
+STTY_SAVED=""
 MIRRORS=()
 SOURCES=()
 declare -A DEAD=()
@@ -121,12 +126,20 @@ else
 	B=""; D=""; R=""; G=""; Y=""; C=""; Z=""
 fi
 if [ -t 1 ] && grep -qi 'utf-\?8' <<<"${LC_ALL:-${LC_CTYPE:-${LANG:-}}}"; then
-	OK="✓"; BAD="✗"; DOT="·"; SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; H="─"; V="│"; TL="┌"; TR="┐"; BL="└"; BR="┘"
+	OK="✓"; BAD="✗"; DOT="·"; SPIN='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'; H="─"; V="│"; TL="┌"; TR="┐"; BL="└"; BR="┘"; PTR="❯"; LED="●"; UD="↑↓"
 else
-	OK="+"; BAD="x"; DOT="-"; SPIN="|/-\\"; H="-"; V="|"; TL="+"; TR="+"; BL="+"; BR="+"
+	OK="+"; BAD="x"; DOT="-"; SPIN="|/-\\"; H="-"; V="|"; TL="+"; TR="+"; BL="+"; BR="+"; PTR=">"; LED="*"; UD="up/down"
 fi
 
-cleanup() { [ -n "$TMP" ] && rm -rf "$TMP"; return 0; }
+# Puts the terminal back after a picker, also from the traps: the cursor is shown and the line settings return.
+tty_restore() {
+	[ -n "$STTY_SAVED" ] || return 0
+	stty "$STTY_SAVED" </dev/tty 2>/dev/null || true
+	printf '\033[?25h'
+	STTY_SAVED=""
+}
+
+cleanup() { tty_restore; [ -n "$TMP" ] && rm -rf "$TMP"; return 0; }
 trap cleanup EXIT
 trap 'printf "\n"; exit 130' INT TERM
 
@@ -169,6 +182,94 @@ confirm() {
 	[ "$DRY" = 1 ] && { dry "ask: $1"; return 0; }
 	[ "$(ask "$1 [y/N]" n | tr '[:upper:]' '[:lower:]')" = y ]
 }
+
+# In the menu a destructive step asks for its word to be typed. Everywhere else it is the plain question.
+confirm_typed() {
+	local word="$1"
+	shift
+	if [ "$MENU" = 1 ] && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ]; then [ "$(ask "$* Type $word to go on:" "")" = "$word" ]; else confirm "$*"; fi
+}
+
+# The list every menu uses. Items are "value|label" and "=Heading" starts a group. The answer is in PICKED, and the return is 1 on q or Esc. <top> is the number of lines already on the screen above the list. Without a usable terminal (no tty, TERM=dumb, under 40 columns) it is a numbered list and a typed number.
+pick() {
+	local top="$1" quit="$2" i n=0 cur=0 start=0 key rest cand rc num="" rows=0 cols=0 view total cl first drawn=0 mark hint tty=0 text lines=() val=() at=() idx=()
+	shift 2
+	for i in "$@"; do
+		if [ "${i:0:1}" = "=" ]; then lines+=("${i:1}"); idx+=(-1); else val+=("${i%%|*}"); at+=("${#lines[@]}"); lines+=("${i#*|}"); idx+=("$n"); n=$((n + 1)); fi
+	done
+	total=${#lines[@]}
+	if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && { : </dev/tty; } 2>/dev/null; then read -r rows cols < <(stty size </dev/tty 2>/dev/null) || true; fi
+	[ "${rows:-0}" -ge 10 ] && [ "${cols:-0}" -ge 40 ] && tty=1
+	if [ "$tty" = 0 ]; then
+		for ((i = 0; i < total; i++)); do
+			if [ "${idx[i]}" = -1 ]; then printf '\n  %s%s%s\n' "$D" "${lines[i]}" "$Z"; else printf '  %s%2d%s  %s\n' "$B" $((idx[i] + 1)) "$Z" "${lines[i]}"; fi
+		done
+		while true; do
+			key="$(ask "Number, or q to $quit:" "")"
+			case "$key" in
+				"" | q | Q) return 1 ;;
+				*[!0-9]* | 0*) warn "pick a number from the list" ;;
+				*) if [ "$key" -le "$n" ]; then PICKED="${val[key - 1]}"; return 0; fi; warn "pick a number from the list" ;;
+			esac
+		done
+	fi
+	view=$((rows - top - 3))
+	[ "$view" -ge 5 ] || view=5
+	[ "$view" -le "$total" ] || view=$total
+	STTY_SAVED="$(stty -g </dev/tty)"
+	stty -echo -icanon </dev/tty
+	printf '\033[?25l'
+	while true; do
+		cl=${at[cur]}; first=$cl
+		[ "$cl" -gt 0 ] && [ "${idx[cl - 1]}" = -1 ] && first=$((cl - 1))
+		[ "$first" -ge "$start" ] || start=$first
+		[ "$cl" -lt $((start + view)) ] || start=$((cl - view + 1))
+		[ "$drawn" = 0 ] || printf '\033[%dA' $((view + 2))
+		for ((i = start; i < start + view; i++)); do
+			text="${lines[i]:0:cols - 12}"
+			if [ "${idx[i]}" = -1 ]; then printf '\r\033[K  %s%s%s\n' "$D" "$text" "$Z"
+			elif [ "${idx[i]}" = "$cur" ]; then printf '\r\033[K  %s%s%s %s%2d  %s%s\n' "$C" "$PTR" "$Z" "$B" $((idx[i] + 1)) "$text" "$Z"
+			else printf '\r\033[K    %2d  %s\n' $((idx[i] + 1)) "$text"; fi
+		done
+		mark=""; [ "$view" = "$total" ] || mark=" $DOT $((cur + 1))/$n"
+		hint="$UD move $DOT Enter choose $DOT number jumps $DOT q $quit$mark"
+		printf '\r\033[K\n\r\033[K  %s%s%s\n' "$D" "${hint:0:cols - 3}" "$Z"
+		drawn=1
+		rc=0
+		if [ -n "$num" ]; then IFS= read -rsn1 -t 1 key </dev/tty || rc=$?; else IFS= read -rsn1 key </dev/tty || rc=$?; fi
+		if [ "$rc" -gt 128 ]; then num=""; continue; fi
+		[ "$rc" = 0 ] || key=q
+		if [ "$key" = $'\033' ]; then
+			rest=""
+			IFS= read -rsn2 -t 0.05 rest </dev/tty || true
+			case "$rest" in
+				"[A" | OA) key=k ;;
+				"[B" | OB) key=j ;;
+				"") key=q ;;
+				*) IFS= read -rsn8 -t 0.02 rest </dev/tty || true; key=x ;;
+			esac
+		fi
+		case "$key" in
+			k) cur=$(((cur + n - 1) % n)); num="" ;;
+			j) cur=$(((cur + 1) % n)); num="" ;;
+			[0-9])
+				cand="$num$key"
+				if [[ "$cand" =~ ^[1-9][0-9]*$ ]] && [ "$cand" -le "$n" ]; then num="$cand"
+				elif [[ "$key" =~ ^[1-9]$ ]] && [ "$key" -le "$n" ]; then num="$key"
+				else num=""; fi
+				[ -z "$num" ] || cur=$((num - 1))
+				;;
+			"") PICKED="${val[cur]}"; break ;;
+			q | Q) printf '\033[%dA\033[J' $((view + 2)); tty_restore; return 1 ;;
+			*) num="" ;;
+		esac
+	done
+	printf '\033[%dA\033[J' $((view + 2))
+	tty_restore
+}
+
+# Header of a step of the install questions.
+wiz() { printf '\n  %sStep %s of 4%s  %s\n\n' "$B" "$1" "$Z" "$2"; }
 
 # Runs a command, or prints it in a dry run.
 act() {
@@ -968,20 +1069,12 @@ pick_component() {
 	esac
 }
 
-do_install() {
-	local what comp port detected
-	comp="$(pick_component "${1:-}")"
-	what="$comp"
-	need_root
-	refuse_links
-	detect_target
-	ensure_tools
-	[ -z "$DOMAIN" ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--domain is for install panel or install both"
-	[ "$NO_DOMAIN" = 0 ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--no-domain is for install panel or install both"
-	[ "$NO_DOMAIN" = 0 ] || [ -z "$DOMAIN" ] || die "--no-domain and --domain cannot be used together"
-	[ -z "$PUBLIC_IP" ] || [ "$NO_DOMAIN" = 1 ] || die "--ip needs --no-domain"
+# The web server questions and the checks of its settings, for install and for the menu's Web server entry. WEB_NOW=1 skips the first yes or no, for a caller that already asked it.
+web_plan() {
+	local comp="$1" port detected
 	if [ -z "$DOMAIN" ] && [ -z "$WEB" ] && [ "$NO_DOMAIN" = 0 ] && { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
-		if confirm "Set up a web server with HTTPS for the panel now? It needs a domain name that points at this server."; then
+		[ "$WEB_NOW" = 1 ] || wiz 2 "Web server"
+		if [ "$WEB_NOW" = 1 ] || confirm "Set up a web server with HTTPS for the panel now? It needs a domain name that points at this server."; then
 			DOMAIN="$(ask "Domain name:" "")"
 			if [ -n "$DOMAIN" ]; then
 				WEB="$(ask "Web server, caddy or nginx? [caddy]" caddy)"
@@ -990,12 +1083,6 @@ do_install() {
 		elif confirm "No domain name? Then the subscriptions are served on this server's IP, with a self-signed certificate that the apps check by its pin."; then NO_DOMAIN=1
 		fi
 	fi
-	# Two-step sign-in is on unless the operator says no at a fresh install of the panel, and the question's default is yes. --no-two-step says no for a script. A panel that has its config keeps it: the switch is then only in that file.
-	if [ "$TWO_STEP" = off ] && [ -f "$CONF_DIR/panel.json" ]; then warn "--no-two-step only applies to a fresh install: $CONF_DIR/panel.json is kept as it is"
-	elif { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ ! -f "$CONF_DIR/panel.json" ] && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
-		case "$(ask "Ask for an authenticator code at sign-in (two-step sign-in)? Recommended: without it, anyone who learns the admin password gets the panel, the node and every user's link. [Y/n]" y | tr '[:upper:]' '[:lower:]')" in n | no) TWO_STEP=off ;; esac
-	fi
-	[ "$TWO_STEP" = on ] || [ -f "$CONF_DIR/panel.json" ] || warn "two-step sign-in will be off: the panel asks for the password only. Not recommended for a panel with real users. To turn it on later, see \"Two-step sign-in off\" in the panel manual"
 	[ -z "$WEB" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--web needs --domain or --no-domain"
 	[ -z "$HTTPS_PORT" ] || [ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "--https-port needs --domain or --no-domain"
 	if [ "$NO_DOMAIN" = 1 ]; then
@@ -1033,6 +1120,46 @@ do_install() {
 		[ "$HTTPS_PORT" != "$PANEL_PORT" ] || die "port $PANEL_PORT is the panel's own port on 127.0.0.1: pick another --https-port"
 		HTTPS_HOST="${DOMAIN:-$PUBLIC_IP}"; [ "$HTTPS_PORT" = 443 ] || HTTPS_HOST+=":$HTTPS_PORT"
 		web_preflight
+	fi
+}
+
+do_install() {
+	local what comp ui=0 lines=()
+	[ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null && ui=1
+	if [ -z "${1:-}" ] && [ "$ui" = 1 ]; then
+		wiz 1 "What to install"
+		pick 6 cancel "both|Node and panel: one server for everything" "node|Node: the VPN server only" "panel|Panel: the web panel for nodes and users" "mirror|Mirror: a copy of the releases for people who cannot reach GitHub" || die "cancelled"
+		comp="$PICKED"
+	else comp="$(pick_component "${1:-}")"; fi
+	what="$comp"
+	need_root
+	refuse_links
+	detect_target
+	ensure_tools
+	[ -z "$DOMAIN" ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--domain is for install panel or install both"
+	[ "$NO_DOMAIN" = 0 ] || [ "$comp" = panel ] || [ "$comp" = both ] || die "--no-domain is for install panel or install both"
+	[ "$NO_DOMAIN" = 0 ] || [ -z "$DOMAIN" ] || die "--no-domain and --domain cannot be used together"
+	[ -z "$PUBLIC_IP" ] || [ "$NO_DOMAIN" = 1 ] || die "--ip needs --no-domain"
+	web_plan "$comp"
+	# Two-step sign-in is on unless the operator says no at a fresh install of the panel, and the question's default is yes. --no-two-step says no for a script. A panel that has its config keeps it: the switch is then only in that file.
+	if [ "$TWO_STEP" = off ] && [ -f "$CONF_DIR/panel.json" ]; then warn "--no-two-step only applies to a fresh install: $CONF_DIR/panel.json is kept as it is"
+	elif { [ "$comp" = panel ] || [ "$comp" = both ]; } && [ ! -f "$CONF_DIR/panel.json" ] && [ "$ASSUME_YES" = 0 ] && [ "$DRY" = 0 ] && { : </dev/tty; } 2>/dev/null; then
+		wiz 3 "Sign-in"
+		case "$(ask "Ask for an authenticator code at sign-in (two-step sign-in)? Recommended: without it, anyone who learns the admin password gets the panel, the node and every user's link. [Y/n]" y | tr '[:upper:]' '[:lower:]')" in n | no) TWO_STEP=off ;; esac
+	fi
+	[ "$TWO_STEP" = on ] || [ -f "$CONF_DIR/panel.json" ] || warn "two-step sign-in will be off: the panel asks for the password only. Not recommended for a panel with real users. To turn it on later, see \"Two-step sign-in off\" in the panel manual"
+	if [ "$ui" = 1 ]; then
+		wiz 4 "Check and go"
+		lines=("Install       ${comp/both/node and panel}" "Release       ${WANT_VERSION:-the newest signed release}")
+		if [ "$comp" = panel ] || [ "$comp" = both ]; then
+			if [ -n "$DOMAIN" ]; then lines+=("Web server    $WEB for $DOMAIN, https port $HTTPS_PORT" "Ports         panel 127.0.0.1:$PANEL_PORT, plain site 127.0.0.1:$DECOY_PORT, 80 for the certificate")
+			elif [ "$NO_DOMAIN" = 1 ]; then lines+=("Web server    $WEB on $PUBLIC_IP, https port $HTTPS_PORT, self-signed" "Ports         panel 127.0.0.1:$PANEL_PORT, plain site 127.0.0.1:$DECOY_PORT")
+			else lines+=("Web server    none: the panel listens on 127.0.0.1:$PANEL_PORT only"); fi
+			if [ -f "$CONF_DIR/panel.json" ]; then lines+=("Two-step      kept as $CONF_DIR/panel.json has it"); else lines+=("Two-step      $TWO_STEP"); fi
+		fi
+		lines+=("" "Nothing changes until you answer yes.")
+		box "Summary" "${lines[@]}"
+		case "$(ask "Go on? [Y/n]" y | tr '[:upper:]' '[:lower:]')" in n | no) die "cancelled" ;; esac
 	fi
 	[ "$DRY" = 1 ] || { TMP="$(mktemp -d)"; install -d -m 0755 "$STATE_DIR" 2>/dev/null || true; }
 	has_systemd || [ "$DRY" = 1 ] || warn "systemd is not running: units are written but nothing is started"
@@ -1285,7 +1412,7 @@ do_restore() {
 	refuse_links
 	[ -n "$file" ] || die "usage: veilway.sh restore <backup.tar.gz>"
 	[ -r "$file" ] || [ "$DRY" = 1 ] || die "cannot read $file"
-	confirm "Restore $file over $CONF_DIR, the usage state and the panel data?" || die "cancelled"
+	confirm_typed restore "Restore $file over $CONF_DIR, the usage state and the panel data?" || die "cancelled"
 	if [ "$DRY" = 1 ]; then dry "stop services, save current files to $BACKUP_DIR, extract $file to /, fix owners, start services"; return 0; fi
 	TMP="$(umask 077; mktemp -d)"
 	cp -- "$file" "$TMP/archive.tar.gz"
@@ -1312,7 +1439,7 @@ do_restore() {
 
 do_uninstall() {
 	need_root
-	confirm "Remove Veilway binaries, units, users and this installer? Backups in $BACKUP_DIR stay." || die "cancelled"
+	confirm_typed uninstall "Remove Veilway binaries, units, users and this installer? Backups in $BACKUP_DIR stay." || die "cancelled"
 	do_backup || true
 	# Only the units this server has, so parts that were never installed print nothing.
 	for u in veilway-mirror.service veilway.service veilway-panel.service veilway-panel-update.path veilway-panel-update.service veilway-xray.socket veilway-xray.service; do
@@ -1343,41 +1470,202 @@ do_version() {
 	row "panel" "$p"
 }
 
+# Runs one action of the menu in a subshell, so a die or a Ctrl-C ends the action and not the menu. Exit code 99 means the action only went back, and 130 a Ctrl-C.
+menu_run() {
+	local rc
+	printf '%s' "$CLS"
+	[ "$1" = do_status ] || header
+	trap ':' INT
+	set +e
+	( set -e; trap cleanup EXIT; trap 'printf "\n"; exit 130' INT TERM; "$@" )
+	rc=$?
+	set -e
+	trap 'printf "\n"; exit 130' INT TERM
+	MENU_RC=$rc
+	[ "$rc" = 99 ] || [ "$rc" = 130 ] || { printf '\n'; ask "Press Enter to go back." "" >/dev/null; }
+}
+
 menu() {
-	local c a
-	header
+	local c it=() p ok unit v s dot txt line lines=() extra prefix host port w when f cols=80 ad
+	if [ "$ASSUME_YES" = 1 ] || [ "$DRY" = 1 ]; then header; return 0; fi
+	MENU=1
+	if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ]; then CLS=$'\033[H\033[2J'; read -r _ cols < <(stty size </dev/tty 2>/dev/null) || true; fi
+	[[ "$cols" =~ ^[0-9]+$ ]] || cols=80
 	while true; do
-		printf '  %s1%s Install    %s2%s Update     %s3%s Status     %s4%s Logs\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
-		printf '  %s5%s Restart    %s6%s Check      %s7%s Doctor     %s8%s Backup\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
-		printf '  %s9%s Restore    %s10%s Uninstall %s11%s Add-ons  %s12%s Admins\n' "$B" "$Z" "$B" "$Z" "$B" "$Z" "$B" "$Z"
-		printf '  %s0%s Quit\n\n' "$B" "$Z"
-		c="$(ask "Choose:" 0)"
-		case "$c" in
-			1) do_install "" ;;
-			2) do_update both ;;
-			3) do_status ;;
-			4) do_logs "$(ask "Which, node, panel or mirror? [node]" node)" ;;
-			5) do_restart both ;;
-			6) run_check ;;
-			7) do_doctor ;;
-			8) do_backup ;;
-			9) do_restore "$(ask "Backup file:" "")" ;;
-			10) do_uninstall ;;
-			11)
-				do_addon xray status
-				if [ -x "$ADDON_DIR/xray/xray" ]; then a="$(ask "Remove the Xray add-on, or leave it? [leave]" leave)"; else a="$(ask "Install the Xray add-on, or leave it? [leave]" leave)"; fi
-				case "$a" in install | remove) do_addon xray "$a" ;; leave | "") ;; *) warn "answer install, remove or leave" ;; esac
-				;;
-			12)
-				do_admin list
-				a="$(ask "Username to give a new password, or empty to leave:" "")"
-				[ -z "$a" ] || do_admin reset "$a"
-				;;
-			0 | q | "") return 0 ;;
-			*) warn "pick a number from the list" ;;
-		esac
+		printf '%s' "$CLS"
+		printf '  %sVeilway%s %sinstaller %s%s\n  %s%s%s\n' "$B" "$Z" "$D" "$SCRIPT_VERSION" "$Z" "$D" "$(rule 40)" "$Z"
+		lines=()
+		for p in node panel mirror xray; do
+			case "$p" in
+				node) ok=0; [ -x "$BIN_DIR/veilway" ] && ok=1; unit=veilway.service; v="$(installed_version node)" ;;
+				panel) ok=0; [ -x "$BIN_DIR/veilway-panel" ] && ok=1; unit=veilway-panel.service; v="$(installed_version panel)" ;;
+				mirror) ok=0; [ -f "$UNIT_DIR/veilway-mirror.service" ] && ok=1; unit=veilway-mirror.service; v="$(installed_version node)" ;;
+				xray) ok=0; [ -x "$ADDON_DIR/xray/xray" ] && ok=1; unit=veilway-xray.socket; v="$(cat "$ADDON_DIR/xray/release" 2>/dev/null || true)" ;;
+			esac
+			if [ "$ok" = 0 ]; then
+				[ "$p" = node ] || [ "$p" = panel ] || continue
+				dot="$D"; txt="not installed"; v=""
+			else
+				s=""; has_systemd && s="$(systemctl is-active "$unit" 2>/dev/null || true)"
+				case "$s" in active) dot="$G"; txt="running" ;; failed) dot="$R"; txt="failed" ;; "") dot="$D"; txt="no systemd" ;; *) dot="$D"; txt="stopped" ;; esac
+			fi
+			line="$(printf '  %-6s %-14s %s%s%s %-11s' "$p" "$v" "$dot" "$LED" "$Z" "$txt")"
+			if [ "$p" = panel ] && [ "$ok" = 1 ] && [ -r "$CONF_DIR/panel.json" ]; then
+				prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+				if [ "$(web_state mode)" = domain ]; then
+					host="$(web_state domain)"; port="$(web_state https_port)"
+					[ -z "$port" ] || [ "$port" = 443 ] || host="$host:$port"
+					extra="https://$host$prefix/"
+				else extra="through an SSH tunnel to 127.0.0.1:$PANEL_PORT"; fi
+				[ "${#extra}" -le $((cols - 40)) ] || extra="${extra:0:cols - 43}..."
+				line+=" ${D}${extra}${Z}"
+			fi
+			lines+=("$line")
+		done
+		w="$(web_state web)"
+		if [ -z "$w" ]; then txt="none"
+		else
+			host="$(web_state domain)"; [ "$(web_state mode)" != ip ] || host="$(web_state ip)"
+			port="$(web_state https_port)"
+			txt="$host:${port:-443}"
+		fi
+		lines+=("$(printf '  %-6s %-14s %s' web "${w:-none}" "$([ -z "$w" ] || echo "$txt")")")
+		f="$VER_DIR/update.check"
+		if [ -f "$f" ] && [ ! -L "$f" ]; then
+			read -r c <"$f" || true
+			when="$(date -r "$f" +%F 2>/dev/null || true)"
+			if [[ "$c" =~ $TAG_RE ]] && [ "$c" != none ]; then lines+=("$(printf '  %-6s %s%s waiting%s' update "$Y" "$c" "$Z")")
+			else lines+=("$(printf '  %-6s none waiting, checked %s' update "$when")"); fi
+		fi
+		printf '%s\n' "${lines[@]}"
 		printf '\n'
+		pick $((3 + ${#lines[@]})) quit "=Set up" "install|Install or add a part" "web|Web server" "addon|Add-ons" "=Daily" "status|Status" "logs|Logs" "restart|Restart" "=Safety" "update|Update" "backup|Backup" "restore|Restore" "=Fix" "check|Check config" "doctor|Doctor" "admin|Admins" "=Remove" "uninstall|Uninstall" || { printf '\n'; return 0; }
+		case "$PICKED" in
+			install) menu_run do_install "" ;;
+			web) menu_run do_web ;;
+			addon)
+				printf '%s' "$CLS"; header
+				do_addon xray status
+				printf '\n'
+				if [ -x "$ADDON_DIR/xray/xray" ]; then it=("remove|Remove the Xray add-on"); else it=("install|Install the Xray add-on"); fi
+				if pick 6 leave "${it[@]}" "leave|Leave it as it is" && [ "$PICKED" != leave ]; then menu_run do_addon xray "$PICKED"; fi
+				;;
+			status) menu_run do_status ;;
+			logs | restart)
+				c="$PICKED"; it=()
+				[ -x "$BIN_DIR/veilway" ] && it+=("node|Node")
+				[ -x "$BIN_DIR/veilway-panel" ] && it+=("panel|Panel")
+				[ -f "$UNIT_DIR/veilway-mirror.service" ] && it+=("mirror|Mirror")
+				[ "$c" = logs ] || { [ -x "$BIN_DIR/veilway" ] && [ -x "$BIN_DIR/veilway-panel" ] && it+=("both|Node and panel"); }
+				if [ "${#it[@]}" = 0 ]; then menu_run warn "no part is installed here"
+				else
+					printf '%s' "$CLS"; header
+					printf '  %s\n\n' "$([ "$c" = logs ] && echo "Logs of which part?" || echo "Restart which part?")"
+					if pick 6 back "${it[@]}"; then menu_run "do_$c" "$PICKED"; fi
+				fi
+				;;
+			update)
+				menu_run do_update both
+				[ "$MENU_RC" != 0 ] || { install -d -m 0755 "$VER_DIR" && printf 'none\n' >"$VER_DIR/update.check"; } || true
+				;;
+			backup) menu_run do_backup ;;
+			restore)
+				it=()
+				while IFS= read -r f; do
+					[ -f "$BACKUP_DIR/$f" ] || continue
+					case "$f" in *"|"*) ;; *) it+=("$BACKUP_DIR/$f|$f  ($(date -r "$BACKUP_DIR/$f" "+%F %H:%M" 2>/dev/null || true))") ;; esac
+				done < <(ls -1t "$BACKUP_DIR" 2>/dev/null || true)
+				it+=("path|Type a path to a backup file")
+				printf '%s' "$CLS"; header
+				printf '  Restore from which backup? Newest first.\n\n'
+				if pick 6 back "${it[@]}"; then
+					c="$PICKED"
+					[ "$c" != path ] || c="$(ask "Backup file:" "")"
+					menu_run do_restore "$c"
+				fi
+				;;
+			check) menu_run run_check ;;
+			doctor) menu_run do_doctor ;;
+			admin)
+				it=()
+				if [ -x "$BIN_DIR/veilway-panel" ] && [ -f "$CONF_DIR/panel.json" ]; then
+					while IFS= read -r ad; do [ -z "$ad" ] || it+=("${ad%% *}|$ad"); done < <(as_panel_user "$BIN_DIR/veilway-panel" admins --config "$CONF_DIR/panel.json" 2>/dev/null || true)
+				fi
+				if [ "${#it[@]}" = 0 ]; then menu_run do_admin list
+				else
+					printf '%s' "$CLS"; header
+					printf '  Give which admin a new password?\n\n'
+					if pick 6 back "${it[@]}"; then menu_run do_admin reset "$PICKED"; fi
+				fi
+				;;
+			uninstall) menu_run do_uninstall ;;
+		esac
 	done
+}
+
+# The menu's Web server entry: what is set up now and what can be done with it. Code 99 means back.
+do_web() {
+	local web mode host port site routes on inc ed code url sub prefix it=() args=()
+	web="$(web_state web)"; mode="$(web_state mode)"
+	if [ -z "$web" ]; then row "web server" "none set up by this script"
+	else
+		host="$(web_state domain)"; [ "$mode" != ip ] || host="$(web_state ip)"
+		port="$(web_state https_port)"; port="${port:-443}"
+		site="$CADDY_SITE"; routes="$CADDY_ROUTES"
+		[ "$web" = caddy ] || { site="$NGINX_SITE"; routes="$NGINX_ROUTES"; }
+		on=unknown
+		if has ss; then on=off; [ -z "$(ss -H -ltn "sport = :$DECOY_PORT" 2>/dev/null)" ] || on=on; fi
+		inc=no; grep -qF "$routes/" "$site" 2>/dev/null && inc=yes
+		row "web server" "$web"
+		row "address" "$host:$port ($([ "$mode" = ip ] && echo "IP, self-signed" || echo domain))"
+		row "site file" "$site$([ -f "$site" ] || echo " (missing)")"
+		row "plain site" "$on$([ "$on" != on ] || echo ", on 127.0.0.1:$DECOY_PORT only, page $WEB_ROOT/index.html")"
+		row "routes include" "$inc"
+	fi
+	printf '\n'
+	if [ -z "$web" ]; then it=("set|Set up a web server for the panel"); else it=("check|Check it" "decoy|Edit the plain page" "remove|Remove it"); fi
+	pick 11 back "${it[@]}" "back|Back" || return 99
+	case "$PICKED" in
+		back) return 99 ;;
+		set)
+			[ -f "$CONF_DIR/panel.json" ] || die "the panel is not installed here: use Install or add a part first"
+			need_root
+			refuse_links
+			detect_target
+			ensure_tools
+			pick 11 back "domain|I have a domain name that points at this server" "ip|No domain: use this server's IP, with a self-signed certificate" || return 99
+			if [ "$PICKED" = domain ]; then WEB_NOW=1; else NO_DOMAIN=1; fi
+			web_plan panel
+			[ -n "$DOMAIN" ] || [ "$NO_DOMAIN" = 1 ] || die "no web server was set up"
+			TMP="$(mktemp -d)"
+			web_setup
+			svc restart veilway-panel.service
+			prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+			sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+			if [ "$NO_DOMAIN" = 1 ]; then box "Web server" "Subscriptions: https://$HTTPS_HOST$sub/main, self-signed, pin $(web_state pin)" "Admin pages: ssh -L 8480:127.0.0.1:$PANEL_PORT root@$PUBLIC_IP, then http://localhost:8480$prefix/"
+			else box "Web server" "Admin pages: https://$HTTPS_HOST$prefix/" "Port 80 must stay reachable: the certificate is checked over it."; fi
+			;;
+		check)
+			if ! has "$web"; then warn "$web is not installed here"
+			elif [ "$web" = caddy ]; then caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 && step "caddy accepts its config" || warn "caddy refuses its config: run caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+			else nginx -t >/dev/null 2>&1 && step "nginx accepts its config" || warn "nginx refuses its config: run nginx -t"; fi
+			systemctl is-active --quiet "$web.service" 2>/dev/null && step "$web is running" || warn "$web is not running: sudo systemctl start $web"
+			url="https://$host:$port/"
+			if [ "$mode" = ip ]; then url="https://127.0.0.1:$port/"; else args=(--resolve "$host:$port:127.0.0.1"); fi
+			code="$(curl -ksS -o /dev/null -m 8 -w '%{http_code}' ${args[@]+"${args[@]}"} "$url" 2>/dev/null || true)"
+			if [ "${code:-000}" != 000 ]; then step "$url answers $code"; else warn "$url gave no answer from this server: the web server may not listen there"; fi
+			code="$(curl -sS -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$DECOY_PORT/" 2>/dev/null || true)"
+			if [ "${code:-000}" != 000 ]; then step "the plain site on 127.0.0.1:$DECOY_PORT answers $code"; else warn "nothing answers on 127.0.0.1:$DECOY_PORT: a node's decoy origin needs a page there"; fi
+			;;
+		decoy)
+			info "the plain page is $WEB_ROOT/index.html"
+			info "a guide for a good one: https://veilway-project.github.io/veilway-docs/guides/decoy-site/"
+			ed="${EDITOR:-nano}"; has "$ed" || ed=vi
+			if [ ! -f "$WEB_ROOT/index.html" ]; then warn "there is no page at $WEB_ROOT/index.html"
+			elif has "$ed" && confirm "Open it in $ed now?"; then "$ed" "$WEB_ROOT/index.html" </dev/tty >/dev/tty || true; fi
+			;;
+		remove) do_uninstall_web ;;
+	esac
 }
 
 # SHA-256 of the archives of the one Xray-core release this Veilway runs, from the .dgst files the release publishes. Nothing else is trusted: an archive that does not match is refused, and the node checks the executable inside against its own pin before every start.
