@@ -41,7 +41,8 @@
 set -euo pipefail
 umask 022
 
-SCRIPT_VERSION="1.0.0"
+# The release this script belongs to. The release build writes its tag here, and a version bump sets it on main.
+SCRIPT_VERSION="v0.3.8-alpha"
 CORE_REPO="veilway-project/veilway"
 PANEL_REPO="veilway-project/veilway-panel"
 PUBKEY="RWQiodKlFCiJ3bkZD3ojKV7AYyTYf3F5x/XY8upWvpSFTVm3O2cNRbrV"

@@ -180,7 +180,8 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - run: cp scripts/veilway.sh dist/veilway.sh
+      # The installer says which release it belongs to: the tag is written into the copy that is signed and published.
+      - run: sed 's/^SCRIPT_VERSION=.*/SCRIPT_VERSION="${{ github.ref_name }}"/' scripts/veilway.sh > dist/veilway.sh && grep -q '^SCRIPT_VERSION="${{ github.ref_name }}"$' dist/veilway.sh
       # RELEASE_SIGNING_KEY holds the contents of an unencrypted minisign secret key file (minisign -G -W).
       # The trusted comment binds each signature to the tag and the asset name, so a signature cannot be reused for another file.
       - name: Sign assets
