@@ -1,5 +1,5 @@
 // Development only: stands in for the Tauri side so the screens can run in a plain browser. main.tsx loads it only when Vite runs in "mock" mode, so a production build never contains it.
-// The address picks the scene and the display: ?scene=empty|question|connected|fallback|offer|xray&lang=en|fa&scheme=dark|light&proxy=on|only (the local proxy, already on). "offer" holds pasted links with no Xray add-on, "xray" is connected through it.
+// The address picks the scene and the display: ?scene=empty|question|connected|fallback|offer|xray&lang=en|fa&scheme=dark|light&proxy=on|only (the local proxy, already on), and &kept for a connection that dropped with the kill switch left on. "offer" holds pasted links with no Xray add-on, "xray" is connected through it.
 import type {BundleReview, Host, LegacyOffer, ProxySettings, Running, Settings, StatusView, Subscription, XrayState} from "./tauri.ts";
 
 const query = new URLSearchParams(location.search), scene = query.get("scene") ?? "connected";
@@ -38,7 +38,7 @@ const xrayState = (): XrayState => ({supported: true, installed: xrayInstalled, 
 const list = () => [...(legacyHeld ? [pasted()] : []), ...(held ? [subscription(languages[0] === "fa")] : [])];
 
 const opened = now() - 3725, connection = {transport: query.get("transport") ?? "tls", address: "203.0.113.24:443", host: "node.harbor.example", front: null, server_name: "cdn.harbor.example", check: "public-and-pin", since: opened, alpha: query.get("transport") === "faketls"};
-let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty" && scene !== "offer", selected: string | null = null;
+let held = scene === "empty" ? 0 : 1, sent = 48 * 1024 ** 2, received = 712 * 1024 ** 2, connected = scene !== "empty" && scene !== "offer" && !query.has("kept"), kept = query.has("kept"), selected: string | null = null;
 const status = (): StatusView => {
 	sent += 40000 + Math.random() * 90000;
 	received += 600000 + Math.random() * 2400000;
@@ -67,7 +67,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 	},
 	"plugin:event|unlisten": () => null,
 	library: args => { languages = (args.languages as string[]) ?? ["en"]; return list(); },
-	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: false}),
+	status: (): Running => ({connected, status: connected ? status() : null, kill_switch_kept: !connected && kept}),
 	log_history: () => ["0.4s client ready", "1.2s connect requested", "2.0s connected through Frankfurt"],
 	get_settings: (): Settings => ({auto_update: scene === "update", theme: "dark", locale: query.get("lang") === "fa" ? "fa" : "en", kill_switch: true, proxy, mirrors: []}),
 	set_settings: args => {
@@ -88,7 +88,7 @@ const answers: Record<string, (args: Record<string, unknown>) => unknown> = {
 		return null;
 	},
 	xray_remove: () => { xrayInstalled = false; return xrayState(); },
-	disconnect: () => { connected = false; return null; },
+	disconnect: () => { connected = false; kept = false; return null; },
 	answer: () => null,
 	select_exit: args => { selected = (args.tag as string | null) ?? null; return [subscription(languages[0] === "fa")]; },
 	import_open: args => {

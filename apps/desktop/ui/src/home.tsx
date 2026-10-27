@@ -10,7 +10,9 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 	const {t, rate, time, date, locale, number, bytes} = useD(), toast = useToast(), [picking, setPicking] = useState(false), [tick, setTick] = useState(() => Date.now());
 	const status = running.status, state = running.connected ? status?.state ?? "connecting" : "off", subscription = chosen?.subscription, logo = useLogo(subscription?.logo ?? null);
 	const link: ConnectState = state === "connected" ? "on" : state === "off" || state === "failed" ? "off" : "connecting";
-	const heading = state === "connected" ? t("state.connected") : state === "connecting" ? t("state.connecting") : state === "reconnecting" ? t("state.reconnecting") : state === "stopped" ? t("state.stopped") : state === "failed" ? t("state.failed") : t("state.disconnected");
+	// A connection that dropped on its own leaves the kill switch holding every packet: that state leads the page, so it never reads as plain disconnected.
+	const kept = !running.connected && (ended?.kept || running.kill_switch_kept);
+	const heading = kept ? t("state.blocked") : state === "connected" ? t("state.connected") : state === "connecting" ? t("state.connecting") : state === "reconnecting" ? t("state.reconnecting") : state === "stopped" ? t("state.stopped") : state === "failed" ? t("state.failed") : t("state.disconnected");
 	// Before the node's list arrives (and while disconnected) the exits are the ones the connection lists, with the choice saved for the subscription.
 	const exits = status?.exits ?? [], saved = subscription?.exit_choice ?? null, listed = exits.length > 0 ? exits.map(exit => ({tag: exit.tag, name: exit.name, selected: exit.selected, exit})) : (chosen?.profile.exits ?? []).map(([tag, name]) => ({tag, name, selected: tag === saved, exit: undefined})), current = exits.find(e => e.tag === status?.exit), usage = status?.usage, now = points[points.length - 1];
 	const xray = status?.xray ?? null, said = xray?.say_code ?? status?.say_code, refused = chosen?.profile.legacy?.refused ?? null;
@@ -45,7 +47,6 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 	].flatMap(row => row.shown ? [{...row, key: row.key as DesktopKey, plain: row.plain ?? row.shown}] : []) : [];
 	const copyDetails = () => navigator.clipboard.writeText(en["details.title"] + "\n" + rows.map(row => en[row.key] + ": " + row.plain).join("\n")).then(() => toast({tone: "success", title: t("details.copied")}), () => toast({tone: "danger", title: t("details.copyFailed")}));
 	const proxy = status?.proxy ?? null, proxyAt = proxy && !proxy.error ? (proxy.listen.startsWith("0.0.0.0:") ? t("home.proxyLan", {port: number(Number(proxy.listen.split(":")[1]), {useGrouping: false})}) : t("home.proxy", {address: `\u2066${proxy.listen}\u2069`})) : null;
-	const kept = ended?.kept || (!running.connected && running.kill_switch_kept);
 	return <div className="d-page">
 		<div className="d-hero">
 			<h1 className="vw-display" aria-live="polite">{heading}</h1>
@@ -54,7 +55,9 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 			{subscription?.unknown_type && <p className="vw-muted vw-small">{t("profile.unknownType")}</p>}
 			{(code || wait) && <p className="d-say">{[code, wait].filter(Boolean).join(" ")}</p>}
 			{proxyAt && <p className="d-say">{proxyAt}</p>}
-			<ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null || proxyBlocked) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>
+			{kept && <p className="d-say">{t("home.blocked")}</p>}
+			{kept ? <span className="d-actions d-start"><Button variant="primary" disabled={busy} onClick={onDisconnect}>{t("home.unblock")}</Button>{chosen && !pending && refused === null && !proxyBlocked && <Button disabled={busy} onClick={onConnect}>{t("home.reconnect")}</Button>}</span>
+				: <ConnectSwitch state={link} disabled={busy || !chosen || ((pending || refused !== null || proxyBlocked) && link === "off")} onToggle={link === "off" ? onConnect : onDisconnect}/>}
 		</div>
 		{link === "off" && choices.length > 1 && chosen && <SelectField label={t("home.connection")} value={chosen.subscription.id + "\n" + chosen.profile.id} onChange={value => { const [subscription = "", profile = ""] = value.split("\n"); onPrefs({choice: {subscription, profile}}); }} options={choices.map(c => ({value: c.subscription.id + "\n" + c.profile.id, label: c.profile.name, group: new Set(choices.map(other => other.subscription.id)).size > 1 ? c.subscription.provider : undefined}))}/>}
 		{link === "off" && chosen && (chosen.profile.transports?.length ?? 0) > 1 && <SelectField label={t("home.transport")} value={prefs.transports[chosen.subscription.id + "\n" + chosen.profile.id] ?? "auto"} onChange={value => { const key = chosen.subscription.id + "\n" + chosen.profile.id, {[key]: _, ...rest} = prefs.transports; onPrefs({transports: value === "auto" ? rest : {...rest, [key]: value}}); }} options={[{value: "auto", label: t("home.transportAuto"), detail: t("home.transportAutoDetail")}, ...(chosen.profile.transports ?? []).map(name => ({value: name, label: name, detail: ("transport." + name) in en ? t(("transport." + name) as DesktopKey) : undefined}))]}/>}
@@ -65,7 +68,7 @@ export function Home({running, busy, ended, points, choices, chosen, prefs, prox
 			{t(accepted === undefined ? "terms.body" : "terms.changed", {provider: subscription.provider})}
 			<span className="d-actions d-start">{([["terms.terms", subscription.terms], ["terms.privacy", subscription.privacy]] as const).map(([label, url]) => url && <Button key={label} size="sm" variant="quiet" icon="external" onClick={() => open(url)}>{t(label)}</Button>)}</span>
 		</Banner>}
-		{(ended?.error || kept) && <Banner tone="danger" title={t("home.ended")} action={kept && <Button size="sm" onClick={onDisconnect}>{t("home.disconnect")}</Button>}>{[ended?.error === "alpha_off" ? t("alpha.off") : ended?.error && failureText(ended.error, t), kept ? t("home.kept") : null].filter(Boolean).join(" ")}</Banner>}
+		{ended?.error && <Banner tone="danger" title={t("home.ended")}>{ended.error === "alpha_off" ? t("alpha.off") : failureText(ended.error, t)}</Banner>}
 		{status?.out_of_date && subscription && <Banner tone="warning" title={t("home.outOfDate")} action={subscription.can_refresh && <Button size="sm" icon="refresh" onClick={() => onRefresh(subscription.id)}>{t("home.refresh")}</Button>}>{t("home.outOfDateBody")}</Banner>}
 		{status?.notices.map((notice, i) => <Banner key={i} tone={notice.severity === "warning" ? "warning" : "info"} title={t("home.notice", {provider: subscription?.provider ?? ""})}>{notice.text}</Banner>)}
 		{listed.length > 0 && <Glass className="d-list"><List label={t("home.exit")}><ListRow onClick={() => setPicking(true)} leading={<Icon name="globe"/>} title={t("home.exit")} detail={listed.find(e => e.selected)?.name ?? (state === "connected" && current ? t("home.exitAutoUsing", {exit: current.name}) : t("home.exitAuto"))} trailing={<Icon name="chevronForward"/>}/></List></Glass>}
