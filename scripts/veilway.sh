@@ -1517,7 +1517,7 @@ menu() {
 					[ -z "$port" ] || [ "$port" = 443 ] || host="$host:$port"
 					extra="https://$host$prefix/"
 				else extra="through an SSH tunnel to 127.0.0.1:$PANEL_PORT"; fi
-				[ "${#extra}" -le $((cols - 40)) ] || extra="${extra:0:cols - 43}..."
+				[ "${#extra}" -le $((cols - 40)) ] || extra="${extra:0:$((cols > 53 ? cols - 43 : 10))}..."
 				line+=" ${D}${extra}${Z}"
 			fi
 			lines+=("$line")
@@ -2267,7 +2267,7 @@ web_routes_result() {
 
 # The panel's Add to web server button: web-routes.json in $UPDATE_DIR is the whole wanted set of ws and fronted paths, and replaces the file in the routes folder. It comes from a less trusted user, so each route is checked strictly, the target is always 127.0.0.1 and one bad route refuses all of them.
 do_web_routes() {
-	local json="$UPDATE_DIR/web-routes.json" re='^/[A-Za-z0-9._~-][A-Za-z0-9._~/-]{11,127}$' err="" web raw lines="" path port type n=0 seen=" " f="$CONF_DIR/panel.json" prefix="/panel" sub="/sub" q extra fmt blk body="" file prev had=0
+	local w json="$UPDATE_DIR/web-routes.json" re='^/[A-Za-z0-9._~-][A-Za-z0-9._~/-]{11,127}$' err="" web raw lines="" path port type n=0 seen=" " f="$CONF_DIR/panel.json" prefix="/panel" sub="/sub" q extra fmt blk body="" file prev had=0
 	need_root
 	if [ "$DRY" = 1 ]; then dry "read $json, check every route, write the routes folder of the web server, check its config, reload it and write $UPDATE_DIR/web-routes.result"; return 0; fi
 	web="$(web_state web)"
@@ -2319,7 +2319,7 @@ do_web_routes() {
 	fi
 	rm -f -- "$json"
 	if [ -n "$err" ]; then warn "web routes refused: $err"; web_routes_result false "Nothing was changed: $err." 0 "$web"
-	else step "$web serves $n routes of the panel"; web_routes_result true "$n routes are live on $web." "$n" "$web"; fi
+	else w="paths"; [ "$n" != 1 ] || w="path"; step "$web serves $n $w of the panel"; web_routes_result true "$n $w of the panel $([ "$n" = 1 ] && echo is || echo are) live on $web." "$n" "$web"; fi
 }
 
 # The panel answers every path it does not serve with its not_found, and the web server's own 404 answers the rest of the site. They have to be the same bytes, or the panel's paths can be told apart.
