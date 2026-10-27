@@ -5626,7 +5626,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-desktop"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -5661,7 +5661,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-engine"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.23.1",
  "boringtun",
@@ -5703,7 +5703,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-linux"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -5722,7 +5722,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-macos"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -5740,7 +5740,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-proto"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -5757,7 +5757,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-transport"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.23.1",
  "boring",
@@ -5780,7 +5780,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-windows"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -5798,7 +5798,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-xray"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "libc",

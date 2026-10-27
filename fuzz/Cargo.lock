@@ -1947,7 +1947,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "veilway-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-engine"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.23.1",
  "boringtun",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-linux"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "ipnet",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-proto"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-transport"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.23.1",
  "boring",
@@ -2099,7 +2099,7 @@ dependencies = [
 
 [[package]]
 name = "veilway-wg"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
