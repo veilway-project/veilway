@@ -7,7 +7,7 @@
 #   sudo bash veilway.sh install panel|both --domain panel.example.com [--web caddy|nginx] [--https-port 443]   also set up a web server with HTTPS and a decoy site
 #   sudo bash veilway.sh install panel|both --no-domain [--ip <address>] [--web caddy|nginx] [--https-port 443]   no domain: the subscriptions on this server's IP, self-signed and pinned
 #   sudo bash veilway.sh install relay <node-ip> [--transport tls:443 ...] [--rate 50] [--conns 256]   forward ports to a node
-#   sudo bash veilway.sh update [node|panel|mirror|both]   also adds the decoy origin (127.0.0.1:8080) to a web server setup that lacks it
+#   sudo bash veilway.sh update [node|panel|mirror|both]   also adds the decoy origin (127.0.0.1:8080) and the routes folder of the panel to a web server setup that lacks them
 #   bash veilway.sh status | logs [node|panel|mirror] | restart [node|panel|mirror|both]
 #   sudo bash veilway.sh check | doctor
 #   sudo bash veilway.sh backup [file] | restore <file> | uninstall | version
@@ -94,6 +94,8 @@ CADDY_IMPORT="import /etc/caddy/conf.d/*.caddy"
 NGINX_SITE="/etc/nginx/conf.d/veilway-panel.conf"
 CADDY_DECOY="/etc/caddy/conf.d/veilway-decoy.caddy"
 NGINX_DECOY="/etc/nginx/conf.d/veilway-decoy.conf"
+CADDY_ROUTES="/etc/caddy/veilway-routes"
+NGINX_ROUTES="/etc/nginx/veilway-routes"
 DRY=0
 ASSUME_YES=0
 ALLOW_DOWNGRADE=0
@@ -736,7 +738,7 @@ install_self() {
 	step "installed $SELF"
 }
 
-# The panel runs unprivileged and never updates or restarts itself. It writes the word "panel", "node" or "both", or "restart-" and one of them, to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
+# The panel runs unprivileged and never updates or restarts itself. It writes the word "panel", "node" or "both", or "restart-" and one of them, or "web-routes" after it wrote web-routes.json, to a file in $UPDATE_DIR, which only it and root can write. The path unit sees the file and starts the root service, which runs `panel-update-request`.
 updater_units() {
 	act install -d -m 0770 -o root -g veilway-panel "$UPDATE_DIR"
 	act install -d -m 0700 -o root -g root "$BACKUP_DIR"
@@ -765,7 +767,7 @@ TimeoutStartSec=15min
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_FSETID CAP_SETUID CAP_SETGID
 ProtectSystem=strict
-ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -$BACKUP_DIR -$UPDATE_DIR -$CONF_DIR
+ReadWritePaths=-$BIN_DIR -$(dirname "$SELF") -$UNIT_DIR -$VER_DIR -$BACKUP_DIR -$UPDATE_DIR -$CONF_DIR -/etc/caddy -/etc/nginx -/var/log/nginx
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true
@@ -809,12 +811,13 @@ do_panel_update_request() {
 	local req="$UPDATE_DIR/request" word=""
 	need_root
 	if [ -f "$req" ] && [ ! -L "$req" ]; then word="$(timeout 5 head -c 16 -- "$req" 2>/dev/null | tr -d '\n' || true)"; fi
-	rm -f -- "$req"
+	act rm -f -- "$req"
 	case "$word" in
 		panel | node | both) ;;
+		web-routes) do_web_routes; return 0 ;;
 		# The panel's Restart buttons. A node restart drops every live tunnel for a moment.
 		restart-node | restart-panel | restart-both) do_restart "${word#restart-}"; return 0 ;;
-		*) warn "the update request was not panel, node, both or a restart: ignored"; return 0 ;;
+		*) warn "the update request was not panel, node, both, web-routes or a restart: ignored"; return 0 ;;
 	esac
 	# A service has no terminal to answer a question on: the admin said yes in the panel.
 	ASSUME_YES=1
@@ -1147,6 +1150,7 @@ EOF
 				else act sed -i "s#^http://:$DECOY_PORT {\$#http://127.0.0.1:$DECOY_PORT {#" "$decoy"; warn "caddy did not accept the decoy site for every host name in $decoy, so it was put back"; fi
 			fi
 		done
+		web_routes_include "$web" || true
 	fi
 	update_self
 	warn "a node restart drops every live tunnel for a moment"
@@ -1802,7 +1806,7 @@ web_caddy() {
 		fi
 	fi
 	[ "$NO_DOMAIN" = 0 ] || [ "$DRY" = 1 ] || chown caddy:caddy "$SUB_KEY" "$SUB_CERT"
-	act install -d -m 0755 /etc/caddy/conf.d
+	act install -d -m 0755 /etc/caddy/conf.d "$CADDY_ROUTES"
 	if [ "$DRY" = 1 ]; then dry "add the line \"$CADDY_IMPORT\" to $cf (a fresh install gets a Caddyfile with only that line)"
 	elif [ "$fresh" = 1 ] || [ ! -f "$cf" ]; then
 		backup_file "$cf"
@@ -1826,6 +1830,7 @@ https://:$HTTPS_PORT {
 	handle @sub {
 		reverse_proxy 127.0.0.1:$PANEL_PORT
 	}
+	import $CADDY_ROUTES/*.caddy
 	handle {
 		respond 404
 	}
@@ -1841,6 +1846,7 @@ $HTTPS_HOST {$tls
 	handle $sub/* {
 		reverse_proxy 127.0.0.1:$PANEL_PORT
 	}
+	import $CADDY_ROUTES/*.caddy
 	handle {
 		root * $WEB_ROOT
 		file_server
@@ -1868,6 +1874,7 @@ web_nginx() {
 		act rm -f /etc/nginx/sites-enabled/default
 		web_note nginx_default_removed 1
 	fi
+	act install -d -m 0755 "$NGINX_ROUTES"
 	if [ -n "$cert" ]; then tls="	listen $HTTPS_PORT ssl;
 	listen [::]:$HTTPS_PORT ssl;
 	ssl_certificate ${cert%%:*};
@@ -1888,6 +1895,7 @@ server {
 		proxy_set_header Host \$http_host;
 		proxy_set_header X-Forwarded-For \$remote_addr;
 	}
+	include $NGINX_ROUTES/*.conf;
 	location / {
 		return 404;
 	}
@@ -1909,6 +1917,7 @@ $tls
 		proxy_set_header Host \$http_host;
 		proxy_set_header X-Forwarded-For \$remote_addr;
 	}
+	include $NGINX_ROUTES/*.conf;
 	location / {
 		try_files \$uri \$uri/ =404;
 	}
@@ -1932,6 +1941,97 @@ EOF
 	if certbot --nginx -d "$DOMAIN" --https-port "$HTTPS_PORT" --non-interactive --agree-tos --register-unsafely-without-email --redirect; then step "certbot issued the certificate for $DOMAIN and turned on https"
 		[ "$HTTPS_PORT" = 443 ] || { sed -i "s|return 301 https://\$host\$request_uri;|return 301 https://\$host:$HTTPS_PORT\$request_uri;|" "$NGINX_SITE"; svc reload nginx.service; }
 	else warn "certbot could not get a certificate (the DNS record must point at this server and port 80 must be reachable). The site answers on http only until you run: sudo certbot --nginx -d $DOMAIN --https-port $HTTPS_PORT"; fi
+}
+
+# Checks the web server's config and reloads it. A failed reload leaves the server on its old config. A running Caddy is checked by its own reload, since caddy validate wants a home folder the update service does not have.
+web_reload() {
+	if [ "$1" = caddy ] && systemctl is-active --quiet caddy.service 2>/dev/null; then systemctl reload caddy.service >/dev/null 2>&1; return; fi
+	case "$1" in caddy) caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 ;; *) nginx -t >/dev/null 2>&1 ;; esac || return 1
+	! systemctl is-active --quiet "$1.service" 2>/dev/null || systemctl reload "$1.service" >/dev/null 2>&1
+}
+
+# Adds the line that includes the routes folder to a site file written before the panel could add routes, in front of the catch-all. The web server refusing it takes it back.
+web_routes_include() {
+	local site="$CADDY_SITE" dir="$CADDY_ROUTES" line="	import $CADDY_ROUTES/*.caddy" anchor="	handle {" saved
+	if [ "$1" = nginx ]; then site="$NGINX_SITE"; dir="$NGINX_ROUTES"; line="	include $NGINX_ROUTES/*.conf;"; anchor="	location / {"; fi
+	[ -f "$site" ] || return 0
+	act install -d -m 0755 "$dir"
+	grep -qF "$dir/" "$site" && return 0
+	grep -qxF "$anchor" "$site" || { warn "$site has no place for the routes of the panel's Add to web server button: add the line \"${line#?}\" by hand before the last block"; return 1; }
+	if [ "$DRY" = 1 ]; then dry "add \"${line#?}\" to $site, check the $1 config, reload $1 and take it back if $1 refuses it"; return 0; fi
+	backup_file "$site"
+	saved="$(mktemp "$VER_DIR/.site.XXXXXX")"
+	cp -p "$site" "$saved"
+	awk -v l="$line" -v a="$anchor" '!d && $0 == a { print l; d = 1 } { print }' "$saved" >"$site"
+	if web_reload "$1"; then step "$site now includes $dir"
+	else cp -p "$saved" "$site"; web_reload "$1" || true; warn "$1 did not accept the routes folder in $site, so it was taken back"; rm -f -- "$saved"; return 1; fi
+	rm -f -- "$saved"
+}
+
+# The panel's answer to a web-routes request, a JSON file it can read in $UPDATE_DIR. It is made in $VER_DIR first, which only root can write, and moved in.
+web_routes_result() {
+	local tmp
+	tmp="$(mktemp "$VER_DIR/.web-routes.XXXXXX")"
+	printf '{"ok": %s, "message": "%s", "at": %s, "routes": %s, "web": "%s"}\n' "$1" "$2" "$(date +%s)" "$3" "$4" >"$tmp"
+	chown root:veilway-panel "$tmp"; chmod 0640 "$tmp"
+	mv -f "$tmp" "$UPDATE_DIR/web-routes.result"
+}
+
+# The panel's Add to web server button: web-routes.json in $UPDATE_DIR is the whole wanted set of ws and fronted paths, and replaces the file in the routes folder. It comes from a less trusted user, so each route is checked strictly, the target is always 127.0.0.1 and one bad route refuses all of them.
+do_web_routes() {
+	local json="$UPDATE_DIR/web-routes.json" re='^/[A-Za-z0-9._~-][A-Za-z0-9._~/-]{11,127}$' err="" web raw lines="" path port type n=0 seen=" " f="$CONF_DIR/panel.json" prefix="/panel" sub="/sub" q extra fmt blk body="" file prev had=0
+	need_root
+	if [ "$DRY" = 1 ]; then dry "read $json, check every route, write the routes folder of the web server, check its config, reload it and write $UPDATE_DIR/web-routes.result"; return 0; fi
+	web="$(web_state web)"
+	if [ "$web" != caddy ] && [ "$web" != nginx ]; then web=""; err="this server has no web server that veilway.sh set up"
+	elif { [ "$web" = caddy ] && [ ! -f "$CADDY_SITE" ]; } || { [ "$web" = nginx ] && [ ! -f "$NGINX_SITE" ]; }; then err="the site file veilway.sh wrote for $web is gone"
+	elif ! has jq; then err="jq is not installed here"
+	elif [ -L "$json" ] || [ ! -f "$json" ]; then err="the routes file is missing or is a link"
+	else
+		raw="$(timeout 5 head -c 65537 -- "$json" 2>/dev/null | tr -d '\0' || true)"
+		if [ "$(printf '%s' "$raw" | wc -c)" -gt 65536 ]; then err="the routes file is over 64 KiB"
+		elif ! lines="$(printf '%s' "$raw" | jq -r '.routes | if type == "array" then .[] else error("routes") end | if type == "object" and (.path | type) == "string" and (.type | type) == "string" and (.port | type) == "number" and .port == (.port | floor) then [.path, (.port | tostring), .type] | @tsv else error("route") end' 2>/dev/null)"; then err="the routes file is not JSON of the expected shape"; fi
+	fi
+	if [ -z "$err" ] && [ -f "$f" ]; then
+		prefix="$(sed -n 's/.*"prefix": *"\([^"]*\)".*/\1/p' "$f")"
+		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$f")"
+		prefix="${prefix:-/panel}"; sub="${sub:-/sub}"
+	fi
+	if [ -z "$err" ] && [ -n "$lines" ]; then
+		if [ "$web" = caddy ]; then fmt='handle %s* {\n\treverse_proxy 127.0.0.1:%s {\n\t\theader_down -Server\n\t}\n}\n'
+		else fmt='location %s {\n\tproxy_pass http://127.0.0.1:%s;\n\tproxy_http_version 1.1;\n\tproxy_set_header Upgrade $http_upgrade;\n\tproxy_set_header Connection "upgrade";\n\tproxy_set_header Host $host;\n\tproxy_set_header X-Forwarded-For $remote_addr;%b\n}\n'; fi
+		while IFS=$'\t' read -r path port type; do
+			n=$((n + 1))
+			if [ "$n" -gt 32 ]; then err="there are more than 32 routes"; break; fi
+			if ! [[ "$path" =~ $re ]] || [[ "$path" == *//* || "$path" == *..* ]]; then err="route $n has a path that is not allowed"; break; fi
+			for q in "$prefix" "$sub"; do if [[ "$q/" == "$path"* || "$path/" == "$q/"* ]]; then err="route $n is the panel's own path or runs into it"; break 2; fi; done
+			if [[ "$seen" == *" $path "* ]]; then err="route $n repeats a path"; break; fi
+			seen+="$path "
+			if ! [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$port" -gt 65535 ]; then err="route $n has a port that is not 1 to 65535"; break; fi
+			case "$type" in ws) extra="" ;; fronted) extra='\n\tproxy_buffering off;\n\tproxy_read_timeout 1h;' ;; *) err="route $n is not ws or fronted"; break ;; esac
+			if [ "$web" = caddy ]; then printf -v blk "$fmt" "$path" "$port"; else printf -v blk "$fmt" "$path" "$port" "$extra"; fi
+			body+="$blk"
+		done <<<"$lines"
+	fi
+	if [ -z "$err" ]; then
+		file="$NGINX_ROUTES/panel.conf"; [ "$web" != caddy ] || file="$CADDY_ROUTES/panel.caddy"
+		prev="$(mktemp "$VER_DIR/.routes.XXXXXX")"
+		if [ -f "$file" ]; then cp -p "$file" "$prev"; had=1; fi
+		if ! web_routes_include "$web"; then err="the site file of $web has no place for the routes"
+		else
+			printf '# The Add to web server button of the panel writes this file: edits here are overwritten.\n%s' "$body" >"$file.new"
+			chmod 0644 "$file.new"; mv -f "$file.new" "$file"
+			if ! web_reload "$web"; then
+				if [ "$had" = 1 ]; then cp -p "$prev" "$file"; else rm -f -- "$file"; fi
+				web_reload "$web" || true
+				err="$web did not accept the routes, so they were taken back"
+			fi
+		fi
+		rm -f -- "$prev"
+	fi
+	rm -f -- "$json"
+	if [ -n "$err" ]; then warn "web routes refused: $err"; web_routes_result false "Nothing was changed: $err." 0 "$web"
+	else step "$web serves $n routes of the panel"; web_routes_result true "$n routes are live on $web." "$n" "$web"; fi
 }
 
 # The panel answers every path it does not serve with its not_found, and the web server's own 404 answers the rest of the site. They have to be the same bytes, or the panel's paths can be told apart.
@@ -1983,7 +2083,7 @@ web_setup() {
 	web_not_found
 }
 
-# Takes back what web_setup and update recorded in $WEB_STATE: the site file, the decoy site file, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
+# Takes back what web_setup and update recorded in $WEB_STATE: the site file, the decoy site file, the routes folder, the import line, the plain site if nobody edited it, not_found, and the packages it installed. The node's moved transports stay where they are.
 do_uninstall_web() {
 	local web domain p sha pkgs rest port from to moved
 	need_root
@@ -1995,12 +2095,14 @@ do_uninstall_web() {
 	case "$web" in
 		caddy)
 			act rm -f -- "$CADDY_SITE"
+			act rm -rf -- "$CADDY_ROUTES"
 			if [ -f /etc/caddy/Caddyfile ] && [ "$DRY" = 1 ]; then dry "remove the line \"$CADDY_IMPORT\" from /etc/caddy/Caddyfile"
 			elif [ -f /etc/caddy/Caddyfile ]; then rest="$(grep -vxF "$CADDY_IMPORT" /etc/caddy/Caddyfile || true)"; printf '%s\n' "$rest" >/etc/caddy/Caddyfile; fi
 			act rmdir /etc/caddy/conf.d 2>/dev/null || true
 			;;
 		nginx)
 			act rm -f -- "$NGINX_SITE"
+			act rm -rf -- "$NGINX_ROUTES"
 			if [ -n "$(web_state certbot_domain)" ] && has certbot; then act certbot delete --cert-name "$domain" --non-interactive || true; fi
 			if [ "$(web_state nginx_default_removed)" = 1 ] && [ -e /etc/nginx/sites-available/default ]; then act ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default; fi
 			;;
