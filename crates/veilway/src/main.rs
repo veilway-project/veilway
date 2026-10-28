@@ -278,8 +278,11 @@ fn print(report: &Report, config: &Path) -> bool {
 /// How long a node that was told to stop may still run, whatever it has open and whatever holds it up. A service manager kills what takes longer than its own limit, which for `docker stop` is 10 seconds.
 const STOP_DEADLINE: Duration = Duration::from_secs(5);
 
+// Windows gives the main thread 1 MiB of stack, which the future of a debug build outgrows, so the work runs on a thread of its own.
+fn main() -> anyhow::Result<()> {std::thread::Builder::new().name("main".into()).stack_size(16 << 20).spawn(start)?.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn start() -> anyhow::Result<()> {
 	// `RUST_LOG` overrides the level. Without `destinations` the userspace stack is silenced, because its own log lines name the addresses of every flow.
 	let filter = |log: &Log| {
 		let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(match log.level {LogLevel::Error => "error", LogLevel::Warn => "warn", LogLevel::Info => "info", LogLevel::Debug => "debug", LogLevel::Trace => "trace"}));
