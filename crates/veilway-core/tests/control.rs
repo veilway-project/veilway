@@ -1277,6 +1277,8 @@ async fn an_exit_with_a_load_setting_tells_a_device_how_busy_it_is() {
 	assert_eq!(node.engine.exit_health().iter().map(|health| (health.exit.as_str(), health.load)).collect::<Vec<_>>(), [("main", Some("high")), ("alt", None)]);
 }
 
+// The config file must be private to be reloaded, which is a mode on Unix.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_country_list_is_read_again_at_each_reload_and_a_list_that_fails_refuses_the_reload() {
 	let (list, config) = (std::env::temp_dir().join(format!("veilway-geoip-reload-{}", std::process::id())), std::env::temp_dir().join(format!("veilway-geoip-reload-{}.json", std::process::id())));
