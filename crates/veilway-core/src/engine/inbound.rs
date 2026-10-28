@@ -47,7 +47,7 @@ impl Route {
 			Route::Obfs(socket, session) => session.send(tunnel, socket, datagram, control, room).await,
 			Route::Stream(session) => session.push(datagram, control),
 			Route::FakeTls(session) => session.push(datagram, control),
-			Route::Dial(dialler) => dialler.push(datagram),
+			Route::Dial(dialler) => dialler.push(datagram, room == Room::Exact),
 		}
 	}
 
@@ -58,7 +58,7 @@ impl Route {
 			Route::Obfs(socket, session) => if let Some(sealed) = session.seal(Some(datagram), control, Room::Inbound) {tunnel.sent(socket.try_send_to(&sealed, session.source))},
 			Route::Stream(session) => session.push(datagram, control),
 			Route::FakeTls(session) => session.push(datagram, control),
-			Route::Dial(dialler) => dialler.push(datagram),
+			Route::Dial(dialler) => dialler.push(datagram, false),
 		}
 	}
 }

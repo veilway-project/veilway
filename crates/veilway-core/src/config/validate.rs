@@ -983,11 +983,13 @@ impl Config {
 		for (i, _) in self.dns.sets.iter().enumerate().take(MAX_DNS_SETS).filter(|(i, set)| !reached[*i] && set.users.is_empty() && !(set.inbounds.is_empty() && set.groups.is_empty())) {
 			r.warning(format!("dns.sets[{i}]"), "no query goes to its servers: the groups it names have no user, and every user of the inbounds it names goes by a set that names them or one of their groups");
 		}
+		let countries = geoip::named(self);
+		let geoip = if countries.is_empty() {None} else {geoip::load(&countries).map_err(|e| r.error("routing.rules", e)).ok()};
 		// Whether every address of a network is matched by an `ip` entry. `geoip:private` leaves the inbound pools to the `tunnel:` names, which leave out the gateways.
 		let inside = |entry: &IpEntry, net: &IpNet| match entry {
 			IpEntry::Net(outer) => outer.contains(net),
-			// A country's ranges are not known to cover a whole network, so no network is known to be inside one.
-			IpEntry::Country(_) => false,
+			// A country's ranges are known to cover a single address only, outside the inbound pools.
+			IpEntry::Country(cc) => net.prefix_len() == net.max_prefix_len() && !pools.iter().any(|(pool, _)| pool.contains(&net.addr())) && geoip.as_ref().and_then(|loaded| loaded.sets.get(cc)).is_some_and(|set| set.contains(net.addr())),
 			IpEntry::Private => private.iter().any(|outer| outer.contains(net)) && !pools.iter().any(|(pool, _)| pool.contains(&net.network()) || net.contains(&pool.network())),
 			// The addresses of the host are read at run time, so no network is known to be inside them.
 			IpEntry::HostSelf => false,
@@ -995,8 +997,6 @@ impl Config {
 			IpEntry::Tunnel(tag) => inbound_tags.get(tag.as_str()).is_some_and(|inbound| pools.iter().any(|(pool, owner)| owner == inbound && pool.contains(net) && !net.contains(&pool.addr()))),
 		};
 		let rules = &self.routing.rules[..self.routing.rules.len().min(MAX_RULES)];
-		let countries = geoip::named(self);
-		let geoip = if countries.is_empty() {None} else {geoip::load(&countries).map_err(|e| r.error("routing.rules", e)).ok()};
 		if let Some(days) = geoip.as_ref().map(|loaded| loaded.age_days(OffsetDateTime::now_utc())).filter(|days| *days > geoip::STALE_DAYS) {r.warning("routing.rules", format!("the country address list is {days} days old, so recent changes of the registries are missing: `veilway.sh update node` installs the newest"))}
 		if self.routing.rules.len() > MAX_RULES {r.error("routing.rules", format!("expected at most {MAX_RULES} rules"))}
 		tags(&mut r, "routing.rules", rules.iter().map(|rule| rule.tag.as_str()));

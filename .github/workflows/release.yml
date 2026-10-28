@@ -183,7 +183,29 @@ jobs:
       # The installer says which release it belongs to: the tag is written into the copy that is signed and published.
       - run: sed 's/^SCRIPT_VERSION=.*/SCRIPT_VERSION="${{ github.ref_name }}"/' scripts/veilway.sh > dist/veilway.sh && grep -q '^SCRIPT_VERSION="${{ github.ref_name }}"$' dist/veilway.sh
       # The country address lists of the five registries, made once for this release and signed like every other asset. Plain pushes do not run this, only tags do.
-      - run: sh scripts/geoip.sh dist/veilway-geoip.txt
+      # The node binary built above reads the file the way a node does before it is signed, so a file the node would refuse is never published. When the lists cannot be made or the result fails that check, the previous release's list stands in, checked the same way. With none to fall back to the release stops.
+      - name: Country address list
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          node=dist/veilway-x86_64-unknown-linux-musl
+          chmod +x "$node"
+          if sh scripts/geoip.sh dist/veilway-geoip.txt && "$node" geoip-check dist/veilway-geoip.txt; then exit 0; fi
+          rm -f dist/veilway-geoip.txt
+          echo "::warning::the country address list could not be made or the node refuses it, so the previous release's list is used"
+          previous=""
+          for tag in $(gh release list --limit 20 --json tagName --jq '.[].tagName'); do
+            [ "$tag" = "$REF_NAME" ] && continue
+            if gh release view "$tag" --json assets --jq '.assets[].name' | grep -x veilway-geoip.txt > /dev/null; then previous="$tag"; break; fi
+          done
+          if [ -z "$previous" ]; then echo "::error::no country address list was made and no earlier release has one"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/geoip-previous"
+          gh release download "$previous" --pattern veilway-geoip.txt --dir "$RUNNER_TEMP/geoip-previous" --clobber
+          "$node" geoip-check "$RUNNER_TEMP/geoip-previous/veilway-geoip.txt" || { echo "::error::the list of release $previous is refused by this node as well"; exit 1; }
+          cp "$RUNNER_TEMP/geoip-previous/veilway-geoip.txt" dist/veilway-geoip.txt
+          echo "::warning::veilway-geoip.txt is the one of release $previous"
       # RELEASE_SIGNING_KEY holds the contents of an unencrypted minisign secret key file (minisign -G -W).
       # The trusted comment binds each signature to the tag and the asset name, so a signature cannot be reused for another file.
       - name: Sign assets

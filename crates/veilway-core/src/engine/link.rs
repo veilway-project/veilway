@@ -225,11 +225,12 @@ pub(super) fn through_name(via: Arc<Upstream>, carried: impl Fn(Option<String>) 
 }
 
 /// The way into the session of a link this node dials. The tunnel of the link sends through it whatever it has for the other node, and a datagram that finds no room is dropped and counted.
-pub struct Dialler {out: mpsc::Sender<Vec<u8>>, pub unsent: AtomicU64}
+pub struct Dialler {out: mpsc::Sender<(Vec<u8>, bool)>, pub unsent: AtomicU64}
 
 impl Dialler {
-	pub fn push(&self, datagram: &[u8]) {
-		if self.out.try_send(datagram.to_vec()).is_err() {self.unsent.fetch_add(1, Ordering::Relaxed);}
+	/// `probe` marks a datagram of a size probe, which a transport sends with no padding.
+	pub fn push(&self, datagram: &[u8], probe: bool) {
+		if self.out.try_send((datagram.to_vec(), probe)).is_err() {self.unsent.fetch_add(1, Ordering::Relaxed);}
 	}
 }
 
@@ -238,7 +239,7 @@ enum Carrier {Native(Session), Plain(UdpSocket)}
 
 /// One session to one candidate, from the dial to its end. `opened` is told once, when the session is one: a chunk of the node opened on a native transport, and a datagram of the other node authenticated on plain `udp`.
 #[allow(clippy::too_many_arguments)]
-async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &Arc<State>, queue: &mut mpsc::Receiver<Vec<u8>>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
+async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>, tag: &str, dialled: &Dialled, state: &Arc<State>, queue: &mut mpsc::Receiver<(Vec<u8>, bool)>, transport: usize, candidate: usize, env: Env, opened: &mut (dyn FnMut() + Send)) -> Ended {
 	let (key, mut made) = (dialled.link.inbound, Vec::new());
 	// "Through an outbound": the stream TCP transports dial over is the proxy chain's. The chain's failure is what the transport is told, by where it stopped and whether it timed out there.
 	let connect = dialled.via.clone().map(|via| through(via, {let (state, tag) = (state.clone(), tag.to_string()); move |cause| state.carried(&tag, cause)}));
@@ -352,9 +353,10 @@ async fn session(shared: &Arc<Shared>, tunnel: &Arc<Tunnel>, me: &Weak<Dialler>,
 					Transport::WsPlain {..} => RuleTransport::WsPlain,
 				})).await}
 			}
-			Some(datagram) = queue.recv() => {
+			Some((datagram, probe)) = queue.recv() => {
 				// A handshake initiation of a tunnel that has had no handshake for as long as a link may be quiet is one WireGuard's timer made "because the node stopped answering": on `udp-obfs` it opens a new session, and on a stream it wants an answer or the session is lost.
 				let kind = match datagram.first() {
+					_ if probe => Kind::Probe,
 					Some(1) if !shared.plan().inbound_of(tunnel).and_then(|at| shared.plan().inbounds[at].link).is_some_and(|link| shared.plan().up(link)) => Kind::Stalled,
 					Some(1..=3) => Kind::Handshake,
 					_ => Kind::Packet {flow: 0, control: false},

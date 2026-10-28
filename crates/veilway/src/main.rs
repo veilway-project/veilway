@@ -66,6 +66,9 @@ enum Command {
 		/// The country address list that rules naming `geoip:<cc>` use, read at start and at every reload (scripts/veilway.sh installs it). Only a config that names a country needs it
 		#[arg(long, default_value = veilway_core::config::geoip::DEFAULT_PATH)] geoip: PathBuf,
 	},
+	/// Read a country address list the way `run` does and say whether the node would accept it. The release checks the file it made with this before it is signed
+	#[command(hide = true)]
+	GeoipCheck {file: PathBuf},
 	/// Try everything a config needs of this host and the network (ports, certificates, DNS, every outbound) and change nothing
 	Doctor {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
@@ -411,6 +414,21 @@ async fn main() -> anyhow::Result<()> {
 			veilway_core::config::geoip::set_path(geoip);
 			let (_, report) = veilway_core::config::load(&config, true);
 			if print(&report, &config) {std::process::exit(1)}
+			Ok(())
+		}
+		Command::GeoipCheck {file} => {
+			veilway_core::config::geoip::set_path(file);
+			match veilway_core::config::geoip::load(&Default::default()) {
+				Ok(list) if list.listed >= 200 => println!("the country address list of {} is accepted, {} countries", list.date, list.listed),
+				Ok(list) => {
+					eprintln!("error: the country address list has {} countries, which is too few to be the registries' data", list.listed);
+					std::process::exit(1)
+				}
+				Err(e) => {
+					eprintln!("error: {e}");
+					std::process::exit(1)
+				}
+			}
 			Ok(())
 		}
 		Command::Doctor {config, allow_readable_config, state, replay, addons, xray_dir, geoip, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {

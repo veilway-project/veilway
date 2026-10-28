@@ -746,7 +746,7 @@ mod tests {
 		let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
 		let state = UpstreamState::new("b", [1; 16], [2; 32]);
 		state.known_gateways(&["203.0.113.1".parse().unwrap()]);
-		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[state]).unwrap();
+		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[state], None).unwrap();
 		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Gate, _))));
 		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 17, 47873, Some("gateway.example.org"), usize::MAX, None), Err((Reason::Gate, _))));
 		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Unsupported, _))));

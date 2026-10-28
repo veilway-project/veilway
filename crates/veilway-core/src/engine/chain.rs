@@ -440,8 +440,8 @@ pub fn clamp(raw: &mut [u8], packet: &Packet, mtu: u16) {
 }
 
 impl Shared {
-	/// Sends one IP packet into link `link`, which must be up. False when it went nowhere: the tunnel has no session with the other node, or no way to it.
-	pub(super) async fn into_link(&self, plan: &Plan, link: usize, packet: &[u8]) -> bool {
+	/// Sends one IP packet into link `link`, which must be up. False when it went nowhere: the tunnel has no session with the other node, or no way to it. A `probe` of the link's size goes out whole and unpadded on every transport, so what arrives says what the path carries.
+	pub(super) async fn into_link(&self, plan: &Plan, link: usize, packet: &[u8], probe: bool) -> bool {
 		let (of, mut out) = (&plan.links[link], Vec::new());
 		// The packet goes to the engine of the upstream, which carries it to the provider under its own WireGuard.
 		if let Carrier::Upstream(upstream) = &of.carrier {
@@ -458,7 +458,7 @@ impl Shared {
 		};
 		let Some(route) = route else {return false};
 		let unsent = tunnel.unsent.load(std::sync::atomic::Ordering::Relaxed);
-		for datagram in &out {route.send(tunnel, datagram, false, Room::Mtu(of.mtu())).await}
+		for datagram in &out {route.send(tunnel, datagram, false, if probe {Room::Exact} else {Room::Mtu(of.mtu())}).await}
 		// A link's inbound carries links alone, so a send the system refused on it now was one of this link's: the size warning.
 		if of.listener && tunnel.unsent.load(std::sync::atomic::Ordering::Relaxed) > unsent {of.state.warn(&of.tag)}
 		of.state.traffic.up(packet.len());
@@ -469,7 +469,7 @@ impl Shared {
 	pub(super) async fn tunnelled(&self, plan: &Plan, exit: usize, link: usize, mut raw: Vec<u8>) -> bool {
 		let Some(packet) = netstack::parse(&raw) else {return false};
 		fields(&mut raw, &packet, HOPS);
-		let sent = self.into_link(plan, link, &raw).await;
+		let sent = self.into_link(plan, link, &raw, false).await;
 		if sent {plan.exits[exit].traffic.up(raw.len())}
 		sent
 	}
@@ -533,7 +533,7 @@ impl Shared {
 		fields(&mut raw, packet, hops);
 		if packet.protocol == Protocol::TCP && raw.get(packet.upper + 13).is_some_and(|flags| flags & 0x05 != 0) {self.flows.track(&key, id, FLOW_IDLE, true)}
 		let len = raw.len();
-		if self.into_link(plan, link, &raw).await {
+		if self.into_link(plan, link, &raw, false).await {
 			plan.exits[exit].traffic.up(len);
 			if let Some(link) = incoming {plan.links[link].state.chained.fetch_add(1, std::sync::atomic::Ordering::Relaxed);}
 		} else {self.refuse(plan, from, &raw, packet, Reason::Unreachable, true).await}
@@ -643,7 +643,7 @@ impl Shared {
 			(IpAddr::V6(from), IpAddr::V6(to)) => etherparse::PacketBuilder::ipv6(from.octets(), to.octets(), HOPS).udp(port, server.port()).write(&mut raw, &asked),
 			_ => return None,
 		};
-		let sent = built.is_ok() && raw.len() <= usize::from(of.mtu()) && self.into_link(plan, link, &raw).await;
+		let sent = built.is_ok() && raw.len() <= usize::from(of.mtu()) && self.into_link(plan, link, &raw, false).await;
 		if sent {plan.exits[exit].traffic.up(query.len())}
 		let answer = if sent {tokio::time::timeout(LOOKUP, answer).await.ok().and_then(Result::ok)} else {None};
 		self.nat.forget(of.id, Protocol::UDP, server, port);

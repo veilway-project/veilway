@@ -522,7 +522,7 @@ impl Plan {
 	/// Compiles a validated config. `now` decides which users have expired, `tunnels` holds the tunnel of each inbound in the order of the config,
 	/// and `previous` is the plan in force, whose counters, name memory and other state go to whatever keeps its tag, user name or public key.
 	/// `upstreams` is the state of each enabled upstream of the config, which the plan makes the carrier of its link and of the exit that names it.
-	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>, upstreams: &[Arc<UpstreamState>]) -> anyhow::Result<Plan> {
+	pub fn new(config: &Config, now: OffsetDateTime, previous: &Plan, tunnels: Vec<Arc<Tunnel>>, upstreams: &[Arc<UpstreamState>], listed: Option<Arc<Loaded>>) -> anyhow::Result<Plan> {
 		let stale = || anyhow!("the config names something it does not define; it was not validated");
 		// A link this node dials has a tunnel of its own, behind those of the inbounds and in the order of `links`.
 		let wanted: Vec<&config::Link> = config.links.iter().filter(|link| link.enabled != Some(false)).collect();
@@ -751,8 +751,7 @@ impl Plan {
 			Ok(())
 		};
 		(if Handle::try_current().is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread) {tokio::task::block_in_place(tables)} else {tables()})?;
-		let countries = geoip::named(config);
-		let geoip = if countries.is_empty() {None} else {Some(geoip::load(&countries).map_err(|e| anyhow!(e))?)};
+		let geoip = if geoip::named(config).is_empty() {None} else {Some(listed.ok_or_else(|| anyhow!("a rule names a country, and no country address list was given"))?)};
 		let mut rules = Vec::new();
 		for rule in config.routing.rules.iter().filter(|rule| rule.enabled != Some(false)) {
 			rules.push(Rule {

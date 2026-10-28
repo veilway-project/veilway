@@ -215,7 +215,7 @@ async fn bridge(shared: Arc<Shared>, id: [u8; 16], mode: Mode, mut arrivals: mps
 			let Some(at) = find(&plan, &id, role) else {break Ended::Reset};
 			iface.poll(clock(), &mut device, &mut sockets);
 			let mut sent = true;
-			for raw in std::mem::take(&mut device.tx) {sent = sent && shared.into_link(&plan, at, &raw).await}
+			for raw in std::mem::take(&mut device.tx) {sent = sent && shared.into_link(&plan, at, &raw, false).await}
 			if !sent {break Ended::Reset}
 			let now = Instant::now();
 			let socket = sockets.get_mut::<tcp::Socket>(handle);
@@ -233,7 +233,7 @@ async fn bridge(shared: Arc<Shared>, id: [u8; 16], mode: Mode, mut arrivals: mps
 							state.refuse(&tag, "the control API does not take it");
 							socket.abort();
 							iface.poll(clock(), &mut device, &mut sockets);
-							for raw in std::mem::take(&mut device.tx) {shared.into_link(&plan, at, &raw).await;}
+							for raw in std::mem::take(&mut device.tx) {shared.into_link(&plan, at, &raw, false).await;}
 							return;
 						}
 					}
@@ -305,7 +305,7 @@ async fn bridge(shared: Arc<Shared>, id: [u8; 16], mode: Mode, mut arrivals: mps
 		sockets.get_mut::<tcp::Socket>(handle).abort();
 		iface.poll(clock(), &mut device, &mut sockets);
 		let plan = shared.plan();
-		if let Some(at) = find(&plan, &id, role) {for raw in std::mem::take(&mut device.tx) {shared.into_link(&plan, at, &raw).await;}}
+		if let Some(at) = find(&plan, &id, role) {for raw in std::mem::take(&mut device.tx) {shared.into_link(&plan, at, &raw, false).await;}}
 	}
 	match ended {
 		Ended::Unopened | Ended::Refused => {
@@ -349,7 +349,7 @@ impl Shared {
 					// What answers a connection that has ended is told so, as any TCP does, so that the other node does not retransmit to nobody.
 					if packet.sport != PORT {return false}
 					counters.dropped.fetch_add(1, Ordering::Relaxed);
-					if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst).await;}
+					if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst, false).await;}
 					return true;
 				}
 			}
@@ -365,7 +365,7 @@ impl Shared {
 		// A segment of no connection is answered with a reset, and only a SYN opens one.
 		if !syn {
 			counters.dropped.fetch_add(1, Ordering::Relaxed);
-			if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst).await;}
+			if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst, false).await;}
 			return true;
 		}
 		let admitted = {
@@ -387,7 +387,7 @@ impl Shared {
 				let (ours, handoff) = duplex(WINDOW);
 				tokio::spawn(bridge(self.clone(), key, Mode::Serve {own: mine, handoff, tag: of.tag.clone()}, arrivals, ours, Held {shared: self.clone(), key: (key, packet.sport), state: of.state.clone()}, None, None));
 			}
-			None => if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst).await;},
+			None => if let Some(rst) = netstack::tcp_rst(&raw[..packet.len]) {self.into_link(plan, link, &rst, false).await;},
 		}
 		true
 	}

@@ -1277,12 +1277,15 @@ async fn an_exit_with_a_load_setting_tells_a_device_how_busy_it_is() {
 	assert_eq!(node.engine.exit_health().iter().map(|health| (health.exit.as_str(), health.load)).collect::<Vec<_>>(), [("main", Some("high")), ("alt", None)]);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_country_list_is_read_again_at_each_reload_and_a_list_that_fails_refuses_the_reload() {
 	let (list, config) = (std::env::temp_dir().join(format!("veilway-geoip-reload-{}", std::process::id())), std::env::temp_dir().join(format!("veilway-geoip-reload-{}.json", std::process::id())));
 	veilway_core::config::geoip::set_path(list.clone());
 	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nde 4 5.0.0.0 256\n").unwrap();
-	let node = launch(|doc| doc["routing"]["rules"].as_array_mut().unwrap().push(json!({"tag": "home", "ip": ["geoip:de"], "action": "reject"})), None).await;
+	let node = launch(|doc| {
+		doc["users"][0]["quota_bytes"] = json!(30000);
+		doc["routing"]["rules"].as_array_mut().unwrap().push(json!({"tag": "home", "ip": ["geoip:de"], "action": "reject"}));
+	}, None).await;
 	let held = |ip: &str| node.engine.plan().geoip.as_ref().unwrap().sets[b"de"].contains(ip.parse().unwrap());
 	assert!(held("5.0.0.1") && !held("5.0.1.1"));
 	// The file is what SIGHUP reads, and bytes that already run still read the list again.
@@ -1299,5 +1302,10 @@ async fn a_country_list_is_read_again_at_each_reload_and_a_list_that_fails_refus
 	assert!(node.engine.reload_from(&config).await.is_err() && node.engine.plan().generation == generation && held("5.0.1.1"), "a list without the country was accepted");
 	std::fs::remove_file(&list).unwrap();
 	assert!(node.engine.reload_from(&config).await.is_err() && node.engine.plan().generation == generation);
+	// Only a reload reads the list: with the file gone, a user who spends their quota is still cut off, by a recompile that keeps the list of the plan in force.
+	let mut a = Client::connect(KEY_A, node.addr).await;
+	for at in 0..30u16 {a.send(&udp(A, PUBLIC, 41000 + at, 9000, &[7; 1200])).await}
+	eventually("the user was not cut off with the list gone", || node.engine.usage("a").is_some_and(|usage| usage.denied.is_some())).await;
+	assert!(held("5.0.1.1") && node.engine.plan().generation > generation);
 	std::fs::remove_file(&config).unwrap();
 }

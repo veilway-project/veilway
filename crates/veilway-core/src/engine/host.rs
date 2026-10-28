@@ -257,7 +257,10 @@ impl Host {
 			let state = self.upstreams.get(&written.tag).map(|(_, _, state, _)| state).filter(|state| state.bound() == vault.bound()).cloned().unwrap_or_else(|| UpstreamState::new(&written.tag, vault.id(), vault.bound()));
 			upstreams.push((written.effective(), None, state, vault));
 		}
-		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>())?;
+		// The one place the country address list is read, off the runtime thread: a recompile of the running config (`expire`) reuses the list of the plan in force and never touches the file.
+		let countries = geoip::named(config);
+		let listed = if countries.is_empty() {None} else {Some(tokio::task::spawn_blocking(move || geoip::load(&countries)).await?.map_err(|e| anyhow!(e))?)};
+		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>(), listed)?;
 		if let Some(loaded) = &plan.geoip {tracing::info!("the country address list {} is in force: made {}, {} of its {} countries are named by rules", geoip::path().display(), loaded.date, loaded.sets.len(), loaded.listed)}
 		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, &plan.hops, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
 		for (tunnel, ..) in &fresh {
@@ -740,7 +743,7 @@ impl Host {
 	/// the config that runs is compiled again at the present time, with the counts as they are now, and switched to.
 	pub fn expire(&mut self, shared: &Arc<Shared>) {
 		let (Some(config), old) = (&self.config, shared.plan()) else {return};
-		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect(), &old.upstreams()) {
+		match Plan::new(config, (shared.now)(), &old, old.inbounds.iter().map(|inbound| inbound.tunnel.clone()).collect(), &old.upstreams(), old.geoip.clone()) {
 			Ok(mut plan) => {
 				plan.l3 = old.l3.clone();
 				self.switch(shared, plan, false);

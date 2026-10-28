@@ -19,10 +19,12 @@ const WAIT: Duration = Duration::from_secs(2);
 const SPACING: Duration = Duration::from_millis(200);
 /// Probes in one walk, whatever happens.
 const PROBES: usize = 16;
-/// A walk starts this often while the link is up, and its first probe is the size in use, so a path that has not changed costs one round trip.
+/// A walk starts this often while the link is up, and its first probe is the configured `mtu`, the ceiling, and the table below it follows, so a path that carries the ceiling costs one round trip and one that carries less costs a few.
 pub const EVERY: Duration = Duration::from_secs(600);
 /// Walks the size warning asks for are at least this far apart.
 pub const GAP: Duration = Duration::from_secs(60);
+/// This many walks in a row with no answer at all drop the size found before, so a size never outlives a path that no longer answers.
+const SILENT_WALKS: u32 = 3;
 /// A link answers at most 20 probes at once and then one every 500 ms.
 const ANSWERS: u32 = 20;
 const REFILL: u128 = 500;
@@ -69,6 +71,17 @@ impl Walk {
 	}
 }
 
+/// Clears what a walk holds when it ends, however it ends: finished, cancelled or panicked.
+struct Clear<'a>(&'a Probing);
+
+impl Drop for Clear<'_> {
+	fn drop(&mut self) {
+		*self.0.active.lock().unwrap_or_else(|e| e.into_inner()) = None;
+		self.0.asked.store(false, Ordering::Relaxed);
+		self.0.walking.store(false, Ordering::Relaxed);
+	}
+}
+
 /// What a link keeps of its probing. The found size is stored with the `mtu` it was found under, so a reload that changes `mtu` does not apply a size found for another.
 #[derive(Default)]
 pub struct Probing {
@@ -78,6 +91,8 @@ pub struct Probing {
 	/// The size warning wants a walk now.
 	pub(super) asked: AtomicBool,
 	silent: AtomicBool,
+	/// Walks in a row that got no answer at all.
+	misses: AtomicU32,
 	/// The walk in hand: its identifier, its token and where matching replies go.
 	active: Mutex<Option<(u16, [u8; 8], mpsc::Sender<(u16, u16)>)>>,
 	answers: Mutex<Option<(u32, Instant)>>,
@@ -118,6 +133,13 @@ impl Shared {
 		let Some(packet) = netstack::parse(raw).filter(|packet| !packet.fragment && packet.src == packet.dst && of.dialler.contains(&packet.dst)) else {return false};
 		let reply = matches!((packet.protocol, packet.icmp), (Protocol::ICMP, Some((ECHO_REPLY_V4, 0))) | (Protocol::ICMPV6, Some((ECHO_REPLY_V6, 0))));
 		if !packet.echo_request() && !reply {return false}
+		// What the other node sends here is the user's traffic as far as quota, rate and counters go, so a probe cannot draw what nothing counts. Only the exit half has a user.
+		let held = of.device.filter(|_| !of.entry).map(|device| &plan.users[plan.devices[device].user]);
+		if let Some(user) = held {
+			self.spend(user, true, raw.len());
+			self.charge(user, true, raw.len());
+			plan.inbounds[of.inbound].traffic.up(raw.len());
+		}
 		let probing = &of.state.probing;
 		if reply {
 			let active = probing.active.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(id, token, tx)| (*id, *token, tx.clone()));
@@ -136,7 +158,13 @@ impl Shared {
 			tokens > 0
 		};
 		match netstack::echo_reply(raw, &packet).filter(|reply| allowed && packet.len <= usize::from(of.mtu) && reply.len() == packet.len) {
-			Some(reply) => {let _ = self.into_link(plan, link, &reply).await;}
+			Some(reply) => if self.into_link(plan, link, &reply, true).await {
+				if let Some(user) = held {
+					self.spend(user, false, reply.len());
+					self.charge(user, false, reply.len());
+					plan.inbounds[of.inbound].traffic.down(reply.len());
+				}
+			},
 			None => {of.state.dropped.fetch_add(1, Ordering::Relaxed);}
 		}
 		true
@@ -146,6 +174,7 @@ impl Shared {
 /// One walk of link `id`, as a task. It ends early, with nothing changed, when the link goes or comes down, and says every change of the size in force.
 pub(super) async fn walk(shared: Arc<Shared>, id: [u8; 16], state: Arc<link::State>) {
 	let probing = &state.probing;
+	let clear = Clear(probing);
 	let outcome = async {
 		let (mut seed, (tx, mut replies)) = ([0u8; 10], mpsc::channel(8));
 		random(&mut seed).ok()?;
@@ -168,26 +197,28 @@ pub(super) async fn walk(shared: Arc<Shared>, id: [u8; 16], state: Arc<link::Sta
 					let at = plan.links.iter().position(|link| link.id == id).filter(|at| plan.up(*at))?;
 					let address = plan.links[at].dialler.iter().find(|address| address.is_ipv4()).or(plan.links[at].dialler.first())?;
 					// A probe the tunnel cannot send is a lost one.
-					if let Some(packet) = request(*address, probe, seq, size, &token) {let _ = shared.into_link(&plan, at, &packet).await;}
+					if let Some(packet) = request(*address, probe, seq, size, &token) {let _ = shared.into_link(&plan, at, &packet, true).await;}
 				}
 				Some(Action::Done(found)) => return Some((tag, ceiling, found)),
 				None => {}
 			}
 		}
 	}.await;
-	*probing.active.lock().unwrap_or_else(|e| e.into_inner()) = None;
-	probing.asked.store(false, Ordering::Relaxed);
-	probing.walking.store(false, Ordering::Relaxed);
+	drop(clear);
 	let Some((tag, ceiling, found)) = outcome else {return};
 	match found {
 		Some(size) => {
 			let before = probing.effective(ceiling);
 			probing.found.store(u32::from(ceiling) << 16 | u32::from(size), Ordering::Relaxed);
 			probing.silent.store(false, Ordering::Relaxed);
+			probing.misses.store(0, Ordering::Relaxed);
 			let now = probing.effective(ceiling);
 			if before != now {tracing::info!("link {tag}: the path between the two nodes carries packets of {size} bytes in both directions, so the link's mtu in force is {now} (it was {before}, and the configured mtu is {ceiling}). It is probed again every {}s, and goes back up when the path allows it", EVERY.as_secs())}
 		}
-		None => if !probing.silent.swap(true, Ordering::Relaxed) {tracing::info!("link {tag}: the other node answered no size probe, not even one of {MTU_MIN} bytes, so it is an older node or does not answer them. The link keeps its mtu of {}, and is probed again every {}s", probing.effective(ceiling), EVERY.as_secs())},
+		None => {
+			if probing.misses.fetch_add(1, Ordering::Relaxed) + 1 >= SILENT_WALKS && probing.found.swap(0, Ordering::Relaxed) != 0 {tracing::info!("link {tag}: {SILENT_WALKS} walks in a row got no answer, so the size found before is dropped and the link is back at its configured mtu of {ceiling}")}
+			if !probing.silent.swap(true, Ordering::Relaxed) {tracing::info!("link {tag}: the other node answered no size probe, not even one of {MTU_MIN} bytes, so it is an older node or does not answer them. The link keeps its mtu of {}, and is probed again every {}s", probing.effective(ceiling), EVERY.as_secs())}
+		}
 	}
 }
 
