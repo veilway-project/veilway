@@ -182,6 +182,8 @@ jobs:
           merge-multiple: true
       # The installer says which release it belongs to: the tag is written into the copy that is signed and published.
       - run: sed 's/^SCRIPT_VERSION=.*/SCRIPT_VERSION="${{ github.ref_name }}"/' scripts/veilway.sh > dist/veilway.sh && grep -q '^SCRIPT_VERSION="${{ github.ref_name }}"$' dist/veilway.sh
+      # The country address lists of the five registries, made once for this release and signed like every other asset. Plain pushes do not run this, only tags do.
+      - run: sh scripts/geoip.sh dist/veilway-geoip.txt
       # RELEASE_SIGNING_KEY holds the contents of an unencrypted minisign secret key file (minisign -G -W).
       # The trusted comment binds each signature to the tag and the asset name, so a signature cannot be reused for another file.
       - name: Sign assets

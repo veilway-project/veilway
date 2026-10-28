@@ -2,7 +2,7 @@
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Instant;
-use veilway_core::config::{load, save, schema, Config, Diagnostic, Report, MAX_DIAGNOSTICS, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_RULES, MAX_USERS, REDACTED};
+use veilway_core::config::{geoip, load, save, schema, Config, Diagnostic, Report, MAX_DIAGNOSTICS, MAX_FILE_BYTES, MAX_JSON_NODES, MAX_RULES, MAX_USERS, REDACTED};
 
 /// An obviously fake key: one byte repeated.
 fn key(byte: u8) -> String {veilway_wg::encode_key(&[byte; 32])}
@@ -958,7 +958,7 @@ fn disabled_rules() {
 
 #[test]
 fn private_networks_and_geoip() {
-	for bad in ["geoip:ir", "geoip:", "geoip:Private", "geoip:private ", "GEOIP:private", "geosite:private", "private", "geoip:private/8", "tunnel:", "tunnel:Users", "tunnel:users/24", "tunnel:ho.me", "tunnel:-home", "tunnel:home ", "users", "2001:db8::1/32", "fe80::%eth0/64", "::ffff:10.0.0.0/104"] {
+	for bad in ["geoip:IR", "geoip:i", "geoip:irn", "geoip:i1", "geoip:", "geoip:Private", "geoip:private ", "GEOIP:private", "geosite:private", "private", "geoip:private/8", "tunnel:", "tunnel:Users", "tunnel:users/24", "tunnel:ho.me", "tunnel:-home", "tunnel:home ", "users", "2001:db8::1/32", "fe80::%eth0/64", "::ffff:10.0.0.0/104"] {
 		let message = refused("routing.rules[1].ip[0]", |d| d["routing"]["rules"][1]["ip"] = json!([bad]));
 		assert!(!bad.contains(':') || message.contains("geoip:private") && message.contains("tunnel:users") && message.contains("this version"), "{bad}: {message}");
 	}
@@ -1371,4 +1371,35 @@ fn host_self_names_the_addresses_of_the_machine() {
 	for bad in ["host:", "host:Self", "host:self ", "host:self/32", "host:other", "self"] {refused("routing.rules[1].ip[0]", |d| d["routing"]["rules"][1]["ip"] = json!([bad]));}
 	let config = parse(&with(|d| d["routing"]["rules"][1]["ip"] = json!(["host:self"]))).unwrap();
 	assert_eq!(Config::parse(serde_json::to_string(&config).unwrap().as_bytes()).unwrap(), config);
+}
+
+#[test]
+fn a_rule_names_a_country_only_with_a_list_that_has_it() {
+	let home = |cc: &str| with(|d| rule(d, json!({"tag": "home", "ip": [format!("geoip:{cc}")], "action": {"exit": "open"}})));
+	let list = std::env::temp_dir().join(format!("veilway-geoip-test-{}", std::process::id()));
+	geoip::set_path(list.clone());
+	let _ = std::fs::remove_file(&list);
+	let report = check(&home("de"));
+	assert!(report.errors.iter().any(|e| e.path == "routing.rules" && e.message.contains(list.to_str().unwrap()) && e.message.contains("veilway.sh update node")), "{report:#?}");
+	assert_eq!(serde_json::to_string(&parse(&home("de")).unwrap()).unwrap().matches("geoip:de").count(), 1);
+	std::fs::write(&list, "veilway-geoip 1 2020-01-01\nde 4 5.0.0.0 256\n").unwrap();
+	let report = check(&home("de"));
+	assert!(report.errors.is_empty() && report.warnings.iter().any(|w| w.message.contains("days old")), "{report:#?}");
+	let report = check(&home("tr"));
+	assert!(report.errors.iter().any(|e| e.path == "routing.rules[4].ip[0]" && e.message.contains("country address list")), "{report:#?}");
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nde 4 5.0.0.0 257 \n").unwrap();
+	assert!(check(&home("de")).errors.iter().any(|e| e.message.contains("is not valid") && e.message.contains("line 2")));
+	// Without a rule that names a country the list is not read, so a missing one is no error.
+	let _ = std::fs::remove_file(&list);
+	assert!(check(&good()).errors.is_empty());
+	// Two equal entries are a duplicate, and a country covers no network the shadow check knows of.
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nde 4 5.0.0.0 256\n").unwrap();
+	error_at("routing.rules[4].ip[1]", |d| rule(d, json!({"tag": "twice", "ip": ["geoip:de", "geoip:de"], "action": "user"})));
+	let report = check(&with(|d| {
+		rule(d, json!({"tag": "first", "ip": ["geoip:de"], "action": "block"}));
+		rule(d, json!({"tag": "second", "ip": ["5.0.0.0/24"], "action": "user"}));
+		rule(d, json!({"tag": "third", "ip": ["geoip:de"], "action": "user"}));
+	}));
+	assert!(report.errors.is_empty() && report.warnings.iter().any(|w| w.path == "routing.rules[6]") && !report.warnings.iter().any(|w| w.path == "routing.rules[5]"), "{report:#?}");
+	let _ = std::fs::remove_file(&list);
 }

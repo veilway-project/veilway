@@ -308,24 +308,26 @@ pub struct Proxy(pub IpNet);
 
 text_value!(Proxy, "an address such as 127.0.0.1 or a network such as 10.0.0.0/8 with no host bits set", "^[0-9A-Fa-f:.]+(/(0|[1-9][0-9]{0,2}))?$", |s| if s.contains('/') {net(s, false).map(Proxy)} else {ip(s).map(|ip| Proxy(IpNet::from(ip)))}, |proxy| if proxy.0.prefix_len() == proxy.0.max_prefix_len() {proxy.0.addr().to_string()} else {proxy.0.to_string()});
 
-/// One entry of a rule's `ip` condition: a network, the name `geoip:private` for the ranges in `GEOIP_PRIVATE` outside every inbound pool, the name `host:self` for every address of the machine the node runs on (read from its interfaces, so it follows them), the name `tunnel:users` for every address in every inbound pool except the gateways, or `tunnel:<inbound tag>` for those of one inbound.
+/// One entry of a rule's `ip` condition: a network, the name `geoip:private` for the ranges in `GEOIP_PRIVATE` outside every inbound pool, the name `geoip:<cc>` (two lowercase letters) for every address the registries gave to that country, outside every inbound pool (the list is `geoip.rs`'s), the name `host:self` for every address of the machine the node runs on (read from its interfaces, so it follows them), the name `tunnel:users` for every address in every inbound pool except the gateways, or `tunnel:<inbound tag>` for those of one inbound.
 /// `Tunnel` holds the tag as written. Whether an inbound has it is for `validate` to say.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum IpEntry {Net(IpNet), Private, HostSelf, Users, Tunnel(String)}
+pub enum IpEntry {Net(IpNet), Private, Country([u8; 2]), HostSelf, Users, Tunnel(String)}
 
-text_value!(IpEntry, "a network such as 10.7.0.0/24 with no host bits set, geoip:private, host:self, tunnel:users or tunnel:<inbound tag>", "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:private|host:self|tunnel:[a-z0-9][a-z0-9_-]{0,63})$", |s| {
+text_value!(IpEntry, "a network such as 10.7.0.0/24 with no host bits set, geoip:private, geoip:<two letter country code> such as geoip:tr, host:self, tunnel:users or tunnel:<inbound tag>", "^([0-9A-Fa-f:.]+/(0|[1-9][0-9]{0,2})|geoip:(private|[a-z]{2})|host:self|tunnel:[a-z0-9][a-z0-9_-]{0,63})$", |s| {
 	match (net(s, false), s.strip_prefix("tunnel:")) {
 		_ if s == "geoip:private" => Ok(IpEntry::Private),
 		_ if s == "host:self" => Ok(IpEntry::HostSelf),
+		_ if matches!(s.strip_prefix("geoip:").map(str::as_bytes), Some([b'a'..=b'z', b'a'..=b'z'])) => Ok(IpEntry::Country([s.as_bytes()[6], s.as_bytes()[7]])),
 		_ if s == "tunnel:users" => Ok(IpEntry::Users),
 		(_, Some(tag)) if ident(tag, false) => Ok(IpEntry::Tunnel(tag.to_string())),
 		(Ok(net), _) => Ok(IpEntry::Net(net)),
-		(Err(_), _) if s.contains(':') => Err("an IPv6 network with no host bits set, geoip:private, host:self, tunnel:users or tunnel:<inbound tag>: no other geoip name is supported in this version"),
+		(Err(_), _) if s.contains(':') => Err("an IPv6 network with no host bits set, geoip:private, geoip:<two letter country code>, host:self, tunnel:users or tunnel:<inbound tag>: no other geoip name is supported in this version"),
 		(Err(expected), _) => Err(expected),
 	}
 }, |entry| match entry {
 	IpEntry::Net(net) => net.to_string(),
 	IpEntry::Private => "geoip:private".to_string(),
+	IpEntry::Country(cc) => format!("geoip:{}{}", cc[0] as char, cc[1] as char),
 	IpEntry::HostSelf => "host:self".to_string(),
 	IpEntry::Users => "tunnel:users".to_string(),
 	IpEntry::Tunnel(tag) => format!("tunnel:{tag}"),

@@ -9,7 +9,7 @@ use super::limits::Clock;
 use super::upstream::{self, UpstreamState};
 use super::upstream_state::{UpstreamFile, UpstreamVault};
 use super::{certificate, control, faketls, hostaddrs, l3, link, obfs, pins, proxy, replay, stream, tunnel, wg_out, CutOff, Event, Over, Shared, QUEUE};
-use crate::config::{loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
+use crate::config::{geoip, loops, Certificate, Config, ProxyInbound, RuleTransport, Upstream, Host as Named, Http2, Protocol, Tls, Transport, Tunnel as Forwarded, TunnelProtocol, DEFAULT_MTU, DEFAULT_SESSIONS, DEFAULT_SITE_PORT, DEFAULT_SITE_RATE, DEFAULT_SITE_RELAYED, MAX_NAMES_LOGGED, MAX_TCP_IDLE_SECS, MAX_UDP_IDLE_SECS};
 use anyhow::anyhow;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -258,6 +258,7 @@ impl Host {
 			upstreams.push((written.effective(), None, state, vault));
 		}
 		let mut plan = Plan::new(config, (shared.now)(), &old, tunnels, &upstreams.iter().map(|(_, _, state, _)| state.clone()).collect::<Vec<_>>())?;
+		if let Some(loaded) = &plan.geoip {tracing::info!("the country address list {} is in force: made {}, {} of its {} countries are named by rules", geoip::path().display(), loaded.date, loaded.sets.len(), loaded.listed)}
 		for (written, reach, ..) in &mut upstreams {*reach = written.via.as_deref().map(|tag| upstream::reach(&config.outbounds, &plan.latency, &plan.hops, tag).ok_or_else(|| anyhow!("the config names something it does not define; it was not validated"))).transpose()?}
 		for (tunnel, ..) in &fresh {
 			let (Some(at), mut peers) = (plan.inbound_of(tunnel), tunnel.lock()) else {continue};
@@ -454,9 +455,9 @@ impl Host {
 	pub fn commit(&mut self, shared: &Arc<Shared>, staged: Staged) {
 		let Staged {plan, config, udp, ws: relays, mut acceptors, tls: listeners, streams, borrowed, sites, certified, pinned, tunnels, loopbacks, forwards, proxies, l3, upstreams} = staged;
 		// A reload of the bytes that already run stages the running config itself. With no tunnel and no interface to start there is nothing to switch to:
-		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again.
+		// the plan in force stays, no flow is judged again, and all that follows here is the certificates that were read again. A country address list that changed on disk is a change: the plan is switched to.
 		hostaddrs::refresh();
-		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config));
+		let same = tunnels.is_empty() && l3.is_none() && self.config.as_ref().is_some_and(|running| Arc::ptr_eq(running, &config)) && plan.geoip.as_deref() == shared.plan().geoip.as_deref();
 		let (old, plan) = if same {(shared.plan(), shared.plan())} else {self.switch(shared, plan, true)};
 		self.config = Some(config);
 		// Dropping the interface of an exit that is gone takes its routes and its firewall table with it.

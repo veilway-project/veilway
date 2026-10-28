@@ -1,4 +1,5 @@
 //! Config version 1: the typed model, strict parsing, validation and reloading. `crate::engine` compiles a validated document into its plan.
+pub mod geoip;
 mod model;
 mod parse;
 mod reload;

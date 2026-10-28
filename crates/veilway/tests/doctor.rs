@@ -792,6 +792,39 @@ async fn a_link_is_looked_at_without_dialling_it() {
 	std::fs::remove_dir_all(&dir).unwrap();
 }
 
+// A rule that names a country needs the list `--geoip` points at: `check` and `doctor` say where it is missing, and read it when it is there.
+#[tokio::test]
+async fn a_rule_that_names_a_country_needs_the_list() {
+	let (dir, server) = (scratch("geoip"), dns(false).await);
+	let key = |byte: u8| veilway_wg::encode_key(&[byte; 32]);
+	let (list, config) = (dir.join("geoip.txt"), dir.join("config.json"));
+	let rules = |named: bool| json!([{"tag": "isolate-users", "ip": ["tunnel:users"], "action": "reject"}, {"tag": "no-private", "ip": ["geoip:private"], "action": "reject"}, {"tag": "home", "ip": if named {json!(["geoip:de"])} else {json!(["1.2.3.0/24"])}, "action": {"exit": "main"}}]);
+	let document = |named: bool| json!({
+		"version": 1, "dns": {"servers": [server.to_string()]},
+		"inbounds": [{"tag": "home", "type": "wireguard", "private_key": key(0x11), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": free().to_string()}]}],
+		"outbounds": [{"tag": "plain", "type": "direct"}],
+		"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}],
+		"routing": {"default": "main", "rules": rules(named)},
+		"users": [{"name": "a", "exits": "all", "devices": [{"name": "phone", "public_key": key(0x21), "addresses": ["10.7.0.2"]}]}]
+	}).to_string();
+	let check = || tokio::process::Command::new(env!("CARGO_BIN_EXE_veilway")).arg("check").arg("--config").arg(&config).arg("--geoip").arg(&list).output();
+	private(&dir, "config.json", &document(true));
+	let (done, (_, printed, _)) = (check().await.unwrap(), doctor(&dir, &["--json", "--no-api", "--geoip", list.to_str().unwrap()]).await);
+	let (shown, parsed) = (String::from_utf8_lossy(&done.stderr).to_string() + &String::from_utf8_lossy(&done.stdout), serde_json::from_str::<Value>(&printed).unwrap());
+	assert!(!done.status.success() && shown.contains(list.to_str().unwrap()) && shown.contains("veilway.sh update node"), "{shown}");
+	assert!(printed.contains(list.to_str().unwrap()) && printed.contains("veilway.sh update node") && parsed["checks"].as_array().unwrap().iter().all(|line| line["check"] != "routing" || line["subject"] != "geoip"), "{parsed:#}");
+	std::fs::write(&list, "veilway-geoip 1 2099-01-01\nde 4 5.0.0.0 256\nfr 4 6.0.0.0 256\n").unwrap();
+	let (done, (_, printed, _)) = (check().await.unwrap(), doctor(&dir, &["--json", "--no-api", "--geoip", list.to_str().unwrap()]).await);
+	let parsed = serde_json::from_str::<Value>(&printed).unwrap();
+	assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+	assert_eq!(status(&parsed, "routing", "geoip"), "ok", "{parsed:#}");
+	assert!(message(&parsed, "routing", "geoip").contains("2099-01-01") && message(&parsed, "routing", "geoip").contains("1 of its 2 countries"), "{parsed:#}");
+	private(&dir, "config.json", &document(false));
+	let (_, printed, _) = doctor(&dir, &["--json", "--no-api", "--geoip", "/nonexistent/geoip.txt"]).await;
+	assert!(serde_json::from_str::<Value>(&printed).unwrap()["checks"].as_array().unwrap().iter().all(|line| line["subject"] != "geoip"), "a list nobody needs was looked at");
+	std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// A node on `path` that answers each route with its status and body, and 404 to any other route.
 fn routed(path: &Path, routes: Vec<(String, u16, String)>) -> tokio::task::JoinHandle<()> {
 	let listener = tokio::net::UnixListener::bind(path).unwrap();

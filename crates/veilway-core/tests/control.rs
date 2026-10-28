@@ -1276,3 +1276,28 @@ async fn an_exit_with_a_load_setting_tells_a_device_how_busy_it_is() {
 	assert_eq!(level(exits), [("main".to_string(), Load::High), ("alt".to_string(), Load::Unknown)]);
 	assert_eq!(node.engine.exit_health().iter().map(|health| (health.exit.as_str(), health.load)).collect::<Vec<_>>(), [("main", Some("high")), ("alt", None)]);
 }
+
+#[tokio::test]
+async fn a_country_list_is_read_again_at_each_reload_and_a_list_that_fails_refuses_the_reload() {
+	let (list, config) = (std::env::temp_dir().join(format!("veilway-geoip-reload-{}", std::process::id())), std::env::temp_dir().join(format!("veilway-geoip-reload-{}.json", std::process::id())));
+	veilway_core::config::geoip::set_path(list.clone());
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nde 4 5.0.0.0 256\n").unwrap();
+	let node = launch(|doc| doc["routing"]["rules"].as_array_mut().unwrap().push(json!({"tag": "home", "ip": ["geoip:de"], "action": "reject"})), None).await;
+	let held = |ip: &str| node.engine.plan().geoip.as_ref().unwrap().sets[b"de"].contains(ip.parse().unwrap());
+	assert!(held("5.0.0.1") && !held("5.0.1.1"));
+	// The file is what SIGHUP reads, and bytes that already run still read the list again.
+	std::fs::write(&config, node.doc.to_string()).unwrap();
+	std::fs::set_permissions(&config, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+	node.engine.reload_from(&config).await.unwrap();
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nfr 4 6.0.0.0 256\nde 4 5.0.1.0 256\n").unwrap();
+	node.engine.reload_from(&config).await.unwrap();
+	assert!(!held("5.0.0.1") && held("5.0.1.1"));
+	let generation = node.engine.plan().generation;
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nde 4 5.0.2.0 0\n").unwrap();
+	assert!(node.engine.reload_from(&config).await.is_err() && node.engine.plan().generation == generation && held("5.0.1.1"), "a list that does not read was accepted");
+	std::fs::write(&list, "veilway-geoip 1 2026-10-28\nfr 4 6.0.0.0 256\n").unwrap();
+	assert!(node.engine.reload_from(&config).await.is_err() && node.engine.plan().generation == generation && held("5.0.1.1"), "a list without the country was accepted");
+	std::fs::remove_file(&list).unwrap();
+	assert!(node.engine.reload_from(&config).await.is_err() && node.engine.plan().generation == generation);
+	std::fs::remove_file(&config).unwrap();
+}

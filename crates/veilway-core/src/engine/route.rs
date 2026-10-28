@@ -492,6 +492,7 @@ pub fn evaluate<'a>(plan: &'a Plan, inbound: usize, user: usize, dst: IpAddr, pr
 		IpMatch::Net(net) => within(net),
 		// Addresses inside an inbound pool belong to the `tunnel:` names alone.
 		IpMatch::Private => plan.pool_of(dst).is_none() && plan.private.iter().any(within),
+		IpMatch::Country(ranges) => plan.pool_of(dst).is_none() && (ranges.contains(dst) || carried.iter().flatten().any(|v4| ranges.contains(IpAddr::V4(*v4)))),
 		IpMatch::HostSelf => plan.pool_of(dst).is_none() && hostaddrs::contains(dst),
 		IpMatch::Users => pool.is_some(),
 		IpMatch::Tunnel(tunnel) => pool == Some(*tunnel),
@@ -811,5 +812,17 @@ mod tests {
 		for yes in ["192.0.2.7", "2001:db8::7", "::ffff:192.0.2.7", "64:ff9b::c000:207", "2002:c000:207::1"] {assert!(at(yes), "{yes}")}
 		for no in ["192.0.2.8", "2001:db8::8", "::ffff:192.0.2.8", "1.1.1.1"] {assert!(!at(no), "{no}")}
 		super::super::hostaddrs::refresh();
+	}
+
+	#[test]
+	fn a_country_matches_its_ranges_outside_the_pools_and_through_a_carried_ipv4_address() {
+		let list = "veilway-geoip 1 2026-10-28\nde 4 5.0.0.0 256\nde 4 10.7.0.0 256\nde 4 192.0.2.7 1\nde 6 2001:db8:5:: 48\nfr 4 6.0.0.0 256\n";
+		let wanted = std::collections::BTreeSet::from([*b"de"]);
+		let ranges = crate::config::geoip::parse(list.as_bytes(), &wanted).unwrap().sets[b"de"].clone();
+		let rule = super::super::plan::Rule {tag: "home".into(), inbound: None, user: None, group: None, link: None, transport: None, ip: Some(vec![IpMatch::Country(ranges)]), domain: None, protocol: None, port: None, icmp_type: None, icmp_code: None, action: Action::Reject};
+		let plan = Plan {rules: vec![rule], pools: vec![("10.7.0.0/24".parse().unwrap(), 0)], ..Plan::default()};
+		let at = |dst: &str| matches!(evaluate(&plan, 0, 0, dst.parse().unwrap(), 6, 443, None, None, &|_| false), Action::Reject);
+		for yes in ["5.0.0.0", "5.0.0.255", "192.0.2.7", "2001:db8:5::1", "2001:db8:5:ffff:ffff:ffff:ffff:ffff", "::ffff:5.0.0.9", "64:ff9b::500:1", "2002:500:1::1"] {assert!(at(yes), "{yes}")}
+		for no in ["4.255.255.255", "5.0.1.0", "192.0.2.6", "192.0.2.8", "6.0.0.1", "2001:db8:6::1", "2001:db8:4:ffff::1", "::ffff:5.0.1.1", "1.1.1.1", "10.7.0.5", "10.7.0.1"] {assert!(!at(no), "{no}")}
 	}
 }

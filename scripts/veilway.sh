@@ -66,6 +66,7 @@ NODE_DIR="$CONF_DIR/node"
 STATE_DIR="/var/lib/veilway"
 MIRROR_DIR="/etc/veilway-mirror"
 ADDON_DIR="/usr/local/lib/veilway/addons"
+GEOIP_FILE="/usr/local/lib/veilway/geoip.txt"
 XRAY_RELEASE="v26.10.21"
 # Only where the package manager has no minisign. The hash was pinned after the tarball's signature was checked with the author's key RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3.
 MINISIGN_VERSION="0.11"
@@ -495,6 +496,14 @@ fetch_and_install() {
 	printf '%s\n' "$tag" >"$vf"; chmod 0644 "$vf"; mv -f "$vf" "$VER_DIR/$which.version"
 }
 
+# The country address list of the release the node was just taken from, checked like the binary. The node runs without it, so a failure only warns. Needs the tag that fetch_and_install left in TAG_OUT.
+fetch_geoip() {
+	local dir="${GEOIP_FILE%/*}"
+	if [ "$DRY" = 1 ]; then dry "download veilway-geoip.txt and its .minisig, verify with minisign key ${NODE_PUBKEY:0:12}..., match comment \"veilway <tag> veilway-geoip.txt\", install -m 0644 as $GEOIP_FILE"; return 0; fi
+	if ( download_verified "$CORE_REPO" "$NODE_PUBKEY" veilway-geoip.txt "$TAG_OUT" veilway ) && install -d -m 0755 -o root -g root "$dir" && install -m 0644 -o root -g root "$TMP/veilway-geoip.txt" "$GEOIP_FILE.new" && mv -f "$GEOIP_FILE.new" "$GEOIP_FILE"; then step "installed $GEOIP_FILE ($TAG_OUT)"
+	else warn "the country address list was not installed: rules that name a country (geoip:tr) will not validate until $GEOIP_FILE exists. Run sudo bash veilway.sh update node to try again"; fi
+}
+
 ensure_user() {
 	local user="$1" home="$2"
 	id "$user" >/dev/null 2>&1 && return 0
@@ -739,6 +748,7 @@ install_node() {
 	act install -d -m 0750 -o veilway -g veilway "$STATE_DIR"
 	act install -d -m 0750 -o root -g veilway "$CONF_DIR"
 	fetch_and_install node
+	fetch_geoip
 	prepare_node_dir
 	node_unit
 	install_self
@@ -1187,6 +1197,7 @@ do_update() {
 			cur="$(installed_version node)"
 			info "node is at ${cur:-unknown}"
 			fetch_and_install node
+			fetch_geoip
 			prepare_node_dir
 			node_unit
 			if [ -f "$UNIT_DIR/veilway-xray.service" ]; then xray_units; xray_node_group; fi
@@ -1448,6 +1459,7 @@ do_uninstall() {
 	done
 	act rm -f "$UNIT_DIR/veilway.service" "$UNIT_DIR/veilway-panel.service" "$UNIT_DIR/veilway-panel-update.path" "$UNIT_DIR/veilway-panel-update.service" "$UNIT_DIR/veilway-xray.socket" "$UNIT_DIR/veilway-xray.service" "$UNIT_DIR/veilway-mirror.service" "$BIN_DIR/veilway" "$BIN_DIR/veilway-panel"
 	act rm -rf "$ADDON_DIR"
+	act rm -f "$GEOIP_FILE"
 	daemon_reload
 	if confirm "Also delete $CONF_DIR, $STATE_DIR, $PANEL_DIR and $MIRROR_DIR? The backup above keeps a copy."; then
 		act rm -rf "$CONF_DIR" "$STATE_DIR" "$PANEL_DIR" "$MIRROR_DIR"

@@ -695,6 +695,14 @@ pub async fn run(file: &Path, allow_readable: bool, state: Option<PathBuf>, repl
 	lines.extend(tried.into_iter().flat_map(|(_, lines)| lines));
 	let (named, covered) = (config.routing.rules.iter().any(|rule| rule.enabled != Some(false) && rule.ip.iter().flatten().any(|entry| matches!(entry, config::IpEntry::HostSelf))), veilway_core::engine::hostaddrs::list().iter().map(ToString::to_string).collect::<Vec<_>>().join(", "));
 	lines.push(line(Status::Ok, "routing", "host:self", format!("covers {covered}{}", if named {" (an enabled rule names it)"} else {". No enabled rule names it, so users can reach these addresses: add a reject rule with ip [\"host:self\"] to refuse them"})));
+	let countries = config::geoip::named(&config);
+	if !countries.is_empty() {
+		let listed = config::geoip::path().display().to_string();
+		lines.push(match config::geoip::load(&countries) {
+			Ok(list) => line(Status::Ok, "routing", "geoip", format!("{listed} is the list of {}, {} of its {} countries are named by rules", list.date, list.sets.len(), list.listed)),
+			Err(why) => line(Status::Fail, "routing", "geoip", format!("{why}: a rule names a country, so `veilway run` would not start")),
+		});
+	}
 	#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 	let (v4, v6) = (config.inbounds.iter().flat_map(|inbound| &inbound.address).any(|pool| pool.0.addr().is_ipv4()), config.inbounds.iter().flat_map(|inbound| &inbound.address).any(|pool| pool.0.addr().is_ipv6()));
 	for (nth, exit) in config.exits.iter().filter(|exit| matches!(exit.backend, Backend::L3(_))).enumerate() {

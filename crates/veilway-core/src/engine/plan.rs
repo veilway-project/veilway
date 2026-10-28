@@ -6,6 +6,7 @@ use super::upstream::UpstreamState;
 use super::wg_out::{Spec, WgOut};
 use super::xray_out::{Hop, Hops};
 use super::{control, icmp, l3, link, proxy, usage, ExitState, Traffic, UserState};
+use crate::config::geoip::{self, Loaded, Ranges};
 use crate::config::{self, Config, Exits, InboundType, IpEntry, LinkManage, LinkTransportType, NoticeSeverity, Policy, QuotaPeriod, Transport, DEFAULT_INTERFACE, DEFAULT_LINK_FLOWS, DEFAULT_TCP_IDLE_SECS, DEFAULT_UDP_IDLE_SECS, GEOIP_PRIVATE, MAX_DNS_SERVERS};
 use anyhow::anyhow;
 use ipnet::IpNet;
@@ -415,7 +416,7 @@ impl Link {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Holder {pub device: usize, pub inbound: usize}
 
-pub enum IpMatch {Net(IpNet), Private, HostSelf, Users, Tunnel(usize)}
+pub enum IpMatch {Net(IpNet), Private, Country(Arc<Ranges>), HostSelf, Users, Tunnel(usize)}
 
 pub enum Action {Exit(usize), User, Block, Reject}
 
@@ -477,6 +478,8 @@ pub struct Plan {
 	/// Every inbound pool with its inbound, gateway address included.
 	pub pools: Vec<(IpNet, usize)>,
 	pub private: Vec<IpNet>,
+	/// The country address list this plan was compiled with, when a rule names a country.
+	pub geoip: Option<Arc<Loaded>>,
 	pub by_address: HashMap<IpAddr, Holder>,
 	/// The device of each public key.
 	pub by_key: HashMap<[u8; 32], usize>,
@@ -748,6 +751,8 @@ impl Plan {
 			Ok(())
 		};
 		(if Handle::try_current().is_ok_and(|runtime| runtime.runtime_flavor() == RuntimeFlavor::MultiThread) {tokio::task::block_in_place(tables)} else {tables()})?;
+		let countries = geoip::named(config);
+		let geoip = if countries.is_empty() {None} else {Some(geoip::load(&countries).map_err(|e| anyhow!(e))?)};
 		let mut rules = Vec::new();
 		for rule in config.routing.rules.iter().filter(|rule| rule.enabled != Some(false)) {
 			rules.push(Rule {
@@ -759,6 +764,7 @@ impl Plan {
 				ip: rule.ip.as_ref().map(|list| list.iter().map(|entry| Ok(match entry {
 					IpEntry::Net(net) => IpMatch::Net(*net),
 					IpEntry::Private => IpMatch::Private,
+					IpEntry::Country(cc) => IpMatch::Country(geoip.as_ref().and_then(|loaded| loaded.sets.get(cc)).cloned().ok_or_else(|| anyhow!("a rule names a country that is not in the country address list {}", geoip::path().display()))?),
 					IpEntry::HostSelf => IpMatch::HostSelf,
 					IpEntry::Users => IpMatch::Users,
 					IpEntry::Tunnel(tag) => IpMatch::Tunnel(find(&inbound_tags, tag)?),
@@ -785,6 +791,7 @@ impl Plan {
 			default_exit: find(&exit_tags, &config.routing.default)?,
 			fallback: config.routing.fallback.iter().map(|tag| find(&exit_tags, tag)).collect::<anyhow::Result<Vec<usize>>>()?,
 			private: GEOIP_PRIVATE.iter().filter_map(|net| net.parse().ok()).collect(),
+			geoip,
 			l3: None,
 			notices: config.notices.iter().map(|notice| (notice.severity, notice.text.clone())).collect(),
 			latency,

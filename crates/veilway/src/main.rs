@@ -44,6 +44,8 @@ enum Command {
 		#[arg(long, default_value = "/run/veilway-xray/host.sock")] xray_socket: PathBuf,
 		/// The folder shared with Xray's user where the sockets of Xray outbounds are made
 		#[arg(long, default_value = "/run/veilway-xray-out")] xray_dir: PathBuf,
+		/// The country address list that rules naming `geoip:<cc>` use, read at start and at every reload (scripts/veilway.sh installs it). Only a config that names a country needs it
+		#[arg(long, default_value = veilway_core::config::geoip::DEFAULT_PATH)] geoip: PathBuf,
 		/// The unix socket of the control API, which whoever can open administers the node [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -61,6 +63,8 @@ enum Command {
 	/// Validate a version 1 config and print every error and warning
 	Check {
 		#[arg(long, short, default_value = "config.json")] config: PathBuf,
+		/// The country address list that rules naming `geoip:<cc>` use, read at start and at every reload (scripts/veilway.sh installs it). Only a config that names a country needs it
+		#[arg(long, default_value = veilway_core::config::geoip::DEFAULT_PATH)] geoip: PathBuf,
 	},
 	/// Try everything a config needs of this host and the network (ports, certificates, DNS, every outbound) and change nothing
 	Doctor {
@@ -75,6 +79,8 @@ enum Command {
 		#[arg(long, default_value = "/usr/local/lib/veilway/addons")] addons: PathBuf,
 		/// The folder `run` would make the sockets of Xray outbounds in, which is checked when the config has one
 		#[arg(long, default_value = "/run/veilway-xray-out")] xray_dir: PathBuf,
+		/// The country address list `run` would read for rules naming `geoip:<cc>`. Only a config that names a country needs it
+		#[arg(long, default_value = veilway_core::config::geoip::DEFAULT_PATH)] geoip: PathBuf,
 		/// The control socket `run` would use, which also says whether a node runs already [default: veilway.sock next to the config file]
 		#[cfg(unix)]
 		#[arg(long, conflicts_with = "no_api")] api: Option<PathBuf>,
@@ -294,7 +300,8 @@ async fn main() -> anyhow::Result<()> {
 			println!("{}", veilway_core::config::transport_secret()?);
 			Ok(())
 		}
-		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, xray_dir, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+		Command::Run {config, allow_readable_config, state, replay, addons, xray_socket, xray_dir, geoip, #[cfg(unix)] api, #[cfg(unix)] no_api} => {
+			veilway_core::config::geoip::set_path(geoip);
 			// A config pushed by the managing node and not confirmed before the last stop is put back before the config is read.
 			#[cfg(unix)]
 			let restored = veilway_api::restore_trial(&config)?;
@@ -400,12 +407,14 @@ async fn main() -> anyhow::Result<()> {
 			tracing_subscriber::fmt().with_env_filter(EnvFilter::new("info")).init();
 			veilway_core::engine::xray_host::run(addons, socket).await
 		}
-		Command::Check {config} => {
+		Command::Check {config, geoip} => {
+			veilway_core::config::geoip::set_path(geoip);
 			let (_, report) = veilway_core::config::load(&config, true);
 			if print(&report, &config) {std::process::exit(1)}
 			Ok(())
 		}
-		Command::Doctor {config, allow_readable_config, state, replay, addons, xray_dir, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+		Command::Doctor {config, allow_readable_config, state, replay, addons, xray_dir, geoip, #[cfg(unix)] api, #[cfg(unix)] no_api, json, timeout} => {
+			veilway_core::config::geoip::set_path(geoip);
 			#[cfg(unix)]
 			let socket = (!no_api).then(|| api.unwrap_or_else(|| config.parent().unwrap_or(Path::new("")).join("veilway.sock")));
 			#[cfg(not(unix))]

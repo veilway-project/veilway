@@ -8,6 +8,7 @@ use ipnet::IpNet;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
+use time::OffsetDateTime;
 use veilway_proto::subscription::is_host;
 use veilway_proto::subscription::link::Link as SubscriptionLink;
 use veilway_proto::subscription::payload::{self, dialable};
@@ -985,6 +986,8 @@ impl Config {
 		// Whether every address of a network is matched by an `ip` entry. `geoip:private` leaves the inbound pools to the `tunnel:` names, which leave out the gateways.
 		let inside = |entry: &IpEntry, net: &IpNet| match entry {
 			IpEntry::Net(outer) => outer.contains(net),
+			// A country's ranges are not known to cover a whole network, so no network is known to be inside one.
+			IpEntry::Country(_) => false,
 			IpEntry::Private => private.iter().any(|outer| outer.contains(net)) && !pools.iter().any(|(pool, _)| pool.contains(&net.network()) || net.contains(&pool.network())),
 			// The addresses of the host are read at run time, so no network is known to be inside them.
 			IpEntry::HostSelf => false,
@@ -992,6 +995,9 @@ impl Config {
 			IpEntry::Tunnel(tag) => inbound_tags.get(tag.as_str()).is_some_and(|inbound| pools.iter().any(|(pool, owner)| owner == inbound && pool.contains(net) && !net.contains(&pool.addr()))),
 		};
 		let rules = &self.routing.rules[..self.routing.rules.len().min(MAX_RULES)];
+		let countries = geoip::named(self);
+		let geoip = if countries.is_empty() {None} else {geoip::load(&countries).map_err(|e| r.error("routing.rules", e)).ok()};
+		if let Some(days) = geoip.as_ref().map(|loaded| loaded.age_days(OffsetDateTime::now_utc())).filter(|days| *days > geoip::STALE_DAYS) {r.warning("routing.rules", format!("the country address list is {days} days old, so recent changes of the registries are missing: `veilway.sh update node` installs the newest"))}
 		if self.routing.rules.len() > MAX_RULES {r.error("routing.rules", format!("expected at most {MAX_RULES} rules"))}
 		tags(&mut r, "routing.rules", rules.iter().map(|rule| rule.tag.as_str()));
 		// An exit together with every exit its unsupported policy hands traffic to.
@@ -1067,6 +1073,7 @@ impl Config {
 				r.warning(format!("{at}.domain"), "never matches what arrives from a link: the names behind a link's traffic were resolved by the other node, and this node never learns them. A block by name does not cover a link");
 			}
 			for (j, entry) in rule.ip.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
+				if matches!(entry, IpEntry::Country(cc) if geoip.as_ref().is_some_and(|loaded| !loaded.sets.contains_key(cc))) {r.error(format!("{at}.ip[{j}]"), "expected a country that is in the country address list, found one that is not")}
 				if matches!(entry, IpEntry::Tunnel(tag) if !inbound_tags.contains_key(tag.as_str())) {r.error(format!("{at}.ip[{j}]"), "expected tunnel:users or tunnel: with the tag of an inbound, found a tag no inbound has")}
 			}
 			for (j, name) in rule.domain.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
