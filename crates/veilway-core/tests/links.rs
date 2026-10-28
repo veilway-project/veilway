@@ -217,7 +217,8 @@ impl Peer {
 				TunnResult::WriteToTunnelV4(packet, _) | TunnResult::WriteToTunnelV6(packet, _) => (None, Some(packet.to_vec())),
 				_ => (None, None),
 			};
-			packets.extend(packet);
+			// The node's size probe (an echo request from an address to itself) is for a node that answers it. This peer is none, like an older node, and what it says is nobody's answer.
+			packets.extend(packet.filter(|packet| !(packet.len() > 20 && packet[9] == 1 && packet[20] == 8 && packet[12..16] == packet[16..20])));
 			let Some(reply) = reply else {return packets};
 			if datagram.first() == Some(&2) {self.up.store(true, Ordering::SeqCst)}
 			self.put(reply).await;
@@ -384,6 +385,32 @@ async fn a_forward_link_over_tls_carries_a_users_traffic_out_of_the_exit() {
 	let net = linked("links-forward-tls", true, Over::Tls, |_| {}, time).await;
 	assert_eq!(net.entry.links()[0].transport.map(|(name, ..)| name), Some("tls"));
 	carries(net, 41000).await;
+}
+
+/// "A link finds the largest size that works in both directions": a path with no limit of its own carries the configured `mtu`, so both nodes find it by probing inside the link, and the size in force stays the configured one. Both halves probe, the node that is dialled included.
+async fn finds_its_mtu(net: Linked, mtu: u16) {
+	for (node, name) in [(&net.entry, "entry"), (&net.exit, "exit")] {
+		let deadline = Instant::now() + Duration::from_secs(20);
+		while node.links()[0].mtu_found != Some(mtu) {
+			assert!(Instant::now() < deadline, "the {name} found no path MTU of {mtu} within 20 s: {:?}", node.links());
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+		assert_eq!(node.links()[0].mtu, mtu);
+	}
+	net.entry.shutdown().await;
+	net.exit.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forward_link_over_udp_obfs_finds_its_path_mtu_at_both_nodes() {
+	let time = time!();
+	finds_its_mtu(linked("links-mtu-forward", true, Over::Obfs, |_| {}, time).await, 1390).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reverse_link_over_tls_finds_its_path_mtu_at_both_nodes() {
+	let time = time!();
+	finds_its_mtu(linked("links-mtu-reverse", false, Over::Tls, |_| {}, time).await, 1420).await;
 }
 
 // Node links page, "Pin-only candidates": a node with no domain is linked to through its own certificate, trusted through the pin alone, and the pin holds across the node's renewals of the certificate.

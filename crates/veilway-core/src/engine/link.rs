@@ -3,6 +3,7 @@
 //! What a link carries is not here: `chain` is the entry half, and the exit half is the path every decrypted packet takes, with the link's own limits.
 use super::flows::{self, Stop};
 use super::inbound::{Tunnel, Via};
+use super::linkmtu;
 use super::plan::{self, Dialled, Plan, Upstream};
 use super::{Shared, Traffic};
 use crate::config::{random, RuleTransport};
@@ -85,12 +86,14 @@ pub struct State {
 	chain: Mutex<Option<String>>,
 	/// What the management connections of the link count, see `manage`.
 	pub manage: super::manage::Counters,
+	/// The path MTU found by probing and what keeps it up to date, see `linkmtu`.
+	pub probing: linkmtu::Probing,
 	/// Ends the session the dialler has now, so that the next one opens with a handshake, see `manage_renew`.
 	pub renew: Notify,
 }
 
 impl Default for State {
-	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), chained: AtomicU64::new(0), hopped: Default::default(), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), pinned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), renew: Notify::new()}}
+	fn default() -> State {State {status: Mutex::new((Status::Connecting, Instant::now())), flips: AtomicU64::new(0), traffic: Traffic::default(), dropped: AtomicU64::new(0), chained: AtomicU64::new(0), hopped: Default::default(), heard: Mutex::new(Instant::now()), attempt: Mutex::default(), warned: Mutex::default(), pinned: Mutex::default(), chain: Mutex::default(), manage: Default::default(), probing: Default::default(), renew: Notify::new()}}
 }
 
 impl State {
@@ -110,6 +113,9 @@ impl State {
 	pub fn warning(&self) -> bool {self.warned.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|at| at.elapsed() < WARNED)}
 
 	pub(super) fn warn(&self, tag: &str) {
+		// A walk sends packets larger than the path on purpose, and says what it found itself.
+		if self.probing.walking.load(Ordering::Relaxed) {return}
+		self.probing.asked.store(true, Ordering::Relaxed);
 		if self.warned.lock().unwrap_or_else(|e| e.into_inner()).replace(Instant::now()).is_none_or(|before| before.elapsed() >= WARNED) {tracing::info!("link {tag}: the system refused an outer packet of the link for its size, so the link's mtu is likely too high for the path between the two nodes. Full-size packets are lost until it is lowered on both nodes. The warning clears {}s after the last such report", WARNED.as_secs())}
 	}
 
@@ -140,10 +146,17 @@ impl State {
 
 impl Shared {
 	/// Once a second: holds every link's state against its tunnel and says each change, "logged at info with the link's tag, and counted". Nothing is latched: a link is up again the moment its tunnel has a handshake, with no action by anyone.
-	pub(super) fn check_links(&self) {
+	pub(super) fn check_links(self: &Arc<Self>) {
 		let plan = self.plan();
 		for (at, link) in plan.links.iter().enumerate().filter(|(_, link)| matches!(link.carrier, plan::Carrier::Paired)) {
 			let (state, now, up) = (&link.state, Instant::now(), plan.up(at));
+			// "Up" for two seconds before the first walk, so the other node has the session too; then every `linkmtu::EVERY`, and at once when the size warning asks, at most once in `linkmtu::GAP`.
+			let (was, since) = state.status();
+			let walked = *state.probing.walked.lock().unwrap_or_else(|e| e.into_inner());
+			if up && was == Status::Up && since >= Duration::from_secs(2) && walked.is_none_or(|at| at.elapsed() >= linkmtu::EVERY || (state.probing.asked.load(Ordering::Relaxed) && at.elapsed() >= linkmtu::GAP)) && !state.probing.walking.swap(true, Ordering::Relaxed) {
+				*state.probing.walked.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+				tokio::spawn(linkmtu::walk(self.clone(), link.id, state.clone()));
+			}
 			let quiet = {
 				let mut heard = state.heard.lock().unwrap_or_else(|e| e.into_inner());
 				if up {*heard = now}
@@ -160,6 +173,8 @@ impl Shared {
 				_ => String::new(),
 			});
 			state.flips.fetch_add(1, Ordering::Relaxed);
+			// A link that comes up again is walked again, whatever the last walk was.
+			if next == Status::Up {*state.probing.walked.lock().unwrap_or_else(|e| e.into_inner()) = None}
 			*status = (next, now);
 		}
 	}

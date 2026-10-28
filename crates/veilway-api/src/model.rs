@@ -828,6 +828,10 @@ pub struct Link {
 	pub candidate_index: Option<usize>,
 	/// The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns.
 	pub size_warning: bool,
+	/// The link's mtu in force: the configured one, lowered to the path MTU the node found by probing inside the link. Never above the configured mtu.
+	pub mtu: u16,
+	/// The largest packet size that crossed the path in both directions at the last walk that found one. Null before one did, and when the other node answers no probes, which an older node does not.
+	pub mtu_found: Option<u16>,
 	/// On the exit half: why this node cut the link off. Null for a link that may run.
 	pub denied: Option<Denied>,
 	/// On the entry half: the exit with a chain backend the link is behind.

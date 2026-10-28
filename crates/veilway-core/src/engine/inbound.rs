@@ -158,13 +158,13 @@ impl Shared {
 		let (inbound, device, mut out) = (&plan.inbounds[to.inbound], &plan.devices[to.device], Vec::new());
 		let link = device.link.map(|link| &plan.links[link]);
 		// "Nothing is fragmented for a link, in either direction. The other node drops fragments", and "both nodes lower the segment size in every TCP opening packet that crosses the link".
-		if link.is_some_and(|link| packet.len() > usize::from(link.mtu)) {
+		if link.is_some_and(|link| packet.len() > usize::from(link.mtu())) {
 			self.count(Reason::TooBig);
 			return 0;
 		}
 		let clamped = link.and_then(|link| netstack::parse(packet).filter(|parsed| parsed.protocol == Protocol::TCP).map(|parsed| {
 			let mut raw = packet.to_vec();
-			chain::clamp(&mut raw, &parsed, link.mtu);
+			chain::clamp(&mut raw, &parsed, link.mtu());
 			raw
 		}));
 		let packet = clamped.as_deref().unwrap_or(packet);
@@ -271,6 +271,8 @@ impl Shared {
 		let linked = plan.link_of(at, &peer);
 		// Management through the link, before the entry half's early return and every rule: see `manage`.
 		if let Some(link) = linked.filter(|link| plan.links[*link].manage.is_some()) {if self.manage_ingress(plan, link, &raw).await {return}}
+		// Size probes of the link, answered or matched before anything else looks at them: see `linkmtu`.
+		if let Some(link) = linked {if self.probe_ingress(plan, link, &raw).await {return}}
 		if let Some(link) = linked.filter(|link| plan.links[*link].entry) {return self.chain_back(plan, link, raw).await}
 		// A device this plan does not know was cut off between its packet being decrypted and now, and so was a link.
 		let Some(device) = linked.map_or_else(|| plan.by_key.get(&peer).copied(), |link| plan.links[link].device) else {return self.count(Reason::Stale)};
@@ -287,7 +289,7 @@ impl Shared {
 			if let Some(link) = linked {plan.links[link].state.dropped.fetch_add(1, Ordering::Relaxed);}
 			return self.count(Reason::SpoofedSource);
 		}
-		if let Some(link) = linked {chain::clamp(&mut raw, &packet, plan.links[link].mtu)}
+		if let Some(link) = linked {chain::clamp(&mut raw, &packet, plan.links[link].mtu())}
 		let transport = packet.protocol == Protocol::TCP || packet.protocol == Protocol::UDP;
 		let gateway = plan.is_gateway(packet.dst);
 		let dns = linked.is_none() && packet.dport == 53 && transport && (gateway || plan.hijack);

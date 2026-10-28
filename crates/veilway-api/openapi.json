@@ -996,6 +996,23 @@
             "$ref": "#/components/schemas/Management",
             "description": "What the management connections of the link count. All zero on a link that is not managed."
           },
+          "mtu": {
+            "description": "The link's mtu in force: the configured one, lowered to the path MTU the node found by probing inside the link. Never above the configured mtu.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mtu_found": {
+            "description": "The largest packet size that crossed the path in both directions at the last walk that found one. Null before one did, and when the other node answers no probes, which an older node does not.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "role": {
             "$ref": "#/components/schemas/LinkRole"
           },
@@ -1058,6 +1075,8 @@
           "transport_index",
           "candidate_index",
           "size_warning",
+          "mtu",
+          "mtu_found",
           "denied",
           "exit",
           "flows",

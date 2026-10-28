@@ -11,6 +11,7 @@ mod host;
 pub mod hostaddrs;
 pub mod icmp;
 mod inbound;
+mod linkmtu;
 pub mod l3;
 pub mod limits;
 pub mod link;
@@ -193,6 +194,10 @@ pub struct LinkReport {
 	pub chained: u64,
 	pub flips: u64,
 	pub warning: bool,
+	/// The link's `mtu` in force: the configured one, lowered by the path MTU found by probing.
+	pub mtu: u16,
+	/// The largest size that passed a probe in both directions at the last walk that found one. None before one did, and when the other node answers none.
+	pub mtu_found: Option<u16>,
 	/// What the management connections of the link count.
 	pub management: manage::Totals,
 	/// On the exit half: a link this node cut off for its quota or its expiry.
@@ -706,7 +711,7 @@ impl Engine {
 					Some(veilway_proto::subscription::payload::Transport::Tls(_)) => "tls",
 					_ => "ws",
 				}, transport, candidate)),
-				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), chained: link.state.chained.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), management: link.state.manage.totals(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
+				flows: link::flows(&self.shared, &plan, at), traffic: link.state.traffic.totals(), dropped: link.state.dropped.load(Ordering::Relaxed), chained: link.state.chained.load(Ordering::Relaxed), flips: link.state.flips.load(Ordering::Relaxed), warning: link.state.warning(), mtu: link.mtu(), mtu_found: link.state.probing.found(link.mtu), management: link.state.manage.totals(), denied: link.denied, exit: link.exit.map(|exit| plan.exits[exit].tag.clone()),
 			}
 		}).collect()
 	}

@@ -393,8 +393,8 @@ pub struct Link {
 }
 
 impl Link {
-	/// The largest packet the link carries. For an upstream it is the profile's, lowered by what the engine found.
-	pub fn mtu(&self) -> u16 {if let Carrier::Upstream(upstream) = &self.carrier {upstream.mtu()} else {self.mtu}}
+	/// The largest packet the link carries. For an upstream it is the profile's, lowered by what the engine found. For a node link it is the configured `mtu`, lowered by the path MTU that probing found (`linkmtu`).
+	pub fn mtu(&self) -> u16 {if let Carrier::Upstream(upstream) = &self.carrier {upstream.mtu()} else {self.state.probing.effective(self.mtu)}}
 
 	/// The entry's address in the link for one family: what a packet into the link is sent from.
 	pub fn address(&self, v4: bool) -> Option<IpAddr> {
@@ -842,7 +842,7 @@ impl Plan {
 	pub fn exit_of(&self, device: usize) -> usize {self.exit_with(device, self.devices[device].control.selected().as_deref())}
 
 	/// The largest packet the tunnel of an inbound carries to a device: the inbound's `mtu`, or what the device set on the control channel when that is less.
-	pub fn mtu_of(&self, to: Holder) -> u16 {self.devices[to.device].control.mtu().map_or(self.inbounds[to.inbound].mtu, |mtu| mtu.min(self.inbounds[to.inbound].mtu)).min(self.devices[to.device].link.map_or(u16::MAX, |link| self.links[link].mtu))}
+	pub fn mtu_of(&self, to: Holder) -> u16 {self.devices[to.device].control.mtu().map_or(self.inbounds[to.inbound].mtu, |mtu| mtu.min(self.inbounds[to.inbound].mtu)).min(self.devices[to.device].link.map_or(u16::MAX, |link| self.links[link].mtu()))}
 
 	/// The link a packet belongs to that came out of the tunnel of inbound `at` under the key `peer`: the link that tunnel was made for, or the link this node is dialled for under that key through that inbound.
 	pub fn link_of(&self, at: usize, peer: &[u8; 32]) -> Option<usize> {self.inbounds[at].link.or_else(|| self.by_link.get(peer).copied().filter(|link| self.links[*link].inbound == at))}

@@ -751,6 +751,16 @@ export interface components {
             manage: components["schemas"]["LinkManage"] | null;
             /** @description What the management connections of the link count. All zero on a link that is not managed. */
             management: components["schemas"]["Management"];
+            /**
+             * Format: uint16
+             * @description The link's mtu in force: the configured one, lowered to the path MTU the node found by probing inside the link. Never above the configured mtu.
+             */
+            mtu: number;
+            /**
+             * Format: uint16
+             * @description The largest packet size that crossed the path in both directions at the last walk that found one. Null before one did, and when the other node answers no probes, which an older node does not.
+             */
+            mtu_found: number | null;
             role: components["schemas"]["LinkRole"];
             /** @description The system refused an outer packet of the link for its size within the last 600 seconds, which suggests the link's mtu is too high for the path. Anyone on the path can forge such a report, so it only warns. */
             size_warning: boolean;

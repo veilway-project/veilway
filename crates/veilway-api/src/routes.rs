@@ -559,7 +559,7 @@ async fn links(State(api): State<Arc<Api>>) -> Response {
 			_ => model::Transport::Ws,
 		}),
 		transport_index: link.transport.map(|(_, at, _)| at), candidate_index: link.transport.map(|(.., candidate)| candidate),
-		size_warning: link.warning,
+		size_warning: link.warning, mtu: link.mtu, mtu_found: link.mtu_found,
 		denied: link.denied.map(|denied| match denied {
 			Denied::Disabled => model::Denied::Disabled,
 			Denied::Expired => model::Denied::Expired,
