@@ -743,7 +743,7 @@ prepare_node_dir() {
 }
 
 install_node() {
-	local inbound key port p
+	local inbound key tkey cookie path port p
 	step "node"
 	ensure_user veilway "$STATE_DIR"
 	act install -d -m 0750 -o veilway -g veilway "$STATE_DIR"
@@ -756,21 +756,22 @@ install_node() {
 	daemon_reload
 	if [ "$DRY" = 1 ]; then
 		dry "write $CONF_DIR/config.example.json from the release tag"
-		dry "write $NODE_DIR/config.json if there is none: one udp-obfs inbound on a random free UDP port with a new key, and one direct exit"
+		if [ "${1:-}" = both ] && [ -n "$WEB" ]; then dry "write $NODE_DIR/config.json if there is none: one tls inbound (self-signed, the plain site as its decoy) on a random free TCP port with new keys, and one direct exit"; else dry "write $NODE_DIR/config.json if there is none: no inbound, and one direct exit"; fi
 	else
 		tag="$(installed_version node)"
 		if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "$RAW_BASE/$CORE_REPO/${tag:-main}/config.example.json" 2>/dev/null; then
 			step "wrote $CONF_DIR/config.example.json"
 		fi
-		# A node needs a config to run, and the panel needs a running node to change it, so a fresh install starts with one working inbound (a veilway inbound with a udp-obfs transport, in the panel's default device pool) and no users. The port is random, never WireGuard's well-known 51820, which a censor may watch. Without a key or a free port it starts with no inbound.
+		# A node needs a config to run, and the panel needs a running node to change it. When the web server is set up with it (install both with a domain or --no-domain), a fresh install starts with one working inbound: a veilway inbound with a tls transport on a random free TCP port, a self-signed certificate the apps check by its pin, and the plain site on 127.0.0.1 as its decoy, in the panel's default device pool, with no users. Never a UDP transport: UDP to an odd port is easy to spot. A node alone has no decoy page, so it starts with no inbound, and so does one without a key or a free port.
 		if [ ! -e "$NODE_DIR/config.json" ]; then
 			inbound=""
-			key="$("$BIN_DIR/veilway" genkey 2>/dev/null | sed -n 's/^private_key: *//p')"
-			port=""
-			for p in $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)); do
-				if ! has ss || [ -z "$(ss -H -lun "sport = :$p" 2>/dev/null)" ]; then port="$p"; break; fi
+			key=""; tkey=""; port=""
+			[ "${1:-}" = both ] && [ -n "$WEB" ] && key="$("$BIN_DIR/veilway" genkey 2>/dev/null | sed -n 's/^private_key: *//p')" && tkey="$("$BIN_DIR/veilway" genkey --transport 2>/dev/null | sed -n 's/^transport_key: *//p')"
+			cookie="$(od -An -N5 -tx1 /dev/urandom | tr -d ' \n')"; path="/$(od -An -N10 -tx1 /dev/urandom | tr -d ' \n')"
+			[ -n "$key" ] && [ -n "$tkey" ] && for p in $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)); do
+				if ! has ss || [ -z "$(ss -H -ltn "sport = :$p" 2>/dev/null)" ]; then port="$p"; break; fi
 			done
-			if [ -n "$key" ] && [ -n "$port" ]; then inbound="{\"tag\": \"main\", \"type\": \"veilway\", \"private_key\": \"$key\", \"address\": [\"10.66.0.1/16\"], \"transports\": [{\"type\": \"udp-obfs\", \"listen\": \"0.0.0.0:$port\"}]}"; fi
+			if [ -n "$port" ] && [ ${#cookie} = 10 ] && [ ${#path} = 21 ]; then inbound="{\"tag\": \"main\", \"type\": \"veilway\", \"private_key\": \"$key\", \"address\": [\"10.66.0.1/16\"], \"transport_keys\": [\"$tkey\"], \"upgrade_cookie\": \"$cookie\", \"transports\": [{\"type\": \"tls\", \"listen\": \"0.0.0.0:$port\", \"path\": \"$path\", \"tls\": {\"self_signed\": true}, \"decoy\": {\"origin\": \"http://127.0.0.1:$DECOY_PORT\"}}]}"; fi
 			( umask 077; as_node_user tee "$NODE_DIR/config.json" >/dev/null ) <<EOF
 {
 	"version": 1,
@@ -786,8 +787,8 @@ install_node() {
 }
 EOF
 			if [ -n "$inbound" ]; then
-				step "wrote $NODE_DIR/config.json: inbound main on UDP port $port (udp-obfs)"
-				if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow the node's port (sudo ufw allow $port/udp) or devices cannot connect"; fi
+				step "wrote $NODE_DIR/config.json: inbound main on TCP port $port (tls, self-signed)"
+				if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow the node's port (sudo ufw allow $port/tcp) or devices cannot connect"; fi
 			else step "wrote $NODE_DIR/config.json: no inbound yet, add one in the panel"; fi
 		fi
 		chown -h veilway:veilway "$NODE_DIR/config.json"
@@ -1198,7 +1199,7 @@ do_install() {
 	case "$what" in
 		node) install_node ;;
 		panel) install_panel ;;
-		both) install_node; install_panel both ;;
+		both) install_node both; install_panel both ;;
 		mirror) install_mirror ;;
 	esac
 	[ "$what" != node ] || [ "$DRY" = 1 ] || info "to let a panel manage this node, run: sudo -u veilway $BIN_DIR/veilway link answer --config $NODE_DIR/config.json --tag panel --apply=/run/veilway/control.sock"
