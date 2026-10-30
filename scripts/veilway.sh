@@ -743,6 +743,7 @@ prepare_node_dir() {
 }
 
 install_node() {
+	local inbound key port p
 	step "node"
 	ensure_user veilway "$STATE_DIR"
 	act install -d -m 0750 -o veilway -g veilway "$STATE_DIR"
@@ -755,19 +756,26 @@ install_node() {
 	daemon_reload
 	if [ "$DRY" = 1 ]; then
 		dry "write $CONF_DIR/config.example.json from the release tag"
-		dry "write $NODE_DIR/config.json if there is none: no inbound and one direct exit, for the panel to fill in"
+		dry "write $NODE_DIR/config.json if there is none: one udp-obfs inbound on a random free UDP port with a new key, and one direct exit"
 	else
 		tag="$(installed_version node)"
 		if [ ! -f "$CONF_DIR/config.example.json" ] && curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -o "$CONF_DIR/config.example.json" "$RAW_BASE/$CORE_REPO/${tag:-main}/config.example.json" 2>/dev/null; then
 			step "wrote $CONF_DIR/config.example.json"
 		fi
-		# A node needs a config to run, and the panel needs a running node to change it, so a fresh install starts with a node that has no inbound.
+		# A node needs a config to run, and the panel needs a running node to change it, so a fresh install starts with one working inbound (a veilway inbound with a udp-obfs transport, in the panel's default device pool) and no users. The port is random, never WireGuard's well-known 51820, which a censor may watch. Without a key or a free port it starts with no inbound.
 		if [ ! -e "$NODE_DIR/config.json" ]; then
-			( umask 077; as_node_user tee "$NODE_DIR/config.json" >/dev/null ) <<'EOF'
+			inbound=""
+			key="$("$BIN_DIR/veilway" genkey 2>/dev/null | sed -n 's/^private_key: *//p')"
+			port=""
+			for p in $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)) $((RANDOM % 30000 + 20000)); do
+				if ! has ss || [ -z "$(ss -H -lun "sport = :$p" 2>/dev/null)" ]; then port="$p"; break; fi
+			done
+			if [ -n "$key" ] && [ -n "$port" ]; then inbound="{\"tag\": \"main\", \"type\": \"veilway\", \"private_key\": \"$key\", \"address\": [\"10.66.0.1/16\"], \"transports\": [{\"type\": \"udp-obfs\", \"listen\": \"0.0.0.0:$port\"}]}"; fi
+			( umask 077; as_node_user tee "$NODE_DIR/config.json" >/dev/null ) <<EOF
 {
 	"version": 1,
 	"dns": {"servers": ["1.1.1.1:53", "[2606:4700:4700::1111]:53"]},
-	"inbounds": [],
+	"inbounds": [$inbound],
 	"users": [],
 	"outbounds": [{"tag": "plain", "type": "direct"}],
 	"exits": [{"tag": "main", "name": "This server", "backend": {"type": "netstack", "outbound": "plain"}}],
@@ -777,7 +785,10 @@ install_node() {
 	]}
 }
 EOF
-			step "wrote $NODE_DIR/config.json: no inbound yet, add one in the panel"
+			if [ -n "$inbound" ]; then
+				step "wrote $NODE_DIR/config.json: inbound main on UDP port $port (udp-obfs)"
+				if has ufw && ufw status 2>/dev/null | grep -q "Status: active"; then warn "ufw is active: allow the node's port (sudo ufw allow $port/udp) or devices cannot connect"; fi
+			else step "wrote $NODE_DIR/config.json: no inbound yet, add one in the panel"; fi
 		fi
 		chown -h veilway:veilway "$NODE_DIR/config.json"
 		as_node_user chmod 0600 "$NODE_DIR/config.json"
@@ -936,6 +947,7 @@ do_panel_update_request() {
 }
 
 install_panel() {
+	local sub first=()
 	step "panel"
 	ensure_user veilway "$STATE_DIR"
 	ensure_user veilway-panel "$PANEL_DIR"
@@ -948,6 +960,15 @@ install_panel() {
 	install_self
 	daemon_reload
 	[ -z "$DOMAIN" ] && [ "$NO_DOMAIN" = 0 ] || web_setup
+	# The panel stores these only where it has nothing yet, so a re-run never replaces what the operator set. The node address only goes in when the node is on this server, and the pin only for the self-signed endpoint on an IP address.
+	if [ "$DRY" = 1 ]; then dry "fill the panel's node address and endpoint main from this install, where the panel has none"
+	else
+		sub="$(sed -n 's/.*"sub_path": *"\([^"]*\)".*/\1/p' "$CONF_DIR/panel.json")"
+		[ -z "$HTTPS_HOST" ] || first=(--endpoint-url "https://$HTTPS_HOST${sub:-/sub}/main")
+		[ -z "$HTTPS_HOST" ] || [ "$NO_DOMAIN" = 0 ] || first+=(--endpoint-pin "$(web_state pin)")
+		[ "${1:-}" != both ] || [ -z "${DOMAIN:-$PUBLIC_IP}" ] || first+=(--node-host "${DOMAIN:-$PUBLIC_IP}")
+		if [ "${#first[@]}" -gt 0 ]; then as_panel_user "$BIN_DIR/veilway-panel" first-run --config "$CONF_DIR/panel.json" "${first[@]}" || warn "the panel did not take its node address and endpoint: add them under Settings (a panel older than the release that has first-run cannot)"; fi
+	fi
 	svc enable veilway-panel.service
 	svc enable veilway-panel-update.path
 	svc start veilway-panel-update.path
@@ -1177,7 +1198,7 @@ do_install() {
 	case "$what" in
 		node) install_node ;;
 		panel) install_panel ;;
-		both) install_node; install_panel ;;
+		both) install_node; install_panel both ;;
 		mirror) install_mirror ;;
 	esac
 	[ "$what" != node ] || [ "$DRY" = 1 ] || info "to let a panel manage this node, run: sudo -u veilway $BIN_DIR/veilway link answer --config $NODE_DIR/config.json --tag panel --apply=/run/veilway/control.sock"
@@ -2020,6 +2041,7 @@ web_free_https() {
 	fi
 	web_note node_moved "$HTTPS_PORT $move_to"
 	step "moved the node's TCP transports from $HTTPS_PORT to $move_to"
+	warn "profiles that name port $HTTPS_PORT stop working until you press Publish in the panel's Profiles page (the node's TCP transports are on $move_to now)"
 }
 
 # Written once and never over an edit: the operator owns the page. Each server draws its own from these parts (topic, title, entries, dates, type and colors), so no two serve the same text or bytes and a search for one page finds one server. A page of the operator's own is still the better cover.
