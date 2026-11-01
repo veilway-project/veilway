@@ -196,6 +196,11 @@ pub fn check_install_dir() -> io::Result<()> {
 	// SAFETY: the token is open and the buffer is a live struct of the size passed.
 	if unsafe {GetTokenInformation(token.0, TokenElevation, (&mut elevation as *mut TOKEN_ELEVATION).cast(), std::mem::size_of::<TOKEN_ELEVATION>() as u32, &mut returned)} == 0 {return Err(io::Error::last_os_error())}
 	if elevation.TokenIsElevated == 0 {return Ok(())}
+	install_dir_safe()
+}
+
+/// The check of `check_install_dir` without the elevation test, so a window without rights can tell before the prompt why a helper would refuse.
+pub fn install_dir_safe() -> io::Result<()> {
 	let exe = std::env::current_exe()?;
 	let dir = exe.parent().ok_or_else(|| io::Error::other("the program has no folder"))?;
 	let (owner, aces) = security(dir)?;

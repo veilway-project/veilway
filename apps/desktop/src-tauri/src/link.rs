@@ -130,7 +130,7 @@ fn run_as(exe: &str, arguments: &str) -> std::io::Result<()> {
 	Ok(())
 }
 
-/// Asks the system for administrator rights once and starts `exe --helper --dir <dir>` with them. The child, when there is one, is the prompt (macOS) or the parent of the helper (Linux); on Windows the prompt returns at once.
+/// Asks the system for administrator rights once and starts `exe --helper --dir <dir>` with them. The child, when there is one, is the prompt (macOS) or the parent of the helper (Linux); on Windows the prompt returns at once, after the install folder is checked here so a helper that would refuse it is never asked for.
 pub fn elevate(exe: &Path, dir: &Path) -> std::io::Result<Option<Child>> {
 	let (exe, dir) = (plain_path(exe)?, plain_path(dir)?);
 	#[cfg(target_os = "linux")]
@@ -139,6 +139,7 @@ pub fn elevate(exe: &Path, dir: &Path) -> std::io::Result<Option<Child>> {
 	return Command::new("osascript").args(["-e", &format!("do shell script \"'{exe}' --helper --dir '{dir}' --uid {} >/dev/null 2>&1 &\" with administrator privileges", unsafe {libc::getuid()})]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(Some);
 	#[cfg(windows)]
 	{
+		veilway_windows::state::install_dir_safe()?;
 		run_as(exe, &format!("--helper --dir \"{dir}\" --sid {}", user_sid()?))?;
 		Ok(None)
 	}
@@ -184,7 +185,7 @@ impl Backend {
 				child = None;
 			}
 		}
-		Err("The helper did not start in time.".into())
+		Err("The helper did not start in time. If the administrator prompt was allowed, security software may have stopped it.".into())
 	}
 
 	pub async fn call(&self, call: Call) -> Result<Value, String> {
