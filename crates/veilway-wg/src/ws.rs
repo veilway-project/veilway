@@ -127,8 +127,10 @@ pub fn acceptor(tls:&TlsFiles)->anyhow::Result<Acceptor>{Ok(load(tls)?.0)}
 /// One listener for several tunnels: `routes` maps each request path to the UDP endpoint its frames are forwarded to.
 /// The certificate is loaded before this returns, so a bad file fails the caller instead of a background task.
 pub fn relay(listener:TcpListener, tls:Option<TlsFiles>, routes:Vec<(String, SocketAddr)>, max_conns:usize, stats:Arc<Stats>)->anyhow::Result<impl std::future::Future<Output=()>+Send+'static>{
-	let acceptor=tls.as_ref().map(|files| acceptor(files).map_err(|e| e.context(format!("tls files {} and {}", files.cert.display(), files.key.display())))).transpose()?;
-	info!(listen=%listener.local_addr()?, paths=?routes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), tls=acceptor.is_some(), max_conns, "relay listening");
+	let loaded=tls.as_ref().map(|files| load(files).map_err(|e| anyhow::Error::from(e).context(format!("tls files {} and {}", files.cert.display(), files.key.display())))).transpose()?;
+	let pin=loaded.as_ref().and_then(|(_, certs)| pin(&certs[0]).ok()).map(|p| crate::encode_key(&p));
+	let acceptor=loaded.map(|(acceptor, _)| acceptor);
+	info!(listen=%listener.local_addr()?, paths=?routes.iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), tls=acceptor.is_some(), pin=pin.as_deref().unwrap_or("-"), max_conns, "relay listening");
 	let (keep, served)=watch::channel(Arc::new(Served{acceptor, routes:routes.into_iter().map(|(path, target)| Route{path, target, id:0}).collect()}));
 	let serving=relay_served(listener, served, max_conns, stats);
 	Ok(async move{
@@ -256,28 +258,54 @@ where S:AsyncRead+AsyncWrite+Unpin{
 	Ok(())
 }
 
+/// How the client checks a `wss` relay's certificate. A `ws` URL has no certificate, so only `Roots` goes with one.
+#[derive(Clone, Debug)]
+pub enum Trust{
+	/// The chain leads to a webpki root and is valid for the URL's host now.
+	Roots,
+	/// The SHA-256 of the leaf's public key (SubjectPublicKeyInfo) is one of these, and TLS 1.3 was negotiated. The chain, the name and the dates are not looked at, so a self-signed relay passes; the handshake's signature is still verified under the pinned key, so a server that shows the certificate without holding its key fails.
+	Pins(Vec<[u8;32]>),
+	/// Any certificate. For self-signed testing only.
+	Insecure,
+}
+
+/// The pin of a certificate: the SHA-256 of its public key, what [`Trust::Pins`] holds and what `bridge relay` logs at start.
+pub fn pin(cert:&CertificateDer<'_>)->Result<[u8;32], rustls::Error>{
+	let key=rustls::server::ParsedCertificate::try_from(cert)?.subject_public_key_info();
+	Ok(ring::digest::digest(&ring::digest::SHA256, key.as_ref()).as_ref().try_into().unwrap_or_default())
+}
+
 /// Listen on `listen` (UDP); each local source address gets one WS connection to `url` (lazy, reconnecting).
-pub async fn run_client(listen:SocketAddr, url:String, insecure:bool)->anyhow::Result<()>{
-	run_client_on(UdpSocket::bind(listen).await?, url, insecure).await
+pub async fn run_client(listen:SocketAddr, url:String, trust:Trust)->anyhow::Result<()>{
+	run_client_on(UdpSocket::bind(listen).await?, url, trust).await
 }
 
 /// Same as [`run_client`] but on an already bound socket, so callers can pick an ephemeral port and know it.
-pub async fn run_client_on(sock:UdpSocket, url:String, insecure:bool)->anyhow::Result<()>{
-	run_client_to(sock, url, insecure, None).await
+pub async fn run_client_on(sock:UdpSocket, url:String, trust:Trust)->anyhow::Result<()>{
+	run_client_to(sock, url, trust, None).await
 }
 
 /// Same as [`run_client_on`] but dialing an already resolved address, for callers whose DNS is
 /// unusable by connect time (the Windows client installs a tunnel NRPT rule before the tunnel is up).
 /// TLS SNI and the HTTP Host header still come from `url`, so only the A/AAAA lookup is skipped.
-pub async fn run_client_to(sock:UdpSocket, url:String, insecure:bool, addr:Option<SocketAddr>)->anyhow::Result<()>{
+pub async fn run_client_to(sock:UdpSocket, url:String, trust:Trust, addr:Option<SocketAddr>)->anyhow::Result<()>{
 	let _=rustls::crypto::ring::default_provider().install_default();
-	let connector=Some(Connector::Rustls(Arc::new(if insecure{
-		rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth()
-	}else{
-		rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore{roots:webpki_roots::TLS_SERVER_ROOTS.to_vec()}).with_no_client_auth()
+	// A pin on a plain ws URL would check nothing, so it is refused rather than ignored.
+	if matches!(&trust, Trust::Pins(pins) if pins.is_empty() || !url.to_ascii_lowercase().starts_with("wss://")){anyhow::bail!("a pin needs a wss:// URL and at least one pin")}
+	let connector=Some(Connector::Rustls(Arc::new(match &trust{
+		Trust::Roots=>rustls::ClientConfig::builder().with_root_certificates(rustls::RootCertStore{roots:webpki_roots::TLS_SERVER_ROOTS.to_vec()}).with_no_client_auth(),
+		Trust::Pins(pins)=>{
+			let provider=Arc::new(rustls::crypto::ring::default_provider());
+			let algorithms=provider.signature_verification_algorithms;
+			let mut cfg=rustls::ClientConfig::builder_with_provider(provider).with_protocol_versions(&[&rustls::version::TLS13])?.dangerous().with_custom_certificate_verifier(Arc::new(Pinned{pins:pins.clone(), algorithms})).with_no_client_auth();
+			// No resumed session, so every connection shows its certificate to the check.
+			(cfg.enable_early_data, cfg.resumption)=(false, rustls::client::Resumption::disabled());
+			cfg
+		}
+		Trust::Insecure=>rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(NoVerify)).with_no_client_auth(),
 	})));
 	let sock=Arc::new(sock);
-	info!(listen=%sock.local_addr()?, %url, insecure, dial=?addr, "bridge listening");
+	info!(listen=%sock.local_addr()?, %url, trust=match &trust{Trust::Roots=>"roots", Trust::Pins(_)=>"pins", Trust::Insecure=>"insecure"}, dial=?addr, "bridge listening");
 	let (mut peers, mut buf)=(HashMap::<SocketAddr, mpsc::Sender<Bytes>>::new(), [0u8; MAX_DATAGRAM]);
 	let mut sweep=tokio::time::interval(Duration::from_secs(60));
 	loop{
@@ -355,6 +383,29 @@ async fn client_peer(sock:Arc<UdpSocket>, peer:SocketAddr, url:String, connector
 		tokio::time::sleep(backoff).await;
 		backoff=(backoff*2).min(BACKOFF_MAX);
 	}
+}
+
+const UNPINNED:rustls::Error=rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure);
+
+/// The leaf's public key, when its SHA-256 is one of the pins.
+fn pinned_key(cert:&CertificateDer<'_>, pins:&[[u8;32]])->Result<rustls::pki_types::SubjectPublicKeyInfoDer<'static>, rustls::Error>{
+	let key=rustls::server::ParsedCertificate::try_from(cert)?.subject_public_key_info();
+	if pins.iter().any(|p| p==ring::digest::digest(&ring::digest::SHA256, key.as_ref()).as_ref()){Ok(key)}else{Err(UNPINNED)}
+}
+
+/// [`Trust::Pins`]: the pin and the TLS 1.3 signature under the pinned key, nothing of the chain, the name or the dates. TLS 1.2 is never offered.
+#[derive(Debug)]
+struct Pinned{pins:Vec<[u8;32]>, algorithms:rustls::crypto::WebPkiSupportedAlgorithms}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned{
+	fn verify_server_cert(&self, e:&CertificateDer<'_>, _i:&[CertificateDer<'_>], _n:&rustls::pki_types::ServerName<'_>, _o:&[u8], _t:rustls::pki_types::UnixTime)->Result<rustls::client::danger::ServerCertVerified, rustls::Error>{
+		pinned_key(e, &self.pins).map(|_| rustls::client::danger::ServerCertVerified::assertion())
+	}
+	fn verify_tls12_signature(&self, _m:&[u8], _c:&CertificateDer<'_>, _d:&rustls::DigitallySignedStruct)->Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>{Err(UNPINNED)}
+	fn verify_tls13_signature(&self, m:&[u8], c:&CertificateDer<'_>, d:&rustls::DigitallySignedStruct)->Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>{
+		rustls::crypto::verify_tls13_signature_with_raw_key(m, &pinned_key(c, &self.pins)?, d, &self.algorithms)
+	}
+	fn supported_verify_schemes(&self)->Vec<rustls::SignatureScheme>{self.algorithms.supported_schemes()}
 }
 
 /// Accepts any server certificate. Only reachable through `--insecure`, for self-signed testing.

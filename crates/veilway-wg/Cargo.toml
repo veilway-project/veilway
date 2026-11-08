@@ -21,6 +21,7 @@ tokio-tungstenite.workspace=true
 tokio-rustls.workspace=true
 rustls.workspace=true
 webpki-roots.workspace=true
+ring.workspace=true
 
 [dev-dependencies]
 rcgen.workspace=true

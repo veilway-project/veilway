@@ -618,7 +618,7 @@ async fn tcp_reaches_the_responder_over_the_ws_relay(){
 	let node=launch(setup).await;
 	let bridge=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let bridge_addr=bridge.local_addr().unwrap();
-	tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{}/wg", node.addr), false));
+	tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{}/wg", node.addr), veilway_wg::ws::Trust::Roots));
 	let mut client=Client::connect(node.keys[0], node.public, bridge_addr).await;
 	handshake(&mut client, [93, 184, 216, 34], 40006, 80).await;
 	let mut got=Vec::new();
@@ -976,7 +976,7 @@ async fn a_rule_by_transport_follows_the_session_a_flow_began_on_and_the_flow_ke
 	let bridge=||async{
 		let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let at=socket.local_addr().unwrap();
-		tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), false));
+		tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots));
 		at
 	};
 	let mut by_udp=Client::connect(node.keys[0], node.public, node.addr).await;
@@ -1309,7 +1309,7 @@ async fn two_inbounds_share_one_ws_address_with_different_paths(){
 	for path in ["/home", "/office", "/elsewhere"]{
 		let bridge=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		bridges.push(bridge.local_addr().unwrap());
-		tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{shared}{path}"), false));
+		tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{shared}{path}"), veilway_wg::ws::Trust::Roots));
 	}
 	let office_public=veilway_wg::public_key(&office);
 	let mut a=Client::connect(node.keys[0], node.public, bridges[0]).await;
@@ -1403,7 +1403,7 @@ async fn tunnel_dns_follows_a_rule_by_transport(){
 	assert_eq!((seen_first.lock().unwrap().len(), seen_second.lock().unwrap().len()), (1, 0), "a query over udp did not leave by the default exit");
 	let socket=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let bridge=socket.local_addr().unwrap();
-	tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), false));
+	tokio::spawn(veilway_wg::ws::run_client_on(socket, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots));
 	let mut by_ws=Client::connect(node.keys[1], node.public, bridge).await;
 	by_ws.send_ip(&ip_udp(PEER_B, [9, 9, 9, 9], 41151, 53, &dns_query(0x1235, "example.com", 1))).await;
 	assert!(by_ws.recv_ip(Duration::from_secs(5)).await.is_some(), "no dns reply over ws");
@@ -2603,7 +2603,7 @@ async fn a_transport_added_by_a_reload_serves_and_a_removed_one_stops(){
 	assert_eq!(first.say(&mut a, b"same session").await, Answer::Accepted, "adding a transport disturbed a session over another");
 	let bridge=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let bridged=bridge.local_addr().unwrap();
-	tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{relay}/wg"), false));
+	tokio::spawn(veilway_wg::ws::run_client_on(bridge, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots));
 	let mut over_ws=Client::connect(node.keys[0], node.public, bridged).await;
 	let mut third=Flow::open(&mut over_ws, PEER_A, OTHER, 42092, 80).await;
 	assert_eq!(third.say(&mut over_ws, b"over ws").await, Answer::Accepted);

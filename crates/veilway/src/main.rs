@@ -250,6 +250,8 @@ enum Bridge {
 		#[arg(long)] url: String,
 		/// Skip TLS certificate verification, for self-signed testing only
 		#[arg(long)] insecure: bool,
+		/// Accept the wss relay by the SHA-256 of its certificate's public key (base64, logged by `bridge relay` at start) instead of a certificate authority, so a self-signed relay works safely. TLS 1.3 only. Repeat it to accept a new key during a change
+		#[arg(long, conflicts_with = "insecure")] pin: Vec<String>,
 	},
 	/// Server side: accept ws/wss on a path and forward datagrams to a local WireGuard endpoint
 	Relay {
@@ -544,9 +546,10 @@ async fn start() -> anyhow::Result<()> {
 			print!("{}", veilway_core::config::schema());
 			Ok(())
 		}
-		Command::Bridge {command: Bridge::Client {listen, url, insecure}} => {
+		Command::Bridge {command: Bridge::Client {listen, url, insecure, pin}} => {
 			tracing_subscriber::fmt().with_env_filter(filter(&bridge)).init();
-			ws::run_client(listen, url, insecure).await
+			let pins = pin.iter().map(|p| veilway_wg::decode_key(p).map_err(|_| anyhow::anyhow!("--pin {p}: expected the base64 of 32 bytes"))).collect::<anyhow::Result<Vec<_>>>()?;
+			ws::run_client(listen, url, if insecure {ws::Trust::Insecure} else if pins.is_empty() {ws::Trust::Roots} else {ws::Trust::Pins(pins)}).await
 		}
 		Command::Bridge {command: Bridge::Relay {listen, path, target, cert, key, max_conns}} => {
 			tracing_subscriber::fmt().with_env_filter(filter(&bridge)).init();

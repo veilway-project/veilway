@@ -136,7 +136,7 @@ impl Tunnel{
 				let bridge=UdpSocket::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))).await?;
 				let local=bridge.local_addr()?;
 				let (url, insecure)=(url.clone(), *insecure);
-				tasks.push(tokio::spawn(async move{if let Err(e)=veilway_wg::ws::run_client_to(bridge, url, insecure, Some(endpoint)).await{tracing::error!("ws bridge stopped: {e}")}}));
+				tasks.push(tokio::spawn(async move{if let Err(e)=veilway_wg::ws::run_client_to(bridge, url, if insecure{veilway_wg::ws::Trust::Insecure}else{veilway_wg::ws::Trust::Roots}, Some(endpoint)).await{tracing::error!("ws bridge stopped: {e}")}}));
 				local
 			}
 			_=>endpoint,

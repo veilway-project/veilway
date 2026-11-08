@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use veilway_wg::ws::{Stats, TlsFiles, MAX_CONNS, MAX_PENDING_PER_SOURCE, UPGRADE_TIMEOUT};
+use veilway_wg::ws::{Stats, TlsFiles, Trust, MAX_CONNS, MAX_PENDING_PER_SOURCE, UPGRADE_TIMEOUT};
 
 /// Bind a UDP echo server that bounces every datagram back to its sender.
 async fn echo_server()->SocketAddr{
@@ -18,7 +18,7 @@ async fn echo_server()->SocketAddr{
 }
 
 /// Bring up echo + relay + bridge and return the bridge's local UDP address.
-async fn stack(tls:Option<TlsFiles>, scheme:&str)->SocketAddr{
+async fn stack(tls:Option<TlsFiles>, scheme:&str, trust:Trust)->SocketAddr{
 	let target=echo_server().await;
 	let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let relay=listener.local_addr().unwrap();
@@ -26,7 +26,7 @@ async fn stack(tls:Option<TlsFiles>, scheme:&str)->SocketAddr{
 	let client=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let addr=client.local_addr().unwrap();
 	let url=format!("{scheme}://127.0.0.1:{}/wg", relay.port());
-	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, url, true).await.unwrap()});
+	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, url, trust).await.unwrap()});
 	addr
 }
 
@@ -48,7 +48,7 @@ fn payloads()->Vec<Vec<u8>>{
 
 #[tokio::test]
 async fn plain_ws_roundtrip(){
-	let bridge=stack(None, "ws").await;
+	let bridge=stack(None, "ws", Trust::Roots).await;
 	let p=payloads();
 	tokio::join!(roundtrip(bridge, &p), roundtrip(bridge, &p));
 }
@@ -61,8 +61,31 @@ async fn tls_roundtrip_with_self_signed_cert(){
 	let (cert, key)=(dir.join("cert.pem"), dir.join("key.pem"));
 	std::fs::write(&cert, ck.cert.pem()).unwrap();
 	std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
-	let bridge=stack(Some(TlsFiles{cert, key}), "wss").await;
+	let bridge=stack(Some(TlsFiles{cert, key}), "wss", Trust::Insecure).await;
 	roundtrip(bridge, &payloads()).await;
+	let _=std::fs::remove_dir_all(&dir);
+}
+
+/// A self-signed relay passes with its pin and with nothing else: a wrong pin carries no datagram, and a pin on a plain ws URL is refused.
+#[tokio::test]
+async fn pinned_self_signed_relay(){
+	let ck=rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+	let dir=std::env::temp_dir().join(format!("veilway-ws-pin-{}", std::process::id()));
+	std::fs::create_dir_all(&dir).unwrap();
+	let (cert, key)=(dir.join("cert.pem"), dir.join("key.pem"));
+	std::fs::write(&cert, ck.cert.pem()).unwrap();
+	std::fs::write(&key, ck.signing_key.serialize_pem()).unwrap();
+	let pin=veilway_wg::ws::pin(ck.cert.der()).unwrap();
+	let bridge=stack(Some(TlsFiles{cert:cert.clone(), key:key.clone()}), "wss", Trust::Pins(vec![[7u8; 32], pin])).await;
+	roundtrip(bridge, &payloads()).await;
+	let bridge=stack(Some(TlsFiles{cert, key}), "wss", Trust::Pins(vec![[7u8; 32]])).await;
+	let sock=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	sock.connect(bridge).await.unwrap();
+	sock.send(b"hello").await.unwrap();
+	let mut buf=[0u8; 64];
+	assert!(tokio::time::timeout(Duration::from_secs(3), sock.recv(&mut buf)).await.is_err(), "a wrong pin carried a datagram");
+	let plain=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	assert!(veilway_wg::ws::run_client_on(plain, "ws://127.0.0.1:1/wg".to_string(), Trust::Pins(vec![pin])).await.is_err());
 	let _=std::fs::remove_dir_all(&dir);
 }
 
@@ -76,7 +99,7 @@ async fn pre_resolved_address_skips_dns(){
 	let bridge=client.local_addr().unwrap();
 	// The host in the url never resolves, so an echo only comes back if the bridge dialled `relay` itself.
 	let url=format!("ws://does-not-resolve.invalid:{}/wg", relay.port());
-	tokio::spawn(async move{veilway_wg::ws::run_client_to(client, url, false, Some(relay)).await.unwrap()});
+	tokio::spawn(async move{veilway_wg::ws::run_client_to(client, url, veilway_wg::ws::Trust::Roots, Some(relay)).await.unwrap()});
 	roundtrip(bridge, &payloads()).await;
 }
 
@@ -94,7 +117,7 @@ async fn silent_connections_do_not_hold_the_relay_forever(){
 	assert_eq!((stats.stalled.load(Ordering::Relaxed), stats.refused.load(Ordering::Relaxed)), (4, 1), "four held a place until the timeout and the fifth found the relay full");
 	let client=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let bridge=client.local_addr().unwrap();
-	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, format!("ws://{relay}/wg"), false).await.unwrap()});
+	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots).await.unwrap()});
 	roundtrip(bridge, &payloads()).await;
 	drop(silent);
 }
@@ -119,6 +142,6 @@ async fn unfinished_upgrades_are_bounded_per_source(){
 	drop(silent);
 	let client=UdpSocket::bind("127.0.0.1:0").await.unwrap();
 	let bridge=client.local_addr().unwrap();
-	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, format!("ws://{relay}/wg"), false).await.unwrap()});
+	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots).await.unwrap()});
 	roundtrip(bridge, &payloads()).await;
 }

@@ -179,7 +179,7 @@ Where UDP is blocked, run the bridge next to the WireGuard app, and set `Endpoin
 veilway bridge client --listen 127.0.0.1:51820 --url wss://vpn.example.com/wg
 ```
 
-`--insecure` skips certificate verification. Use it only to test a self-signed relay.
+For a relay with a self-signed certificate, add `--pin <pin>` with the pin `veilway bridge relay` logs when it starts. The bridge then accepts that certificate's key and nothing else. `--insecure` skips certificate verification. Use it only for testing.
 
 ## Run with Docker
 
