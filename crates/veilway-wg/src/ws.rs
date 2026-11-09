@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use rustls::pki_types::pem::{self, PemObject};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -15,13 +16,17 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Bytes, Message};
-use tokio_tungstenite::Connector;
+use tokio_tungstenite::{Connector, WebSocketStream};
 use tracing::{debug, info, trace, warn};
 
 /// Largest WireGuard datagram we are willing to move in either direction.
 pub const MAX_DATAGRAM:usize=65535;
 const IDLE:Duration=Duration::from_secs(300);
-const PING_EVERY:Duration=Duration::from_secs(30);
+const PING_EVERY:Duration=Duration::from_secs(5);
+/// A connection ends when one write makes no progress, or nothing at all (a pong included) arrives, for this long, so the client dials again.
+const STALL:Duration=Duration::from_secs(15);
+/// Datagrams waiting for the WebSocket write; past this they are dropped, as a lossy link would drop them.
+const WRITE_QUEUE:usize=128;
 const BACKOFF_MIN:Duration=Duration::from_millis(250);
 const BACKOFF_MAX:Duration=Duration::from_secs(8);
 const QUEUE:usize=1024;
@@ -211,7 +216,7 @@ pub fn relay_served(listener:TcpListener, mut served:watch::Receiver<Arc<Served>
 
 /// One accepted transport: handshake on a known path before `deadline`, then pump a private UDP socket against the WS for as long as `served` still holds the route it came in on.
 async fn relay_conn<S>(stream:S, peer:SocketAddr, routes:&[Route], mut served:watch::Receiver<Arc<Served>>, deadline:Instant, pending:Pending)->anyhow::Result<()>
-where S:AsyncRead+AsyncWrite+Unpin{
+where S:AsyncRead+AsyncWrite+Unpin+Send+'static{
 	let mut chosen=None;
 	let ws=tokio::time::timeout_at(deadline, tokio_tungstenite::accept_hdr_async_with_config(stream, |req:&Request, resp:Response|->Result<Response, ErrorResponse>{
 		chosen=routes.iter().find(|route| req.uri().path()==route.path);
@@ -223,15 +228,15 @@ where S:AsyncRead+AsyncWrite+Unpin{
 	let udp=UdpSocket::bind(if target.is_ipv4(){SocketAddr::from((Ipv4Addr::LOCALHOST, 0))}else{SocketAddr::from((Ipv6Addr::LOCALHOST, 0))}).await?;
 	udp.connect(target).await?;
 	info!(%peer, %target, "ws connected");
-	let (mut tx, mut rx)=ws.split();
+	let (tx, mut rx)=ws.split();
+	let out=writer(tx, peer);
 	let mut buf=vec![0u8; MAX_DATAGRAM];
-	let mut ping=tokio::time::interval(PING_EVERY);
-	ping.tick().await;
-	let mut deadline=Instant::now()+IDLE;
+	let (mut deadline, mut heard)=(Instant::now()+IDLE, Instant::now()+STALL);
 	let reason=loop{
 		tokio::select!{
 			msg=rx.next()=>{
-				// tungstenite queues the pong for incoming pings itself, so only binary matters here.
+				// tungstenite queues the pong for incoming pings itself, and any frame, a pong included, shows the path is alive.
+				if let Some(Ok(_))=&msg{heard=Instant::now()+STALL}
 				match msg{
 					None=>break "closed",
 					Some(Err(e))=>{debug!(%peer, error=%e, "ws read failed"); break "error"}
@@ -246,15 +251,15 @@ where S:AsyncRead+AsyncWrite+Unpin{
 			n=udp.recv(&mut buf)=>{
 				let n=match n{Ok(n)=>n, Err(e)=>{warn!(%peer, error=%e, "udp recv failed"); continue}};
 				deadline=Instant::now()+IDLE;
-				tx.send(Message::Binary(Bytes::copy_from_slice(&buf[..n]))).await?;
+				if out.try_send(Bytes::copy_from_slice(&buf[..n])).is_err(){trace!(%peer, "ws write queue full, dropping datagram")}
 			}
-			_=ping.tick()=>tx.send(Message::Ping(Bytes::new())).await?,
+			_=out.closed()=>break "write stalled",
+			_=tokio::time::sleep_until(heard)=>break "no answer",
 			_=tokio::time::sleep_until(deadline)=>break "idle",
 			changed=served.changed()=>if changed.is_err()|| !served.borrow_and_update().routes.contains(route){break "route removed"},
 		}
 	};
 	info!(%peer, reason, "ws disconnected");
-	let _=tx.send(Message::Close(None)).await;
 	Ok(())
 }
 
@@ -349,17 +354,17 @@ async fn client_peer(sock:Arc<UdpSocket>, peer:SocketAddr, url:String, connector
 			Ok((ws, _))=>{
 				backoff=BACKOFF_MIN;
 				info!(%peer, %url, "ws connected");
-				let (mut tx, mut stream)=ws.split();
+				let (tx, mut stream)=ws.split();
+				let (out, mut heard)=(writer(tx, peer), Instant::now()+STALL);
 				let reason=loop{
 					tokio::select!{
 						d=rx.recv()=>{
 							let Some(d)=d else{return};
 							deadline=Instant::now()+IDLE;
-							let n=d.len();
-							if let Err(e)=tx.send(Message::Binary(d)).await{debug!(%peer, error=%e, "ws write failed"); break "write error"}
-							trace!(%peer, n, "frame sent");
+							if out.try_send(d).is_err(){trace!(%peer, "ws write queue full, dropping datagram")}
 						}
 						m=stream.next()=>{
+							if let Some(Ok(_))=&m{heard=Instant::now()+STALL}
 							match m{
 								None=>break "closed",
 								Some(Err(e))=>{debug!(%peer, error=%e, "ws read failed"); break "read error"}
@@ -372,6 +377,8 @@ async fn client_peer(sock:Arc<UdpSocket>, peer:SocketAddr, url:String, connector
 								Some(Ok(_))=>{}
 							}
 						}
+						_=out.closed()=>break "write stalled",
+						_=tokio::time::sleep_until(heard)=>break "no answer",
 						_=tokio::time::sleep_until(deadline)=>{info!(%peer, "idle, dropping mapping"); return}
 					}
 				};
@@ -383,6 +390,29 @@ async fn client_peer(sock:Arc<UdpSocket>, peer:SocketAddr, url:String, connector
 		tokio::time::sleep(backoff).await;
 		backoff=(backoff*2).min(BACKOFF_MAX);
 	}
+}
+
+/// The write half of a bridge connection, in a task of its own behind a bounded queue, so a TCP path that backs up drops datagrams instead of stopping the reader, the UDP side and the ping. The task pings every PING_EVERY and ends when a write makes no progress for STALL, which closes the returned sender; once the sender is dropped it says goodbye with a Close.
+fn writer<S>(mut tx:SplitSink<WebSocketStream<S>, Message>, peer:SocketAddr)->mpsc::Sender<Bytes>
+where S:AsyncRead+AsyncWrite+Unpin+Send+'static{
+	let (out, mut queue)=mpsc::channel::<Bytes>(WRITE_QUEUE);
+	tokio::spawn(async move{
+		let mut ping=tokio::time::interval(PING_EVERY);
+		ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+		loop{
+			let msg=tokio::select!{
+				d=queue.recv()=>match d{Some(d)=>Message::Binary(d), None=>break},
+				_=ping.tick()=>Message::Ping(Bytes::new()),
+			};
+			match tokio::time::timeout(STALL, tx.send(msg)).await{
+				Ok(Ok(()))=>{}
+				Ok(Err(e))=>{debug!(%peer, error=%e, "ws write failed"); return}
+				Err(_)=>{info!(%peer, secs=STALL.as_secs(), "ws write made no progress, closing"); return}
+			}
+		}
+		let _=tokio::time::timeout(STALL, tx.send(Message::Close(None))).await;
+	});
+	out
 }
 
 const UNPINNED:rustls::Error=rustls::Error::InvalidCertificate(rustls::CertificateError::ApplicationVerificationFailure);

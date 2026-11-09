@@ -145,3 +145,26 @@ async fn unfinished_upgrades_are_bounded_per_source(){
 	tokio::spawn(async move{veilway_wg::ws::run_client_on(client, format!("ws://{relay}/wg"), veilway_wg::ws::Trust::Roots).await.unwrap()});
 	roundtrip(bridge, &payloads()).await;
 }
+
+#[tokio::test]
+async fn a_peer_that_stops_reading_is_dropped(){
+	use futures_util::SinkExt;
+	use futures_util::StreamExt;
+	use tokio_tungstenite::tungstenite::{Bytes, Message};
+	let target=UdpSocket::bind("127.0.0.1:0").await.unwrap();
+	let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let relay=listener.local_addr().unwrap();
+	let to=target.local_addr().unwrap();
+	tokio::spawn(async move{veilway_wg::ws::serve(listener, None, "/wg".to_string(), to).await.unwrap()});
+	let (mut ws, _)=tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}/wg", relay.port())).await.unwrap();
+	ws.send(Message::Binary(Bytes::from_static(b"hello"))).await.unwrap();
+	let mut buf=[0u8; 64];
+	let (_, from)=tokio::time::timeout(Duration::from_secs(5), target.recv_from(&mut buf)).await.unwrap().unwrap();
+	// Nobody reads the WebSocket while the relay is flooded, so its TCP path backs up the way a slow link does.
+	let start=Instant::now();
+	let big=vec![0u8; 60000];
+	while start.elapsed()<Duration::from_secs(20){let _=target.send_to(&big, from).await; tokio::time::sleep(Duration::from_millis(2)).await;}
+	// The relay must have given up on the stalled connection; an old relay waits forever and keeps the stream going.
+	let ended=tokio::time::timeout(Duration::from_secs(20), async{while let Some(Ok(_))=ws.next().await{}}).await;
+	assert!(ended.is_ok(), "the relay kept a stalled connection");
+}
