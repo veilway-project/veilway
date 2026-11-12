@@ -15,9 +15,9 @@ exclude=["tests/", "examples/", "proptest-regressions/"]
 embedded-wintun=[]
 
 [dependencies]
-veilway-engine={path="../veilway-engine", version="0.3.17"}
-veilway-proto={path="../veilway-proto", version="0.3.17"}
-veilway-transport={path="../veilway-transport", version="0.3.17"}
+veilway-engine={path="../veilway-engine", version="0.3.18"}
+veilway-proto={path="../veilway-proto", version="0.3.18"}
+veilway-transport={path="../veilway-transport", version="0.3.18"}
 tokio.workspace=true
 tracing.workspace=true
 anyhow.workspace=true
