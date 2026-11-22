@@ -432,6 +432,8 @@ pub struct Stream {
 	pub handshakes: u64,
 	pub tunnel: u64,
 	pub queue_full: u64,
+	/// Datagrams for a device dropped where they left the send queue of its connection, for having waited there past the limit (about 25 ms under load).
+	pub queue_late: u64,
 	pub chunks_sent: u64,
 	/// Sessions that ended, by reason: no WireGuard packet within 10 seconds of the proof, no chunk for 300 seconds, every chunk number used, the device's ninth session, a device or transport secret the config no longer has, a connection that closed or a peer that closed the session, a chunk that did not open or a frame the protocol does not allow, and a transport the config no longer has.
 	pub ended_deadline: u64,
@@ -491,7 +493,7 @@ impl From<veilway_core::StreamTotals> for Stream {
 			stranger_syntax: totals.stranger_syntax, stranger_slow: totals.stranger_slow, stranger_closed: totals.stranger_closed, stranger_displaced: totals.stranger_displaced, stranger_origin: totals.stranger_origin, stranger_proof: totals.stranger_proof,
 			refused_window: totals.refused_window, refused_floor: totals.refused_floor, refused_seen: totals.refused_seen, refused_cache_full: totals.refused_cache_full, refused_limit: totals.refused_limit, refused_no_replay: totals.refused_no_replay, refused_pool: totals.refused_pool, refused_pending: totals.refused_pending, refused_device_rate: totals.refused_device_rate, refused_source_rate: totals.refused_source_rate,
 			relays: totals.relays, relays_evicted: totals.relays_evicted, decoy_down: totals.decoy_down, proofs_accepted: totals.proofs_accepted, proofs_waited: totals.proofs_waited, head_refused: totals.head_refused, established: totals.established, establish_full: totals.establish_full,
-			handshakes: totals.handshakes, tunnel: totals.tunnel, queue_full: totals.queue_full, chunks_sent: totals.chunks_sent,
+			handshakes: totals.handshakes, tunnel: totals.tunnel, queue_full: totals.queue_full, queue_late: totals.queue_late, chunks_sent: totals.chunks_sent,
 			ended_deadline: totals.ended_deadline, ended_idle: totals.ended_idle, ended_packets: totals.ended_packets, ended_displaced: totals.ended_displaced, ended_revoked: totals.ended_revoked, ended_closed: totals.ended_closed, ended_invalid: totals.ended_invalid, ended_unserved: totals.ended_unserved,
 			upgrade_learned: totals.upgrade_learned, upgrade_learn_failed: totals.upgrade_learn_failed,
 			proxies: totals.proxies, decoys: totals.decoys, fronted: totals.fronted, proxy_accepted: totals.proxy_accepted, proxy_requests: totals.proxy_requests, proxy_unnamed: totals.proxy_unnamed, proxy_idle: totals.proxy_idle, forwards: totals.forwards, forwards_unframed: totals.forwards_unframed, forwards_cut: totals.forwards_cut,

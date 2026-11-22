@@ -41,6 +41,7 @@ use tokio::task::AbortHandle;
 #[cfg(feature = "bench")]
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
+use veilway_transport::queue::{self, Outbox};
 use veilway_proto::chunk::{ChunkError, Opener, Padding, Sealer, MAX_ITEMS, MAX_PLAINTEXT, MAX_SEALED};
 use veilway_proto::fronted::{self, BodyError, BODY_MAX, BODY_MIN, BODY_TIME, HOLD};
 use veilway_proto::http::{self, Answer, Framing};
@@ -161,7 +162,7 @@ pub enum Stranger {
 const STRANGERS: usize = Stranger::Unestablished as usize + 1;
 
 #[derive(Clone, Copy)]
-enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped, ShapedPolls, ShapedRepeats, ShapedLate, ShapedStreams, ShapedEvents, ShapedBeats, ShapedLimited, H2Connections, H2Users, H2Strangers, H2Refused, H2Rapid, H2Flood, H2Limit}
+enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, HandshakeDisplaced, Relayed, Evicted, DecoyDown, Proofs, Waited, HeadRefused, Established, EstablishFull, Handshakes, Tunnel, QueueFull, QueueLate, Chunks, Learned, LearnFailed, Proxied, Requests, Unnamed, ProxyIdle, Forwarded, Unframed, Cut, Polls, Repeats, Legacy, Redialed, OriginDropped, ShapedPolls, ShapedRepeats, ShapedLate, ShapedStreams, ShapedEvents, ShapedBeats, ShapedLimited, H2Connections, H2Users, H2Strangers, H2Refused, H2Rapid, H2Flood, H2Limit}
 
 const COUNTS: usize = Count::H2Limit as usize + 1;
 
@@ -229,6 +230,8 @@ pub struct StreamTotals {
 	pub handshakes: u64,
 	pub tunnel: u64,
 	pub queue_full: u64,
+	/// Datagrams dropped where they left the send queue, for having waited past its limit (`veilway_transport::queue`).
+	pub queue_late: u64,
 	pub chunks_sent: u64,
 	pub ended_deadline: u64,
 	pub ended_idle: u64,
@@ -467,7 +470,7 @@ impl Undecided {
 pub(super) struct Relayed {pub(super) last: AtomicI64, pub(super) kill: Notify}
 
 /// What only the one request in flight of a `fronted` session has: the node's side of the chunks, the session's allowance of handshakes, and what waits to go to the device.
-struct Turn {sealer: Sealer, handshakes: Handshakes, waiting: mpsc::Receiver<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
+struct Turn {sealer: Sealer, handshakes: Handshakes, waiting: Outbox<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
 
 /// What a `fronted` session is between two requests. Nothing here changes but under the hand of a request whose every chunk opened at the expected numbers, or of the proof that opened the session: "a live session it named is left exactly as it was".
 struct Polled {
@@ -498,7 +501,7 @@ struct Kept {read: ReadHalf<Stream>, write: WriteHalf<Stream>, source: IpAddr}
 pub struct Session {
 	pub seat: Arc<Seat>,
 	pub over: Over,
-	queue: mpsc::Sender<(Vec<u8>, bool)>,
+	queue: mpsc::Sender<((Vec<u8>, bool), Instant)>,
 	counters: Arc<Counters>,
 }
 
@@ -509,8 +512,17 @@ impl Session {
 	/// Hands the session one WireGuard datagram for its device. `wide` says it holds a control channel packet.
 	/// "Drop, do not queue. Each connection has a send queue of 256 datagrams. When it is full, new datagrams are dropped and counted."
 	pub fn push(&self, datagram: &[u8], wide: bool) {
-		if self.queue.try_send((datagram.to_vec(), wide)).is_err() {self.counters.count(Count::QueueFull)}
+		if self.queue.try_send(((datagram.to_vec(), wide), Instant::now())).is_err() {self.counters.count(Count::QueueFull)}
 	}
+}
+
+/// Whether a datagram for a device is never dropped for its wait in the send queue: whatever is not WireGuard data (handshakes, cookies) and what holds a control channel packet.
+pub(super) fn exempt((datagram, wide): &(Vec<u8>, bool)) -> bool {*wide || datagram.first() != Some(&4)}
+
+/// The send queue of one session, `size` datagrams with the wait limit of `veilway_transport::queue`.
+pub(super) fn send_queue(size: usize, counters: &Arc<Counters>) -> (mpsc::Sender<((Vec<u8>, bool), Instant)>, Outbox<(Vec<u8>, bool)>) {
+	let counters = counters.clone();
+	queue::channel(size, exempt, Box::new(move || counters.count(Count::QueueLate)))
 }
 
 /// The stream listener of one address. It lives for as long as a config has a stream transport on that address, across reloads, and its connections with it.
@@ -607,7 +619,7 @@ impl State {
 			refused_window: stranger(Stranger::Window), refused_floor: stranger(Stranger::Floor), refused_seen: stranger(Stranger::Seen), refused_cache_full: stranger(Stranger::CacheFull), refused_limit: stranger(Stranger::Limit), refused_no_replay: stranger(Stranger::NoReplay), refused_pool: stranger(Stranger::Pool), refused_pending: stranger(Stranger::Pending), refused_device_rate: stranger(Stranger::DeviceRate), refused_source_rate: stranger(Stranger::SourceRate),
 			relays: count(Count::Relayed), relays_evicted: count(Count::Evicted), decoy_down: count(Count::DecoyDown),
 			proofs_accepted: count(Count::Proofs), proofs_waited: count(Count::Waited), head_refused: count(Count::HeadRefused), established: count(Count::Established), establish_full: count(Count::EstablishFull),
-			handshakes: count(Count::Handshakes), tunnel: count(Count::Tunnel), queue_full: count(Count::QueueFull), chunks_sent: count(Count::Chunks),
+			handshakes: count(Count::Handshakes), tunnel: count(Count::Tunnel), queue_full: count(Count::QueueFull), queue_late: count(Count::QueueLate), chunks_sent: count(Count::Chunks),
 			ended_deadline: ended(Ended::Deadline), ended_idle: ended(Ended::Idle), ended_packets: ended(Ended::Packets), ended_displaced: ended(Ended::Displaced), ended_revoked: ended(Ended::Revoked), ended_closed: ended(Ended::Closed), ended_invalid: ended(Ended::Invalid), ended_unserved: ended(Ended::Unserved),
 			upgrade_learned: count(Count::Learned), upgrade_learn_failed: count(Count::LearnFailed),
 			proxies, decoys, fronted, proxy_accepted: count(Count::Proxied), proxy_requests: count(Count::Requests), proxy_unnamed: count(Count::Unnamed), proxy_idle: count(Count::ProxyIdle), forwards: count(Count::Forwarded), forwards_unframed: count(Count::Unframed), forwards_cut: count(Count::Cut),
@@ -802,6 +814,8 @@ pub fn accept(shared: &Arc<Shared>, listener: Arc<Listener>, socket: TcpListener
 				Some(seat) => {
 					listener.counters.count(Count::Proxied);
 					let _ = tcp.set_nodelay(true);
+					#[cfg(any(target_os = "linux", target_os = "android"))]
+					let _ = SockRef::from(&tcp).set_tcp_notsent_lowat(veilway_transport::queue::UNSENT);
 					let Ok(local) = tcp.local_addr() else {
 						listener.counters.count(Count::Broken);
 						continue;
@@ -842,6 +856,9 @@ fn enter(listener: &Arc<Listener>, table: fn(&Listener) -> MutexGuard<'_, Undeci
 /// How ordinary servers close in that case is on the list to measure: the connection is dropped here as the system closes it.
 async fn direct(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>, tcp: TcpStream, peer: SocketAddr, place: Place, _room: OwnedSemaphorePermit) {
 	let _ = tcp.set_nodelay(true);
+	// What the system holds unsent stays small, so a slow path makes datagrams wait in the session's queue, where their wait is limited (`veilway_transport::queue`), and not in the socket's buffer.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	let _ = SockRef::from(&tcp).set_tcp_notsent_lowat(veilway_transport::queue::UNSENT);
 	let Ok(local) = tcp.local_addr() else {return listener.counters.count(Count::Broken)};
 	let (io, user): (Stream, bool) = match &served.acceptor {
 		Some(acceptor) => {
@@ -1195,7 +1212,7 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 	};
 	buf.copy_within(end..filled, 0);
 	filled -= end;
-	let (queue, mut waiting) = mpsc::channel(SEND_QUEUE);
+	let (queue, mut waiting) = send_queue(SEND_QUEUE, &listener.counters);
 	let session = Arc::new(Session {seat: seat.clone(), over: route.over, queue, counters: listener.counters.clone()});
 	let (mut reader, mut writer) = tokio::io::split(io);
 	let (mut opener, mut sealer, mut sealed, mut out, handshakes) = (Opener::new(accepted.keys.c2s), Sealer::new(accepted.keys.s2c, padding), Vec::new(), Vec::new(), Handshakes::new(Clock::of((shared.now)()).ms));
@@ -1846,7 +1863,7 @@ async fn poll(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served, w
 	let (polling, number, place) = match asked {
 		// 3. "An accepted proof is spent and creates a pending session, whatever happens next."
 		Ok(accepted) => {
-			let (route, id, (queue, waiting), seat) = (&served.routes[accepted.route], listener.ids.fetch_add(1, Ordering::Relaxed), mpsc::channel(SEND_QUEUE), accepted.seat);
+			let (route, id, (queue, waiting), seat) = (&served.routes[accepted.route], listener.ids.fetch_add(1, Ordering::Relaxed), send_queue(SEND_QUEUE, &listener.counters), accepted.seat);
 			let Ok(padding) = Padding::new(accepted.wide, accepted.normal, &mut random) else {
 				seat.end(Ended::Closed);
 				return Poll::Stranger(Stranger::Body, None);

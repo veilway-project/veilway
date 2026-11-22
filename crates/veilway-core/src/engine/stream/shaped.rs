@@ -50,7 +50,7 @@ struct State {
 }
 
 /// What waits to go to the device. Held by the one request that drains it at a time: the stream, or the request that has no stream to give its data to.
-struct Queue {waiting: mpsc::Receiver<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
+struct Queue {waiting: Outbox<(Vec<u8>, bool)>, held: VecDeque<(Vec<u8>, bool)>, lone: Option<Instant>}
 
 impl Queue {
 	/// Takes what waits in the channel into `held`, as much as the node keeps unsent: "Unsent bytes of a stream: at most 65,536 on the node", and "downstream queue: 128 datagrams of at most 1,600 bytes". What does not fit stays in the channel, which drops on overflow, so a session never holds more than the channel's 204,800 bytes and these 65,536 together.
@@ -126,7 +126,7 @@ pub(super) async fn serve(shared: &Arc<Shared>, listener: &Arc<Listener>, served
 	let (shaped, n, place) = match asked {
 		// 3. "The proof is verified and spent as before." An accepted proof is spent and creates a pending session, whatever happens next.
 		Asked::Opening(accepted) => {
-			let (route, id, (queue, waiting), seat) = (&served.routes[accepted.route], listener.ids.fetch_add(1, Ordering::Relaxed), mpsc::channel(QUEUE), accepted.seat);
+			let (route, id, (queue, waiting), seat) = (&served.routes[accepted.route], listener.ids.fetch_add(1, Ordering::Relaxed), send_queue(QUEUE, &listener.counters), accepted.seat);
 			listener.counters.count(Count::Proofs);
 			let (Ok(padding), Some(shape)) = (Padding::new(accepted.wide, accepted.normal, &mut random), route.shape.clone()) else {
 				seat.end(Ended::Closed);

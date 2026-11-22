@@ -1,6 +1,9 @@
 use super::seqnum::SeqNum;
 use etherparse::TcpHeader;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 
 // veilway patch: 16 KiB each upstream, which held one connection to 16 KiB a round trip (80 KiB/s at 200 ms). With the
 // window scale below a connection may have 512 KiB on the way each direction.
@@ -8,6 +11,14 @@ pub(super) const MAX_UNACK: u32 = 1024 * 512;
 pub(super) const READ_BUFFER_SIZE: usize = 1024 * 512;
 // veilway patch: the window scale this stack announces when the peer's SYN carries one (RFC 7323 2.2), enough for READ_BUFFER_SIZE.
 pub(super) const WINDOW_SHIFT: u8 = 4;
+// veilway patch: the queue a flow may keep on its path, see `Tcb::send_limit`. The smallest limit, how long the floor of the
+// round trip stands before a probe measures it again, how long that probe holds the flow to four segments at least, how many
+// round trips a best rate stands (between 1 s and 10 s), and the round trip assumed before one is measured.
+const QUEUE_FLOOR: u32 = 16 * 1024;
+const RTT_WINDOW: Duration = Duration::from_secs(10);
+const PROBE_RTT: Duration = Duration::from_millis(200);
+const RATE_ROUNDS: u32 = 10;
+const RTT_UNKNOWN: Duration = Duration::from_millis(100);
 pub(super) const MAX_COUNT_FOR_DUP_ACK: usize = 3; // Maximum number of duplicate ACKs before retransmission
 
 /// Retransmission timeout
@@ -82,6 +93,40 @@ pub(crate) struct Tcb {
     // counted none of them, so the window never closed on a reader that was slow: a peer sent as fast as it could and the stack
     // held all of it in memory. They count against the receive window now, see `get_available_read_buffer_size`.
     pub(super) queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    // veilway patch: what the limits of a flow's queue are made of, see `send_limit`: the floor of the round trip and when it was
+    // measured, a probe of it that runs (since when, and the lowest it saw), the best rates data was acknowledged and received at,
+    // and when the SYN/ACK left, which gives the first round trip.
+    min_rtt: Option<(Duration, Instant)>,
+    probe: Option<(Instant, Option<Duration>)>,
+    sent_rate: Rate,
+    received_rate: Rate,
+    pub(super) syn_ack_sent: Option<Instant>,
+}
+
+/// veilway patch: the best rate a flow moved data at lately, in bytes a second. Each sample spans at least a round trip, and a
+/// best one stands for `RATE_ROUNDS` round trips, so a pause in the data does not lower it at once.
+#[derive(Debug, Clone, Default)]
+struct Rate {
+    since: Option<Instant>,
+    bytes: u64,
+    best: Option<(f64, Instant)>,
+}
+
+impl Rate {
+    fn add(&mut self, bytes: usize, rtt: Duration, now: Instant) {
+        let since = *self.since.get_or_insert(now);
+        self.bytes = self.bytes.saturating_add(bytes as u64);
+        let span = now.saturating_duration_since(since);
+        if span < rtt.max(Duration::from_millis(1)) {
+            return;
+        }
+        let rate = self.bytes as f64 / span.as_secs_f64();
+        let stands = (rtt * RATE_ROUNDS).clamp(Duration::from_secs(1), Duration::from_secs(10));
+        if self.best.is_none_or(|(best, at)| rate >= best || now.saturating_duration_since(at) > stands) {
+            self.best = Some((rate, now));
+        }
+        (self.since, self.bytes) = (Some(now), 0);
+    }
 }
 
 impl Tcb {
@@ -122,6 +167,11 @@ impl Tcb {
             recover: seq.into(),
             recovering: false,
             queued: Default::default(),
+            min_rtt: None,
+            probe: None,
+            sent_rate: Rate::default(),
+            received_rate: Rate::default(),
+            syn_ack_sent: None,
         }
     }
 
@@ -175,6 +225,40 @@ impl Tcb {
         self.recovering && ack > self.last_received_ack
     }
 
+    /// veilway patch: one round trip, of data sent at `sent` or of the SYN/ACK. A lower one is the new floor at once. While a
+    /// probe runs, the lowest round trip of data sent since it started is kept, and becomes the floor when it ends.
+    fn on_rtt(&mut self, rtt: Duration, sent: Instant, now: Instant) {
+        if let Some((start, seen)) = &mut self.probe
+            && sent >= *start
+        {
+            *seen = Some(seen.map_or(rtt, |seen| seen.min(rtt)));
+        }
+        if self.min_rtt.is_none_or(|(min, _)| rtt <= min) {
+            self.min_rtt = Some((rtt, now));
+        }
+    }
+
+    /// veilway patch: the queue a flow may keep on its path. Upstream let a flow have 512 KiB in flight and announce 512 KiB of
+    /// window, so a fast sender filled a slow path with seconds of data before a loss told it to slow down, and every flow behind
+    /// it waited as long. Now a flow may have in flight twice what its path carries in one round trip: the best rate its data was
+    /// acknowledged at lately, over the floor of its round trip, which is a queue of one round trip at most. The window it
+    /// announces is held to the same for what it receives. The floor of the round trip is measured again every `RTT_WINDOW` by
+    /// a probe that holds the flow to four segments, as BBR does: a queue the flow made itself would otherwise raise the floor,
+    /// and the limit with it. Before both are known, the old limits apply.
+    fn send_limit(&self) -> u32 {
+        if self.probe.is_some() {
+            return 4 * self.smss();
+        }
+        self.limit(&self.sent_rate, self.max_unacked_bytes)
+    }
+
+    fn limit(&self, rate: &Rate, ceiling: u32) -> u32 {
+        match (self.min_rtt, rate.best) {
+            (Some((rtt, _)), Some((best, _))) => ((2.0 * best * rtt.as_secs_f64()) as u32).clamp(QUEUE_FLOOR.min(ceiling), ceiling),
+            _ => ceiling,
+        }
+    }
+
     pub fn calculate_payload_max_len(&self, ip_header_size: usize, tcp_header_size: usize) -> usize {
         let send_window = self.get_send_window() as usize;
         let mtu = self.get_mtu() as usize;
@@ -203,6 +287,9 @@ impl Tcb {
             log::warn!("{:?}: Received packet seq {seq} < self ack {}, len = {}", self.state, self.ack, buf.len());
             return;
         }
+        // veilway patch: the rate data comes in at, see `send_limit`.
+        let rtt = self.min_rtt.map_or(RTT_UNKNOWN, |(rtt, _)| rtt);
+        self.received_rate.add(buf.len(), rtt, Instant::now());
         self.unordered_packets.insert(seq, buf);
     }
     pub(super) fn get_available_read_buffer_size(&self) -> usize {
@@ -283,7 +370,15 @@ impl Tcb {
         self.send_window
     }
     pub(super) fn get_recv_window(&self) -> u32 {
-        self.get_available_read_buffer_size().try_into().unwrap_or(u32::MAX)
+        // veilway patch: held to the limit of `send_limit` for what the flow receives. Only the SYN/ACK gives a round trip to a
+        // flow that sends nothing, so once that is `2 * RTT_WINDOW` old and no probe has measured it again, the window is not held.
+        let available = self.get_available_read_buffer_size();
+        let held = self.read_buffer_size.saturating_sub(available);
+        let limit = match self.min_rtt {
+            Some((_, at)) if at.elapsed() <= 2 * RTT_WINDOW => self.limit(&self.received_rate, self.read_buffer_size.try_into().unwrap_or(u32::MAX)) as usize,
+            _ => self.read_buffer_size,
+        };
+        limit.saturating_sub(held).min(available).try_into().unwrap_or(u32::MAX)
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -356,6 +451,33 @@ impl Tcb {
         if !self.recovering && ack > self.last_received_ack && ack <= self.seq {
             self.on_acked(ack.distance(self.last_received_ack));
         }
+        // veilway patch: the round trip and the rate data is acknowledged at, see `send_limit`. A round trip comes from the last
+        // segment this ACK covers whole that was never sent again (Karn), or from the SYN/ACK.
+        if ack > self.last_received_ack && ack <= self.seq {
+            let now = Instant::now();
+            let sent = self.syn_ack_sent.take().or_else(|| {
+                self.inflight_packets
+                    .values()
+                    .filter(|p| p.retransmit_count == 0 && p.seq + p.payload.len() as u32 <= ack)
+                    .map(|p| p.send_time)
+                    .max()
+            });
+            if let Some(sent) = sent {
+                self.on_rtt(now.saturating_duration_since(sent), sent, now);
+            }
+            let rtt = self.min_rtt.map_or(RTT_UNKNOWN, |(rtt, _)| rtt);
+            self.sent_rate.add(ack.distance(self.last_received_ack) as usize, rtt, now);
+            match (self.probe, self.min_rtt) {
+                (Some((start, Some(seen))), Some((min, _))) if now.saturating_duration_since(start) >= PROBE_RTT.max(min) => {
+                    (self.min_rtt, self.probe) = (Some((seen, now)), None);
+                }
+                (None, Some((min, at))) if now.saturating_duration_since(at) > RTT_WINDOW => {
+                    self.probe = Some((now, None));
+                    log::trace!("probing the round trip, floor {min:?}");
+                }
+                _ => {}
+            }
+        }
         match self.inflight_packets.first_key_value() {
             None => return,
             Some((&seq, _)) if ack < seq => return,
@@ -414,7 +536,8 @@ impl Tcb {
     pub fn is_send_buffer_full(&self) -> bool {
         // To respect the receiver's window (remote_window) size and avoid sending too many unacknowledged packets, which may cause packet loss
         // Simplified version: min(cwnd, rwnd)
-        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window()).min(self.cwnd)
+        // veilway patch: and never more than `send_limit`.
+        self.seq.distance(self.get_last_received_ack()) >= self.max_unacked_bytes.min(self.get_send_window()).min(self.cwnd).min(self.send_limit())
     }
 }
 
@@ -639,5 +762,65 @@ mod tests {
         assert!(!tcb.partial_ack(start + 20_000));
         assert!(tcb.on_loss(true));
         assert_eq!(tcb.cwnd, 1460);
+    }
+
+    /// A flow has in flight at most twice its best rate over the floor of its round trip, four segments while a probe runs,
+    /// and the old limits before both are known.
+    #[test]
+    fn a_flow_keeps_at_most_twice_its_path_in_flight() {
+        let inflight = |tcb: &mut Tcb| {
+            let mut sent = 0;
+            while !tcb.is_send_buffer_full() && sent < 2_000_000 {
+                tcb.add_inflight_packet(vec![0; 1000]).unwrap();
+                sent += 1000;
+            }
+            sent
+        };
+        let mut open = tcb();
+        open.set_window_scale(7);
+        open.update_send_window(u16::MAX, false);
+        open.cwnd = u32::MAX / 2;
+        assert_eq!(inflight(&mut open), (MAX_UNACK as usize).div_ceil(1000) * 1000);
+        let mut held = Tcb { min_rtt: Some((Duration::from_millis(50), Instant::now())), ..tcb() };
+        held.set_window_scale(7);
+        held.update_send_window(u16::MAX, false);
+        held.cwnd = u32::MAX / 2;
+        held.sent_rate.best = Some((1_000_000.0, Instant::now()));
+        assert_eq!(inflight(&mut held), 100_000);
+        let mut slow = Tcb { min_rtt: Some((Duration::from_millis(50), Instant::now())), ..tcb() };
+        slow.cwnd = u32::MAX / 2;
+        slow.sent_rate.best = Some((10_000.0, Instant::now()));
+        assert_eq!(inflight(&mut slow), (QUEUE_FLOOR as usize).div_ceil(1000) * 1000, "never under the floor");
+        let mut probing = Tcb { probe: Some((Instant::now(), None)), ..tcb() };
+        probing.cwnd = u32::MAX / 2;
+        assert_eq!(inflight(&mut probing), (4 * 1460usize).div_ceil(1000) * 1000);
+    }
+
+    /// The window is held to twice the receive rate over the round trip while the round trip is fresh, and is not once it is old.
+    #[test]
+    fn the_window_is_held_while_the_round_trip_is_known() {
+        let now = Instant::now();
+        let mut tcb = Tcb { min_rtt: Some((Duration::from_millis(50), now)), ..tcb() };
+        tcb.received_rate.best = Some((1_000_000.0, now));
+        assert_eq!(tcb.get_recv_window(), 100_000);
+        tcb.queued.store(30_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tcb.get_recv_window(), 70_000);
+        tcb.min_rtt = Some((Duration::from_millis(50), now - 3 * RTT_WINDOW));
+        assert_eq!(tcb.get_recv_window(), READ_BUFFER_SIZE as u32 - 30_000);
+    }
+
+    /// A rate is taken over at least a round trip, and a lower one does not replace a best one until that is old.
+    #[test]
+    fn a_rate_spans_a_round_trip_and_keeps_its_best() {
+        let (mut rate, start) = (Rate::default(), Instant::now());
+        for ms in 0..=100u64 {
+            rate.add(1000, Duration::from_millis(10), start + Duration::from_millis(ms));
+        }
+        let (best, _) = rate.best.unwrap();
+        assert!((900_000.0..=1_200_000.0).contains(&best), "{best}");
+        rate.add(1000, Duration::from_millis(10), start + Duration::from_millis(400));
+        assert_eq!(rate.best.unwrap().0, best);
+        rate.add(1000, Duration::from_millis(10), start + Duration::from_millis(1500));
+        assert!(rate.best.unwrap().0 < 10_000.0);
     }
 }

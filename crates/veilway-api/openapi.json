@@ -2255,6 +2255,12 @@
             "minimum": 0,
             "type": "integer"
           },
+          "queue_late": {
+            "description": "Datagrams for a device dropped where they left the send queue of its connection, for having waited there past the limit (about 25 ms under load).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "refused_cache_full": {
             "format": "uint64",
             "minimum": 0,
@@ -2491,6 +2497,7 @@
           "handshakes",
           "tunnel",
           "queue_full",
+          "queue_late",
           "chunks_sent",
           "ended_deadline",
           "ended_idle",

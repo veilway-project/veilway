@@ -28,6 +28,7 @@ pub mod http;
 pub mod mlkem;
 mod parallel;
 pub mod probe;
+pub mod queue;
 mod shaped;
 pub mod stream;
 mod tls;
@@ -57,7 +58,7 @@ use veilway_proto::subscription::payload::{Candidate, Http2, Padding, Profile, T
 use veilway_proto::subscription::Secret;
 use veilway_proto::{session, NoRandom};
 
-/// "Stream send queue: 256 datagrams per connection." A datagram that finds it full is dropped and counted, on every transport.
+/// "Stream send queue: 256 datagrams per connection." A datagram that finds it full is dropped and counted, on every transport, and so is one that waited in it past the limit of `queue`.
 pub const QUEUE: usize = 256;
 /// What an attempt gets to carry a chunk from the node: "10 s per transport" of transport fallback and "10 s each" of the candidate attempts. Connecting, TLS and the answer to the request share it.
 pub const ATTEMPT: Duration = Duration::from_secs(10);
@@ -384,7 +385,7 @@ pub struct Numbers {
 	/// Datagrams sent and received.
 	pub sent: u64,
 	pub received: u64,
-	/// Datagrams dropped: a full queue, a size outside the limits, a packet the host refused for its size, a caller that does not read.
+	/// Datagrams dropped: a full queue, a wait in the queue past its limit (`queue`), a size outside the limits, a packet the host refused for its size, a caller that does not read.
 	pub dropped: u64,
 	/// When a chunk of the node last opened.
 	pub heard: Option<Instant>,
@@ -395,7 +396,7 @@ pub(crate) struct Shared {datagram: usize, room: AtomicU16, low_power: AtomicBoo
 pub(crate) enum Ask {Close, Moved, Power}
 
 /// One session's ends as its task holds them.
-pub(crate) struct Port {pub out: mpsc::Receiver<(Vec<u8>, Kind)>, pub input: mpsc::Sender<Vec<u8>>, pub ask: mpsc::UnboundedReceiver<Ask>, pub state: watch::Sender<State>, pub shared: Arc<Shared>, pub last: Arc<Mutex<Option<Instant>>>, pub source: Source, pub env: Env}
+pub(crate) struct Port {pub out: queue::Outbox<(Vec<u8>, Kind)>, pub input: mpsc::Sender<Vec<u8>>, pub ask: mpsc::UnboundedReceiver<Ask>, pub state: watch::Sender<State>, pub shared: Arc<Shared>, pub last: Arc<Mutex<Option<Instant>>>, pub source: Source, pub env: Env}
 
 impl Port {
 	pub fn want(&self, want: Want) -> Option<Vec<u8>> {self.source.lock().ok().and_then(|mut source| source(want))}
@@ -424,7 +425,7 @@ impl Port {
 }
 
 /// The ends of a session its owner holds: the caller, or the task of several connections.
-pub(crate) struct Member {pub out: mpsc::Sender<(Vec<u8>, Kind)>, pub ask: mpsc::UnboundedSender<Ask>, pub state: watch::Receiver<State>, pub last: Arc<Mutex<Option<Instant>>>, pub task: JoinHandle<()>}
+pub(crate) struct Member {pub out: mpsc::Sender<((Vec<u8>, Kind), tokio::time::Instant)>, pub ask: mpsc::UnboundedSender<Ask>, pub state: watch::Receiver<State>, pub last: Arc<Mutex<Option<Instant>>>, pub task: JoinHandle<()>}
 
 /// Runs what opens a session, unless the caller closes or drops the session first: then nothing more is dialled, written or asked of anyone, and None comes back. `opening` must not touch the session's requests itself.
 pub(crate) async fn unasked<T>(ask: &mut mpsc::UnboundedReceiver<Ask>, opening: impl std::future::Future<Output = T>) -> Option<T> {
@@ -510,7 +511,9 @@ fn check(link: &Link, target: &Target, env: &Env) -> Result<(), Refuse> {
 
 // Starts the task of one session. Its datagrams go to `input`, which several connections of one tunnel share.
 pub(crate) fn launch(link: Link, target: Target, count: usize, env: Env, source: Source, input: mpsc::Sender<Vec<u8>>, shared: Arc<Shared>) -> Member {
-	let ((out, queued), (ask, asked), (state, watched), last) = (mpsc::channel(QUEUE), mpsc::unbounded_channel(), watch::channel(State::Opening), Arc::new(Mutex::new(None)));
+	// Tunnel traffic that waited too long is dropped where it leaves, see `queue`. A handshake, a probe and the control channel never are.
+	let dropping = shared.clone();
+	let ((out, queued), (ask, asked), (state, watched), last) = (queue::channel(QUEUE, |(_, kind): &(Vec<u8>, Kind)| !matches!(kind, Kind::Packet {control: false, ..}), Box::new(move || {dropping.dropped.fetch_add(1, Ordering::Relaxed);})), mpsc::unbounded_channel(), watch::channel(State::Opening), Arc::new(Mutex::new(None)));
 	let heard = last.clone();
 	let task = tokio::spawn(async move {
 		let (mut port, transport) = (Port {out: queued, input, ask: asked, state, shared, last: heard, source, env}, target.name());
@@ -542,7 +545,7 @@ impl Session {
 	}
 	/// Hands one WireGuard datagram to the session. False when it was dropped because the queue is full or the session is over: "Drop, do not queue." Nothing is ever sent outside the session.
 	pub fn send(&self, datagram: Vec<u8>, kind: Kind) -> bool {
-		let queued = !matches!(self.state(), State::Ended(_)) && self.member.out.try_send((datagram, kind)).is_ok();
+		let queued = !matches!(self.state(), State::Ended(_)) && self.member.out.try_send(((datagram, kind), tokio::time::Instant::now())).is_ok();
 		if !queued {self.shared.dropped.fetch_add(1, Ordering::Relaxed);}
 		queued
 	}

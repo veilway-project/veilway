@@ -86,6 +86,9 @@ pub(crate) async fn tcp(candidate: &Front, hook: &Option<Hook>, deadline: Instan
 		}
 	};
 	let _ = stream.set_nodelay(true);
+	// What the system holds unsent stays small, so that a slow path makes datagrams wait in the session's queue, where their wait is limited, and not in the socket's buffer, which nothing here can see into.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	let _ = SockRef::from(&stream).set_tcp_notsent_lowat(crate::queue::UNSENT);
 	Ok(stream)
 }
 

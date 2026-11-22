@@ -93,5 +93,5 @@ fn pass(port: &Port, members: &[(usize, Member, bool)], datagram: Vec<u8>, kind:
 		Kind::Handshake | Kind::Probe => ready().next(),
 		Kind::Stalled => ready().max_by_key(|(_, member, _)| member.last.lock().ok().and_then(|last| *last)),
 	};
-	if !to.is_some_and(|(_, member, _)| member.out.try_send((datagram, kind)).is_ok()) {port.dropped(1)}
+	if !to.is_some_and(|(_, member, _)| member.out.try_send(((datagram, kind), tokio::time::Instant::now())).is_ok()) {port.dropped(1)}
 }

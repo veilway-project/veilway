@@ -603,6 +603,8 @@ async fn tcp_main_logic_loop(
             None,
             None,
         )?;
+        // veilway patch: the first round trip, see `Tcb::send_limit`.
+        tcb.syn_ack_sent = Some(std::time::Instant::now());
         tcb.increase_seq();
         tcb.change_state(TcpState::SynReceived);
         let state = tcb.get_state();

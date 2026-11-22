@@ -127,7 +127,7 @@ enum Why {
 const WHYS: usize = Why::SourceRate as usize + 1;
 
 #[derive(Clone, Copy)]
-enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, Early, Skipped, Relayed, Evicted, SiteDown, SiteBudget, Decoys, Proofs, Waited, Established, EstablishFull, Handshakes, Tunnel, QueueFull, Probes, ProbeFailed, Live, Kept, Generic, LiveMiss, FlightsSpent, Idled, Chunks}
+enum Count {Accepted, AcceptFailed, Broken, HandshakeFailed, HandshakeSlow, Early, Skipped, Relayed, Evicted, SiteDown, SiteBudget, Decoys, Proofs, Waited, Established, EstablishFull, Handshakes, Tunnel, QueueFull, QueueLate, Probes, ProbeFailed, Live, Kept, Generic, LiveMiss, FlightsSpent, Idled, Chunks}
 
 const COUNTS: usize = Count::Chunks as usize + 1;
 
@@ -199,6 +199,8 @@ pub struct FakeTlsTotals {
 	pub handshakes: u64,
 	pub tunnel: u64,
 	pub queue_full: u64,
+	/// Datagrams dropped where they left the send queue, for having waited past its limit (`veilway_transport::queue`).
+	pub queue_late: u64,
 	pub chunks_sent: u64,
 	/// Probes of the site that kept a shape, probes that failed, and the shapes kept right now.
 	pub probes: u64,
@@ -596,7 +598,7 @@ impl Drop for Held<'_> {
 }
 
 /// One session: a connection, a device, and the queue of what the node has for that device.
-pub struct Session {seat: Arc<Seat>, queue: mpsc::Sender<(Vec<u8>, bool)>, counters: Arc<Counters>}
+pub struct Session {seat: Arc<Seat>, queue: mpsc::Sender<((Vec<u8>, bool), Instant)>, counters: Arc<Counters>}
 
 impl Session {
 	/// Established and the one its device is answered on.
@@ -605,7 +607,7 @@ impl Session {
 	/// Hands the session one WireGuard datagram for its device. `wide` says it holds a packet of the control channel.
 	/// "Drop, do not queue. Each connection has a send queue of 256 datagrams. When it is full, new datagrams are dropped and counted."
 	pub fn push(&self, datagram: &[u8], wide: bool) {
-		if self.queue.try_send((datagram.to_vec(), wide)).is_err() {self.counters.count(Count::QueueFull)}
+		if self.queue.try_send(((datagram.to_vec(), wide), Instant::now())).is_err() {self.counters.count(Count::QueueFull)}
 	}
 }
 
@@ -681,7 +683,7 @@ impl State {
 			refused_hello: why(Why::Refused), refused_window: why(Why::Window), refused_floor: why(Why::Floor), refused_seen: why(Why::Seen), refused_cache_full: why(Why::CacheFull), refused_limit: why(Why::Limit), refused_no_replay: why(Why::NoReplay), refused_pool: why(Why::Pool), refused_pending: why(Why::Pending), refused_device_rate: why(Why::DeviceRate), refused_source_rate: why(Why::SourceRate),
 			decoys: count(Count::Decoys), relays: count(Count::Relayed), relays_evicted: count(Count::Evicted), site_down: count(Count::SiteDown), site_budget: count(Count::SiteBudget),
 			proofs_accepted: count(Count::Proofs), proofs_waited: count(Count::Waited), established: count(Count::Established), establish_full: count(Count::EstablishFull),
-			handshakes: count(Count::Handshakes), tunnel: count(Count::Tunnel), queue_full: count(Count::QueueFull), chunks_sent: count(Count::Chunks),
+			handshakes: count(Count::Handshakes), tunnel: count(Count::Tunnel), queue_full: count(Count::QueueFull), queue_late: count(Count::QueueLate), chunks_sent: count(Count::Chunks),
 			ended_deadline: ended(Ended::Deadline), ended_idle: ended(Ended::Idle), ended_packets: ended(Ended::Packets), ended_displaced: ended(Ended::Displaced), ended_revoked: ended(Ended::Revoked), ended_closed: ended(Ended::Closed), ended_invalid: ended(Ended::Invalid), ended_unserved: ended(Ended::Unserved),
 		}
 	}
@@ -986,6 +988,9 @@ pub fn accept(shared: &Arc<Shared>, listener: Arc<Listener>, socket: TcpListener
 #[allow(clippy::too_many_arguments)]
 async fn conn(shared: Arc<Shared>, listener: Arc<Listener>, served: Arc<Served>, mut tcp: TcpStream, peer: SocketAddr, place: Place, _room: OwnedSemaphorePermit, by: Instant) {
 	let _ = tcp.set_nodelay(true);
+	// What the system holds unsent stays small, see `stream::direct`.
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	let _ = SockRef::from(&tcp).set_tcp_notsent_lowat(veilway_transport::queue::UNSENT);
 	// 1. "If the budget for new connections to the site has room, open one connection to the site now, with the connect timeout, and watch it." It is never waited for before the decision, so a site that cannot be reached touches no user.
 	let early = listener.spend(served.rate, Clock::of((shared.now)()).ms);
 	listener.counters.count(if early {Count::Early} else {Count::Skipped});
@@ -1416,7 +1421,8 @@ async fn session(shared: &Arc<Shared>, listener: &Arc<Listener>, served: &Served
 	let current = listener.served();
 	if listener.closed.load(Ordering::Acquire) || current.key != served.key || !Arc::ptr_eq(&current.tunnel, &served.tunnel) {seat.end(Ended::Unserved)}
 	let Ok(padding) = Padding::new(accepted.wide, accepted.normal, &mut random) else {return seat.end(Ended::Closed)};
-	let (queue, mut waiting) = mpsc::channel(SEND_QUEUE);
+	let late = listener.counters.clone();
+	let (queue, mut waiting) = veilway_transport::queue::channel(SEND_QUEUE, super::stream::exempt, Box::new(move || late.count(Count::QueueLate)));
 	let session = Arc::new(Session {seat: seat.clone(), queue, counters: listener.counters.clone()});
 	// The tickets and the first application data records of the shape, with the time each is due. They are sealed when they are written, so that they are never out of order with a frame.
 	let mut extras: VecDeque<(Instant, u8, Vec<u8>)> = extras.into();

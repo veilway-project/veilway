@@ -1280,6 +1280,11 @@ export interface components {
             proxy_unnamed: number;
             /** Format: uint64 */
             queue_full: number;
+            /**
+             * Format: uint64
+             * @description Datagrams for a device dropped where they left the send queue of its connection, for having waited there past the limit (about 25 ms under load).
+             */
+            queue_late: number;
             /** Format: uint64 */
             refused_cache_full: number;
             /** Format: uint64 */
