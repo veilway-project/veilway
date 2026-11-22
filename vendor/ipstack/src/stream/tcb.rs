@@ -373,14 +373,16 @@ impl Tcb {
         // veilway patch: held to the limit of `send_limit` for what the flow receives. Only the SYN/ACK gives a round trip to a
         // flow that sends nothing, so once that is `2 * RTT_WINDOW` old and no probe has measured it again, the window is not held.
         // The limit counts only what arrived in order and the reader has not taken: segments past a gap are inside the window
-        // already, and counting them closed it on a peer that then could not send the segment the gap waits for.
+        // already, and counting them closed it on a peer that then could not send the segment the gap waits for. The limit alone
+        // never takes the window under four segments: a window it closed was opened again by one ACK, and when that ACK was lost
+        // a peer that does not probe a closed window (smoltcp) waited for ever. Only the buffer closes it, as before.
         let available = self.get_available_read_buffer_size();
         let held = self.queued.load(std::sync::atomic::Ordering::Relaxed);
         let limit = match self.min_rtt {
             Some((_, at)) if at.elapsed() <= 2 * RTT_WINDOW => self.limit(&self.received_rate, self.read_buffer_size.try_into().unwrap_or(u32::MAX)) as usize,
             _ => self.read_buffer_size,
         };
-        limit.saturating_sub(held).min(available).try_into().unwrap_or(u32::MAX)
+        limit.saturating_sub(held).max(4 * self.smss() as usize).min(available).try_into().unwrap_or(u32::MAX)
     }
     // #[inline(always)]
     // pub(super) fn buffer_size(&self, payload_len: u16) -> u16 {
@@ -807,6 +809,9 @@ mod tests {
         assert_eq!(tcb.get_recv_window(), 100_000);
         tcb.queued.store(30_000, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(tcb.get_recv_window(), 70_000);
+        tcb.queued.store(99_000, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(tcb.get_recv_window(), 4 * 1460, "the limit alone never closes the window");
+        tcb.queued.store(30_000, std::sync::atomic::Ordering::Relaxed);
         tcb.add_unordered_packet(tcb.get_ack() + 5000, vec![0; 60_000]);
         assert_eq!(tcb.get_recv_window(), 70_000, "segments past a gap do not close the window");
         tcb.unordered_packets.clear();
