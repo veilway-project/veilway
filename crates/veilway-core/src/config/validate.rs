@@ -1016,7 +1016,7 @@ impl Config {
 		for set in &sets {*classes.entry(*set).or_default() += 1}
 		let countable = classes.len() <= MAX_ENTITLEMENT_CLASSES;
 		if !countable {r.warning("routing.rules", format!("users differ in exits, groups and inbounds in more than {MAX_ENTITLEMENT_CLASSES} ways, so rules were not checked for sending users to exits they are not entitled to"))}
-		// The transports a flow can start on here: those of the tunnel inbounds, and the proxy types.
+		// The transports a flow can start on here: those of the tunnel inbounds, the proxy types and the Xray inbounds.
 		let offered: HashSet<RuleTransport> = self.inbounds.iter().take(MAX_INBOUNDS).flat_map(|inbound| inbound.transports.iter().take(MAX_TRANSPORTS)).map(|transport| match transport {
 			Transport::Udp {..} => RuleTransport::Udp,
 			Transport::UdpObfs {..} => RuleTransport::UdpObfs,
@@ -1030,7 +1030,7 @@ impl Config {
 			ProxyType::Socks5 => vec![RuleTransport::Socks5],
 			ProxyType::Http => vec![RuleTransport::Http],
 			ProxyType::Mixed => vec![RuleTransport::Socks5, RuleTransport::Http],
-		})).collect();
+		})).chain(self.xray.iter().filter(|xray| !xray.inbounds.is_empty()).map(|_| RuleTransport::Xray)).collect();
 		let last_refusal = rules.iter().rposition(|rule| live(rule) && matches!(rule.action, Action::Block | Action::Reject));
 		for (i, rule) in rules.iter().enumerate() {
 			let at = format!("routing.rules[{i}]");
@@ -1042,7 +1042,7 @@ impl Config {
 			for (j, _) in rule.transport.iter().flatten().enumerate().take(MAX_RULE_ENTRIES).filter(|(_, wanted)| !offered.contains(wanted)) {r.warning(format!("{at}.transport[{j}]"), "no inbound of this node has this transport, so this entry never matches")}
 			if !present.contains(&true) {r.error(&at, "expected at least one condition")}
 			let (mut from, mut of) = (Bits::default(), Bits::default());
-			if live(rule) && rule.inbound.is_some() && self.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()) {r.warning(format!("{at}.inbound"), "a rule scoped by inbound does not apply to traffic that comes in through an Xray inbound: the add-on's hop knows the user and no inbound, so that traffic skips this rule")}
+			if live(rule) && rule.inbound.is_some() && self.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()) {r.warning(format!("{at}.inbound"), "a rule scoped by inbound does not apply to traffic that comes in through an Xray inbound: the add-on's hop knows the user and no inbound, so that traffic skips this rule. Name the transport `xray` to scope a rule to it")}
 			for (j, tag) in rule.inbound.iter().flatten().enumerate().take(MAX_RULE_ENTRIES) {
 				match all_tags.get(tag.as_str()) {
 					Some(inbound) if small && *inbound < 256 => from.set(*inbound),

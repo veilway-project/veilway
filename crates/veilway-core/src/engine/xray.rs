@@ -574,7 +574,7 @@ async fn session(shared: &Arc<Shared>, mut client: TcpStream, secret: &str, via:
 		anyhow::bail!("user {user}: cut off");
 	}
 	if command == 3 {return xray_udp::associate(shared.clone(), client, user, target, via.clone(), &|_| true).await}
-	let mut opened = match connect(shared, plan, at, target, via, None).await {
+	let mut opened = match connect(shared, plan, at, target, via, Some(RuleTransport::Xray)).await {
 		Ok(opened) => opened,
 		Err(refused) => {
 			shared.count(refused.reason);
@@ -809,6 +809,29 @@ mod tests {
 		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Gate, _))));
 		assert!(matches!(exit_for(&plan, 0, "203.0.113.1".parse().unwrap(), 17, 47873, Some("gateway.example.org"), usize::MAX, None), Err((Reason::Gate, _))));
 		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, None), Err((Reason::Unsupported, _))));
+	}
+
+	// What comes through an Xray inbound reports the transport `xray`, so a rule can send it to a netstack exit while the user's own exit is one the add-on cannot use, and nothing else changes.
+	#[test]
+	fn a_rule_on_the_xray_transport_sends_the_add_on_to_a_netstack_exit() {
+		let config = Config::parse(json!({
+			"version": 1,
+			"dns": {"servers": ["1.1.1.1:53"]},
+			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&[0x11; 32]), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
+			"outbounds": [{"tag": "plain", "type": "direct"}],
+			"exits": [{"tag": "up", "backend": {"type": "upstream", "upstream": "b"}}, {"tag": "near", "backend": {"type": "netstack", "outbound": "plain"}}],
+			"routing": {"default": "up", "rules": [{"tag": "xray-out", "transport": ["xray"], "action": {"exit": "near"}}]},
+			"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}],
+			"upstreams": [{"tag": "b", "link": "veilway://sub/sub.example.com/s#v1.a.b.c", "signing_key": "0000 0000 0000 0000 0000 0000 0000 0000", "private_key": veilway_wg::encode_key(&[0x61; 32]), "device_secret": "RERERERERERERERERERERA"}],
+			"xray": {"inbounds": [{"tag": "v1", "protocol": "vless", "listen": "0.0.0.0:8444", "tls": {"self_signed": true}, "decoy": "http://127.0.0.1:8080", "clients": [{"user": "alice", "secret": "0b1c2d3e-4f50-4617-8899-aabbccddeeff"}]}]}
+		}).to_string().as_bytes()).unwrap();
+		let inbound = &config.inbounds[0];
+		let (to_stack, _) = mpsc::channel(1);
+		let tunnel = Arc::new(Tunnel::new(inbound.tag.clone(), Peers {wg: Wg::new(inbound.private_key.expose().0), via: Vec::new()}, to_stack));
+		let plan = Plan::new(&config, time::OffsetDateTime::now_utc(), &Plan::default(), vec![tunnel], &[UpstreamState::new("b", [1; 16], [2; 32])], None).unwrap();
+		let near = plan.exits.iter().position(|exit| exit.tag == "near").unwrap();
+		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, Some(crate::config::RuleTransport::Xray)), Ok((exit, _)) if exit == near));
+		assert!(matches!(exit_for(&plan, 0, "198.51.100.7".parse().unwrap(), 6, 80, None, usize::MAX, Some(crate::config::RuleTransport::Socks5)), Err((Reason::Unsupported, _))), "another transport keeps the user's exit");
 	}
 
 	// The host's own word is the user, since the peer of the lease socket is root when systemd made the socket.

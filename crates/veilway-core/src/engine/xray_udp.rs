@@ -132,7 +132,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 	let label = via.label.as_str();
 	let (name, port, found) = match &target {
 		Target::Address(addr) => (None, addr.port(), vec![addr.ip()]),
-		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name, plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5)).await),
+		Target::Name(name, port) => (Some(name.as_str()), *port, resolve(&shared, &plan, at, name, plan.proxy_index(via.inbound.as_deref()), Some(via.inbound.as_ref().map_or(RuleTransport::Xray, |_| RuleTransport::Socks5))).await),
 	};
 	let shown = plan.show(name.map_or_else(|| found.first().map_or_else(String::new, ToString::to_string), str::to_string));
 	let Some(ip) = found.iter().copied().find(|ip| !gate::refused(*ip, &plan.pools)) else {
@@ -141,7 +141,7 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 		tracing::debug!("{label}: user {user}: udp to {shown}: {}", if found.is_empty() {"no address"} else {"refused by the gate"});
 		return Some(reason);
 	};
-	let (exit, outbound) = match exit_for(&plan, at, ip, 17, port, name, plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5)) {
+	let (exit, outbound) = match exit_for(&plan, at, ip, 17, port, name, plan.proxy_index(via.inbound.as_deref()), Some(via.inbound.as_ref().map_or(RuleTransport::Xray, |_| RuleTransport::Socks5))) {
 		Ok(found) => found,
 		Err((reason, why)) => {
 			shared.count(reason);
@@ -288,7 +288,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 						continue;
 					}
 					let (shared, message) = (shared.clone(), data.to_vec());
-					let (inbound, session) = (plan.proxy_index(via.inbound.as_deref()), via.inbound.as_ref().map(|_| RuleTransport::Socks5));
+					let (inbound, session) = (plan.proxy_index(via.inbound.as_deref()), Some(via.inbound.as_ref().map_or(RuleTransport::Xray, |_| RuleTransport::Socks5)));
 					answers.spawn(async move {
 						let (counted, resolver) = (&plan.users[at], &shared.resolver);
 						shared.spend(counted, true, message.len() + overhead);

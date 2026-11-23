@@ -1664,10 +1664,10 @@ pub struct Routing {
 	pub rules: Vec<Rule>,
 }
 
-/// A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke.
+/// A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke. What a user sends through an Xray inbound reports `xray`, so a rule can send it to a `netstack` exit when the user's own exit is one the add-on cannot use.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
-pub enum RuleTransport {Udp, UdpObfs, Tls, Ws, WsPlain, Fronted, FrontedShaped, Faketls, Socks5, Http}
+pub enum RuleTransport {Udp, UdpObfs, Tls, Ws, WsPlain, Fronted, FrontedShaped, Faketls, Socks5, Http, Xray}
 
 /// Every condition that is present must hold. A condition that is present is never an empty list.
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq, Eq)]

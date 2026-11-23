@@ -1961,7 +1961,7 @@
       "type": "object"
     },
     "RuleTransport": {
-      "description": "A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke.",
+      "description": "A transport a routing rule can name: the kind of session a flow started on. The tunnel transports are `udp` (plain WireGuard, also what a `ws` of a `wireguard` inbound reports as `ws`), `udp-obfs`, `tls`, `ws` (both kinds), `ws-plain`, `fronted`, `fronted-shaped` and `faketls`. A proxy inbound reports `socks5` or `http`, and a `mixed` inbound the one its connection spoke. What a user sends through an Xray inbound reports `xray`, so a rule can send it to a `netstack` exit when the user's own exit is one the add-on cannot use.",
       "enum": [
         "udp",
         "udp-obfs",
@@ -1972,7 +1972,8 @@
         "fronted-shaped",
         "faketls",
         "socks5",
-        "http"
+        "http",
+        "xray"
       ],
       "type": "string"
     },
