@@ -1,6 +1,6 @@
 {
 	"name": "@veilway/sdk",
-	"version": "0.3.20-alpha",
+	"version": "0.3.21-alpha",
 	"description": "Typed client for the Veilway control API",
 	"license": "Apache-2.0",
 	"repository": {
