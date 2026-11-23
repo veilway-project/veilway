@@ -11,12 +11,12 @@ use super::route::{self, Reason};
 use super::wg_stack::Who;
 use super::xray_owner::{self, Lookup};
 use super::xray_out::{self, Wire};
-use super::{dns, flows, gate, xray_udp, Shared};
-use crate::config::{Config, Outbound as ConfigOutbound, Store, XrayProtocol};
+use super::{certificate, dns, flows, gate, xray_udp, Shared};
+use crate::config::{Certificate, Config, Outbound as ConfigOutbound, Store, XrayProtocol};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -33,6 +33,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use veilway_proto::proxy::http::Body;
+use veilway_wg::ws::TlsFiles;
 
 /// The release of Xray-core this build runs. The installer pins its archives and `PIN` pins what they hold.
 pub const RELEASE: &str = "v26.10.21";
@@ -92,16 +93,17 @@ async fn pem(dir: &Path, name: &str) -> anyhow::Result<Vec<String>> {
 /// The document Xray is started with. Users who are disabled are left out, so a change that cuts a user off also stops Xray from accepting their credential. A quota or an expiry is held by the hop, at once.
 /// Everything not listed here goes to a blackhole outbound, which is the first and so the default. Xray has no access log, and the addresses in what it logs are masked. A connection that does not carry a user's credential is handed to the operator's web server on a `vless` or `trojan` listener, as a connection that never was Xray's would be, and a certificate and its key are in the document and not on a path, since Xray has no access to the node's folders.
 /// Each outbound of `wires` adds a loopback SOCKS5 inbound that only routes to it, and the outbound itself (`xray_out`). They are named apart from the inbounds' and the users' by their prefixes.
-fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret: &str, wires: &[Wire]) -> Value {
+/// `pems` holds the certificate and the key of each inbound with TLS, by its tag.
+fn generate(config: &Config, pems: &HashMap<String, (Vec<String>, Vec<String>)>, hop: u16, secret: &str, wires: &[Wire]) -> Value {
 	let able: Vec<&str> = config.users.iter().filter(|user| user.enabled != Some(false)).map(|user| user.name.as_str()).collect();
 	let (mut inbounds, mut used) = (Vec::new(), Vec::<&str>::new());
 	for inbound in config.xray.iter().flat_map(|xray| &xray.inbounds) {
 		// An inbound whose certificate or key could not be read is left out, and the others run.
-		if inbound.tls.as_ref().is_some_and(|tls| !pems.contains_key(tls.cert.as_str()) || !pems.contains_key(tls.key.as_str())) {continue}
+		if inbound.tls.is_some() && !pems.contains_key(&inbound.tag) {continue}
 		let clients: Vec<_> = inbound.clients.iter().filter(|client| able.contains(&client.user.as_str())).collect();
 		used.extend(clients.iter().map(|client| client.user.as_str()));
 		let list: Vec<Value> = clients.iter().map(|client| match inbound.protocol {
-			XrayProtocol::Vless => json!({"id": client.secret.expose(), "email": client.user}),
+			XrayProtocol::Vless => json!({"id": client.secret.expose(), "email": client.user, "flow": client.flow.map_or("", |_| "xtls-rprx-vision")}),
 			XrayProtocol::Trojan | XrayProtocol::Shadowsocks => json!({"password": client.secret.expose(), "email": client.user}),
 		}).collect();
 		let fallbacks: Vec<Value> = inbound.decoy.iter().map(|origin| json!({"dest": if origin.0.port == 80 {format!("{}:80", origin.host())} else {origin.host()}})).collect();
@@ -111,8 +113,8 @@ fn generate(config: &Config, pems: &HashMap<&str, Vec<String>>, hop: u16, secret
 			XrayProtocol::Shadowsocks => json!({"method": "2022-blake3-aes-256-gcm", "password": inbound.server_key.as_ref().map_or("", |key| key.expose().as_str()), "clients": list, "network": "tcp,udp"}),
 		};
 		// Only HTTP/1.1 is offered, because the web server behind the fallback is spoken to in the clear and takes no HTTP/2.
-		let stream = match &inbound.tls {
-			Some(tls) => json!({"network": "tcp", "security": "tls", "tlsSettings": {"alpn": ["http/1.1"], "certificates": [{"certificate": pems.get(tls.cert.as_str()), "key": pems.get(tls.key.as_str())}]}}),
+		let stream = match pems.get(&inbound.tag) {
+			Some((cert, key)) => json!({"network": "tcp", "security": "tls", "tlsSettings": {"alpn": ["http/1.1"], "certificates": [{"certificate": cert, "key": key}]}}),
 			None => json!({"network": "tcp"}),
 		};
 		let protocol = match inbound.protocol {
@@ -156,6 +158,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 	// What one start of Xray has made for its outbounds, and the outbounds it carries.
 	let (mut start_name, mut endpoints, mut carried): (Option<String>, HashMap<String, (PathBuf, String)>, HashMap<String, ConfigOutbound>) = (None, HashMap::new(), HashMap::new());
 	let mut told: HashMap<String, bool> = HashMap::new();
+	let (mut kept, mut renewing): (HashMap<String, certificate::Made>, Option<Instant>) = (HashMap::new(), None);
 	loop {
 		let config = changes.borrow_and_update().config.clone();
 		let (inbounds, hops) = (config.xray.as_ref().is_some_and(|xray| !xray.inbounds.is_empty()), shared.plan().hops.clone());
@@ -172,6 +175,8 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 			waiting = None;
 			(start_name, carried) = (None, HashMap::new());
 			endpoints.clear();
+			shared.xray_pins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+			(kept, renewing) = (HashMap::new(), None);
 		} else if waiting.is_none_or(|until| until <= Instant::now()) {
 			waiting = None;
 			if !inbounds {
@@ -188,14 +193,47 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 				}
 			}
 			if !inbounds || hop.is_some() {
-				let mut files = HashMap::new();
-				for name in config.xray.iter().flat_map(|xray| &xray.inbounds).filter_map(|inbound| inbound.tls.as_ref()).flat_map(|tls| [tls.cert.as_str(), tls.key.as_str()]) {
-					if files.contains_key(name) {continue}
-					match pem(&dir, name).await {
-						Ok(lines) => drop(files.insert(name, lines)),
-						Err(e) => tracing::error!("xray: {e:#}: the inbounds that use it are left out until it can be read"),
+				// A certificate the node makes is kept next to the config file. It lasts `certificate::LASTING`, since Xray's clients pin the whole certificate and a new one would break every link, and is made anew only when its name changes, its files are gone or it is due. The document changes with it, so Xray is started again. A failure keeps the one in use.
+				let (mut files, mut pins, mut made, mut failed, now) = (HashMap::new(), BTreeMap::new(), HashMap::new(), false, (shared.now)());
+				for inbound in config.xray.iter().flat_map(|xray| &xray.inbounds) {
+					let names = match &inbound.tls {
+						None => continue,
+						Some(Certificate::Files(own)) => Some((own.cert.clone(), own.key.clone())),
+						Some(Certificate::SelfSigned(own)) => {
+							let (cert, key) = (format!("xray-{}.crt", inbound.tag), format!("xray-{}.key", inbound.tag));
+							match certificate::ensure_for(TlsFiles {cert: dir.join(&cert), key: dir.join(&key)}, inbound.listen.0, own.name.as_deref(), now, true) {
+								Ok((own, fresh)) => {
+									if fresh {tracing::info!("xray inbound {}: its self-signed certificate was made, valid until {}", inbound.tag, own.not_after)}
+									made.insert(inbound.tag.clone(), own);
+									Some((cert, key))
+								}
+								Err(e) => {
+									failed = true;
+									tracing::error!("xray inbound {}: no self-signed certificate: {e:#}. It is tried again in an hour", inbound.tag);
+									kept.get(&inbound.tag).map(|own: &certificate::Made| {
+										made.insert(inbound.tag.clone(), own.clone());
+										(cert, key)
+									})
+								}
+							}
+						}
+					};
+					let Some((cert, key)) = names else {continue};
+					match (pem(&dir, &cert).await, pem(&dir, &key).await) {
+						(Ok(cert), Ok(key)) => {
+							let Some(pin) = certificate::leaf_pin_hex(&cert.join("\n")) else {
+								tracing::error!("xray inbound {}: the certificate file holds no certificate that reads, so the inbound is left out", inbound.tag);
+								continue;
+							};
+							pins.insert(inbound.tag.clone(), pin);
+							files.insert(inbound.tag.clone(), (cert, key));
+						}
+						(cert, key) => for e in [cert.err(), key.err()].into_iter().flatten() {tracing::error!("xray: {e:#}: the inbound `{}` that uses it is left out until it can be read", inbound.tag)},
 					}
 				}
+				*shared.xray_pins.lock().unwrap_or_else(|e| e.into_inner()) = pins;
+				kept = made;
+				renewing = kept.values().map(|own| own.not_after - certificate::LEAD.whole_seconds() - now.unix_timestamp()).min().map(|secs| Instant::now() + Duration::from_secs(secs.max(1).unsigned_abs())).into_iter().chain(failed.then(|| Instant::now() + Duration::from_secs(certificate::RETRY.unsigned_abs()))).min();
 				// The outbounds that have an address, and why each of the others has none.
 				let (mut ready, mut unreached): (Vec<(&String, IpAddr)>, HashMap<&String, String>) = (Vec::new(), HashMap::new());
 				for (tag, outbound) in &wanted {
@@ -336,7 +374,7 @@ pub(super) async fn run(shared: Arc<Shared>, store: Arc<Store>, dir: PathBuf, so
 				}
 			},
 			_ = async {
-				match [waiting, settling].into_iter().flatten().filter(|until| *until > Instant::now()).min() {
+				match [waiting, settling, renewing].into_iter().flatten().filter(|until| *until > Instant::now()).min() {
 					Some(until) => tokio::time::sleep_until(until.into()).await,
 					None => std::future::pending().await,
 				}
@@ -727,6 +765,27 @@ mod tests {
 	use tokio::sync::mpsc;
 	use veilway_proto::xray::{self, PINS};
 	use veilway_wg::Wg;
+
+	#[test]
+	fn the_vision_flow_is_written_for_the_client_that_has_it_and_a_self_signed_inbound_waits_for_its_certificate() {
+		let config = Config::parse(json!({
+			"version": 1,
+			"dns": {"servers": ["1.1.1.1:53"]},
+			"inbounds": [{"tag": "home", "type": "wireguard", "private_key": veilway_wg::encode_key(&[0x11; 32]), "address": ["10.7.0.1/24"], "transports": [{"type": "udp", "listen": "0.0.0.0:51820"}]}],
+			"outbounds": [{"tag": "plain", "type": "direct"}],
+			"exits": [{"tag": "main", "backend": {"type": "netstack", "outbound": "plain"}}],
+			"routing": {"default": "main", "rules": []},
+			"users": [{"name": "alice", "exits": "all", "devices": [{"name": "laptop", "public_key": veilway_wg::encode_key(&[0x21; 32]), "addresses": ["10.7.0.2"]}]}, {"name": "bob", "exits": "all", "devices": []}],
+			"xray": {"inbounds": [{"tag": "v1", "protocol": "vless", "listen": "0.0.0.0:8444", "tls": {"self_signed": true}, "decoy": "http://127.0.0.1:8080", "clients": [{"user": "alice", "secret": "0b9f4c1e-3d2a-4f6b-8c7d-1e2f3a4b5c6d", "flow": "xtls-rprx-vision"}, {"user": "bob", "secret": "1c0a5d2f-4e3b-4a7c-9d8e-2f3a4b5c6d7e"}]}]}
+		}).to_string().as_bytes()).unwrap();
+		let document = generate(&config, &HashMap::new(), 1, "x", &[]);
+		assert!(document["inbounds"].as_array().unwrap().is_empty());
+		let pems = HashMap::from([("v1".to_string(), (vec!["cert".to_string()], vec!["key".to_string()]))]);
+		let document = generate(&config, &pems, 1, "x", &[]);
+		let clients = &document["inbounds"][0]["settings"]["clients"];
+		assert_eq!((clients[0]["flow"].as_str(), clients[1]["flow"].as_str()), (Some("xtls-rprx-vision"), Some("")));
+		assert_eq!(document["inbounds"][0]["streamSettings"]["tlsSettings"]["certificates"][0], json!({"certificate": ["cert"], "key": ["key"]}));
+	}
 
 	// The add-on's hop is held to the gate of an upstream exit as the tunnel is: a destination that is a gateway of the profile is counted as the gate's refusal, and what else is routed to an upstream exit is refused as unsupported, since the add-on can only use `netstack` exits.
 	#[test]

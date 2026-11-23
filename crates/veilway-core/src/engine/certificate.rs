@@ -22,6 +22,8 @@ pub const VALID_MIN: Duration = Duration::days(80);
 pub const VALID_SPREAD: u32 = 21;
 pub const BACKDATE: u32 = 7 * 86_400;
 pub const LEAD: Duration = Duration::days(20);
+/// The validity of a certificate made for an Xray inbound: about ten years. Xray's clients pin the whole certificate, not its key, so a certificate made anew would break every link; this one is kept for the life of the node.
+pub const LASTING: Duration = Duration::days(3650);
 /// How long a renewal that failed waits before it is tried again, so that a full disk is said once an hour and not at every sweep.
 pub const RETRY: i64 = 3_600;
 const SUFFIXES: [&str; 8] = ["local", "lan", "internal", "home.arpa", "localdomain", "intranet", "corp", "lab"];
@@ -102,6 +104,13 @@ pub fn file_pin(files: &TlsFiles) -> Option<([u8; 32], i64, i64)> {
 	Some((digest(&SHA256, cert.public_key().raw).as_ref().try_into().ok()?, cert.validity().not_before.timestamp(), cert.validity().not_after.timestamp()))
 }
 
+/// The pin an Xray client takes as `pinnedPeerCertSha256`: the lowercase hex SHA-256 of the DER of the first certificate in `pem`, the leaf. Not the SPKI pin the node's own profiles carry. None when `pem` has no certificate that reads.
+pub fn leaf_pin_hex(pem: &str) -> Option<String> {
+	let der = CertificateDer::from_pem_slice(pem.as_bytes()).ok()?;
+	x509_parser::parse_x509_certificate(&der).ok()?;
+	Some(digest(&SHA256, &der).as_ref().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 /// What `veilway doctor` reads, writing nothing: the pin of the key kept for `files` and, when the certificate file holds a certificate of that key, its validity, which is 0 to 0 otherwise. None while there is no key: the node makes it at its next start.
 pub fn read(files: TlsFiles, listen: SocketAddr) -> anyhow::Result<Option<Made>> {
 	let Some(key) = key(&files)? else {return Ok(None)};
@@ -110,7 +119,7 @@ pub fn read(files: TlsFiles, listen: SocketAddr) -> anyhow::Result<Option<Made>>
 }
 
 // The certificate of `key` as its file holds it, unless that is missing, does not read, is not of that key, has another name than `name` asks for or is due, when one is made and written. The second value says whether one was made.
-fn certify(files: TlsFiles, listen: SocketAddr, name: Option<&str>, key: &KeyPair, now: OffsetDateTime) -> anyhow::Result<(Made, bool)> {
+fn certify(files: TlsFiles, listen: SocketAddr, name: Option<&str>, key: &KeyPair, now: OffsetDateTime, lasting: bool) -> anyhow::Result<(Made, bool)> {
 	let (held, clock) = (held(&files, key), now.unix_timestamp());
 	let current = Made {listen, files, name: name.map(str::to_owned), pin: pin(key), not_before: 0, not_after: 0, retry: 0};
 	if let Some((Some(held), not_before, not_after)) = &held {
@@ -140,7 +149,7 @@ fn certify(files: TlsFiles, listen: SocketAddr, name: Option<&str>, key: &KeyPai
 	// A serial is a positive number.
 	serial[0] &= 0x7f;
 	let start = now.replace_nanosecond(0).unwrap_or(now) - Duration::seconds(i64::from(u32::from_le_bytes([drawn[16], drawn[17], drawn[18], drawn[19]]) % BACKDATE));
-	let end = start + VALID_MIN + Duration::days(i64::from(u32::from(drawn[21]) % VALID_SPREAD));
+	let end = start + (if lasting {LASTING} else {VALID_MIN}) + Duration::days(i64::from(u32::from(drawn[21]) % VALID_SPREAD));
 	let mut params = CertificateParams::new(vec![name.clone()]).context("the name is no name")?;
 	params.distinguished_name = DistinguishedName::new();
 	params.distinguished_name.push(DnType::CommonName, name);
@@ -152,7 +161,10 @@ fn certify(files: TlsFiles, listen: SocketAddr, name: Option<&str>, key: &KeyPai
 
 /// The key and the certificate of the listener at `listen`, kept in `files`: the key as it was kept, or a new one when there is none yet, and the certificate as `certify` has it. `name` is the config's `tls.name`.
 /// A key file that is there and does not read as a key of ECDSA on P-256 is an error: it is never written over, since it may be the one key every profile pins. The second value says whether a new key was made, which is a new pin.
-pub fn ensure(files: TlsFiles, listen: SocketAddr, name: Option<&str>, now: OffsetDateTime) -> anyhow::Result<(Made, bool)> {
+pub fn ensure(files: TlsFiles, listen: SocketAddr, name: Option<&str>, now: OffsetDateTime) -> anyhow::Result<(Made, bool)> {ensure_for(files, listen, name, now, false)}
+
+/// `ensure`, with a certificate that lasts `LASTING` when `lasting` is set.
+pub fn ensure_for(files: TlsFiles, listen: SocketAddr, name: Option<&str>, now: OffsetDateTime, lasting: bool) -> anyhow::Result<(Made, bool)> {
 	let (key, made_key) = match key(&files)? {
 		Some(key) => (key, false),
 		None => {
@@ -171,7 +183,7 @@ pub fn ensure(files: TlsFiles, listen: SocketAddr, name: Option<&str>, now: Offs
 			Err(e) => tracing::warn!("{}: group or others can read the key of the self-signed certificate of {listen}, and the node cannot restrict it ({}). Whoever reads it can answer as this node to every profile that pins it: restrict it (chmod 600)", files.key.display(), e.kind()),
 		}
 	}
-	let (made, renewed) = certify(files, listen, name, &key, now)?;
+	let (made, renewed) = certify(files, listen, name, &key, now, lasting)?;
 	Ok((made, made_key || renewed))
 }
 
@@ -179,7 +191,7 @@ pub fn ensure(files: TlsFiles, listen: SocketAddr, name: Option<&str>, now: Offs
 pub fn renew(current: &Made, now: OffsetDateTime) -> anyhow::Result<Made> {
 	let key = key(&current.files)?.ok_or_else(|| anyhow!("the key file {} is gone: the node does not make a new key while it runs, since the pin would change and every profile would need a refreshed subscription", current.files.key.display()))?;
 	if pin(&key) != current.pin {anyhow::bail!("the key file {} holds another key than the one the node started with: the pin would change from {} to {} and every profile would need a refreshed subscription", current.files.key.display(), current.pin_text(), veilway_wg::encode_key(&pin(&key)))}
-	Ok(certify(current.files.clone(), current.listen, current.name.as_deref(), &key, now)?.0)
+	Ok(certify(current.files.clone(), current.listen, current.name.as_deref(), &key, now, false)?.0)
 }
 
 #[cfg(test)]
@@ -290,6 +302,31 @@ mod tests {
 		let udp: Transport = serde_json::from_value(serde_json::json!({"type": "udp", "listen": "127.0.0.1:51820"})).unwrap();
 		let all = [udp, tls.clone(), tls];
 		assert_eq!((stem("edge", &all, 1), stem("edge", &all, 2)), ("edge".to_owned(), "edge-1".to_owned()));
+	}
+
+	#[test]
+	fn a_lasting_certificate_is_kept_for_years() {
+		let (dir, listen, now) = (scratch("lasting"), SocketAddr::from(([0, 0, 0, 0], 8444)), OffsetDateTime::now_utc());
+		let (first, made) = ensure_for(files(&dir, "xray"), listen, None, now, true).unwrap();
+		assert!(made && first.not_after - first.not_before >= LASTING.whole_seconds());
+		let (kept, again) = ensure_for(files(&dir, "xray"), listen, None, now + Duration::days(400), true).unwrap();
+		assert!(!again && kept.not_before == first.not_before);
+	}
+
+	#[test]
+	fn the_pin_of_an_xray_client_is_the_hex_of_the_leaf_der_and_not_of_its_key() {
+		let (dir, listen) = (scratch("hex"), SocketAddr::from(([127, 0, 0, 1], 443)));
+		let (made, _) = ensure(files(&dir, "edge"), listen, None, OffsetDateTime::now_utc()).unwrap();
+		let pem = fs::read_to_string(&made.files.cert).unwrap();
+		let hex = leaf_pin_hex(&pem).unwrap();
+		let der = CertificateDer::from_pem_slice(pem.as_bytes()).unwrap();
+		assert!(hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+		assert_eq!(hex.as_bytes().chunks(2).map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()).collect::<Vec<_>>(), digest(&SHA256, &der).as_ref());
+		assert_ne!(hex, made.pin.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+		assert!(leaf_pin_hex("not a certificate").is_none() && leaf_pin_hex("").is_none());
+		// A certificate made anew has another DER, so another pin, with the same key.
+		let renewed = renew(&made, OffsetDateTime::from_unix_timestamp(made.not_after - LEAD.whole_seconds()).unwrap()).unwrap();
+		assert!(renewed.pin == made.pin && leaf_pin_hex(&fs::read_to_string(&made.files.cert).unwrap()).unwrap() != hex);
 	}
 
 	#[test]

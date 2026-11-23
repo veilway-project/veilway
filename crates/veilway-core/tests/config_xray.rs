@@ -93,6 +93,30 @@ fn check_marker(doc: &Value) -> bool {
 }
 
 #[test]
+fn a_self_signed_certificate_and_the_vision_flow_read_and_the_rules_hold() {
+	let mut doc = node();
+	doc["xray"]["inbounds"][0]["tls"] = json!({"self_signed": true, "name": "www.example.org"});
+	doc["xray"]["inbounds"][0]["clients"][0]["flow"] = json!("xtls-rprx-vision");
+	let report = check(&doc);
+	assert!(report.errors.is_empty(), "{:#?}", report.errors);
+	let config = Config::parse(doc.to_string().as_bytes()).unwrap();
+	assert_eq!(serde_json::to_value(&config).unwrap()["xray"]["inbounds"][0]["tls"], json!({"self_signed": true, "name": "www.example.org"}));
+	assert_eq!(serde_json::to_value(&config).unwrap()["xray"]["inbounds"][0]["clients"][0]["flow"], json!("xtls-rprx-vision"));
+	refused("xray.inbounds[0].tls.name", |doc| doc["xray"]["inbounds"][0]["tls"] = json!({"self_signed": true, "name": "Not A Name"}));
+	refused("xray.inbounds[2].tls", |doc| doc["xray"]["inbounds"][2]["tls"] = json!({"self_signed": true}));
+	refused("xray.inbounds[1].clients[0].flow", |doc| doc["xray"]["inbounds"][1]["clients"][0]["flow"] = json!("xtls-rprx-vision"));
+	refused("xray.inbounds[2].clients[0].flow", |doc| doc["xray"]["inbounds"][2]["clients"][0]["flow"] = json!("xtls-rprx-vision"));
+	for bad in [json!({"self_signed": true, "cert": "a", "key": "b"}), json!({"self_signed": false}), json!({"cert": "a", "key": "b", "name": "x.example"})] {
+		let mut doc = node();
+		doc["xray"]["inbounds"][0]["tls"] = bad;
+		assert!(Config::parse(doc.to_string().as_bytes()).is_err());
+	}
+	let mut doc = node();
+	doc["xray"]["inbounds"][0]["clients"][0]["flow"] = json!("xtls-rprx-direct");
+	assert!(Config::parse(doc.to_string().as_bytes()).is_err());
+}
+
+#[test]
 fn a_change_of_the_section_is_a_change() {
 	let (old, new) = (Config::parse(node().to_string().as_bytes()).unwrap(), {
 		let mut doc = node();

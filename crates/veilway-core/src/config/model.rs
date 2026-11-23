@@ -2123,9 +2123,9 @@ pub struct XrayInbound {
 	pub protocol: XrayProtocol,
 	/// The public listener of Xray.
 	pub listen: Addr,
-	/// The certificate files of the listener. Required for `vless` and `trojan`, and not allowed for `shadowsocks`, which encrypts itself.
+	/// The certificate of the listener: `{"cert": "file.crt", "key": "file.key"}` files next to the config file, or `{"self_signed": true, "name": "optional.example"}` for a key and certificate the node makes, keeps and renews like those of a `tls` transport (files `xray-<tag>.crt` and `xray-<tag>.key` next to the config file). Xray is given them in its document, and a renewal starts it again. The control API's status reports `xray_pins` for both kinds: the lowercase hex SHA-256 of the leaf certificate, the `pinnedPeerCertSha256` of an Xray client. Required for `vless` and `trojan`, and not allowed for `shadowsocks`, which encrypts itself.
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub tls: Option<Tls>,
+	pub tls: Option<Certificate>,
 	/// Where a connection that is not a user's goes after the TLS handshake: the operator's own web server, the same one the `decoy.origin` of a `tls` transport names. Required for `vless` and `trojan`, not allowed for `shadowsocks`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub decoy: Option<Origin>,
@@ -2145,6 +2145,9 @@ pub struct XrayClient {
 	/// A UUID for `vless`. For `trojan` a password of 22 to 128 characters from A-Z a-z 0-9 and _ - . + / =. For `shadowsocks` a key of 32 bytes as standard base64. No two clients of an inbound share a secret.
 	#[schemars(length(min = 22, max = 128))]
 	pub secret: Secret<String>,
+	/// `xtls-rprx-vision` for a `vless` client that speaks the Vision flow. Not allowed for `trojan` and `shadowsocks`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub flow: Option<XrayFlow>,
 }
 
 #[derive(Deserialize, Serialize, JsonSchema, Clone, Copy, Debug, PartialEq, Eq)]

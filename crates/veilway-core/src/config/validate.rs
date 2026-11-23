@@ -1183,6 +1183,10 @@ impl Config {
 					(Some(_), true) => r.error(format!("{at}.tls"), "expected no tls: shadowsocks encrypts itself"),
 					_ => {}
 				}
+				match &inbound.tls {
+					Some(Certificate::SelfSigned(SelfSigned {name: Some(name), ..})) if name.len() > 64 || !domain(name, false) => r.error(format!("{at}.tls.name"), "expected a lowercase DNS name of at most 64 characters, such as www.example.com: the certificate carries it as its subject"),
+					_ => {}
+				}
 				match (&inbound.decoy, sealed) {
 					(None, false) => r.error(format!("{at}.decoy"), "expected the origin of the operator's own web server, such as http://127.0.0.1:8080: a connection that is not a user's is sent there, so the listener answers a stranger as a web server would"),
 					(Some(_), true) => r.error(format!("{at}.decoy"), "expected no decoy: shadowsocks answers a stranger with nothing"),
@@ -1201,6 +1205,7 @@ impl Config {
 				for (j, client) in inbound.clients.iter().enumerate().take(MAX_USERS) {
 					let at = format!("{at}.clients[{j}]");
 					if !user_names.contains_key(client.user.as_str()) {r.error(format!("{at}.user"), "expected the name of a user, found a name no user has")}
+					if client.flow.is_some() && inbound.protocol != XrayProtocol::Vless {r.error(format!("{at}.flow"), "expected no flow: only a vless client has one")}
 					let secret = client.secret.expose();
 					if secret == REDACTED {
 						r.error(format!("{at}.secret"), "expected a secret, found the marker the control API shows in the place of one: write the secret itself");

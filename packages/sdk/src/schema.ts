@@ -1160,6 +1160,10 @@ export interface components {
             /** Format: uint */
             users: number;
             version: string;
+            /** @description For each Xray inbound with TLS that runs, by tag: the lowercase hex SHA-256 of the DER of its leaf certificate, which is the `pinnedPeerCertSha256` of an Xray client. For a self-signed certificate it changes with each renewal, since the certificate does. Empty for a node with none. */
+            xray_pins: {
+                [key: string]: string;
+            };
         };
         /** @description What the stream listeners of the `tls` transports, and of the `ws` and `fronted` transports of `veilway` inbounds, did since start, and what they hold right now. Everything but `undecided`, `relayed`, `pending`, `sessions`, `proxies`, `decoys` and `fronted` only grows. Whoever is not a user gets the decoy origin's answer whatever the reason, and no reason holds an address, a path, a token or a key. */
         Stream: {

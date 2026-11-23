@@ -148,6 +148,8 @@ pub struct Status {
 	pub flows: usize,
 	/// The certificate of every `tls` transport, one for each listen address, with its pin: the ones the node made for transports with `"self_signed": true` (`self_signed` true), and the ones read from the `cert` file of the others (`self_signed` false: a chain from an authority, the pin is the second condition). Empty for a node that has none.
 	pub certificates: Vec<SelfSigned>,
+	/// For each Xray inbound with TLS that runs, by tag: the lowercase hex SHA-256 of the DER of its leaf certificate, which is the `pinnedPeerCertSha256` of an Xray client. For a self-signed certificate it changes with each renewal, since the certificate does. Empty for a node with none.
+	pub xray_pins: std::collections::BTreeMap<String, String>,
 	/// The node's public addresses, as the config names them: host names or IP addresses, with no port. A profile is given these, each with the port of one of its transports. Empty for a node that names none.
 	pub public_addresses: Vec<config::Host>,
 	pub addons: Addons,

@@ -2027,6 +2027,13 @@
           },
           "version": {
             "type": "string"
+          },
+          "xray_pins": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "For each Xray inbound with TLS that runs, by tag: the lowercase hex SHA-256 of the DER of its leaf certificate, which is the `pinnedPeerCertSha256` of an Xray client. For a self-signed certificate it changes with each renewal, since the certificate does. Empty for a node with none.",
+            "type": "object"
           }
         },
         "required": [
@@ -2039,6 +2046,7 @@
           "users",
           "flows",
           "certificates",
+          "xray_pins",
           "public_addresses",
           "addons"
         ],
