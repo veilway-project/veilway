@@ -249,7 +249,7 @@ fn a_rule_by_transport_names_only_transports_that_exist_and_warns_for_those_the_
 	doc["routing"]["rules"] = rule(json!(["udp", "http", "socks5"]));
 	let report = check(&doc);
 	assert!(report.errors.is_empty() && !report.warnings.iter().any(|warning| warning.path.contains("transport")), "{report:#?}");
-	for unknown in ["tcp", "UDP", "wireguard", "xray", ""] {
+	for unknown in ["tcp", "UDP", "wireguard", "vless", ""] {
 		doc["routing"]["rules"] = rule(json!([unknown]));
 		assert!(Config::parse(doc.to_string().as_bytes()).is_err(), "{unknown:?} was taken for a transport");
 	}
@@ -261,6 +261,8 @@ fn a_rule_by_transport_names_only_transports_that_exist_and_warns_for_those_the_
 	doc["inbounds"].as_array_mut().unwrap().truncate(1);
 	doc["routing"]["rules"] = rule(json!(["socks5"]));
 	assert!(check(&doc).warnings.iter().any(|warning| warning.path == "routing.rules[0].transport[0]"), "socks5 without a proxy inbound");
+	doc["routing"]["rules"] = rule(json!(["xray"]));
+	assert!(check(&doc).warnings.iter().any(|warning| warning.path == "routing.rules[0].transport[0]"), "xray without an Xray inbound");
 	doc["routing"]["rules"] = json!([{"tag": "a", "transport": ["udp"], "action": "block"}, {"tag": "b", "transport": ["udp"], "ip": ["203.0.113.0/24"], "action": "block"}]);
 	assert!(check(&doc).warnings.iter().any(|warning| warning.path == "routing.rules[1]" && warning.message.contains("never matches")), "a rule by transport is covered by an earlier one on the same transport");
 	doc["routing"]["rules"] = json!([{"tag": "a", "transport": ["udp"], "action": "block"}, {"tag": "b", "ip": ["203.0.113.0/24"], "action": "block"}]);
