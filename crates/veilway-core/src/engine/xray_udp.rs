@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 /// Associations one user may hold, and all users together.
-pub(super) const MAX_ASSOCIATIONS_PER_USER: usize = 32;
+pub(super) const MAX_ASSOCIATIONS_PER_USER: usize = 256;
 pub(super) const MAX_ASSOCIATIONS: usize = 4096;
 /// Flows in one association, of one user in all of theirs, and in all associations. A flow also counts against the user's `flows`, with their TCP connections.
 const MAX_FLOWS_PER_ASSOCIATION: usize = 64;
@@ -233,6 +233,8 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 	};
 	tracing::debug!("{}: user {user}: udp association on {bound}", via.label);
 	let (mut buffer, mut sink, mut seen, mut tick) = (vec![0u8; BUFFER], [0u8; 1], Instant::now(), tokio::time::interval(WATCH));
+	// An association that carried only DNS ends once it is quiet for `DNS_IDLE`: phones open one for each lookup and would hold the user's caps for minutes.
+	let mut only_dns = true;
 	// The source whose owner was found to be `uid`, and the lookups made in the second that began at the instant.
 	let (mut verified, mut checks) = (None::<SocketAddr>, (Instant::now(), 0usize));
 	let (back, mut replies) = mpsc::channel::<Vec<u8>>(QUEUE);
@@ -363,6 +365,7 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 				next += 1;
 				let (sender, receiver) = mpsc::channel(QUEUE);
 				let _ = sender.try_send(data.to_vec());
+				only_dns &= matches!(&target, Target::Address(addr) if addr.port() == 53) || matches!(&target, Target::Name(_, 53));
 				flows.insert(target.clone(), (next, Held::Live(sender)));
 				let (shared, back, user, number, key, via) = (shared.clone(), back.clone(), user.clone(), next, target.clone(), via.clone());
 				tasks.spawn(async move {
@@ -396,8 +399,9 @@ pub(super) async fn associate(shared: Arc<Shared>, mut control: TcpStream, user:
 			// The association belongs to the connection that asked for it: Xray closing it ends the association, and so does anything it sends on it.
 			_ = control.read(&mut sink) => break,
 			_ = tick.tick() => {
-				if seen.elapsed() >= ASSOCIATION_IDLE {
-					tracing::debug!("{}: user {user}: udp association ended, it was quiet for {ASSOCIATION_IDLE:?}", via.label);
+				let idle = if only_dns {DNS_IDLE} else {ASSOCIATION_IDLE};
+				if seen.elapsed() >= idle {
+					tracing::debug!("{}: user {user}: udp association ended, it was quiet for {idle:?}", via.label);
 					break;
 				}
 				let now = shared.plan();
@@ -502,7 +506,7 @@ mod tests {
 		assert!(Slot::take(&limits.user_flows, "bob", limits.per_user_flows).is_some());
 		drop(a1);
 		assert!(Slot::take(&limits.user_flows, "alice", limits.per_user_flows).is_some());
-		assert_eq!((MAX_ASSOCIATIONS_PER_USER, MAX_FLOWS_PER_USER), (32, 256));
+		assert_eq!((MAX_ASSOCIATIONS_PER_USER, MAX_FLOWS_PER_USER), (256, 256));
 	}
 
 	/// An address of this machine that is not loopback, which the gate lets a destination be.
