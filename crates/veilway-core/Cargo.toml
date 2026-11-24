@@ -27,7 +27,7 @@ tracing.workspace=true
 ipstack.workspace=true
 ipnet.workspace=true
 etherparse.workspace=true
-smoltcp.workspace=true
+smoltcp={workspace=true, features=["socket-tcp-cubic"]}
 base64.workspace=true
 schemars.workspace=true
 time.workspace=true

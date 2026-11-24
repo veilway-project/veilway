@@ -193,6 +193,11 @@ impl Tcb {
     }
 
     /// veilway patch: the sender's segment size for congestion control.
+    /// veilway patch: the MSS the SYN/ACK announces, the MTU less the headers. Without the option a peer may send no more than 536 bytes a segment (RFC 9293 3.7.1).
+    pub(super) fn own_mss(&self, v4: bool) -> u16 {
+        self.mtu.saturating_sub(if v4 { 40 } else { 60 }).max(88)
+    }
+
     fn smss(&self) -> u32 {
         u32::from(self.peer_mss).min(u32::from(self.mtu).saturating_sub(40)).max(88)
     }

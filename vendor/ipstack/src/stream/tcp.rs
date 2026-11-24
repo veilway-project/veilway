@@ -1017,14 +1017,17 @@ fn extract_data_n_write_upstream(
         return Ok(());
     }
 
-    if let Some(data) = tcb.consume_unordered_packets(8192) {
+    // veilway patch: everything in order is handed over at once, not 8192 bytes a segment: after a gap was filled the rest
+    // waited for segments the sender did not send, since it waited for this ACK. And every segment is answered, one out of
+    // order with the ACK it already had, so the sender sees duplicate ACKs and sends the missing one again (RFC 9293 3.10.7.4).
+    if let Some(data) = tcb.consume_unordered_packets(usize::MAX) {
         let hint = if state == TcpState::Established { "normally" } else { "still" };
         log::trace!("{network_tuple} {state:?}: {l_info} {hint} receiving data, len = {}", data.len());
         tcb.queued.fetch_add(data.len(), std::sync::atomic::Ordering::Relaxed);
         data_tx.send(data).map_err(|e| std::io::Error::new(BrokenPipe, e))?;
         read_notify.lock().unwrap().take().map(|w| w.wake_by_ref()).unwrap_or(());
-        write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     }
+    write_packet_to_device(up_packet_sender, network_tuple, tcb, None, ACK, None, None)?;
     Ok(())
 }
 
@@ -1046,7 +1049,9 @@ pub(crate) fn write_packet_to_device(
     let window = if syn { tcb.get_recv_window() } else { tcb.get_recv_window() >> shift };
     // veilway patch: no floor of one MTU any more. A window of zero is announced as zero, so that a reader that is slow holds the peer back, see `Tcb::queued`.
     let (ack, window_size) = (tcb.get_ack().0, window.min(u32::from(u16::MAX)) as u16);
-    let scaled: Option<Vec<TcpOptions>> = (syn && shift > 0).then(|| options.into_iter().flatten().cloned().chain([TcpOptions::WindowScale(shift)]).collect());
+    // veilway patch: and its MSS, so the peer's segments fill the MTU instead of the 536 bytes it must assume without one.
+    let mss = TcpOptions::MaximumSegmentSize(tcb.own_mss(tuple.src.is_ipv4()));
+    let scaled: Option<Vec<TcpOptions>> = syn.then(|| options.into_iter().flatten().filter(|option| !matches!(option, TcpOptions::MaximumSegmentSize(_))).cloned().chain([mss]).chain((shift > 0).then_some(TcpOptions::WindowScale(shift))).collect());
     let options = scaled.as_ref().or(options);
     let (src, dst) = (tuple.dst, tuple.src); // Note: The address is reversed here
     let calc = |ip_header_len: usize, tcp_header_len: usize| tcb.calculate_payload_max_len(ip_header_len, tcp_header_len);

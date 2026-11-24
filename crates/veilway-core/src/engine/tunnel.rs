@@ -363,7 +363,12 @@ async fn bridge<S: AsyncRead + AsyncWrite + Unpin>(shared: &Arc<Shared>, exit: &
 			let plan = shared.plan();
 			// "A connection stays on its link and is reset when that link goes down."
 			let Some((exit, link)) = route(shared, &plan, exit, How::Stay(&id)) else {break Ended::Reset};
-			iface.poll(clock(), &mut device, &mut sockets);
+			// A poll sends one segment of the socket: it is polled again while it makes more, up to what the device holds.
+			loop {
+				let made = device.tx.len();
+				iface.poll(clock(), &mut device, &mut sockets);
+				if device.tx.len() == made || device.tx.len() >= MADE {break}
+			}
 			let mut sent = true;
 			for raw in std::mem::take(&mut device.tx) {
 				sent = sent && shared.tunnelled(&plan, exit, link, raw).await;
