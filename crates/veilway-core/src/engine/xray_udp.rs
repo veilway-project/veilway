@@ -142,7 +142,8 @@ async fn flow(shared: Arc<Shared>, plan: Arc<Plan>, at: usize, target: Target, f
 		return Some(reason);
 	};
 	let (exit, outbound) = match exit_for(&plan, at, ip, 17, port, name, plan.proxy_index(via.inbound.as_deref()), Some(via.inbound.as_ref().map_or(RuleTransport::Xray, |_| RuleTransport::Socks5))) {
-		Ok(found) => found,
+		Ok((exit, Some(outbound))) => (exit, outbound),
+		Ok((_, None)) => unreachable!("a chain exit is given for TCP only"),
 		Err((reason, why)) => {
 			shared.count(reason);
 			tracing::debug!("{label}: user {user}: udp to {shown}: {why}");

@@ -11,7 +11,7 @@ use super::route::{self, Reason};
 use super::wg_stack::Who;
 use super::xray_owner::{self, Lookup};
 use super::xray_out::{self, Wire};
-use super::{certificate, dns, flows, gate, xray_udp, Shared};
+use super::{certificate, dns, flows, gate, tunnel, xray_udp, Shared};
 use crate::config::{Certificate, Config, Outbound as ConfigOutbound, Store, XrayProtocol};
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
@@ -615,11 +615,12 @@ pub(super) async fn connect(shared: &Arc<Shared>, plan: Arc<Plan>, at: usize, ta
 		Err((reason, why)) => return Err(Refused {reason, code: 2, why: anyhow::anyhow!("user {user}: {shown}: {why}")}),
 	};
 	let dialled = match outbound {
-		Outbound::Socks5(up) => tokio::time::timeout(DIAL, flows::dial_conn(up, dst, tokio::time::Instant::now() + DIAL)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|failure| failure.error)),
-		Outbound::WireGuard(out) if out.has(ip) => tokio::time::timeout(DIAL, out.connect(dst, Who::User(at))).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Stack).map_err(|why| anyhow::anyhow!("{why}"))),
-		Outbound::WireGuard(_) => Err(anyhow::anyhow!("the exit's address is of the other family")),
-		Outbound::Direct {bind: Some(bind), ..} if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
-		Outbound::Direct {bind, interface} => tokio::time::timeout(DIAL, flows::connect_from(*bind, interface.as_deref(), dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Tcp).map_err(|e| anyhow::anyhow!("{}", e.kind()))),
+		None => tokio::time::timeout(DIAL, tunnel::dial(shared, &plan.exits[exit].tag, dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Stack)),
+		Some(Outbound::Socks5(up)) => tokio::time::timeout(DIAL, flows::dial_conn(up, dst, tokio::time::Instant::now() + DIAL)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map_err(|failure| failure.error)),
+		Some(Outbound::WireGuard(out)) if out.has(ip) => tokio::time::timeout(DIAL, out.connect(dst, Who::User(at))).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Stack).map_err(|why| anyhow::anyhow!("{why}"))),
+		Some(Outbound::WireGuard(_)) => Err(anyhow::anyhow!("the exit's address is of the other family")),
+		Some(Outbound::Direct {bind: Some(bind), ..}) if bind.is_ipv4() != ip.is_ipv4() => Err(anyhow::anyhow!("the exit's address is of the other family")),
+		Some(Outbound::Direct {bind, interface}) => tokio::time::timeout(DIAL, flows::connect_from(*bind, interface.as_deref(), dst)).await.map_err(|_| anyhow::anyhow!("timed out")).and_then(|result| result.map(flows::Conn::Tcp).map_err(|e| anyhow::anyhow!("{}", e.kind()))),
 	};
 	let remote = dialled.map_err(|e| Refused {reason: Reason::Unreachable, code: 5, why: anyhow::anyhow!("user {user}: {shown}: exit {}: {e}", plan.exits[exit].tag)})?;
 	tracing::debug!("{}: user {user}: {shown} through exit {}", via.label, plan.exits[exit].tag);
@@ -688,7 +689,7 @@ pub(super) async fn relay(shared: &Shared, opened: &mut Opened, client: &mut Tcp
 }
 
 /// The exit the rules give a flow of user `at` that came in through `inbound` on a session of `transport` (None for the Xray hop) (the number rules' `inbound` conditions use, `usize::MAX` for the Xray hop, which has none) to `ip` and `port` (`name` when it was asked for by name) and the outbound of that exit, which TCP and UDP both ask: the gate has already been through. An error is what to count and what to say.
-pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>, inbound: usize, transport: Option<RuleTransport>) -> Result<(usize, &'a Outbound), (Reason, String)> {
+pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, port: u16, name: Option<&str>, inbound: usize, transport: Option<RuleTransport>) -> Result<(usize, Option<&'a Outbound>), (Reason, String)> {
 	// A name asked for, or one the user resolved to this address through the node's resolver: an address alone is matched by domain rules the way the tunnel does it.
 	let exit = match route::evaluate(plan, inbound, at, ip, protocol, port, None, transport, &|patterns| name.is_some_and(|name| patterns.iter().any(|pattern| pattern.matches(name))) || plan.users[at].state.names().matches(ip, patterns, Instant::now())) {
 		Action::Exit(exit) => *exit,
@@ -698,11 +699,13 @@ pub(super) fn exit_for<'a>(plan: &'a Plan, at: usize, ip: IpAddr, protocol: u8, 
 	let tag = plan.exits[exit].tag.as_str();
 	if plan.users[at].entitled.as_ref().is_some_and(|list| !list.contains(&exit)) {return Err((Reason::Entitlement, format!("exit {tag} is not in the user's exits")))}
 	match &plan.exits[exit].backend {
-		Backend::Netstack {outbound, ..} => Ok((exit, outbound)),
+		Backend::Netstack {outbound, ..} => Ok((exit, Some(outbound))),
 		Backend::Block => Err((Reason::BlockExit, format!("exit {tag} blocks"))),
 		// The gateways of an upstream's profile are the engine's own, as they are for the flows of the tunnels: no flow of a user goes there through that exit, whichever way it came in.
 		Backend::Chain {links} if plan.reaches_upstream(links, ip) => Err((Reason::Gate, format!("exit {tag} is an upstream, and the address is a gateway of its profile"))),
-		_ => Err((Reason::Unsupported, format!("exit {tag} is not a netstack exit, which is all the add-on can use"))),
+		// TCP goes through a `chain` exit as a tunnel's connection does (`tunnel::dial`): None is that.
+		Backend::Chain {links} if protocol == 6 && !plan.upstream_backed(links) => Ok((exit, None)),
+		_ => Err((Reason::Unsupported, format!("exit {tag} is not a netstack exit, which is all the add-on can use for UDP"))),
 	}
 }
 

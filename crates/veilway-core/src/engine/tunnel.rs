@@ -20,9 +20,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinSet};
 use tokio::time::{interval, sleep, sleep_until, Instant, MissedTickBehavior};
 
@@ -298,24 +298,42 @@ enum Ended {Graceful, Unopened, Reset, Idle}
 
 /// One TCP connection: "The entry ends the client's TCP connection with the system's TCP, and opens its own TCP connection inside the link with a userspace TCP stack. Bytes are copied both ways, a half close is passed on, and a reset on either side resets the other."
 async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream: TcpStream, peer: SocketAddr, slot: Slot) {
-	let (state, target) = (slot.state.clone(), tunnel.target.0);
+	if !bridge(&shared, &tunnel.exit, &mut stream, peer, tunnel.target.0, &slot, None).await {reset(&stream)}
+}
+
+/// A TCP connection to `target` through the `chain` exit `exit`, opened inside a link as a tunnel's connection is, for the Xray hop and the proxy inbounds. The stream is the caller's to copy through; the connection runs in a task of its own until either side ends it, and is not counted with any tunnel.
+pub(super) async fn dial(shared: &Arc<Shared>, exit: &str, target: SocketAddr) -> anyhow::Result<DuplexStream> {
+	let (near, mut far) = tokio::io::duplex(WINDOW);
+	let (opened, open) = oneshot::channel();
+	let (shared, exit) = (shared.clone(), exit.to_string());
+	tokio::spawn(async move {
+		let slot = Slot {state: Arc::new(State::default()), seq: 0, source: IpAddr::from([0, 0, 0, 0]), closed: Arc::new(AtomicBool::new(false))};
+		bridge(&shared, &exit, &mut far, SocketAddr::from(([0, 0, 0, 0], 0)), target, &slot, Some(opened)).await;
+	});
+	open.await.map_err(|_| anyhow::anyhow!("the link did not open the connection"))?;
+	Ok(near)
+}
+
+/// Copies one connection of `stream` through the link, telling `opened` once the far side answered. False when the stream is to be reset.
+async fn bridge<S: AsyncRead + AsyncWrite + Unpin>(shared: &Arc<Shared>, exit: &str, stream: &mut S, peer: SocketAddr, target: SocketAddr, slot: &Slot, mut opened: Option<oneshot::Sender<()>>) -> bool {
+	let state = slot.state.clone();
 	let key = Key {protocol: Protocol::TCP, src: peer.ip(), dst: target.ip(), sport: peer.port(), dport: target.port()};
 	let plan = shared.plan();
 	// "While the `chain` exit is down, a connection is refused at once ... and counted."
-	let Some((_, link)) = route(&shared, &plan, &tunnel.exit, How::Pick(&key)) else {
+	let Some((_, link)) = route(shared, &plan, exit, How::Pick(&key)) else {
 		state.count(Count::Down);
-		return reset(&stream);
+		return false;
 	};
 	let (id, mtu, address) = (plan.links[link].id, plan.links[link].mtu(), plan.links[link].address(target.is_ipv4()));
 	drop(plan);
 	let Some(address) = address else {
 		state.count(Count::Down);
-		return reset(&stream);
+		return false;
 	};
 	let (queue, mut arrivals) = mpsc::channel(QUEUE);
 	let Some(port) = shared.nat.tunnel(id, Protocol::TCP, target, queue, state.clone()) else {
 		state.count(Count::Full);
-		return reset(&stream);
+		return false;
 	};
 	let _mapping = Mapping {shared: shared.clone(), link: id, protocol: Protocol::TCP, target, port};
 	let (started, mut seed) = (Instant::now(), [0u8; 8]);
@@ -332,7 +350,7 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 	socket.set_hop_limit(Some(HOPS));
 	if socket.connect(iface.context(), target, (address, port)).is_err() {
 		state.count(Count::Full);
-		return reset(&stream);
+		return false;
 	}
 	state.count(Count::Opened);
 	let mut sockets = SocketSet::new(Vec::new());
@@ -340,11 +358,11 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 	let (mut connected, mut client_eof, mut far_fin, mut far_done) = (false, false, false, false);
 	let (mut inbuf, mut out, mut written, mut idle_at) = (vec![0u8; CHUNK], Vec::<u8>::new(), 0usize, started + SILENT);
 	let ended = {
-		let (mut reader, mut writer) = stream.split();
+		let (mut reader, mut writer) = tokio::io::split(&mut *stream);
 		'bridge: loop {
 			let plan = shared.plan();
 			// "A connection stays on its link and is reset when that link goes down."
-			let Some((exit, link)) = route(&shared, &plan, &tunnel.exit, How::Stay(&id)) else {break Ended::Reset};
+			let Some((exit, link)) = route(shared, &plan, exit, How::Stay(&id)) else {break Ended::Reset};
 			iface.poll(clock(), &mut device, &mut sockets);
 			let mut sent = true;
 			for raw in std::mem::take(&mut device.tx) {
@@ -358,6 +376,7 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 			if !connected {
 				if socket.may_send() {
 					connected = true;
+					if let Some(opened) = opened.take() {let _ = opened.send(());}
 				} else if at == tcp::State::Closed || now >= started + CONNECT {
 					socket.abort();
 					break Ended::Unopened;
@@ -430,24 +449,24 @@ async fn connection(shared: Arc<Shared>, tunnel: Arc<config::Tunnel>, mut stream
 			}
 		}
 	};
-	if ended != Ended::Graceful {
-		// "A reset on either side resets the other": the far side is told when the link can carry it, and the client always.
+	if ended == Ended::Graceful {return true}
+	// "A reset on either side resets the other": the far side is told when the link can carry it, and the client always.
+	{
 		sockets.get_mut::<tcp::Socket>(handle).abort();
 		iface.poll(clock(), &mut device, &mut sockets);
 		let plan = shared.plan();
-		if let Some((exit, link)) = route(&shared, &plan, &tunnel.exit, How::Stay(&id)) {
+		if let Some((exit, link)) = route(shared, &plan, exit, How::Stay(&id)) {
 			for raw in std::mem::take(&mut device.tx) {
 				if shared.tunnelled(&plan, exit, link, raw).await {state.count(Count::UpPackets)}
 			}
 		}
-		reset(&stream);
 	}
 	state.count(match ended {
 		Ended::Unopened => Count::ConnectFailed,
-		Ended::Reset => Count::Reset,
 		Ended::Idle => Count::Idled,
-		Ended::Graceful => return,
+		Ended::Reset | Ended::Graceful => Count::Reset,
 	});
+	false
 }
 
 /// The packets of one connection's userspace stack: what arrived from the link waits in `rx`, and what the stack made waits in `tx` to be sent into the link.
