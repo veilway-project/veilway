@@ -38,7 +38,7 @@ ipnet={version="2", features=["serde"]}
 image={version="0.25", default-features=false, features=["png", "jpeg"]}
 rqrr="0.11"
 # The picture of a code for a link the user passes on.
-qrcode={version="0.14", default-features=false, features=["svg"]}
+qrcode={version="0.15", default-features=false, features=["svg"]}
 
 # The platform layer runs in the helper, which is this same binary started with --helper and elevated once (see helper.rs).
 [target.'cfg(unix)'.dependencies]
